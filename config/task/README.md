@@ -1,15 +1,18 @@
 # Task production configuration
 
 The Task API is part of `steward-apiserver`; the durable Task worker is part of
-`steward-controller`. Steward v0.2 supports direct Git packages and immutable versioned
+`steward-controller`. Steward v0.3 supports direct Git packages and immutable versioned
 Workflows. The removed unversioned workflow catalog is not a supported execution path.
 
 ## Authority
 
-Every externally submitted Task requires exactly one active, provisioned User Envelope owned by
-the authenticated canonical user. Steward validates the requested runtime against its exact
-approved snapshot, then persists the Envelope instance ID, revision, digest, snapshot, effective
-requirements, and admission result. The controller recovers only that immutable evidence.
+Every externally submitted Task requires an active, provisioned User Envelope owned by the
+authenticated canonical user. When several are active, the request selects one by its exact,
+owner-scoped `envelopeDigest`; omitting the selector is supported only when exactly one is active.
+The v0.2-compatible path still requires exactly one active, provisioned User Envelope.
+Steward validates the requested runtime against the selected approved snapshot, then persists the
+Envelope instance ID, revision, digest, snapshot, effective requirements, and admission result.
+The controller recovers only that immutable evidence.
 
 The deployment capability catalog is descriptive. It supplies model and tool choices to the
 administrator template editor and grants no Task authority. Product-owned Connection operations
@@ -24,8 +27,13 @@ user Task.
 | `STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE` | Required and non-empty. |
 | `STEWARD_TASK_EXECUTION_BINDINGS_FILE` | Preferred read-only `steward.execution-bindings/v1` catalog. Missing or empty means no coding agents are available. |
 | `STEWARD_TASK_EXECUTION_BINDINGS_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
-| `STEWARD_CAPABILITY_CATALOG_FILE` | Read-only `steward.capability-catalog/v1` document used by browser administration. Required when browser administration is enabled. |
+| `STEWARD_CAPABILITY_CATALOG_FILE` | Read-only `steward.capability-catalog/v2` document used by browser administration. Required when browser administration is enabled. |
 | `STEWARD_CAPABILITY_CATALOG_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
+| `STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE` | Optional read-only complete Envelope that bounds every template-free request at creation and approval. When neither form is configured, custom requests fail closed. |
+| `STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
+| `STEWARD_RUN_RELEASE_FILE` | Preferred read-only normalized steward-run release handoff for browser Workflow generation. Browser administration requires exactly one file or inline form and steward-run v0.7.0 or later. |
+| `STEWARD_RUN_RELEASE_JSON` | Inline equivalent used by the Helm chart. Configuring both release-handoff forms fails startup. |
+| `STEWARD_DEFAULT_LLM_TEMPLATE_JSON` | Optional ordinary catalog seed for the disabled-by-default LLM smoke template. Its model, roles, budget, TTL, revision, and empty tool set are explicit non-secret configuration. |
 | `STEWARD_EXECUTION_ENABLED` | `false` for core-only installation with orchestration staged; `true` after governed dependencies and execution bindings are ready. |
 | `STEWARD_TASK_INFERENCE_ENDPOINT` | Required with governed execution. Exact OpenAI-compatible Responses API endpoint used by the Codex adapter. |
 | `STEWARD_TASK_MCP_GW_ENDPOINT` | Exact HTTP(S) streamable MCP endpoint, required when effective Task authority contains tools. |
@@ -45,7 +53,7 @@ immutable checksum-named ConfigMap. It contains only model and tool identities:
 config:
   apiserver:
     capabilityCatalog:
-      schemaVersion: steward.capability-catalog/v1
+      schemaVersion: steward.capability-catalog/v2
       models:
         - provider: openai
           model: gpt-5.4
@@ -53,9 +61,22 @@ config:
         - provider: github
           resource: actions_get
           action: read
+          accessClass: read
+      catalogs:
+        - provider: github
+          catalogId: github-tools
+          version: 1.6.0
+          available: true
 ```
 
-It contains no budget, TTL, user, template, Envelope, or admission fields. Changing it changes
+Template-free requests have a separate deployment-owned safety boundary. Set
+`config.apiserver.customEnvelopeSafetyCeiling` to a complete Envelope whose models and tools are
+present in the capability catalog. Steward checks the requested budget, runtime minutes, TTL,
+runner platforms/resources, models, and tools both when the user creates the request and when an
+administrator approves it. Leaving the value `null` disables custom requests fail-closed.
+
+Access classes and provider availability are descriptive UI metadata. It contains no budget,
+TTL, user, template, Envelope, or admission fields. Changing it changes
 what the editor can offer; it does not change an existing template, User Envelope, Task, or
 admission decision.
 
@@ -69,14 +90,18 @@ decision channel is unavailable.
 
 ## Database and rollout
 
-Both production binaries run the append-only SQL migrator at startup. Steward v0.2 migration
-`0039_user_envelope_only_task_authority.sql` rejects an unfinished v0.1.23 Task unless it has one
-complete User Envelope pin or one complete internal-authority pin. Terminal historical rows remain
-readable. See [the migration register](../../migrations/README.md) and the installation guide for
-upgrade and rollback boundaries.
+Both production binaries run the append-only SQL migrator at startup. An upgrade from released
+v0.2.6 applies migrations `0040` through `0051`; the release head is `0051`. They preserve existing
+Task, request, approval, identity, and Envelope history while adding the v0.3 catalog, browser,
+observability, escalation, and custom-request state. See
+[the migration register](../../migrations/README.md) and the
+[v0.3 upgrade guide](../../docs/installation/upgrade-v0.3.0.md) for the mixed-version and rollback
+boundaries.
 
-Use apiserver, controller, web, chart, and supporting images from the same exact release. Do not
-mix v0.1.23 writers with a database that has admitted v0.2 User-Envelope-only Tasks.
+Use apiserver, controller, web, chart, and supporting images from the same exact release. Stop
+template authoring during the v0.2.6-to-v0.3.0 rolling upgrade, and do not return pre-v0.3 writers
+after template-free requests, multiple active Envelopes, or new catalog-only template revisions
+exist.
 
 ## Optional Jira decision channel
 

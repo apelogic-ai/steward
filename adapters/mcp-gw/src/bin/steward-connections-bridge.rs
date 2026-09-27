@@ -79,6 +79,7 @@ fn gateway_failure(error: &PortError) -> &'static str {
                 "MCP-GW unavailable while attempting to read GitHub connection status"
                     | "MCP-GW unavailable while attempting to start GitHub connection"
                     | "MCP-GW unavailable while attempting to disconnect GitHub connection"
+                    | "MCP-GW unavailable while attempting to re-run GitHub workflow"
             ) =>
         {
             "bridge MCP-GW returned an unexpected status"
@@ -174,6 +175,14 @@ mod tests {
                 operation: GithubBridgeOperation::Status,
             }),
             "the bridge must accept exactly its server-authored operation and input ABI"
+        );
+        let mut rerun_arguments = arguments.clone();
+        rerun_arguments[2] = "github.rerun".to_owned();
+        assert_eq!(
+            parse_invocation(&rerun_arguments),
+            Ok(Invocation {
+                operation: GithubBridgeOperation::Rerun,
+            })
         );
         for hostile in [
             vec![
@@ -368,6 +377,12 @@ mod tests {
             gateway_failure(&PortError::Failed {
                 reason: "MCP-GW unavailable while attempting to read GitHub connection status"
                     .to_owned(),
+            }),
+            "bridge MCP-GW returned an unexpected status"
+        );
+        assert_eq!(
+            gateway_failure(&PortError::Failed {
+                reason: "MCP-GW unavailable while attempting to re-run GitHub workflow".to_owned(),
             }),
             "bridge MCP-GW returned an unexpected status"
         );

@@ -141,6 +141,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         0,
         "migration 0040 must not synthesize federated subjects from historical identity data"
     );
+    assert_template_catalog_upgrade_result(&store).await?;
     verify_federated_subject_lifecycle(&store).await?;
 
     let tls_active =
@@ -491,6 +492,13 @@ async fn seed_v0123_upgrade_fixture(store: &PgStore) -> Result<(), Box<dyn Error
     .bind(&workflow_digest)
     .execute(store.pool())
     .await?;
+    sqlx::query(
+        "INSERT INTO envelopes (scope_kind, scope_ref, revision, spec, authored_by) \
+         VALUES ('member_role', 'engineer', 7, $1, 'upgrade-admin')",
+    )
+    .bind(&approved_envelope["spec"])
+    .execute(store.pool())
+    .await?;
     let envelope_request_id = "00000000-0000-0000-0000-000000000100";
     sqlx::query(
         "INSERT INTO envelope_requests \
@@ -588,6 +596,30 @@ async fn seed_v0123_upgrade_fixture(store: &PgStore) -> Result<(), Box<dyn Error
         .await?;
         transaction.commit().await?;
     }
+    Ok(())
+}
+
+async fn assert_template_catalog_upgrade_result(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let migrated_template = sqlx::query_as::<_, (String, Vec<String>, i64)>(
+        "SELECT display_name, member_roles, revision \
+         FROM envelope_template_revisions \
+         WHERE template_id = 'engineer' AND revision = 7",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        migrated_template,
+        ("engineer".to_owned(), vec!["engineer".to_owned()], 7),
+        "the role-keyed template history must migrate without changing request identity"
+    );
+    let preserved_request = sqlx::query_as::<_, (String, i64)>(
+        "SELECT template_id, template_revision FROM envelope_requests \
+         WHERE idempotency_key = 'upgrade-envelope'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(preserved_request, ("engineer".to_owned(), 7));
+
     Ok(())
 }
 

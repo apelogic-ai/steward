@@ -4032,11 +4032,16 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "kube",
+ "reqwest 0.12.28",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
  "steward-adapter-claude-code",
  "steward-adapter-codex",
  "steward-adapter-github-artifact",
  "steward-adapter-github-source",
  "steward-adapter-jira",
+ "steward-admission",
  "steward-apiserver",
  "steward-store",
  "steward-types",
@@ -4124,6 +4129,7 @@ name = "steward-store"
 version = "0.0.0"
 dependencies = [
  "serde_json",
+ "sha2",
  "sqlx",
  "steward-admission",
  "steward-types",

@@ -372,6 +372,16 @@ spec:
 {{- end }}
             - { name: STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE, value: {{ .Values.config.apiserver.kubernetesTokenReviewAudience | quote }} }
             - { name: STEWARD_CAPABILITY_CATALOG_FILE, value: /run/capability-catalog/capability-catalog.json }
+{{- with .Values.config.apiserver.customEnvelopeSafetyCeiling }}
+            - { name: STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON, value: {{ . | toJson | quote }} }
+{{- end }}
+{{- with .Values.config.apiserver.stewardRunRelease }}
+            - { name: STEWARD_RUN_RELEASE_JSON, value: {{ . | toJson | quote }} }
+{{- end }}
+{{- if .Values.config.apiserver.defaultLlmTemplate.enabled }}
+            - name: STEWARD_DEFAULT_LLM_TEMPLATE_JSON
+              value: {{ omit .Values.config.apiserver.defaultLlmTemplate "enabled" | toJson | quote }}
+{{- end }}
             - { name: STEWARD_TASK_EXECUTION_BINDINGS_MODE, value: {{ .Values.config.apiserver.executionBindingsMode | quote }} }
             - { name: STEWARD_TASK_EXECUTION_BINDINGS_FILE, value: /run/execution-bindings/execution-bindings.json }
             - { name: STEWARD_EXECUTION_ENABLED, value: {{ .Values.execution.enabled | quote }} }

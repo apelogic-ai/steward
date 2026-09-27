@@ -297,6 +297,10 @@ fn require_unique_paths<'a>(
 pub struct DirectTaskSubmission {
     pub contract_version: String,
     pub invocation_path: RelativePath,
+    /// Optional public content selector for one active User Envelope owned by the caller.
+    /// The invocation manifest field remains accepted during the compatibility window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_digest: Option<EnvelopeDigest>,
 }
 
 impl DirectTaskSubmission {
@@ -474,6 +478,10 @@ pub enum DirectAdmissionDelta {
         requested: Option<Decimal>,
         ceiling: Decimal,
         currency: Currency,
+    },
+    RuntimeMinutes {
+        requested: Option<Decimal>,
+        ceiling: Decimal,
     },
     Ttl {
         requested: Duration,

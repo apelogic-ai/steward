@@ -1313,17 +1313,8 @@ impl TaskSubmissionLedger for PgStore {
                 .as_str()
                 .strip_prefix("steward:")
                 .ok_or(StoreError::InvalidEnvelopeRequest)?;
-            PgStore::envelope_requests(self, owner_user_id)
+            PgStore::active_provisioned_user_envelopes_by_digest(self, owner_user_id, store_digest)
                 .await
-                .map(|records| {
-                    records
-                        .into_iter()
-                        .filter(|record| {
-                            record.status == steward_store::EnvelopeRequestStatus::Provisioned
-                                && record.envelope_digest.as_deref() == Some(store_digest)
-                        })
-                        .collect()
-                })
         })
     }
 
@@ -1339,18 +1330,9 @@ impl TaskSubmissionLedger for PgStore {
         &'a self,
         owner_user_id: &'a CanonicalUserId,
     ) -> BoxFuture<'a, Result<Vec<EnvelopeRequestRecord>, StoreError>> {
-        Box::pin(async move {
-            PgStore::envelope_requests(self, owner_user_id)
-                .await
-                .map(|records| {
-                    records
-                        .into_iter()
-                        .filter(|record| {
-                            record.status == steward_store::EnvelopeRequestStatus::Provisioned
-                        })
-                        .collect()
-                })
-        })
+        Box::pin(
+            async move { PgStore::active_provisioned_user_envelopes(self, owner_user_id).await },
+        )
     }
 
     fn task_by_idempotency<'a>(
@@ -1431,6 +1413,10 @@ impl TaskSubmissionLedger for PgStore {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskSubmissionRequest {
     pub workflow: String,
+    /// Optional exact active User Envelope selector. The digest is content identity scoped to
+    /// the authenticated canonical owner; it is not bearer authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_digest: Option<EnvelopeDigest>,
     /// Optional compatibility assertion for an unversioned legacy Workflow.
     /// Steward selects the runtime from its own Workflow catalog when this is
     /// omitted and rejects any supplied value that does not match the catalog.
@@ -2164,13 +2150,19 @@ where
         &canonical_json_bytes(&definition).map_err(ApiError::Admission)?,
     )?;
 
-    let explicit_envelope = manifest.envelope.is_some();
-    let envelope = resolve_direct_user_envelope(
-        ledger,
-        &identity.canonical_user_id,
-        manifest.envelope.as_ref(),
-    )
-    .await?;
+    let envelope_selector = match (&request.envelope_digest, &manifest.envelope) {
+        (Some(request_digest), Some(manifest_digest)) if request_digest != manifest_digest => {
+            return Err(ApiError::Admission(
+                "Task submission and invocation manifest select different Envelopes".to_owned(),
+            ));
+        }
+        (Some(digest), _) | (None, Some(digest)) => Some(digest),
+        (None, None) => None,
+    };
+    let explicit_envelope = envelope_selector.is_some();
+    let envelope =
+        resolve_direct_user_envelope(ledger, &identity.canonical_user_id, envelope_selector)
+            .await?;
     let approved = envelope.approved_envelope.as_ref().ok_or_else(|| {
         ApiError::Admission(if explicit_envelope {
             "the selected Envelope is not active".to_owned()
@@ -2728,12 +2720,14 @@ where
         .await
         .map_err(ApiError::Store)?
         .ok_or(ApiError::TaskWorkflowNotFound)?;
-    let envelopes = application
-        .ledger
-        .active_provisioned_user_envelopes(&identity.canonical_user_id)
-        .await
-        .map_err(ApiError::Store)?;
-    let plan = resolve_versioned_task_plan(&identity, workflow, envelopes, &application.config)?;
+    let envelope = resolve_direct_user_envelope(
+        &application.ledger,
+        &identity.canonical_user_id,
+        request.envelope_digest.as_ref(),
+    )
+    .await?;
+    let plan =
+        resolve_versioned_task_plan(&identity, workflow, vec![envelope], &application.config)?;
     let user_envelope = plan
         .envelope
         .approved_envelope
@@ -2846,11 +2840,17 @@ fn validate_task_retry(
     match reference {
         Some(reference) => {
             let workflow_reference = format!("{}@{}", reference.name, reference.version);
+            let requested_envelope_digest = request
+                .envelope_digest
+                .as_ref()
+                .and_then(|digest| digest.as_str().strip_prefix("steward:"));
             if request.agent_runtime_uid.is_some()
                 || record.workflow != workflow_reference
                 || record.workflow_name.as_deref() != Some(reference.name.as_str())
                 || record.workflow_version != Some(reference.version)
                 || record.runtime_ownership != RuntimeOwnership::Provisioned
+                || requested_envelope_digest
+                    .is_some_and(|digest| record.user_envelope_digest.as_deref() != Some(digest))
             {
                 return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
             }
@@ -3079,7 +3079,7 @@ async fn status_response<L: TaskSubmissionLedger>(
     }
 }
 
-fn stable_task_runtime_name(operation_id: Uuid) -> String {
+pub(crate) fn stable_task_runtime_name(operation_id: Uuid) -> String {
     format!("task-{}", operation_id.simple())
 }
 
@@ -3088,8 +3088,8 @@ mod workflow_request_tests {
     use std::sync::Arc;
 
     use super::{
-        TaskApiConfig, resolve_versioned_task_plan, stable_task_runtime_name,
-        task_orchestration_reservation, versioned_workflow_reference,
+        TaskApiConfig, TaskCreateRequest, TaskSubmissionRequest, resolve_versioned_task_plan,
+        stable_task_runtime_name, task_orchestration_reservation, versioned_workflow_reference,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{Envelope, EnvelopeSpec};
@@ -3219,6 +3219,31 @@ mod workflow_request_tests {
         assert!(
             versioned_workflow_reference("repository-review@1", Some("base")).is_err(),
             "versioned Workflow requests must not let the caller select the coding runtime"
+        );
+    }
+
+    #[test]
+    fn versioned_workflow_accepts_a_typed_envelope_digest_selector() {
+        let request = serde_json::from_value::<TaskSubmissionRequest>(serde_json::json!({
+            "workflow": "repository-review@1",
+            "envelopeDigest": format!("steward:sha256:{}", "a".repeat(64))
+        }));
+        assert!(
+            request.is_ok(),
+            "versioned Workflow submissions must accept the public Envelope digest selector"
+        );
+    }
+
+    #[test]
+    fn direct_package_accepts_a_typed_envelope_digest_selector() {
+        let request = serde_json::from_value::<TaskCreateRequest>(serde_json::json!({
+            "contractVersion": "steward.task/v2",
+            "invocationPath": ".steward/invocations/release-summary.json",
+            "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64))
+        }));
+        assert!(
+            matches!(request, Ok(TaskCreateRequest::Direct(_))),
+            "direct-package submissions must accept the public Envelope digest selector"
         );
     }
 
@@ -3382,6 +3407,7 @@ mod workflow_request_tests {
                     single_run_limit: Some("1.00".to_owned()),
                     currency: "USD".to_owned(),
                 },
+                runtime_minutes_limit: None,
                 ttl: Duration("15m".to_owned()),
                 runner: RunnerRequirements::default(),
             },
@@ -3389,8 +3415,8 @@ mod workflow_request_tests {
         Ok(EnvelopeRequestRecord {
             id: Uuid::new_v4(),
             owner_user_id: CanonicalUserId::parse(owner_user_id)?,
-            template_id: "developer".to_owned(),
-            template_revision: 2,
+            template_id: Some("developer".to_owned()),
+            template_revision: Some(2),
             requested_envelope: envelope.clone(),
             approved_envelope: Some(envelope),
             status: EnvelopeRequestStatus::Provisioned,
@@ -3398,8 +3424,12 @@ mod workflow_request_tests {
             envelope_instance_id: Some("env_instance_01".to_owned()),
             envelope_digest: Some("envelope-digest".to_owned()),
             reason: None,
+            rationale: None,
+            evidence_url: None,
+            decision_key: None,
+            expires_at: None,
             status_actor: owner_user_id.to_owned(),
-            status_template_revision: 2,
+            status_template_revision: Some(2),
             created_at: "2026-08-24T00:00:00.000000Z".to_owned(),
             status_at: "2026-08-24T00:00:01.000000Z".to_owned(),
         })
@@ -3469,7 +3499,7 @@ mod workflow_request_tests {
         assert_eq!(plan.spec.budget.monthly_limit, "10.00");
         assert_eq!(plan.spec.budget.single_run_limit.as_deref(), Some("1.00"));
         assert_eq!(plan.spec.ttl.0, "15m");
-        assert_eq!(plan.envelope.template_revision, 2);
+        assert_eq!(plan.envelope.template_revision, Some(2));
         assert_eq!(
             plan.envelope.envelope_instance_id.as_deref(),
             Some("env_instance_01")

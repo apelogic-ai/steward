@@ -1,6 +1,9 @@
 # Task submission API contract
 
-> **Compatibility scope:** This document describes the Steward v0.2 Task HTTP surface.
+> **Compatibility scope:** This document describes the current Steward v0.3
+> Task HTTP surface. The `steward.task/v2` wire contract originated in v0.2 and
+> remains compatible; v0.3 adds the optional Envelope digest selector and
+> federated-identity administration described below.
 > The frozen [steward.m1/v1 contract](contracts/m1/v1/README.md) and direct-package
 > [steward.task/v2 contract](contracts/task/v2/README.md) remain authoritative for their
 > respective wire shapes.
@@ -37,6 +40,15 @@ approved snapshot, effective requirements, and admission result before runtime e
 controller reuses that evidence during restart and retry and fails closed if the Envelope becomes
 inactive before execution. Deployment capability catalogs and code-owned internal authorities do
 not authorize external Tasks.
+
+Both supported submission shapes accept an optional public content selector:
+`"envelopeDigest":"steward:sha256:<64 lowercase hex>"`. Resolution is scoped to
+the authenticated canonical user and active provisioned status. One exact match
+is selected; no match is rejected; multiple matches fail closed. When the field
+is omitted, the existing implicit behavior succeeds only when exactly one active
+Envelope exists and returns `409` when several are active. Steward never selects
+by recency, template order, or another heuristic. The persisted Task binding still
+contains owner ID, Envelope instance ID, digest, and approved snapshot.
 
 For a versioned Workflow, its stored agent reference is an opaque identifier advertised by the
 current deployment catalog. The submitter supplies the Workflow reference, not the agent image,
@@ -105,8 +117,8 @@ association. Disabled subjects return `403 task_identity_disabled`.
 For v3, Steward reads the current display email from its canonical-user store
 and server-authors service `steward-run`, acting user, owner, and canonical user
 ID. Caller-supplied canonical identity is invalid. Association is authentication
-state, not authority: normal direct-package source binding and unique active
-User Envelope selection still run before reservation, and the admitted Envelope
+state, not authority: normal direct-package source binding and exact active User
+Envelope selection still run before reservation, and the admitted Envelope
 snapshot remains the Task's immutable authority evidence.
 
 Administrator operations use the existing browser administrator session and

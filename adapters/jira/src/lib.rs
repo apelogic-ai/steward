@@ -117,14 +117,20 @@ impl DecisionChannel for JiraAdapter {
             return Ok(reference);
         }
         let marker = approval_marker(&request.request_id);
-        let description = format!(
-            "Steward approval request {}\nRuntime UID: {}\nActor: {}\nMember role: {}\n{}",
-            request.request_id,
-            request.runtime_uid,
-            request.actor,
-            request.member_role,
-            request.counterexample
+        let mut description = format!(
+            "Steward approval request {}\nRuntime UID: {}\nActor: {}",
+            request.request_id, request.runtime_uid, request.actor
         );
+        if let Some(template_id) = request.template_id.as_deref() {
+            description.push_str(&format!("\nTemplate ID: {template_id}"));
+        }
+        if let Some(member_role) = request.eligibility_member_role.as_deref() {
+            description.push_str(&format!("\nEligibility member role: {member_role}"));
+        } else if let Some(member_role) = request.member_role.as_deref() {
+            description.push_str(&format!("\nMember role: {member_role}"));
+        }
+        description.push('\n');
+        description.push_str(&request.counterexample);
         let body = CreateIssue {
             fields: CreateIssueFields {
                 project: ProjectRef {
@@ -402,7 +408,9 @@ mod tests {
             request_id: "approval-a".to_owned(),
             runtime_uid: "runtime-a".to_owned(),
             actor: "bob@example.org".to_owned(),
-            member_role: "engineer".to_owned(),
+            template_id: None,
+            eligibility_member_role: Some("engineer".to_owned()),
+            member_role: Some("engineer".to_owned()),
             counterexample: "outside approved envelope".to_owned(),
         };
         assert!(matches!(
@@ -457,7 +465,9 @@ mod tests {
             request_id: "approval-a".to_owned(),
             runtime_uid: "runtime-a".to_owned(),
             actor: "bob@example.org".to_owned(),
-            member_role: "engineer".to_owned(),
+            template_id: None,
+            eligibility_member_role: Some("engineer".to_owned()),
+            member_role: Some("engineer".to_owned()),
             counterexample:
                 "envelope exceeded: budget.monthlyLimit requested 220.00 USD, ceiling 200.00 USD"
                     .to_owned(),

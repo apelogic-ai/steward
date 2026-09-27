@@ -6,6 +6,7 @@ bash "${root}/scripts/test-validate-release-version.sh"
 bash "${root}/scripts/validate-release-version.sh" >/dev/null
 bash "${root}/scripts/test-released-artifact-acceptance.sh"
 bash "${root}/scripts/test-release-chart-contract.sh"
+bash "${root}/scripts/test-chart-nullable-values.sh"
 bash "${root}/scripts/test-steward-registry-lock.sh"
 bash "${root}/scripts/test-steward-gateway-backend-tls-check.sh"
 python3 "${root}/scripts/test-platform-preflight.py"
@@ -83,6 +84,7 @@ digest1="sha256:1111111111111111111111111111111111111111111111111111111111111111
 digest2="sha256:2222222222222222222222222222222222222222222222222222222222222222"
 digest3="sha256:3333333333333333333333333333333333333333333333333333333333333333"
 image_values=(
+  --set-json 'config.apiserver.stewardRunRelease={"manifestSchemaVersion":3,"version":"0.7.0","workflowRepository":"example-org/steward-run","workflowCommit":"3333333333333333333333333333333333333333","actionCommit":"4444444444444444444444444444444444444444","governedJobContainerImage":"registry.example.test/steward-run@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
   --set-string images.repository=registry.example.test/customer/steward
   --set images.apiserver.tag=validation-apiserver
   --set "images.apiserver.digest=${digest0}"
@@ -92,6 +94,7 @@ image_values=(
   --set "images.mint.digest=${digest2}"
 )
 core_image_values=(
+  --set-json 'config.apiserver.stewardRunRelease={"manifestSchemaVersion":3,"version":"0.7.0","workflowRepository":"example-org/steward-run","workflowCommit":"3333333333333333333333333333333333333333","actionCommit":"4444444444444444444444444444444444444444","governedJobContainerImage":"registry.example.test/steward-run@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
   --set-string images.repository=registry.example.test/customer/steward
   --set images.apiserver.tag=validation-apiserver
   --set "images.apiserver.digest=${digest0}"

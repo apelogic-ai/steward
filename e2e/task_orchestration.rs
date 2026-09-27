@@ -25,6 +25,9 @@ use steward_apiserver::connections::{
 use steward_apiserver::governed_connections::{
     ConnectionExecutionBindings, GovernedConnectionsBroker, GovernedConnectionsConfig,
 };
+use steward_apiserver::{
+    AuthenticatedCaller, AuthenticationError, BoxFuture, RequestAuthenticator, operator_admin,
+};
 use steward_controller::{
     TaskControllerError, reconcile_agent_runtime_work_item, reconcile_task_orchestration_work_item,
     webhook_router_for_controller,
@@ -36,24 +39,75 @@ use steward_ports::{
     SandboxTaskRuntime, TaskAttemptId,
 };
 use steward_store::{
-    EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, PgStore,
-    StoreError, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
-    WorkflowPublication,
+    AgentRunLogStream, EnvelopeRequestReservationRequest, EnvelopeRequestStatus,
+    EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, PgStore, StoreError,
+    TaskActivationObservation, TaskExecutionObservation, TaskExecutionTransition,
+    TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest, WorkflowPublication,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
     CanonicalAuthorityBinding, DisposableExecutionBinding, Duration, Email,
     ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, OrganizationId,
     OrganizationIdentityPolicy, Phase, Principal, RunnerRequirements, RuntimeOwnership,
-    RuntimeRefs, TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding, TaskPhase, ToolGrant,
+    RuntimeRefs, SpendSummary, TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding,
+    TaskPhase, ToolGrant,
 };
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tower::ServiceExt;
 
 const RUNTIME_PATH_PREFIX: &str =
     "/apis/agents.apelogic.ai/v1alpha1/namespaces/steward-test/agentruntimes";
 const SECRET_PATH_PREFIX: &str = "/api/v1/namespaces/steward-test/secrets";
 const CONTROLLER_USERNAME: &str = "system:serviceaccount:steward-system:steward-controller";
+const OPERATOR_USERNAME: &str = "system:serviceaccount:steward-test:operator";
+
+#[derive(Clone)]
+struct OperatorTestAuthenticator;
+
+impl RequestAuthenticator for OperatorTestAuthenticator {
+    fn authenticate<'a>(
+        &'a self,
+        bearer_token: &'a str,
+    ) -> BoxFuture<'a, Result<AuthenticatedCaller, AuthenticationError>> {
+        Box::pin(async move {
+            if bearer_token != "operator-token" {
+                return Err(AuthenticationError::InvalidCredentials);
+            }
+            Ok(AuthenticatedCaller {
+                actor: OPERATOR_USERNAME.to_owned(),
+                member_roles: Vec::new(),
+                canonical_user_id: None,
+                is_admin: true,
+            })
+        })
+    }
+}
+
+async fn operator_api_request(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> Result<Response<Body>, Box<dyn Error>> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, "Bearer operator-token");
+    let body = match body {
+        Some(body) => {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+            Body::from(body.to_string())
+        }
+        None => Body::empty(),
+    };
+    Ok(app.clone().oneshot(request.body(body)?).await?)
+}
+
+async fn response_json(response: Response<Body>) -> Result<serde_json::Value, Box<dyn Error>> {
+    let body = to_bytes(response.into_body(), 1024 * 1024).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
 
 #[derive(Clone)]
 struct WebhookAdmissionHarness {
@@ -86,6 +140,495 @@ impl Drop for ServerGuard {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+#[tokio::test]
+async fn concurrent_provisioning_enforces_active_digest_uniqueness_transactionally()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("concurrent-envelope-{suffix}"),
+                "example.com",
+                &format!("alice-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let envelope = Envelope {
+        revision: 1,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "example".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "1.00".to_owned(),
+                single_run_limit: Some("0.50".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            runtime_minutes_limit: Some("10".to_owned()),
+            ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
+        },
+    };
+    let template_a = format!("template-a-{suffix}");
+    let template_b = format!("template-b-{suffix}");
+    for template_id in [&template_a, &template_b] {
+        store
+            .insert_envelope_template_revision(EnvelopeTemplatePublication {
+                template_id,
+                display_name: template_id,
+                member_roles: std::slice::from_ref(template_id),
+                ceiling: &envelope,
+                auto_provision_threshold: Some(&envelope),
+                authored_by: "test-bootstrap",
+            })
+            .await?;
+    }
+    let request_a = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &identity.user_id,
+            template_id: Some(&template_a),
+            template_revision: Some(1),
+            requested_envelope: &envelope,
+            idempotency_key: &format!("request-a-{suffix}"),
+            actor: "test-bootstrap",
+        })
+        .await?
+        .record;
+    let request_b = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &identity.user_id,
+            template_id: Some(&template_b),
+            template_revision: Some(1),
+            requested_envelope: &envelope,
+            idempotency_key: &format!("request-b-{suffix}"),
+            actor: "test-bootstrap",
+        })
+        .await?
+        .record;
+    let digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&envelope)?)
+    );
+    let instance_a = format!("env_{}", request_a.id.simple());
+    let instance_b = format!("env_{}", request_b.id.simple());
+    let update_a = EnvelopeRequestStatusUpdate {
+        from: EnvelopeRequestStatus::Pending,
+        to: EnvelopeRequestStatus::Provisioned,
+        approval_id: None,
+        envelope_instance_id: Some(&instance_a),
+        envelope_digest: Some(&digest),
+        reason: None,
+        rationale: Some("concurrency test"),
+        evidence_url: None,
+        expires_at: None,
+        approved_envelope: Some(&envelope),
+        actor: "test-bootstrap",
+    };
+    let update_b = EnvelopeRequestStatusUpdate {
+        from: EnvelopeRequestStatus::Pending,
+        to: EnvelopeRequestStatus::Provisioned,
+        approval_id: None,
+        envelope_instance_id: Some(&instance_b),
+        envelope_digest: Some(&digest),
+        reason: None,
+        rationale: Some("concurrency test"),
+        evidence_url: None,
+        expires_at: None,
+        approved_envelope: Some(&envelope),
+        actor: "test-bootstrap",
+    };
+    let (result_a, result_b) = tokio::join!(
+        store.append_envelope_request_status(request_a.id, update_a),
+        store.append_envelope_request_status(request_b.id, update_b),
+    );
+    assert!(
+        matches!(
+            (&result_a, &result_b),
+            (Ok(_), Err(StoreError::EnvelopeRequestDigestConflict))
+                | (Err(StoreError::EnvelopeRequestDigestConflict), Ok(_))
+        ),
+        "exactly one conflicting template may win concurrent digest provisioning: {result_a:?} / {result_b:?}"
+    );
+    let active = store
+        .envelope_requests(&identity.user_id)
+        .await?
+        .into_iter()
+        .filter(|request| request.status == EnvelopeRequestStatus::Provisioned)
+        .count();
+    assert_eq!(active, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn operator_rbac_and_provisioning_preserve_distinct_active_authority()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool.clone());
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let role = format!("engineer-{suffix}");
+    let identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("operator-provision-{suffix}"),
+                "example.com",
+                &format!("alice-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let bob_identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.org",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("operator-provision-bob-{suffix}"),
+                "example.org",
+                &format!("bob-{suffix}@example.org"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let envelope = |revision, monthly_limit: &str| Envelope {
+        revision,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "example".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: monthly_limit.to_owned(),
+                single_run_limit: Some("0.50".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            runtime_minutes_limit: Some("10".to_owned()),
+            ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
+        },
+    };
+    let template_a = format!("develop-{suffix}");
+    let template_b = format!("review-{suffix}");
+    let envelope_a1 = envelope(1, "1.00");
+    let envelope_b1 = envelope(1, "2.00");
+    for (template_id, ceiling) in [(&template_a, &envelope_a1), (&template_b, &envelope_b1)] {
+        store
+            .insert_envelope_template_revision(EnvelopeTemplatePublication {
+                template_id,
+                display_name: template_id,
+                member_roles: std::slice::from_ref(&role),
+                ceiling,
+                auto_provision_threshold: Some(ceiling),
+                authored_by: "test-bootstrap",
+            })
+            .await?;
+    }
+    let operator_app = operator_admin::router(store.clone(), OperatorTestAuthenticator);
+    let users =
+        operator_api_request(&operator_app, Method::GET, "/admin/operator/v1/users", None).await?;
+    assert_eq!(users.status(), StatusCode::OK);
+    let users = response_json(users).await?;
+    assert!(users["users"].as_array().is_some_and(|users| {
+        users
+            .iter()
+            .any(|user| user["userId"] == identity.user_id.as_str())
+    }));
+    let roles =
+        operator_api_request(&operator_app, Method::GET, "/admin/operator/v1/roles", None).await?;
+    assert_eq!(roles.status(), StatusCode::OK);
+    assert!(
+        response_json(roles).await?["memberRoles"]
+            .as_array()
+            .is_some_and(|roles| roles.iter().any(|candidate| candidate == &role))
+    );
+
+    let admin_grant = operator_api_request(
+        &operator_app,
+        Method::POST,
+        "/admin/operator/v1/rbac",
+        Some(json!({
+            "userId": identity.user_id.as_str(),
+            "kind": "administrator",
+            "action": "grant",
+        })),
+    )
+    .await?;
+    assert_eq!(admin_grant.status(), StatusCode::OK);
+    let pure_admin = operator_api_request(
+        &operator_app,
+        Method::POST,
+        "/admin/operator/v1/envelopes/provision",
+        Some(json!({
+            "ownerUserId": identity.user_id.as_str(),
+            "templateId": template_a,
+            "templateRevision": 1,
+            "requestedEnvelope": envelope_a1,
+            "idempotencyKey": format!("pure-admin-{suffix}"),
+        })),
+    )
+    .await?;
+    assert_eq!(pure_admin.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    for action in ["grant", "grant", "revoke", "revoke", "grant"] {
+        let response = operator_api_request(
+            &operator_app,
+            Method::POST,
+            "/admin/operator/v1/rbac",
+            Some(json!({
+                "userId": identity.user_id.as_str(),
+                "kind": "member_role",
+                "memberRole": role,
+                "action": action,
+            })),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let bob_role_grant = operator_api_request(
+        &operator_app,
+        Method::POST,
+        "/admin/operator/v1/rbac",
+        Some(json!({
+            "userId": bob_identity.user_id.as_str(),
+            "kind": "member_role",
+            "memberRole": role.as_str(),
+            "action": "grant",
+        })),
+    )
+    .await?;
+    assert_eq!(bob_role_grant.status(), StatusCode::OK);
+    let role_events = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM browser_rbac_assignment_events \
+         WHERE user_id = $1 AND assignment_kind = 'member_role' AND member_role = $2",
+    )
+    .bind(identity.user_id.as_str())
+    .bind(&role)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        role_events, 3,
+        "exact grant and revoke retries must not duplicate audit events"
+    );
+    let effective = operator_api_request(
+        &operator_app,
+        Method::GET,
+        &format!(
+            "/admin/operator/v1/users/{}/effective-access",
+            identity.user_id.as_str()
+        ),
+        None,
+    )
+    .await?;
+    assert_eq!(effective.status(), StatusCode::OK);
+    let effective = response_json(effective).await?;
+    assert_eq!(effective["administrator"], true);
+    assert_eq!(effective["memberRoles"], json!([role.as_str()]));
+    assert_eq!(
+        effective["eligibleTemplates"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    for (template_id, requested_envelope, idempotency_key) in [
+        (&template_a, &envelope_a1, format!("provision-a1-{suffix}")),
+        (&template_b, &envelope_b1, format!("provision-b1-{suffix}")),
+    ] {
+        let response = operator_api_request(
+            &operator_app,
+            Method::POST,
+            "/admin/operator/v1/envelopes/provision",
+            Some(json!({
+                "ownerUserId": identity.user_id.as_str(),
+                "templateId": template_id,
+                "templateRevision": 1,
+                "requestedEnvelope": requested_envelope,
+                "idempotencyKey": idempotency_key,
+            })),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let initial_requests = store.envelope_requests(&identity.user_id).await?;
+    let a1 = initial_requests
+        .iter()
+        .find(|request| {
+            request.template_id.as_deref() == Some(template_a.as_str())
+                && request.status == EnvelopeRequestStatus::Provisioned
+        })
+        .cloned()
+        .ok_or("operator API did not provision template A")?;
+    let b1 = initial_requests
+        .iter()
+        .find(|request| {
+            request.template_id.as_deref() == Some(template_b.as_str())
+                && request.status == EnvelopeRequestStatus::Provisioned
+        })
+        .cloned()
+        .ok_or("operator API did not provision template B")?;
+    assert_eq!(a1.owner_user_id, identity.user_id);
+    assert_eq!(a1.status_actor, OPERATOR_USERNAME);
+    assert_eq!(b1.status_actor, OPERATOR_USERNAME);
+
+    let envelope_a2 = envelope(2, "3.00");
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &template_a,
+            display_name: &template_a,
+            member_roles: std::slice::from_ref(&role),
+            ceiling: &envelope_a2,
+            auto_provision_threshold: Some(&envelope_a2),
+            authored_by: OPERATOR_USERNAME,
+        })
+        .await?;
+    let provision_a2 = |idempotency_key: String| {
+        json!({
+            "ownerUserId": identity.user_id.as_str(),
+            "templateId": template_a,
+            "templateRevision": 2,
+            "requestedEnvelope": envelope_a2,
+            "idempotencyKey": idempotency_key,
+        })
+    };
+    let a2_response = operator_api_request(
+        &operator_app,
+        Method::POST,
+        "/admin/operator/v1/envelopes/provision",
+        Some(provision_a2(format!("provision-a2-{suffix}"))),
+    )
+    .await?;
+    assert_eq!(a2_response.status(), StatusCode::OK);
+    let a2_response = response_json(a2_response).await?;
+    let a2_retry = operator_api_request(
+        &operator_app,
+        Method::POST,
+        "/admin/operator/v1/envelopes/provision",
+        Some(provision_a2(format!("provision-a2-retry-{suffix}"))),
+    )
+    .await?;
+    assert_eq!(a2_retry.status(), StatusCode::OK);
+    assert_eq!(response_json(a2_retry).await?, a2_response);
+
+    let bob_a2_response = operator_api_request(
+        &operator_app,
+        Method::POST,
+        "/admin/operator/v1/envelopes/provision",
+        Some(json!({
+            "ownerUserId": bob_identity.user_id.as_str(),
+            "templateId": template_a.as_str(),
+            "templateRevision": 2,
+            "requestedEnvelope": &envelope_a2,
+            "idempotencyKey": format!("provision-bob-a2-{suffix}"),
+        })),
+    )
+    .await?;
+    assert_eq!(bob_a2_response.status(), StatusCode::OK);
+
+    let requests = store.envelope_requests(&identity.user_id).await?;
+    let a2 = requests
+        .iter()
+        .find(|request| {
+            request.template_id.as_deref() == Some(template_a.as_str())
+                && request.template_revision == Some(2)
+                && request.status == EnvelopeRequestStatus::Provisioned
+        })
+        .cloned()
+        .ok_or("operator API did not provision template A revision 2")?;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.status == EnvelopeRequestStatus::Provisioned)
+            .map(|request| request.id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [a2.id, b1.id].into_iter().collect(),
+        "replacing one template must preserve unrelated active authority"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .find(|request| request.id == a1.id)
+            .map(|request| request.status),
+        Some(EnvelopeRequestStatus::Stale)
+    );
+    let active = store
+        .active_provisioned_user_envelopes(&identity.user_id)
+        .await?;
+    assert_eq!(active.len(), 2);
+    let a2_digest = a2
+        .envelope_digest
+        .as_deref()
+        .ok_or("provisioned Envelope omitted its digest")?;
+    let selected = store
+        .active_provisioned_user_envelopes_by_digest(&identity.user_id, a2_digest)
+        .await?;
+    assert_eq!(
+        selected.iter().map(|record| record.id).collect::<Vec<_>>(),
+        [a2.id]
+    );
+    let bob_requests = store.envelope_requests(&bob_identity.user_id).await?;
+    let bob_a2 = bob_requests
+        .iter()
+        .find(|request| request.status == EnvelopeRequestStatus::Provisioned)
+        .ok_or("operator API did not provision Bob's template A revision 2")?;
+    assert_eq!(bob_a2.envelope_digest.as_deref(), Some(a2_digest));
+    let bob_selected = store
+        .active_provisioned_user_envelopes_by_digest(&bob_identity.user_id, a2_digest)
+        .await?;
+    assert_eq!(
+        bob_selected
+            .iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>(),
+        [bob_a2.id],
+        "the same digest must resolve independently for each owner"
+    );
+    let b1_digest = b1
+        .envelope_digest
+        .as_deref()
+        .ok_or("provisioned template B omitted its digest")?;
+    assert!(
+        store
+            .active_provisioned_user_envelopes_by_digest(&bob_identity.user_id, b1_digest)
+            .await?
+            .is_empty(),
+        "an owner must not select another user's active Envelope by digest"
+    );
+    Ok(())
 }
 
 fn disposable_execution_binding() -> Result<TaskExecutionBinding, io::Error> {
@@ -443,6 +986,589 @@ async fn internal_authority_provisions_and_recovers_cleanup_without_a_service_en
 }
 
 #[tokio::test]
+async fn multiple_named_envelope_templates_coexist_for_one_role_and_pin_requests_independently()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let store = PgStore::new(
+        PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await?,
+    );
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let role = format!("engineer-{suffix}");
+    let email = Email(format!("alice-{suffix}@example.com"));
+    let identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("template-subject-{suffix}"),
+                "example.com",
+                email.as_str(),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let envelope = Envelope {
+        revision: 1,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "example".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "25.00".to_owned(),
+                single_run_limit: Some("5.00".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            runtime_minutes_limit: None,
+            ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
+        },
+    };
+    let template_ids = [format!("develop-{suffix}"), format!("review-{suffix}")];
+    for (template_id, display_name) in template_ids.iter().zip(["Develop", "Review"]) {
+        store
+            .insert_envelope_template_revision(EnvelopeTemplatePublication {
+                template_id,
+                display_name,
+                member_roles: std::slice::from_ref(&role),
+                ceiling: &envelope,
+                auto_provision_threshold: Some(&envelope),
+                authored_by: "test-bootstrap",
+            })
+            .await?;
+    }
+
+    let eligible = store
+        .available_envelope_templates(std::slice::from_ref(&role))
+        .await?;
+    assert_eq!(
+        eligible
+            .iter()
+            .map(|template| template.template_id.as_str())
+            .collect::<Vec<_>>(),
+        template_ids.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    let mut request_ids = Vec::new();
+    for (index, template_id) in template_ids.iter().enumerate() {
+        let request = store
+            .reserve_envelope_request(EnvelopeRequestReservationRequest {
+                owner_user_id: &identity.user_id,
+                template_id: Some(template_id),
+                template_revision: Some(envelope.revision),
+                requested_envelope: &envelope,
+                idempotency_key: &format!("template-request-{suffix}-{index}"),
+                actor: identity.user_id.as_str(),
+            })
+            .await?
+            .record;
+        assert_eq!(request.template_id.as_ref(), Some(template_id));
+        request_ids.push(request.id);
+    }
+    assert_ne!(request_ids[0], request_ids[1]);
+
+    let filing_token = store
+        .claim_envelope_request_decision_filing(request_ids[0], "admin-test")
+        .await?;
+    assert!(matches!(
+        store
+            .claim_envelope_request_decision_filing(request_ids[0], "admin-retry")
+            .await,
+        Err(StoreError::DecisionFilingInProgress)
+    ));
+    store
+        .complete_envelope_request_decision_filing(
+            request_ids[0],
+            filing_token,
+            "PROJ-123",
+            "https://jira.example.com/browse/PROJ-123",
+            "admin-test",
+        )
+        .await?;
+    let reference = store
+        .envelope_request_decision_reference(request_ids[0])
+        .await?
+        .ok_or(StoreError::DecisionReferenceMismatch)?;
+    assert_eq!(reference.decision_key, "PROJ-123");
+    assert!(matches!(
+        store
+            .claim_envelope_request_decision_filing(request_ids[0], "admin-retry")
+            .await,
+        Err(StoreError::DecisionReferenceMismatch)
+    ));
+
+    let released_token = store
+        .claim_envelope_request_decision_filing(request_ids[1], "admin-test")
+        .await?;
+    store
+        .release_envelope_request_decision_filing(request_ids[1], released_token)
+        .await?;
+    store
+        .claim_envelope_request_decision_filing(request_ids[1], "admin-retry")
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool.clone());
+    store.migrate().await?;
+    // Exercise the unified runtime-approval projection against real PostgreSQL even when this
+    // isolated run has not yet created an exception approval.
+    store.admin_approvals().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let email = Email(format!("alice-{suffix}@example.com"));
+    let identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("escalation-subject-{suffix}"),
+                "example.com",
+                email.as_str(),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let template_id = format!("develop-{suffix}");
+    let envelope = Envelope {
+        revision: 1,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "example".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "100.00".to_owned(),
+                single_run_limit: Some("10.00".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            runtime_minutes_limit: Some("1.00".to_owned()),
+            ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
+        },
+    };
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &template_id,
+            display_name: "Develop",
+            member_roles: std::slice::from_ref(&template_id),
+            ceiling: &envelope,
+            auto_provision_threshold: Some(&envelope),
+            authored_by: "test-bootstrap",
+        })
+        .await?;
+    let request = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &identity.user_id,
+            template_id: Some(&template_id),
+            template_revision: Some(envelope.revision),
+            requested_envelope: &envelope,
+            idempotency_key: &format!("envelope-{suffix}"),
+            actor: identity.user_id.as_str(),
+        })
+        .await?
+        .record;
+    let approval_id = Uuid::new_v4();
+    let envelope_instance_id = format!("env_{}", request.id.simple());
+    let envelope_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&envelope)?)
+    );
+    store
+        .append_envelope_request_status(
+            request.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: Some(approval_id),
+                envelope_instance_id: Some(&envelope_instance_id),
+                envelope_digest: Some(&envelope_digest),
+                reason: None,
+                rationale: Some("bounded test approval"),
+                evidence_url: None,
+                expires_at: None,
+                approved_envelope: Some(&envelope),
+                actor: "test-bootstrap",
+            },
+        )
+        .await?;
+    let workflow = format!("escalation-{suffix}");
+    let workflow_digest = format!("sha256:{:x}", Sha256::digest(workflow.as_bytes()));
+    store
+        .publish_initial_workflow(WorkflowPublication {
+            name: &workflow,
+            display_name: "Escalation test",
+            agent: "example-agent@1",
+            prompt: "Exercise cumulative spend escalation.",
+            content_digest: &workflow_digest,
+            published_by: "test-bootstrap",
+        })
+        .await?;
+    let service = format!("escalation-{suffix}");
+    let spec = AgentRuntimeSpec {
+        principal: Principal::Service {
+            name: service.clone(),
+            acting_user: Some(email.clone()),
+        },
+        owner: email.clone(),
+        canonical_authority: Some(CanonicalAuthorityBinding::new(
+            identity.user_id.clone(),
+            Some(identity.user_id.clone()),
+        )?),
+        agent_type: AgentType {
+            name: "example-agent@1".to_owned(),
+        },
+        llms: envelope.spec.llms.clone(),
+        tools: envelope.spec.tools.clone(),
+        budget: envelope.spec.budget.clone(),
+        ttl: envelope.spec.ttl.clone(),
+        runner: envelope.spec.runner.clone(),
+        bindings: None,
+    };
+    let execution_binding = disposable_execution_binding()?;
+    let task_uid = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let runtime_name = format!("task-{}", operation_id.simple());
+    let candidate_digest = digest(serde_json::to_value(&spec))?;
+    let inert_digest = manifest_digest_with_binding(
+        task_uid,
+        operation_id,
+        &runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let active_digest = manifest_digest_with_binding(
+        task_uid,
+        operation_id,
+        &runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    let agent_command = ["example-agent".to_owned(), "run".to_owned()];
+    let admission_decision = AdmissionDecision::Admit;
+    let reservation = store
+        .reserve_task(&TaskReservationRequest {
+            task_uid,
+            operation_id,
+            idempotency_key: &format!("escalation-task-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some(email.as_str()),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: email.as_str(),
+            owner_user_id: identity.user_id.as_str(),
+            workflow: &workflow,
+            workflow_name: Some(&workflow),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &agent_command,
+            execution_binding: Some(&execution_binding),
+            direct_task_evidence: None,
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &candidate_digest,
+            admission_decision: &admission_decision,
+            inert_manifest_digest: &inert_digest,
+            active_manifest_digest: &active_digest,
+        })
+        .await?;
+    store
+        .put_task_inputs(
+            task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"live execution input",
+        )
+        .await?;
+    store
+        .request_task_execution(task_uid, &service, identity.user_id.as_str())
+        .await?;
+    store
+        .authorize_task_runtime_creation(
+            task_uid,
+            reservation.operation.generation,
+            "test-controller",
+        )
+        .await?;
+    let operation = store
+        .task_runtime_operation(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    let runtime_uid = format!("runtime-{suffix}");
+    store
+        .record_task_runtime_observed(
+            task_uid,
+            operation.generation,
+            &runtime_uid,
+            "1",
+            "test-controller",
+        )
+        .await?;
+    let operation = store
+        .task_runtime_operation(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .decide_task_runtime_authority_v3(task_uid, operation.generation, "test-controller")
+        .await?;
+    let operation = store
+        .task_runtime_operation(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .decide_task_runtime_authority_v3(task_uid, operation.generation, "test-controller")
+        .await?;
+    let operation = store
+        .task_runtime_operation(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .record_task_activation_observed(
+            task_uid,
+            operation.generation,
+            &TaskActivationObservation {
+                runtime_uid: &runtime_uid,
+                resource_version: "2",
+                active_manifest_digest: &active_digest,
+                provider_set_ready: true,
+            },
+            "test-controller",
+        )
+        .await?;
+    let attempt = store
+        .claim_task_execution_attempt(
+            task_uid,
+            &format!("sha256:{}", "a".repeat(64)),
+            &format!("sha256:{}", "b".repeat(64)),
+            "test-controller",
+        )
+        .await?;
+    let attempt = match attempt {
+        TaskExecutionTransition::Created(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "live-log execution attempt was not created: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    let attempt = match store
+        .authorize_task_execution_start(attempt.attempt_id, attempt.generation, "test-controller")
+        .await?
+    {
+        TaskExecutionTransition::Applied(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "live-log execution start was not authorized: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    store
+        .record_task_execution_observation(
+            attempt.attempt_id,
+            attempt.generation,
+            TaskExecutionObservation::Running {
+                adapter_observation_id: "live-attempt",
+                execution_stdout: Some(b"live stdout"),
+                execution_stderr: Some(b"live stderr"),
+            },
+            "test-controller",
+        )
+        .await?;
+    let live_log = store
+        .agent_run_execution_log(
+            task_uid,
+            Some(identity.user_id.as_str()),
+            AgentRunLogStream::Stdout,
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("live execution log was not projected"))?;
+    assert_eq!(live_log.content, b"live stdout");
+    assert!(
+        !live_log.complete,
+        "a running transcript must remain pollable"
+    );
+    sqlx::query(
+        "INSERT INTO task_lifecycle_events \
+         (task_uid, event_kind, phase, provenance, at) \
+         VALUES ($1, 'phase', 'running', 'recorded', clock_timestamp() - interval '2 minutes')",
+    )
+    .bind(task_uid)
+    .execute(&pool)
+    .await?;
+    let runtime_minutes = store
+        .observe_envelope_instance_runtime_minutes(
+            &envelope_instance_id,
+            task_uid,
+            &runtime_uid,
+            envelope
+                .spec
+                .runtime_minutes_limit
+                .as_deref()
+                .ok_or_else(|| io::Error::other("runtime-minute limit is missing"))?,
+        )
+        .await?;
+    assert!(runtime_minutes.exhausted);
+    let runtime_minutes_escalation = store
+        .admin_escalations()
+        .await?
+        .into_iter()
+        .find(|record| record.runtime_uid == runtime_uid && record.dimension == "runtime_minutes")
+        .ok_or_else(|| io::Error::other("runtime-minute escalation was not projected"))?;
+    assert_eq!(runtime_minutes_escalation.currency, "min");
+    let runtime_grant = store
+        .record_escalation_top_up(
+            runtime_minutes_escalation.escalation_id,
+            "10.00",
+            "2999-01-01T00:00:00Z",
+            "finish the bounded task",
+            "test-admin",
+        )
+        .await?;
+    assert_eq!(runtime_grant.base_limit, "1.00");
+    assert_eq!(runtime_grant.target_limit, "11.00");
+    assert_eq!(
+        store
+            .active_envelope_instance_runtime_minutes_top_up(&envelope_instance_id)
+            .await?,
+        Some("10.00".to_owned())
+    );
+    let resumed_runtime_minutes = store
+        .observe_envelope_instance_runtime_minutes(
+            &envelope_instance_id,
+            task_uid,
+            &runtime_uid,
+            "1.00",
+        )
+        .await?;
+    assert!(
+        !resumed_runtime_minutes.exhausted,
+        "the active instance grant must resume execution above observed runtime minutes"
+    );
+    store
+        .record_spend_observation(
+            &runtime_uid,
+            1,
+            "immutable-runtime-spec",
+            &SpendSummary {
+                observed_amount: "110.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            true,
+        )
+        .await?;
+
+    let escalation = store
+        .admin_escalations()
+        .await?
+        .into_iter()
+        .find(|record| record.runtime_uid == runtime_uid && record.dimension == "llm_spend")
+        .ok_or_else(|| io::Error::other("spend escalation was not projected"))?;
+    assert_eq!(escalation.envelope_instance_id, envelope_instance_id);
+    assert_eq!(escalation.limit, "100.00");
+    assert_eq!(
+        store
+            .record_escalation_top_up(
+                escalation.escalation_id,
+                "5.00",
+                "2999-01-01T00:00:00Z",
+                "insufficient to resume the task",
+                "test-admin",
+            )
+            .await,
+        Err(StoreError::InvalidCumulativeEscalation),
+        "a successful top-up must raise the effective limit above observed spend"
+    );
+    let grant = store
+        .record_escalation_top_up(
+            escalation.escalation_id,
+            "25.00",
+            "2999-01-01T00:00:00Z",
+            "finish the bounded task",
+            "test-admin",
+        )
+        .await?;
+    assert_eq!(grant.base_limit, "100.00");
+    assert_eq!(grant.target_limit, "125.00");
+    assert_eq!(
+        store
+            .active_envelope_instance_spend_top_up(&envelope_instance_id)
+            .await?,
+        Some("25.00".to_owned())
+    );
+    let usage = store.envelope_usage(&envelope_instance_id).await?;
+    assert_eq!(usage.observed_amount, Some("110.00".to_owned()));
+    assert_eq!(usage.active_top_up_amount, Some("25.00".to_owned()));
+    let retry = store
+        .record_escalation_top_up(
+            escalation.escalation_id,
+            "25.0",
+            "2999-01-01T00:00:00Z",
+            "finish the bounded task",
+            "test-admin",
+        )
+        .await?;
+    assert_eq!(
+        retry.id, grant.id,
+        "retries must return the one append-only grant"
+    );
+    assert_eq!(
+        store
+            .record_escalation_top_up(
+                escalation.escalation_id,
+                "30.00",
+                "2999-01-01T00:00:00Z",
+                "different authority",
+                "test-admin",
+            )
+            .await,
+        Err(StoreError::CumulativeEscalationConflict)
+    );
+    let decided = store
+        .cumulative_escalation(escalation.escalation_id)
+        .await?
+        .ok_or_else(|| io::Error::other("decided escalation was not projected"))?;
+    assert_eq!(decided.grant_id, Some(grant.id));
+    assert_eq!(decided.limit, "125.00");
+    assert_eq!(decided.grant_active, Some(true));
+    Ok(())
+}
+
+#[tokio::test]
 async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
 -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
@@ -495,18 +1621,26 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
                 single_run_limit: Some("10.00".to_owned()),
                 currency: "USD".to_owned(),
             },
+            runtime_minutes_limit: None,
             ttl: Duration("1h".to_owned()),
             runner: RunnerRequirements::default(),
         },
     };
     store
-        .insert_envelope(&member_role, &envelope, "admin@example.com")
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &member_role,
+            display_name: &member_role,
+            member_roles: std::slice::from_ref(&member_role),
+            ceiling: &envelope,
+            auto_provision_threshold: Some(&envelope),
+            authored_by: "admin@example.com",
+        })
         .await?;
     let envelope_request = store
         .reserve_envelope_request(EnvelopeRequestReservationRequest {
             owner_user_id: &identity.user_id,
-            template_id: &member_role,
-            template_revision: envelope.revision,
+            template_id: Some(&member_role),
+            template_revision: Some(envelope.revision),
             requested_envelope: &envelope,
             idempotency_key: &format!("envelope-{suffix}"),
             actor: "admin@example.com",
@@ -524,6 +1658,9 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
                 envelope_instance_id: None,
                 envelope_digest: None,
                 reason: None,
+                rationale: None,
+                evidence_url: None,
+                expires_at: None,
                 approved_envelope: Some(&envelope),
                 actor: "admin@example.com",
             },
@@ -558,6 +1695,9 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
                 envelope_instance_id: Some(&envelope_instance_id),
                 envelope_digest: Some(&envelope_digest),
                 reason: None,
+                rationale: None,
+                evidence_url: None,
+                expires_at: None,
                 approved_envelope: Some(&envelope),
                 actor: "steward-test",
             },
@@ -1815,6 +2955,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             operation_runtime_name: &runtime_name,
             inert_manifest_digest: &duplicate_inert_digest,
             active_manifest_digest: &duplicate_active_digest,
+            direct_task_evidence: None,
         },
     )
     .await?;
@@ -1849,6 +2990,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             operation_runtime_name: "task-corrupted-projection",
             inert_manifest_digest: &rejected_inert_digest,
             active_manifest_digest: &rejected_active_digest,
+            direct_task_evidence: None,
         },
     )
     .await?;
@@ -1860,6 +3002,80 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             Err(StoreError::InvalidTaskTransition)
         ),
         "an inconsistent persisted Task/runtime projection must fail closed"
+    );
+
+    let mut github_candidates = Vec::new();
+    for (attempt, run_id) in [(3_u32, "900001"), (2_u32, "900001"), (4_u32, "other-run")] {
+        let candidate_task_uid = Uuid::new_v4();
+        let candidate_operation_id = Uuid::new_v4();
+        let candidate_runtime_name = format!("task-{}", candidate_operation_id.simple());
+        let candidate_inert_digest = manifest_digest_with_binding(
+            candidate_task_uid,
+            candidate_operation_id,
+            &candidate_runtime_name,
+            &inert_spec(&spec, &envelope),
+            "inert",
+            Some(&execution_binding),
+        )?;
+        let candidate_active_digest = manifest_digest_with_binding(
+            candidate_task_uid,
+            candidate_operation_id,
+            &candidate_runtime_name,
+            &spec,
+            "active",
+            Some(&execution_binding),
+        )?;
+        let evidence = direct_task_evidence_fixture(
+            candidate_task_uid,
+            attempt,
+            run_id,
+            envelope.revision,
+            &envelope_digest,
+        )?;
+        insert_task_projection_fixture(
+            &pool,
+            TaskProjectionFixture {
+                source_task_uid: task_uid,
+                task_uid: candidate_task_uid,
+                operation_id: candidate_operation_id,
+                idempotency_key: &format!("github-rerun-{run_id}-{attempt}-{suffix}"),
+                task_runtime_name: &candidate_runtime_name,
+                operation_runtime_name: &candidate_runtime_name,
+                inert_manifest_digest: &candidate_inert_digest,
+                active_manifest_digest: &candidate_active_digest,
+                direct_task_evidence: Some(&evidence),
+            },
+        )
+        .await?;
+        github_candidates.push((attempt, run_id, candidate_task_uid));
+    }
+    let attempt_two = store
+        .github_rerun_task(identity.user_id.as_str(), "example-org/caller", "900001", 1)
+        .await?
+        .ok_or_else(|| io::Error::other("GitHub attempt two was not correlated"))?;
+    assert_eq!(attempt_two.task_uid, github_candidates[1].2);
+    let attempt_three = store
+        .github_rerun_task(identity.user_id.as_str(), "example-org/caller", "900001", 2)
+        .await?
+        .ok_or_else(|| io::Error::other("GitHub attempt three was not correlated"))?;
+    assert_eq!(attempt_three.task_uid, github_candidates[0].2);
+    assert!(
+        store
+            .github_rerun_task(identity.user_id.as_str(), "example-org/caller", "900001", 3)
+            .await?
+            .is_none()
+    );
+    assert!(
+        store
+            .github_rerun_task(
+                "usr_abcdefabcdefabcdefabcdefabcdefab",
+                "example-org/caller",
+                "900001",
+                1,
+            )
+            .await?
+            .is_none(),
+        "a later attempt owned by another canonical user must remain invisible"
     );
     assert_eq!(reservation.record.task_uid, task_uid);
     Ok(())
@@ -1910,6 +3126,7 @@ struct TaskProjectionFixture<'a> {
     operation_runtime_name: &'a str,
     inert_manifest_digest: &'a str,
     active_manifest_digest: &'a str,
+    direct_task_evidence: Option<&'a serde_json::Value>,
 }
 
 async fn insert_task_projection_fixture(
@@ -1928,11 +3145,14 @@ async fn insert_task_projection_fixture(
           orchestration_version, orchestration_operation_id, candidate_digest, \
           service_envelope_digest, original_admission_decision, original_admission_deltas) \
          SELECT $1, $2, submitter_service, acting_user, acting_user_id, owner, owner_user_id, \
-                identity_binding_state, workflow, workflow_name, workflow_version, workflow_digest, \
+                identity_binding_state, workflow, \
+                CASE WHEN $6::jsonb IS NULL THEN workflow_name ELSE NULL END, \
+                CASE WHEN $6::jsonb IS NULL THEN workflow_version ELSE NULL END, \
+                CASE WHEN $6::jsonb IS NULL THEN workflow_digest ELSE NULL END, \
                 user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
                 authority_kind, user_envelope_snapshot, coding_agent_runtime, NULL, \
                 runtime_namespace, $3, runtime_ownership, 'submitted', runtime_spec, agent_command, \
-                execution_binding, direct_task_evidence, envelope_revision, orchestration_version, \
+                execution_binding, COALESCE($6::jsonb, direct_task_evidence), envelope_revision, orchestration_version, \
                 $4, candidate_digest, service_envelope_digest, original_admission_decision, \
                 original_admission_deltas \
          FROM task_submissions WHERE task_uid = $5",
@@ -1942,6 +3162,7 @@ async fn insert_task_projection_fixture(
     .bind(fixture.task_runtime_name)
     .bind(fixture.operation_id)
     .bind(fixture.source_task_uid)
+    .bind(fixture.direct_task_evidence)
     .execute(&mut *transaction)
     .await?
     .rows_affected();
@@ -1963,6 +3184,24 @@ async fn insert_task_projection_fixture(
     .await?;
     transaction.commit().await?;
     Ok(())
+}
+
+fn direct_task_evidence_fixture(
+    task_uid: Uuid,
+    attempt: u32,
+    run_id: &str,
+    envelope_revision: i64,
+    envelope_digest: &str,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let mut evidence: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/contracts/task/v2/fixtures/positive/task-binding-evidence.json"
+    ))?;
+    evidence["taskUid"] = json!(task_uid);
+    evidence["sourceProvenance"]["run"]["id"] = json!(run_id);
+    evidence["sourceProvenance"]["run"]["attempt"] = json!(attempt);
+    evidence["envelope"]["revision"] = json!(envelope_revision);
+    evidence["envelope"]["digest"] = json!(format!("steward:{envelope_digest}"));
+    Ok(evidence)
 }
 
 async fn operation(

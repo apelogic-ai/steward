@@ -173,7 +173,14 @@ class PlatformPreflightTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(defaults.returncode, 0, defaults.stderr)
-        self.assertIn("capabilityCatalog:\n      schemaVersion: steward.capability-catalog/v1\n      models: []\n      tools: []", defaults.stdout)
+        self.assertIn(
+            "capabilityCatalog:\n"
+            "      schemaVersion: steward.capability-catalog/v2\n"
+            "      models: []\n"
+            "      tools: []\n"
+            "      catalogs: []",
+            defaults.stdout,
+        )
         self.assertIn("kubeApiCidrs: []", defaults.stdout)
         self.assertIn("postgresCidrs: []", defaults.stdout)
 
@@ -182,6 +189,30 @@ class PlatformPreflightTests(unittest.TestCase):
         result = self.run_validate(self.input)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("input contains unsupported fields", result.stderr)
+
+    def test_rejects_steward_run_without_envelope_digest_capability(self) -> None:
+        self.input["stewardRunRelease"]["version"] = "0.6.0"
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stewardRunRelease.version must be 0.7.0 or later", result.stderr)
+
+    def test_rejects_incompatible_steward_run_handoff_schema(self) -> None:
+        self.input["stewardRunRelease"]["manifestSchemaVersion"] = 2
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stewardRunRelease.manifestSchemaVersion must equal 3", result.stderr)
+
+    def test_rejects_steward_run_repository_components_rejected_by_runtime(self) -> None:
+        for repository in ("./steward-run", "example-org/.."):
+            with self.subTest(repository=repository):
+                invalid = copy.deepcopy(self.input)
+                invalid["stewardRunRelease"]["workflowRepository"] = repository
+                result = self.run_validate(invalid)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "stewardRunRelease.workflowRepository must be owner/repository",
+                    result.stderr,
+                )
 
     def test_rejects_placeholder_digest(self) -> None:
         self.input["deploymentLock"]["artifacts"]["images.apiserver"]["target"]["digest"] = "sha256:" + "0" * 64
@@ -304,6 +335,10 @@ class PlatformPreflightTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             values = json.loads((output / "steward-values.json").read_text(encoding="utf-8"))
             self.assertEqual(values["config"]["apiserver"]["capabilityCatalog"], complete["capabilityCatalog"])
+            self.assertEqual(
+                values["config"]["apiserver"]["stewardRunRelease"],
+                complete["stewardRunRelease"],
+            )
             self.assertEqual(values["networkPolicy"]["kubeApiCidrs"], complete["networkPolicy"]["kubeApiCidrs"])
             self.assertEqual(values["networkPolicy"]["postgresCidrs"], complete["networkPolicy"]["postgresCidrs"])
             self.assertEqual(values["config"]["apiserver"]["inferenceEndpoint"], "https://inference.example.test/v1/responses")
@@ -412,6 +447,18 @@ class PlatformPreflightTests(unittest.TestCase):
         result = self.run_validate(self.input)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("model must be a non-empty string", result.stderr)
+
+        self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        self.input["capabilityCatalog"]["tools"][0]["accessClass"] = "unknown"
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("accessClass must be read, write, or destructive", result.stderr)
+
+        self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        self.input["capabilityCatalog"]["catalogs"][0]["available"] = "yes"
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("available must be a boolean", result.stderr)
 
     def test_rejects_missing_empty_or_malformed_required_network_policy_cidrs(self) -> None:
         del self.input["networkPolicy"]["kubeApiCidrs"]

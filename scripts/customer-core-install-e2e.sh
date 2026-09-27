@@ -194,6 +194,7 @@ values=(
 )
 complete_values=(
   "${values[@]}"
+  --set-json 'config.apiserver.stewardRunRelease={"manifestSchemaVersion":3,"version":"0.7.0","workflowRepository":"example-org/steward-run","workflowCommit":"3333333333333333333333333333333333333333","actionCommit":"4444444444444444444444444444444444444444","governedJobContainerImage":"registry.example.test/steward-run@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
   --set execution.enabled=true
   --set web.enabled=true
   --set browserAuth.enabled=true

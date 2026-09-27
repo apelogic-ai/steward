@@ -1,29 +1,40 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::serve::Listener;
+use reqwest::{Method, StatusCode as HttpStatusCode, Url};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use steward_adapter_claude_code::ClaudeCodeTaskExecutionAdapter;
 use steward_adapter_codex::CodexTaskExecutionAdapter;
 use steward_adapter_github_artifact::GitHubArtifactVerifier;
 use steward_adapter_github_source::{GitHubAppCredentials, GitHubSourceAdapter};
 use steward_adapter_jira::{JiraAdapter, JiraConfig};
+use steward_apiserver::operator_admin::{
+    OperatorAssignmentAction, OperatorAssignmentKind, OperatorAssignmentRequest,
+    OperatorAssignmentResponse, OperatorEffectiveAccessResponse, OperatorProvisionRequest,
+    OperatorProvisionResponse, OperatorRolesResponse, OperatorTemplateApplyRequest,
+    OperatorTemplateResponse, OperatorUserView, OperatorUsersResponse,
+};
 use steward_apiserver::task_auth::{TaskAuthDiscoveryConfig, task_auth_discovery_router};
 use steward_apiserver::{
     ConfiguredTaskIdentityResolver, ExecutionBindingCatalog,
     IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository, KubernetesTokenAuthenticator,
     KubernetesTokenReviewAudience, MAX_EXECUTION_BINDING_CATALOG_BYTES,
     MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, TaskApiConfig, agent_runs_ui, browser_admin,
-    browser_auth, connections, google_oidc, governed_connections, router, stable_runtime_bridge,
-    task_router, user_envelopes, workflows,
+    browser_auth, connections, google_oidc, governed_connections, operator_admin, router,
+    stable_runtime_bridge, task_router, user_envelopes, workflows,
 };
 use steward_store::{
-    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, PgStore,
-    TaskOrchestrationMode,
+    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
+    EnvelopeTemplatePublication, PgStore, TaskOrchestrationMode,
 };
 use steward_types::{CanonicalUserId, OrganizationId};
 use tokio::net::{TcpListener, TcpStream};
@@ -41,12 +52,65 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_PENDING_TLS_HANDSHAKES: usize = 64;
 
+const OPERATOR_EXIT_USAGE: u8 = 2;
+const OPERATOR_EXIT_NOT_FOUND: u8 = 3;
+const OPERATOR_EXIT_FORBIDDEN: u8 = 4;
+const OPERATOR_EXIT_CONFLICT: u8 = 5;
+const OPERATOR_EXIT_UNAVAILABLE: u8 = 6;
+
+#[derive(Debug)]
+enum OperatorCommandError {
+    Invalid(&'static str),
+    NotFound(&'static str),
+    Forbidden(&'static str),
+    Conflict(&'static str),
+    Unavailable(&'static str),
+}
+
+impl std::fmt::Display for OperatorCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message)
+            | Self::NotFound(message)
+            | Self::Forbidden(message)
+            | Self::Conflict(message)
+            | Self::Unavailable(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl Error for OperatorCommandError {}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> ExitCode {
+    let arguments = env::args().skip(1).collect::<Vec<_>>();
+    let operator_command = arguments.first().is_some_and(|command| {
+        matches!(
+            command.as_str(),
+            "bootstrap-rbac" | "rbac" | "templates" | "envelopes"
+        )
+    });
+    match run(arguments).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(if operator_command {
+                operator_exit_code(error.as_ref())
+            } else {
+                1
+            })
+        }
+    }
+}
+
+async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
-    let mut arguments = env::args().skip(1);
+    let mut arguments = arguments.into_iter();
     match arguments.next().as_deref() {
         Some("bootstrap-rbac") => return bootstrap_rbac(arguments.collect()).await,
+        Some("rbac") => return rbac_command(arguments.collect()).await,
+        Some("templates") => return templates_command(arguments.collect()).await,
+        Some("envelopes") => return envelopes_command(arguments.collect()).await,
         Some("validate-execution-bindings") => {
             return validate_execution_bindings(arguments.collect());
         }
@@ -67,6 +131,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let task_orchestration_mode = task_orchestration_mode()?;
     let store = PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?;
     store.migrate().await?;
+    ensure_default_llm_template(&store).await?;
     tokio::spawn(
         steward_apiserver::governed_connections::ConnectionOperationReconciler::new(store.clone())
             .run(),
@@ -141,13 +206,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         decisions.clone(),
         workflow_agents,
         task_orchestration_mode,
-    )?;
+    )
+    .await?;
     let app = router(
         runtimes.clone(),
         store.clone(),
-        authenticator,
+        authenticator.clone(),
         decisions.clone(),
     )
+    .merge(operator_admin::router(store.clone(), authenticator))
     .merge(task_auth_discovery_router(
         configured_task_identity.discovery,
     ))
@@ -168,6 +235,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn operator_exit_code(error: &(dyn Error + 'static)) -> u8 {
+    if let Some(error) = error.downcast_ref::<OperatorCommandError>() {
+        return match error {
+            OperatorCommandError::Invalid(_) => OPERATOR_EXIT_USAGE,
+            OperatorCommandError::NotFound(_) => OPERATOR_EXIT_NOT_FOUND,
+            OperatorCommandError::Forbidden(_) => OPERATOR_EXIT_FORBIDDEN,
+            OperatorCommandError::Conflict(_) => OPERATOR_EXIT_CONFLICT,
+            OperatorCommandError::Unavailable(_) => OPERATOR_EXIT_UNAVAILABLE,
+        };
+    }
+    if let Some(error) = error.downcast_ref::<steward_store::StoreError>() {
+        return match error {
+            steward_store::StoreError::Database(_) => OPERATOR_EXIT_UNAVAILABLE,
+            steward_store::StoreError::CanonicalIdentityInactive
+            | steward_store::StoreError::FederatedSubjectDisabled => OPERATOR_EXIT_FORBIDDEN,
+            steward_store::StoreError::CanonicalIdentityNotFound
+            | steward_store::StoreError::EnvelopeTemplateNotFound
+            | steward_store::StoreError::EnvelopeRequestNotFound
+            | steward_store::StoreError::WorkflowNotFound
+            | steward_store::StoreError::TaskNotFound
+            | steward_store::StoreError::ApprovalNotFound
+            | steward_store::StoreError::ConnectionOperationNotFound
+            | steward_store::StoreError::CumulativeEscalationNotFound => OPERATOR_EXIT_NOT_FOUND,
+            steward_store::StoreError::CanonicalIdentityConflict
+            | steward_store::StoreError::EnvelopeRequestDigestConflict
+            | steward_store::StoreError::EnvelopeRequestIdempotencyConflict
+            | steward_store::StoreError::EnvelopeRequestTemplateStale
+            | steward_store::StoreError::EnvelopeRevisionNotIncreasing
+            | steward_store::StoreError::TaskIdempotencyConflict
+            | steward_store::StoreError::WorkflowAlreadyExists => OPERATOR_EXIT_CONFLICT,
+            _ => OPERATOR_EXIT_USAGE,
+        };
+    }
+    OPERATOR_EXIT_USAGE
 }
 
 fn execution_enabled() -> Result<bool, io::Error> {
@@ -521,7 +624,41 @@ fn install_rustls_crypto_provider() -> Result<(), io::Error> {
     }
 }
 
-fn browser_application_router(
+fn parse_custom_envelope_safety_ceiling(
+    document: &str,
+    capability_catalog: &browser_admin::CapabilityCatalog,
+) -> Result<steward_admission::Envelope, io::Error> {
+    let ceiling = serde_json::from_str::<user_envelopes::BrowserEnvelope>(document)
+        .map(Into::<steward_admission::Envelope>::into)
+        .map_err(|_| io::Error::other("custom Envelope safety ceiling is invalid JSON"))?;
+    if ceiling.revision <= 0
+        || ceiling.spec.runtime_minutes_limit.is_none()
+        || steward_admission::validate_envelope(&ceiling).is_err()
+    {
+        return Err(io::Error::other(
+            "custom Envelope safety ceiling is structurally invalid or lacks a runtime-minutes limit",
+        ));
+    }
+    if ceiling
+        .spec
+        .llms
+        .iter()
+        .any(|model| !capability_catalog.models.contains(model))
+        || ceiling.spec.tools.iter().any(|tool| {
+            !capability_catalog
+                .tools
+                .iter()
+                .any(|available| available.grants(tool))
+        })
+    {
+        return Err(io::Error::other(
+            "custom Envelope safety ceiling selects an unavailable capability",
+        ));
+    }
+    Ok(ceiling)
+}
+
+async fn browser_application_router(
     store: PgStore,
     runtimes: KubeRuntimeRepository,
     decisions: JiraAdapter,
@@ -540,6 +677,29 @@ fn browser_application_router(
     .ok_or_else(|| io::Error::other("browser administration requires a capability catalog"))?;
     let capability_catalog = browser_admin::CapabilityCatalog::from_json(&capability_catalog_json)
         .map_err(io::Error::other)?;
+    let custom_envelope_safety_ceiling = configured_bounded_json(
+        "STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON",
+        "STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE",
+        user_envelopes::MAX_CUSTOM_ENVELOPE_SAFETY_CEILING_BYTES,
+        "custom Envelope safety ceiling",
+    )?
+    .map(|document| parse_custom_envelope_safety_ceiling(&document, &capability_catalog))
+    .transpose()?;
+    let steward_run_release = configured_bounded_json(
+        "STEWARD_RUN_RELEASE_JSON",
+        "STEWARD_RUN_RELEASE_FILE",
+        steward_apiserver::MAX_STEWARD_RUN_RELEASE_BYTES,
+        "steward-run release coordinates",
+    )?
+    .ok_or_else(|| {
+        io::Error::other(
+            "browser administration requires steward-run release coordinates from the installation BOM",
+        )
+    })
+    .and_then(|document| {
+        steward_apiserver::steward_run_release_from_installation_bom(&document)
+            .map_err(io::Error::other)
+    })?;
     let origin = required("STEWARD_BROWSER_ORIGIN")?;
     let config = browser_auth::GoogleOidcConfig::new(
         client_id,
@@ -562,17 +722,29 @@ fn browser_application_router(
     .map_err(io::Error::other)?;
     let connections =
         governed_connections_configuration(&origin, store.clone(), task_orchestration_mode)?;
+    workflows::ensure_sample_workflow(&store, &workflow_agents)
+        .await
+        .map_err(|error| io::Error::other(format!("sample Workflow bootstrap failed: {error}")))?;
     let app = browser_auth::browser_auth_router(auth.clone())
         .merge(user_envelopes::protected_router(
-            user_envelopes::PgEnvelopeRequestBroker::new(store.clone()),
+            user_envelopes::PgEnvelopeRequestBroker::new(
+                store.clone(),
+                capability_catalog.clone(),
+                custom_envelope_safety_ceiling.clone(),
+                steward_run_release,
+            ),
             auth.clone(),
         ))
-        .merge(agent_runs_ui::protected_router(store.clone(), auth.clone()))
-        .merge(browser_admin::protected_router(
+        .merge(steward_apiserver::preferences::protected_router(
+            store.clone(),
+            auth.clone(),
+        ))
+        .merge(browser_admin::protected_router_with_custom_envelope_safety(
             runtimes.clone(),
             store.clone(),
             decisions,
             capability_catalog,
+            custom_envelope_safety_ceiling,
             auth.clone(),
         ))
         .merge(browser_admin::protected_federated_subject_router(
@@ -585,8 +757,14 @@ fn browser_application_router(
             workflow_agents,
         ));
     let app = match connections {
-        Some(broker) => app.merge(connections::protected_router(broker, auth.clone())),
-        None => app,
+        Some(broker) => app
+            .merge(agent_runs_ui::protected_router_with_github_reruns(
+                store.clone(),
+                broker.clone(),
+                auth.clone(),
+            ))
+            .merge(connections::protected_router(broker, auth.clone())),
+        None => app.merge(agent_runs_ui::protected_router(store.clone(), auth.clone())),
     };
     let app = match stable_bridge_configuration()? {
         Some((service, verifier)) => app.merge(stable_runtime_bridge::protected_router(
@@ -759,6 +937,606 @@ async fn bootstrap_rbac(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[derive(Default)]
+struct OperatorOptions {
+    values: BTreeMap<String, String>,
+    json: bool,
+}
+
+fn operator_options(arguments: &[String]) -> Result<OperatorOptions, io::Error> {
+    let mut options = OperatorOptions::default();
+    let mut values = arguments.iter();
+    while let Some(flag) = values.next() {
+        if !flag.starts_with("--") {
+            return Err(io::Error::other(format!("unexpected argument {flag}")));
+        }
+        let value = values
+            .next()
+            .ok_or_else(|| io::Error::other(format!("{flag} requires a value")))?;
+        if flag == "--output" {
+            if value != "json" || options.json {
+                return Err(io::Error::other("--output accepts json exactly once"));
+            }
+            options.json = true;
+        } else if options
+            .values
+            .insert(flag.trim_start_matches("--").to_owned(), value.clone())
+            .is_some()
+        {
+            return Err(io::Error::other(format!("duplicate option {flag}")));
+        }
+    }
+    Ok(options)
+}
+
+fn required_option<'a>(options: &'a OperatorOptions, name: &str) -> Result<&'a str, io::Error> {
+    options
+        .values
+        .get(name)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| io::Error::other(format!("--{name} is required")))
+}
+
+struct OperatorApiClient {
+    base_url: Url,
+    bearer_token: String,
+    client: reqwest::Client,
+}
+
+impl OperatorApiClient {
+    fn from_environment() -> Result<Self, Box<dyn Error>> {
+        let base_url = Url::parse(&required("STEWARD_OPERATOR_API_URL")?)
+            .map_err(|_| OperatorCommandError::Invalid("STEWARD_OPERATOR_API_URL is invalid"))?;
+        if base_url.scheme() != "https"
+            || base_url.host_str().is_none()
+            || base_url.username() != ""
+            || base_url.password().is_some()
+            || base_url.path() != "/"
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+        {
+            return Err(OperatorCommandError::Invalid(
+                "STEWARD_OPERATOR_API_URL must be an HTTPS origin",
+            )
+            .into());
+        }
+        let token_file = required("STEWARD_OPERATOR_TOKEN_FILE")?;
+        let bearer_token = fs::read_to_string(token_file).map_err(|_| {
+            OperatorCommandError::Unavailable("operator bearer token file is unavailable")
+        })?;
+        let bearer_token = bearer_token.trim().to_owned();
+        if bearer_token.is_empty()
+            || bearer_token.len() > 16 * 1024
+            || bearer_token.chars().any(char::is_whitespace)
+        {
+            return Err(
+                OperatorCommandError::Invalid("operator bearer token file is invalid").into(),
+            );
+        }
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30));
+        if let Some(ca_file) = optional_unicode_environment("STEWARD_OPERATOR_CA_FILE")? {
+            let pem = fs::read(ca_file).map_err(|_| {
+                OperatorCommandError::Unavailable("operator CA file is unavailable")
+            })?;
+            let certificate = reqwest::Certificate::from_pem(&pem)
+                .map_err(|_| OperatorCommandError::Invalid("operator CA file is invalid"))?;
+            builder = builder.add_root_certificate(certificate);
+        }
+        let client = builder.build().map_err(|_| {
+            OperatorCommandError::Unavailable("operator HTTP client is unavailable")
+        })?;
+        Ok(Self {
+            base_url,
+            bearer_token,
+            client,
+        })
+    }
+
+    fn endpoint(&self, segments: &[&str]) -> Result<Url, Box<dyn Error>> {
+        let mut url = self.base_url.clone();
+        {
+            let mut path = url.path_segments_mut().map_err(|_| {
+                OperatorCommandError::Invalid("STEWARD_OPERATOR_API_URL cannot be a base URL")
+            })?;
+            path.pop_if_empty();
+            for segment in ["admin", "operator", "v1"]
+                .into_iter()
+                .chain(segments.iter().copied())
+            {
+                path.push(segment);
+            }
+        }
+        Ok(url)
+    }
+
+    async fn get<T: DeserializeOwned>(&self, segments: &[&str]) -> Result<T, Box<dyn Error>> {
+        self.send::<(), T>(Method::GET, segments, None).await
+    }
+
+    async fn send<B: Serialize + ?Sized, T: DeserializeOwned>(
+        &self,
+        method: Method,
+        segments: &[&str],
+        body: Option<&B>,
+    ) -> Result<T, Box<dyn Error>> {
+        let mut request = self
+            .client
+            .request(method, self.endpoint(segments)?)
+            .bearer_auth(&self.bearer_token);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| OperatorCommandError::Unavailable("operator API is unavailable"))?;
+        match response.status() {
+            status if status.is_success() => response.json().await.map_err(|_| {
+                OperatorCommandError::Unavailable("operator API returned an invalid response")
+                    .into()
+            }),
+            HttpStatusCode::BAD_REQUEST | HttpStatusCode::UNPROCESSABLE_ENTITY => {
+                Err(OperatorCommandError::Invalid("operator API rejected the request").into())
+            }
+            HttpStatusCode::UNAUTHORIZED | HttpStatusCode::FORBIDDEN => {
+                Err(OperatorCommandError::Forbidden("operator authorization failed").into())
+            }
+            HttpStatusCode::NOT_FOUND => {
+                Err(OperatorCommandError::NotFound("operator resource not found").into())
+            }
+            HttpStatusCode::CONFLICT => {
+                Err(OperatorCommandError::Conflict("operator request conflicts").into())
+            }
+            _ => Err(OperatorCommandError::Unavailable("operator API is unavailable").into()),
+        }
+    }
+}
+
+async fn rbac_command(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let Some(command) = arguments.first().map(String::as_str) else {
+        return Err(io::Error::other(rbac_usage()).into());
+    };
+    let client = OperatorApiClient::from_environment()?;
+    match command {
+        "users" => rbac_users(&client, &arguments[1..]).await,
+        "roles" => rbac_roles(&client, &arguments[1..]).await,
+        "grant" => rbac_mutation(&client, OperatorAssignmentAction::Grant, &arguments[1..]).await,
+        "revoke" => rbac_mutation(&client, OperatorAssignmentAction::Revoke, &arguments[1..]).await,
+        "effective-access" => rbac_effective_access(&client, &arguments[1..]).await,
+        _ => Err(io::Error::other(rbac_usage()).into()),
+    }
+}
+
+async fn rbac_users(
+    client: &OperatorApiClient,
+    arguments: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let Some(command) = arguments.first().map(String::as_str) else {
+        return Err(io::Error::other(rbac_usage()).into());
+    };
+    let options = operator_options(&arguments[1..])?;
+    match command {
+        "list" if options.values.is_empty() => {
+            let users = client.get::<OperatorUsersResponse>(&["users"]).await?.users;
+            if options.json {
+                let rows = users
+                    .iter()
+                    .map(|user| {
+                        serde_json::json!({
+                            "userId": user.user_id,
+                            "displayEmail": user.display_email,
+                            "organizationId": user.organization_id,
+                            "state": user.state,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!("{}", serde_json::to_string(&rows)?);
+            } else {
+                for user in users {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        user.user_id, user.display_email, user.organization_id, user.state
+                    );
+                }
+            }
+            Ok(())
+        }
+        "show" => {
+            let user_id = CanonicalUserId::parse(required_option(&options, "user-id")?.to_owned())
+                .map_err(io::Error::other)?;
+            if options.values.len() != 1 {
+                return Err(io::Error::other(rbac_usage()).into());
+            }
+            let user = client
+                .get::<OperatorUserView>(&["users", user_id.as_str()])
+                .await?;
+            if options.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "userId": user.user_id,
+                        "displayEmail": user.display_email,
+                        "organizationId": user.organization_id,
+                        "state": user.state,
+                    })
+                );
+            } else {
+                println!("user id: {}", user.user_id);
+                println!("display email: {}", user.display_email);
+                println!("organization id: {}", user.organization_id);
+                println!("state: {}", user.state);
+            }
+            Ok(())
+        }
+        _ => Err(io::Error::other(rbac_usage()).into()),
+    }
+}
+
+async fn rbac_roles(
+    client: &OperatorApiClient,
+    arguments: &[String],
+) -> Result<(), Box<dyn Error>> {
+    if arguments.first().map(String::as_str) != Some("list") {
+        return Err(io::Error::other(rbac_usage()).into());
+    }
+    let options = operator_options(&arguments[1..])?;
+    if !options.values.is_empty() {
+        return Err(io::Error::other(rbac_usage()).into());
+    }
+    let roles = client
+        .get::<OperatorRolesResponse>(&["roles"])
+        .await?
+        .member_roles;
+    if options.json {
+        println!("{}", serde_json::to_string(&roles)?);
+    } else {
+        for role in roles {
+            println!("{role}");
+        }
+    }
+    Ok(())
+}
+
+async fn rbac_mutation(
+    client: &OperatorApiClient,
+    action: OperatorAssignmentAction,
+    arguments: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let Some(kind) = arguments.first().map(String::as_str) else {
+        return Err(io::Error::other(rbac_usage()).into());
+    };
+    let options = operator_options(&arguments[1..])?;
+    let user_id = CanonicalUserId::parse(required_option(&options, "user-id")?.to_owned())
+        .map_err(io::Error::other)?;
+    let (assignment_kind, member_role) = match kind {
+        "admin" if options.values.len() == 1 => (OperatorAssignmentKind::Administrator, None),
+        "member-role" if options.values.len() == 2 => (
+            OperatorAssignmentKind::MemberRole,
+            Some(required_option(&options, "role")?.to_owned()),
+        ),
+        _ => return Err(io::Error::other(rbac_usage()).into()),
+    };
+    let response = client
+        .send::<_, OperatorAssignmentResponse>(
+            Method::POST,
+            &["rbac"],
+            Some(&OperatorAssignmentRequest {
+                user_id: user_id.as_str().to_owned(),
+                kind: assignment_kind,
+                member_role: member_role.clone(),
+                action,
+            }),
+        )
+        .await?;
+    if options.json {
+        println!("{}", serde_json::to_string(&response)?);
+    } else {
+        println!("RBAC mutation recorded for {}", user_id.as_str());
+    }
+    Ok(())
+}
+
+async fn rbac_effective_access(
+    client: &OperatorApiClient,
+    arguments: &[String],
+) -> Result<(), Box<dyn Error>> {
+    let options = operator_options(arguments)?;
+    let user_id = CanonicalUserId::parse(required_option(&options, "user-id")?.to_owned())
+        .map_err(io::Error::other)?;
+    if options.values.len() != 1 {
+        return Err(io::Error::other(rbac_usage()).into());
+    }
+    let response = client
+        .get::<OperatorEffectiveAccessResponse>(&["users", user_id.as_str(), "effective-access"])
+        .await?;
+    if options.json {
+        println!("{}", serde_json::to_string(&response)?);
+    } else {
+        print!("{}", format_effective_access_human(&response));
+    }
+    Ok(())
+}
+
+fn format_effective_access_human(response: &OperatorEffectiveAccessResponse) -> String {
+    let mut output = format!(
+        "user id: {}\ndisplay email: {}\nadministrator: {}\nmember roles: {}\neligible templates: {}\n",
+        response.user.user_id,
+        response.user.display_email,
+        response.administrator,
+        response.member_roles.join(", "),
+        response.eligible_templates.len(),
+    );
+    for template in &response.eligible_templates {
+        output.push_str(&format!(
+            "  {}@{}\n",
+            template.template_id, template.revision
+        ));
+    }
+    output.push_str(&format!(
+        "active Envelopes: {}\n",
+        response.active_envelopes.len()
+    ));
+    for envelope in &response.active_envelopes {
+        output.push_str(&format!(
+            "  {}\t{}\t{}@{}\n",
+            envelope.envelope_instance_id,
+            envelope.envelope_digest,
+            envelope.template_id.as_deref().unwrap_or("custom"),
+            envelope
+                .template_revision
+                .map_or_else(|| "-".to_owned(), |revision| revision.to_string())
+        ));
+    }
+    output
+}
+
+fn rbac_usage() -> &'static str {
+    "usage: steward rbac users list [--output json] | users show --user-id <id> [--output json] | roles list [--output json] | grant|revoke admin --user-id <id> [--output json] | grant|revoke member-role --user-id <id> --role <role> [--output json] | effective-access --user-id <id> [--output json]"
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TemplateDocument {
+    template_id: String,
+    display_name: String,
+    member_roles: Vec<String>,
+    ceiling: user_envelopes::BrowserEnvelope,
+    auto_provision_threshold: Option<user_envelopes::BrowserEnvelope>,
+}
+
+fn parse_template_document(bytes: &[u8]) -> Result<TemplateDocument, io::Error> {
+    const MAX_TEMPLATE_DOCUMENT_BYTES: usize = 256 * 1024;
+    if bytes.len() > MAX_TEMPLATE_DOCUMENT_BYTES {
+        return Err(io::Error::other("template document exceeds 256 KiB"));
+    }
+    let document = std::str::from_utf8(bytes)
+        .map_err(|_| io::Error::other("template document must be UTF-8"))?;
+    let options = serde_saphyr::options! {
+        budget: serde_saphyr::budget! {
+            max_events: 10_000,
+            max_aliases: 0,
+            max_anchors: 0,
+            max_depth: 32,
+            max_inclusion_depth: 0,
+            max_documents: 1,
+            max_nodes: 5_000,
+            max_total_scalar_bytes: MAX_TEMPLATE_DOCUMENT_BYTES,
+            max_total_comment_bytes: 32 * 1024,
+            max_merge_keys: 0,
+        },
+        duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
+        merge_keys: serde_saphyr::MergeKeyPolicy::Error,
+        alias_limits: serde_saphyr::alias_limits! {
+            max_total_replayed_events: 0,
+            max_replay_stack_depth: 0,
+            max_alias_expansions_per_anchor: 0,
+        },
+        strict_booleans: true,
+        require_indent: serde_saphyr::RequireIndent::Even,
+    };
+    serde_saphyr::from_str_with_options(document, options)
+        .map_err(|_| io::Error::other("template document must be valid strict YAML or JSON"))
+}
+
+async fn ensure_default_llm_template(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let Some(document) = optional_unicode_environment("STEWARD_DEFAULT_LLM_TEMPLATE_JSON")? else {
+        return Ok(());
+    };
+    let mut document: TemplateDocument = serde_json::from_str(&document)?;
+    document.member_roles.sort();
+    if document
+        .member_roles
+        .windows(2)
+        .any(|roles| roles[0] == roles[1])
+    {
+        return Err(io::Error::other("template member roles must be unique").into());
+    }
+    let ceiling: steward_admission::Envelope = document.ceiling.into();
+    let capability_catalog_json = configured_bounded_json(
+        "STEWARD_CAPABILITY_CATALOG_JSON",
+        "STEWARD_CAPABILITY_CATALOG_FILE",
+        browser_admin::MAX_CAPABILITY_CATALOG_BYTES,
+        "capability catalog",
+    )?
+    .ok_or_else(|| {
+        io::Error::other("default LLM smoke template requires the capability catalog")
+    })?;
+    let capability_catalog = browser_admin::CapabilityCatalog::from_json(&capability_catalog_json)
+        .map_err(io::Error::other)?;
+    if !ceiling.spec.tools.is_empty()
+        || ceiling.spec.llms.len() != 1
+        || !capability_catalog.models.contains(&ceiling.spec.llms[0])
+    {
+        return Err(io::Error::other(
+            "default LLM smoke template requires one exact available model and empty tools",
+        )
+        .into());
+    }
+    if document.auto_provision_threshold.is_some() {
+        return Err(io::Error::other(
+            "default LLM smoke template threshold is fixed to its ceiling",
+        )
+        .into());
+    }
+    if let Some(existing) = store
+        .envelope_template_revision(&document.template_id, ceiling.revision)
+        .await?
+    {
+        if existing.display_name != document.display_name
+            || existing.member_roles != document.member_roles
+            || existing.ceiling != ceiling
+            || existing.auto_provision_threshold.as_ref() != Some(&ceiling)
+        {
+            return Err(io::Error::other(
+                "default LLM smoke template revision exists with different content",
+            )
+            .into());
+        }
+        return Ok(());
+    }
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &document.template_id,
+            display_name: &document.display_name,
+            member_roles: &document.member_roles,
+            ceiling: &ceiling,
+            auto_provision_threshold: Some(&ceiling),
+            authored_by: "system:install",
+        })
+        .await?;
+    Ok(())
+}
+
+async fn templates_command(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
+    if arguments.first().map(String::as_str) != Some("apply") {
+        return Err(io::Error::other(
+            "usage: steward templates apply --file <path> [--output json]",
+        )
+        .into());
+    }
+    let options = operator_options(&arguments[1..])?;
+    if options.values.len() != 1 {
+        return Err(io::Error::other(
+            "usage: steward templates apply --file <path> [--output json]",
+        )
+        .into());
+    }
+    let path = required_option(&options, "file")?;
+    let mut document = parse_template_document(&fs::read(path)?)?;
+    document.member_roles.sort();
+    if document
+        .member_roles
+        .windows(2)
+        .any(|roles| roles[0] == roles[1])
+    {
+        return Err(io::Error::other("template member roles must be unique").into());
+    }
+    let revision = document.ceiling.revision;
+    let client = OperatorApiClient::from_environment()?;
+    let response = client
+        .send::<_, OperatorTemplateResponse>(
+            Method::PUT,
+            &[
+                "templates",
+                &document.template_id,
+                "revisions",
+                &revision.to_string(),
+            ],
+            Some(&OperatorTemplateApplyRequest {
+                display_name: document.display_name,
+                member_roles: document.member_roles,
+                ceiling: document.ceiling,
+                auto_provision_threshold: document.auto_provision_threshold,
+            }),
+        )
+        .await?;
+    if options.json {
+        println!("{}", serde_json::to_string(&response)?);
+    } else {
+        println!(
+            "template {}@{} applied",
+            response.template_id, response.ceiling.revision
+        );
+    }
+    Ok(())
+}
+
+async fn envelopes_command(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
+    if arguments.first().map(String::as_str) != Some("provision") {
+        return Err(io::Error::other(
+            "usage: steward envelopes provision --user-id <id> --template-id <id> [--template-revision <revision>] [--output json]",
+        )
+        .into());
+    }
+    let options = operator_options(&arguments[1..])?;
+    if !matches!(options.values.len(), 2 | 3) {
+        return Err(io::Error::other(
+            "usage: steward envelopes provision --user-id <id> --template-id <id> [--template-revision <revision>] [--output json]",
+        )
+        .into());
+    }
+    let user_id = CanonicalUserId::parse(required_option(&options, "user-id")?.to_owned())
+        .map_err(io::Error::other)?;
+    let template_id = required_option(&options, "template-id")?;
+    if !browser_admin::valid_template_identifier(template_id) {
+        return Err(io::Error::other("--template-id must be a valid catalog identifier").into());
+    }
+    let client = OperatorApiClient::from_environment()?;
+    let template = if let Some(revision) = options.values.get("template-revision") {
+        let revision = revision
+            .parse::<i64>()
+            .map_err(|_| io::Error::other("--template-revision must be a positive integer"))?;
+        if revision <= 0 {
+            return Err(io::Error::other("--template-revision must be a positive integer").into());
+        }
+        client
+            .get::<OperatorTemplateResponse>(&[
+                "templates",
+                template_id,
+                "revisions",
+                &revision.to_string(),
+            ])
+            .await?
+    } else {
+        client
+            .get::<OperatorTemplateResponse>(&["templates", template_id])
+            .await?
+    };
+    let idempotency_key = format!(
+        "cli:{}:{}:{}",
+        user_id.as_str(),
+        template.template_id,
+        template.ceiling.revision,
+    );
+    let provisioned = client
+        .send::<_, OperatorProvisionResponse>(
+            Method::POST,
+            &["envelopes", "provision"],
+            Some(&OperatorProvisionRequest {
+                owner_user_id: user_id.as_str().to_owned(),
+                template_id: template.template_id,
+                template_revision: template.ceiling.revision,
+                requested_envelope: template.ceiling,
+                idempotency_key,
+            }),
+        )
+        .await?;
+    if options.json {
+        println!("{}", serde_json::to_string(&provisioned)?);
+    } else {
+        println!(
+            "Envelope {} provisioned for {}",
+            provisioned.envelope_instance_id,
+            user_id.as_str()
+        );
+    }
+    Ok(())
+}
+
 fn bootstrap_rbac_arguments(
     arguments: Vec<String>,
 ) -> Result<(CanonicalUserId, BrowserRbacAssignment, String), io::Error> {
@@ -922,8 +1700,9 @@ mod tests {
     use std::time::Duration;
 
     use axum::serve::Listener;
-    use steward_store::BrowserRbacAssignment;
-    use tokio::io::AsyncReadExt;
+    use reqwest::{Method, Url};
+    use steward_store::{BrowserRbacAssignment, StoreError};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::timeout;
     use tokio_rustls::TlsAcceptor;
@@ -931,12 +1710,219 @@ mod tests {
     use tokio_rustls::rustls::server::ResolvesServerCertUsingSni;
 
     use super::{
-        CodexTaskExecutionAdapter, KubernetesTokenReviewAudience, TaskApiConfig, TlsListener,
-        bootstrap_rbac_arguments, decode_tls_material, github_source_adapter_from_values,
-        install_rustls_crypto_provider, kubernetes_token_review_audience,
-        parse_execution_bindings_mode, stable_bridge_configuration_from_values,
-        validate_execution_bindings, with_claude_code_execution_adapter,
+        CodexTaskExecutionAdapter, KubernetesTokenReviewAudience, OPERATOR_EXIT_CONFLICT,
+        OPERATOR_EXIT_FORBIDDEN, OPERATOR_EXIT_NOT_FOUND, OPERATOR_EXIT_UNAVAILABLE,
+        OPERATOR_EXIT_USAGE, OperatorCommandError, TaskApiConfig, TlsListener,
+        bootstrap_rbac_arguments, decode_tls_material, format_effective_access_human,
+        github_source_adapter_from_values, install_rustls_crypto_provider,
+        kubernetes_token_review_audience, operator_exit_code, parse_custom_envelope_safety_ceiling,
+        parse_execution_bindings_mode, parse_template_document,
+        stable_bridge_configuration_from_values, validate_execution_bindings,
+        with_claude_code_execution_adapter,
     };
+
+    #[test]
+    fn effective_access_human_output_names_eligible_templates() {
+        let output = format_effective_access_human(
+            &steward_apiserver::operator_admin::OperatorEffectiveAccessResponse {
+                user: steward_apiserver::operator_admin::OperatorUserView {
+                    user_id: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+                    display_email: "alice@example.com".to_owned(),
+                    organization_id: "example-org".to_owned(),
+                    state: "active".to_owned(),
+                },
+                administrator: false,
+                member_roles: vec!["engineer".to_owned()],
+                eligible_templates: vec![
+                    steward_apiserver::operator_admin::OperatorEligibleTemplateView {
+                        template_id: "default".to_owned(),
+                        revision: 3,
+                    },
+                ],
+                active_envelopes: Vec::new(),
+            },
+        );
+
+        assert!(output.contains("  default@3\n"));
+    }
+
+    #[test]
+    fn custom_envelope_safety_ceiling_requires_bounded_runtime_minutes() {
+        let catalog = steward_apiserver::browser_admin::CapabilityCatalog {
+            schema_version: "steward.capability-catalog/v2".to_owned(),
+            models: vec![steward_types::ModelRef {
+                provider: "provider-a".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            catalogs: Vec::new(),
+        };
+        let unbounded = r#"{"revision":1,"spec":{"llms":[{"provider":"provider-a","model":"model-a"}],"tools":[],"budget":{"monthlyLimit":"1.00","currency":"USD"},"ttl":"1h","runner":{}}}"#;
+        assert!(parse_custom_envelope_safety_ceiling(unbounded, &catalog).is_err());
+    }
+
+    #[tokio::test]
+    async fn operator_http_client_sends_the_bearer_to_the_versioned_path_and_maps_statuses()
+    -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|error| format!("bind operator test server: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read operator test address: {error}"))?;
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in [
+                ("200 OK", r#"{"ok":true}"#),
+                ("409 Conflict", r#"{"error":"conflict"}"#),
+            ] {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .map_err(|error| format!("accept operator request: {error}"))?;
+                let mut bytes = Vec::with_capacity(2048);
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        if bytes.len() >= 8192 {
+                            return Err("operator request headers exceed 8192 bytes".to_owned());
+                        }
+                        let mut chunk = [0_u8; 1024];
+                        let count = stream
+                            .read(&mut chunk)
+                            .await
+                            .map_err(|error| format!("read operator request: {error}"))?;
+                        if count == 0 {
+                            return Err("operator request ended before its headers".to_owned());
+                        }
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    Ok::<_, String>(())
+                })
+                .await
+                .map_err(|_| "operator request read timed out".to_owned())??;
+                requests.push(String::from_utf8_lossy(&bytes).into_owned());
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .map_err(|error| format!("write operator response: {error}"))?;
+            }
+            Ok::<_, String>(requests)
+        });
+        let client = super::OperatorApiClient {
+            base_url: Url::parse(&format!("http://{address}/"))
+                .map_err(|error| format!("build operator test URL: {error}"))?,
+            bearer_token: "test-operator-token".to_owned(),
+            client: reqwest::Client::builder()
+                .build()
+                .map_err(|error| format!("build operator test client: {error}"))?,
+        };
+        let response = client
+            .get::<serde_json::Value>(&["users", "usr_0123456789abcdef0123456789abcdef"])
+            .await
+            .map_err(|error| format!("operator client GET failed: {error}"))?;
+        assert_eq!(response["ok"], true);
+        let error = match client
+            .send::<(), serde_json::Value>(Method::POST, &["rbac"], None)
+            .await
+        {
+            Ok(_) => return Err("409 was not surfaced as an operator conflict".to_owned()),
+            Err(error) => error,
+        };
+        assert_eq!(
+            super::operator_exit_code(error.as_ref()),
+            OPERATOR_EXIT_CONFLICT
+        );
+        let requests = server
+            .await
+            .map_err(|error| format!("join operator test server: {error}"))??;
+        assert!(requests[0].starts_with(
+            "GET /admin/operator/v1/users/usr_0123456789abcdef0123456789abcdef HTTP/1.1"
+        ));
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.contains("authorization: Bearer test-operator-token"))
+        );
+        assert!(requests[1].starts_with("POST /admin/operator/v1/rbac HTTP/1.1"));
+        Ok(())
+    }
+
+    #[test]
+    fn operator_commands_publish_stable_exit_code_classes() {
+        assert_eq!(
+            operator_exit_code(&OperatorCommandError::Invalid("invalid")),
+            OPERATOR_EXIT_USAGE
+        );
+        assert_eq!(
+            operator_exit_code(&OperatorCommandError::NotFound("missing")),
+            OPERATOR_EXIT_NOT_FOUND
+        );
+        assert_eq!(
+            operator_exit_code(&OperatorCommandError::Forbidden("forbidden")),
+            OPERATOR_EXIT_FORBIDDEN
+        );
+        assert_eq!(
+            operator_exit_code(&OperatorCommandError::Conflict("conflict")),
+            OPERATOR_EXIT_CONFLICT
+        );
+        assert_eq!(
+            operator_exit_code(&OperatorCommandError::Unavailable("unavailable")),
+            OPERATOR_EXIT_UNAVAILABLE
+        );
+        assert_eq!(
+            operator_exit_code(&StoreError::CanonicalIdentityInactive),
+            OPERATOR_EXIT_FORBIDDEN
+        );
+        assert_eq!(
+            operator_exit_code(&StoreError::EnvelopeRequestDigestConflict),
+            OPERATOR_EXIT_CONFLICT
+        );
+        assert_eq!(
+            operator_exit_code(&StoreError::InvalidEnvelopeTemplate),
+            OPERATOR_EXIT_USAGE
+        );
+        assert_eq!(
+            operator_exit_code(&StoreError::Database("unavailable".to_owned())),
+            OPERATOR_EXIT_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn template_apply_accepts_strict_yaml_and_rejects_duplicate_keys() -> Result<(), String> {
+        let document = parse_template_document(
+            br#"templateId: default
+displayName: Default smoke
+memberRoles:
+  - engineer
+ceiling:
+  revision: 1
+  spec:
+    llms:
+      - provider: provider-a
+        model: model-a
+    tools: []
+    budget:
+      monthlyLimit: "1.00"
+      currency: USD
+    ttl: 10m
+autoProvisionThreshold: null
+"#,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(document.template_id, "default");
+        assert_eq!(document.member_roles, ["engineer"]);
+        assert!(
+            parse_template_document(
+                b"templateId: default\ntemplateId: duplicate\ndisplayName: Default\nmemberRoles: []\n"
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn released_validator_accepts_the_documented_catalog_example() -> Result<(), String> {

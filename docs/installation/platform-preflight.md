@@ -1,8 +1,8 @@
 # Platform preflight bundle
 
-Status: **Supported for Steward v0.2.6**
+Status: **Supported for Steward v0.3.0**
 
-The release asset `steward-platform-preflight-0.2.6.tar.gz` contains a
+The release asset `steward-platform-preflight-0.3.0.tar.gz` contains a
 dependency-free Python validator and generator, its input schema, and neutral
 examples. It converts one reviewed non-secret input into deterministic Steward
 Helm values, a Flux-compatible values `ConfigMap`, machine diagnostics, and a
@@ -11,12 +11,13 @@ human summary.
 The input names every namespace, immutable image digest, public hostname,
 Gateway parent, certificate DNS name, database CA reference, provider profile,
 ARC controller service account, external Secret, template capability catalog,
+the verified steward-run release projection selected by the installation BOM,
 and NetworkPolicy API/PostgreSQL destinations. Secret bodies are neither
 accepted nor emitted. Existing infrastructure remains operator-owned.
 
 ```sh
-tar -xzf steward-platform-preflight-0.2.6.tar.gz
-tar -xzf steward-runtime-providers-0.2.6.tar.gz
+tar -xzf steward-platform-preflight-0.3.0.tar.gz
+tar -xzf steward-runtime-providers-0.3.0.tar.gz
 cd platform-preflight/v1
 ./steward-platform-preflight generate \
   --input examples/governed-complete.json \
@@ -45,7 +46,8 @@ the explicitly supplied endpoints.
 is the copy-ready governed input. It includes a non-empty capability catalog,
 one immutable execution binding, exact Codex Responses endpoint, named MCP-GW
 authority contract, backend-TLS CA ConfigMap, all required namespaces,
-browser-auth egress, Kubernetes API and PostgreSQL CIDRs, and every immutable
+browser-auth egress, Kubernetes API and PostgreSQL CIDRs, the schema-3
+steward-run workflow/action/image projection, and every immutable
 component/runtime coordinate. The
 compact and separated examples exercise the same contract with different
 namespace layouts.

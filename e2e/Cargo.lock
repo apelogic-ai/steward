@@ -3758,6 +3758,7 @@ dependencies = [
  "steward-types",
  "tokio",
  "tokio-rustls",
+ "tower",
 ]
 
 [[package]]
@@ -3773,6 +3774,7 @@ name = "steward-store"
 version = "0.0.0"
 dependencies = [
  "serde_json",
+ "sha2",
  "sqlx",
  "steward-admission",
  "steward-types",

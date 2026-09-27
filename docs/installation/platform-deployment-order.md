@@ -2,8 +2,9 @@
 
 Status: **Reference**
 
-Applies to Steward v0.2.6 and its User-Envelope-only Task authority model. An
-installation still on v0.1.23 follows [upgrade to v0.2.6](upgrade-v0.2.0.md)
+Applies to Steward v0.3.0 and its User-Envelope-only Task authority model. An
+installation still on v0.1.23 first follows the [v0.2 upgrade](upgrade-v0.2.0.md),
+and an installation on v0.2.6 follows the [v0.3 upgrade](upgrade-v0.3.0.md)
 before using this page.
 
 Steward, `steward-run`, and `github-oidc-exchange` are separately released
@@ -13,9 +14,10 @@ single guide owns: the order in which a customer installs them, the reason the
 order is what it is, and the Steward-side configuration that joins them.
 
 Authority is limited to that subject. Each product's own installation guide
-remains authoritative for its own steps, and
-[`docs/contracts/m1/v1/**`](../contracts/m1/v1/README.md) remains the normative
-wire contract. Where this page and a product guide disagree about that
+remains authoritative for its own steps, and the
+[Task v2 contract](../contracts/task/v2/README.md) plus Steward's
+[product compatibility](governed-platform-compatibility.md) remain the
+normative wire and client-capability contracts. Where this page and a product guide disagree about that
 product's procedure, the product guide controls.
 
 ## The products and their boundaries
@@ -23,7 +25,7 @@ product's procedure, the product guide controls.
 | Product | Installs | Its guide | Authoritative for |
 |---|---|---|---|
 | `github-oidc-exchange` | Kubernetes Identity service issuing the task token | [quickstart](https://github.com/apelogic-ai/github-oidc-exchange/blob/main/docs/quickstart.md), [installation](https://github.com/apelogic-ai/github-oidc-exchange/blob/main/docs/installation.md) | Issuer, policy, keyring, JWKS, exchange routes |
-| `steward-run` | GitHub Action, reusable workflow, ARC runner scale set | [installation](https://github.com/apelogic-ai/steward-run/blob/main/docs/installation-v0.4.2.md) | Runner registration, workflow pinning, action inputs |
+| `steward-run` | GitHub Action, reusable workflow, ARC runner scale set | [installation](https://github.com/apelogic-ai/steward-run/blob/main/docs/installation.md) | Runner registration, workflow pinning, action inputs |
 | Steward | Control plane: API, admission webhook, controller | [installation guide](installation-guide.md) | Token acceptance, Envelope authority, approval, execution |
 | MCP-GW, LiteLLM, OpenShell, SPIRE | Customer-operated dependencies | Their own products | Their own deployment and credentials |
 
@@ -72,20 +74,21 @@ presentation layer.
 
 ## Step 1: record the version set
 
-No product publishes a combined compatibility matrix. Before installing, record
-one version per row from the release handoffs actually being installed, and
-check each against Steward's
-[tested versions and integration boundaries](installation-guide.md#tested-versions-and-integration-boundaries).
-A component outside that table is untested here, not merely undocumented.
+Release/integration packaging publishes the signed installation BOM after all
+independently versioned artifacts exist. Use that BOM as the exact version set;
+verify its coordinates against each product handoff and check its declared
+contracts against Steward's
+[product compatibility](governed-platform-compatibility.md). Do not reconstruct
+the installation set from source-repository pins.
 
-| Component | Version in this deployment | Source of truth |
+| Component | Version in this deployment | Verification input |
 |---|---|---|
 | Steward chart and images | | Steward release handoff |
 | Steward deployment lock and platform preflight bundle | | Same Steward release handoff |
 | `steward-run` runner image, chart, workflow commit | | `steward-run` release manifest |
 | Identity application and chart | | Identity release handoff |
 | Kubernetes | | Cluster; must satisfy every chart's `kubeVersion` simultaneously |
-| PostgreSQL, MCP-GW, LiteLLM, OpenShell, agent-sandbox | | Customer deployment |
+| PostgreSQL, MCP-GW, LiteLLM, OpenShell, agent-sandbox | | Installation BOM and dependency handoffs |
 
 The Kubernetes version must satisfy the **intersection** of the three charts'
 declared ranges, which is narrower than Steward's own range alone.
@@ -212,15 +215,16 @@ to enable the browser path, have the person sign in once, record the audited
 initial RBAC grant, verify the deployment capability catalog, author versioned
 Envelope templates, and complete one User Envelope request and approval.
 
-Two outputs of this step are inputs to Step 6:
+Two identity outputs of this step are inputs to Step 6:
 
 - the opaque `usr_<...>` canonical user ID the person reads from `/settings`;
 - the verified email bound to that canonical identity.
 
-Finish this step when the person has exactly one active provisioned User
-Envelope with the intended revision and authority. The capability catalog
-advertises models and tools but grants no authority, and an empty catalog
-cannot narrow an Envelope that already admits a Task.
+Finish this step when the person has an active provisioned User Envelope with
+the intended revision and authority. If several are active, also record the
+exact public `envelopeDigest` that the acceptance Task will select. The
+capability catalog advertises models and tools but grants no authority, and an
+empty catalog cannot narrow an Envelope that already admits a Task.
 
 ## Step 6: enroll v2 identity or associate a v3 subject
 
@@ -265,10 +269,11 @@ may seed only that same verified issuer/subject association.
 Submit one direct Git package invocation while Steward remains in core mode.
 The caller references the exact package source through a checked-in invocation
 manifest. Steward must authenticate the caller, admit the Task against the
-caller's unique active provisioned User Envelope, and record the exact User
-Envelope evidence without creating a runtime. A published Workflow revision
-remains an optional curation layer over the same immutable package, not a
-registration prerequisite.
+selected active provisioned User Envelope, and record the exact User Envelope
+evidence without creating a runtime. Supply `envelopeDigest` when several are
+active; omission is supported only when exactly one is active. A published
+Workflow revision remains an optional curation layer over the same immutable
+package, not a registration prerequisite.
 
 Repeat with a wrong audience, an untrusted issuer or CA, an unauthorized
 repository, ref, and actor, and a canonical user with no active Envelope. Each

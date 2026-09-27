@@ -3,12 +3,13 @@
 import { useEffect, useState } from "react";
 
 import { PageHeader } from "@/components/workspace-ui";
+import type { BrowserExecutionLogResponse } from "@/api-client";
 import type { ExecutionLogStream } from "@/data/execution-log";
 import { authStartPath } from "@/session/auth-redirect";
 
 type ExecutionLogState =
   | { status: "loading" }
-  | { status: "ready"; text: string }
+  | { status: "ready"; complete: boolean; text: string }
   | { status: "unavailable" }
   | { status: "error" };
 
@@ -28,15 +29,18 @@ export function RunLogView({
     let active = true;
     const controller = new AbortController();
     const apiPrefix = admin ? "/admin/api/v1/all-runs" : "/app/api/v1/runs";
+    let offset = 0;
+    let content = "";
+    let timer: ReturnType<typeof setTimeout> | undefined;
 
     async function load() {
       try {
         const response = await fetch(
-          `${apiPrefix}/${encodeURIComponent(taskUid)}/logs/${stream}`,
+          `${apiPrefix}/${encodeURIComponent(taskUid)}/logs/${stream}?after=${offset}`,
           {
             cache: "no-store",
             credentials: "same-origin",
-            headers: { accept: "text/plain" },
+            headers: { accept: "application/json" },
             signal: controller.signal,
           },
         );
@@ -53,8 +57,13 @@ export function RunLogView({
           setState({ status: "error" });
           return;
         }
-        const text = await response.text();
-        if (active) setState({ status: "ready", text });
+        const chunk = await response.json() as BrowserExecutionLogResponse;
+        content += chunk.content;
+        offset = chunk.truncated
+          ? offset + new TextEncoder().encode(chunk.content).byteLength
+          : chunk.sizeBytes;
+        if (active) setState({ status: "ready", complete: chunk.complete, text: content });
+        if (active && (!chunk.complete || chunk.truncated)) timer = setTimeout(() => void load(), chunk.truncated ? 0 : 2000);
       } catch (error) {
         if (active && !(error instanceof DOMException && error.name === "AbortError")) {
           setState({ status: "error" });
@@ -65,6 +74,7 @@ export function RunLogView({
     void load();
     return () => {
       active = false;
+      if (timer) clearTimeout(timer);
       controller.abort();
     };
   }, [admin, stream, taskUid]);
@@ -101,6 +111,7 @@ export function RunLogView({
               <p className="mt-1 text-muted-ink">Execution logs may reproduce arbitrary user, tool, or agent output.</p>
             </div>
             <pre className="max-h-[70vh] overflow-auto whitespace-pre-wrap break-words rounded-md border bg-canvas p-4 font-mono text-xs">{state.text}</pre>
+            {!state.complete ? <p className="text-xs text-muted-ink" role="status">Live log · polling for new output…</p> : null}
           </>
         ) : null}
       </section>

@@ -21,12 +21,16 @@ const LEGACY_STATUS_PATH: &str = "/oauth/github/status";
 const LIFECYCLE_STATUS_PATH: &str = "/connections/github/status";
 const START_PATH: &str = "/oauth/github/start";
 const DISCONNECT_PATH: &str = "/oauth/github/disconnect";
+const MCP_PATH: &str = "/mcp";
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const RERUN_REQUEST_ID: &str = "steward-github-rerun";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GithubBridgeOperation {
     Status,
     Start,
     Disconnect,
+    Rerun,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +57,7 @@ impl GithubBridgeOperation {
             "github.status" => Ok(Self::Status),
             "github.start" => Ok(Self::Start),
             "github.disconnect" => Ok(Self::Disconnect),
+            "github.rerun" => Ok(Self::Rerun),
             _ => Err(rejected("Connections bridge operation is not allowlisted")),
         }
     }
@@ -68,6 +73,7 @@ impl GithubBridgeOperation {
             ),
             Self::Start => (Method::POST, START_PATH),
             Self::Disconnect => (Method::POST, DISCONNECT_PATH),
+            Self::Rerun => (Method::POST, MCP_PATH),
         }
     }
 }
@@ -75,7 +81,14 @@ impl GithubBridgeOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GithubBridgeRequest {
     Empty,
-    Start { redirect_after: String },
+    Start {
+        redirect_after: String,
+    },
+    Rerun {
+        owner: String,
+        repo: String,
+        run_id: u64,
+    },
 }
 
 impl GithubBridgeRequest {
@@ -99,6 +112,33 @@ impl GithubBridgeRequest {
                 validate_redirect_after(&redirect_after)?;
                 Ok(Self::Start { redirect_after })
             }
+            GithubBridgeOperation::Rerun => {
+                if object.len() != 3 {
+                    return Err(rejected("GitHub rerun request has unexpected fields"));
+                }
+                let owner = object
+                    .get("owner")
+                    .and_then(Value::as_str)
+                    .filter(|value| valid_repository_component(value, 39))
+                    .map(str::to_owned)
+                    .ok_or_else(|| rejected("GitHub rerun owner is invalid"))?;
+                let repo = object
+                    .get("repo")
+                    .and_then(Value::as_str)
+                    .filter(|value| valid_repository_component(value, 100))
+                    .map(str::to_owned)
+                    .ok_or_else(|| rejected("GitHub rerun repository is invalid"))?;
+                let run_id = object
+                    .get("runId")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| rejected("GitHub rerun run ID is invalid"))?;
+                Ok(Self::Rerun {
+                    owner,
+                    repo,
+                    run_id,
+                })
+            }
         }
     }
 
@@ -106,6 +146,24 @@ impl GithubBridgeRequest {
         match self {
             Self::Empty => None,
             Self::Start { redirect_after } => Some(json!({"redirectAfter": redirect_after})),
+            Self::Rerun {
+                owner,
+                repo,
+                run_id,
+            } => Some(json!({
+                "jsonrpc": "2.0",
+                "id": RERUN_REQUEST_ID,
+                "method": "tools/call",
+                "params": {
+                    "name": "actions_run_trigger",
+                    "arguments": {
+                        "method": "rerun_workflow_run",
+                        "owner": owner,
+                        "repo": repo,
+                        "run_id": run_id,
+                    }
+                }
+            })),
         }
     }
 }
@@ -219,6 +277,9 @@ impl GithubMcpGateway {
             ) | (
                 GithubBridgeOperation::Start,
                 GithubBridgeRequest::Start { .. }
+            ) | (
+                GithubBridgeOperation::Rerun,
+                GithubBridgeRequest::Rerun { .. }
             )
         ) {
             return Err(rejected(
@@ -236,6 +297,11 @@ impl GithubMcpGateway {
             );
             if let Some(body) = &body {
                 http = http.json(body);
+            }
+            if operation == GithubBridgeOperation::Rerun {
+                http = http
+                    .header("Mcp-Protocol-Version", MCP_PROTOCOL_VERSION)
+                    .header("Accept", "application/json, text/event-stream");
             }
             let response = match http.send().await {
                 Ok(response) => response,
@@ -315,6 +381,31 @@ fn parse_response(
                 return Err(unavailable("disconnect GitHub connection"));
             }
             Ok(json!({"disconnected": true}))
+        }
+        GithubBridgeOperation::Rerun => {
+            require_status(status, StatusCode::OK, "re-run GitHub workflow")?;
+            let object = mcp_json_object(body, "GitHub rerun MCP response")?;
+            if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+                || object.get("id").and_then(Value::as_str) != Some(RERUN_REQUEST_ID)
+                || object.contains_key("error")
+            {
+                return Err(rejected(
+                    "GitHub rerun MCP response has an invalid envelope",
+                ));
+            }
+            let result = object
+                .get("result")
+                .and_then(Value::as_object)
+                .ok_or_else(|| rejected("GitHub rerun MCP response omitted its result"))?;
+            if result.get("isError").and_then(Value::as_bool) == Some(true)
+                || result
+                    .get("structuredContent")
+                    .and_then(Value::as_object)
+                    .is_some_and(|structured| structured.contains_key("error"))
+            {
+                return Err(failed("MCP-GW rejected GitHub workflow rerun"));
+            }
+            Ok(json!({"dispatched": true}))
         }
     }
 }
@@ -547,6 +638,37 @@ fn json_object(body: &[u8], description: &str) -> Result<Map<String, Value>, Por
         .ok_or_else(|| rejected(&format!("{description} must be one JSON object")))
 }
 
+fn mcp_json_object(body: &[u8], description: &str) -> Result<Map<String, Value>, PortError> {
+    if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        return value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| rejected(&format!("{description} must be one JSON object")));
+    }
+    let text = std::str::from_utf8(body)
+        .map_err(|_| rejected(&format!("{description} must be JSON or one SSE event")))?;
+    let mut data = None;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("data:") {
+            if data.replace(value.trim_start()).is_some() {
+                return Err(rejected(&format!(
+                    "{description} must contain exactly one SSE data event"
+                )));
+            }
+        } else if line.strip_prefix("event:").map(str::trim) != Some("message") {
+            return Err(rejected(&format!(
+                "{description} contains an unsupported SSE field"
+            )));
+        }
+    }
+    let data = data.ok_or_else(|| rejected(&format!("{description} omitted SSE data")))?;
+    json_object(data.as_bytes(), description)
+}
+
 fn exact_string_field(object: &Map<String, Value>, expected: &str) -> Result<String, PortError> {
     if object.len() != 1 {
         return Err(rejected("Connections bridge request has unexpected fields"));
@@ -557,6 +679,16 @@ fn exact_string_field(object: &Map<String, Value>, expected: &str) -> Result<Str
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| rejected("Connections bridge request is missing its exact string field"))
+}
+
+fn valid_repository_component(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn validate_origin(value: &str) -> Result<Url, PortError> {
@@ -703,6 +835,139 @@ mod tests {
                 "only github.start may receive one server-authored field"
             );
         }
+    }
+
+    #[test]
+    fn github_rerun_is_an_explicit_allowlisted_bridge_operation() -> Result<(), String> {
+        let operation = GithubBridgeOperation::parse("github.rerun")
+            .map_err(|error| format!("parse rerun operation: {error:?}"))?;
+        assert_eq!(
+            GithubBridgeRequest::parse(
+                operation,
+                br#"{"owner":"example-org","repo":"example-repo","runId":12345}"#,
+            )
+            .map_err(|error| format!("parse rerun request: {error:?}"))?,
+            GithubBridgeRequest::Rerun {
+                owner: "example-org".to_owned(),
+                repo: "example-repo".to_owned(),
+                run_id: 12345,
+            }
+        );
+        for invalid in [
+            br#"{"owner":"example-org","repo":"example-repo"}"#.as_slice(),
+            br#"{"owner":"example-org","repo":"example-repo","runId":0}"#.as_slice(),
+            br#"{"owner":"example-org","repo":"example-repo","runId":12345,"workflow":"other.yml"}"#.as_slice(),
+            br#"{"owner":"../other","repo":"example-repo","runId":12345}"#.as_slice(),
+        ] {
+            assert!(GithubBridgeRequest::parse(operation, invalid).is_err());
+        }
+        assert!(GithubBridgeOperation::parse("github.dispatch").is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn github_rerun_calls_only_the_exact_actions_tool_and_discards_provider_output()
+    -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind rerun fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read rerun fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept rerun request: {error}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|error| format!("bound rerun fixture read: {error}"))?;
+            let mut request = [0_u8; 8192];
+            let read = stream
+                .read(&mut request)
+                .map_err(|error| format!("read rerun request: {error}"))?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /mcp HTTP/1.1\r\n"));
+            let lower = request.to_ascii_lowercase();
+            assert!(
+                lower.contains("\r\nauthorization: bearer openshell-token-grant-placeholder\r\n")
+            );
+            assert!(lower.contains("\r\nmcp-protocol-version: 2025-06-18\r\n"));
+            let body = request
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .ok_or_else(|| "rerun request omitted its body".to_owned())?;
+            let body: serde_json::Value = serde_json::from_str(body)
+                .map_err(|error| format!("decode rerun request: {error}"))?;
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "steward-github-rerun",
+                    "method": "tools/call",
+                    "params": {
+                        "name": "actions_run_trigger",
+                        "arguments": {
+                            "method": "rerun_workflow_run",
+                            "owner": "example-org",
+                            "repo": "example-repo",
+                            "run_id": 12345,
+                        }
+                    }
+                })
+            );
+            let response = r#"{"jsonrpc":"2.0","id":"steward-github-rerun","result":{"content":[{"type":"text","text":"provider detail"}],"isError":false}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .map_err(|error| format!("write rerun response: {error}"))?;
+            Ok(())
+        });
+        let gateway = GithubMcpGateway::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build rerun gateway: {error:?}"))?;
+        let response = gateway
+            .execute(
+                GithubBridgeOperation::Rerun,
+                GithubBridgeRequest::Rerun {
+                    owner: "example-org".to_owned(),
+                    repo: "example-repo".to_owned(),
+                    run_id: 12345,
+                },
+            )
+            .await
+            .map_err(|error| format!("execute rerun: {error:?}"))?;
+        server
+            .join()
+            .map_err(|_| "rerun fixture panicked".to_owned())??;
+        assert_eq!(response, serde_json::json!({"dispatched": true}));
+        Ok(())
+    }
+
+    #[test]
+    fn github_rerun_accepts_one_streamable_http_event_and_rejects_ambiguous_events() {
+        let payload = r#"{"jsonrpc":"2.0","id":"steward-github-rerun","result":{"content":[],"isError":false}}"#;
+        let event = format!("event: message\ndata: {payload}\n\n");
+        assert_eq!(
+            parse_response(
+                GatewayContract::LifecycleV049,
+                GithubBridgeOperation::Rerun,
+                StatusCode::OK,
+                event.as_bytes(),
+            ),
+            Ok(serde_json::json!({"dispatched": true}))
+        );
+
+        let repeated = format!("data: {payload}\n\ndata: {payload}\n\n");
+        assert!(
+            parse_response(
+                GatewayContract::LifecycleV049,
+                GithubBridgeOperation::Rerun,
+                StatusCode::OK,
+                repeated.as_bytes(),
+            )
+            .is_err(),
+            "more than one SSE data event must not be treated as one rerun result"
+        );
     }
 
     #[test]

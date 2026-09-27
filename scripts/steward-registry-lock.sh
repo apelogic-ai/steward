@@ -56,8 +56,8 @@ descriptor_digest() {
 read_handoff_artifacts() {
   local handoff="$1"
   jq -er '
-    if .schemaVersion != "steward.release-handoff/v1" then
-      error("release handoff must use steward.release-handoff/v1")
+    if (.schemaVersion == "steward.release-handoff/v1" or .schemaVersion == "steward.release-handoff/v2") | not then
+      error("release handoff must use steward.release-handoff/v1 or v2")
     elif (.version | type) != "string" or .version == "" then
       error("release handoff version is required")
     elif (.commit | type) != "string" or (.commit | test("^[0-9a-f]{40}$") | not) then

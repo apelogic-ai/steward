@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "steward.product-compatibility/v1",
+  "stewardVersion": "0.3.0",
+  "taskApiContract": "steward.task/v2",
+  "clientCapabilities": {
+    "envelopeDigestSelector": {
+      "stewardRunMinimumVersion": "0.7.0"
+    }
+  },
+  "dependencyContracts": {
+    "identityPolicy": "github-oidc-exchange.apelogic.io/v5",
+    "taskIdentity": "steward-task-v2",
+    "githubConnectionAuthority": "steward.connections.github/v2",
+    "gatewayApi": {
+      "apiVersion": "gateway.networking.k8s.io/v1",
+      "requiredGatewayClassFeature": "BackendTLSPolicy"
+    },
+    "inference": {
+      "codex-v1": {
+        "urlSemantics": "exact-operation-url",
+        "operationPath": "/v1/responses"
+      },
+      "claude-code-v1": {
+        "urlSemantics": "base-url",
+        "operationPath": "/v1/messages"
+      }
+    }
+  }
+}

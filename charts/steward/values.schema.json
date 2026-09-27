@@ -476,6 +476,7 @@
             "jiraAccountEmail",
             "kubernetesTokenReviewAudience",
             "capabilityCatalog",
+            "defaultLlmTemplate",
             "executionBindingsMode",
             "executionBindings",
             "inferenceEndpoint",
@@ -494,9 +495,9 @@
             "capabilityCatalog": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["schemaVersion", "models", "tools"],
+              "required": ["schemaVersion", "models", "tools", "catalogs"],
               "properties": {
-                "schemaVersion": {"const": "steward.capability-catalog/v1"},
+                "schemaVersion": {"const": "steward.capability-catalog/v2"},
                 "models": {
                   "type": "array",
                   "maxItems": 256,
@@ -518,15 +519,200 @@
                   "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["provider", "resource", "action"],
+                    "required": ["provider", "resource", "action", "accessClass"],
                     "properties": {
                       "provider": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
                       "resource": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
-                      "action": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"}
+                      "action": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
+                      "accessClass": {"type": "string", "enum": ["read", "write", "destructive"]}
+                    }
+                  }
+                },
+                "catalogs": {
+                  "type": "array",
+                  "maxItems": 128,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["provider", "catalogId", "version", "available"],
+                    "properties": {
+                      "provider": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
+                      "catalogId": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
+                      "version": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
+                      "available": {"type": "boolean"}
                     }
                   }
                 }
               }
+            },
+            "customEnvelopeSafetyCeiling": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "required": ["revision", "spec"],
+              "properties": {
+                "revision": {"type": "integer", "minimum": 1},
+                "spec": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["llms", "tools", "budget", "runtimeMinutesLimit", "ttl", "runner"],
+                  "properties": {
+                    "llms": {
+                      "type": "array",
+                      "minItems": 1,
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["provider", "model"],
+                        "properties": {
+                          "provider": {"type": "string", "minLength": 1},
+                          "model": {"type": "string", "minLength": 1}
+                        }
+                      }
+                    },
+                    "tools": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["provider", "resource", "action"],
+                        "properties": {
+                          "provider": {"type": "string", "minLength": 1},
+                          "resource": {"type": "string", "minLength": 1},
+                          "action": {"type": "string", "minLength": 1}
+                        }
+                      }
+                    },
+                    "budget": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["monthlyLimit", "currency"],
+                      "properties": {
+                        "monthlyLimit": {"type": "string", "pattern": "^[0-9]+(?:\\.[0-9]+)?$"},
+                        "singleRunLimit": {"type": ["string", "null"]},
+                        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"}
+                      }
+                    },
+                    "runtimeMinutesLimit": {"type": "string", "minLength": 1},
+                    "ttl": {"type": "string", "minLength": 1},
+                    "runner": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "platforms": {
+                          "type": "array",
+                          "uniqueItems": true,
+                          "items": {"type": "string", "enum": ["linux", "mac", "windows"]}
+                        },
+                        "memory": {"type": ["string", "null"]},
+                        "compute": {"type": ["string", "null"]},
+                        "storage": {"type": ["string", "null"]}
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "stewardRunRelease": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "required": [
+                "manifestSchemaVersion",
+                "version",
+                "workflowRepository",
+                "workflowCommit",
+                "actionCommit",
+                "governedJobContainerImage"
+              ],
+              "properties": {
+                "manifestSchemaVersion": {"const": 3},
+                "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+                "workflowRepository": {
+                  "type": "string",
+                  "maxLength": 200,
+                  "pattern": "^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$",
+                  "not": {"pattern": "^\\.{1,2}/|/\\.{1,2}$"}
+                },
+                "workflowCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+                "actionCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+                "governedJobContainerImage": {
+                  "type": "string",
+                  "pattern": "^[^@\\s:]+(?:/[^@\\s:]+)+@sha256:[0-9a-f]{64}$"
+                }
+              }
+            },
+            "defaultLlmTemplate": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["enabled", "templateId", "displayName", "memberRoles", "ceiling"],
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "templateId": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+                "displayName": {"type": "string", "minLength": 1, "maxLength": 128},
+                "memberRoles": {
+                  "type": "array",
+                  "maxItems": 64,
+                  "uniqueItems": true,
+                  "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"}
+                },
+                "ceiling": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["revision", "spec"],
+                  "properties": {
+                    "revision": {"type": "integer", "minimum": 1},
+                    "spec": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["llms", "tools", "budget", "ttl", "runner"],
+                      "properties": {
+                        "llms": {
+                          "type": "array",
+                          "maxItems": 1,
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["provider", "model"],
+                            "properties": {
+                              "provider": {"type": "string", "minLength": 1},
+                              "model": {"type": "string", "minLength": 1}
+                            }
+                          }
+                        },
+                        "tools": {"type": "array", "maxItems": 0},
+                        "budget": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": ["monthlyLimit", "currency"],
+                          "properties": {
+                            "monthlyLimit": {"type": "string", "pattern": "^[0-9]+(?:\\.[0-9]+)?$"},
+                            "singleRunLimit": {"type": ["string", "null"]},
+                            "currency": {"type": "string", "minLength": 1}
+                          }
+                        },
+                        "runtimeMinutesLimit": {"type": ["string", "null"]},
+                        "ttl": {"type": "string", "minLength": 1},
+                        "runner": {"type": "object"}
+                      }
+                    }
+                  }
+                }
+              },
+              "allOf": [
+                {
+                  "if": {"properties": {"enabled": {"const": true}}},
+                  "then": {
+                    "properties": {
+                      "memberRoles": {"minItems": 1},
+                      "ceiling": {
+                        "properties": {
+                          "spec": {"properties": {"llms": {"minItems": 1}}}
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
             },
             "executionBindingsMode": {"type": "string", "enum": ["staged", "active"]},
             "inferenceEndpoint": {"type": "string", "pattern": "^$|^https?://"},
@@ -974,6 +1160,21 @@
     }
   },
   "allOf": [
+    {
+      "if": {"properties": {"browserAuth": {"properties": {"enabled": {"const": true}}}}},
+      "then": {
+        "properties": {
+          "config": {
+            "properties": {
+              "apiserver": {
+                "required": ["stewardRunRelease"],
+                "properties": {"stewardRunRelease": {"type": "object"}}
+              }
+            }
+          }
+        }
+      }
+    },
     {
       "if": {"properties": {"execution": {"properties": {"enabled": {"const": true}}}}},
       "then": {

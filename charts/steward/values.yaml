@@ -155,9 +155,33 @@ config:
     kubernetesTokenReviewAudience: https://kubernetes.default.svc
     # Deployment availability only. This catalog grants no Task or user authority.
     capabilityCatalog:
-      schemaVersion: steward.capability-catalog/v1
+      schemaVersion: steward.capability-catalog/v2
       models: []
       tools: []
+      catalogs: []
+    # Optional hard ceiling for template-free user requests. When null, custom requests fail
+    # closed; when set, every request and later approval is checked against this current ceiling.
+    customEnvelopeSafetyCeiling: null
+    # Exact verified steward-run release coordinates selected by the installation BOM. Required
+    # when browser administration is enabled; null keeps the source chart product-neutral.
+    stewardRunRelease: null
+    # Optional ordinary catalog entry for an operator-selected LLM smoke test. Disabled by
+    # default; every authority field is explicit and no model is inferred from the catalog.
+    defaultLlmTemplate:
+      enabled: false
+      templateId: default
+      displayName: Default LLM smoke test
+      memberRoles: []
+      ceiling:
+        revision: 1
+        spec:
+          llms: []
+          tools: []
+          budget:
+            monthlyLimit: "0"
+            currency: USD
+          ttl: 15m
+          runner: {}
     # Keep staged for the first binary rollout; activate only after every controller is upgraded.
     executionBindingsMode: staged
     # Deployment-owned catalog. An empty list advertises no coding agents and creates no fallback.

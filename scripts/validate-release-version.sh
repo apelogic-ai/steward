@@ -17,13 +17,13 @@ for observed in "${chart_version}" "${app_version}" "${readme_version}" "${guide
   fi
 done
 
-if [[ "${chart_version}" == "0.2.6" ]]; then
+if [[ "${chart_version}" == "0.3.0" ]]; then
   chart_readme_version="$(sed -nE "s/^Current release contract: chart ${tick}([^${tick}]+)${tick}.*/\\1/p" "${root}/charts/steward/README.md")"
   changelog_version="$(sed -nE 's/^## \[([0-9]+\.[0-9]+\.[0-9]+)\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$/\1/p' "${root}/CHANGELOG.md" | head -n 1)"
-  upgrade_version="$(sed -nE 's/^# Upgrade to Steward v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' "${root}/docs/installation/upgrade-v0.2.0.md")"
+  upgrade_version="$(sed -nE 's/^# Upgrade to Steward v([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' "${root}/docs/installation/upgrade-v0.3.0.md")"
   for observed in "${chart_readme_version}" "${changelog_version}" "${upgrade_version}"; do
     if [[ -z "${observed}" || "${observed}" != "${chart_version}" ]]; then
-      echo "v0.2 release metadata is inconsistent: chart=${chart_version}, chart-readme=${chart_readme_version}, changelog=${changelog_version}, upgrade=${upgrade_version}" >&2
+      echo "v0.3 release metadata is inconsistent: chart=${chart_version}, chart-readme=${chart_readme_version}, changelog=${changelog_version}, upgrade=${upgrade_version}" >&2
       exit 1
     fi
   done

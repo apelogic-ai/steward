@@ -4,6 +4,75 @@ export type ClientOptions = {
     baseUrl: `${string}://${string}` | (string & {});
 };
 
+export type AdminRequestDecision = {
+    decisionKey?: string | null;
+    evidenceUrl?: string | null;
+    expiresAt?: string | null;
+    rationale?: string | null;
+};
+
+export type AdminRequestHistoryEvent = {
+    actor: string;
+    at: string;
+    reason?: string | null;
+    state: AdminRequestState;
+};
+
+export type AdminRequestKind = 'ceiling_exceeded' | 'cumulative_exhausted' | 'custom' | 'within_ceiling';
+
+export type AdminRequestRequester = {
+    displayEmail: string;
+    userId: string;
+};
+
+export type AdminRequestResponse = {
+    apiVersion: string;
+    request: AdminRequestView;
+};
+
+export type AdminRequestSource = 'envelope_request' | 'runtime_exception' | 'escalation';
+
+export type AdminRequestState = 'requested' | 'escalated' | 'auto_approved' | 'approved' | 'rejected' | 'expired';
+
+export type AdminRequestStateFilter = 'all' | 'needs_action' | 'requested' | 'escalated' | 'auto_approved' | 'approved' | 'rejected' | 'expired';
+
+export type AdminRequestTemplate = {
+    displayName?: string | null;
+    id?: string | null;
+    revision?: number | null;
+};
+
+export type AdminRequestView = {
+    createdAt: string;
+    decision?: null | AdminRequestDecision;
+    deltas: Array<DirectAdmissionDelta>;
+    escalation?: null | EscalationView;
+    history: Array<AdminRequestHistoryEvent>;
+    id: string;
+    kind: AdminRequestKind;
+    requestedEnvelope?: null | BrowserEnvelope;
+    requester: AdminRequestRequester;
+    source: AdminRequestSource;
+    state: AdminRequestState;
+    stateActor: string;
+    stateAt: string;
+    template: AdminRequestTemplate;
+    templateEnvelope?: null | BrowserEnvelope;
+};
+
+export type AdminRequestsResponse = {
+    apiVersion: string;
+    nextCursor?: string | null;
+    requests: Array<AdminRequestView>;
+};
+
+export type AdminRequestsSummaryResponse = {
+    apiVersion: string;
+    escalated: number;
+    needsAction: number;
+    requested: number;
+};
+
 export type AgentRunAvailability = 'available' | 'partial' | 'unavailable';
 
 export type AgentRunDataStatus = {
@@ -37,6 +106,12 @@ export type AgentRunTimelineEventView = {
     at: string;
     kind: 'finalized';
     provenance: AgentRunTimelineProvenanceView;
+} | {
+    at: string;
+    details: unknown;
+    kind: 'stage';
+    provenance: AgentRunTimelineProvenanceView;
+    stage: string;
 };
 
 export type AgentRunTimelineProvenanceView = 'recorded' | 'backfilled';
@@ -102,11 +177,13 @@ export type AgentType = {
 
 export type AllRunsResponse = {
     apiVersion: string;
+    facets: BrowserRunFacets;
     nextCursor?: string | null;
     runs: Array<AllRunsView>;
 };
 
 export type AllRunsView = BrowserRunView & {
+    ownerDisplayEmail?: string | null;
     /**
      * Opaque canonical identifier only; display email and acting-user identities stay server-side.
      */
@@ -119,9 +196,26 @@ export type ApprovalRequest = {
     rationale: string;
 };
 
+export type ApproveEnvelopeRequestBody = {
+    evidenceUrl?: string | null;
+    expiresAt?: string | null;
+    /**
+     * Required for ceiling-exceeded requests and whenever decision metadata is supplied.
+     * Legacy clients may omit it only for an unfiled within-ceiling request.
+     */
+    rationale?: string | null;
+};
+
 export type AssociateFederatedSubjectBody = {
     canonicalUserId: CanonicalUserId;
     expectedRevision: number;
+};
+
+export type AuthorEnvelopeTemplateBody = {
+    autoProvisionThreshold?: null | BrowserEnvelope;
+    displayName: string;
+    envelope: BrowserEnvelope;
+    memberRoles: Array<string>;
 };
 
 export type AuthorityRequirements = {
@@ -138,6 +232,12 @@ export type AvailableEnvelopeTemplate = {
     displayName: string;
     id: string;
     revision: number;
+};
+
+export type AvailableProviderConnection = {
+    displayName: string;
+    enabled: boolean;
+    provider: string;
 };
 
 export type BindingRef = string;
@@ -176,6 +276,13 @@ export type BrowserEnvelope = {
     spec: BrowserEnvelopeSpec;
 };
 
+export type BrowserEnvelopeRequestDecisionReferenceResponse = {
+    apiVersion: string;
+    decisionKey: string;
+    evidenceUrl: string;
+    requestId: string;
+};
+
 export type BrowserEnvelopeRequestDecisionResponse = {
     apiVersion: string;
     request: BrowserEnvelopeRequestDecisionView;
@@ -185,15 +292,19 @@ export type BrowserEnvelopeRequestDecisionView = {
     actedBy: string;
     approvalId?: string | null;
     approvedEnvelope?: null | BrowserEnvelope;
+    decisionKey?: string | null;
     envelopeDigest?: string | null;
     envelopeInstanceId?: string | null;
+    evidenceUrl?: string | null;
+    expiresAt?: string | null;
+    rationale?: string | null;
     reason?: string | null;
     requestId: string;
     requestedEnvelope: BrowserEnvelope;
     status: string;
     statusAt: string;
-    templateId: string;
-    templateRevision: number;
+    templateId?: string | null;
+    templateRevision?: number | null;
 };
 
 export type BrowserEnvelopeRequestView = {
@@ -201,22 +312,30 @@ export type BrowserEnvelopeRequestView = {
     ownerDisplayEmail: string;
     requestId: string;
     requestedEnvelope: BrowserEnvelope;
-    templateEnvelope: BrowserEnvelope;
-    templateId: string;
-    templateRevision: number;
+    templateEnvelope?: null | BrowserEnvelope;
+    templateId?: string | null;
+    templateRevision?: number | null;
 };
 
 export type BrowserEnvelopeSpec = {
     budget: Budget;
     llms: Array<ModelRef>;
     runner?: RunnerRequirements;
+    runtimeMinutesLimit?: string | null;
     tools: Array<ToolGrant>;
     ttl: Duration;
 };
 
 export type BrowserEnvelopeTemplateListItem = {
+    autoProvisionThreshold?: null | BrowserEnvelope;
+    displayName: string;
     envelope: BrowserEnvelope;
+    id: string;
+    /**
+     * Compatibility alias for clients written before templates could target multiple roles.
+     */
     memberRole: string;
+    memberRoles: Array<string>;
 };
 
 export type BrowserEnvelopeTemplateListResponse = {
@@ -226,8 +345,23 @@ export type BrowserEnvelopeTemplateListResponse = {
 
 export type BrowserEnvelopeTemplateResponse = {
     apiVersion: string;
+    autoProvisionThreshold?: null | BrowserEnvelope;
+    displayName: string;
     envelope: BrowserEnvelope;
+    id: string;
+    /**
+     * Compatibility alias for clients written before templates could target multiple roles.
+     */
     memberRole: string;
+    memberRoles: Array<string>;
+};
+
+export type BrowserExecutionLogResponse = {
+    complete: boolean;
+    content: string;
+    sizeBytes: number;
+    stream: string;
+    truncated: boolean;
 };
 
 export type BrowserFederatedSubjectAuditResponse = {
@@ -276,11 +410,53 @@ export type BrowserMutationRequest = {
     [key: string]: never;
 };
 
+export type BrowserPreferencesView = {
+    apiVersion: string;
+    onboardingDismissed: boolean;
+    revision: number;
+    theme?: null | BrowserTheme;
+    workflowAcknowledged: boolean;
+};
+
 export type BrowserRole = 'user' | 'admin';
+
+export type BrowserRunExitCategory = 'succeeded' | 'failed' | 'cancelled';
+
+export type BrowserRunFacets = {
+    phase: BrowserRunPhaseFacets;
+};
+
+export type BrowserRunPhaseFacets = {
+    cancelled: number;
+    failed: number;
+    parked: number;
+    queued: number;
+    running: number;
+    submitted: number;
+    succeeded: number;
+};
 
 export type BrowserRunResponse = {
     apiVersion: string;
     run: BrowserRunView;
+};
+
+export type BrowserRunStage = {
+    displayName: string;
+    id: BrowserRunStageId;
+    state: BrowserRunStageState;
+    steps: Array<BrowserRunStep>;
+};
+
+export type BrowserRunStageId = 'admission' | 'provision_runtime' | 'agent_execution' | 'finalize';
+
+export type BrowserRunStageState = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+
+export type BrowserRunStep = {
+    displayName: string;
+    id: string;
+    logStreams: Array<string>;
+    state: BrowserRunStageState;
 };
 
 export type BrowserRunTimelineEvent = {
@@ -293,12 +469,42 @@ export type BrowserRunTimelineEvent = {
 } | {
     at: string;
     kind: 'finalized';
+} | {
+    at: string;
+    envelopeDigest?: string | null;
+    envelopeRevision?: number | null;
+    kind: 'admitted';
+} | {
+    at: string;
+    kind: 'runtimeBound';
+    ownership: RuntimeOwnership;
+    runtimeUid: string;
+} | {
+    at: string;
+    kind: 'executionStarted';
+} | {
+    at: string;
+    exitCategory: BrowserRunExitCategory;
+    kind: 'executionEnded';
 };
 
 export type BrowserRunTimelineResponse = {
     apiVersion: string;
     events: Array<BrowserRunTimelineEvent>;
     taskUid: string;
+};
+
+export type BrowserRunTrigger = {
+    actor: string;
+    callerWorkflow: string;
+    event: string;
+    provider: string;
+    ref: string;
+    repository: string;
+    runAttempt: number;
+    runId: string;
+    runUrl: string;
+    sha: string;
 };
 
 export type BrowserRunView = {
@@ -311,7 +517,9 @@ export type BrowserRunView = {
     phase: TaskPhase;
     runtimeOwnership: RuntimeOwnership;
     runtimeUid?: string | null;
+    stages: Array<BrowserRunStage>;
     taskUid: string;
+    trigger?: null | BrowserRunTrigger;
     updatedAt: string;
     userEnvelopeDigest?: string | null;
     userEnvelopeInstanceId?: string | null;
@@ -321,6 +529,8 @@ export type BrowserRunView = {
     workflowName?: string | null;
     workflowVersion?: number | null;
 };
+
+export type BrowserTheme = 'light' | 'dark' | 'system';
 
 export type Budget = {
     currency: string;
@@ -357,9 +567,24 @@ export type CanonicalAuthorityBinding = {
 export type CanonicalUserId = string;
 
 export type CapabilityCatalog = {
+    catalogs: Array<CapabilityProviderCatalog>;
     models: Array<ModelRef>;
     schemaVersion: string;
-    tools: Array<ToolGrant>;
+    tools: Array<CapabilityTool>;
+};
+
+export type CapabilityProviderCatalog = {
+    available: boolean;
+    catalogId: string;
+    provider: string;
+    version: string;
+};
+
+export type CapabilityTool = {
+    accessClass: ToolAccessClass;
+    action: string;
+    provider: string;
+    resource: string;
 };
 
 export type ClosureEntry = {
@@ -384,13 +609,19 @@ export type ConnectionStatusResponse = {
     status: ProviderConnectionStatus;
 };
 
+export type ConnectionsCollectionResponse = {
+    apiVersion: string;
+    available: Array<AvailableProviderConnection>;
+    connections: Array<ProviderConnectionView>;
+};
+
 export type ContentDigest = string;
 
 export type CreateEnvelopeRequestBody = {
     idempotencyKey: string;
     requestedEnvelope: BrowserEnvelope;
-    templateId: string;
-    templateRevision: number;
+    templateId?: string | null;
+    templateRevision?: number | null;
 };
 
 export type CreateRuntimeRequest = {
@@ -415,6 +646,10 @@ export type DirectAdmissionDelta = {
     ceiling: Decimal;
     currency: Currency;
     dimension: 'singleRunBudget';
+    requested?: null | Decimal;
+} | {
+    ceiling: Decimal;
+    dimension: 'runtimeMinutes';
     requested?: null | Decimal;
 } | {
     ceiling: Duration;
@@ -482,6 +717,7 @@ export type DirectTaskStatusResponse = {
 
 export type DirectTaskSubmission = {
     contractVersion: string;
+    envelopeDigest?: null | EnvelopeDigest;
     invocationPath: RelativePath;
 };
 
@@ -506,6 +742,16 @@ export type EnvelopeEvidence = {
     uid: Uuid;
 };
 
+export type EnvelopeRequestHistoryEvent = {
+    actor: string;
+    at: string;
+    evidenceUrl?: string | null;
+    expiresAt?: string | null;
+    rationale?: string | null;
+    reason?: string | null;
+    status: EnvelopeRequestStatus;
+};
+
 export type EnvelopeRequestResponse = {
     apiVersion: string;
     request: UserEnvelopeRequest;
@@ -515,12 +761,66 @@ export type EnvelopeRequestStatus = 'pending' | 'approved' | 'rejected' | 'provi
 
 export type EnvelopeRequestsResponse = {
     apiVersion: string;
+    nextCursor?: string | null;
     requests: Array<UserEnvelopeRequest>;
+};
+
+export type EnvelopeSpendUsage = {
+    currency: string;
+    limit: string;
+    observed: string;
+    observedAt: string;
 };
 
 export type EnvelopeTemplatesResponse = {
     apiVersion: string;
     templates: Array<AvailableEnvelopeTemplate>;
+};
+
+export type EnvelopeUsagePeriod = {
+    end: string;
+    start: string;
+};
+
+export type EnvelopeUsageView = {
+    availability: AgentRunDataStatus;
+    period: EnvelopeUsagePeriod;
+    spend?: null | EnvelopeSpendUsage;
+};
+
+export type EscalationDenyRequest = {
+    rationale: string;
+};
+
+export type EscalationDimension = 'llm_spend' | 'runtime_minutes';
+
+export type EscalationMeter = {
+    dimension: EscalationDimension;
+    exhausted: boolean;
+    limit: string;
+    observedAt: string;
+    unit: string;
+    used: string;
+};
+
+export type EscalationPeriod = {
+    end: string;
+    start: string;
+};
+
+export type EscalationTopUpRequest = {
+    amount: string;
+    dimension: EscalationDimension;
+    rationale: string;
+    validUntil: string;
+};
+
+export type EscalationView = {
+    blockedTaskUid: string;
+    envelopeInstanceId: string;
+    meters: Array<EscalationMeter>;
+    parkedAt: string;
+    period: EscalationPeriod;
 };
 
 export type ExactGitCommit = string;
@@ -543,6 +843,7 @@ export type GeneratedGithubActionsWorkflow = {
     contentType: string;
     schemaVersion: string;
     sha256: string;
+    suggestedPath: string;
     yaml: string;
 };
 
@@ -579,8 +880,94 @@ export type ModelRequirement = {
 
 export type MyRunsResponse = {
     apiVersion: string;
+    facets: BrowserRunFacets;
     nextCursor?: string | null;
     runs: Array<BrowserRunView>;
+};
+
+export type OperatorActiveEnvelopeView = {
+    envelopeDigest: string;
+    envelopeInstanceId: string;
+    templateId?: string | null;
+    templateRevision?: number | null;
+};
+
+export type OperatorAssignmentAction = 'grant' | 'revoke';
+
+export type OperatorAssignmentKind = 'administrator' | 'member_role';
+
+export type OperatorAssignmentRequest = {
+    action: OperatorAssignmentAction;
+    kind: OperatorAssignmentKind;
+    memberRole?: string | null;
+    userId: string;
+};
+
+export type OperatorAssignmentResponse = {
+    action: OperatorAssignmentAction;
+    actor: string;
+    kind: OperatorAssignmentKind;
+    memberRole?: string | null;
+    userId: string;
+};
+
+export type OperatorEffectiveAccessResponse = {
+    activeEnvelopes: Array<OperatorActiveEnvelopeView>;
+    administrator: boolean;
+    eligibleTemplates: Array<OperatorEligibleTemplateView>;
+    memberRoles: Array<string>;
+    user: OperatorUserView;
+};
+
+export type OperatorEligibleTemplateView = {
+    revision: number;
+    templateId: string;
+};
+
+export type OperatorProvisionRequest = {
+    idempotencyKey: string;
+    ownerUserId: string;
+    requestedEnvelope: BrowserEnvelope;
+    templateId: string;
+    templateRevision: number;
+};
+
+export type OperatorProvisionResponse = {
+    envelopeDigest: string;
+    envelopeInstanceId: string;
+    ownerUserId: string;
+    templateId: string;
+    templateRevision: number;
+};
+
+export type OperatorRolesResponse = {
+    memberRoles: Array<string>;
+};
+
+export type OperatorTemplateApplyRequest = {
+    autoProvisionThreshold?: null | BrowserEnvelope;
+    ceiling: BrowserEnvelope;
+    displayName: string;
+    memberRoles: Array<string>;
+};
+
+export type OperatorTemplateResponse = {
+    autoProvisionThreshold?: null | BrowserEnvelope;
+    ceiling: BrowserEnvelope;
+    displayName: string;
+    memberRoles: Array<string>;
+    templateId: string;
+};
+
+export type OperatorUserView = {
+    displayEmail: string;
+    organizationId: string;
+    state: string;
+    userId: string;
+};
+
+export type OperatorUsersResponse = {
+    users: Array<OperatorUserView>;
 };
 
 export type PackageClosure = {
@@ -609,6 +996,20 @@ export type ProviderConnectionStatus = {
     scopesRequired: Array<string>;
 };
 
+export type ProviderConnectionView = {
+    displayName: string;
+    provider: string;
+    status: ProviderConnectionStatus;
+};
+
+export type ProvisionEnvelopeBody = {
+    idempotencyKey: string;
+    ownerUserId: string;
+    requestedEnvelope: BrowserEnvelope;
+    templateId: string;
+    templateRevision: number;
+};
+
 export type PublishWorkflowRequest = {
     agent: string;
     displayName: string;
@@ -626,6 +1027,7 @@ export type PublishedWorkflowOption = {
     agent: string;
     displayName: string;
     name: string;
+    sample: boolean;
     version: number;
 };
 
@@ -645,6 +1047,23 @@ export type RenderGithubActionsWorkflowBody = {
 };
 
 export type RepositoryUrl = string;
+
+export type RerunPendingResponse = {
+    apiVersion: string;
+    retryAfterMs: number;
+    state: RerunPendingState;
+};
+
+export type RerunPendingState = 'pending';
+
+export type RerunRequest = {
+    idempotencyKey: string;
+};
+
+export type RerunResponse = {
+    apiVersion: string;
+    taskUid: string;
+};
 
 export type ResolvedSource = {
     commit: ExactGitCommit;
@@ -775,8 +1194,11 @@ export type TaskSubmissionRequest = {
      * Versioned Workflows always reject this field.
      */
     codingAgentRuntime?: string | null;
+    envelopeDigest?: null | EnvelopeDigest;
     workflow: string;
 };
+
+export type ToolAccessClass = 'read' | 'write' | 'destructive';
 
 export type ToolGrant = {
     action: string;
@@ -796,21 +1218,29 @@ export type TriggerRepository = {
     ownerId: StableProviderId;
 };
 
+export type UpdateBrowserPreferences = {
+    onboardingDismissed?: boolean | null;
+    theme?: null | BrowserTheme;
+    workflowAcknowledged?: boolean | null;
+};
+
 export type UserEnvelopeRequest = {
     approvalId?: string | null;
     approvedEnvelope?: null | BrowserEnvelope;
     createdAt: string;
     envelopeDigest?: string | null;
     envelopeInstanceId?: string | null;
+    history: Array<EnvelopeRequestHistoryEvent>;
     id: string;
     reason?: string | null;
     requestedEnvelope: BrowserEnvelope;
     status: EnvelopeRequestStatus;
     statusActor: string;
     statusAt: string;
-    statusTemplateRevision: number;
-    templateId: string;
-    templateRevision: number;
+    statusTemplateRevision?: number | null;
+    templateId?: string | null;
+    templateRevision?: number | null;
+    usage?: null | EnvelopeUsageView;
 };
 
 export type Uuid = string;
@@ -932,7 +1362,12 @@ export type AllRunExecutionLogData = {
          */
         stream: string;
     };
-    query?: never;
+    query: {
+        /**
+         * Required by generated clients for the typed JSON response; legacy callers may omit it for text/plain
+         */
+        after: number;
+    };
     url: '/admin/api/v1/all-runs/{task_uid}/logs/{stream}';
 };
 
@@ -946,7 +1381,7 @@ export type AllRunExecutionLogErrors = {
      */
     403: unknown;
     /**
-     * Terminal execution log was not found
+     * Execution log was not found
      */
     404: unknown;
     /**
@@ -956,11 +1391,10 @@ export type AllRunExecutionLogErrors = {
 };
 
 export type AllRunExecutionLogResponses = {
-    /**
-     * Bounded execution log
-     */
-    200: unknown;
+    200: BrowserExecutionLogResponse;
 };
+
+export type AllRunExecutionLogResponse = AllRunExecutionLogResponses[keyof AllRunExecutionLogResponses];
 
 export type AllRunTimelineData = {
     body?: never;
@@ -1256,7 +1690,7 @@ export type StartConnectionResponses = {
 export type StartConnectionResponse2 = StartConnectionResponses[keyof StartConnectionResponses];
 
 export type ApproveAdminEnvelopeRequestData = {
-    body: BrowserMutationRequest;
+    body: ApproveEnvelopeRequestBody;
     headers: {
         'X-Steward-CSRF': string;
     };
@@ -1285,6 +1719,10 @@ export type ApproveAdminEnvelopeRequestErrors = {
      */
     409: unknown;
     /**
+     * Approval rationale or decision metadata is invalid
+     */
+    422: unknown;
+    /**
      * Envelope request authority is unavailable
      */
     503: unknown;
@@ -1295,6 +1733,51 @@ export type ApproveAdminEnvelopeRequestResponses = {
 };
 
 export type ApproveAdminEnvelopeRequestResponse = ApproveAdminEnvelopeRequestResponses[keyof ApproveAdminEnvelopeRequestResponses];
+
+export type FileAdminEnvelopeRequestData = {
+    body: BrowserMutationRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        request_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/envelope-requests/{request_id}/file';
+};
+
+export type FileAdminEnvelopeRequestErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Envelope request was not found
+     */
+    404: unknown;
+    /**
+     * Envelope request is no longer governed by the current template revision
+     */
+    409: unknown;
+    /**
+     * Envelope request does not exceed its template ceiling
+     */
+    422: unknown;
+    /**
+     * Envelope request or decision channel is unavailable
+     */
+    503: unknown;
+};
+
+export type FileAdminEnvelopeRequestResponses = {
+    200: BrowserEnvelopeRequestDecisionReferenceResponse;
+};
+
+export type FileAdminEnvelopeRequestResponse = FileAdminEnvelopeRequestResponses[keyof FileAdminEnvelopeRequestResponses];
 
 export type RejectAdminEnvelopeRequestData = {
     body: RejectEnvelopeRequestBody;
@@ -1372,10 +1855,10 @@ export type ListAdminEnvelopeTemplatesResponse = ListAdminEnvelopeTemplatesRespo
 export type GetAdminEnvelopeTemplateData = {
     body?: never;
     path: {
-        member_role: string;
+        template_id: string;
     };
     query?: never;
-    url: '/admin/api/v1/envelope-templates/{member_role}';
+    url: '/admin/api/v1/envelope-templates/{template_id}';
 };
 
 export type GetAdminEnvelopeTemplateErrors = {
@@ -1409,13 +1892,54 @@ export type AuthorAdminEnvelopeTemplateData = {
         'X-Steward-CSRF': string;
     };
     path: {
-        member_role: string;
+        template_id: string;
     };
     query?: never;
-    url: '/admin/api/v1/envelope-templates/{member_role}';
+    url: '/admin/api/v1/envelope-templates/{template_id}';
 };
 
 export type AuthorAdminEnvelopeTemplateErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Envelope revision is not newer than the current revision
+     */
+    409: unknown;
+    /**
+     * Template identifier, envelope, or deployed capability selection is invalid
+     */
+    422: unknown;
+    /**
+     * Envelope templates are unavailable
+     */
+    503: unknown;
+};
+
+export type AuthorAdminEnvelopeTemplateResponses = {
+    201: BrowserEnvelopeTemplateResponse;
+};
+
+export type AuthorAdminEnvelopeTemplateResponse = AuthorAdminEnvelopeTemplateResponses[keyof AuthorAdminEnvelopeTemplateResponses];
+
+export type PutAdminEnvelopeTemplateData = {
+    body: AuthorEnvelopeTemplateBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        template_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/envelope-templates/{template_id}';
+};
+
+export type PutAdminEnvelopeTemplateErrors = {
     /**
      * Browser session is absent or invalid
      */
@@ -1438,11 +1962,148 @@ export type AuthorAdminEnvelopeTemplateErrors = {
     503: unknown;
 };
 
-export type AuthorAdminEnvelopeTemplateResponses = {
+export type PutAdminEnvelopeTemplateResponses = {
     201: BrowserEnvelopeTemplateResponse;
 };
 
-export type AuthorAdminEnvelopeTemplateResponse = AuthorAdminEnvelopeTemplateResponses[keyof AuthorAdminEnvelopeTemplateResponses];
+export type PutAdminEnvelopeTemplateResponse = PutAdminEnvelopeTemplateResponses[keyof PutAdminEnvelopeTemplateResponses];
+
+export type ProvisionAdminEnvelopeData = {
+    body: ProvisionEnvelopeBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/envelopes/provision';
+};
+
+export type ProvisionAdminEnvelopeErrors = {
+    /**
+     * Canonical user ID or idempotency key is malformed
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Canonical user or template revision was not found
+     */
+    404: unknown;
+    /**
+     * Idempotency, active digest, or provisioning state conflicts
+     */
+    409: unknown;
+    /**
+     * User eligibility or requested Envelope is invalid
+     */
+    422: unknown;
+    /**
+     * Envelope authority is unavailable
+     */
+    503: unknown;
+};
+
+export type ProvisionAdminEnvelopeResponses = {
+    200: BrowserEnvelopeRequestDecisionResponse;
+};
+
+export type ProvisionAdminEnvelopeResponse = ProvisionAdminEnvelopeResponses[keyof ProvisionAdminEnvelopeResponses];
+
+export type DenyAdminEscalationData = {
+    body: EscalationDenyRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        escalation_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/escalations/{escalation_id}/deny';
+};
+
+export type DenyAdminEscalationErrors = {
+    /**
+     * Denial rationale is invalid
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role or mutation proof is invalid
+     */
+    403: unknown;
+    /**
+     * Escalation was not found
+     */
+    404: unknown;
+    /**
+     * Escalation was already decided differently
+     */
+    409: unknown;
+    /**
+     * Escalation authority is unavailable
+     */
+    503: unknown;
+};
+
+export type DenyAdminEscalationResponses = {
+    200: AdminRequestResponse;
+};
+
+export type DenyAdminEscalationResponse = DenyAdminEscalationResponses[keyof DenyAdminEscalationResponses];
+
+export type TopUpAdminEscalationData = {
+    body: EscalationTopUpRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        escalation_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/escalations/{escalation_id}/top-up';
+};
+
+export type TopUpAdminEscalationErrors = {
+    /**
+     * Top-up is invalid or runtime-minutes enforcement is unavailable
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role or mutation proof is invalid
+     */
+    403: unknown;
+    /**
+     * Escalation or bound runtime was not found
+     */
+    404: unknown;
+    /**
+     * Escalation was already decided differently
+     */
+    409: unknown;
+    /**
+     * Escalation authority is unavailable
+     */
+    503: unknown;
+};
+
+export type TopUpAdminEscalationResponses = {
+    200: AdminRequestResponse;
+};
+
+export type TopUpAdminEscalationResponse = TopUpAdminEscalationResponses[keyof TopUpAdminEscalationResponses];
 
 export type ListAdminFederatedSubjectsData = {
     body?: never;
@@ -1687,6 +2348,105 @@ export type ReplaceAdminFederatedSubjectAssociationResponses = {
 };
 
 export type ReplaceAdminFederatedSubjectAssociationResponse = ReplaceAdminFederatedSubjectAssociationResponses[keyof ReplaceAdminFederatedSubjectAssociationResponses];
+
+export type ListAdminRequestsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        state?: AdminRequestStateFilter;
+        kind?: AdminRequestKind;
+        cursor?: string;
+        limit?: number;
+    };
+    url: '/admin/api/v1/requests';
+};
+
+export type ListAdminRequestsErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Filter, cursor, or limit is invalid
+     */
+    422: unknown;
+    /**
+     * Request read model is unavailable
+     */
+    503: unknown;
+};
+
+export type ListAdminRequestsResponses = {
+    200: AdminRequestsResponse;
+};
+
+export type ListAdminRequestsResponse = ListAdminRequestsResponses[keyof ListAdminRequestsResponses];
+
+export type GetAdminRequestsSummaryData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/requests/summary';
+};
+
+export type GetAdminRequestsSummaryErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Request read model is unavailable
+     */
+    503: unknown;
+};
+
+export type GetAdminRequestsSummaryResponses = {
+    200: AdminRequestsSummaryResponse;
+};
+
+export type GetAdminRequestsSummaryResponse = GetAdminRequestsSummaryResponses[keyof GetAdminRequestsSummaryResponses];
+
+export type GetAdminRequestData = {
+    body?: never;
+    path: {
+        request_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/requests/{request_id}';
+};
+
+export type GetAdminRequestErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Request was not found
+     */
+    404: unknown;
+    /**
+     * Request read model is unavailable
+     */
+    503: unknown;
+};
+
+export type GetAdminRequestResponses = {
+    200: AdminRequestResponse;
+};
+
+export type GetAdminRequestResponse = GetAdminRequestResponses[keyof GetAdminRequestResponses];
 
 export type AgentRunsContractData = {
     body?: never;
@@ -1990,10 +2750,317 @@ export type GetAdminWorkflowVersionResponses = {
 
 export type GetAdminWorkflowVersionResponse = GetAdminWorkflowVersionResponses[keyof GetAdminWorkflowVersionResponses];
 
-export type ListRequestsData = {
+export type ProvisionOperatorEnvelopeData = {
+    body: OperatorProvisionRequest;
+    path?: never;
+    query?: never;
+    url: '/admin/operator/v1/envelopes/provision';
+};
+
+export type ProvisionOperatorEnvelopeErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type ProvisionOperatorEnvelopeResponses = {
+    200: OperatorProvisionResponse;
+};
+
+export type ProvisionOperatorEnvelopeResponse = ProvisionOperatorEnvelopeResponses[keyof ProvisionOperatorEnvelopeResponses];
+
+export type MutateOperatorRbacData = {
+    body: OperatorAssignmentRequest;
+    path?: never;
+    query?: never;
+    url: '/admin/operator/v1/rbac';
+};
+
+export type MutateOperatorRbacErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type MutateOperatorRbacResponses = {
+    200: OperatorAssignmentResponse;
+};
+
+export type MutateOperatorRbacResponse = MutateOperatorRbacResponses[keyof MutateOperatorRbacResponses];
+
+export type ListOperatorRolesData = {
     body?: never;
     path?: never;
     query?: never;
+    url: '/admin/operator/v1/roles';
+};
+
+export type ListOperatorRolesErrors = {
+    401: unknown;
+    403: unknown;
+    503: unknown;
+};
+
+export type ListOperatorRolesResponses = {
+    200: OperatorRolesResponse;
+};
+
+export type ListOperatorRolesResponse = ListOperatorRolesResponses[keyof ListOperatorRolesResponses];
+
+export type GetLatestOperatorTemplateData = {
+    body?: never;
+    path: {
+        template_id: string;
+    };
+    query?: never;
+    url: '/admin/operator/v1/templates/{template_id}';
+};
+
+export type GetLatestOperatorTemplateErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type GetLatestOperatorTemplateResponses = {
+    200: OperatorTemplateResponse;
+};
+
+export type GetLatestOperatorTemplateResponse = GetLatestOperatorTemplateResponses[keyof GetLatestOperatorTemplateResponses];
+
+export type GetOperatorTemplateRevisionData = {
+    body?: never;
+    path: {
+        template_id: string;
+        revision: number;
+    };
+    query?: never;
+    url: '/admin/operator/v1/templates/{template_id}/revisions/{revision}';
+};
+
+export type GetOperatorTemplateRevisionErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type GetOperatorTemplateRevisionResponses = {
+    200: OperatorTemplateResponse;
+};
+
+export type GetOperatorTemplateRevisionResponse = GetOperatorTemplateRevisionResponses[keyof GetOperatorTemplateRevisionResponses];
+
+export type ApplyOperatorTemplateRevisionData = {
+    body: OperatorTemplateApplyRequest;
+    path: {
+        template_id: string;
+        revision: number;
+    };
+    query?: never;
+    url: '/admin/operator/v1/templates/{template_id}/revisions/{revision}';
+};
+
+export type ApplyOperatorTemplateRevisionErrors = {
+    401: unknown;
+    403: unknown;
+    409: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type ApplyOperatorTemplateRevisionResponses = {
+    200: OperatorTemplateResponse;
+    201: OperatorTemplateResponse;
+};
+
+export type ApplyOperatorTemplateRevisionResponse = ApplyOperatorTemplateRevisionResponses[keyof ApplyOperatorTemplateRevisionResponses];
+
+export type ListOperatorUsersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/operator/v1/users';
+};
+
+export type ListOperatorUsersErrors = {
+    401: unknown;
+    403: unknown;
+    503: unknown;
+};
+
+export type ListOperatorUsersResponses = {
+    200: OperatorUsersResponse;
+};
+
+export type ListOperatorUsersResponse = ListOperatorUsersResponses[keyof ListOperatorUsersResponses];
+
+export type GetOperatorUserData = {
+    body?: never;
+    path: {
+        user_id: string;
+    };
+    query?: never;
+    url: '/admin/operator/v1/users/{user_id}';
+};
+
+export type GetOperatorUserErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type GetOperatorUserResponses = {
+    200: OperatorUserView;
+};
+
+export type GetOperatorUserResponse = GetOperatorUserResponses[keyof GetOperatorUserResponses];
+
+export type GetOperatorEffectiveAccessData = {
+    body?: never;
+    path: {
+        user_id: string;
+    };
+    query?: never;
+    url: '/admin/operator/v1/users/{user_id}/effective-access';
+};
+
+export type GetOperatorEffectiveAccessErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type GetOperatorEffectiveAccessResponses = {
+    200: OperatorEffectiveAccessResponse;
+};
+
+export type GetOperatorEffectiveAccessResponse = GetOperatorEffectiveAccessResponses[keyof GetOperatorEffectiveAccessResponses];
+
+export type ListProviderConnectionsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/connections';
+};
+
+export type ListProviderConnectionsErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Connection broker is unavailable
+     */
+    503: unknown;
+};
+
+export type ListProviderConnectionsResponses = {
+    200: ConnectionsCollectionResponse;
+};
+
+export type ListProviderConnectionsResponse = ListProviderConnectionsResponses[keyof ListProviderConnectionsResponses];
+
+export type DisconnectProviderConnectionData = {
+    body: DisconnectConnectionRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        provider: string;
+    };
+    query?: never;
+    url: '/app/api/v1/connections/{provider}/disconnect';
+};
+
+export type DisconnectProviderConnectionErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Provider is unavailable
+     */
+    404: unknown;
+    409: ConnectionOperationErrorResponse;
+    /**
+     * Connection broker is unavailable
+     */
+    503: unknown;
+};
+
+export type DisconnectProviderConnectionError = DisconnectProviderConnectionErrors[keyof DisconnectProviderConnectionErrors];
+
+export type DisconnectProviderConnectionResponses = {
+    /**
+     * Connection was disconnected
+     */
+    204: void;
+};
+
+export type DisconnectProviderConnectionResponse = DisconnectProviderConnectionResponses[keyof DisconnectProviderConnectionResponses];
+
+export type StartProviderConnectionData = {
+    body: BrowserMutationRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        provider: string;
+    };
+    query?: never;
+    url: '/app/api/v1/connections/{provider}/start';
+};
+
+export type StartProviderConnectionErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Provider is unavailable
+     */
+    404: unknown;
+    /**
+     * Connection broker is unavailable
+     */
+    503: unknown;
+};
+
+export type StartProviderConnectionResponses = {
+    200: StartConnectionResponse;
+};
+
+export type StartProviderConnectionResponse = StartProviderConnectionResponses[keyof StartProviderConnectionResponses];
+
+export type ListRequestsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        status?: EnvelopeRequestStatus;
+        cursor?: string;
+        limit?: number;
+    };
     url: '/app/api/v1/envelope-requests';
 };
 
@@ -2002,6 +3069,10 @@ export type ListRequestsErrors = {
      * Browser session is absent or invalid
      */
     401: unknown;
+    /**
+     * Cursor or limit is invalid
+     */
+    422: unknown;
     /**
      * Envelope requests are unavailable
      */
@@ -2156,6 +3227,65 @@ export type ListTemplatesResponses = {
 
 export type ListTemplatesResponse = ListTemplatesResponses[keyof ListTemplatesResponses];
 
+export type GetBrowserPreferencesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/preferences';
+};
+
+export type GetBrowserPreferencesErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Preferences are unavailable
+     */
+    503: unknown;
+};
+
+export type GetBrowserPreferencesResponses = {
+    200: BrowserPreferencesView;
+};
+
+export type GetBrowserPreferencesResponse = GetBrowserPreferencesResponses[keyof GetBrowserPreferencesResponses];
+
+export type UpdateBrowserPreferencesData = {
+    body: UpdateBrowserPreferences;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/preferences';
+};
+
+export type UpdateBrowserPreferencesErrors = {
+    /**
+     * At least one preference must be supplied
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Preferences are unavailable
+     */
+    503: unknown;
+};
+
+export type UpdateBrowserPreferencesResponses = {
+    200: BrowserPreferencesView;
+};
+
+export type UpdateBrowserPreferencesResponse = UpdateBrowserPreferencesResponses[keyof UpdateBrowserPreferencesResponses];
+
 export type MyRunsData = {
     body?: never;
     path?: never;
@@ -2221,6 +3351,47 @@ export type MyRunResponses = {
 
 export type MyRunResponse = MyRunResponses[keyof MyRunResponses];
 
+export type CancelMyRunData = {
+    body?: never;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/cancel';
+};
+
+export type CancelMyRunErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Run was not found in the user's scope
+     */
+    404: unknown;
+    /**
+     * Run has already reached a terminal phase
+     */
+    409: unknown;
+    /**
+     * Run cancellation is unavailable
+     */
+    503: unknown;
+};
+
+export type CancelMyRunResponses = {
+    200: BrowserRunResponse;
+};
+
+export type CancelMyRunResponse = CancelMyRunResponses[keyof CancelMyRunResponses];
+
 export type MyRunExecutionLogData = {
     body?: never;
     path: {
@@ -2230,7 +3401,12 @@ export type MyRunExecutionLogData = {
          */
         stream: string;
     };
-    query?: never;
+    query: {
+        /**
+         * Required by generated clients for the typed JSON response; legacy callers may omit it for text/plain
+         */
+        after: number;
+    };
     url: '/app/api/v1/runs/{task_uid}/logs/{stream}';
 };
 
@@ -2240,7 +3416,7 @@ export type MyRunExecutionLogErrors = {
      */
     401: unknown;
     /**
-     * Terminal execution log was not found in the user's scope
+     * Execution log was not found in the user's scope
      */
     404: unknown;
     /**
@@ -2250,11 +3426,63 @@ export type MyRunExecutionLogErrors = {
 };
 
 export type MyRunExecutionLogResponses = {
-    /**
-     * Bounded execution log
-     */
-    200: unknown;
+    200: BrowserExecutionLogResponse;
 };
+
+export type MyRunExecutionLogResponse = MyRunExecutionLogResponses[keyof MyRunExecutionLogResponses];
+
+export type RerunMyRunData = {
+    body: RerunRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/rerun';
+};
+
+export type RerunMyRunErrors = {
+    /**
+     * Idempotency key is invalid
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Run was not found in the user's scope
+     */
+    404: unknown;
+    /**
+     * The original envelope is no longer active or GitHub connection authorization is pending
+     */
+    409: unknown;
+    /**
+     * Run submission is unavailable
+     */
+    503: unknown;
+};
+
+export type RerunMyRunResponses = {
+    /**
+     * Idempotent replay
+     */
+    200: RerunResponse;
+    201: RerunResponse;
+    /**
+     * GitHub accepted the rerun and Steward is awaiting the correlated Task
+     */
+    202: RerunPendingResponse;
+};
+
+export type RerunMyRunResponse = RerunMyRunResponses[keyof RerunMyRunResponses];
 
 export type MyRunTimelineData = {
     body?: never;

@@ -27,12 +27,20 @@ import { useSession } from "@/session/session-context";
 import { listPublishedWorkflows, renderWorkflowForEnvelope, type PublishedWorkflowListResponse } from "@/workflows/api";
 import { workflowReference } from "@/workflows/contracts";
 
+function dateTime(value: string): string {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString();
+}
+
 function EnvelopeSummary({ envelope }: Readonly<{ envelope: BrowserEnvelope }>) {
   return <DefinitionList items={[
     ["Monthly limit", `${envelope.spec.budget.monthlyLimit} ${envelope.spec.budget.currency}`],
     ["Single-run limit", envelope.spec.budget.singleRunLimit
       ? `${envelope.spec.budget.singleRunLimit} ${envelope.spec.budget.currency}`
       : "Not set"],
+    ["Runtime minutes", envelope.spec.runtimeMinutesLimit
+      ? `${envelope.spec.runtimeMinutesLimit} min / month`
+      : "Unlimited"],
     ["TTL", envelope.spec.ttl],
     ["Models", envelope.spec.llms.length ? envelope.spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") : "None"],
     ["Tools", envelope.spec.tools.length ? envelope.spec.tools.map((tool) => `${tool.provider}:${tool.resource}:${tool.action}`).join(", ") : "None"],
@@ -57,13 +65,15 @@ export function EnvelopesView() {
 }
 
 function EnvelopeCard({ request }: Readonly<{ request: UserEnvelopeRequest }>) {
+  const usage = request.usage?.spend;
   return (
     <li className="rounded-panel border bg-panel p-5 shadow-sm">
       <div className="flex items-start justify-between gap-4">
-        <div><h2 className="font-semibold">{request.templateId}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div>
+        <div><h2 className="font-semibold">{request.templateId ?? "Custom envelope"}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div>
         <StatusBadge value={request.status} />
       </div>
       <div className="mt-5"><EnvelopeSummary envelope={request.approvedEnvelope ?? request.requestedEnvelope} /></div>
+      {request.usage ? <p className="mt-4 text-sm text-muted-ink">This month: {usage ? `${usage.observed} / ${usage.limit} ${usage.currency}` : request.usage.availability.reason ?? "Usage unavailable"}</p> : null}
       <Link className="mt-5 inline-flex min-h-11 items-center text-sm font-semibold text-brand hover:text-brand-strong" href={`/envelopes/${request.id}`}>View envelope →</Link>
     </li>
   );
@@ -91,20 +101,37 @@ export function NewEnvelopeView() {
   const state = useApiResource<EnvelopeTemplatesResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Choose authority within a server-defined template ceiling." title="New envelope" />
-      <ResourceBoundary state={state}>{({ templates }) => templates.length === 0 ? (
-        <EmptyState title="No data" />
-      ) : <EnvelopeRequestForm templates={templates} />}</ResourceBoundary>
+      <PageHeader description="Request authority from a template or submit a complete custom envelope for administrator review." title="New envelope" />
+      <ResourceBoundary state={state}>{({ templates }) => <EnvelopeRequestForm templates={templates} />}</ResourceBoundary>
     </section>
   );
 }
 
 function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<AvailableEnvelopeTemplate> }>) {
+  const [requestType, setRequestType] = useState<"template" | "custom">(templates.length ? "template" : "custom");
+  const [submitting, setSubmitting] = useState(false);
+  return (
+    <div className="space-y-5">
+      <label className="grid max-w-md gap-2 text-sm font-semibold">Request type
+        <select className="min-h-11 rounded-md border bg-panel px-3 font-normal" disabled={submitting} onChange={(event) => setRequestType(event.target.value === "custom" ? "custom" : "template")} value={requestType}>
+          {templates.length ? <option value="template">Use a template</option> : null}
+          <option value="custom">Custom envelope</option>
+        </select>
+      </label>
+      {requestType === "template" && templates.length
+        ? <TemplateEnvelopeRequestForm onSubmittingChange={setSubmitting} templates={templates} />
+        : <CustomEnvelopeRequestForm onSubmittingChange={setSubmitting} />}
+    </div>
+  );
+}
+
+function TemplateEnvelopeRequestForm({ onSubmittingChange, templates }: Readonly<{ onSubmittingChange: (submitting: boolean) => void; templates: Array<AvailableEnvelopeTemplate> }>) {
   const router = useRouter();
   const session = useSession();
   const [templateId, setTemplateId] = useState(templates[0]?.id ?? "");
   const template = templates.find((item) => item.id === templateId) ?? templates[0];
   const [budget, setBudget] = useState(template.ceiling.spec.budget.monthlyLimit);
+  const [runtimeMinutes, setRuntimeMinutes] = useState(template.ceiling.spec.runtimeMinutesLimit ?? "");
   const [ttl, setTtl] = useState(template.ceiling.spec.ttl);
   const [models, setModels] = useState(() => new Set(template.ceiling.spec.llms.map((item) => `${item.provider}\u0000${item.model}`)));
   const [tools, setTools] = useState(() => new Set(template.ceiling.spec.tools.map((item) => `${item.provider}\u0000${item.resource}\u0000${item.action}`)));
@@ -115,6 +142,7 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
     if (!next) return;
     setTemplateId(id);
     setBudget(next.ceiling.spec.budget.monthlyLimit);
+    setRuntimeMinutes(next.ceiling.spec.runtimeMinutesLimit ?? "");
     setTtl(next.ceiling.spec.ttl);
     setModels(new Set(next.ceiling.spec.llms.map((item) => `${item.provider}\u0000${item.model}`)));
     setTools(new Set(next.ceiling.spec.tools.map((item) => `${item.provider}\u0000${item.resource}\u0000${item.action}`)));
@@ -125,6 +153,7 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
     event.preventDefault();
     if (session.status !== "authenticated") return;
     setSubmission("submitting");
+    onSubmittingChange(true);
     const result = await createRequest({
       body: {
         idempotencyKey: crypto.randomUUID(),
@@ -139,6 +168,7 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
               monthlyLimit: budget,
               singleRunLimit: template.ceiling.spec.budget.singleRunLimit,
             },
+            ...(runtimeMinutes.trim() ? { runtimeMinutesLimit: runtimeMinutes.trim() } : {}),
             ttl,
             llms: template.ceiling.spec.llms.filter((item) => models.has(`${item.provider}\u0000${item.model}`)),
             tools: template.ceiling.spec.tools.filter((item) => tools.has(`${item.provider}\u0000${item.resource}\u0000${item.action}`)),
@@ -154,36 +184,127 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
       return;
     }
     setSubmission(classifyMutationFailure(result.response?.status));
+    onSubmittingChange(false);
   }
 
   return (
     <form className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
       <label className="grid gap-2 text-sm font-semibold">Template
-        <select className="min-h-11 rounded-md border bg-panel px-3 font-normal" onChange={(event) => selectTemplate(event.target.value)} value={template.id}>
+        <select className="min-h-11 rounded-md border bg-panel px-3 font-normal" disabled={submission === "submitting"} onChange={(event) => selectTemplate(event.target.value)} value={template.id}>
           {templates.map((item) => <option key={item.id} value={item.id}>{item.displayName} · revision {item.revision}</option>)}
         </select>
       </label>
-      <div className="grid gap-4 sm:grid-cols-2">
+      <div className="grid gap-4 sm:grid-cols-3">
         <label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})
-          <input className="min-h-11 rounded-md border px-3 font-normal" inputMode="decimal" onChange={(event) => setBudget(event.target.value)} required value={budget} />
+          <input className="min-h-11 rounded-md border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setBudget(event.target.value)} required value={budget} />
         </label>
         <label className="grid gap-2 text-sm font-semibold">Time to live
-          <input className="min-h-11 rounded-md border px-3 font-normal" onChange={(event) => setTtl(event.target.value)} required value={ttl} />
+          <input className="min-h-11 rounded-md border px-3 font-normal" disabled={submission === "submitting"} onChange={(event) => setTtl(event.target.value)} required value={ttl} />
         </label>
+        {template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month
+          <input className="min-h-11 rounded-md border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setRuntimeMinutes(event.target.value)} required value={runtimeMinutes} />
+        </label> : null}
       </div>
       <Accordion preferenceKey={`steward.ui.envelope-accordion.${template.id}.models`} title="Models">
         <div className="space-y-3">{template.ceiling.spec.llms.map((item) => {
           const key = `${item.provider}\u0000${item.model}`;
-          return <label className="flex min-h-11 items-center gap-3 text-sm" key={key}><input checked={models.has(key)} onChange={() => setModels((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next; })} type="checkbox" />{item.provider}/{item.model}</label>;
+          return <label className="flex min-h-11 items-center gap-3 text-sm" key={key}><input checked={models.has(key)} disabled={submission === "submitting"} onChange={() => setModels((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next; })} type="checkbox" />{item.provider}/{item.model}</label>;
         })}</div>
       </Accordion>
       <Accordion preferenceKey={`steward.ui.envelope-accordion.${template.id}.tools`} title="Tools">
         <div className="space-y-3">{template.ceiling.spec.tools.map((item) => {
           const key = `${item.provider}\u0000${item.resource}\u0000${item.action}`;
-          return <label className="flex min-h-11 items-center gap-3 text-sm" key={key}><input checked={tools.has(key)} onChange={() => setTools((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next; })} type="checkbox" />{item.provider}:{item.resource}:{item.action}</label>;
+          return <label className="flex min-h-11 items-center gap-3 text-sm" key={key}><input checked={tools.has(key)} disabled={submission === "submitting"} onChange={() => setTools((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next; })} type="checkbox" />{item.provider}:{item.resource}:{item.action}</label>;
         })}</div>
       </Accordion>
       {submission !== "idle" && submission !== "submitting" ? <p className="text-sm text-red-800" role="alert">{{ conflict: "The template revision changed. Reload before retrying.", rejected: "Rust admission rejected the requested authority as outside the template ceiling.", forbidden: "The Rust authorization boundary rejected the request.", unavailable: "The authoritative request service is unavailable.", error: "The request could not be accepted." }[submission]}</p> : null}
+      <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
+    </form>
+  );
+}
+
+function parseCustomEnvelope(value: string): BrowserEnvelope | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const envelope = parsed as Record<string, unknown>;
+  if (!Number.isSafeInteger(envelope.revision) || typeof envelope.spec !== "object" || envelope.spec === null || Array.isArray(envelope.spec)) return null;
+  const spec = envelope.spec as Record<string, unknown>;
+  if (!Array.isArray(spec.llms) || !Array.isArray(spec.tools) || typeof spec.ttl !== "string") return null;
+  if (typeof spec.budget !== "object" || spec.budget === null || Array.isArray(spec.budget)) return null;
+  const budget = spec.budget as Record<string, unknown>;
+  if (typeof budget.currency !== "string" || typeof budget.monthlyLimit !== "string") return null;
+  return parsed as BrowserEnvelope;
+}
+
+function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmittingChange: (submitting: boolean) => void }>) {
+  const router = useRouter();
+  const session = useSession();
+  const [envelopeJson, setEnvelopeJson] = useState("");
+  const [submission, setSubmission] = useState<"idle" | "submitting" | "invalid" | MutationFailureState>("idle");
+  const idempotencyKey = useRef<string | null>(null);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (session.status !== "authenticated") return;
+    const requestedEnvelope = parseCustomEnvelope(envelopeJson);
+    if (!requestedEnvelope) {
+      setSubmission("invalid");
+      return;
+    }
+    setSubmission("submitting");
+    onSubmittingChange(true);
+    const result = await createRequest({
+      body: {
+        idempotencyKey: idempotencyKey.current ??= crypto.randomUUID(),
+        requestedEnvelope,
+      },
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "X-Steward-CSRF": session.value.csrf },
+    });
+    if (result.data && result.response?.status === 201) {
+      router.push(`/envelopes/${result.data.request.id}`);
+      return;
+    }
+    setSubmission(classifyMutationFailure(result.response?.status));
+    onSubmittingChange(false);
+  }
+
+  const failure = submission === "invalid"
+    ? "Enter a complete envelope JSON object with revision, budget, models, tools, and TTL."
+    : submission !== "idle" && submission !== "submitting"
+      ? {
+          conflict: "An equivalent envelope request already exists. Reload before retrying.",
+          rejected: "Steward rejected the custom authority. It must fit the deployment safety ceiling and capability catalog.",
+          forbidden: "The Rust authorization boundary rejected the request.",
+          unavailable: "The authoritative request service is unavailable.",
+          error: "The request could not be accepted.",
+        }[submission]
+      : null;
+
+  return (
+    <form className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
+      <div>
+        <h2 className="font-semibold">Complete requested authority</h2>
+        <p className="mt-1 text-sm text-muted-ink">Custom requests have no governing template and always require administrator approval. Steward validates the complete envelope against the deployment safety ceiling; model, tool, and limit values are specific to this deployment.</p>
+      </div>
+      <label className="grid gap-2 text-sm font-semibold">Complete envelope JSON
+        <textarea
+          className="min-h-80 rounded-md border bg-canvas p-4 font-mono text-xs font-normal"
+          disabled={submission === "submitting"}
+          onChange={(event) => { setEnvelopeJson(event.target.value); idempotencyKey.current = null; setSubmission("idle"); }}
+          placeholder={'{\n  "revision": 1,\n  "spec": {\n    "llms": [],\n    "tools": [],\n    "budget": { "monthlyLimit": "1.00", "currency": "USD" },\n    "runtimeMinutesLimit": "60",\n    "ttl": "15m",\n    "runner": {}\n  }\n}'}
+          required
+          spellCheck={false}
+          value={envelopeJson}
+        />
+      </label>
+      {failure ? <p className="text-sm text-red-800" role="alert">{failure}</p> : null}
       <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
     </form>
   );
@@ -201,14 +322,26 @@ export function EnvelopeDetailView({ requestId }: Readonly<{ requestId: string }
 }
 
 function EnvelopeDetail({ request }: Readonly<{ request: UserEnvelopeRequest }>) {
+  const usage = request.usage?.spend;
   return (
     <div className="space-y-5">
       <article className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
-        <div className="flex flex-wrap justify-between gap-3"><div><h2 className="text-xl font-semibold">{request.templateId}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div><StatusBadge value={request.status} /></div>
+        <div className="flex flex-wrap justify-between gap-3"><div><h2 className="text-xl font-semibold">{request.templateId ?? "Custom envelope"}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div><StatusBadge value={request.status} /></div>
         <EnvelopeSummary envelope={request.approvedEnvelope ?? request.requestedEnvelope} />
+        {request.usage ? <DefinitionList items={[
+          ["Period", `${dateTime(request.usage.period.start)} – ${dateTime(request.usage.period.end)}`],
+          ["Spend", usage ? `${usage.observed} / ${usage.limit} ${usage.currency}` : request.usage.availability.reason ?? "Unavailable"],
+          ["Observed", usage ? dateTime(usage.observedAt) : "Not reported"],
+        ]} /> : null}
         {request.reason ? <p className="rounded-md bg-notice p-4 text-sm"><strong>Server reason:</strong> {request.reason}</p> : null}
         {request.envelopeInstanceId ? <PrimaryLink href={`/envelopes/${request.id}/runs`}>View recent runs</PrimaryLink> : null}
       </article>
+      <section className="space-y-3 rounded-panel border bg-panel p-6 shadow-sm">
+        <h2 className="text-xl font-semibold">Status history</h2>
+        {request.history.length ? <ol className="space-y-3">{request.history.map((event, index) => (
+          <li className="rounded-md border p-3" key={`${event.at}-${index}`}><div className="flex items-center justify-between gap-3"><StatusBadge value={event.status} /><time className="text-xs text-muted-ink">{dateTime(event.at)}</time></div><p className="mt-2 text-sm">Actor: {event.actor}</p>{event.reason ? <p className="mt-1 text-sm text-muted-ink">{event.reason}</p> : null}</li>
+        ))}</ol> : <EmptyState title="No history" />}
+      </section>
       {request.status === "provisioned" ? <WorkflowGenerator requestId={request.id} /> : <EmptyState title="Workflow not available"><p>A governed GitHub Actions workflow can be rendered only after this request is provisioned.</p></EmptyState>}
     </div>
   );
@@ -228,7 +361,10 @@ function WorkflowGenerator({ requestId }: Readonly<{ requestId: string }>) {
     if (!selected) { setStatus("rejected"); return; }
     setStatus("loading");
     const result = await renderWorkflowForEnvelope(session.value.csrf, requestId, selected);
-    if (result.data && result.response?.ok) { setWorkflow(result.data); setStatus("idle"); } else setStatus(classifyMutationFailure(result.response?.status));
+    if (result.data && result.response?.ok) {
+      setWorkflow(result.data);
+      setStatus("idle");
+    } else setStatus(classifyMutationFailure(result.response?.status));
   }
   return (
     <section className="space-y-4 rounded-panel border bg-panel p-6 shadow-sm" aria-labelledby="workflow-title">
@@ -240,7 +376,7 @@ function WorkflowGenerator({ requestId }: Readonly<{ requestId: string }>) {
         </form>
       )}</ResourceBoundary>
       {status !== "idle" && status !== "loading" ? <p role="alert" className="text-sm text-red-800">{{ conflict: "The envelope changed before the workflow could be rendered. Reload before retrying.", rejected: "Rust rejected the workflow inputs.", forbidden: "The Rust authorization boundary rejected workflow rendering.", unavailable: "The authoritative workflow service is unavailable.", error: "The workflow response could not be accepted." }[status]}</p> : null}
-      {workflow ? <div className="space-y-2"><p className="text-xs text-muted-ink">SHA-256: <span className="break-all font-mono">{workflow.workflow.sha256}</span></p><textarea aria-label="Generated workflow" className="min-h-80 w-full rounded-md border bg-canvas p-4 font-mono text-xs" readOnly value={workflow.workflow.yaml} /></div> : null}
+      {workflow ? <div className="space-y-2"><p className="text-xs text-muted-ink">Suggested path: <span className="break-all font-mono">{workflow.workflow.suggestedPath}</span></p><p className="text-xs text-muted-ink">SHA-256: <span className="break-all font-mono">{workflow.workflow.sha256}</span></p><textarea aria-label="Generated workflow" className="min-h-80 w-full rounded-md border bg-canvas p-4 font-mono text-xs" readOnly value={workflow.workflow.yaml} /></div> : null}
     </section>
   );
 }
