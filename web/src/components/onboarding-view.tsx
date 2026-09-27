@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useState } from "react";
 
 import {
@@ -15,6 +16,7 @@ import {
   type MyRunsResponse,
   type PublishedWorkflowsResponse,
 } from "@/api-client";
+import { SectionCard } from "@/components/hs";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -100,7 +102,7 @@ export function sampleRunDone(
 export function OnboardingView() {
   const session = useSession();
   const [workflowAcknowledgement, setWorkflowAcknowledgement] = useState<"idle" | "working" | "done" | MutationFailureState>("idle");
-  const [dismissal, setDismissal] = useState<"idle" | "working" | "done" | MutationFailureState>("idle");
+  const [dismissal, setDismissal] = useState<"idle" | "working" | "done" | "shown" | MutationFailureState>("idle");
   const load = useCallback(async () => {
     const [connections, envelopes, preferences, workflows, runs] = await Promise.all([
       listProviderConnections({ cache: "no-store", credentials: "same-origin" }),
@@ -122,6 +124,16 @@ export function OnboardingView() {
   }, []);
   const state = useApiResource<OnboardingData>(load);
 
+  async function setOnboardingDismissed(value: boolean) {
+    if (session.status !== "authenticated") return;
+    setDismissal("working");
+    const result = await updateBrowserPreferences({ body: { onboardingDismissed: value }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf } });
+    if (result.data && result.response?.ok) {
+      setDismissal(value ? "done" : "shown");
+      window.dispatchEvent(new CustomEvent("hypershell:preferences-updated", { detail: { onboardingDismissed: value } }));
+    } else setDismissal(classifyMutationFailure(result.response?.status));
+  }
+
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader description="Set up a governed envelope and run Steward's sample Workflow." title="Get started" />
@@ -136,20 +148,25 @@ export function OnboardingView() {
         const workflowReady = data.preferences.workflowAcknowledged || workflowAcknowledgement === "done";
         const firstRun = sampleRunDone(data.runs.runs, sampleWorkflow, provisionedEnvelopeIds);
         const steps = [
-          ["Connect GitHub", connected, "Authorize GitHub from Connections."],
-          ["Provision an envelope", provisioned, "Choose any eligible named envelope template."],
+          ["Connect GitHub", connected, "Authorize GitHub from Connections.", "/connections", "Open connections"],
+          ["Provision an envelope", provisioned, "Choose any eligible named envelope template.", "/envelopes/new", "Request envelope"],
           ["Add the generated workflow", workflowReady, sampleWorkflow
             ? `Render ${sampleWorkflow} from the envelope detail and commit its GitHub Actions file.`
-            : "The deployment has no executable onboarding sample."],
-          ["Run the test workflow", firstRun, "Run it from GitHub with gh workflow run or the Actions UI."],
-          ["Inspect the governed run", firstRun, "Return here to inspect stages, logs, provenance, and spend."],
+            : "The deployment has no executable onboarding sample.", "/envelopes", "Open envelopes"],
+          ["Run the test workflow", firstRun, "Run it from GitHub with gh workflow run or the Actions UI.", "/runs", "Check runs"],
+          ["Inspect the governed run", firstRun, "Return here to inspect stages, logs, provenance, and spend.", "/runs", "Open runs"],
         ] as const;
-        if (data.preferences.onboardingDismissed || dismissal === "done") {
-          return <p className="rounded-panel border bg-panel p-6 text-sm text-muted-ink">Onboarding is dismissed for your account. You can still use the links in the main navigation.</p>;
+        if ((data.preferences.onboardingDismissed && dismissal !== "shown") || dismissal === "done") {
+          return <SectionCard title="Checklist dismissed"><p className="text-sm text-muted-ink">The onboarding link is hidden from your sidebar. Your progress is still preserved.</p><button className="mt-5 min-h-10 rounded-control border px-4 py-2 text-sm font-semibold" disabled={dismissal === "working"} onClick={() => void setOnboardingDismissed(false)} type="button">Show checklist again</button></SectionCard>;
         }
+        const completed = steps.filter(([, done]) => done).length;
         return (
-          <div className="space-y-5">
-            <ol className="space-y-3">{steps.map(([label, done, detail], index) => <li className="rounded-panel border bg-panel p-5 shadow-sm" key={label}><div className="flex items-center justify-between gap-3"><h2 className="font-semibold">{index + 1}. {label}</h2><StatusBadge value={done ? "done" : "pending"} /></div><p className="mt-2 text-sm text-muted-ink">{detail}</p></li>)}</ol>
+          <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_300px]">
+            <SectionCard title="Setup checklist">
+              <ol className="divide-y divide-line-soft">{steps.map(([label, done, detail, href, action], index) => <li className="grid gap-3 py-5 first:pt-0 last:pb-0 sm:grid-cols-[36px_minmax(0,1fr)_auto] sm:items-start" key={label}><span aria-hidden="true" className={`grid size-8 place-items-center rounded-full text-sm font-bold ${done ? "bg-ok-soft text-ok" : "border bg-panel text-muted-ink"}`}>{done ? "✓" : index + 1}</span><div><h2 className="font-semibold">{index + 1}. {label}</h2><p className="mt-1 text-sm text-muted-ink">{detail}</p></div><div className="flex items-center gap-3"><StatusBadge value={done ? "done" : "pending"} />{!done ? <Link className="text-sm font-semibold" href={href}>{action}</Link> : null}</div></li>)}</ol>
+            </SectionCard>
+            <aside className="space-y-5">
+              <SectionCard title="Progress"><p className="text-4xl font-semibold tracking-tight">{completed}<span className="text-xl text-muted-ink"> / {steps.length}</span></p><div aria-label={`${completed} of ${steps.length} onboarding steps complete`} className="mt-4 h-2 overflow-hidden rounded-full bg-line-soft"><div className={`h-full rounded-full bg-brand ${completed === 0 ? "w-0" : completed === 1 ? "w-1/5" : completed === 2 ? "w-2/5" : completed === 3 ? "w-3/5" : completed === 4 ? "w-4/5" : "w-full"}`} /></div><p className="mt-3 text-sm text-muted-ink">Complete the steps in order to prove a governed GitHub workflow end to end.</p></SectionCard>
             {sampleWorkflow && !workflowReady ? <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={workflowAcknowledgement === "working"} onClick={async () => {
               if (session.status !== "authenticated") return;
               setWorkflowAcknowledgement("working");
@@ -157,13 +174,9 @@ export function OnboardingView() {
               setWorkflowAcknowledgement(result.data && result.response?.ok ? "done" : classifyMutationFailure(result.response?.status));
             }} type="button">I added the sample workflow</button> : null}
             {workflowAcknowledgement !== "idle" && workflowAcknowledgement !== "working" && workflowAcknowledgement !== "done" ? <p className="text-sm text-red-800" role="alert">The workflow acknowledgement could not be saved ({workflowAcknowledgement}).</p> : null}
-            <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={dismissal === "working"} onClick={async () => {
-              if (session.status !== "authenticated") return;
-              setDismissal("working");
-              const result = await updateBrowserPreferences({ body: { onboardingDismissed: true }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf } });
-              setDismissal(result.data && result.response?.ok ? "done" : classifyMutationFailure(result.response?.status));
-            }} type="button">Dismiss checklist</button>
-            {dismissal !== "idle" && dismissal !== "working" ? <p className="text-sm text-red-800" role="alert">The checklist preference could not be saved ({dismissal}).</p> : null}
+              <button className="min-h-10 w-full rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={dismissal === "working"} onClick={() => void setOnboardingDismissed(true)} type="button">Dismiss checklist</button>
+              {dismissal !== "idle" && dismissal !== "working" && dismissal !== "shown" ? <p className="text-sm text-red-800" role="alert">The checklist preference could not be saved ({dismissal}).</p> : null}
+            </aside>
           </div>
         );
       }}</ResourceBoundary>

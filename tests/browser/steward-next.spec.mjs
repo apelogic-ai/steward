@@ -1305,6 +1305,18 @@ test("onboarding persists workflow acknowledgement and ignores unrelated runs", 
     await developer.page.reload();
     await expect(developer.page.getByRole("listitem").filter({ hasText: "3. Add the generated workflow" }).getByText("done", { exact: true })).toBeVisible();
     await expect(developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" }).getByText("pending", { exact: true })).toBeVisible();
+
+    await developer.page.getByRole("button", { name: "Dismiss checklist" }).click();
+    await expect(developer.page.getByRole("heading", { name: "Checklist dismissed" })).toBeVisible();
+    await expect(developer.page.getByRole("link", { name: "Get started" })).toHaveCount(0);
+    const dismissal = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
+    expect(dismissal.body).toEqual({ onboardingDismissed: true });
+
+    await developer.page.getByRole("button", { name: "Show checklist again" }).click();
+    await expect(developer.page.getByRole("heading", { name: "Setup checklist" })).toBeVisible();
+    await expect(developer.page.getByRole("link", { name: "Get started" })).toBeVisible();
+    const restored = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
+    expect(restored.body).toEqual({ onboardingDismissed: false });
   } finally {
     await closeGuardedPage(developer);
   }

@@ -270,13 +270,14 @@ function ProfileMenu({ adminMode, session }: Readonly<{
   );
 }
 
-function AppSidebar({ adminMode, needsAction, session }: Readonly<{
+function AppSidebar({ adminMode, needsAction, onboardingDismissed, session }: Readonly<{
   adminMode: boolean;
   needsAction: number | null;
+  onboardingDismissed: boolean;
   session: Extract<SessionState, { status: "authenticated" }>;
 }>) {
   const pathname = usePathname();
-  const navigation = adminMode ? adminNavigation : userNavigation;
+  const navigation = adminMode ? adminNavigation : userNavigation.filter((item) => !onboardingDismissed || item.href !== "/get-started");
   return (
     <aside className="flex min-h-full flex-col border-b border-line bg-panel px-3 pt-[18px] pb-3 md:sticky md:top-0 md:h-screen md:border-e md:border-b-0">
       <Link aria-label="HyperShell home" className="flex items-center gap-2.5 px-2 pb-[22px] text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"}>
@@ -317,6 +318,7 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
   const adminMode = pathname === "/admin" || pathname.startsWith("/admin/");
   const workspaceAuthorized = session.status === "authenticated" && (!adminMode || session.value.role === "admin");
   const [needsAction, setNeedsAction] = useState<number | null>(null);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(false);
 
   useEffect(() => {
     if (!adminMode || !workspaceAuthorized) return;
@@ -327,11 +329,29 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
     return () => { active = false; };
   }, [adminMode, workspaceAuthorized]);
 
+  useEffect(() => {
+    if (adminMode || !workspaceAuthorized) return;
+    let active = true;
+    void getBrowserPreferences({ cache: "no-store", credentials: "same-origin" }).then((result) => {
+      if (active && result.data && result.response?.ok) setOnboardingDismissed(result.data.onboardingDismissed);
+    });
+    const preferencesUpdated = (event: Event) => {
+      if (event instanceof CustomEvent && typeof event.detail?.onboardingDismissed === "boolean") {
+        setOnboardingDismissed(event.detail.onboardingDismissed);
+      }
+    };
+    window.addEventListener("hypershell:preferences-updated", preferencesUpdated);
+    return () => {
+      active = false;
+      window.removeEventListener("hypershell:preferences-updated", preferencesUpdated);
+    };
+  }, [adminMode, workspaceAuthorized]);
+
   return (
     <TooltipProvider>
       <div className="min-h-screen md:grid md:grid-cols-[216px_minmax(0,1fr)]">
         <a className="sr-only focus:not-sr-only focus:fixed focus:start-4 focus:top-4 focus:z-50 focus:rounded-control focus:bg-panel focus:px-4 focus:py-3" href="#workspace">Skip to workspace</a>
-        {session.status === "authenticated" && workspaceAuthorized ? <AppSidebar adminMode={adminMode} needsAction={needsAction} session={session} /> : <div className="hidden md:block" />}
+        {session.status === "authenticated" && workspaceAuthorized ? <AppSidebar adminMode={adminMode} needsAction={needsAction} onboardingDismissed={onboardingDismissed} session={session} /> : <div className="hidden md:block" />}
         <main className="min-w-0 px-4 pt-[18px] pb-16 sm:px-7" id="workspace">
           <div className="mx-auto max-w-[1180px]">
             {session.status === "loading" ? <StatePanel title="Loading HyperShell"><p>Checking the server-owned session…</p></StatePanel> : null}
