@@ -19,6 +19,7 @@ import {
   type AdminRequestView,
   type AdminRequestsResponse,
 } from "@/api-client";
+import { FilterTabs, SectionCard } from "@/components/hs";
 import { DefinitionList, EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -67,11 +68,49 @@ export function AdminApprovalsView() {
       <ResourceBoundary state={state}>{({ requests }) => requests.length === 0 ? (
         <EmptyState title="No data" />
       ) : (
-        <ul className="space-y-5">
-          {requests.map((request) => <UnifiedRequestCard key={request.id} request={request} />)}
-        </ul>
+        <RequestWorkspace requests={requests} />
       )}</ResourceBoundary>
     </section>
+  );
+}
+
+function requestSourceLabel(source: AdminRequestView["source"]): string {
+  return {
+    envelope_request: "Envelope",
+    runtime_exception: "Exception",
+    escalation: "Limit",
+  }[source];
+}
+
+function RequestWorkspace({ requests }: Readonly<{ requests: Array<AdminRequestView> }>) {
+  const [source, setSource] = useState("all");
+  const [selectedId, setSelectedId] = useState(requests[0]?.id ?? "");
+  const visible = source === "all" ? requests : requests.filter((request) => request.source === source);
+  const selected = visible.find((request) => request.id === selectedId) ?? visible[0];
+  const counts = new Map<AdminRequestView["source"], number>();
+  for (const request of requests) counts.set(request.source, (counts.get(request.source) ?? 0) + 1);
+
+  return (
+    <div className="space-y-5">
+      <FilterTabs active={source} items={[
+        { count: requests.length, label: "All", value: "all" },
+        { count: counts.get("envelope_request") ?? 0, label: "Envelopes", value: "envelope_request" },
+        { count: counts.get("runtime_exception") ?? 0, label: "Exceptions", value: "runtime_exception" },
+        { count: counts.get("escalation") ?? 0, label: "Limits", value: "escalation" },
+      ]} onChange={setSource} />
+      <div className="grid min-h-[620px] overflow-hidden rounded-panel border bg-panel shadow-sm lg:grid-cols-[minmax(280px,0.72fr)_minmax(0,1.45fr)]">
+        <section aria-label="Request queue" className="border-b border-line lg:border-b-0 lg:border-r">
+          <div className="flex items-center justify-between border-b border-line px-5 py-4"><h2 className="text-sm font-semibold">Needs review</h2><span className="font-mono text-xs text-muted-ink">{visible.length}</span></div>
+          {visible.length ? <ul className="divide-y divide-line-soft">{visible.map((request) => {
+            const active = request.id === selected?.id;
+            return <li key={request.id}><button aria-current={active ? "true" : undefined} className={`grid w-full gap-3 px-5 py-4 text-left transition-colors hover:bg-subtle ${active ? "bg-brand-soft" : ""}`} onClick={() => setSelectedId(request.id)} type="button"><span className="flex items-center justify-between gap-3"><span className="text-xs font-semibold uppercase tracking-wide text-muted-ink">{requestSourceLabel(request.source)}</span><StatusBadge value={request.state} /></span><span><span className="block font-semibold">{request.template.displayName ?? "Custom envelope"}</span><span className="mt-1 block truncate text-sm text-muted-ink">{request.requester.displayEmail}</span></span><span className="text-xs text-faint-ink">{new Date(request.createdAt).toLocaleString()}</span></button></li>;
+          })}</ul> : <div className="p-5"><EmptyState title="No matching requests" /></div>}
+        </section>
+        <section aria-label="Request detail" className="min-w-0 bg-subtle p-4 sm:p-6">
+          {selected ? <ul><UnifiedRequestCard key={selected.id} request={selected} /></ul> : <EmptyState title="Select a request" />}
+        </section>
+      </div>
+    </div>
   );
 }
 
@@ -189,7 +228,7 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
 
   if (request.source === "escalation" && request.escalation) {
     return (
-      <li className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
+      <li className="space-y-5">
         <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="text-xl font-semibold">{request.template.displayName}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">Escalation {request.id}</p></div><StatusBadge value={status === "approved" ? "approved" : status === "rejected" ? "rejected" : request.state} /></div>
         <DefinitionList items={[["Requested by", request.requester.displayEmail], ["Envelope instance", request.escalation.envelopeInstanceId], ["Blocked task", request.escalation.blockedTaskUid], ["Parked", request.escalation.parkedAt]]} />
         <ul className="space-y-2">{request.escalation.meters.map((meter) => <li className="rounded-md border p-4" key={meter.dimension}><p className="font-semibold">{meter.dimension === "llm_spend" ? "LLM spend" : "Runtime minutes"}</p><p className="mt-1 text-sm">{meter.used} / {meter.limit} {meter.unit}</p><p className="mt-1 text-xs text-muted-ink">Observed {meter.observedAt}</p></li>)}</ul>
@@ -208,10 +247,10 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
   }
 
   return (
-    <li className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
+    <li className="space-y-5">
       <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="text-xl font-semibold">{request.template.displayName ?? "Custom envelope request"}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div><StatusBadge value={status === "approved" ? "approved" : status === "rejection-complete" ? "rejected" : request.state} /></div>
-      <DefinitionList items={[["Kind", request.kind], ["Source", request.source], ["Requested by", request.requester.displayEmail], ["Created", request.createdAt], ["State actor", request.stateActor]]} />
-      {request.deltas.length ? <section className="space-y-3"><h3 className="font-semibold">Requested changes</h3><ul className="space-y-2">{request.deltas.map((delta, index) => <li className="rounded-md border p-3 text-sm" key={`${delta.dimension}-${index}`}><strong>{delta.dimension}</strong>: {deltaValue(delta.requested)} <span className="text-muted-ink">(ceiling {deltaValue(delta.ceiling)})</span></li>)}</ul></section> : <p className="rounded-md bg-notice p-4 text-sm">{request.kind === "custom" ? "This custom request has no governing template." : "This request is within the configured ceiling."}</p>}
+      <SectionCard title="Request"><DefinitionList items={[["Kind", request.kind], ["Source", requestSourceLabel(request.source)], ["Requested by", request.requester.displayEmail], ["Created", request.createdAt], ["State actor", request.stateActor]]} /></SectionCard>
+      {request.deltas.length ? <SectionCard title="Requested changes"><ul className="divide-y divide-line-soft">{request.deltas.map((delta, index) => <li className="grid gap-1 py-3 text-sm first:pt-0 last:pb-0 sm:grid-cols-[minmax(140px,0.7fr)_1fr_1fr]" key={`${delta.dimension}-${index}`}><strong>{delta.dimension}</strong><span>Requested <strong>{deltaValue(delta.requested)}</strong></span><span className="text-muted-ink">Ceiling {deltaValue(delta.ceiling)}</span></li>)}</ul></SectionCard> : <p className="rounded-control border border-line bg-notice p-4 text-sm">{request.kind === "custom" ? "This custom request has no governing template." : "This request is within the configured ceiling."}</p>}
       {reference ? <DefinitionList items={[["Decision key", reference.decisionKey], ["Evidence URL", reference.evidenceUrl]]} /> : <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={status === "filing"} onClick={() => void fileDecision()} type="button">{status === "filing" ? "Filing…" : "File decision reference"}</button>}
       <form className="grid gap-4 border-t pt-5 sm:grid-cols-2" onSubmit={approve}>
         <label className="grid gap-2 text-sm font-semibold sm:col-span-2">Rationale<textarea className="min-h-24 rounded-md border p-3 font-normal" name="rationale" required /></label>

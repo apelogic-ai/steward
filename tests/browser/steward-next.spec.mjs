@@ -1572,7 +1572,7 @@ test("administrator templates and approvals use typed browser authority", async 
     });
     await expect(envelopeRequestCard).toBeVisible();
     await expect(envelopeRequestCard.getByText("alice@example.com")).toBeVisible();
-    await expect(envelopeRequestCard.getByText("envelope_request", { exact: true })).toBeVisible();
+    await expect(envelopeRequestCard.getByText("Envelope", { exact: true })).toBeVisible();
     await expect(envelopeRequestCard.getByRole("heading", { name: "Requested changes" })).toBeVisible();
     await expect(envelopeRequestCard.getByRole("button", { name: "Reject request" })).toBeVisible();
     await envelopeRequestCard.getByLabel("Rationale", { exact: true }).fill("Approved for the requested bounded envelope.");
@@ -1581,6 +1581,7 @@ test("administrator templates and approvals use typed browser authority", async 
     const envelopeApprovalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`);
     expectMutationProof(envelopeApprovalMutation);
     expect(envelopeApprovalMutation.body.rationale).toBe("Approved for the requested bounded envelope.");
+    await administrator.page.getByLabel("Request queue").getByRole("button", { name: /Exception/ }).click();
     const runtimeApprovalCard = administrator.page.getByRole("listitem").filter({
       has: administrator.page.getByText(approvalId, { exact: true }),
     });
