@@ -259,7 +259,10 @@ function AuthenticatedTemplateList() {
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader
-        actions={<Link className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-strong" href="/admin/envelopes/templates/new">Create template</Link>}
+        actions={<div className="flex flex-wrap gap-3">
+          <Link className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas" href="/admin/envelopes/provision">Provision envelope</Link>
+          <Link className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-strong" href="/admin/envelopes/templates/new">Create template</Link>
+        </div>}
         description="Review the current immutable envelope templates available in Steward."
         title="Envelope templates"
       />

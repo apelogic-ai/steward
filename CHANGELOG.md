@@ -18,7 +18,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   connection status; catalog metadata; and durable onboarding progress.
 - Added exact administrator provisioning of a catalog-backed User Envelope for
   an eligible canonical user, plus template-free custom requests that remain
-  pending until an explicit decision. Custom requests fail closed unless an
+  pending until an explicit decision. The browser exposes both flows: users may
+  submit a complete custom Envelope without choosing a template, and
+  administrators may provision an exact template revision to a canonical user.
+  Custom requests fail closed unless an
   operator configures `customEnvelopeSafetyCeiling`; Steward rechecks their
   capabilities, budget, runtime minutes, TTL, and runner authority against the
   current ceiling at both creation and approval.

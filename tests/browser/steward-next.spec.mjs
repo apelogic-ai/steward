@@ -226,6 +226,7 @@ const presentationRoutes = [
   { path: "/connections", heading: "Connections", activeNavigation: "Connections" },
   { path: "/settings", heading: "Settings", activeNavigation: "Settings" },
   { path: "/admin/envelopes/templates", heading: "Envelope templates", activeNavigation: "Templates" },
+  { path: "/admin/envelopes/provision", heading: "Provision envelope", activeNavigation: "Provision" },
   { path: "/admin/envelopes/templates/analyst", heading: "Envelope template", activeNavigation: "Templates" },
   { path: "/admin/workflows", heading: "Workflows", activeNavigation: "Workflows" },
   { path: "/admin/workflows/new", heading: "New workflow", activeNavigation: "Workflows" },
@@ -299,6 +300,7 @@ async function startWeb() {
         requestUrl.pathname === "/app/api/v1/envelope-requests"
         || requestUrl.pathname.endsWith("/github-actions-workflow")
         || requestUrl.pathname.startsWith("/admin/api/v1/envelope-templates/")
+        || requestUrl.pathname === "/admin/api/v1/envelopes/provision"
         || requestUrl.pathname === "/admin/api/v1/workflows"
         || requestUrl.pathname.endsWith("/versions")
         || requestUrl.pathname === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`
@@ -321,7 +323,12 @@ async function startWeb() {
           headers: request.headers,
           body: rawBody ? JSON.parse(rawBody) : null,
         });
-        const failureStatus = mutationFailures[requestUrl.pathname];
+        const configuredFailure = mutationFailures[requestUrl.pathname];
+        const failure = Array.isArray(configuredFailure) ? configuredFailure.shift() : configuredFailure;
+        const failureStatus = typeof failure === "object" && failure !== null ? failure.status : failure;
+        if (typeof failure === "object" && failure !== null && failure.delayMs) {
+          await new Promise((resolve) => setTimeout(resolve, failure.delayMs));
+        }
         if (failureStatus) {
           response.writeHead(failureStatus, { "content-type": "application/json", "cache-control": "no-store" });
           response.end("{}");
@@ -345,6 +352,27 @@ async function startWeb() {
             memberRoles: submitted.memberRoles,
             envelope: submitted.envelope,
             autoProvisionThreshold: submitted.autoProvisionThreshold ?? null,
+          }));
+          return;
+        }
+        if (requestUrl.pathname === "/admin/api/v1/envelopes/provision") {
+          const submitted = JSON.parse(rawBody);
+          response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+          response.end(JSON.stringify({
+            apiVersion: "steward.browser-admin/v1",
+            request: {
+              actedBy: administratorSession.principal.userId,
+              approvalId: "00000000-0000-0000-0000-000000000009",
+              approvedEnvelope: submitted.requestedEnvelope,
+              envelopeDigest: `sha256:${"e".repeat(64)}`,
+              envelopeInstanceId: "env_00000000000000000000000000000009",
+              requestId: "00000000-0000-0000-0000-000000000009",
+              requestedEnvelope: submitted.requestedEnvelope,
+              status: "provisioned",
+              statusAt: "2026-08-24T17:10:00Z",
+              templateId: submitted.templateId,
+              templateRevision: submitted.templateRevision,
+            },
           }));
           return;
         }
@@ -1098,13 +1126,13 @@ test("empty entity collections show only No data", async ({ browser }) => {
   try {
     for (const path of [
       "/envelopes",
-      "/envelopes/new",
       `/envelopes/${envelopeId}/runs`,
       "/runs",
       `/runs/${taskUid}`,
       "/admin/runs",
       `/admin/runs/${taskUid}`,
       "/admin/envelopes/templates",
+      "/admin/envelopes/provision",
       "/admin/workflows",
       "/admin/approvals",
     ]) {
@@ -1128,7 +1156,7 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await expect(developer.page.getByText("25.00 USD")).toBeVisible();
 
     await developer.page.goto(`${origin}/envelopes/new`);
-    const template = developer.page.getByLabel("Template");
+    const template = developer.page.locator("label").filter({ hasText: /^Template/ }).locator("select");
     await expect(template.locator("option")).toHaveText(["Analyst · revision 2", "Developer · revision 4"]);
     await expect(template).toHaveValue("analyst");
     await expect(developer.page.getByLabel("Monthly limit (USD)")).toHaveValue("10.00");
@@ -1188,6 +1216,81 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await expect(administrator.page.getByText("repository-review@1")).toBeVisible();
     await administrator.page.goto(`${origin}/admin/runs/${taskUid}`);
     await expect(administrator.page.getByRole("heading", { name: "Timeline" })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("users can request a custom envelope without selecting a template", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    expectedHttpStatuses: [503],
+    mutationFailures: { "/app/api/v1/envelope-requests": [{ delayMs: 1_000, status: 503 }] },
+  });
+  try {
+    await developer.page.goto(`${origin}/envelopes/new`);
+    await developer.page.getByLabel("Request type").selectOption("custom");
+    await expect(developer.page.locator("label").filter({ hasText: /^Template/ }).locator("select")).toHaveCount(0);
+    await developer.page.getByLabel("Complete envelope JSON").fill(JSON.stringify(analystEnvelope, null, 2));
+    await developer.page.getByRole("button", { name: "Submit request" }).click();
+    await Promise.all([
+      expect(developer.page.getByLabel("Request type")).toBeDisabled(),
+      expect(developer.page.getByLabel("Complete envelope JSON")).toBeDisabled(),
+      expect(developer.page.locator('button[type="submit"]')).toBeDisabled(),
+    ]);
+    await expect(developer.page.getByRole("alert").filter({ hasText: "unavailable" })).toBeVisible();
+    await developer.page.getByRole("button", { name: "Submit request" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
+
+    const mutations = developer.mutations.filter((entry) => entry.path === "/app/api/v1/envelope-requests");
+    expect(mutations).toHaveLength(2);
+    const mutation = mutations[1];
+    expectMutationProof(mutation);
+    expect(mutations[0].body.idempotencyKey).toBe(mutation.body.idempotencyKey);
+    expect(mutation.body).not.toHaveProperty("templateId");
+    expect(mutation.body).not.toHaveProperty("templateRevision");
+    expect(mutation.body.requestedEnvelope).toEqual(analystEnvelope);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("administrators can provision a template envelope directly to a user", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    expectedHttpStatuses: [503],
+    mutationFailures: { "/admin/api/v1/envelopes/provision": [{ delayMs: 1_000, status: 503 }] },
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates`);
+    await administrator.page.getByRole("link", { name: "Provision envelope" }).click();
+    await expect(administrator.page).toHaveURL(`${origin}/admin/envelopes/provision`);
+
+    await administrator.page.getByLabel("Canonical user ID").fill(developerSession.principal.userId);
+    const template = administrator.page.getByLabel("Template");
+    await expect(template.locator("option")).toHaveText([
+      "Analyst · revision 4",
+      "Developer · revision 4",
+    ]);
+    await template.selectOption("developer");
+    await administrator.page.getByRole("button", { name: "Provision envelope" }).click();
+    await Promise.all([
+      expect(administrator.page.getByLabel("Canonical user ID")).toBeDisabled(),
+      expect(template).toBeDisabled(),
+      expect(administrator.page.locator('button[type="submit"]')).toBeDisabled(),
+    ]);
+    await expect(administrator.page.getByRole("alert").filter({ hasText: "unavailable" })).toBeVisible();
+    await administrator.page.getByRole("button", { name: "Provision envelope" }).click();
+    await expect(administrator.page.getByRole("status")).toContainText("Envelope provisioned");
+
+    const mutations = administrator.mutations.filter((entry) => entry.path === "/admin/api/v1/envelopes/provision");
+    expect(mutations).toHaveLength(2);
+    const mutation = mutations[1];
+    expectMutationProof(mutation);
+    expect(mutations[0].body.idempotencyKey).toBe(mutation.body.idempotencyKey);
+    expect(mutation.body.ownerUserId).toBe(developerSession.principal.userId);
+    expect(mutation.body.templateId).toBe("developer");
+    expect(mutation.body.templateRevision).toBe(4);
+    expect(mutation.body.requestedEnvelope).toEqual(envelope);
   } finally {
     await closeGuardedPage(administrator);
   }

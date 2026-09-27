@@ -19,6 +19,7 @@ const developerNavigation = [
 const adminNavigation = [
   { href: "/admin/workflows", label: "Workflows" },
   { href: "/admin/envelopes/templates", label: "Templates" },
+  { href: "/admin/envelopes/provision", label: "Provision" },
   { href: "/admin/runs", label: "Runs" },
   { href: "/admin/approvals", label: "Approvals" },
   { href: "/admin/settings", label: "Settings" },
