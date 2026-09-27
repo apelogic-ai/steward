@@ -8,7 +8,7 @@ endpoint, OpenShell, LiteLLM, or SPIRE. Governed
 execution and Jira are explicit opt-ins with additional prerequisites; they
 do not silently activate when an integration is absent.
 
-In Steward v0.2, every external Task is governed solely by the authenticated
+Since Steward v0.2, every external Task is governed solely by the authenticated
 user's exact provisioned User Envelope. The controller persists and recovers
 that immutable authority snapshot. Product-owned Connection operations use
 fixed internal authorities, while the deployment capability catalog describes
@@ -47,7 +47,7 @@ records the limits of this tested matrix.
 | Normative M1 fields, ownership, and compatibility | [Frozen `steward.m1/v1` contract](docs/contracts/m1/v1/README.md) |
 | Accepted post-M1 Agent, Task, session, and runtime semantics | [Post-M1 architecture baseline](docs/v2/README.md) |
 | Post-M1 contracts that remain unresolved | [Deferred-contract register](docs/v2/deferred-implementation-contracts.md) |
-| Implemented v0.2 Task lifecycle and identity contract | [Task submission API](docs/task-submission-api.md) |
+| Current Task lifecycle, identity, and Envelope-selection contract | [Task submission API](docs/task-submission-api.md) |
 | Upgrade from v0.2.6 and understand the rollback boundary | [v0.3 upgrade guide](docs/installation/upgrade-v0.3.0.md) |
 | Enable or roll back federated Task identity | [Federated Task identity upgrade](docs/installation/federated-task-identity-upgrade.md) |
 | Release history and security-relevant changes | [Changelog](CHANGELOG.md) |

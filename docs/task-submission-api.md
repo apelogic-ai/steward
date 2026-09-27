@@ -1,6 +1,9 @@
 # Task submission API contract
 
-> **Compatibility scope:** This document describes the Steward v0.2 Task HTTP surface.
+> **Compatibility scope:** This document describes the current Steward v0.3
+> Task HTTP surface. The `steward.task/v2` wire contract originated in v0.2 and
+> remains compatible; v0.3 adds the optional Envelope digest selector and
+> federated-identity administration described below.
 > The frozen [steward.m1/v1 contract](contracts/m1/v1/README.md) and direct-package
 > [steward.task/v2 contract](contracts/task/v2/README.md) remain authoritative for their
 > respective wire shapes.
@@ -114,8 +117,8 @@ association. Disabled subjects return `403 task_identity_disabled`.
 For v3, Steward reads the current display email from its canonical-user store
 and server-authors service `steward-run`, acting user, owner, and canonical user
 ID. Caller-supplied canonical identity is invalid. Association is authentication
-state, not authority: normal direct-package source binding and unique active
-User Envelope selection still run before reservation, and the admitted Envelope
+state, not authority: normal direct-package source binding and exact active User
+Envelope selection still run before reservation, and the admitted Envelope
 snapshot remains the Task's immutable authority evidence.
 
 Administrator operations use the existing browser administrator session and

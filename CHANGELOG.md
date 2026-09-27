@@ -7,7 +7,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-09-26
+## [0.3.0] - 2026-09-27
 
 ### Added
 
@@ -80,6 +80,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   catalog before rolling out this release. New template writes are not
   dual-written to the legacy store, so mixed-version template authoring and
   rollback after a new catalog write are unsupported.
+- The embedded migration head advances through `0051`. Migrations `0041`–`0051`
+  add the template catalog, decision metadata, browser preferences, escalation
+  and runtime-minute ledgers, typed stage and live-log storage, re-run authority,
+  durable onboarding acknowledgement, and template-free request shape. They are
+  append-only; a Helm rollback does not reverse them, and the v0.3 upgrade guide
+  defines the resulting rollback boundary.
 - Valid v2 credentials may idempotently seed only their same verified
   issuer/subject and already-resolved canonical user as a best-effort transition
   to v3. Seeding failure, conflict, or disablement never changes v2

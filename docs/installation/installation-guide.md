@@ -539,9 +539,11 @@ enable and verify the human browser path before performing them.
 5. **User Envelope operation.** An authenticated user requests authority from
    the applicable published template, and an authorized administrator reviews,
    approves, or rejects that exact request. Before Task submission, prove the
-   user has exactly one active provisioned User Envelope with the intended
-   revision and authority. Never pre-create or select a User Envelope through
-   Helm values.
+   user has an active provisioned User Envelope with the intended revision and
+   authority. When several are active, record and submit the exact public
+   `envelopeDigest`; omission is supported only when exactly one is active.
+   The v0.2-compatible path still requires exactly one active provisioned User Envelope.
+   Never pre-create or select a User Envelope through Helm values.
 6. **Federated-subject association, only when v3 is enabled.** Submit one valid
    `steward-task-v3` credential. Steward records the exact issuer/subject and
    returns `task_identity_unassociated` without creating a Task. An authorized
@@ -568,7 +570,7 @@ Do not hand off merely because `helm template` or `helm lint` passed.
    --context "$CLUSTER_CONTEXT" -n steward rollout status deployment/steward-apiserver`
    and the same command for `deployment/steward-controller` complete.
    The database operator confirms the embedded migration table is at the
-   migration packaged in the exact release (currently `0049`) using an
+   migration packaged in the exact release (currently `0051`) using an
    approved database session that does not expose the URI or row contents.
 2. The `agentruntimes.agents.apelogic.ai` CRD is Established, and the
    `steward-agentruntime` validating webhook has `failurePolicy: Fail`, the

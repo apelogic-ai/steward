@@ -75,6 +75,27 @@ Tasks, runs, runtimes, Envelopes, or historical identity. The new
 additive tables during a rolling upgrade. After v3 observations are written,
 rollback requires disabling v3 first and preserving migration 0040 data.
 
+Migration 0041 creates the immutable Envelope Template catalog, imports every
+legacy member-role revision without changing its identity or content, and binds
+existing requests to exact catalog revisions. New template writes use this
+catalog; legacy role-keyed rows remain compatibility history.
+
+Migration 0042 adds optional decision rationale, evidence, and expiry metadata,
+plus an append-only external decision-reference ledger. Migration 0047 adds the
+short-lived operational claim that serializes external decision filing without
+weakening the immutable completed reference.
+
+Migration 0043 creates append-only browser preference revisions for onboarding
+dismissal and theme without turning identity-provider data into authority.
+
+Migration 0044 adds instance-scoped cumulative spend grants and denials without
+rewriting a template or approved request.
+
+Migration 0045 creates and backfills typed Task stage events for admission,
+runtime binding, execution start, and execution end, then records later stages
+through database triggers. Migration 0046 adds bounded mutable live stdout and
+stderr snapshots while leaving terminal execution logs immutable.
+
 Migration 0048 adds append-only runtime-minute observations, exhaustion records,
 instance-scoped grants, and denial decisions. Runtime usage is derived from
 `task_lifecycle_events` running-to-terminal intervals, with a running Task clipped

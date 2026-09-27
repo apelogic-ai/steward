@@ -215,15 +215,16 @@ to enable the browser path, have the person sign in once, record the audited
 initial RBAC grant, verify the deployment capability catalog, author versioned
 Envelope templates, and complete one User Envelope request and approval.
 
-Two outputs of this step are inputs to Step 6:
+Two identity outputs of this step are inputs to Step 6:
 
 - the opaque `usr_<...>` canonical user ID the person reads from `/settings`;
 - the verified email bound to that canonical identity.
 
-Finish this step when the person has exactly one active provisioned User
-Envelope with the intended revision and authority. The capability catalog
-advertises models and tools but grants no authority, and an empty catalog
-cannot narrow an Envelope that already admits a Task.
+Finish this step when the person has an active provisioned User Envelope with
+the intended revision and authority. If several are active, also record the
+exact public `envelopeDigest` that the acceptance Task will select. The
+capability catalog advertises models and tools but grants no authority, and an
+empty catalog cannot narrow an Envelope that already admits a Task.
 
 ## Step 6: enroll v2 identity or associate a v3 subject
 
@@ -268,10 +269,11 @@ may seed only that same verified issuer/subject association.
 Submit one direct Git package invocation while Steward remains in core mode.
 The caller references the exact package source through a checked-in invocation
 manifest. Steward must authenticate the caller, admit the Task against the
-caller's unique active provisioned User Envelope, and record the exact User
-Envelope evidence without creating a runtime. A published Workflow revision
-remains an optional curation layer over the same immutable package, not a
-registration prerequisite.
+selected active provisioned User Envelope, and record the exact User Envelope
+evidence without creating a runtime. Supply `envelopeDigest` when several are
+active; omission is supported only when exactly one is active. A published
+Workflow revision remains an optional curation layer over the same immutable
+package, not a registration prerequisite.
 
 Repeat with a wrong audience, an untrusted issuer or CA, an unauthorized
 repository, ref, and actor, and a canonical user with no active Envelope. Each
