@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 
@@ -20,6 +19,7 @@ import {
   type UserEnvelopeRequest,
 } from "@/api-client";
 import { RunCards } from "@/components/run-views";
+import { DataTable, FilterTabs, Meter } from "@/components/hs";
 import { DefinitionList, EmptyState, PageHeader, PrimaryLink, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -48,35 +48,53 @@ function EnvelopeSummary({ envelope }: Readonly<{ envelope: BrowserEnvelope }>) 
 }
 
 export function EnvelopesView() {
+  const [status, setStatus] = useState("all");
   const load = useCallback(() => listRequests({ cache: "no-store", credentials: "same-origin" }), []);
   const state = useApiResource<EnvelopeRequestsResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader actions={<PrimaryLink href="/envelopes/new">Request envelope</PrimaryLink>} description="Request and inspect governed runtime authority." title="Envelopes" />
-      <ResourceBoundary state={state}>{({ requests }) => requests.length === 0 ? (
-        <EmptyState title="No data" />
-      ) : (
-        <ul className="grid gap-4 lg:grid-cols-2">
-          {requests.map((request) => <EnvelopeCard key={request.id} request={request} />)}
-        </ul>
-      )}</ResourceBoundary>
+      <ResourceBoundary state={state}>{({ requests }) => {
+        if (requests.length === 0) return <EmptyState title="No data" />;
+        const counts = new Map<string, number>();
+        for (const request of requests) counts.set(request.status, (counts.get(request.status) ?? 0) + 1);
+        const filtered = status === "all" ? requests : requests.filter((request) => request.status === status);
+        return <div className="space-y-5">
+          <FilterTabs active={status} items={[
+            { count: requests.length, label: "All", value: "all" },
+            ...Array.from(counts).map(([value, count]) => ({ count, label: value.charAt(0).toUpperCase() + value.slice(1), value })),
+          ]} onChange={setStatus} />
+          <EnvelopeTable requests={filtered} />
+        </div>;
+      }}</ResourceBoundary>
     </section>
   );
 }
 
-function EnvelopeCard({ request }: Readonly<{ request: UserEnvelopeRequest }>) {
-  const usage = request.usage?.spend;
-  return (
-    <li className="rounded-panel border bg-panel p-5 shadow-sm">
-      <div className="flex items-start justify-between gap-4">
-        <div><h2 className="font-semibold">{request.templateId ?? "Custom envelope"}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div>
-        <StatusBadge value={request.status} />
-      </div>
-      <div className="mt-5"><EnvelopeSummary envelope={request.approvedEnvelope ?? request.requestedEnvelope} /></div>
-      {request.usage ? <p className="mt-4 text-sm text-muted-ink">This month: {usage ? `${usage.observed} / ${usage.limit} ${usage.currency}` : request.usage.availability.reason ?? "Usage unavailable"}</p> : null}
-      <Link className="mt-5 inline-flex min-h-11 items-center text-sm font-semibold text-brand hover:text-brand-strong" href={`/envelopes/${request.id}`}>View envelope →</Link>
-    </li>
-  );
+function EnvelopeTable({ requests }: Readonly<{ requests: Array<UserEnvelopeRequest> }>) {
+  if (requests.length === 0) return <EmptyState title="No matching envelopes" />;
+  return <DataTable
+    ariaLabel="Envelopes"
+    columns={[
+      { key: "name", label: "Envelope", className: "font-semibold", render: (request) => <span><span className="block truncate">{request.templateId ?? "Custom envelope"}</span><span className="mt-0.5 block truncate font-mono text-xs font-normal text-muted-ink">{request.id}</span></span> },
+      { key: "status", label: "Status", render: (request) => <StatusBadge value={request.status} /> },
+      { key: "revision", label: "Revision", className: "tabular-nums text-muted-ink", render: (request) => request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision },
+      { key: "usage", label: "Monthly spend", render: (request) => {
+        const spend = request.usage?.spend;
+        if (!spend) {
+          const envelope = request.approvedEnvelope ?? request.requestedEnvelope;
+          return <span className="text-muted-ink">{request.usage?.availability.reason ?? "Not reported"} · limit <strong className="font-medium text-ink">{envelope.spec.budget.monthlyLimit} {envelope.spec.budget.currency}</strong></span>;
+        }
+        return <Meter label={spend.currency} limit={Number(spend.limit)} limitLabel={spend.limit} used={Number(spend.observed)} usedLabel={spend.observed} />;
+      } },
+      { key: "updated", label: "Updated", className: "text-muted-ink", render: (request) => dateTime(request.statusAt) },
+    ]}
+    gridTemplateColumns="minmax(220px,1.5fr) 130px 90px minmax(190px,1fr) 180px"
+    minWidth="850px"
+    rowHref={(request) => `/envelopes/${request.id}`}
+    rowKey={(request) => request.id}
+    rows={requests}
+  />;
 }
 
 function Accordion({ children, preferenceKey, title }: Readonly<{ children: ReactNode; preferenceKey: string; title: string }>) {

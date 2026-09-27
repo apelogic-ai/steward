@@ -15,6 +15,7 @@ import {
   type RunnerPlatform,
   type ToolGrant,
 } from "@/api-client";
+import { DataTable, GrantChipList, type GrantKind } from "@/components/hs";
 import { EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -228,6 +229,13 @@ function toolLabel(tool: ToolGrant, choices: Array<ToolGrant>): string {
     : display;
 }
 
+function toolGrantKind(action: string): GrantKind {
+  const normalized = action.toLowerCase();
+  if (normalized.includes("delete") || normalized.includes("admin")) return "destructive";
+  if (normalized.includes("write") || normalized.includes("create") || normalized.includes("update")) return "write";
+  return "read";
+}
+
 function mutationMessage(status: Exclude<TemplateMutationState, "idle" | "saving">): string {
   return {
     saved: "Template revision accepted by the Rust authority.",
@@ -269,19 +277,23 @@ function AuthenticatedTemplateList() {
       <ResourceBoundary state={acceptedState}>{({ templates }) => templates.length === 0 ? (
         <EmptyState title="No data" />
       ) : (
-        <ul className="grid gap-3" role="list">
-          {templates.map(({ id, displayName: templateDisplayName, memberRoles, envelope }) => (
-            <li key={id}>
-              <Link className="flex min-h-20 items-center justify-between gap-4 rounded-panel border bg-panel px-5 py-4 shadow-sm hover:border-brand" href={`/admin/envelopes/templates/${encodeURIComponent(id)}`}>
-                <span>
-                  <span className="block font-semibold">{templateDisplayName}</span>
-                  <span className="mt-1 block text-sm text-muted-ink">{id} · {memberRoles.join(", ")}</span>
-                </span>
-                <span className="text-sm text-muted-ink">Revision {envelope.revision}</span>
-              </Link>
-            </li>
-          ))}
-        </ul>
+        <DataTable
+          ariaLabel="Envelope templates"
+          columns={[
+            { key: "template", label: "Template", className: "font-semibold", render: (template) => <span><span className="block truncate">{template.displayName}</span><span className="mt-0.5 block truncate font-mono text-xs font-normal text-muted-ink">{template.id}</span></span> },
+            { key: "roles", label: "Roles", className: "text-muted-ink", render: (template) => template.memberRoles.map(displayName).join(", ") },
+            { key: "authority", label: "Authority", render: (template) => <GrantChipList grants={[
+              ...template.envelope.spec.llms.map((model) => ({ kind: "model" as const, name: modelValue(model) })),
+              ...template.envelope.spec.tools.map((tool) => ({ kind: toolGrantKind(tool.action), name: toolValue(tool) })),
+            ]} limit={2} /> },
+            { key: "revision", label: "Revision", className: "tabular-nums text-muted-ink", render: (template) => template.envelope.revision },
+          ]}
+          gridTemplateColumns="minmax(220px,1.2fr) minmax(160px,.8fr) minmax(300px,1.5fr) 90px"
+          minWidth="860px"
+          rowHref={(template) => `/admin/envelopes/templates/${encodeURIComponent(template.id)}`}
+          rowKey={(template) => template.id}
+          rows={templates}
+        />
       )}</ResourceBoundary>
     </section>
   );

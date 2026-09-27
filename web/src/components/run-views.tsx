@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useState } from "react";
 
@@ -19,6 +18,7 @@ import {
   type BrowserRunView,
   type MyRunsResponse,
 } from "@/api-client";
+import { DataTable, FilterTabs } from "@/components/hs";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
@@ -93,31 +93,27 @@ function TerminalPhaseLogs({ admin, taskUid }: Readonly<{ admin: boolean; taskUi
 export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; runs: Array<BrowserRunView> }>) {
   if (runs.length === 0) return <EmptyState title="No data" />;
   const newestRuns = [...runs].sort((left, right) => runUpdatedAt(right) - runUpdatedAt(left));
-  return (
-    <ul className="grid gap-4">
-      {newestRuns.map((run) => (
-        <li className="rounded-panel border bg-panel px-5 py-4 shadow-sm" key={run.taskUid}>
-          <div className="flex items-start justify-between gap-4">
-            <div className="min-w-0">
-              <p className="truncate font-semibold">{run.workflow}</p>
-            </div>
-            <StatusBadge value={run.phase} />
-          </div>
-          <div className="mt-4">
-            <DefinitionList items={[
-              ["Runtime", runtimeLabel(run.runtimeUid)],
-              ["Updated", dateTime(run.updatedAt)],
-              ["Spend", run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "Not reported"],
-            ]} />
-          </div>
-          <Link className="inline-flex min-h-11 items-center text-sm font-semibold text-brand hover:text-brand-strong" href={`${admin ? "/admin/runs" : "/runs"}/${run.taskUid}`}>View run →</Link>
-        </li>
-      ))}
-    </ul>
-  );
+  const columns = [
+    { key: "workflow", label: "Workflow", className: "font-semibold", render: (run: BrowserRunView) => <span className="block truncate">{run.workflow}</span> },
+    ...(admin ? [{ key: "owner", label: "Owner", render: (run: BrowserRunView) => <span className="block truncate text-muted-ink">{"ownerDisplayEmail" in run ? String(run.ownerDisplayEmail ?? "Not reported") : "Not reported"}</span> }] : []),
+    { key: "status", label: "Status", render: (run: BrowserRunView) => <StatusBadge value={run.phase} /> },
+    { key: "runtime", label: "Runtime", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => runtimeLabel(run.runtimeUid) },
+    { key: "spend", label: "Spend", className: "tabular-nums", render: (run: BrowserRunView) => run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "—" },
+    { key: "updated", label: "Updated", className: "text-muted-ink", render: (run: BrowserRunView) => dateTime(run.updatedAt) },
+  ];
+  return <DataTable
+    ariaLabel={admin ? "All runs" : "Runs"}
+    columns={columns}
+    gridTemplateColumns={admin ? "minmax(180px,1.5fr) minmax(180px,1fr) 120px 100px 100px 170px" : "minmax(220px,1.5fr) 120px 110px 100px 180px"}
+    minWidth={admin ? "980px" : "780px"}
+    rowHref={(run) => `${admin ? "/admin/runs" : "/runs"}/${run.taskUid}`}
+    rowKey={(run) => run.taskUid}
+    rows={newestRuns}
+  />;
 }
 
 export function RunsView({ admin = false }: Readonly<{ admin?: boolean }>) {
+  const [phase, setPhase] = useState("all");
   const load = useCallback(() => admin
     ? allRuns({ cache: "no-store", credentials: "same-origin" }) as Promise<{ data?: AllRunsResponse; response?: Response }>
     : myRuns({ cache: "no-store", credentials: "same-origin" }) as Promise<{ data?: MyRunsResponse; response?: Response }>, [admin]);
@@ -130,12 +126,15 @@ export function RunsView({ admin = false }: Readonly<{ admin?: boolean }>) {
       />
       <ResourceBoundary state={state}>{(data) => (
         <div className="space-y-5">
-          <ul aria-label="Run phase counts" className="flex flex-wrap gap-2">
-            {Object.entries(data.facets.phase).map(([phase, count]) => (
-              <li className="rounded-full border bg-panel px-3 py-1 text-sm" key={phase}>{phase}: {count}</li>
-            ))}
-          </ul>
-          <RunCards admin={admin} runs={data.runs} />
+          <FilterTabs
+            active={phase}
+            items={[
+              { count: data.runs.length, label: "All", value: "all" },
+              ...Object.entries(data.facets.phase).filter(([, count]) => count > 0).map(([value, count]) => ({ count, label: value.charAt(0).toUpperCase() + value.slice(1), value })),
+            ]}
+            onChange={setPhase}
+          />
+          <RunCards admin={admin} runs={phase === "all" ? data.runs : data.runs.filter((run) => run.phase === phase)} />
         </div>
       )}</ResourceBoundary>
     </section>

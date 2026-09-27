@@ -1141,7 +1141,7 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
   const developer = await guardedPage(browser);
   try {
     await developer.page.goto(`${origin}/envelopes`);
-    await expect(developer.page.getByRole("heading", { name: "developer" })).toBeVisible();
+    await expect(developer.page.getByRole("link", { name: /developer/ })).toBeVisible();
     await expect(developer.page.getByText("25.00 USD")).toBeVisible();
 
     await developer.page.goto(`${origin}/envelopes/new`);

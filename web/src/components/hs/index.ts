@@ -1,5 +1,7 @@
 export * from "./code-block";
 export * from "./breadcrumbs";
+export * from "./data-table";
+export * from "./filter-tabs";
 export * from "./grant-chip";
 export * from "./meter";
 export * from "./section-card";
