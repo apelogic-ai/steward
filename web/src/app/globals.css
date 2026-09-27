@@ -1,4 +1,15 @@
 @import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is([data-theme="dark"] *));
+@custom-variant data-open (&:where([data-state="open"], [data-open]:not([data-open="false"])));
+@custom-variant data-closed (&:where([data-state="closed"], [data-closed]:not([data-closed="false"])));
+@custom-variant data-checked (&:where([data-state="checked"], [data-checked]:not([data-checked="false"])));
+@custom-variant data-selected (&:where([data-selected="true"]));
+@custom-variant data-disabled (&:where([data-disabled="true"], [data-disabled]:not([data-disabled="false"])));
+@custom-variant data-active (&:where([data-state="active"], [data-active]:not([data-active="false"])));
+@custom-variant data-horizontal (&:where([data-orientation="horizontal"]));
+@custom-variant data-vertical (&:where([data-orientation="vertical"]));
 
 @theme inline {
   --font-sans: var(--font-space-grotesk), Arial, sans-serif;
@@ -48,6 +59,49 @@
   --radius-panel: 12px;
   --shadow-control: var(--hs-shadow);
   --shadow-popover: 0 12px 32px rgba(20, 24, 26, 0.16);
+  --font-heading: var(--font-space-grotesk), Arial, sans-serif;
+  --color-sidebar-ring: var(--hs-brand);
+  --color-sidebar-border: var(--hs-line);
+  --color-sidebar-accent-foreground: var(--hs-ink);
+  --color-sidebar-accent: var(--hs-subtle);
+  --color-sidebar-primary-foreground: var(--hs-on-brand);
+  --color-sidebar-primary: var(--hs-brand);
+  --color-sidebar-foreground: var(--hs-ink);
+  --color-sidebar: var(--hs-panel);
+  --color-ring: var(--hs-brand);
+  --color-input: var(--hs-field);
+  --color-border: var(--hs-line);
+  --color-destructive: var(--hs-err);
+  --color-accent-foreground: var(--hs-ink);
+  --color-accent: var(--hs-subtle);
+  --color-muted-foreground: var(--hs-muted);
+  --color-muted: var(--hs-line2);
+  --color-secondary-foreground: var(--hs-ink);
+  --color-secondary: var(--hs-subtle);
+  --color-primary-foreground: var(--hs-on-brand);
+  --color-primary: var(--hs-brand);
+  --color-popover-foreground: var(--hs-ink);
+  --color-popover: var(--hs-panel);
+  --color-card-foreground: var(--hs-ink);
+  --color-card: var(--hs-panel);
+  --color-foreground: var(--hs-ink);
+  --color-background: var(--hs-bg);
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+  --radius-2xl: 16px;
+  --radius-3xl: 20px;
+  --radius-4xl: 24px;
+}
+
+@utility no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
 }
 
 :root,
@@ -215,4 +269,16 @@ input[type="radio"] {
   flex-basis: 2.75rem;
   inline-size: 2.75rem;
   block-size: 2.75rem;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
 }

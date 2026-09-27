@@ -10,7 +10,7 @@ describe("status badges", () => {
     expect(html).toContain("self-start");
     expect(html).toContain("w-fit");
     expect(html).toContain("shrink-0");
-    expect(html).toContain("rounded-full px-2.5 py-1");
+    expect(html).toContain("rounded-full px-2.5 py-[3px]");
     expect(html).toContain('data-tone="ok"');
   });
 
