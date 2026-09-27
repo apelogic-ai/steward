@@ -18,7 +18,7 @@ import {
   type BrowserRunView,
   type MyRunsResponse,
 } from "@/api-client";
-import { DataTable, FilterTabs } from "@/components/hs";
+import { DataTable, FilterTabs, SectionCard } from "@/components/hs";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
@@ -37,6 +37,17 @@ function runUpdatedAt(value: BrowserRunView): number {
 function runtimeLabel(value: string | null | undefined): string {
   if (!value) return "Not assigned";
   return value.split("-", 1)[0] || value;
+}
+
+function durationLabel(createdAt: string, updatedAt: string): string {
+  const start = new Date(createdAt).valueOf();
+  const end = new Date(updatedAt).valueOf();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "Not reported";
+  const seconds = Math.round((end - start) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
 }
 
 function isTerminalPhase(phase: string): boolean {
@@ -177,53 +188,42 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
         ];
         if (admin && "ownerDisplayEmail" in run) detailItems.push(["Owner", String(run.ownerDisplayEmail ?? "Not reported")]);
         return (
-        <article className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div><h2 className="text-xl font-semibold">{run.workflow}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p></div>
-            <StatusBadge value={run.phase} />
-          </div>
-          <DefinitionList items={detailItems} />
-          {run.trigger ? (
-            <section className="space-y-3 border-t pt-5">
-              <h3 className="font-semibold">Triggered by GitHub</h3>
-              <DefinitionList items={[
-                ["Repository", run.trigger.repository],
-                ["Event", run.trigger.event],
-                ["Actor", run.trigger.actor],
-                ["Ref", run.trigger.ref],
-                ["Commit", run.trigger.sha],
-                ["Workflow", run.trigger.callerWorkflow],
-              ]} />
-              <a className="text-sm font-semibold text-brand hover:text-brand-strong" href={run.trigger.runUrl} rel="noreferrer" target="_blank">Open GitHub run ↗</a>
-            </section>
-          ) : null}
-          <section className="space-y-3 border-t pt-5">
-            <h3 className="font-semibold">Stages</h3>
-            <ol className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-              {run.stages.map((stage) => <li className="rounded-md border p-3" key={stage.id}><p className="text-sm font-semibold">{stage.displayName}</p><StatusBadge value={stage.state} />{stage.steps.map((step) => <div className="mt-3 border-t pt-3" key={step.id}><p className="text-sm">{step.displayName}</p><div className="mt-2 flex flex-wrap gap-2">{step.logStreams.map((stream) => <a className="text-xs font-semibold text-brand" href={`${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}/logs/${stream}`} key={stream}>{stream}</a>)}</div></div>)}</li>)}
-            </ol>
-          </section>
-          {!admin ? <div className="flex flex-wrap gap-3 border-t pt-5"><button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={rerunState === "working"} onClick={async () => {
-            if (session.status !== "authenticated") return;
-            setRerunState("working");
-            const idempotencyKey = crypto.randomUUID();
-            const outcome = await pollRerun(() => rerunMyRun({ body: { idempotencyKey }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } }));
-            if ("taskUid" in outcome) router.push(`/runs/${outcome.taskUid}`);
-            else setRerunState(outcome.failure);
-          }} type="button">{rerunState === "working" ? "Starting…" : "Re-run"}</button>{rerunState !== "idle" && rerunState !== "working" ? <p className="self-center text-sm text-red-800" role="alert">The run could not be re-run ({rerunState}).</p> : null}</div> : null}
-          {!admin && !isTerminalPhase(run.phase) ? (
-            <div className="space-y-2 border-t pt-5">
-              <button className="min-h-11 rounded-md border border-red-700 px-4 py-2 text-sm font-semibold text-red-800 disabled:opacity-50" disabled={cancelState === "working" || cancelState === "cancelled"} onClick={async () => {
+          <article className="space-y-6">
+            <header className="rounded-panel border bg-panel p-5 shadow-sm sm:p-6">
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div><p className="text-xs font-semibold uppercase tracking-wide text-muted-ink">Workflow run</p><h2 className="mt-1 text-2xl font-semibold tracking-tight">{run.workflow}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p></div>
+                <StatusBadge value={run.phase} />
+              </div>
+              <div className="mt-5 flex flex-wrap items-center gap-x-5 gap-y-2 border-t border-line-soft pt-4 text-sm text-muted-ink"><span>Started {dateTime(run.createdAt)}</span><span>Duration {durationLabel(run.createdAt, run.updatedAt)}</span></div>
+              {!admin ? <div className="mt-5 flex flex-wrap gap-3"><button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={rerunState === "working"} onClick={async () => {
+                if (session.status !== "authenticated") return;
+                setRerunState("working");
+                const idempotencyKey = crypto.randomUUID();
+                const outcome = await pollRerun(() => rerunMyRun({ body: { idempotencyKey }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } }));
+                if ("taskUid" in outcome) router.push(`/runs/${outcome.taskUid}`);
+                else setRerunState(outcome.failure);
+              }} type="button">{rerunState === "working" ? "Starting…" : "Re-run"}</button>{!isTerminalPhase(run.phase) ? <button className="min-h-10 rounded-control border border-danger-line px-4 py-2 text-sm font-semibold text-err disabled:opacity-50" disabled={cancelState === "working" || cancelState === "cancelled"} onClick={async () => {
                 if (session.status !== "authenticated") return;
                 setCancelState("working");
                 const result = await cancelMyRun({ cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } });
                 setCancelState(result.data && result.response?.ok ? "cancelled" : classifyMutationFailure(result.response?.status));
-              }} type="button">{cancelState === "working" ? "Cancelling…" : cancelState === "cancelled" ? "Cancellation requested" : "Cancel run"}</button>
-              {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="text-sm text-red-800" role="alert">The run could not be cancelled ({cancelState}).</p> : null}
+              }} type="button">{cancelState === "working" ? "Cancelling…" : cancelState === "cancelled" ? "Cancellation requested" : "Cancel run"}</button> : null}</div> : null}
+              {rerunState !== "idle" && rerunState !== "working" ? <p className="mt-3 text-sm text-err" role="alert">The run could not be re-run ({rerunState}).</p> : null}
+              {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="mt-3 text-sm text-err" role="alert">The run could not be cancelled ({cancelState}).</p> : null}
+            </header>
+            <div className="grid items-start gap-6 xl:grid-cols-[minmax(0,1.45fr)_minmax(300px,0.72fr)]">
+              <section aria-labelledby="stages-title" className="overflow-hidden rounded-panel border bg-panel shadow-sm">
+                <div className="border-b border-line px-5 py-4"><h3 className="font-semibold" id="stages-title">Jobs</h3><p className="mt-1 text-sm text-muted-ink">Governed execution stages and captured output.</p></div>
+                {run.stages.length ? <ol className="divide-y divide-line-soft">{run.stages.map((stage, index) => <li key={stage.id}><details className="group" open><summary className="flex cursor-pointer list-none items-center gap-3 px-5 py-4"><span aria-hidden="true" className={`grid size-6 shrink-0 place-items-center rounded-full text-xs font-bold ${stage.state === "succeeded" ? "bg-ok-soft text-ok" : stage.state === "failed" ? "bg-err-soft text-err" : "bg-info-soft text-info"}`}>{stage.state === "succeeded" ? "✓" : stage.state === "failed" ? "×" : index + 1}</span><span className="min-w-0 flex-1 font-semibold">{stage.displayName}</span><StatusBadge value={stage.state} /><span aria-hidden="true" className="text-muted-ink transition-transform group-open:rotate-90">›</span></summary>{stage.steps.length ? <div className="border-t border-line-soft bg-subtle px-5 py-3 ps-14">{stage.steps.map((step) => <div className="flex flex-wrap items-center justify-between gap-3 py-2" key={step.id}><span className="text-sm">{step.displayName}</span><div className="flex gap-2">{step.logStreams.map((stream) => <a className="rounded-control border bg-panel px-3 py-1.5 font-mono text-xs font-semibold" href={`${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}/logs/${stream}`} key={stream}>{stream}</a>)}</div></div>)}</div> : null}</details></li>)}</ol> : <div className="p-5"><EmptyState title="No stages reported" /></div>}
+              </section>
+              <aside className="space-y-5">
+                <SectionCard title="Summary"><DefinitionList items={detailItems} /></SectionCard>
+                {run.trigger ? <SectionCard title="Triggered by GitHub"><DefinitionList items={[["Repository", run.trigger.repository], ["Event", run.trigger.event], ["Actor", run.trigger.actor], ["Ref", run.trigger.ref], ["Commit", run.trigger.sha], ["Workflow", run.trigger.callerWorkflow]]} /><a className="mt-4 inline-flex text-sm font-semibold text-link hover:text-link-hover" href={run.trigger.runUrl} rel="noreferrer" target="_blank">Open GitHub run ↗</a></SectionCard> : null}
+              </aside>
             </div>
-          ) : null}
-        </article>
-      );}}</ResourceBoundary>
+          </article>
+        );
+      }}</ResourceBoundary>
       <div className="space-y-3">
         <h2 className="text-xl font-semibold">Timeline</h2>
         <ResourceBoundary state={timelineState}>{({ events }) => events.length === 0 ? (
