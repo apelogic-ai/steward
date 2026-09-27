@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useRef, useState, type FormEvent } from "react";
 
 import {
   createRequest,
@@ -20,7 +20,7 @@ import {
   type UserEnvelopeRequest,
 } from "@/api-client";
 import { RunCards } from "@/components/run-views";
-import { CodeBlock, DataTable, FilterTabs, GrantChipList, Meter, SectionCard, StatStrip, grantKindForAction } from "@/components/hs";
+import { CodeBlock, DataTable, FilterTabs, FormSection, GrantChipList, Meter, SectionCard, StatStrip, TagSelect, grantKindForAction } from "@/components/hs";
 import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -83,29 +83,12 @@ function EnvelopeTable({ requests }: Readonly<{ requests: Array<UserEnvelopeRequ
   />;
 }
 
-function Accordion({ children, preferenceKey, title }: Readonly<{ children: ReactNode; preferenceKey: string; title: string }>) {
-  const details = useRef<HTMLDetailsElement>(null);
-  useEffect(() => {
-    if (details.current) details.current.open = localStorage.getItem(preferenceKey) === "open";
-  }, [preferenceKey]);
-  return (
-    <details className="rounded-md border" onToggle={(event) => {
-      const next = event.currentTarget.open;
-      if (next) localStorage.setItem(preferenceKey, "open");
-      else localStorage.removeItem(preferenceKey);
-    }} ref={details}>
-      <summary className="cursor-pointer px-4 py-3 font-semibold">{title}</summary>
-      <div className="border-t p-4">{children}</div>
-    </details>
-  );
-}
-
 export function NewEnvelopeView() {
   const load = useCallback(() => listTemplates({ cache: "no-store", credentials: "same-origin" }), []);
   const state = useApiResource<EnvelopeTemplatesResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Request authority from a template or submit a complete custom envelope for administrator review." title="New envelope" />
+      <PageHeader description="Pick a template, then narrow it. You can’t go above the template’s ceiling." title="Request an envelope" />
       <ResourceBoundary state={state}>{({ templates }) => <EnvelopeRequestForm templates={templates} />}</ResourceBoundary>
     </section>
   );
@@ -191,38 +174,22 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, templates }: Readonly
     onSubmittingChange(false);
   }
 
+  const modelOptions = template.ceiling.spec.llms.map((item) => ({ key: `${item.provider}\u0000${item.model}`, kind: "model" as const, label: `${item.provider}/${item.model}` }));
+  const toolOptions = template.ceiling.spec.tools.map((item) => ({ key: `${item.provider}\u0000${item.resource}\u0000${item.action}`, kind: grantKindForAction(item.action), label: `${item.provider}:${item.resource}:${item.action}` }));
   return (
-    <form className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
-      <label className="grid gap-2 text-sm font-semibold">Template
-        <select className="min-h-11 rounded-md border bg-panel px-3 font-normal" disabled={submission === "submitting"} onChange={(event) => selectTemplate(event.target.value)} value={template.id}>
-          {templates.map((item) => <option key={item.id} value={item.id}>{item.displayName} · revision {item.revision}</option>)}
-        </select>
-      </label>
-      <div className="grid gap-4 sm:grid-cols-3">
-        <label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})
-          <input className="min-h-11 rounded-md border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setBudget(event.target.value)} required value={budget} />
-        </label>
-        <label className="grid gap-2 text-sm font-semibold">Time to live
-          <input className="min-h-11 rounded-md border px-3 font-normal" disabled={submission === "submitting"} onChange={(event) => setTtl(event.target.value)} required value={ttl} />
-        </label>
-        {template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month
-          <input className="min-h-11 rounded-md border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setRuntimeMinutes(event.target.value)} required value={runtimeMinutes} />
-        </label> : null}
-      </div>
-      <Accordion preferenceKey={`steward.ui.envelope-accordion.${template.id}.models`} title="Models">
-        <div className="space-y-3">{template.ceiling.spec.llms.map((item) => {
-          const key = `${item.provider}\u0000${item.model}`;
-          return <label className="flex min-h-11 items-center gap-3 text-sm" key={key}><input checked={models.has(key)} disabled={submission === "submitting"} onChange={() => setModels((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next; })} type="checkbox" />{item.provider}/{item.model}</label>;
-        })}</div>
-      </Accordion>
-      <Accordion preferenceKey={`steward.ui.envelope-accordion.${template.id}.tools`} title="Tools">
-        <div className="space-y-3">{template.ceiling.spec.tools.map((item) => {
-          const key = `${item.provider}\u0000${item.resource}\u0000${item.action}`;
-          return <label className="flex min-h-11 items-center gap-3 text-sm" key={key}><input checked={tools.has(key)} disabled={submission === "submitting"} onChange={() => setTools((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next; })} type="checkbox" />{item.provider}:{item.resource}:{item.action}</label>;
-        })}</div>
-      </Accordion>
-      {submission !== "idle" && submission !== "submitting" ? <p className="text-sm text-red-800" role="alert">{{ conflict: "The template revision changed. Reload before retrying.", rejected: "Rust admission rejected the requested authority as outside the template ceiling.", forbidden: "The Rust authorization boundary rejected the request.", unavailable: "The authoritative request service is unavailable.", error: "The request could not be accepted." }[submission]}</p> : null}
-      <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
+    <form className="flex flex-wrap items-start gap-5" onSubmit={submit}>
+      <SectionCard className="min-w-0 flex-[1_1_520px]">
+        <FormSection number="01" title="Template"><label className="grid gap-2 text-sm font-semibold">Template<select className="min-h-11 rounded-control border bg-panel px-3 font-normal" disabled={submission === "submitting"} onChange={(event) => selectTemplate(event.target.value)} value={template.id}>{templates.map((item) => <option key={item.id} value={item.id}>{item.displayName} · revision {item.revision}</option>)}</select></label></FormSection>
+        <FormSection number="02" title="Budget and lifetime"><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})<input className="min-h-11 rounded-control border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setBudget(event.target.value)} required value={budget} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.budget.monthlyLimit}</span></label><label className="grid gap-2 text-sm font-semibold">Time to live<input className="min-h-11 rounded-control border px-3 font-normal" disabled={submission === "submitting"} onChange={(event) => setTtl(event.target.value)} required value={ttl} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.ttl}</span></label>{template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month<input className="min-h-11 rounded-control border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setRuntimeMinutes(event.target.value)} required value={runtimeMinutes} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.runtimeMinutesLimit}</span></label> : null}</div></FormSection>
+        <FormSection number="03" title="Models"><TagSelect disabled={submission === "submitting"} label="Models" onChange={(next) => setModels(new Set(next))} options={modelOptions} value={[...models]} /></FormSection>
+        <FormSection description="Remove anything this envelope doesn’t need. Only tools in the template ceiling are offered." number="04" title="Tools"><TagSelect disabled={submission === "submitting"} label="Tools" onChange={(next) => setTools(new Set(next))} options={toolOptions} value={[...tools]} /></FormSection>
+      </SectionCard>
+      <SectionCard className="sticky top-7 flex-[1_1_280px] lg:max-w-[380px]" title="Summary">
+        <dl className="space-y-3 text-sm">{[["Template", template.displayName], ["Monthly limit", `${budget} ${template.ceiling.spec.budget.currency}`], ["Per run", template.ceiling.spec.budget.singleRunLimit ?? "Not set"], ["TTL", ttl], ["Models", String(models.size)], ["Tools", String(tools.size)]].map(([label, value]) => <div className="flex justify-between gap-4" key={label}><dt className="text-muted-ink">{label}</dt><dd className="text-right font-medium">{value}</dd></div>)}</dl>
+        {submission !== "idle" && submission !== "submitting" ? <p className="mt-4 text-sm text-err" role="alert">{{ conflict: "The template revision changed. Reload before retrying.", rejected: "Rust admission rejected the requested authority as outside the template ceiling.", forbidden: "The Rust authorization boundary rejected the request.", unavailable: "The authoritative request service is unavailable.", error: "The request could not be accepted." }[submission]}</p> : null}
+        <button className="mt-5 min-h-10 w-full rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
+        <p className="mt-3 text-xs leading-5 text-muted-ink">{template.autoProvisionThreshold === null || template.autoProvisionThreshold === undefined ? "Provisioned instantly when the request stays within this template ceiling." : "Provisioned instantly when the request stays within the template’s auto-approve threshold; otherwise an administrator reviews it."}</p>
+      </SectionCard>
     </form>
   );
 }

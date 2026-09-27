@@ -218,7 +218,7 @@ const approval = {
 
 const presentationRoutes = [
   { path: "/envelopes", heading: "Envelopes", activeNavigation: "Envelopes" },
-  { path: "/envelopes/new", heading: "New envelope", activeNavigation: "Envelopes" },
+  { path: "/envelopes/new", heading: "Request an envelope", activeNavigation: "Envelopes" },
   { path: `/envelopes/${envelopeId}`, heading: "developer", activeNavigation: "Envelopes" },
   { path: `/envelopes/${envelopeId}/runs`, heading: "Recent runs", activeNavigation: "Envelopes" },
   { path: "/runs", heading: "Runs", activeNavigation: "Runs" },
@@ -517,6 +517,7 @@ async function stopWeb(instance) {
 }
 
 async function guardedPage(browser, {
+  adminTemplateAutoProvisionThreshold = null,
   adminTemplateModels = adminEnvelope.spec.llms,
   adminTemplateTools = adminEnvelope.spec.tools,
   legacyAdminTemplate = false,
@@ -707,7 +708,7 @@ async function guardedPage(browser, {
       ? { apiVersion: "steward.browser-admin/v1", memberRole }
       : legacyAdminTemplate
         ? { apiVersion: "steward.admin/v1", template: { id: memberRole, revision: 4, envelope } }
-        : { apiVersion: "steward.browser-admin/v1", id: memberRole, displayName: `${memberRole.charAt(0).toUpperCase()}${memberRole.slice(1)}`, memberRoles: [memberRole], envelope: {
+        : { apiVersion: "steward.browser-admin/v1", id: memberRole, displayName: `${memberRole.charAt(0).toUpperCase()}${memberRole.slice(1)}`, memberRoles: [memberRole], autoProvisionThreshold: adminTemplateAutoProvisionThreshold, envelope: {
           ...adminEnvelope,
           spec: { ...adminEnvelope.spec, llms: adminTemplateModels, tools: adminTemplateTools },
         } });
@@ -1549,6 +1550,7 @@ test("administrator templates and approvals use typed browser authority", async 
       singleRunLimit: "3.00",
     });
     expect(templateMutation.body.envelope.spec.llms).toEqual(capabilityCatalog.models);
+    expect(templateMutation.body.autoProvisionThreshold).toBeNull();
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("reviewer");
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
     await expect.poll(() => administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/reviewer")).toBe(true);
@@ -1595,6 +1597,38 @@ test("administrator templates and approvals use typed browser authority", async 
 
     await administrator.page.goto(`${origin}/admin/settings`);
     await expect(administrator.page.getByRole("heading", { name: /Alice Example/ })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator preserves a narrower auto-provision threshold when revising a template", async ({ browser }) => {
+  const threshold = {
+    ...adminEnvelope,
+    spec: {
+      ...adminEnvelope.spec,
+      budget: {
+        ...adminEnvelope.spec.budget,
+        monthlyLimit: "10.00",
+        singleRunLimit: "1.00",
+      },
+    },
+  };
+  const administrator = await guardedPage(browser, {
+    adminTemplateAutoProvisionThreshold: threshold,
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    const autoApproveToCeiling = administrator.page.getByRole("checkbox", { name: "Auto-approve every request within the ceiling" });
+    await expect(autoApproveToCeiling).not.toBeChecked();
+    await expect(administrator.page.getByRole("textbox", { name: "Auto-approve up to (complete envelope JSON)" })).toHaveValue(JSON.stringify(threshold, null, 2));
+
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
+    const mutation = administrator.mutations.find((item) => item.path === "/admin/api/v1/envelope-templates/analyst");
+    expectMutationProof(mutation);
+    expect(mutation.body.autoProvisionThreshold).toEqual(threshold);
   } finally {
     await closeGuardedPage(administrator);
   }

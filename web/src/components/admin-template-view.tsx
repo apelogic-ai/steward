@@ -15,7 +15,7 @@ import {
   type RunnerPlatform,
   type ToolGrant,
 } from "@/api-client";
-import { DataTable, GrantChipList, grantKindForAction } from "@/components/hs";
+import { DataTable, FormSection, GrantChipList, SectionCard, grantKindForAction } from "@/components/hs";
 import { EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -25,6 +25,7 @@ type TemplateMutationState = "idle" | "saving" | "saved" | "conflict" | "rejecte
 type LimitType = "singleRun" | "monthly";
 
 type AdminTemplateListItem = {
+  autoProvisionThreshold?: BrowserEnvelope | null;
   id: string;
   displayName: string;
   memberRoles: Array<string>;
@@ -88,6 +89,10 @@ function isBrowserEnvelope(value: unknown): value is BrowserEnvelope {
   return validBudget && validModels && validTools && validRunner && validRuntimeMinutes && typeof spec.ttl === "string";
 }
 
+function isAutoProvisionThreshold(value: unknown): value is BrowserEnvelope | null | undefined {
+  return value === undefined || value === null || isBrowserEnvelope(value);
+}
+
 function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): BrowserEnvelopeTemplateResponse | null {
   if (!isRecord(value)) return null;
   if (value.apiVersion === "steward.browser-admin/v1"
@@ -95,6 +100,7 @@ function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): 
     && typeof value.displayName === "string"
     && Array.isArray(value.memberRoles)
     && value.memberRoles.every((role) => typeof role === "string")
+    && isAutoProvisionThreshold(value.autoProvisionThreshold)
     && isBrowserEnvelope(value.envelope)) {
     return value as BrowserEnvelopeTemplateResponse;
   }
@@ -109,6 +115,7 @@ function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): 
       memberRole: templateId,
       memberRoles: [templateId],
       envelope: value.envelope,
+      autoProvisionThreshold: null,
     };
   }
   if (value.apiVersion !== "steward.admin/v1" || !isRecord(value.template)) return null;
@@ -129,6 +136,7 @@ function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): 
       ? template.memberRoles
       : [templateId],
     envelope: template.envelope,
+    autoProvisionThreshold: isAutoProvisionThreshold(template.autoProvisionThreshold) ? template.autoProvisionThreshold : null,
   };
 }
 
@@ -139,9 +147,10 @@ function normalizeTemplateList(value: unknown): AdminTemplateListResponse | null
     if (!isRecord(item) || !isBrowserEnvelope(item.envelope)) return null;
     if (typeof item.id === "string" && typeof item.displayName === "string"
       && Array.isArray(item.memberRoles) && item.memberRoles.every((role) => typeof role === "string")) {
-      templates.push({ id: item.id, displayName: item.displayName, memberRoles: item.memberRoles, envelope: item.envelope });
+      if (!isAutoProvisionThreshold(item.autoProvisionThreshold)) return null;
+      templates.push({ id: item.id, displayName: item.displayName, memberRoles: item.memberRoles, envelope: item.envelope, autoProvisionThreshold: item.autoProvisionThreshold });
     } else if (typeof item.memberRole === "string") {
-      templates.push({ id: item.memberRole, displayName: displayName(item.memberRole), memberRoles: [item.memberRole], envelope: item.envelope });
+      templates.push({ id: item.memberRole, displayName: displayName(item.memberRole), memberRoles: [item.memberRole], envelope: item.envelope, autoProvisionThreshold: null });
     } else return null;
   }
   return { apiVersion: "steward.browser-admin/v1", templates };
@@ -333,7 +342,7 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
         description="Inspect the current immutable revision and author a successor."
         title="Envelope template"
       />
-      <ResourceBoundary state={acceptedState}>{({ displayName: templateDisplayName, envelope, memberRoles }) => (
+      <ResourceBoundary state={acceptedState}>{({ autoProvisionThreshold, displayName: templateDisplayName, envelope, memberRoles }) => (
         <ResourceBoundary state={acceptedCapabilitiesState}>{(capabilities) => (
           <TemplateEditor
             capabilities={capabilities}
@@ -343,6 +352,7 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
             memberRoles={memberRoles}
             templateDisplayName={templateDisplayName}
             template={envelope}
+            autoProvisionThreshold={autoProvisionThreshold}
           />
         )}</ResourceBoundary>
       )}</ResourceBoundary>
@@ -386,13 +396,14 @@ function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
           memberRoles={[]}
           templateDisplayName=""
           template={initialTemplateForCatalog(capabilities)}
+          autoProvisionThreshold={null}
         />
       )}</ResourceBoundary>
     </section>
   );
 }
 
-function TemplateEditor({ capabilities, create = false, csrf, memberRole, memberRoles, templateDisplayName, template }: Readonly<{ capabilities: CapabilityCatalog; create?: boolean; csrf: string; memberRole: string; memberRoles: Array<string>; templateDisplayName: string; template: BrowserEnvelope }>) {
+function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, csrf, memberRole, memberRoles, templateDisplayName, template }: Readonly<{ autoProvisionThreshold?: BrowserEnvelope | null; capabilities: CapabilityCatalog; create?: boolean; csrf: string; memberRole: string; memberRoles: Array<string>; templateDisplayName: string; template: BrowserEnvelope }>) {
   const router = useRouter();
   const modelCatalog = capabilities.models;
   const allowedModels = new Set(modelCatalog.map(modelKey));
@@ -416,6 +427,8 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, member
   const [runtimeMinutesLimit, setRuntimeMinutesLimit] = useState(template.spec.runtimeMinutesLimit ?? "");
   const [name, setName] = useState(templateDisplayName);
   const [roles, setRoles] = useState(memberRoles.join(", "));
+  const [autoApproveToCeiling, setAutoApproveToCeiling] = useState(autoProvisionThreshold === null || autoProvisionThreshold === undefined);
+  const [thresholdJson, setThresholdJson] = useState(JSON.stringify(autoProvisionThreshold ?? template, null, 2));
   const limitAmount = limitType === "singleRun" ? singleRunLimit : monthlyLimit;
 
   function addModel() {
@@ -483,12 +496,24 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, member
         },
       },
     };
+    let nextAutoProvisionThreshold: BrowserEnvelope | null = null;
+    if (!autoApproveToCeiling) {
+      try {
+        const parsed: unknown = JSON.parse(thresholdJson);
+        if (!isBrowserEnvelope(parsed)) { setStatus("rejected"); return; }
+        nextAutoProvisionThreshold = parsed;
+      } catch {
+        setStatus("rejected");
+        return;
+      }
+    }
     setStatus("saving");
     const result = await putAdminEnvelopeTemplate({
       body: {
         displayName: name.trim(),
         memberRoles: selectedRoles,
         envelope,
+        autoProvisionThreshold: nextAutoProvisionThreshold,
       },
       cache: "no-store",
       credentials: "same-origin",
@@ -506,7 +531,8 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, member
 
   const runner = template.spec.runner;
   return (
-    <form className="space-y-6 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
+    <form className="space-y-6" onSubmit={submit}>
+      <SectionCard>
       <div>
         <h2 className="text-xl font-semibold">{create ? "New template" : name}</h2>
         <p className="mt-1 text-sm text-muted-ink">{create ? "Initial revision 1" : `Current revision ${currentRevision}`}</p>
@@ -633,6 +659,13 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, member
         </ul>
       </fieldset>
 
+      <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
+        <div className="space-y-4">
+          <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => setAutoApproveToCeiling(event.target.checked)} type="checkbox" />Auto-approve every request within the ceiling</label>
+          {!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => setThresholdJson(event.target.value)} spellCheck={false} value={thresholdJson} /></label> : null}
+        </div>
+      </FormSection>
+
       <details className="rounded-md border p-4">
         <summary className="cursor-pointer font-semibold">Advanced</summary>
         <fieldset className="mt-5 space-y-4">
@@ -663,6 +696,7 @@ function TemplateEditor({ capabilities, create = false, csrf, memberRole, member
         </label>
         {!create ? <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="copy">Save as new</button> : null}
       </div>
+      </SectionCard>
     </form>
   );
 }
