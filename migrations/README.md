@@ -91,3 +91,12 @@ rows. The operation kind remains database-allowlisted and invokes only MCP-GW's
 Migration 0050 adds the durable onboarding workflow acknowledgement to each
 append-only browser preference revision. Existing revisions default to not
 acknowledged; later preference writes carry the current value forward.
+
+Migration 0051 permits a User Envelope request to omit both template identity
+columns for an explicitly reviewed custom request, while a check constraint
+continues to require both template ID and revision or neither. The existing
+catalog foreign key still protects template-backed requests. The matching event
+revision snapshot becomes nullable; no existing request or history is rewritten.
+The catalog is documented as the sole authority for new template-backed writes,
+while legacy role-keyed Envelope rows remain read-only for one compatibility
+window.

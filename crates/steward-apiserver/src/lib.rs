@@ -9,6 +9,7 @@ mod execution_bindings;
 mod github_actions;
 pub mod google_oidc;
 pub mod governed_connections;
+pub mod operator_admin;
 pub mod preferences;
 pub mod stable_runtime_bridge;
 pub mod task_auth;
@@ -24,10 +25,10 @@ pub use github_actions::{
     GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA, GITHUB_ACTIONS_RENDER_REQUEST_SCHEMA,
     GITHUB_FILE_READ_TEMPLATE, GeneratedGithubActionsWorkflow, GithubActionsEnvelopeSelection,
     GithubActionsRenderContext, GithubActionsRenderError, GithubActionsRenderRequest,
-    GithubActionsTaskTemplate, StewardRunRelease, VERSIONED_GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA,
-    VersionedGithubActionsWorkflowContext, parse_github_actions_render_request,
-    render_github_actions_workflow, render_versioned_github_actions_workflow,
-    reviewed_steward_run_release_v1, reviewed_steward_run_release_v2,
+    GithubActionsTaskTemplate, MAX_STEWARD_RUN_RELEASE_BYTES, StewardRunRelease,
+    VERSIONED_GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA, VersionedGithubActionsWorkflowContext,
+    parse_github_actions_render_request, render_github_actions_workflow,
+    render_versioned_github_actions_workflow, steward_run_release_from_installation_bom,
     validate_generated_github_actions_yaml,
 };
 
@@ -68,15 +69,15 @@ pub use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
 };
 use steward_store::{
-    AdminApprovalRecord, AdminEnvelopeRequestRecord, AgentRunExecutionLog, AgentRunPage,
-    AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind,
-    AgentRunTimelineProvenance, ApprovalCandidate, ApproveAdmission, ApprovedAdmission,
-    CumulativeEscalationRecord, DecisionFiling, DecisionFilingClaim, EnvelopeInstanceGrantRecord,
-    EnvelopeRequestDecisionReference, EnvelopeRequestRecord, EnvelopeRequestStatusEventRecord,
-    EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, EnvelopeTemplateRevisionRecord,
-    GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
-    PendingEnvelopeRequest, PgStore, StoreError, TaskAdmissionLookup, TaskAdmissionRecord,
-    TaskRecord, TaskReservation, TaskReservationRequest,
+    AdminApprovalRecord, AdminEnvelopeProvisionRequest, AdminEnvelopeRequestRecord,
+    AgentRunExecutionLog, AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent,
+    AgentRunTimelineKind, AgentRunTimelineProvenance, ApprovalCandidate, ApproveAdmission,
+    ApprovedAdmission, CumulativeEscalationRecord, DecisionFiling, DecisionFilingClaim,
+    EnvelopeInstanceGrantRecord, EnvelopeRequestDecisionReference, EnvelopeRequestRecord,
+    EnvelopeRequestStatusEventRecord, EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication,
+    EnvelopeTemplateRevisionRecord, GrantApplication, GrantReversion, ParkRejection,
+    ParkedAdmission, PendingApproval, PendingEnvelopeRequest, PgStore, StoreError,
+    TaskAdmissionLookup, TaskAdmissionRecord, TaskRecord, TaskReservation, TaskReservationRequest,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, ModelRef,
@@ -374,6 +375,7 @@ pub struct GrantRevocationRequest {
         browser_admin::list_admin_requests,
         browser_admin::get_admin_request,
         browser_admin::admin_requests_summary,
+        browser_admin::provision_envelope,
         browser_admin::approve_envelope_request,
         browser_admin::reject_envelope_request,
         browser_admin::file_envelope_request,
@@ -387,6 +389,15 @@ pub struct GrantRevocationRequest {
         browser_admin::disable_federated_subject,
         browser_admin::top_up_escalation,
         browser_admin::deny_escalation,
+        operator_admin::users,
+        operator_admin::user,
+        operator_admin::roles,
+        operator_admin::mutate_rbac,
+        operator_admin::effective_access,
+        operator_admin::template,
+        operator_admin::latest_template,
+        operator_admin::apply_template,
+        operator_admin::provision,
         agent_runs_contract,
         agent_run_contract,
         agent_run_timeline_contract
@@ -411,7 +422,22 @@ pub struct GrantRevocationRequest {
         browser_admin::BrowserFederatedSubjectAuditResponse,
         browser_admin::AssociateFederatedSubjectBody,
         browser_admin::DisableFederatedSubjectBody,
+        browser_admin::ProvisionEnvelopeBody,
         browser_admin::AdminRequestStateFilter,
+        operator_admin::OperatorUserView,
+        operator_admin::OperatorUsersResponse,
+        operator_admin::OperatorRolesResponse,
+        operator_admin::OperatorAssignmentKind,
+        operator_admin::OperatorAssignmentAction,
+        operator_admin::OperatorAssignmentRequest,
+        operator_admin::OperatorAssignmentResponse,
+        operator_admin::OperatorEligibleTemplateView,
+        operator_admin::OperatorActiveEnvelopeView,
+        operator_admin::OperatorEffectiveAccessResponse,
+        operator_admin::OperatorTemplateApplyRequest,
+        operator_admin::OperatorTemplateResponse,
+        operator_admin::OperatorProvisionRequest,
+        operator_admin::OperatorProvisionResponse,
         AgentRunAvailability,
         AgentRunDataStatus,
         AgentRunSpendView,
@@ -1100,13 +1126,6 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         &self,
     ) -> BoxFuture<'_, Result<Vec<EnvelopeTemplateRevisionRecord>, StoreError>>;
 
-    fn insert_envelope<'a>(
-        &'a self,
-        member_role: &'a str,
-        envelope: &'a Envelope,
-        authored_by: &'a str,
-    ) -> BoxFuture<'a, Result<(), StoreError>>;
-
     fn latest_envelope<'a>(
         &'a self,
         member_role: &'a str,
@@ -1224,6 +1243,13 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         request_id: Uuid,
         update: EnvelopeRequestStatusUpdate<'a>,
     ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>>;
+
+    fn provision_envelope_for_admin<'a>(
+        &'a self,
+        _request: AdminEnvelopeProvisionRequest<'a>,
+    ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>> {
+        Box::pin(async { Err(StoreError::InvalidEnvelopeRequest) })
+    }
 
     fn retire_pending_approval_if_superseded<'a>(
         &'a self,
@@ -1497,17 +1523,6 @@ impl AdmissionLedger for PgStore {
         Box::pin(async move { PgStore::latest_envelope_templates(self).await })
     }
 
-    fn insert_envelope<'a>(
-        &'a self,
-        member_role: &'a str,
-        envelope: &'a Envelope,
-        authored_by: &'a str,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
-        Box::pin(
-            async move { PgStore::insert_envelope(self, member_role, envelope, authored_by).await },
-        )
-    }
-
     fn latest_envelope<'a>(
         &'a self,
         member_role: &'a str,
@@ -1689,6 +1704,13 @@ impl AdmissionLedger for PgStore {
         Box::pin(
             async move { PgStore::append_envelope_request_status(self, request_id, update).await },
         )
+    }
+
+    fn provision_envelope_for_admin<'a>(
+        &'a self,
+        request: AdminEnvelopeProvisionRequest<'a>,
+    ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>> {
+        Box::pin(async move { PgStore::provision_envelope_for_admin(self, request).await })
     }
 
     fn retire_pending_approval_if_superseded<'a>(
@@ -2306,7 +2328,14 @@ where
     }
     match state
         .ledger
-        .insert_envelope(&member_role, &envelope, &admin.actor)
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &member_role,
+            display_name: &member_role,
+            member_roles: std::slice::from_ref(&member_role),
+            ceiling: &envelope,
+            auto_provision_threshold: Some(&envelope),
+            authored_by: &admin.actor,
+        })
         .await
     {
         Ok(()) => StatusCode::CREATED.into_response(),
@@ -2437,6 +2466,7 @@ impl IntoResponse for ApiError {
                 | StoreError::CanonicalIdentityNotFound
                 | StoreError::FederatedSubjectNotFound
                 | StoreError::EnvelopeRequestNotFound
+                | StoreError::EnvelopeTemplateNotFound
                 | StoreError::WorkflowNotFound
                 | StoreError::ConnectionOperationNotFound
                 | StoreError::CumulativeEscalationNotFound,
@@ -2466,6 +2496,7 @@ impl IntoResponse for ApiError {
                 | StoreError::EnvelopeRevisionNotIncreasing
                 | StoreError::TaskIdempotencyConflict
                 | StoreError::EnvelopeRequestIdempotencyConflict
+                | StoreError::EnvelopeRequestDigestConflict
                 | StoreError::EnvelopeRequestTemplateStale
                 | StoreError::WorkflowAlreadyExists
                 | StoreError::InvalidTaskTransition
@@ -3268,7 +3299,9 @@ where
             request_id: filing.approval_id.to_string(),
             runtime_uid: filing.runtime_uid,
             actor: filing.actor,
-            member_role: filing.member_role,
+            template_id: None,
+            eligibility_member_role: Some(filing.member_role.clone()),
+            member_role: Some(filing.member_role),
             counterexample,
         })
         .await
@@ -3396,17 +3429,18 @@ mod tests {
         TaskExecutionPlan, TaskExecutionPlanRequest,
     };
     use steward_store::{
-        AdminApprovalRecord, AdminEnvelopeRequestRecord, AdmissionApprovalState,
-        AgentRunExecutionLog, AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunSpend,
-        AgentRunTimelineEvent, AgentRunTimelineKind, AgentRunTimelineProvenance, ApprovalCandidate,
-        ApproveAdmission, ApprovedAdmission, CumulativeEscalationRecord, DecisionFiling,
-        DecisionFilingClaim, EnvelopeInstanceGrantRecord, EnvelopeRequestDecisionReference,
-        EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusEventRecord,
-        EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, EnvelopeTemplateRevisionRecord,
-        GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
-        PendingEnvelopeRequest, StoreError, TaskAdmissionLookup, TaskAdmissionRecord,
-        TaskOrchestrationState, TaskRecord, TaskReservation, TaskReservationRequest,
-        TaskRuntimeOperationRecord, TaskRuntimeOwnership, WorkflowRevisionRecord,
+        AdminApprovalRecord, AdminEnvelopeProvisionRequest, AdminEnvelopeRequestRecord,
+        AdmissionApprovalState, AgentRunExecutionLog, AgentRunPage, AgentRunQuery, AgentRunRecord,
+        AgentRunSpend, AgentRunTimelineEvent, AgentRunTimelineKind, AgentRunTimelineProvenance,
+        ApprovalCandidate, ApproveAdmission, ApprovedAdmission, CumulativeEscalationRecord,
+        DecisionFiling, DecisionFilingClaim, EnvelopeInstanceGrantRecord,
+        EnvelopeRequestDecisionReference, EnvelopeRequestRecord, EnvelopeRequestStatus,
+        EnvelopeRequestStatusEventRecord, EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication,
+        EnvelopeTemplateRevisionRecord, GrantApplication, GrantReversion, ParkRejection,
+        ParkedAdmission, PendingApproval, PendingEnvelopeRequest, StoreError, TaskAdmissionLookup,
+        TaskAdmissionRecord, TaskOrchestrationState, TaskRecord, TaskReservation,
+        TaskReservationRequest, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
+        WorkflowRevisionRecord,
     };
     use steward_types::direct_package::{
         ExactGitCommit, RepositoryUrl, SourceProvenance, StableProviderId,
@@ -4699,6 +4733,41 @@ mod tests {
             browser_capability_catalog(),
             admin_auth,
         );
+        let provisioned = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelopes/provision")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"ownerUserId":"usr_0123456789abcdef0123456789abcdef","templateId":"engineer","templateRevision":3,"requestedEnvelope":{"revision":3,"spec":{"llms":[{"provider":"provider-a","model":"model-a"}],"tools":[],"budget":{"monthlyLimit":"200.00","currency":"USD"},"ttl":"24h","runner":{}}},"idempotencyKey":"admin-provision-user-envelope"}"#,
+                    ))
+                    .map_err(|error| format!("build admin Envelope provision request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute admin Envelope provision request: {error}"))?;
+        assert_eq!(provisioned.status(), StatusCode::OK);
+        let admin_provisions = admin_ledger
+            .admin_provisions
+            .lock()
+            .map_err(|_| "fake admin provision lock was poisoned")?
+            .clone();
+        assert_eq!(admin_provisions.len(), 1);
+        assert_eq!(
+            admin_provisions[0].owner_user_id,
+            "usr_0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(admin_provisions[0].template_id, "engineer");
+        assert_eq!(admin_provisions[0].template_revision, 3);
+        assert_ne!(
+            admin_provisions[0].actor, "usr_0123456789abcdef0123456789abcdef",
+            "the authenticated administrator, not the target owner, must be the event actor"
+        );
         let bearer_only = admin_app
             .clone()
             .oneshot(
@@ -5250,6 +5319,128 @@ mod tests {
             "browser writes must audit the canonical Rust-resolved actor, never display identity or UI state"
         );
         assert_eq!(authors[0].2, next);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn custom_envelope_approval_rechecks_the_current_platform_safety_ceiling()
+    -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let runtime_repository = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let mut custom_ledger = ledger();
+        custom_ledger.pending_envelope_requests[0].template_id = None;
+        custom_ledger.pending_envelope_requests[0].template_revision = None;
+        custom_ledger.pending_envelope_requests[0].template_envelope = None;
+        let mut tightened_ceiling = custom_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .clone();
+        tightened_ceiling.spec.budget.monthly_limit = "50.00".to_owned();
+        let (admin_auth, admin_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let app = browser_admin::protected_router_with_custom_envelope_safety(
+            runtime_repository,
+            custom_ledger,
+            FakeDecisionChannel::default(),
+            browser_capability_catalog(),
+            Some(tightened_ceiling),
+            admin_auth,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"rationale":"reviewed custom authority against the current platform ceiling"}"#,
+                    ))
+                    .map_err(|error| format!("build custom approval request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute custom approval request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provisioned_custom_envelope_approval_retry_ignores_later_safety_config_drift()
+    -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let runtime_repository = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let mut custom_ledger = ledger();
+        custom_ledger.pending_envelope_requests[0].template_id = None;
+        custom_ledger.pending_envelope_requests[0].template_revision = None;
+        custom_ledger.pending_envelope_requests[0].template_envelope = None;
+        custom_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .spec
+            .runtime_minutes_limit = Some("60".to_owned());
+        let safety_ceiling = custom_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .clone();
+        let (first_auth, first_cookie, first_csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let first_app = browser_admin::protected_router_with_custom_envelope_safety(
+            runtime_repository.clone(),
+            custom_ledger.clone(),
+            FakeDecisionChannel::default(),
+            browser_capability_catalog(),
+            Some(safety_ceiling),
+            first_auth,
+        );
+        let first = first_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &first_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &first_csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"rationale":"approved within the current custom safety ceiling"}"#,
+                    ))
+                    .map_err(|error| format!("build first custom approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute first custom approval: {error}"))?;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let (retry_auth, retry_cookie, retry_csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let retry_app = browser_admin::protected_router_with_custom_envelope_safety(
+            runtime_repository,
+            custom_ledger,
+            FakeDecisionChannel::default(),
+            browser_admin::CapabilityCatalog::default(),
+            None,
+            retry_auth,
+        );
+        let retry = retry_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &retry_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &retry_csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build custom approval retry: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute custom approval retry: {error}"))?;
+        assert_eq!(retry.status(), StatusCode::OK);
         Ok(())
     }
 
@@ -6329,6 +6520,14 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct AdminProvisionCapture {
+        owner_user_id: String,
+        template_id: String,
+        template_revision: i64,
+        actor: String,
+    }
+
+    #[derive(Clone)]
     struct FakeLedger {
         envelope: Arc<Mutex<Envelope>>,
         envelope_authors: Arc<Mutex<Vec<(String, String, Envelope)>>>,
@@ -6350,6 +6549,7 @@ mod tests {
         task_approval_state: Arc<Mutex<FakeApprovalState>>,
         workflow_revisions: Arc<Mutex<Vec<WorkflowRevisionRecord>>>,
         user_envelopes: Arc<Mutex<Vec<EnvelopeRequestRecord>>>,
+        admin_provisions: Arc<Mutex<Vec<AdminProvisionCapture>>>,
         agent_runs: Arc<Mutex<Vec<AgentRunRecord>>>,
         agent_run_events: AgentRunEvents,
         source_repository_bindings: SourceRepositoryBindings,
@@ -6504,32 +6704,6 @@ mod tests {
                 }
                 latest.sort_by(|left, right| left.template_id.cmp(&right.template_id));
                 Ok(latest)
-            })
-        }
-
-        fn insert_envelope<'a>(
-            &'a self,
-            member_role: &'a str,
-            envelope: &'a Envelope,
-            authored_by: &'a str,
-        ) -> BoxFuture<'a, Result<(), StoreError>> {
-            Box::pin(async move {
-                self.envelope_authors
-                    .lock()
-                    .map_err(|_| {
-                        StoreError::Database(
-                            "fake member-envelope author lock was poisoned".to_owned(),
-                        )
-                    })?
-                    .push((
-                        member_role.to_owned(),
-                        authored_by.to_owned(),
-                        envelope.clone(),
-                    ));
-                *self.envelope.lock().map_err(|_| {
-                    StoreError::Database("fake envelope lock was poisoned".to_owned())
-                })? = envelope.clone();
-                Ok(())
             })
         }
 
@@ -6769,7 +6943,7 @@ mod tests {
                         request: request.clone(),
                         owner_display_email: "alice@example.com".to_owned(),
                         template_display_name: request.template_id.clone(),
-                        template_envelope: request.requested_envelope.clone(),
+                        template_envelope: Some(request.requested_envelope.clone()),
                     });
                 }
                 Ok(records)
@@ -7139,12 +7313,16 @@ mod tests {
                     return Ok(current);
                 }
                 if update.to == EnvelopeRequestStatus::Provisioned {
-                    let template_revision = self
-                        .latest_envelope_template(&current.template_id)
-                        .await?
-                        .map(|template| template.ceiling.revision);
-                    if template_revision != Some(current.template_revision) {
-                        return Err(StoreError::EnvelopeRequestTemplateStale);
+                    if let (Some(template_id), Some(requested_revision)) =
+                        (current.template_id.as_deref(), current.template_revision)
+                    {
+                        let template_revision = self
+                            .latest_envelope_template(template_id)
+                            .await?
+                            .map(|template| template.ceiling.revision);
+                        if template_revision != Some(requested_revision) {
+                            return Err(StoreError::EnvelopeRequestTemplateStale);
+                        }
                     }
                     if update.approved_envelope != Some(&current.requested_envelope) {
                         return Err(StoreError::InvalidEnvelopeRequest);
@@ -7175,6 +7353,46 @@ mod tests {
                     records.push(decided.clone());
                 }
                 Ok(decided)
+            })
+        }
+
+        fn provision_envelope_for_admin<'a>(
+            &'a self,
+            request: AdminEnvelopeProvisionRequest<'a>,
+        ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>> {
+            Box::pin(async move {
+                self.admin_provisions
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database("fake admin provision lock was poisoned".to_owned())
+                    })?
+                    .push(AdminProvisionCapture {
+                        owner_user_id: request.owner_user_id.as_str().to_owned(),
+                        template_id: request.template_id.to_owned(),
+                        template_revision: request.template_revision,
+                        actor: request.actor.to_owned(),
+                    });
+                Ok(EnvelopeRequestRecord {
+                    id: Uuid::from_u128(90),
+                    owner_user_id: request.owner_user_id.clone(),
+                    template_id: Some(request.template_id.to_owned()),
+                    template_revision: Some(request.template_revision),
+                    requested_envelope: request.requested_envelope.clone(),
+                    approved_envelope: Some(request.requested_envelope.clone()),
+                    status: EnvelopeRequestStatus::Provisioned,
+                    approval_id: Some(Uuid::from_u128(91)),
+                    envelope_instance_id: Some("env_admin-provision".to_owned()),
+                    envelope_digest: Some(format!("sha256:{}", "a".repeat(64))),
+                    reason: None,
+                    rationale: None,
+                    evidence_url: None,
+                    decision_key: None,
+                    expires_at: None,
+                    status_actor: request.actor.to_owned(),
+                    status_template_revision: Some(request.template_revision),
+                    created_at: "2026-09-26T12:00:00.000000Z".to_owned(),
+                    status_at: "2026-09-26T12:00:00.000000Z".to_owned(),
+                })
             })
         }
 
@@ -8115,6 +8333,7 @@ mod tests {
             task_approval_state: Arc::new(Mutex::new(FakeApprovalState::Pending)),
             workflow_revisions: Arc::new(Mutex::new(Vec::new())),
             user_envelopes: Arc::new(Mutex::new(Vec::new())),
+            admin_provisions: Arc::new(Mutex::new(Vec::new())),
             agent_runs: Arc::new(Mutex::new(Vec::new())),
             agent_run_events: Arc::new(Mutex::new(Vec::new())),
             source_repository_bindings: Arc::new(Mutex::new(Vec::new())),
@@ -8139,8 +8358,8 @@ mod tests {
         PendingEnvelopeRequest {
             request_id: Uuid::from_u128(request_id),
             owner_display_email: "alice@example.com".to_owned(),
-            template_id: "engineer".to_owned(),
-            template_revision: 3,
+            template_id: Some("engineer".to_owned()),
+            template_revision: Some(3),
             requested_envelope: Envelope {
                 revision: 3,
                 spec: EnvelopeSpec {
@@ -8159,7 +8378,7 @@ mod tests {
                     runner: steward_types::RunnerRequirements::default(),
                 },
             },
-            template_envelope: Envelope {
+            template_envelope: Some(Envelope {
                 revision: 3,
                 spec: EnvelopeSpec {
                     llms: vec![ModelRef {
@@ -8176,7 +8395,7 @@ mod tests {
                     ttl: Duration("24h".to_owned()),
                     runner: steward_types::RunnerRequirements::default(),
                 },
-            },
+            }),
             created_at: "2026-08-24T17:05:00.000000Z".to_owned(),
         }
     }
@@ -8261,8 +8480,8 @@ mod tests {
             .push(EnvelopeRequestRecord {
                 id: Uuid::from_u128(41),
                 owner_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
-                template_id: "engineer".to_owned(),
-                template_revision: 4,
+                template_id: Some("engineer".to_owned()),
+                template_revision: Some(4),
                 requested_envelope: approved.clone(),
                 approved_envelope: Some(approved),
                 status: EnvelopeRequestStatus::Provisioned,
@@ -8275,7 +8494,7 @@ mod tests {
                 decision_key: None,
                 expires_at: None,
                 status_actor: "usr_0123456789abcdef0123456789abcdef".to_owned(),
-                status_template_revision: 4,
+                status_template_revision: Some(4),
                 created_at: "2026-08-24T17:01:00.000000Z".to_owned(),
                 status_at: "2026-08-24T17:02:00.000000Z".to_owned(),
             });
@@ -8429,7 +8648,9 @@ mod tests {
                 request_id: Uuid::nil().to_string(),
                 runtime_uid: "runtime-uid-a".to_owned(),
                 actor: "alice@example.com".to_owned(),
-                member_role: "engineer".to_owned(),
+                template_id: None,
+                eligibility_member_role: Some("engineer".to_owned()),
+                member_role: Some("engineer".to_owned()),
                 counterexample:
                     "envelope exceeded: budget.monthlyLimit requested 220.00 USD, ceiling 200.00 USD"
                         .to_owned(),
@@ -10201,6 +10422,11 @@ mod tests {
             runtime: Arc::new(Mutex::new(runtime())),
         };
         let ledger = ledger();
+        ledger
+            .envelope_templates
+            .lock()
+            .map_err(|_| "fake envelope-template lock was poisoned")?
+            .clear();
         let envelope_body = serde_json::to_vec(
             &*ledger
                 .envelope
@@ -11369,6 +11595,7 @@ mod tests {
         );
 
         let conflicting = retry_app
+            .clone()
             .oneshot(request("different-workflow@1")?)
             .await
             .map_err(|error| format!("submit conflicting versioned Workflow retry: {error}"))?;
@@ -11376,6 +11603,27 @@ mod tests {
             conflicting.status(),
             StatusCode::CONFLICT,
             "the persisted retry path must still reject a different caller-owned Workflow pin"
+        );
+        let conflicting_digest = retry_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "runtime-contract-retry")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"workflow":"repository-review@1","envelopeDigest":"steward:sha256:{}"}}"#,
+                        "f".repeat(64)
+                    )))
+                    .map_err(|error| format!("build conflicting Envelope retry: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit conflicting Envelope retry: {error}"))?;
+        assert_eq!(
+            conflicting_digest.status(),
+            StatusCode::CONFLICT,
+            "a retry cannot change its explicit User Envelope selector"
         );
         Ok(())
     }

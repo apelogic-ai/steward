@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.2.6` and application `0.2.6`.
+Current release contract: chart `0.3.0` and application `0.3.0`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -394,6 +394,16 @@ that allowlist remain inaccessible to both service accounts.
 
   Tool access classes and provider catalog availability are display metadata. Authority,
   budget, TTL, template, and user fields are intentionally not part of this catalog.
+- `config.apiserver.customEnvelopeSafetyCeiling` is the optional deployment-owned maximum for
+  template-free requests. It is a complete Envelope and its capabilities must exist in the
+  catalog. Steward revalidates the current ceiling at both request creation and administrator
+  approval, so tightening it also fences already-pending requests. The default `null` value makes
+  custom requests fail closed.
+- `config.apiserver.stewardRunRelease` is the exact verified steward-run handoff selected by the
+  installation BOM: manifest schema, semantic version, reusable-workflow repository and commit,
+  action commit, and governed job-container digest. Browser workflow generation requires v0.7.0 or later and
+  fails closed when this value is null or malformed. Steward validates and renders these
+  deployment coordinates; its source and chart defaults do not select them.
 - `config.apiserver.executionBindings` is the structured, deployment-owned coding-agent
   catalog. The default `bindings: []` advertises no agents and creates no fallback.
   The chart validates it, renders it into an immutable content-addressed ConfigMap,
@@ -473,7 +483,7 @@ that allowlist remain inaccessible to both service accounts.
   (`/steward/mint` by default).
 
 Both the apiserver and controller apply the embedded append-only Postgres
-migration set on startup (currently through migration `0049`). They must
+migration set on startup (currently through migration `0051`). They must
 receive the same database URL. Review the
 [installation upgrade and backup procedure](../../docs/installation/installation-guide.md#upgrade-rollback-backup-and-removal)
 before upgrading; a Helm rollback does not reverse database migrations.

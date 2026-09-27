@@ -18,7 +18,7 @@ export type AdminRequestHistoryEvent = {
     state: AdminRequestState;
 };
 
-export type AdminRequestKind = 'ceiling_exceeded' | 'cumulative_exhausted' | 'within_ceiling';
+export type AdminRequestKind = 'ceiling_exceeded' | 'cumulative_exhausted' | 'custom' | 'within_ceiling';
 
 export type AdminRequestRequester = {
     displayEmail: string;
@@ -37,9 +37,9 @@ export type AdminRequestState = 'requested' | 'escalated' | 'auto_approved' | 'a
 export type AdminRequestStateFilter = 'all' | 'needs_action' | 'requested' | 'escalated' | 'auto_approved' | 'approved' | 'rejected' | 'expired';
 
 export type AdminRequestTemplate = {
-    displayName: string;
-    id: string;
-    revision: number;
+    displayName?: string | null;
+    id?: string | null;
+    revision?: number | null;
 };
 
 export type AdminRequestView = {
@@ -303,8 +303,8 @@ export type BrowserEnvelopeRequestDecisionView = {
     requestedEnvelope: BrowserEnvelope;
     status: string;
     statusAt: string;
-    templateId: string;
-    templateRevision: number;
+    templateId?: string | null;
+    templateRevision?: number | null;
 };
 
 export type BrowserEnvelopeRequestView = {
@@ -312,9 +312,9 @@ export type BrowserEnvelopeRequestView = {
     ownerDisplayEmail: string;
     requestId: string;
     requestedEnvelope: BrowserEnvelope;
-    templateEnvelope: BrowserEnvelope;
-    templateId: string;
-    templateRevision: number;
+    templateEnvelope?: null | BrowserEnvelope;
+    templateId?: string | null;
+    templateRevision?: number | null;
 };
 
 export type BrowserEnvelopeSpec = {
@@ -620,8 +620,8 @@ export type ContentDigest = string;
 export type CreateEnvelopeRequestBody = {
     idempotencyKey: string;
     requestedEnvelope: BrowserEnvelope;
-    templateId: string;
-    templateRevision: number;
+    templateId?: string | null;
+    templateRevision?: number | null;
 };
 
 export type CreateRuntimeRequest = {
@@ -717,6 +717,7 @@ export type DirectTaskStatusResponse = {
 
 export type DirectTaskSubmission = {
     contractVersion: string;
+    envelopeDigest?: null | EnvelopeDigest;
     invocationPath: RelativePath;
 };
 
@@ -884,6 +885,91 @@ export type MyRunsResponse = {
     runs: Array<BrowserRunView>;
 };
 
+export type OperatorActiveEnvelopeView = {
+    envelopeDigest: string;
+    envelopeInstanceId: string;
+    templateId?: string | null;
+    templateRevision?: number | null;
+};
+
+export type OperatorAssignmentAction = 'grant' | 'revoke';
+
+export type OperatorAssignmentKind = 'administrator' | 'member_role';
+
+export type OperatorAssignmentRequest = {
+    action: OperatorAssignmentAction;
+    kind: OperatorAssignmentKind;
+    memberRole?: string | null;
+    userId: string;
+};
+
+export type OperatorAssignmentResponse = {
+    action: OperatorAssignmentAction;
+    actor: string;
+    kind: OperatorAssignmentKind;
+    memberRole?: string | null;
+    userId: string;
+};
+
+export type OperatorEffectiveAccessResponse = {
+    activeEnvelopes: Array<OperatorActiveEnvelopeView>;
+    administrator: boolean;
+    eligibleTemplates: Array<OperatorEligibleTemplateView>;
+    memberRoles: Array<string>;
+    user: OperatorUserView;
+};
+
+export type OperatorEligibleTemplateView = {
+    revision: number;
+    templateId: string;
+};
+
+export type OperatorProvisionRequest = {
+    idempotencyKey: string;
+    ownerUserId: string;
+    requestedEnvelope: BrowserEnvelope;
+    templateId: string;
+    templateRevision: number;
+};
+
+export type OperatorProvisionResponse = {
+    envelopeDigest: string;
+    envelopeInstanceId: string;
+    ownerUserId: string;
+    templateId: string;
+    templateRevision: number;
+};
+
+export type OperatorRolesResponse = {
+    memberRoles: Array<string>;
+};
+
+export type OperatorTemplateApplyRequest = {
+    autoProvisionThreshold?: null | BrowserEnvelope;
+    ceiling: BrowserEnvelope;
+    displayName: string;
+    memberRoles: Array<string>;
+};
+
+export type OperatorTemplateResponse = {
+    autoProvisionThreshold?: null | BrowserEnvelope;
+    ceiling: BrowserEnvelope;
+    displayName: string;
+    memberRoles: Array<string>;
+    templateId: string;
+};
+
+export type OperatorUserView = {
+    displayEmail: string;
+    organizationId: string;
+    state: string;
+    userId: string;
+};
+
+export type OperatorUsersResponse = {
+    users: Array<OperatorUserView>;
+};
+
 export type PackageClosure = {
     contractVersion: string;
     entries: Array<ClosureEntry>;
@@ -914,6 +1000,14 @@ export type ProviderConnectionView = {
     displayName: string;
     provider: string;
     status: ProviderConnectionStatus;
+};
+
+export type ProvisionEnvelopeBody = {
+    idempotencyKey: string;
+    ownerUserId: string;
+    requestedEnvelope: BrowserEnvelope;
+    templateId: string;
+    templateRevision: number;
 };
 
 export type PublishWorkflowRequest = {
@@ -1100,6 +1194,7 @@ export type TaskSubmissionRequest = {
      * Versioned Workflows always reject this field.
      */
     codingAgentRuntime?: string | null;
+    envelopeDigest?: null | EnvelopeDigest;
     workflow: string;
 };
 
@@ -1142,9 +1237,9 @@ export type UserEnvelopeRequest = {
     status: EnvelopeRequestStatus;
     statusActor: string;
     statusAt: string;
-    statusTemplateRevision: number;
-    templateId: string;
-    templateRevision: number;
+    statusTemplateRevision?: number | null;
+    templateId?: string | null;
+    templateRevision?: number | null;
     usage?: null | EnvelopeUsageView;
 };
 
@@ -1872,6 +1967,53 @@ export type PutAdminEnvelopeTemplateResponses = {
 };
 
 export type PutAdminEnvelopeTemplateResponse = PutAdminEnvelopeTemplateResponses[keyof PutAdminEnvelopeTemplateResponses];
+
+export type ProvisionAdminEnvelopeData = {
+    body: ProvisionEnvelopeBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/envelopes/provision';
+};
+
+export type ProvisionAdminEnvelopeErrors = {
+    /**
+     * Canonical user ID or idempotency key is malformed
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Canonical user or template revision was not found
+     */
+    404: unknown;
+    /**
+     * Idempotency, active digest, or provisioning state conflicts
+     */
+    409: unknown;
+    /**
+     * User eligibility or requested Envelope is invalid
+     */
+    422: unknown;
+    /**
+     * Envelope authority is unavailable
+     */
+    503: unknown;
+};
+
+export type ProvisionAdminEnvelopeResponses = {
+    200: BrowserEnvelopeRequestDecisionResponse;
+};
+
+export type ProvisionAdminEnvelopeResponse = ProvisionAdminEnvelopeResponses[keyof ProvisionAdminEnvelopeResponses];
 
 export type DenyAdminEscalationData = {
     body: EscalationDenyRequest;
@@ -2607,6 +2749,205 @@ export type GetAdminWorkflowVersionResponses = {
 };
 
 export type GetAdminWorkflowVersionResponse = GetAdminWorkflowVersionResponses[keyof GetAdminWorkflowVersionResponses];
+
+export type ProvisionOperatorEnvelopeData = {
+    body: OperatorProvisionRequest;
+    path?: never;
+    query?: never;
+    url: '/admin/operator/v1/envelopes/provision';
+};
+
+export type ProvisionOperatorEnvelopeErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    409: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type ProvisionOperatorEnvelopeResponses = {
+    200: OperatorProvisionResponse;
+};
+
+export type ProvisionOperatorEnvelopeResponse = ProvisionOperatorEnvelopeResponses[keyof ProvisionOperatorEnvelopeResponses];
+
+export type MutateOperatorRbacData = {
+    body: OperatorAssignmentRequest;
+    path?: never;
+    query?: never;
+    url: '/admin/operator/v1/rbac';
+};
+
+export type MutateOperatorRbacErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type MutateOperatorRbacResponses = {
+    200: OperatorAssignmentResponse;
+};
+
+export type MutateOperatorRbacResponse = MutateOperatorRbacResponses[keyof MutateOperatorRbacResponses];
+
+export type ListOperatorRolesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/operator/v1/roles';
+};
+
+export type ListOperatorRolesErrors = {
+    401: unknown;
+    403: unknown;
+    503: unknown;
+};
+
+export type ListOperatorRolesResponses = {
+    200: OperatorRolesResponse;
+};
+
+export type ListOperatorRolesResponse = ListOperatorRolesResponses[keyof ListOperatorRolesResponses];
+
+export type GetLatestOperatorTemplateData = {
+    body?: never;
+    path: {
+        template_id: string;
+    };
+    query?: never;
+    url: '/admin/operator/v1/templates/{template_id}';
+};
+
+export type GetLatestOperatorTemplateErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type GetLatestOperatorTemplateResponses = {
+    200: OperatorTemplateResponse;
+};
+
+export type GetLatestOperatorTemplateResponse = GetLatestOperatorTemplateResponses[keyof GetLatestOperatorTemplateResponses];
+
+export type GetOperatorTemplateRevisionData = {
+    body?: never;
+    path: {
+        template_id: string;
+        revision: number;
+    };
+    query?: never;
+    url: '/admin/operator/v1/templates/{template_id}/revisions/{revision}';
+};
+
+export type GetOperatorTemplateRevisionErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type GetOperatorTemplateRevisionResponses = {
+    200: OperatorTemplateResponse;
+};
+
+export type GetOperatorTemplateRevisionResponse = GetOperatorTemplateRevisionResponses[keyof GetOperatorTemplateRevisionResponses];
+
+export type ApplyOperatorTemplateRevisionData = {
+    body: OperatorTemplateApplyRequest;
+    path: {
+        template_id: string;
+        revision: number;
+    };
+    query?: never;
+    url: '/admin/operator/v1/templates/{template_id}/revisions/{revision}';
+};
+
+export type ApplyOperatorTemplateRevisionErrors = {
+    401: unknown;
+    403: unknown;
+    409: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type ApplyOperatorTemplateRevisionResponses = {
+    200: OperatorTemplateResponse;
+    201: OperatorTemplateResponse;
+};
+
+export type ApplyOperatorTemplateRevisionResponse = ApplyOperatorTemplateRevisionResponses[keyof ApplyOperatorTemplateRevisionResponses];
+
+export type ListOperatorUsersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/operator/v1/users';
+};
+
+export type ListOperatorUsersErrors = {
+    401: unknown;
+    403: unknown;
+    503: unknown;
+};
+
+export type ListOperatorUsersResponses = {
+    200: OperatorUsersResponse;
+};
+
+export type ListOperatorUsersResponse = ListOperatorUsersResponses[keyof ListOperatorUsersResponses];
+
+export type GetOperatorUserData = {
+    body?: never;
+    path: {
+        user_id: string;
+    };
+    query?: never;
+    url: '/admin/operator/v1/users/{user_id}';
+};
+
+export type GetOperatorUserErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type GetOperatorUserResponses = {
+    200: OperatorUserView;
+};
+
+export type GetOperatorUserResponse = GetOperatorUserResponses[keyof GetOperatorUserResponses];
+
+export type GetOperatorEffectiveAccessData = {
+    body?: never;
+    path: {
+        user_id: string;
+    };
+    query?: never;
+    url: '/admin/operator/v1/users/{user_id}/effective-access';
+};
+
+export type GetOperatorEffectiveAccessErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+    422: unknown;
+    503: unknown;
+};
+
+export type GetOperatorEffectiveAccessResponses = {
+    200: OperatorEffectiveAccessResponse;
+};
+
+export type GetOperatorEffectiveAccessResponse = GetOperatorEffectiveAccessResponses[keyof GetOperatorEffectiveAccessResponses];
 
 export type ListProviderConnectionsData = {
     body?: never;

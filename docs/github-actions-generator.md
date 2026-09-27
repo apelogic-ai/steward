@@ -1,6 +1,6 @@
 # Steward GitHub Actions generator contract
 
-Status: renderer core v1; browser integration is a separate change
+Status: current Steward v0.3.0 renderer and browser integration
 
 The generator turns one authoritative Steward envelope selection and one bounded task template
 into workflow YAML that a developer may inspect, copy, commit, and dispatch. It never selects a
@@ -22,20 +22,32 @@ header. It is generation-time provenance; Task admission independently resolves 
 authenticated user's exact provisioned User Envelope. The renderer and deployment capability
 catalog grant no runtime authority.
 
-The v1 request schema is `steward/github-actions-render-request/v1`. Its only task template is
-`github-file-read/v1`, with a repository name, full 40-character Git commit, and relative file
-path. Commands, runners, images, permissions, action references, environment expressions, secret
-references, and arbitrary YAML are not request fields.
+The lower-level v1 renderer accepts schema
+`steward/github-actions-render-request/v1`. Its only task template is
+`github-file-read/v1`, with a repository name, full 40-character Git commit,
+and relative file path. Commands, runners, images, permissions, action
+references, environment expressions, secret references, and arbitrary YAML
+are not request fields.
 
-## Frozen steward-run release
+The browser route accepts a server-published versioned Workflow reference such
+as `repo-summary@1`. It resolves the Workflow and the user's provisioned
+Envelope on the server and emits schema
+`steward/github-actions-rendered-workflow/v2`. Both render paths forward the
+authoritative Envelope digest to steward-run as `envelope-digest`; neither path
+lets the caller supply release coordinates or authority.
 
-The first reviewed contract is steward-run v0.3.7. Its signed release-manifest schema 4 records:
+## BOM-selected steward-run release
 
-| Coordinate | Immutable value |
-|---|---|
-| Reusable workflow | `apelogic-ai/steward-run/.github/workflows/steward-task.yml@9c7487bd18d5e90b24b3e4b296bfdd232a3f4f5a` |
-| Remote action | `apelogic-ai/steward-run@b26790e29ce9c243c6a7aa00450a2a1a98fbd250` |
-| Governed job container | `ghcr.io/apelogic-ai/steward-run@sha256:bea4dfcdc021fb2f9c1a9948f2a0b3e06e6edab15891ad19fd279bc2e0f2e6c2` |
+Steward source does not select a steward-run release. Release/integration
+packaging verifies steward-run's signed release handoff, records its exact
+coordinates in the installation BOM, and supplies that object through
+`config.apiserver.stewardRunRelease`. The object contains OSS release-manifest
+schema 3, semantic version, reusable-workflow repository and commit, action commit, and
+governed job-container digest. The generator requires structurally immutable
+coordinates and steward-run v0.7.0 or later.
+
+The committed golden workflow uses reserved example coordinates. It tests
+deterministic rendering and is not an installation BOM or a deployable pin.
 
 The reusable workflow, not the caller, pins the remote action and owns the six-operation Task
 lifecycle and unconditional finalization. The generated caller retains only `contents: read` and
@@ -67,5 +79,6 @@ characters, traversal, mutable revisions, and secret-like markers.
 
 The golden contract is
 [`github-file-read-v1.yaml`](examples/github-file-read-v1.yaml).
-Changing it requires updating the renderer tests and rechecking the corresponding steward-run
-signed release contract. No live workflow is dispatched by this renderer slice.
+Changing the renderer shape requires updating its tests. Changing deployment
+coordinates requires a newly verified installation BOM, not a Steward source
+change. No live workflow is dispatched by this renderer slice.

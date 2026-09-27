@@ -4,11 +4,12 @@
 # envelope-revision: 7
 # envelope-digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 # task-template: github-file-read/v1
-# steward-run-release-manifest-schema: 4
-# steward-run-version: 0.3.7
-# steward-run-workflow-commit: 9c7487bd18d5e90b24b3e4b296bfdd232a3f4f5a
-# steward-run-action-commit: b26790e29ce9c243c6a7aa00450a2a1a98fbd250
-# governed-job-container: ghcr.io/apelogic-ai/steward-run@sha256:bea4dfcdc021fb2f9c1a9948f2a0b3e06e6edab15891ad19fd279bc2e0f2e6c2
+# steward-run-release-manifest-schema: 3
+# steward-run-version: 0.7.0
+# steward-run-workflow-repository: example-org/steward-run
+# steward-run-workflow-commit: 1111111111111111111111111111111111111111
+# steward-run-action-commit: 2222222222222222222222222222222222222222
+# governed-job-container: registry.example.test/steward-run@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 name: Steward governed GitHub file read
 
@@ -23,7 +24,7 @@ jobs:
     runs-on: ${{ vars.STEWARD_RUNNER_LABEL }}
     timeout-minutes: 5
     container:
-      image: ghcr.io/apelogic-ai/steward-run@sha256:bea4dfcdc021fb2f9c1a9948f2a0b3e06e6edab15891ad19fd279bc2e0f2e6c2
+      image: registry.example.test/steward-run@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     permissions:
       contents: read
     steps:
@@ -59,10 +60,11 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    uses: apelogic-ai/steward-run/.github/workflows/steward-task.yml@9c7487bd18d5e90b24b3e4b296bfdd232a3f4f5a
+    uses: example-org/steward-run/.github/workflows/steward-task.yml@1111111111111111111111111111111111111111
     with:
       runner-label: ${{ vars.STEWARD_RUNNER_LABEL }}
       workflow: github-file-agent-smoke
+      envelope-digest: steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
       input-artifact: steward-github-file-read-input
       output-artifact: steward-github-file-read-output
       steward-api-url: ${{ vars.STEWARD_API_URL }}
@@ -76,7 +78,7 @@ jobs:
     runs-on: ${{ vars.STEWARD_RUNNER_LABEL }}
     timeout-minutes: 5
     container:
-      image: ghcr.io/apelogic-ai/steward-run@sha256:bea4dfcdc021fb2f9c1a9948f2a0b3e06e6edab15891ad19fd279bc2e0f2e6c2
+      image: registry.example.test/steward-run@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     permissions:
       contents: read
     steps:

@@ -209,9 +209,9 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
 
   return (
     <li className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm">
-      <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="text-xl font-semibold">{request.template.displayName}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div><StatusBadge value={status === "approved" ? "approved" : status === "rejection-complete" ? "rejected" : request.state} /></div>
+      <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="text-xl font-semibold">{request.template.displayName ?? "Custom envelope request"}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div><StatusBadge value={status === "approved" ? "approved" : status === "rejection-complete" ? "rejected" : request.state} /></div>
       <DefinitionList items={[["Kind", request.kind], ["Source", request.source], ["Requested by", request.requester.displayEmail], ["Created", request.createdAt], ["State actor", request.stateActor]]} />
-      {request.deltas.length ? <section className="space-y-3"><h3 className="font-semibold">Requested changes</h3><ul className="space-y-2">{request.deltas.map((delta, index) => <li className="rounded-md border p-3 text-sm" key={`${delta.dimension}-${index}`}><strong>{delta.dimension}</strong>: {deltaValue(delta.requested)} <span className="text-muted-ink">(ceiling {deltaValue(delta.ceiling)})</span></li>)}</ul></section> : <p className="rounded-md bg-notice p-4 text-sm">This request is within the configured ceiling.</p>}
+      {request.deltas.length ? <section className="space-y-3"><h3 className="font-semibold">Requested changes</h3><ul className="space-y-2">{request.deltas.map((delta, index) => <li className="rounded-md border p-3 text-sm" key={`${delta.dimension}-${index}`}><strong>{delta.dimension}</strong>: {deltaValue(delta.requested)} <span className="text-muted-ink">(ceiling {deltaValue(delta.ceiling)})</span></li>)}</ul></section> : <p className="rounded-md bg-notice p-4 text-sm">{request.kind === "custom" ? "This custom request has no governing template." : "This request is within the configured ceiling."}</p>}
       {reference ? <DefinitionList items={[["Decision key", reference.decisionKey], ["Evidence URL", reference.evidenceUrl]]} /> : <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={status === "filing"} onClick={() => void fileDecision()} type="button">{status === "filing" ? "Filing…" : "File decision reference"}</button>}
       <form className="grid gap-4 border-t pt-5 sm:grid-cols-2" onSubmit={approve}>
         <label className="grid gap-2 text-sm font-semibold sm:col-span-2">Rationale<textarea className="min-h-24 rounded-md border p-3 font-normal" name="rationale" required /></label>
@@ -232,7 +232,7 @@ export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnve
   const [decision, setDecision] = useState<BrowserEnvelopeRequestDecisionResponse | null>(null);
   const [status, setStatus] = useState<EnvelopeActionState>("idle");
   const requested = request.requestedEnvelope.spec;
-  const governing = request.templateEnvelope.spec;
+  const governing = request.templateEnvelope?.spec;
   const terminal = decision?.request.status === "provisioned" || decision?.request.status === "rejected";
 
   async function approveRequest(event: FormEvent<HTMLFormElement>) {
@@ -289,8 +289,8 @@ export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnve
       </div>
       <DefinitionList items={[
         ["Requested by", request.ownerDisplayEmail],
-        ["Template", request.templateId],
-        ["Template revision", request.templateRevision],
+        ["Template", request.templateId ?? "Custom"],
+        ["Template revision", request.templateRevision?.toString() ?? "Not applicable"],
         ["Created", request.createdAt],
       ]} />
       <div className="grid gap-5 border-t pt-5 lg:grid-cols-2">
@@ -298,10 +298,13 @@ export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnve
           <h3 className="font-semibold">Requested authority</h3>
           <DefinitionList items={envelopeAuthorityItems(requested)} />
         </section>
-        <section aria-label="Governing template" className="space-y-3">
+        {governing ? <section aria-label="Governing template" className="space-y-3">
           <h3 className="font-semibold">Governing template</h3>
           <DefinitionList items={envelopeAuthorityItems(governing)} />
-        </section>
+        </section> : <section aria-label="Governing template" className="space-y-3">
+          <h3 className="font-semibold">Governing template</h3>
+          <p className="text-sm text-muted-ink">Custom requests require administrator review and are not auto-provisioned.</p>
+        </section>}
       </div>
       <form className="grid gap-3 border-t pt-5" onSubmit={approveRequest}>
         <label className="grid gap-2 text-sm font-semibold">Approval rationale

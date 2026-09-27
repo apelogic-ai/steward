@@ -26,6 +26,8 @@ user Task.
 | `STEWARD_TASK_EXECUTION_BINDINGS_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
 | `STEWARD_CAPABILITY_CATALOG_FILE` | Read-only `steward.capability-catalog/v2` document used by browser administration. Required when browser administration is enabled. |
 | `STEWARD_CAPABILITY_CATALOG_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
+| `STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE` | Optional read-only complete Envelope that bounds every template-free request at creation and approval. When neither form is configured, custom requests fail closed. |
+| `STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
 | `STEWARD_EXECUTION_ENABLED` | `false` for core-only installation with orchestration staged; `true` after governed dependencies and execution bindings are ready. |
 | `STEWARD_TASK_INFERENCE_ENDPOINT` | Required with governed execution. Exact OpenAI-compatible Responses API endpoint used by the Codex adapter. |
 | `STEWARD_TASK_MCP_GW_ENDPOINT` | Exact HTTP(S) streamable MCP endpoint, required when effective Task authority contains tools. |
@@ -60,6 +62,12 @@ config:
           version: 1.6.0
           available: true
 ```
+
+Template-free requests have a separate deployment-owned safety boundary. Set
+`config.apiserver.customEnvelopeSafetyCeiling` to a complete Envelope whose models and tools are
+present in the capability catalog. Steward checks the requested budget, runtime minutes, TTL,
+runner platforms/resources, models, and tools both when the user creates the request and when an
+administrator approves it. Leaving the value `null` disables custom requests fail-closed.
 
 Access classes and provider availability are descriptive UI metadata. It contains no budget,
 TTL, user, template, Envelope, or admission fields. Changing it changes

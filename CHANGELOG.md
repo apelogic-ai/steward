@@ -7,8 +7,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-26
+
 ### Added
 
+- Added the HyperShell browser/API redesign: one typed administrator request
+  queue with history and structured deltas; cumulative spend and runtime-minute
+  escalation controls; Envelope usage; trigger provenance; run stages, steps,
+  incremental logs, cancellation and GitHub re-run operations; phase facets;
+  connection status; catalog metadata; and durable onboarding progress.
+- Added exact administrator provisioning of a catalog-backed User Envelope for
+  an eligible canonical user, plus template-free custom requests that remain
+  pending until an explicit decision. Custom requests fail closed unless an
+  operator configures `customEnvelopeSafetyCeiling`; Steward rechecks their
+  capabilities, budget, runtime minutes, TTL, and runner authority against the
+  current ceiling at both creation and approval.
+- Added multiple active User Envelopes with per-owner template and digest
+  uniqueness, and the owner-scoped `envelopeDigest` selector for both versioned
+  Workflow and direct-package Task submissions. Callers that omit the selector
+  remain compatible only when exactly one active Envelope exists.
+- Added the supported operator surface for canonical-user inspection, local RBAC
+  grant/revoke, effective-access inspection, strict JSON/YAML template apply,
+  and exact template provisioning. Commands are clients of bearer-authenticated
+  administrative contracts, record the server-verified operator as actor,
+  support human or JSON output and stable exit-code classes, and preserve
+  `bootstrap-rbac` for bootstrap compatibility.
+- Added an optional, disabled-by-default Helm seed for a bounded LLM-only smoke
+  template. Operators must configure an exact model, budget, TTL, revision, and
+  eligible roles; tools remain empty and the automatic threshold equals the
+  ceiling.
 - Added unauthenticated OAuth protected-resource discovery and an explicitly
   enabled `steward-task-v3` contract keyed by the verified Identity issuer and
   stable numeric GitHub actor subject. The default remains v2-only.
@@ -22,6 +49,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- Replaced Steward's source-pinned cross-product deployment lock with an
+  attested product-compatibility contract. It declares `steward.task/v2` and a
+  `steward-run` v0.7.0 minimum for `envelopeDigest`; release/integration
+  packaging now owns the separately signed installation BOM containing exact
+  product, commit, image, and chart digests.
+- Advanced the Steward release handoff to `steward.release-handoff/v2` for the
+  product-compatibility reference. The registry mirror continues to accept v1
+  handoffs for existing releases.
+- Envelope Template revisions are now the sole authority for new template,
+  request, approval, and provisioning operations. Legacy role-keyed Envelope
+  rows remain read-only for one compatibility window; compatibility authoring
+  routes adapt to the catalog and no longer dual-write.
+- Template `autoProvisionThreshold` is enforced: requests at or below it
+  provision automatically, requests above it but within the ceiling require
+  review, and requests above the ceiling are rejected. A missing threshold
+  retains the historical ceiling-as-threshold behavior.
+- Decision filing now carries authoritative `template_id` and an optional real
+  eligibility-role snapshot. Deprecated `member_role` remains optional during
+  transition and is never populated with a template ID.
+- Capability catalog schema v2 is now required and v1 configuration is rejected
+  by runtime validation, Helm schema validation, and preflight. Upgrade the
+  catalog before rolling out this release. New template writes are not
+  dual-written to the legacy store, so mixed-version template authoring and
+  rollback after a new catalog write are unsupported.
 - Valid v2 credentials may idempotently seed only their same verified
   issuer/subject and already-resolved canonical user as a best-effort transition
   to v3. Seeding failure, conflict, or disablement never changes v2
@@ -169,7 +220,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/apelogic-ai/steward/compare/v0.2.6...v0.3.0
 [0.2.6]: https://github.com/apelogic-ai/steward/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/apelogic-ai/steward/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/apelogic-ai/steward/compare/v0.2.3...v0.2.4

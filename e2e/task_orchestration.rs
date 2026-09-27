@@ -90,6 +90,143 @@ impl Drop for ServerGuard {
     }
 }
 
+#[tokio::test]
+async fn concurrent_provisioning_enforces_active_digest_uniqueness_transactionally()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool);
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("concurrent-envelope-{suffix}"),
+                "example.com",
+                &format!("alice-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let envelope = Envelope {
+        revision: 1,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "example".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "1.00".to_owned(),
+                single_run_limit: Some("0.50".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            runtime_minutes_limit: Some("10".to_owned()),
+            ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
+        },
+    };
+    let template_a = format!("template-a-{suffix}");
+    let template_b = format!("template-b-{suffix}");
+    for template_id in [&template_a, &template_b] {
+        store
+            .insert_envelope_template_revision(EnvelopeTemplatePublication {
+                template_id,
+                display_name: template_id,
+                member_roles: std::slice::from_ref(template_id),
+                ceiling: &envelope,
+                auto_provision_threshold: Some(&envelope),
+                authored_by: "test-bootstrap",
+            })
+            .await?;
+    }
+    let request_a = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &identity.user_id,
+            template_id: Some(&template_a),
+            template_revision: Some(1),
+            requested_envelope: &envelope,
+            idempotency_key: &format!("request-a-{suffix}"),
+            actor: "test-bootstrap",
+        })
+        .await?
+        .record;
+    let request_b = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &identity.user_id,
+            template_id: Some(&template_b),
+            template_revision: Some(1),
+            requested_envelope: &envelope,
+            idempotency_key: &format!("request-b-{suffix}"),
+            actor: "test-bootstrap",
+        })
+        .await?
+        .record;
+    let digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&envelope)?)
+    );
+    let instance_a = format!("env_{}", request_a.id.simple());
+    let instance_b = format!("env_{}", request_b.id.simple());
+    let update_a = EnvelopeRequestStatusUpdate {
+        from: EnvelopeRequestStatus::Pending,
+        to: EnvelopeRequestStatus::Provisioned,
+        approval_id: None,
+        envelope_instance_id: Some(&instance_a),
+        envelope_digest: Some(&digest),
+        reason: None,
+        rationale: Some("concurrency test"),
+        evidence_url: None,
+        expires_at: None,
+        approved_envelope: Some(&envelope),
+        actor: "test-bootstrap",
+    };
+    let update_b = EnvelopeRequestStatusUpdate {
+        from: EnvelopeRequestStatus::Pending,
+        to: EnvelopeRequestStatus::Provisioned,
+        approval_id: None,
+        envelope_instance_id: Some(&instance_b),
+        envelope_digest: Some(&digest),
+        reason: None,
+        rationale: Some("concurrency test"),
+        evidence_url: None,
+        expires_at: None,
+        approved_envelope: Some(&envelope),
+        actor: "test-bootstrap",
+    };
+    let (result_a, result_b) = tokio::join!(
+        store.append_envelope_request_status(request_a.id, update_a),
+        store.append_envelope_request_status(request_b.id, update_b),
+    );
+    assert!(
+        matches!(
+            (&result_a, &result_b),
+            (Ok(_), Err(StoreError::EnvelopeRequestDigestConflict))
+                | (Err(StoreError::EnvelopeRequestDigestConflict), Ok(_))
+        ),
+        "exactly one conflicting template may win concurrent digest provisioning: {result_a:?} / {result_b:?}"
+    );
+    let active = store
+        .envelope_requests(&identity.user_id)
+        .await?
+        .into_iter()
+        .filter(|request| request.status == EnvelopeRequestStatus::Provisioned)
+        .count();
+    assert_eq!(active, 1);
+    Ok(())
+}
+
 fn disposable_execution_binding() -> Result<TaskExecutionBinding, io::Error> {
     let mut binding = DisposableExecutionBinding {
         schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
@@ -523,15 +660,15 @@ async fn multiple_named_envelope_templates_coexist_for_one_role_and_pin_requests
         let request = store
             .reserve_envelope_request(EnvelopeRequestReservationRequest {
                 owner_user_id: &identity.user_id,
-                template_id,
-                template_revision: envelope.revision,
+                template_id: Some(template_id),
+                template_revision: Some(envelope.revision),
                 requested_envelope: &envelope,
                 idempotency_key: &format!("template-request-{suffix}-{index}"),
                 actor: identity.user_id.as_str(),
             })
             .await?
             .record;
-        assert_eq!(request.template_id, *template_id);
+        assert_eq!(request.template_id.as_ref(), Some(template_id));
         request_ids.push(request.id);
     }
     assert_ne!(request_ids[0], request_ids[1]);
@@ -643,8 +780,8 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
     let request = store
         .reserve_envelope_request(EnvelopeRequestReservationRequest {
             owner_user_id: &identity.user_id,
-            template_id: &template_id,
-            template_revision: envelope.revision,
+            template_id: Some(&template_id),
+            template_revision: Some(envelope.revision),
             requested_envelope: &envelope,
             idempotency_key: &format!("envelope-{suffix}"),
             actor: identity.user_id.as_str(),
@@ -1086,9 +1223,6 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         },
     };
     store
-        .insert_envelope(&member_role, &envelope, "admin@example.com")
-        .await?;
-    store
         .insert_envelope_template_revision(EnvelopeTemplatePublication {
             template_id: &member_role,
             display_name: &member_role,
@@ -1101,8 +1235,8 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     let envelope_request = store
         .reserve_envelope_request(EnvelopeRequestReservationRequest {
             owner_user_id: &identity.user_id,
-            template_id: &member_role,
-            template_revision: envelope.revision,
+            template_id: Some(&member_role),
+            template_revision: Some(envelope.revision),
             requested_envelope: &envelope,
             idempotency_key: &format!("envelope-{suffix}"),
             actor: "admin@example.com",

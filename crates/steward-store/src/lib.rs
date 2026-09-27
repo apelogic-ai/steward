@@ -3,11 +3,12 @@
 use std::error::Error;
 use std::fmt;
 
+use sha2::{Digest, Sha256};
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec,
-    add_budget_amount, envelope_is_within, evaluate,
+    add_budget_amount, envelope_is_within, evaluate, validate_envelope,
 };
 use steward_types::direct_package::{DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES};
 use steward_types::{
@@ -93,6 +94,14 @@ pub struct EnvelopeTemplatePublication<'a> {
 pub struct BrowserRbacAssignments {
     pub is_admin: bool,
     pub member_roles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalUserRecord {
+    pub user_id: CanonicalUserId,
+    pub organization_id: OrganizationId,
+    pub display_email: Email,
+    pub state: String,
 }
 
 impl BrowserRbacAssignments {
@@ -280,12 +289,124 @@ fn valid_envelope_template_publication(publication: &EnvelopeTemplatePublication
             .all(|roles| roles[0] < roles[1])
         && publication
             .auto_provision_threshold
-            .is_none_or(|threshold| threshold.revision == publication.ceiling.revision)
+            .is_none_or(|threshold| {
+                threshold.revision == publication.ceiling.revision
+                    && validate_envelope(threshold).is_ok()
+                    && matches!(
+                        envelope_is_within(threshold, publication.ceiling),
+                        Ok(AdmissionDecision::Admit)
+                    )
+            })
+        && validate_envelope(publication.ceiling).is_ok()
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ActiveEnvelopeProvisionPlan {
+    Existing(Uuid),
+    Provision { stale_request_ids: Vec<Uuid> },
+}
+
+fn active_envelope_provision_plan(
+    active: &[(Uuid, Option<String>, String)],
+    template_id: Option<&str>,
+    requested_digest: &str,
+) -> Result<ActiveEnvelopeProvisionPlan, StoreError> {
+    for (request_id, active_template_id, active_digest) in active {
+        if active_digest != requested_digest {
+            continue;
+        }
+        if active_template_id.as_deref() == template_id {
+            return Ok(ActiveEnvelopeProvisionPlan::Existing(*request_id));
+        }
+        return Err(StoreError::EnvelopeRequestDigestConflict);
+    }
+    Ok(ActiveEnvelopeProvisionPlan::Provision {
+        stale_request_ids: active
+            .iter()
+            .filter_map(|(request_id, active_template_id, _)| {
+                (active_template_id.as_deref() == template_id).then_some(*request_id)
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]
 mod browser_rbac_tests {
-    use super::{BrowserRbacAssignment, BrowserRbacAssignments};
+    use steward_admission::{Envelope, EnvelopeSpec};
+    use steward_types::{Budget, Duration, RunnerRequirements};
+
+    use super::{
+        ActiveEnvelopeProvisionPlan, BrowserRbacAssignment, BrowserRbacAssignments,
+        EnvelopeTemplatePublication, StoreError, active_envelope_provision_plan,
+        valid_envelope_template_publication,
+    };
+    use uuid::Uuid;
+
+    fn envelope(monthly_limit: &str) -> Envelope {
+        Envelope {
+            revision: 1,
+            spec: EnvelopeSpec {
+                llms: Vec::new(),
+                tools: Vec::new(),
+                budget: Budget {
+                    monthly_limit: monthly_limit.to_owned(),
+                    single_run_limit: None,
+                    currency: "USD".to_owned(),
+                },
+                runtime_minutes_limit: None,
+                ttl: Duration("1h".to_owned()),
+                runner: RunnerRequirements::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn template_threshold_must_be_valid_and_within_its_ceiling() {
+        let roles = vec!["engineer".to_owned()];
+        let ceiling = envelope("10.00");
+        let threshold = envelope("11.00");
+        let publication = EnvelopeTemplatePublication {
+            template_id: "default",
+            display_name: "Default",
+            member_roles: &roles,
+            ceiling: &ceiling,
+            auto_provision_threshold: Some(&threshold),
+            authored_by: "alice",
+        };
+
+        assert!(!valid_envelope_template_publication(&publication));
+    }
+
+    #[test]
+    fn active_envelope_plan_enforces_template_and_digest_uniqueness() {
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let active = vec![
+            (first, Some("template-a".to_owned()), "sha256:a".to_owned()),
+            (second, Some("template-b".to_owned()), "sha256:b".to_owned()),
+        ];
+
+        assert_eq!(
+            active_envelope_provision_plan(&active, Some("template-a"), "sha256:a"),
+            Ok(ActiveEnvelopeProvisionPlan::Existing(first))
+        );
+        assert_eq!(
+            active_envelope_provision_plan(&active, Some("template-c"), "sha256:a"),
+            Err(StoreError::EnvelopeRequestDigestConflict)
+        );
+        assert_eq!(
+            active_envelope_provision_plan(&active, Some("template-a"), "sha256:c"),
+            Ok(ActiveEnvelopeProvisionPlan::Provision {
+                stale_request_ids: vec![first]
+            })
+        );
+        assert_eq!(
+            active_envelope_provision_plan(&active, Some("template-c"), "sha256:c"),
+            Ok(ActiveEnvelopeProvisionPlan::Provision {
+                stale_request_ids: Vec::new()
+            })
+        );
+    }
 
     #[test]
     fn unassigned_canonical_user_has_no_implicit_steward_authority() {
@@ -519,6 +640,42 @@ impl PgStore {
                 return Err(StoreError::InvalidBrowserRbacAssignment);
             }
         };
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "browser-rbac:{}:{assignment_kind}:{}",
+                change.user_id.as_str(),
+                member_role.map_or("", String::as_str)
+            ))
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let user_state =
+            sqlx::query_scalar::<_, String>("SELECT state FROM canonical_users WHERE user_id = $1")
+                .bind(change.user_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(database_error)?
+                .ok_or(StoreError::CanonicalIdentityNotFound)?;
+        if user_state == "disabled" {
+            return Err(StoreError::CanonicalIdentityInactive);
+        }
+        let current = sqlx::query_scalar::<_, String>(
+            "SELECT action FROM browser_rbac_assignment_events \
+             WHERE user_id = $1 AND assignment_kind = $2 \
+               AND member_role IS NOT DISTINCT FROM $3 \
+             ORDER BY at DESC, id DESC LIMIT 1",
+        )
+        .bind(change.user_id.as_str())
+        .bind(assignment_kind)
+        .bind(member_role)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if current.as_deref() == Some(change.action.as_str()) {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(());
+        }
         sqlx::query(
             "INSERT INTO browser_rbac_assignment_events \
              (id, user_id, assignment_kind, member_role, action, actor) \
@@ -530,10 +687,58 @@ impl PgStore {
         .bind(member_role)
         .bind(change.action.as_str())
         .bind(change.actor)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        Ok(())
+        transaction.commit().await.map_err(database_error)
+    }
+
+    pub async fn canonical_users(&self) -> Result<Vec<CanonicalUserRecord>, StoreError> {
+        sqlx::query(
+            "SELECT user_id, organization_id, display_email, state \
+             FROM canonical_users ORDER BY user_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(canonical_user_record)
+        .collect()
+    }
+
+    pub async fn canonical_user(
+        &self,
+        user_id: &CanonicalUserId,
+    ) -> Result<Option<CanonicalUserRecord>, StoreError> {
+        sqlx::query(
+            "SELECT user_id, organization_id, display_email, state \
+             FROM canonical_users WHERE user_id = $1",
+        )
+        .bind(user_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .map(canonical_user_record)
+        .transpose()
+    }
+
+    pub async fn browser_member_roles(&self) -> Result<Vec<String>, StoreError> {
+        sqlx::query_scalar::<_, String>(
+            "WITH latest_assignments AS ( \
+                 SELECT DISTINCT ON (user_id, member_role) member_role, action \
+                 FROM browser_rbac_assignment_events \
+                 WHERE assignment_kind = 'member_role' \
+                 ORDER BY user_id, member_role, at DESC, id DESC \
+             ) \
+             SELECT DISTINCT role FROM ( \
+                 SELECT unnest(member_roles) AS role FROM envelope_template_revisions \
+                 UNION ALL \
+                 SELECT member_role AS role FROM latest_assignments WHERE action = 'grant' \
+             ) roles WHERE role IS NOT NULL ORDER BY role",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)
     }
 
     /// Resolve only an already-reviewed exact issuer/subject/organization mapping.
@@ -2828,7 +3033,10 @@ impl PgStore {
         &self,
         request: EnvelopeRequestReservationRequest<'_>,
     ) -> Result<EnvelopeRequestReservation, StoreError> {
-        if request.template_id.trim().is_empty()
+        if request
+            .template_id
+            .is_some_and(|template_id| template_id.trim().is_empty())
+            || request.template_id.is_some() != request.template_revision.is_some()
             || request.idempotency_key.trim().is_empty()
             || request.actor.trim().is_empty()
         {
@@ -2856,14 +3064,14 @@ impl PgStore {
         .map_err(database_error)?;
         if let Some(row) = existing {
             let id: Uuid = row.try_get("id").map_err(database_error)?;
-            let template_id: String = row.try_get("template_id").map_err(database_error)?;
-            let template_revision: i64 =
+            let template_id: Option<String> = row.try_get("template_id").map_err(database_error)?;
+            let template_revision: Option<i64> =
                 row.try_get("template_revision").map_err(database_error)?;
             let requested_envelope = row
                 .try_get::<Json<Envelope>, _>("requested_envelope")
                 .map_err(database_error)?
                 .0;
-            if template_id != request.template_id
+            if template_id.as_deref() != request.template_id
                 || template_revision != request.template_revision
                 || requested_envelope != *request.requested_envelope
             {
@@ -2915,6 +3123,82 @@ impl PgStore {
             inserted: true,
             record,
         })
+    }
+
+    /// Provision one exact catalog-backed User Envelope for a canonical user through the same
+    /// request and append-only status ledgers used by the browser workflow.
+    pub async fn provision_envelope_for_admin(
+        &self,
+        request: AdminEnvelopeProvisionRequest<'_>,
+    ) -> Result<EnvelopeRequestRecord, StoreError> {
+        if request.actor.trim().is_empty()
+            || request.idempotency_key.trim().is_empty()
+            || request.requested_envelope.revision != request.template_revision
+            || validate_envelope(request.requested_envelope).is_err()
+        {
+            return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        let state =
+            sqlx::query_scalar::<_, String>("SELECT state FROM canonical_users WHERE user_id = $1")
+                .bind(request.owner_user_id.as_str())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(database_error)?
+                .ok_or(StoreError::CanonicalIdentityNotFound)?;
+        if state != "active" {
+            return Err(StoreError::CanonicalIdentityInactive);
+        }
+        let assignments = self.browser_rbac_assignments(request.owner_user_id).await?;
+        let template = self
+            .envelope_template_revision(request.template_id, request.template_revision)
+            .await?
+            .ok_or(StoreError::EnvelopeTemplateNotFound)?;
+        if !template
+            .member_roles
+            .iter()
+            .any(|role| assignments.member_roles.contains(role))
+            || !matches!(
+                envelope_is_within(request.requested_envelope, &template.ceiling),
+                Ok(AdmissionDecision::Admit)
+            )
+        {
+            return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        let reservation = self
+            .reserve_envelope_request(EnvelopeRequestReservationRequest {
+                owner_user_id: request.owner_user_id,
+                template_id: Some(request.template_id),
+                template_revision: Some(request.template_revision),
+                requested_envelope: request.requested_envelope,
+                idempotency_key: request.idempotency_key,
+                actor: request.actor,
+            })
+            .await?;
+        if reservation.record.status == EnvelopeRequestStatus::Provisioned {
+            return Ok(reservation.record);
+        }
+        if reservation.record.status != EnvelopeRequestStatus::Pending {
+            return Err(StoreError::InvalidEnvelopeRequestTransition);
+        }
+        let instance_id = format!("env_{}", reservation.record.id.simple());
+        let digest = envelope_content_digest(request.requested_envelope)?;
+        self.append_envelope_request_status(
+            reservation.record.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: Some(Uuid::new_v4()),
+                envelope_instance_id: Some(&instance_id),
+                envelope_digest: Some(&digest),
+                reason: None,
+                rationale: None,
+                evidence_url: None,
+                expires_at: None,
+                approved_envelope: Some(request.requested_envelope),
+                actor: request.actor,
+            },
+        )
+        .await
     }
 
     /// Read the current authoritative status derived from the latest immutable event, scoped to
@@ -3248,7 +3532,7 @@ impl PgStore {
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at \
              FROM envelope_requests requests \
              JOIN canonical_users users ON users.user_id = requests.owner_user_id \
-             JOIN envelope_template_revisions templates \
+             LEFT JOIN envelope_template_revisions templates \
                ON templates.template_id = requests.template_id \
               AND templates.revision = requests.template_revision \
              JOIN LATERAL ( \
@@ -3277,13 +3561,17 @@ impl PgStore {
                         .try_get::<Json<Envelope>, _>("requested_envelope")
                         .map_err(database_error)?
                         .0,
-                    template_envelope: Envelope {
-                        revision: row.try_get("template_revision").map_err(database_error)?,
-                        spec: row
-                            .try_get::<Json<EnvelopeSpec>, _>("template_spec")
-                            .map_err(database_error)?
-                            .0,
-                    },
+                    template_envelope: row
+                        .try_get::<Option<i64>, _>("template_revision")
+                        .map_err(database_error)?
+                        .zip(
+                            row.try_get::<Option<Json<EnvelopeSpec>>, _>("template_spec")
+                                .map_err(database_error)?,
+                        )
+                        .map(|(revision, spec)| Envelope {
+                            revision,
+                            spec: spec.0,
+                        }),
                     created_at: row.try_get("created_at").map_err(database_error)?,
                 })
             })
@@ -3300,7 +3588,7 @@ impl PgStore {
                     templates.spec AS template_spec \
              FROM ({ENVELOPE_REQUEST_COLUMNS}) records \
              JOIN canonical_users users ON users.user_id = records.owner_user_id \
-             JOIN envelope_template_revisions templates \
+             LEFT JOIN envelope_template_revisions templates \
                ON templates.template_id = records.template_id \
               AND templates.revision = records.template_revision \
              ORDER BY records.created_at DESC, records.id DESC"
@@ -3316,14 +3604,18 @@ impl PgStore {
                 let template_display_name = row
                     .try_get("template_display_name")
                     .map_err(database_error)?;
-                let template_revision = row.try_get("template_revision").map_err(database_error)?;
-                let template_envelope = Envelope {
-                    revision: template_revision,
-                    spec: row
-                        .try_get::<Json<EnvelopeSpec>, _>("template_spec")
-                        .map_err(database_error)?
-                        .0,
-                };
+                let template_revision = row
+                    .try_get::<Option<i64>, _>("template_revision")
+                    .map_err(database_error)?;
+                let template_envelope = template_revision
+                    .zip(
+                        row.try_get::<Option<Json<EnvelopeSpec>>, _>("template_spec")
+                            .map_err(database_error)?,
+                    )
+                    .map(|(revision, spec)| Envelope {
+                        revision,
+                        spec: spec.0,
+                    });
                 Ok(AdminEnvelopeRequestRecord {
                     request: envelope_request_record(row)?,
                     owner_display_email,
@@ -3400,8 +3692,8 @@ impl PgStore {
                 CanonicalUserId::parse(value)
                     .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
             })?;
-        let template_id: String = request.try_get("template_id").map_err(database_error)?;
-        let template_revision: i64 = request
+        let template_id: Option<String> = request.try_get("template_id").map_err(database_error)?;
+        let template_revision: Option<i64> = request
             .try_get("template_revision")
             .map_err(database_error)?;
         let requested_envelope = request
@@ -3439,21 +3731,28 @@ impl PgStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(database_error)?;
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(format!("envelope-template:{template_id}"))
-                .execute(&mut *transaction)
+            if let (Some(template_id), Some(template_revision)) =
+                (template_id.as_deref(), template_revision)
+            {
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(format!("envelope-template:{template_id}"))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(database_error)?;
+                let revision_exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS( \
+                         SELECT 1 FROM envelope_template_revisions \
+                         WHERE template_id = $1 AND revision = $2 \
+                     )",
+                )
+                .bind(template_id)
+                .bind(template_revision)
+                .fetch_one(&mut *transaction)
                 .await
                 .map_err(database_error)?;
-            let current_revision = sqlx::query_scalar::<_, Option<i64>>(
-                "SELECT max(revision) FROM envelope_template_revisions \
-                 WHERE template_id = $1",
-            )
-            .bind(&template_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-            if current_revision != Some(template_revision) {
-                return Err(StoreError::EnvelopeRequestTemplateStale);
+                if !revision_exists {
+                    return Err(StoreError::EnvelopeRequestTemplateStale);
+                }
             }
         }
         let needs_snapshot = matches!(
@@ -3474,29 +3773,77 @@ impl PgStore {
             _ => return Err(StoreError::InvalidEnvelopeRequest),
         }
         if update.to == EnvelopeRequestStatus::Provisioned {
-            sqlx::query(
-                "INSERT INTO envelope_request_events \
-                 (request_id, status, reason, actor, template_revision) \
-                 SELECT requests.id, 'stale', $3, $2, requests.template_revision \
+            let requested_digest = update
+                .envelope_digest
+                .ok_or(StoreError::InvalidEnvelopeRequest)?;
+            let active = sqlx::query(
+                "SELECT requests.id, requests.template_id, current_status.envelope_digest \
                  FROM envelope_requests requests \
                  JOIN LATERAL ( \
-                     SELECT events.status \
+                     SELECT events.status, events.envelope_digest \
                      FROM envelope_request_events events \
                      WHERE events.request_id = requests.id \
-                     ORDER BY events.id DESC \
-                     LIMIT 1 \
+                     ORDER BY events.id DESC LIMIT 1 \
                  ) current_status ON true \
                  WHERE requests.owner_user_id = $1 \
-                   AND requests.id <> $4 \
+                   AND requests.id <> $2 \
                    AND current_status.status = 'provisioned'",
             )
             .bind(owner_user_id.as_str())
-            .bind(update.actor)
-            .bind(format!("superseded by envelope request {request_id}"))
             .bind(request_id)
-            .execute(&mut *transaction)
+            .fetch_all(&mut *transaction)
             .await
             .map_err(database_error)?;
+            let active = active
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get("id").map_err(database_error)?,
+                        row.try_get("template_id").map_err(database_error)?,
+                        row.try_get("envelope_digest").map_err(database_error)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            let plan =
+                active_envelope_provision_plan(&active, template_id.as_deref(), requested_digest)?;
+            let stale_request_ids = match plan {
+                ActiveEnvelopeProvisionPlan::Existing(existing_id) => {
+                    sqlx::query(
+                        "INSERT INTO envelope_request_events \
+                         (request_id, status, reason, actor, template_revision) \
+                         VALUES ($1, 'stale', $2, $3, $4)",
+                    )
+                    .bind(request_id)
+                    .bind(format!(
+                        "duplicate of active envelope request {existing_id}"
+                    ))
+                    .bind(update.actor)
+                    .bind(template_revision)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(database_error)?;
+                    transaction.commit().await.map_err(database_error)?;
+                    return self
+                        .envelope_request(&owner_user_id, existing_id)
+                        .await?
+                        .ok_or(StoreError::EnvelopeRequestNotFound);
+                }
+                ActiveEnvelopeProvisionPlan::Provision { stale_request_ids } => stale_request_ids,
+            };
+            for stale_request_id in stale_request_ids {
+                sqlx::query(
+                    "INSERT INTO envelope_request_events \
+                     (request_id, status, reason, actor, template_revision) \
+                     SELECT id, 'stale', $2, $3, template_revision \
+                     FROM envelope_requests WHERE id = $1",
+                )
+                .bind(stale_request_id)
+                .bind(format!("superseded by envelope request {request_id}"))
+                .bind(update.actor)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+            }
         }
         sqlx::query(
             "INSERT INTO envelope_request_events \
@@ -3525,75 +3872,6 @@ impl PgStore {
         self.envelope_request(&owner_user_id, request_id)
             .await?
             .ok_or(StoreError::EnvelopeRequestNotFound)
-    }
-
-    pub async fn insert_envelope(
-        &self,
-        member_role: &str,
-        envelope: &Envelope,
-        authored_by: &str,
-    ) -> Result<(), StoreError> {
-        self.insert_user_envelope(member_role, envelope, authored_by)
-            .await
-    }
-
-    async fn insert_user_envelope(
-        &self,
-        scope_ref: &str,
-        envelope: &Envelope,
-        authored_by: &str,
-    ) -> Result<(), StoreError> {
-        let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        lock_envelope_scope(&mut transaction, EnvelopeScopeKind::MemberRole, scope_ref).await?;
-        let latest_revision = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT max(revision) \
-             FROM envelopes \
-             WHERE scope_kind = $1 AND scope_ref = $2",
-        )
-        .bind(EnvelopeScopeKind::MemberRole.as_str())
-        .bind(scope_ref)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        if latest_revision.is_some_and(|revision| envelope.revision <= revision) {
-            return Err(StoreError::EnvelopeRevisionNotIncreasing);
-        }
-        sqlx::query(
-            "INSERT INTO envelopes \
-             (scope_kind, scope_ref, revision, spec, authored_by) \
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(EnvelopeScopeKind::MemberRole.as_str())
-        .bind(scope_ref)
-        .bind(envelope.revision)
-        .bind(Json(&envelope.spec))
-        .bind(authored_by)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        sqlx::query(
-            "INSERT INTO grant_revocations (grant_id, revoked_by, reason) \
-             SELECT grants.id, $3, 'envelope scope superseded' \
-             FROM grants \
-             JOIN approvals ON approvals.id = grants.approval_id \
-             JOIN admission_decisions \
-               ON admission_decisions.id = approvals.admission_decision_id \
-             LEFT JOIN grant_revocations ON grant_revocations.grant_id = grants.id \
-             WHERE admission_decisions.member_role = $1 \
-               AND admission_decisions.proposed_spec->'principal'->>'kind' = $2 \
-               AND admission_decisions.envelope_rev <> $4 \
-               AND grant_revocations.grant_id IS NULL \
-             ON CONFLICT (grant_id) DO NOTHING",
-        )
-        .bind(scope_ref)
-        .bind("user")
-        .bind(authored_by)
-        .bind(envelope.revision)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        transaction.commit().await.map_err(database_error)?;
-        Ok(())
     }
 
     pub async fn latest_envelope(&self, member_role: &str) -> Result<Option<Envelope>, StoreError> {
@@ -3697,6 +3975,27 @@ impl PgStore {
              LIMIT 1",
         )
         .bind(template_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .map(envelope_template_revision_record)
+        .transpose()
+    }
+
+    /// Read one exact immutable User Envelope Template revision.
+    pub async fn envelope_template_revision(
+        &self,
+        template_id: &str,
+        revision: i64,
+    ) -> Result<Option<EnvelopeTemplateRevisionRecord>, StoreError> {
+        sqlx::query(
+            "SELECT template_id, revision, display_name, member_roles, spec, \
+                    auto_provision_threshold \
+             FROM envelope_template_revisions \
+             WHERE template_id = $1 AND revision = $2",
+        )
+        .bind(template_id)
+        .bind(revision)
         .fetch_optional(&self.pool)
         .await
         .map_err(database_error)?
@@ -8533,8 +8832,8 @@ impl EnvelopeRequestStatus {
 pub struct EnvelopeRequestRecord {
     pub id: Uuid,
     pub owner_user_id: CanonicalUserId,
-    pub template_id: String,
-    pub template_revision: i64,
+    pub template_id: Option<String>,
+    pub template_revision: Option<i64>,
     pub requested_envelope: Envelope,
     pub approved_envelope: Option<Envelope>,
     pub status: EnvelopeRequestStatus,
@@ -8547,7 +8846,7 @@ pub struct EnvelopeRequestRecord {
     pub decision_key: Option<String>,
     pub expires_at: Option<String>,
     pub status_actor: String,
-    pub status_template_revision: i64,
+    pub status_template_revision: Option<i64>,
     pub created_at: String,
     pub status_at: String,
 }
@@ -8592,6 +8891,15 @@ pub struct EnvelopeRequestDecisionReference {
 
 pub struct EnvelopeRequestReservationRequest<'a> {
     pub owner_user_id: &'a CanonicalUserId,
+    pub template_id: Option<&'a str>,
+    pub template_revision: Option<i64>,
+    pub requested_envelope: &'a Envelope,
+    pub idempotency_key: &'a str,
+    pub actor: &'a str,
+}
+
+pub struct AdminEnvelopeProvisionRequest<'a> {
+    pub owner_user_id: &'a CanonicalUserId,
     pub template_id: &'a str,
     pub template_revision: i64,
     pub requested_envelope: &'a Envelope,
@@ -8609,10 +8917,10 @@ pub struct EnvelopeRequestReservation {
 pub struct PendingEnvelopeRequest {
     pub request_id: Uuid,
     pub owner_display_email: String,
-    pub template_id: String,
-    pub template_revision: i64,
+    pub template_id: Option<String>,
+    pub template_revision: Option<i64>,
     pub requested_envelope: Envelope,
-    pub template_envelope: Envelope,
+    pub template_envelope: Option<Envelope>,
     pub created_at: String,
 }
 
@@ -8620,8 +8928,8 @@ pub struct PendingEnvelopeRequest {
 pub struct AdminEnvelopeRequestRecord {
     pub request: EnvelopeRequestRecord,
     pub owner_display_email: String,
-    pub template_display_name: String,
-    pub template_envelope: Envelope,
+    pub template_display_name: Option<String>,
+    pub template_envelope: Option<Envelope>,
 }
 
 pub struct EnvelopeRequestStatusUpdate<'a> {
@@ -8866,6 +9174,12 @@ fn valid_sha256_reference(value: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
+}
+
+pub fn envelope_content_digest(envelope: &Envelope) -> Result<String, StoreError> {
+    let bytes =
+        serde_json::to_vec(envelope).map_err(|error| StoreError::Database(error.to_string()))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
 fn valid_digest_pinned_image(value: &str) -> bool {
@@ -9974,6 +10288,7 @@ pub enum StoreError {
     StaleEnvelope,
     EnvelopeRevisionNotIncreasing,
     InvalidEnvelopeTemplate,
+    EnvelopeTemplateNotFound,
     TaskNotFound,
     TaskIdempotencyConflict,
     InvalidTaskIdentityBinding,
@@ -9989,6 +10304,7 @@ pub enum StoreError {
     InvalidCumulativeEscalation,
     EnvelopeRequestNotFound,
     EnvelopeRequestIdempotencyConflict,
+    EnvelopeRequestDigestConflict,
     EnvelopeRequestTemplateStale,
     InvalidEnvelopeRequest,
     InvalidEnvelopeRequestTransition,
@@ -10096,6 +10412,7 @@ impl fmt::Display for StoreError {
                 write!(formatter, "envelope revision must increase monotonically")
             }
             Self::InvalidEnvelopeTemplate => write!(formatter, "envelope template is invalid"),
+            Self::EnvelopeTemplateNotFound => write!(formatter, "envelope template does not exist"),
             Self::TaskNotFound => write!(formatter, "task does not exist"),
             Self::TaskIdempotencyConflict => {
                 write!(
@@ -10143,6 +10460,12 @@ impl fmt::Display for StoreError {
                 write!(
                     formatter,
                     "idempotency key is already bound to another envelope request"
+                )
+            }
+            Self::EnvelopeRequestDigestConflict => {
+                write!(
+                    formatter,
+                    "envelope digest is already active under another template"
                 )
             }
             Self::EnvelopeRequestTemplateStale => {
@@ -11686,6 +12009,31 @@ fn envelope_request_record(
             .map_err(database_error)?,
         created_at: row.try_get("created_at").map_err(database_error)?,
         status_at: row.try_get("status_at").map_err(database_error)?,
+    })
+}
+
+fn canonical_user_record(row: sqlx::postgres::PgRow) -> Result<CanonicalUserRecord, StoreError> {
+    Ok(CanonicalUserRecord {
+        user_id: row
+            .try_get::<String, _>("user_id")
+            .map_err(database_error)
+            .and_then(|value| {
+                CanonicalUserId::parse(value)
+                    .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+            })?,
+        organization_id: row
+            .try_get::<String, _>("organization_id")
+            .map_err(database_error)
+            .and_then(|value| {
+                OrganizationId::parse(value).map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+            })?,
+        display_email: row
+            .try_get::<String, _>("display_email")
+            .map_err(database_error)
+            .and_then(|value| {
+                Email::parse(value).map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+            })?,
+        state: row.try_get("state").map_err(database_error)?,
     })
 }
 

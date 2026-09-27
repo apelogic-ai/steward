@@ -2,7 +2,7 @@
 
 Status: active browser and API boundary.
 
-Applies to Steward 0.2.6.
+Applies to Steward 0.3.0.
 
 ## Presentation ownership
 
@@ -23,10 +23,12 @@ authentication returns `401`; an authenticated ordinary user returns `403`.
 Only a session resolved with the administrator role receives
 `BrowserAdminAuthority`.
 
-The separate operator API uses `RequestAuthenticator` and Kubernetes
-`TokenReview`. A caller must have the configured exact administrator group.
-A member role, Task, runtime, provider identity, browser cookie, or
-route-scoped steward-run bootstrap identity is not operator authority.
+The separate operator API uses `RequestAuthenticator`. It first performs
+Kubernetes `TokenReview`; when that rejects invalid credentials, a configured
+verified Identity Task JWT may authenticate through the existing fallback.
+Either path must yield the configured exact administrator group. A member role,
+Task, runtime, provider identity, browser cookie, or route-scoped steward-run
+bootstrap identity without that group is not operator authority.
 
 Steward does not accept a provider token in a URL, HTML document, Web Storage,
 cookie, or JavaScript configuration. Browser sessions cannot inject a bearer
@@ -82,7 +84,24 @@ The Next.js envelope administration pages consume versioned JSON template and
 request APIs. Templates have immutable IDs, administrator-authored display
 names, one or more eligible member roles, and append-only revisions. More than
 one active template may target the same role; an Envelope request pins the
-chosen template ID and revision.
+chosen template ID and revision. A custom request instead omits both template
+fields, carries the complete requested Envelope, and always requires an explicit
+administrator decision. It never invents a template or member role.
+Custom requests and approvals return `422` unless the requested authority is
+within the deployment's current `customEnvelopeSafetyCeiling` and every model
+and tool remains available in the capability catalog.
+
+`POST /admin/api/v1/envelopes/provision` lets an authenticated administrator
+provision an exact template revision for an existing canonical user. Steward
+checks the target's current member-role eligibility and the requested authority
+against that revision's ceiling. The target remains the immutable owner and the
+administrator is the event actor.
+
+Users may retain active Envelopes from different templates when their content
+digests differ. Replacement stales only the prior active Envelope from the same
+template; the same digest under a different template is a conflict. See
+[`operator-envelope-administration.md`](operator-envelope-administration.md)
+for the complete transaction and task-selector behavior.
 
 Template responses retain `memberRole`, set to the first eligible role, as a
 compatibility alias. Catalog-aware clients use the authoritative `memberRoles`

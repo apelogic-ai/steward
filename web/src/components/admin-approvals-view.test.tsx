@@ -78,6 +78,20 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("Rejection reason (optional)");
   });
 
+  test("renders a template-free custom request without inventing template authority", () => {
+    const custom: BrowserEnvelopeRequestView = {
+      ...request,
+      templateEnvelope: null,
+      templateId: null,
+      templateRevision: null,
+    };
+
+    const html = renderToStaticMarkup(<EnvelopeRequestCard request={custom} />);
+
+    expect(html).toContain("Custom");
+    expect(html).toContain("not auto-provisioned");
+  });
+
   test("show the requested authority beside its exact governing template revision", () => {
     const html = renderToStaticMarkup(<EnvelopeRequestCard request={request} />);
 

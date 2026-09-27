@@ -720,7 +720,9 @@ pub async fn dispatch_one_task_approval<D: DecisionChannel>(
         request_id: work.approval_id.to_string(),
         runtime_uid: work.runtime_uid.clone(),
         actor: work.actor.clone(),
-        member_role: work.member_role.clone(),
+        template_id: None,
+        eligibility_member_role: Some(work.member_role.clone()),
+        member_role: Some(work.member_role.clone()),
         counterexample,
     };
     let observation = if work.delivery_invoked {

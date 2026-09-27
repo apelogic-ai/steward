@@ -11,11 +11,11 @@ use steward_admission::{
     validate_envelope,
 };
 use steward_store::{
-    AdminApprovalRecord, AdminEnvelopeRequestRecord, CumulativeEscalationRecord,
-    EnvelopeRequestRecord, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
-    EnvelopeTemplatePublication, EnvelopeTemplateRevisionRecord, FederatedSubjectAssociation,
-    FederatedSubjectAuditRecord, FederatedSubjectDisable, FederatedSubjectRecord, PendingApproval,
-    PendingEnvelopeRequest, PgStore, StoreError,
+    AdminApprovalRecord, AdminEnvelopeProvisionRequest, AdminEnvelopeRequestRecord,
+    CumulativeEscalationRecord, EnvelopeRequestRecord, EnvelopeRequestStatus,
+    EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, EnvelopeTemplateRevisionRecord,
+    FederatedSubjectAssociation, FederatedSubjectAuditRecord, FederatedSubjectDisable,
+    FederatedSubjectRecord, PendingApproval, PendingEnvelopeRequest, PgStore, StoreError,
 };
 use steward_types::direct_package::DirectAdmissionDelta;
 use steward_types::{AgentRuntimeSpec, CanonicalUserId, ModelRef, ToolGrant};
@@ -57,7 +57,8 @@ pub struct CapabilityTool {
 }
 
 impl CapabilityTool {
-    fn grants(&self, requested: &ToolGrant) -> bool {
+    /// Return whether this availability entry covers the requested tool authority.
+    pub fn grants(&self, requested: &ToolGrant) -> bool {
         self.provider == requested.provider
             && self.resource == requested.resource
             && self.action == requested.action
@@ -198,6 +199,7 @@ pub(crate) struct BrowserAdminState<R, L, D> {
     ledger: L,
     decisions: D,
     capabilities: CapabilityCatalog,
+    custom_envelope_safety_ceiling: Option<Envelope>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
@@ -504,10 +506,10 @@ pub(crate) struct BrowserEnvelopeRequestView {
     #[schema(value_type = String, format = "uuid")]
     request_id: Uuid,
     owner_display_email: String,
-    template_id: String,
-    template_revision: i64,
+    template_id: Option<String>,
+    template_revision: Option<i64>,
     requested_envelope: BrowserEnvelope,
-    template_envelope: BrowserEnvelope,
+    template_envelope: Option<BrowserEnvelope>,
     created_at: String,
 }
 
@@ -519,7 +521,7 @@ impl From<PendingEnvelopeRequest> for BrowserEnvelopeRequestView {
             template_id: request.template_id,
             template_revision: request.template_revision,
             requested_envelope: request.requested_envelope.into(),
-            template_envelope: request.template_envelope.into(),
+            template_envelope: request.template_envelope.map(Into::into),
             created_at: request.created_at,
         }
     }
@@ -530,8 +532,8 @@ impl From<PendingEnvelopeRequest> for BrowserEnvelopeRequestView {
 pub(crate) struct BrowserEnvelopeRequestDecisionView {
     #[schema(value_type = String, format = "uuid")]
     request_id: Uuid,
-    template_id: String,
-    template_revision: i64,
+    template_id: Option<String>,
+    template_revision: Option<i64>,
     requested_envelope: BrowserEnvelope,
     approved_envelope: Option<BrowserEnvelope>,
     status: String,
@@ -604,6 +606,16 @@ pub(crate) struct ApproveEnvelopeRequestBody {
     expires_at: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ProvisionEnvelopeBody {
+    owner_user_id: String,
+    template_id: String,
+    template_revision: i64,
+    requested_envelope: BrowserEnvelope,
+    idempotency_key: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrowserApprovalsResponse {
@@ -617,6 +629,7 @@ pub(crate) struct BrowserApprovalsResponse {
 pub(crate) enum AdminRequestKind {
     CeilingExceeded,
     CumulativeExhausted,
+    Custom,
     WithinCeiling,
 }
 
@@ -662,9 +675,9 @@ pub(crate) struct AdminRequestRequester {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdminRequestTemplate {
-    id: String,
-    display_name: String,
-    revision: i64,
+    id: Option<String>,
+    display_name: Option<String>,
+    revision: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -806,6 +819,7 @@ fn inner_router<R, L, D>(
     ledger: L,
     decisions: D,
     capabilities: CapabilityCatalog,
+    custom_envelope_safety_ceiling: Option<Envelope>,
 ) -> Router
 where
     R: RuntimeRepository,
@@ -845,6 +859,10 @@ where
             post(approve_envelope_request::<R, L, D>),
         )
         .route(
+            "/admin/api/v1/envelopes/provision",
+            post(provision_envelope::<R, L, D>),
+        )
+        .route(
             "/admin/api/v1/envelope-requests/{request_id}/reject",
             post(reject_envelope_request::<R, L, D>),
         )
@@ -873,6 +891,7 @@ where
             ledger,
             decisions,
             capabilities,
+            custom_envelope_safety_ceiling,
         })
 }
 
@@ -897,6 +916,68 @@ where
     D: DecisionChannel + Clone,
 {
     Json(state.capabilities).into_response()
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "provisionAdminEnvelope",
+    path = "/admin/api/v1/envelopes/provision",
+    params(("X-Steward-CSRF" = String, Header)),
+    request_body = ProvisionEnvelopeBody,
+    responses(
+        (status = 200, body = BrowserEnvelopeRequestDecisionResponse),
+        (status = 400, description = "Canonical user ID or idempotency key is malformed"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Canonical user or template revision was not found"),
+        (status = 409, description = "Idempotency, active digest, or provisioning state conflicts"),
+        (status = 422, description = "User eligibility or requested Envelope is invalid"),
+        (status = 503, description = "Envelope authority is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn provision_envelope<R, L, D>(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    Extension(_proof): Extension<BrowserMutationProof>,
+    State(state): State<BrowserAdminState<R, L, D>>,
+    Json(body): Json<ProvisionEnvelopeBody>,
+) -> Response
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    let owner_user_id = match CanonicalUserId::parse(body.owner_user_id) {
+        Ok(owner_user_id) => owner_user_id,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if body.template_id.trim().is_empty()
+        || body.idempotency_key.trim().is_empty()
+        || body.idempotency_key.len() > 200
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let requested_envelope: Envelope = body.requested_envelope.into();
+    let actor = authority.principal().canonical_user_id.as_str();
+    match state
+        .ledger
+        .provision_envelope_for_admin(AdminEnvelopeProvisionRequest {
+            owner_user_id: &owner_user_id,
+            template_id: &body.template_id,
+            template_revision: body.template_revision,
+            requested_envelope: &requested_envelope,
+            idempotency_key: &body.idempotency_key,
+            actor,
+        })
+        .await
+    {
+        Ok(request) => Json(BrowserEnvelopeRequestDecisionResponse {
+            api_version: BROWSER_ADMIN_API_VERSION,
+            request: request.into(),
+        })
+        .into_response(),
+        Err(error) => ApiError::Store(error).into_response(),
+    }
 }
 
 #[utoipa::path(
@@ -943,15 +1024,43 @@ where
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return ApiError::Store(error).into_response(),
     };
+    if request.status == EnvelopeRequestStatus::Pending && request.template_id.is_none() {
+        let capabilities_valid = !state.capabilities.models.is_empty()
+            && request
+                .requested_envelope
+                .spec
+                .llms
+                .iter()
+                .all(|model| state.capabilities.models.contains(model))
+            && request.requested_envelope.spec.tools.iter().all(|tool| {
+                state
+                    .capabilities
+                    .tools
+                    .iter()
+                    .any(|available| available.grants(tool))
+            });
+        let within_platform_safety =
+            state
+                .custom_envelope_safety_ceiling
+                .as_ref()
+                .is_some_and(|ceiling| {
+                    matches!(
+                        envelope_is_within(&request.requested_envelope, ceiling),
+                        Ok(AdmissionDecision::Admit)
+                    )
+                });
+        if !capabilities_valid || !within_platform_safety {
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        }
+    }
     if request.status == EnvelopeRequestStatus::Pending && rationale.is_none() {
-        let template = match state
-            .ledger
-            .latest_envelope_template(&request.template_id)
-            .await
-        {
-            Ok(Some(template)) if template.ceiling.revision == request.template_revision => {
-                template
-            }
+        let (Some(template_id), Some(template_revision)) =
+            (request.template_id.as_deref(), request.template_revision)
+        else {
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        };
+        let template = match state.ledger.latest_envelope_template(template_id).await {
+            Ok(Some(template)) if template.ceiling.revision == template_revision => template,
             Ok(_) => return StatusCode::CONFLICT.into_response(),
             Err(error) => return ApiError::Store(error).into_response(),
         };
@@ -1176,27 +1285,32 @@ where
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return ApiError::Store(error).into_response(),
     };
-    let template = match state
-        .ledger
-        .latest_envelope_template(&request.template_id)
-        .await
-    {
-        Ok(Some(template)) if template.ceiling.revision == request.template_revision => template,
-        Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return ApiError::Store(error).into_response(),
-    };
-    let counterexample =
-        match steward_admission::envelope_is_within(&request.requested_envelope, &template.ceiling)
-        {
-            Ok(AdmissionDecision::Reject { deltas }) => AdmissionDecision::Reject { deltas }
-                .counterexample()
-                .unwrap_or_else(|| "Envelope request exceeds its template ceiling".to_owned()),
-            Ok(AdmissionDecision::Admit) => {
-                return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    let counterexample = match (request.template_id.as_deref(), request.template_revision) {
+        (Some(template_id), Some(template_revision)) => {
+            let template = match state.ledger.latest_envelope_template(template_id).await {
+                Ok(Some(template)) if template.ceiling.revision == template_revision => template,
+                Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+                Err(error) => return ApiError::Store(error).into_response(),
+            };
+            match steward_admission::envelope_is_within(
+                &request.requested_envelope,
+                &template.ceiling,
+            ) {
+                Ok(AdmissionDecision::Reject { deltas }) => AdmissionDecision::Reject { deltas }
+                    .counterexample()
+                    .unwrap_or_else(|| "Envelope request exceeds its template ceiling".to_owned()),
+                Ok(AdmissionDecision::Admit) => {
+                    return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+                }
+                Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
             }
-            Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
-        };
+        }
+        (None, None) => {
+            "Custom Envelope request requires an explicit administrator decision".to_owned()
+        }
+        _ => return StatusCode::CONFLICT.into_response(),
+    };
     let actor = authority.principal().canonical_user_id.as_str();
     let token = match state
         .ledger
@@ -1232,7 +1346,9 @@ where
             request_id: request_id.to_string(),
             runtime_uid: format!("envelope-request/{request_id}"),
             actor: request.owner_user_id.as_str().to_owned(),
-            member_role: request.template_id.clone(),
+            template_id: request.template_id.clone(),
+            eligibility_member_role: None,
+            member_role: None,
             counterexample,
         })
         .await
@@ -1289,7 +1405,33 @@ where
     D: DecisionChannel + Clone,
 {
     protect_browser_admin_routes(
-        inner_router(runtimes, ledger, decisions, capabilities),
+        inner_router(runtimes, ledger, decisions, capabilities, None),
+        browser_auth,
+    )
+}
+
+/// Mount administrator routes with the deployment-owned custom Envelope safety ceiling.
+pub fn protected_router_with_custom_envelope_safety<R, L, D>(
+    runtimes: R,
+    ledger: L,
+    decisions: D,
+    capabilities: CapabilityCatalog,
+    custom_envelope_safety_ceiling: Option<Envelope>,
+    browser_auth: BrowserAuthService,
+) -> Router
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    protect_browser_admin_routes(
+        inner_router(
+            runtimes,
+            ledger,
+            decisions,
+            capabilities,
+            custom_envelope_safety_ceiling,
+        ),
         browser_auth,
     )
 }
@@ -1749,6 +1891,17 @@ where
     .await
 }
 
+/// Return whether a template or member-role identifier satisfies the catalog wire grammar.
+pub fn valid_template_identifier(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+}
+
 fn valid_template_authoring(
     template_id: &str,
     display_name: &str,
@@ -1756,22 +1909,15 @@ fn valid_template_authoring(
     envelope: &Envelope,
     auto_provision_threshold: Option<&Envelope>,
 ) -> bool {
-    let valid_identifier = |value: &str| {
-        let bytes = value.as_bytes();
-        !bytes.is_empty()
-            && bytes.len() <= 128
-            && bytes[0].is_ascii_alphanumeric()
-            && bytes.iter().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
-            })
-    };
-    valid_identifier(template_id)
+    valid_template_identifier(template_id)
         && !display_name.is_empty()
         && display_name.trim() == display_name
         && display_name.chars().count() <= 128
         && !member_roles.is_empty()
         && member_roles.len() <= 64
-        && member_roles.iter().all(|role| valid_identifier(role))
+        && member_roles
+            .iter()
+            .all(|role| valid_template_identifier(role))
         && member_roles.windows(2).all(|roles| roles[0] < roles[1])
         && envelope.revision > 0
         && !envelope.spec.llms.is_empty()
@@ -1856,13 +2002,16 @@ fn decision(
 fn envelope_admin_request(record: AdminEnvelopeRequestRecord) -> AdminRequestView {
     let automatic = record.request.status == EnvelopeRequestStatus::Provisioned
         && record.request.status_actor == "system:auto";
-    let deltas = match envelope_is_within(
-        &record.request.requested_envelope,
-        &record.template_envelope,
-    ) {
-        Ok(AdmissionDecision::Reject { deltas }) => deltas,
-        Ok(AdmissionDecision::Admit) | Err(_) => Vec::new(),
-    };
+    let deltas = record
+        .template_envelope
+        .as_ref()
+        .map(
+            |template| match envelope_is_within(&record.request.requested_envelope, template) {
+                Ok(AdmissionDecision::Reject { deltas }) => deltas,
+                Ok(AdmissionDecision::Admit) | Err(_) => Vec::new(),
+            },
+        )
+        .unwrap_or_default();
     let state = envelope_request_state(record.request.status, automatic);
     let state_actor = if automatic {
         "system:auto".to_owned()
@@ -1871,7 +2020,9 @@ fn envelope_admin_request(record: AdminEnvelopeRequestRecord) -> AdminRequestVie
     };
     AdminRequestView {
         id: record.request.id.to_string(),
-        kind: if deltas.is_empty() {
+        kind: if record.request.template_id.is_none() {
+            AdminRequestKind::Custom
+        } else if deltas.is_empty() {
             AdminRequestKind::WithinCeiling
         } else {
             AdminRequestKind::CeilingExceeded
@@ -1892,7 +2043,7 @@ fn envelope_admin_request(record: AdminEnvelopeRequestRecord) -> AdminRequestVie
         state_actor: state_actor.clone(),
         deltas,
         requested_envelope: Some(record.request.requested_envelope.into()),
-        template_envelope: Some(record.template_envelope.into()),
+        template_envelope: record.template_envelope.map(Into::into),
         escalation: None,
         decision: decision(
             record.request.rationale,
@@ -1959,9 +2110,9 @@ fn approval_admin_request(record: AdminApprovalRecord) -> AdminRequestView {
             display_email: record.requester_display_email,
         },
         template: AdminRequestTemplate {
-            id: record.member_role.clone(),
-            display_name: record.member_role,
-            revision: record.envelope_revision,
+            id: Some(record.member_role.clone()),
+            display_name: Some(record.member_role),
+            revision: Some(record.envelope_revision),
         },
         created_at: record.created_at,
         state_at: record.state_at.clone(),
@@ -2034,9 +2185,9 @@ fn escalation_admin_request(record: CumulativeEscalationRecord) -> AdminRequestV
             display_email: record.requester_display_email,
         },
         template: AdminRequestTemplate {
-            id: record.template_id,
-            display_name: record.template_display_name,
-            revision: record.template_revision,
+            id: Some(record.template_id),
+            display_name: Some(record.template_display_name),
+            revision: Some(record.template_revision),
         },
         created_at: record.parked_at.clone(),
         state_at: state_at.clone(),

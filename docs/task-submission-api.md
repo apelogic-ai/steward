@@ -38,6 +38,15 @@ controller reuses that evidence during restart and retry and fails closed if the
 inactive before execution. Deployment capability catalogs and code-owned internal authorities do
 not authorize external Tasks.
 
+Both supported submission shapes accept an optional public content selector:
+`"envelopeDigest":"steward:sha256:<64 lowercase hex>"`. Resolution is scoped to
+the authenticated canonical user and active provisioned status. One exact match
+is selected; no match is rejected; multiple matches fail closed. When the field
+is omitted, the existing implicit behavior succeeds only when exactly one active
+Envelope exists and returns `409` when several are active. Steward never selects
+by recency, template order, or another heuristic. The persisted Task binding still
+contains owner ID, Envelope instance ID, digest, and approved snapshot.
+
 For a versioned Workflow, its stored agent reference is an opaque identifier advertised by the
 current deployment catalog. The submitter supplies the Workflow reference, not the agent image,
 executable, provider profile, endpoint, namespace, runtime class, or credential. Steward resolves

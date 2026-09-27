@@ -357,7 +357,13 @@ pub struct DecisionRequest {
     pub request_id: String,
     pub runtime_uid: String,
     pub actor: String,
-    pub member_role: String,
+    /// Stable catalog identity for a template-backed User Envelope request.
+    pub template_id: Option<String>,
+    /// Real role that made the template eligible when that role is known unambiguously.
+    pub eligibility_member_role: Option<String>,
+    /// Deprecated compatibility field for legacy runtime-exception decisions. Never contains a
+    /// template ID.
+    pub member_role: Option<String>,
     pub counterexample: String,
 }
 

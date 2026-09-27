@@ -22,17 +22,19 @@ use steward_types::{
 };
 use uuid::Uuid;
 
+use crate::browser_admin::CapabilityCatalog;
 use crate::browser_auth::{
     BrowserAuthService, BrowserMutationProof, BrowserSessionBinding, BrowserSessionContext,
     protect_browser_routes,
 };
 use crate::{
     AgentRunAvailability, AgentRunDataStatus, BoxFuture, GithubActionsEnvelopeSelection,
-    VersionedGithubActionsWorkflowContext, render_versioned_github_actions_workflow,
-    reviewed_steward_run_release_v2,
+    StewardRunRelease, VersionedGithubActionsWorkflowContext,
+    render_versioned_github_actions_workflow,
 };
 
 pub const ENVELOPE_REQUESTS_API_VERSION: &str = "steward.envelope-requests/v1";
+pub const MAX_CUSTOM_ENVELOPE_SAFETY_CEILING_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserEnvelopeSubject {
@@ -88,8 +90,8 @@ pub enum EnvelopeRequestStatus {
 pub struct UserEnvelopeRequest {
     #[schema(value_type = String, format = "uuid")]
     pub id: Uuid,
-    pub template_id: String,
-    pub template_revision: i64,
+    pub template_id: Option<String>,
+    pub template_revision: Option<i64>,
     #[schema(value_type = BrowserEnvelope)]
     pub requested_envelope: Envelope,
     #[schema(value_type = Option<BrowserEnvelope>)]
@@ -101,7 +103,7 @@ pub struct UserEnvelopeRequest {
     pub envelope_digest: Option<String>,
     pub reason: Option<String>,
     pub status_actor: String,
-    pub status_template_revision: i64,
+    pub status_template_revision: Option<i64>,
     pub created_at: String,
     pub status_at: String,
     pub history: Vec<EnvelopeRequestHistoryEvent>,
@@ -238,8 +240,10 @@ pub(crate) struct GithubActionsWorkflowResponse {
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CreateEnvelopeRequestBody {
-    template_id: String,
-    template_revision: i64,
+    #[serde(default)]
+    template_id: Option<String>,
+    #[serde(default)]
+    template_revision: Option<i64>,
     requested_envelope: BrowserEnvelope,
     idempotency_key: String,
 }
@@ -283,7 +287,7 @@ pub(crate) struct PublishedWorkflowsResponse {
 /// Submission passed only after the HTTP boundary has derived its canonical owner, required an
 /// exact template revision and decided whether it is within the automatic-provisioning boundary.
 pub struct ValidatedEnvelopeRequest<'a> {
-    pub template: &'a AvailableEnvelopeTemplate,
+    pub template: Option<&'a AvailableEnvelopeTemplate>,
     pub requested_envelope: &'a Envelope,
     pub idempotency_key: &'a str,
     pub auto_provision: bool,
@@ -304,11 +308,24 @@ pub enum EnvelopeRequestBrokerError {
 #[derive(Clone)]
 pub struct PgEnvelopeRequestBroker {
     store: PgStore,
+    capabilities: CapabilityCatalog,
+    custom_envelope_safety_ceiling: Option<Envelope>,
+    steward_run_release: StewardRunRelease,
 }
 
 impl PgEnvelopeRequestBroker {
-    pub fn new(store: PgStore) -> Self {
-        Self { store }
+    pub fn new(
+        store: PgStore,
+        capabilities: CapabilityCatalog,
+        custom_envelope_safety_ceiling: Option<Envelope>,
+        steward_run_release: StewardRunRelease,
+    ) -> Self {
+        Self {
+            store,
+            capabilities,
+            custom_envelope_safety_ceiling,
+            steward_run_release,
+        }
     }
 
     async fn attach_usage(
@@ -336,6 +353,36 @@ impl PgEnvelopeRequestBroker {
 }
 
 impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
+    fn steward_run_release(&self) -> Option<StewardRunRelease> {
+        Some(self.steward_run_release.clone())
+    }
+
+    fn custom_envelope_capabilities_valid(&self, envelope: &Envelope) -> bool {
+        !self.capabilities.models.is_empty()
+            && envelope
+                .spec
+                .llms
+                .iter()
+                .all(|model| self.capabilities.models.contains(model))
+            && envelope.spec.tools.iter().all(|tool| {
+                self.capabilities
+                    .tools
+                    .iter()
+                    .any(|available| available.grants(tool))
+            })
+    }
+
+    fn custom_envelope_within_platform_safety(&self, envelope: &Envelope) -> bool {
+        self.custom_envelope_safety_ceiling
+            .as_ref()
+            .is_some_and(|ceiling| {
+                matches!(
+                    envelope_is_within(envelope, ceiling),
+                    Ok(AdmissionDecision::Admit)
+                )
+            })
+    }
+
     fn templates<'a>(
         &'a self,
         session: &'a UserEnvelopeSession<BrowserSessionBinding>,
@@ -449,8 +496,8 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                 .store
                 .reserve_envelope_request(EnvelopeRequestReservationRequest {
                     owner_user_id: &session.subject.canonical_user_id,
-                    template_id: &request.template.id,
-                    template_revision: request.template.revision,
+                    template_id: request.template.map(|template| template.id.as_str()),
+                    template_revision: request.template.map(|template| template.revision),
                     requested_envelope: request.requested_envelope,
                     idempotency_key: request.idempotency_key,
                     actor: session.subject.canonical_user_id.as_str(),
@@ -635,7 +682,9 @@ fn envelope_request_history_event(
 fn map_store_broker_error(error: StoreError) -> EnvelopeRequestBrokerError {
     match error {
         StoreError::EnvelopeRequestNotFound => EnvelopeRequestBrokerError::NotFound,
-        StoreError::EnvelopeRequestTemplateStale => EnvelopeRequestBrokerError::Conflict,
+        StoreError::EnvelopeRequestTemplateStale | StoreError::EnvelopeRequestDigestConflict => {
+            EnvelopeRequestBrokerError::Conflict
+        }
         StoreError::EnvelopeRequestIdempotencyConflict
         | StoreError::InvalidEnvelopeRequest
         | StoreError::InvalidEnvelopeRequestTransition => EnvelopeRequestBrokerError::Conflict,
@@ -658,6 +707,18 @@ pub trait EnvelopeRequestBroker<B>: Clone + Send + Sync + 'static
 where
     B: Clone + Eq + Hash + Send + Sync + 'static,
 {
+    fn steward_run_release(&self) -> Option<StewardRunRelease> {
+        None
+    }
+
+    fn custom_envelope_capabilities_valid(&self, _envelope: &Envelope) -> bool {
+        true
+    }
+
+    fn custom_envelope_within_platform_safety(&self, _envelope: &Envelope) -> bool {
+        true
+    }
+
     fn templates<'a>(
         &'a self,
         session: &'a UserEnvelopeSession<B>,
@@ -961,32 +1022,65 @@ where
         return StatusCode::BAD_REQUEST.into_response();
     }
     let requested_envelope: Envelope = body.requested_envelope.into();
-    let template = match state
-        .broker
-        .template(&session, &body.template_id, body.template_revision)
-        .await
-    {
-        Ok(Some(template)) => template,
-        Ok(None) | Err(EnvelopeRequestBrokerError::NotFound) => {
-            return StatusCode::CONFLICT.into_response();
-        }
-        Err(error) => return broker_error_response(error),
-    };
-    if requested_envelope.revision != template.revision
-        || validate_envelope(&requested_envelope).is_err()
-    {
+    if validate_envelope(&requested_envelope).is_err() {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let auto_provision = matches!(
-        envelope_is_within(&requested_envelope, &template.ceiling),
-        Ok(AdmissionDecision::Admit)
-    );
+    let template = match (body.template_id.as_deref(), body.template_revision) {
+        (None, None) => {
+            if !state
+                .broker
+                .custom_envelope_capabilities_valid(&requested_envelope)
+                || !state
+                    .broker
+                    .custom_envelope_within_platform_safety(&requested_envelope)
+            {
+                return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+            }
+            None
+        }
+        (Some(template_id), Some(template_revision)) => {
+            match state
+                .broker
+                .template(&session, template_id, template_revision)
+                .await
+            {
+                Ok(Some(template)) => Some(template),
+                Ok(None) | Err(EnvelopeRequestBrokerError::NotFound) => {
+                    return StatusCode::CONFLICT.into_response();
+                }
+                Err(error) => return broker_error_response(error),
+            }
+        }
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let auto_provision = if let Some(template) = template.as_ref() {
+        if requested_envelope.revision != template.revision {
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        }
+        match envelope_is_within(&requested_envelope, &template.ceiling) {
+            Ok(AdmissionDecision::Admit) => {}
+            Ok(AdmissionDecision::Reject { .. }) => {
+                return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+        let auto_provision_boundary = template
+            .auto_provision_threshold
+            .as_ref()
+            .unwrap_or(&template.ceiling);
+        matches!(
+            envelope_is_within(&requested_envelope, auto_provision_boundary),
+            Ok(AdmissionDecision::Admit)
+        )
+    } else {
+        false
+    };
     match state
         .broker
         .create(
             &session,
             ValidatedEnvelopeRequest {
-                template: &template,
+                template: template.as_ref(),
                 requested_envelope: &requested_envelope,
                 idempotency_key: &body.idempotency_key,
                 auto_provision,
@@ -1067,12 +1161,15 @@ where
         }
         Err(error) => return broker_error_response(error),
     };
+    let Some(reviewed_release) = state.broker.steward_run_release() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     let context = VersionedGithubActionsWorkflowContext {
         envelope,
         workflow_name: workflow.name,
         workflow_version: workflow.version,
         workflow_digest: workflow.content_digest,
-        reviewed_release: reviewed_steward_run_release_v2(),
+        reviewed_release,
     };
     match render_versioned_github_actions_workflow(&body.workflow, &context) {
         Ok(workflow) => Json(GithubActionsWorkflowResponse {
@@ -1124,22 +1221,56 @@ mod tests {
         UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest,
         envelope_usage_view, inner_router,
     };
-    use crate::BoxFuture;
     use crate::connections::{
         ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionSubject,
         ProviderConnectionBroker, ProviderConnectionStatus,
     };
+    use crate::{BoxFuture, StewardRunRelease};
     use steward_admission::{Envelope, EnvelopeSpec};
     use steward_store::{EnvelopeUsageRecord, WorkflowRevisionRecord};
     use steward_types::{CanonicalUserId, Email};
     use uuid::Uuid;
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct TestBroker {
         create_owners: Arc<Mutex<Vec<CanonicalUserId>>>,
+        custom_capabilities_valid: bool,
+        custom_platform_safety_valid: bool,
+    }
+
+    impl Default for TestBroker {
+        fn default() -> Self {
+            Self {
+                create_owners: Arc::new(Mutex::new(Vec::new())),
+                custom_capabilities_valid: true,
+                custom_platform_safety_valid: true,
+            }
+        }
     }
 
     impl EnvelopeRequestBroker<()> for TestBroker {
+        fn steward_run_release(&self) -> Option<StewardRunRelease> {
+            Some(StewardRunRelease {
+                manifest_schema_version: 3,
+                version: "0.7.0".to_owned(),
+                workflow_repository: "example-org/steward-run".to_owned(),
+                workflow_commit: "3333333333333333333333333333333333333333".to_owned(),
+                action_commit: "4444444444444444444444444444444444444444".to_owned(),
+                governed_job_container_image: format!(
+                    "registry.example.test/steward-run@sha256:{}",
+                    "a".repeat(64)
+                ),
+            })
+        }
+
+        fn custom_envelope_capabilities_valid(&self, _envelope: &Envelope) -> bool {
+            self.custom_capabilities_valid
+        }
+
+        fn custom_envelope_within_platform_safety(&self, _envelope: &Envelope) -> bool {
+            self.custom_platform_safety_valid
+        }
+
         fn templates<'a>(
             &'a self,
             _session: &'a UserEnvelopeSession<()>,
@@ -1178,8 +1309,8 @@ mod tests {
                 let approved_envelope = approved_envelope?;
                 Ok(Some(UserEnvelopeRequest {
                     id: request_id,
-                    template_id: "engineer".to_owned(),
-                    template_revision: 3,
+                    template_id: Some("engineer".to_owned()),
+                    template_revision: Some(3),
                     requested_envelope: approved_envelope.clone(),
                     approved_envelope: Some(approved_envelope),
                     status: EnvelopeRequestStatus::Provisioned,
@@ -1191,7 +1322,7 @@ mod tests {
                     ),
                     reason: None,
                     status_actor: "usr_0123456789abcdef0123456789abcdef".to_owned(),
-                    status_template_revision: 3,
+                    status_template_revision: Some(3),
                     created_at: "2026-08-17T00:00:00Z".to_owned(),
                     status_at: "2026-08-17T00:00:00Z".to_owned(),
                     history: Vec::new(),
@@ -1208,8 +1339,8 @@ mod tests {
             let owners = self.create_owners.clone();
             let owner = session.subject.canonical_user_id.clone();
             let status_actor = owner.as_str().to_owned();
-            let template_id = request.template.id.clone();
-            let template_revision = request.template.revision;
+            let template_id = request.template.map(|template| template.id.clone());
+            let template_revision = request.template.map(|template| template.revision);
             let requested_envelope = request.requested_envelope.clone();
             let auto_provision = request.auto_provision;
             let approved_envelope = auto_provision.then(|| requested_envelope.clone());
@@ -1503,6 +1634,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_envelope_request_is_template_free_and_always_pending() -> Result<(), String> {
+        let app = inner_router(TestBroker::default());
+        let requested = template().auto_provision_threshold;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "requestedEnvelope": requested,
+                            "idempotencyKey": "custom-request-1",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build custom request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit custom request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read custom response: {error}"))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|error| format!("parse response: {error}"))?;
+        assert_eq!(value["request"]["status"], "pending");
+        assert!(value["request"]["templateId"].is_null());
+        assert!(value["request"]["templateRevision"].is_null());
+
+        let partial = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "templateId": "engineer",
+                            "requestedEnvelope": template().ceiling,
+                            "idempotencyKey": "invalid-partial-template",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build partial request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit partial request: {error}"))?;
+        assert_eq!(partial.status(), StatusCode::BAD_REQUEST);
+
+        let unavailable_capability = inner_router(TestBroker {
+            custom_capabilities_valid: false,
+            ..TestBroker::default()
+        })
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/envelope-requests")
+                .header("content-type", "application/json")
+                .extension(session()?)
+                .extension(UserEnvelopeMutationProof)
+                .body(Body::from(
+                    serde_json::json!({
+                        "requestedEnvelope": template().ceiling,
+                        "idempotencyKey": "custom-unavailable-capability",
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build unavailable capability request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("submit unavailable capability request: {error}"))?;
+        assert_eq!(
+            unavailable_capability.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        let unsafe_authority = inner_router(TestBroker {
+            custom_platform_safety_valid: false,
+            ..TestBroker::default()
+        })
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/envelope-requests")
+                .header("content-type", "application/json")
+                .extension(session()?)
+                .extension(UserEnvelopeMutationProof)
+                .body(Body::from(
+                    serde_json::json!({
+                        "requestedEnvelope": template().ceiling,
+                        "idempotencyKey": "custom-over-platform-safety-ceiling",
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build unsafe custom request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("submit unsafe custom request: {error}"))?;
+        assert_eq!(unsafe_authority.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn provisioned_envelope_renders_only_the_server_bound_pinned_workflow()
     -> Result<(), String> {
         let app = inner_router(TestBroker::default());
@@ -1540,8 +1780,12 @@ mod tests {
         assert!(yaml.contains("# envelope-id: env_local_test"));
         assert!(yaml.contains("      workflow: repository-review@1"));
         assert!(yaml.contains(
-            "uses: apelogic-ai/steward-run/.github/workflows/steward-task-self-hosted.yml@328159f3b816b8c93a9e5a8c1790243d2965aff8"
+            "uses: example-org/steward-run/.github/workflows/steward-task-self-hosted.yml@3333333333333333333333333333333333333333"
         ));
+        assert!(yaml.contains(&format!(
+            "      envelope-digest: steward:sha256:{}",
+            "a".repeat(64)
+        )));
         assert!(!yaml.contains("contents: write"));
         assert!(!yaml.contains("coding-agent-runtime"));
         assert!(!yaml.contains("TARGET_REVISION"));
@@ -1590,14 +1834,44 @@ mod tests {
             .map_err(|error| format!("send excessive request: {error}"))?;
         assert_eq!(
             response.status(),
-            StatusCode::CREATED,
-            "a valid over-template request must enter review rather than disappearing"
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a request above the template ceiling must be rejected"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_above_auto_threshold_but_within_ceiling_requires_review() -> Result<(), String>
+    {
+        let mut requested = template().ceiling;
+        requested.spec.budget.monthly_limit = "75.00".to_owned();
+        let response = inner_router(TestBroker::default())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "templateId": "engineer",
+                            "templateRevision": 3,
+                            "requestedEnvelope": requested,
+                            "idempotencyKey": "request-above-threshold",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
         let body = to_bytes(response.into_body(), 16 * 1024)
             .await
-            .map_err(|error| format!("read excessive response: {error}"))?;
-        let value: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|error| format!("parse excessive response: {error}"))?;
+            .map_err(|error| format!("read response: {error}"))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|error| format!("parse response: {error}"))?;
         assert_eq!(value["request"]["status"], "pending");
         assert!(value["request"]["approvedEnvelope"].is_null());
         Ok(())
@@ -1649,8 +1923,8 @@ mod tests {
                     let approved_envelope = auto_provision.then(|| requested_envelope.clone());
                     Ok(UserEnvelopeRequest {
                         id: Uuid::nil(),
-                        template_id: "engineer".to_owned(),
-                        template_revision: 3,
+                        template_id: Some("engineer".to_owned()),
+                        template_revision: Some(3),
                         requested_envelope,
                         approved_envelope,
                         status: if auto_provision {
@@ -1663,7 +1937,7 @@ mod tests {
                         envelope_digest: None,
                         reason: None,
                         status_actor: "usr_0123456789abcdef0123456789abcdef".to_owned(),
-                        status_template_revision: 3,
+                        status_template_revision: Some(3),
                         created_at: "2026-08-17T00:00:00Z".to_owned(),
                         status_at: "2026-08-17T00:00:00Z".to_owned(),
                         history: Vec::new(),
@@ -1713,7 +1987,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_minutes_above_the_template_ceiling_enter_review() -> Result<(), String> {
+    async fn runtime_minutes_above_the_template_ceiling_are_rejected() -> Result<(), String> {
         let broker = TestBroker::default();
         let mut requested = template().ceiling;
         requested.spec.runtime_minutes_limit = Some("180".to_owned());
@@ -1738,12 +2012,7 @@ mod tests {
             )
             .await
             .map_err(|error| format!("submit request: {error}"))?;
-        let body = to_bytes(response.into_body(), 16 * 1024)
-            .await
-            .map_err(|error| format!("read response: {error}"))?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|error| format!("parse response: {error}"))?;
-        assert_eq!(value["request"]["status"], "pending");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         Ok(())
     }
 

@@ -1118,7 +1118,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.2.6" => Ok(true),
+            "0.3.0" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -2836,24 +2836,24 @@ mod tests {
         for required in [
             "id-token: write",
             "attestations: write",
-            "steward.release-handoff/v1",
+            "steward.release-handoff/v2",
             "authorityContract: \"user-envelope-only\"",
             "identityPolicyContract: \"github-oidc-exchange.apelogic.io/v5\"",
             "0039_user_envelope_only_task_authority.sql",
             "serviceEnvelopeSupported: false",
-            "governedPlatformCompatibility:",
-            "steward.governed-platform-compatibility/v1",
-            "steward-governed-platform-compatibility-${version}.json",
+            "productCompatibility:",
+            "steward.product-compatibility/v1",
+            "steward-product-compatibility-${version}.json",
             "subject-path: dist/release-handoff.json",
             "release-handoff-attestation.jsonl",
             "gh attestation verify dist/release-handoff.json",
             "Verify published release handoff",
             "cmp dist/release-handoff.json",
-            "Verify published governed-platform compatibility manifest",
+            "Verify published product compatibility manifest",
         ] {
             assert!(
                 release.contains(required),
-                "v0.2 release handoff is missing `{required}`"
+                "v0.3 release handoff is missing `{required}`"
             );
         }
         for component in ["apiserver", "controller", "mint", "bridge", "web"] {
@@ -3742,150 +3742,104 @@ mod tests {
     }
 
     #[test]
-    fn governed_platform_compatibility_manifest_is_complete() -> Result<(), String> {
-        let path = root().join("config/governed-platform/v1/compatibility.json");
-        let content = fs::read_to_string(&path).map_err(|error| {
-            format!("governed-platform compatibility manifest is required: {error}")
-        })?;
+    fn product_compatibility_is_separate_from_the_installation_bom() -> Result<(), String> {
+        let path = root().join("config/product-compatibility/v1/compatibility.json");
+        let old_path = root().join("config/governed-platform/v1/compatibility.json");
+        assert!(
+            !old_path.exists(),
+            "the source-level cross-product installation lock must remain removed"
+        );
+        let content = fs::read_to_string(&path)
+            .map_err(|error| format!("product compatibility contract is required: {error}"))?;
         let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
             .map_err(|error| format!("release workflow is required: {error}"))?;
-        let manifest = serde_json::from_str::<serde_json::Value>(&content).map_err(|error| {
-            format!("governed-platform compatibility manifest is invalid JSON: {error}")
-        })?;
+        let generator =
+            fs::read_to_string(root().join("crates/steward-apiserver/src/github_actions.rs"))
+                .map_err(|error| format!("GitHub Actions generator is required: {error}"))?;
+        let manifest = serde_json::from_str::<serde_json::Value>(&content)
+            .map_err(|error| format!("product compatibility contract is invalid JSON: {error}"))?;
         assert_eq!(
             manifest
                 .pointer("/schemaVersion")
                 .and_then(serde_json::Value::as_str),
-            Some("steward.governed-platform-compatibility/v1")
+            Some("steward.product-compatibility/v1")
         );
-        for pointer in [
-            "/steward/version",
-            "/companions/stewardRun/image",
-            "/companions/stewardRun/chart",
-            "/companions/githubOidcExchange/image",
-            "/companions/githubOidcExchange/chart",
-            "/dependencies/openShell/chart",
-            "/dependencies/agentSandbox/controllerImage",
-            "/dependencies/liteLlm/image",
-        ] {
-            let value = manifest
-                .pointer(pointer)
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("compatibility manifest is missing {pointer}"))?;
-            if pointer.ends_with("/version") {
-                assert!(!value.is_empty(), "{pointer} must not be empty");
-            } else {
-                assert!(
-                    value.contains("@sha256:")
-                        && value
-                            .rsplit_once("@sha256:")
-                            .is_some_and(
-                                |(_, digest)| digest.len() == 64 && digest != "0".repeat(64)
-                            ),
-                    "{pointer} must be an immutable OCI reference"
-                );
-            }
-        }
-        let spire_images = manifest
-            .pointer("/dependencies/spire/images")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| "compatibility manifest must list SPIRE images".to_owned())?;
-        assert!(
-            !spire_images.is_empty(),
-            "SPIRE image list must not be empty"
-        );
-        assert!(spire_images.iter().all(|image| {
-            image
-                .as_str()
-                .is_some_and(|value| value.contains("@sha256:"))
-        }));
         assert_eq!(
             manifest
-                .pointer("/dependencies/spire/identity/spiffeIdTemplate")
+                .pointer("/stewardVersion")
                 .and_then(serde_json::Value::as_str),
-            Some("spiffe://<trust-domain>/steward/mint")
+            Some("0.3.0")
         );
         assert_eq!(
             manifest
-                .pointer("/dependencies/liteLlm/interfaces/codex-v1")
-                .and_then(|value| value.get("urlSemantics"))
+                .pointer("/taskApiContract")
                 .and_then(serde_json::Value::as_str),
-            Some("exact-operation-url")
+            Some("steward.task/v2")
         );
         assert_eq!(
             manifest
-                .pointer("/dependencies/liteLlm/interfaces/codex-v1/operationPath")
+                .pointer("/clientCapabilities/envelopeDigestSelector/stewardRunMinimumVersion",)
                 .and_then(serde_json::Value::as_str),
-            Some("/v1/responses")
+            Some("0.7.0")
         );
         assert_eq!(
             manifest
-                .pointer("/dependencies/liteLlm/interfaces/claude-code-v1/urlSemantics")
+                .pointer("/dependencyContracts/identityPolicy")
                 .and_then(serde_json::Value::as_str),
-            Some("base-url")
+            Some("github-oidc-exchange.apelogic.io/v5")
         );
         assert_eq!(
             manifest
-                .pointer("/dependencies/liteLlm/interfaces/claude-code-v1/operationPath")
-                .and_then(serde_json::Value::as_str),
-            Some("/v1/messages")
-        );
-        assert_eq!(
-            manifest
-                .pointer("/dependencies/mcpGateway/authorityContract")
+                .pointer("/dependencyContracts/githubConnectionAuthority")
                 .and_then(serde_json::Value::as_str),
             Some("steward.connections.github/v2")
         );
-        assert_eq!(
-            manifest
-                .pointer("/dependencies/gatewayApi/minimumCrdRelease")
-                .and_then(serde_json::Value::as_str),
-            Some("1.4.0")
-        );
-        assert_eq!(
-            manifest
-                .pointer("/dependencies/gatewayApi/apiVersion")
-                .and_then(serde_json::Value::as_str),
-            Some("gateway.networking.k8s.io/v1")
-        );
-        assert_eq!(
-            manifest
-                .pointer("/dependencies/gatewayApi/requiredGatewayClassFeature")
-                .and_then(serde_json::Value::as_str),
-            Some("BackendTLSPolicy")
-        );
-        assert_eq!(
-            manifest
-                .pointer("/dependencies/gatewayApi/minimumEnvoyGatewayRelease")
-                .and_then(serde_json::Value::as_str),
-            Some("1.9.1")
-        );
-        assert_eq!(
-            manifest
-                .pointer("/dependencies/gatewayApi/testedEnvoyGatewayRelease")
-                .and_then(serde_json::Value::as_str),
-            Some("1.9.1")
-        );
-        let envoy_gateway_chart = manifest
-            .pointer("/dependencies/gatewayApi/testedEnvoyGatewayChart")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                "compatibility manifest is missing tested Envoy Gateway chart".to_owned()
-            })?;
         assert!(
-            envoy_gateway_chart.starts_with("oci://") && envoy_gateway_chart.contains("@sha256:"),
-            "tested Envoy Gateway chart must be an immutable OCI reference"
+            !content.contains("@sha256:")
+                && !content.contains("\"commit\"")
+                && !content.contains("\"chart\""),
+            "product compatibility must not become a cross-product artifact lock"
         );
         for required in [
-            "steward-governed-platform-compatibility-${version}.json",
-            "governedPlatformCompatibility:",
-            "Attest governed-platform compatibility manifest",
-            "Verify published governed-platform compatibility manifest",
-            "governedPlatformCompatibility.digest",
+            "steward-product-compatibility-${version}.json",
+            "productCompatibility:",
+            "Attest product compatibility manifest",
+            "Verify published product compatibility manifest",
+            "productCompatibility.digest",
         ] {
             assert!(
                 workflow.contains(required),
-                "release workflow must publish and verify compatibility contract `{required}`"
+                "release workflow must publish and verify product contract `{required}`"
+            );
+        }
+        for forbidden in [
+            "config/governed-platform/v1/compatibility.json",
+            "steward.governed-platform-compatibility/v1",
+            "governedPlatformCompatibility:",
+        ] {
+            assert!(
+                !workflow.contains(forbidden),
+                "release workflow must not retain source-level installation lock `{forbidden}`"
+            );
+        }
+        for forbidden in [
+            "REVIEWED_STEWARD_RUN_WORKFLOW_COMMIT",
+            "VERSIONED_STEWARD_RUN_WORKFLOW_COMMIT",
+            "ghcr.io/apelogic-ai/steward-run@sha256:",
+        ] {
+            assert!(
+                !generator.contains(forbidden),
+                "workflow generator must consume BOM-backed coordinates, not `{forbidden}`"
+            );
+        }
+        for required in [
+            "workflow_repository",
+            "steward_run_release_from_installation_bom",
+            "envelope-digest: steward:",
+        ] {
+            assert!(
+                generator.contains(required),
+                "workflow generator must retain BOM-backed selector binding `{required}`"
             );
         }
         Ok(())

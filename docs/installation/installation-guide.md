@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.2.6`. The release workflow pulls the published OCI
+Release contract: chart `0.3.0`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -84,10 +84,11 @@ and [execution bindings](execution-bindings.md) before activating Tasks.
 ### Tested versions and integration boundaries
 
 The released
-[governed-platform compatibility manifest](governed-platform-compatibility.md)
-is authoritative for exact versions, commits, chart/image digests, and named
-contracts. Pin each external product and prove its contract again in the target
-cluster before enabling governed execution.
+[product-compatibility contract](governed-platform-compatibility.md) is
+authoritative for supported API and capability contracts. The separately
+signed installation BOM is authoritative for exact versions, commits, and
+chart/image digests. Pin every BOM coordinate and prove its declared contracts
+again in the target cluster before enabling governed execution.
 
 | Component | Supported / tested now |
 |---|---|
@@ -97,11 +98,11 @@ cluster before enabling governed execution.
 | OpenShell | 0.0.98 |
 | agent-sandbox | 0.5.0 |
 | Runtime | Cluster/OpenShell default; no VM-isolation claim |
-| SPIRE | `spire-crds` 0.5.0; `spire` 0.29.0; exact rendered images in the compatibility manifest |
-| MCP-GW | `steward.connections.github/v1`: 0.3.2; `steward.connections.github/v2`: 0.4.9–0.4.11 |
-| LiteLLM | 1.93.0; Responses and Anthropic Messages contracts defined in the compatibility manifest |
-| Gateway API edge | Gateway API 1.4.0+; Envoy Gateway 1.9.1; the selected GatewayClass reports `BackendTLSPolicy` |
-| Companion products | Exact `steward-run` and `github-oidc-exchange` coordinates in the compatibility manifest |
+| SPIRE | Mint identity contract documented below; exact charts/images come from the installation BOM |
+| MCP-GW | Must implement `steward.connections.github/v2` |
+| LiteLLM | Must implement the documented Responses and Anthropic Messages URL contracts |
+| Gateway API edge | `gateway.networking.k8s.io/v1`; selected GatewayClass reports `BackendTLSPolicy` |
+| Companion products | `steward-run` 0.7.0+ for `envelopeDigest`; exact `steward-run` and Identity coordinates come from the installation BOM |
 
 Runtime support is the Kubernetes/OpenShell default. Operators may set
 `config.controller.openshellRuntimeClassName` only when their platform requires
@@ -143,6 +144,14 @@ The chart references existing names and keys; it never puts secret bytes in
 values. Manage creation and rotation with the customer's approved secret
 system. The default names can be overridden under `secrets`, `tls`,
 `browserAuth`, and `githubSource`.
+
+When `browserAuth.enabled=true`, set
+`config.apiserver.stewardRunRelease` from the verified installation BOM. The
+required normalized fields are `manifestSchemaVersion`, `version`,
+`workflowRepository`, `workflowCommit`, `actionCommit`, and
+`governedJobContainerImage`; Steward requires v0.7.0 or later and immutable
+commits/image digest. This value binds generated workflows to the same
+steward-run release selected for the installation.
 
 | Reference and namespace | Kubernetes type and keys | Producer and consumer | Rotation / condition |
 |---|---|---|---|
@@ -504,16 +513,17 @@ enable and verify the human browser path before performing them.
    identity but grants no administrator or member authority. Email and Google
    subject values are not authorization keys.
 3. **Authorized local RBAC grant.** The user gives that opaque ID to an
-   authorized Steward operator. In the protected runtime where
-   `STEWARD_DATABASE_URL` is already projected, the operator records the
-   audited initial grant explicitly:
+   authorized Steward operator. Configure `STEWARD_OPERATOR_API_URL` with the
+   exact HTTPS Steward origin and `STEWARD_OPERATOR_TOKEN_FILE` with a projected
+   bearer credential whose authenticated identity has administrator authority.
+   The supported day-two CLI calls that API; it does not receive a database
+   credential or a caller-selected audit identity. The older `bootstrap-rbac`
+   command remains compatible for initial bootstrap:
 
    ```sh
-   kubectl -n <namespace> exec deploy/steward-apiserver -- \
-     /usr/local/bin/steward bootstrap-rbac \
-     --user-id usr_<opaque-id> \
-     --grant administrator \
-     --actor <audited-operator>
+   STEWARD_OPERATOR_API_URL=https://steward.example.com \
+   STEWARD_OPERATOR_TOKEN_FILE=/run/secrets/steward/operator-token \
+     steward rbac grant admin --user-id usr_<opaque-id>
    ```
 
    There is no first-login administrator shortcut or automatic bootstrap.
@@ -539,7 +549,9 @@ enable and verify the human browser path before performing them.
    that observation with the intended existing canonical user using its current
    revision, and verifies the audit endpoint. Login, display name, and email are
    never association keys. Association grants no authority; the user still needs
-   the active provisioned User Envelope from step 5.
+   the active provisioned User Envelope from step 5. When more than one active
+   Envelope exists, pass its exact public `envelopeDigest`; omission is supported
+   only when exactly one active Envelope exists.
 
 Record the canonical IDs, immutable revisions, decision evidence, and operator
 actors through the product's supported administration surfaces without placing
