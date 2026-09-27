@@ -15,7 +15,7 @@ import {
   type RunnerPlatform,
   type ToolGrant,
 } from "@/api-client";
-import { DataTable, GrantChipList, type GrantKind } from "@/components/hs";
+import { DataTable, GrantChipList, grantKindForAction } from "@/components/hs";
 import { EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -229,13 +229,6 @@ function toolLabel(tool: ToolGrant, choices: Array<ToolGrant>): string {
     : display;
 }
 
-function toolGrantKind(action: string): GrantKind {
-  const normalized = action.toLowerCase();
-  if (normalized.includes("delete") || normalized.includes("admin")) return "destructive";
-  if (normalized.includes("write") || normalized.includes("create") || normalized.includes("update")) return "write";
-  return "read";
-}
-
 function mutationMessage(status: Exclude<TemplateMutationState, "idle" | "saving">): string {
   return {
     saved: "Template revision accepted by the Rust authority.",
@@ -284,7 +277,7 @@ function AuthenticatedTemplateList() {
             { key: "roles", label: "Roles", className: "text-muted-ink", render: (template) => template.memberRoles.map(displayName).join(", ") },
             { key: "authority", label: "Authority", render: (template) => <GrantChipList grants={[
               ...template.envelope.spec.llms.map((model) => ({ kind: "model" as const, name: modelValue(model) })),
-              ...template.envelope.spec.tools.map((tool) => ({ kind: toolGrantKind(tool.action), name: toolValue(tool) })),
+              ...template.envelope.spec.tools.map((tool) => ({ kind: grantKindForAction(tool.action), name: toolValue(tool) })),
             ]} limit={2} /> },
             { key: "revision", label: "Revision", className: "tabular-nums text-muted-ink", render: (template) => template.envelope.revision },
           ]}

@@ -219,7 +219,7 @@ const approval = {
 const presentationRoutes = [
   { path: "/envelopes", heading: "Envelopes", activeNavigation: "Envelopes" },
   { path: "/envelopes/new", heading: "New envelope", activeNavigation: "Envelopes" },
-  { path: `/envelopes/${envelopeId}`, heading: "Envelope", activeNavigation: "Envelopes" },
+  { path: `/envelopes/${envelopeId}`, heading: "developer", activeNavigation: "Envelopes" },
   { path: `/envelopes/${envelopeId}/runs`, heading: "Recent runs", activeNavigation: "Envelopes" },
   { path: "/runs", heading: "Runs", activeNavigation: "Runs" },
   { path: `/runs/${taskUid}`, heading: "Run detail", activeNavigation: "Runs" },
@@ -1155,7 +1155,7 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await expect(developer.page.getByLabel("Time to live")).toHaveValue("4h");
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
-    const provisioned = developer.page.getByRole("article").getByText("provisioned", { exact: true });
+    const provisioned = developer.page.locator("#page-title").getByText("provisioned", { exact: true });
     await expect(provisioned).toHaveAttribute("data-tone", "ok");
     const envelopeMutation = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/envelope-requests");
     expectMutationProof(envelopeMutation);
@@ -1185,13 +1185,13 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await developer.page.goto(`${origin}/connections`);
     await expect(developer.page.getByRole("heading", { name: "GitHub" })).toBeVisible();
     await expect(developer.page.getByText("alice@example.com").last()).toBeVisible();
-    await developer.page.getByRole("checkbox", { name: "I understand this revokes the shared Steward connection." }).check();
+    await developer.page.getByRole("button", { name: "Disconnect…" }).click();
     await developer.page.getByRole("button", { name: "Disconnect GitHub" }).click();
     await expect.poll(() => developer.mutations.some((mutation) => mutation.path.endsWith("/disconnect"))).toBe(true);
     expectMutationProof(developer.mutations.find((mutation) => mutation.path.endsWith("/disconnect")));
 
     await developer.page.goto(`${origin}/settings`);
-    await expect(developer.page.getByRole("heading", { name: "Server-owned session" })).toBeVisible();
+    await expect(developer.page.getByRole("heading", { name: /Alice Example/ })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -1594,7 +1594,7 @@ test("administrator templates and approvals use typed browser authority", async 
     expect(approvalMutation.body.evidenceUrl).toBe("https://example.com/decisions/PROJ-123");
 
     await administrator.page.goto(`${origin}/admin/settings`);
-    await expect(administrator.page.getByRole("heading", { name: "Administrator session" })).toBeVisible();
+    await expect(administrator.page.getByRole("heading", { name: /Alice Example/ })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }

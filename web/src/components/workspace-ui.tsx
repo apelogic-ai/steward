@@ -7,7 +7,7 @@ import { StatusPill } from "@/components/hs/status-pill";
 export function PageHeader({ actions, description, title }: Readonly<{
   actions?: ReactNode;
   description: string;
-  title: string;
+  title: ReactNode;
 }>) {
   return (
     <header className="flex flex-wrap items-end justify-between gap-4">

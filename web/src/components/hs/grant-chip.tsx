@@ -2,6 +2,13 @@ import { cn } from "@/lib/utils";
 
 export type GrantKind = "model" | "read" | "write" | "destructive";
 
+export function grantKindForAction(action: string): GrantKind {
+  const normalized = action.toLowerCase();
+  if (normalized.includes("delete") || normalized.includes("admin")) return "destructive";
+  if (normalized.includes("write") || normalized.includes("create") || normalized.includes("update")) return "write";
+  return "read";
+}
+
 const kindClasses: Record<GrantKind, string> = {
   model: "bg-info-soft text-info",
   read: "bg-ok-soft text-ok",

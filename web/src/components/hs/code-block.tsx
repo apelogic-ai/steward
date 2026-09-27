@@ -2,6 +2,21 @@
 
 import { useState } from "react";
 
+function highlightedYaml(code: string) {
+  return code.split("\n").map((line, index) => {
+    const match = /^(\s*-?\s*)([^:#]+:)(.*)$/.exec(line);
+    if (!match) return <span key={index}>{line}{index < code.split("\n").length - 1 ? "\n" : ""}</span>;
+    const [, prefix, key, rawValue] = match;
+    const value = rawValue.trim();
+    const valueClass = value === "true" || value === "false"
+      ? "text-code-bool"
+      : /^[A-Za-z_-]+$/.test(value)
+        ? "text-code-ident"
+        : "text-code-string";
+    return <span key={index}>{prefix}<span className="text-code-key">{key}</span>{rawValue ? <span className={valueClass}>{rawValue}</span> : null}{index < code.split("\n").length - 1 ? "\n" : ""}</span>;
+  });
+}
+
 export function CodeBlock({ code, language = "text", path }: Readonly<{
   code: string;
   language?: "yaml" | "shell" | "text";
@@ -21,7 +36,7 @@ export function CodeBlock({ code, language = "text", path }: Readonly<{
           {copied ? "Copied" : "Copy"}
         </button>
       </header>
-      <pre className="overflow-x-auto p-4 font-mono text-sm leading-[21px]"><code>{code}</code></pre>
+      <pre className="overflow-x-auto p-4 font-mono text-sm leading-[21px]"><code>{language === "yaml" ? highlightedYaml(code) : code}</code></pre>
     </section>
   );
 }

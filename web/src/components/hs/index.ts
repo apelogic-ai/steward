@@ -5,5 +5,7 @@ export * from "./filter-tabs";
 export * from "./grant-chip";
 export * from "./meter";
 export * from "./section-card";
+export * from "./stat-strip";
 export * from "./status-pill";
+export * from "./theme-control";
 export * from "./tone";
