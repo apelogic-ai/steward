@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use kube::Client;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::types::Uuid;
+use sqlx::types::{Json, Uuid};
 use sqlx::{PgPool, Row};
 use steward_adapter_openshell::{
     OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
@@ -395,9 +395,15 @@ impl Harness {
         validate_envelope(&envelope).map_err(|error| {
             io::Error::other(format!("validate long-running envelope: {error:?}"))
         })?;
-        self.store
-            .insert_envelope(member_role, &envelope, "e2e-admin")
-            .await?;
+        sqlx::query(
+            "INSERT INTO envelopes (scope_kind, scope_ref, revision, spec, authored_by) \
+             VALUES ('member_role', $1, $2, $3, 'e2e-admin')",
+        )
+        .bind(member_role)
+        .bind(envelope.revision)
+        .bind(Json(&envelope.spec))
+        .execute(&self.database)
+        .await?;
         Ok(envelope)
     }
 
