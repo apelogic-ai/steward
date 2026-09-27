@@ -4,7 +4,12 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 
-import { getAdminRequestsSummary } from "@/api-client";
+import {
+  getAdminRequestsSummary,
+  getBrowserPreferences,
+  updateBrowserPreferences,
+  type BrowserTheme,
+} from "@/api-client";
 import { authStartPath } from "@/session/auth-redirect";
 import { useSession, type SessionState } from "@/session/session-context";
 
@@ -38,13 +43,13 @@ export function workspaceLandingPath(workspace: "admin" | "user"): string {
   return workspace === "admin" ? "/admin/envelopes/templates" : "/envelopes";
 }
 
-type Theme = "dark" | "light";
+type ResolvedTheme = "dark" | "light";
 
-function preferredTheme(): Theme {
+function preferredTheme(): ResolvedTheme {
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-function serverTheme(): Theme {
+function serverTheme(): ResolvedTheme {
   return "light";
 }
 
@@ -58,6 +63,15 @@ function signedOutPath(): string {
   return "/admin/sign-in";
 }
 
+function applyThemePreference(preference: BrowserTheme): void {
+  if (preference === "system") {
+    delete document.documentElement.dataset.theme;
+  } else {
+    document.documentElement.dataset.theme = preference;
+  }
+  document.cookie = `hypershell-theme=${preference}; Path=/; Max-Age=31536000; SameSite=Lax`;
+}
+
 function StatePanel({ children, title }: Readonly<{ children: ReactNode; title: string }>) {
   return (
     <section aria-labelledby="session-state-title" className="mx-auto mt-12 max-w-xl rounded-panel border bg-panel p-6 shadow-sm">
@@ -67,7 +81,7 @@ function StatePanel({ children, title }: Readonly<{ children: ReactNode; title: 
   );
 }
 
-function ThemeIcon({ theme }: Readonly<{ theme: Theme }>) {
+function ThemeIcon({ theme }: Readonly<{ theme: ResolvedTheme }>) {
   return theme === "light" ? (
     <svg aria-hidden="true" fill="none" height="20" viewBox="0 0 24 24" width="20">
       <circle cx="12" cy="12" r="4" stroke="currentColor" strokeWidth="2" />
@@ -86,7 +100,7 @@ function AccountMenu({ adminMode, session }: Readonly<{
 }>) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
-  const [selectedTheme, setSelectedTheme] = useState<Theme | null>(null);
+  const [selectedTheme, setSelectedTheme] = useState<BrowserTheme>("system");
   const [logoutFailed, setLogoutFailed] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -97,7 +111,18 @@ function AccountMenu({ adminMode, session }: Readonly<{
   const initial = displayName.trim().charAt(0).toUpperCase() || "?";
   const dualRole = hasDualRole(session);
   const systemTheme = useSyncExternalStore(subscribeToPreferredTheme, preferredTheme, serverTheme);
-  const theme = selectedTheme ?? systemTheme;
+  const theme = selectedTheme === "system" ? systemTheme : selectedTheme;
+
+  useEffect(() => {
+    let active = true;
+    void getBrowserPreferences({ cache: "no-store", credentials: "same-origin" }).then((result) => {
+      const preference = result.data?.theme ?? "system";
+      if (!active || !result.response?.ok) return;
+      setSelectedTheme(preference);
+      applyThemePreference(preference);
+    });
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -118,10 +143,6 @@ function AccountMenu({ adminMode, session }: Readonly<{
       document.removeEventListener("keydown", closeOnEscape);
     };
   }, [open]);
-
-  useEffect(() => {
-    if (selectedTheme) document.documentElement.dataset.theme = selectedTheme;
-  }, [selectedTheme]);
 
   const logout = async () => {
     setLoggingOut(true);
@@ -204,7 +225,17 @@ function AccountMenu({ adminMode, session }: Readonly<{
             <button
               aria-label={`Switch to ${theme === "light" ? "dark" : "light"} mode`}
               className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border bg-canvas text-muted-ink transition hover:border-brand hover:text-brand"
-              onClick={() => setSelectedTheme(theme === "light" ? "dark" : "light")}
+              onClick={() => {
+                const preference = theme === "light" ? "dark" : "light";
+                setSelectedTheme(preference);
+                applyThemePreference(preference);
+                void updateBrowserPreferences({
+                  body: { theme: preference },
+                  cache: "no-store",
+                  credentials: "same-origin",
+                  headers: { "X-Steward-CSRF": session.value.csrf },
+                });
+              }}
               title={`${theme === "light" ? "Light" : "Dark"} mode`}
               type="button"
             >
@@ -254,14 +285,14 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
       <header className="border-b bg-panel">
         <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-7 gap-y-3 px-4 py-4 sm:px-6 lg:px-8">
           <Link
-            aria-label="ApeLogic Steward home"
+            aria-label="HyperShell home"
             className="me-auto flex items-center gap-2.5 text-lg font-semibold tracking-tight text-ink"
             href={adminMode && workspaceAuthorized ? "/admin/runs" : "/envelopes"}
           >
-            {/* The same-origin SVG keeps the mark visible under Steward's strict style CSP. */}
+            {/* The same-origin image keeps the mark visible under HyperShell's strict style CSP. */}
             {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img alt="ApeLogic" className="apelogic-mark" height="32" src="/icon.svg" width="32" />
-            <span>Steward</span>
+            <img alt="HyperShell" className="size-8 shrink-0 rounded-control bg-white object-cover" height="32" src="/brand/logo" width="32" />
+            <span>HyperShell</span>
           </Link>
           {workspaceAuthorized ? (
             <nav aria-label="Primary navigation" className="order-3 flex w-full gap-1 overflow-x-auto sm:order-none sm:w-auto">

@@ -24,18 +24,39 @@ export function PrimaryLink({ children, href }: Readonly<{ children: ReactNode; 
 }
 
 export function StatusBadge({ value }: Readonly<{ value: string }>) {
-  const badgeClass = {
-    failed: "status-badge-error",
-    "credential expired": "status-badge-error",
-    reauth_required: "status-badge-error",
-    "expiring soon": "status-badge-warning",
-    connected: "status-badge-success",
-    provisioned: "status-badge-success",
-    succeeded: "status-badge-success",
-  }[value.toLowerCase()] ?? "bg-canvas text-muted-ink";
+  const normalized = value.toLowerCase();
+  const tone = normalized === "connected"
+    || normalized === "provisioned"
+    || normalized === "succeeded"
+    || normalized === "approved"
+    || normalized === "auto_approved"
+    ? "ok"
+    : normalized === "failed"
+      || normalized === "credential expired"
+      || normalized === "reauth_required"
+      || normalized === "escalated"
+      || normalized === "conflict"
+      || normalized === "rejected"
+      ? "err"
+      : normalized === "expiring soon"
+        || normalized === "pending"
+        || normalized === "parked"
+        || normalized === "requested"
+        ? "warn"
+        : normalized === "running" || normalized === "queued" || normalized === "submitted"
+          ? "info"
+          : "neutral";
+  const toneClass = {
+    ok: "bg-ok-soft text-ok",
+    err: "bg-err-soft text-err",
+    warn: "bg-warn-soft text-warn",
+    info: "bg-info-soft text-info",
+    neutral: "bg-line-soft text-muted-ink",
+  }[tone];
   return (
-    <span className={`inline-flex w-fit shrink-0 self-start rounded-full border px-2.5 py-1 text-xs font-semibold capitalize ${badgeClass}`}>
-      {value.replaceAll("_", " ")}
+    <span className={`inline-flex w-fit shrink-0 items-center gap-1.5 self-start rounded-full px-2.5 py-1 text-xs font-semibold capitalize ${toneClass}`} data-tone={tone}>
+      <span aria-hidden="true" className="size-1.5 rounded-full bg-current" />
+      {normalized === "auto_approved" ? "Auto-approved" : value.replaceAll("_", " ")}
     </span>
   );
 }

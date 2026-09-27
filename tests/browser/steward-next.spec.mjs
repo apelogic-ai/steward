@@ -885,16 +885,16 @@ test("Next pages carry one strict nonce and nested developer navigation", async 
   }
 });
 
-test("the shell carries the ApeLogic visual system from the db-mcp web app", async ({ browser }) => {
+test("the shell carries the HyperShell visual system", async ({ browser }) => {
   const session = await guardedPage(browser);
   try {
     await session.page.goto(`${origin}/envelopes`);
-    await expect(session.page.getByRole("img", { name: "ApeLogic" })).toHaveAttribute("src", "/icon.svg");
-    await expect(session.page.getByRole("link", { name: /ApeLogic Steward/ })).toHaveAttribute("href", "/envelopes");
-    await expect(session.page.locator("link[rel='icon'][href*='favicon.ico']")).toHaveCount(1);
-    const favicon = await session.page.request.get(`${origin}/favicon.ico`);
+    await expect(session.page.getByRole("img", { name: "HyperShell" })).toHaveAttribute("src", "/brand/logo");
+    await expect(session.page.getByRole("link", { name: "HyperShell home" })).toHaveAttribute("href", "/envelopes");
+    await expect(session.page.locator("link[rel='icon'][href*='/brand/logo']")).toHaveCount(1);
+    const favicon = await session.page.request.get(`${origin}/brand/logo`);
     expect(favicon.status()).toBe(200);
-    expect(favicon.headers()["content-type"]).toContain("image/x-icon");
+    expect(favicon.headers()["content-type"]).toContain("image/jpeg");
 
     const brand = await session.page.evaluate(() => {
       const body = getComputedStyle(document.body);
@@ -909,11 +909,11 @@ test("the shell carries the ApeLogic visual system from the db-mcp web app", asy
       };
     });
     expect(brand).toEqual({
-      background: "rgb(18, 18, 18)",
-      foreground: "rgb(250, 250, 250)",
+      background: "rgb(21, 23, 24)",
+      foreground: "rgb(236, 238, 239)",
       font: expect.stringContaining("Space Grotesk"),
-      headerBorder: "rgb(46, 46, 46)",
-      primary: "rgb(239, 134, 38)",
+      headerBorder: "rgb(47, 52, 55)",
+      primary: "rgb(251, 81, 8)",
     });
   } finally {
     await closeGuardedPage(session);
@@ -998,7 +998,7 @@ test("the account menu identifies the user and exposes only server-authorized wo
     await expect(account.getByRole("button", { name: "Switch to light mode" })).toBeVisible();
 
     const logoutButton = account.getByRole("button", { name: "Log out" });
-    await expect(logoutButton).toHaveCSS("background-color", "rgb(239, 134, 38)");
+    await expect(logoutButton).toHaveCSS("background-color", "rgb(251, 81, 8)");
     await expect(logoutButton.locator("xpath=..")).toHaveCSS("border-top-style", "solid");
     await logoutButton.click();
     await expect(developer.page).toHaveURL(`${origin}/admin/sign-in`);
@@ -1167,9 +1167,7 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
     const provisioned = developer.page.getByRole("article").getByText("provisioned", { exact: true });
-    await expect(provisioned).toHaveCSS("background-color", "rgb(18, 53, 36)");
-    await expect(provisioned).toHaveCSS("border-color", "rgb(47, 128, 85)");
-    await expect(provisioned).toHaveCSS("color", "rgb(134, 239, 172)");
+    await expect(provisioned).toHaveAttribute("data-tone", "ok");
     const envelopeMutation = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/envelope-requests");
     expectMutationProof(envelopeMutation);
     expect(envelopeMutation.body.requestedEnvelope.spec.budget.singleRunLimit).toBe("5.00");

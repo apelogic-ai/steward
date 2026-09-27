@@ -31,8 +31,8 @@ describe("run cards", () => {
     expect(html.indexOf("newruntime")).toBeLessThan(html.indexOf("oldruntime"));
     expect(html).toContain('<ul class="grid gap-4">');
     expect(html).toContain("rounded-panel border bg-panel px-5 py-4 shadow-sm");
-    expect(html).toContain("status-badge-success");
-    expect(html).toContain("status-badge-error");
+    expect(html).toContain('data-tone="ok"');
+    expect(html).toContain('data-tone="err"');
     expect(html).toContain('<div class="mt-4"><dl');
     expect(html).not.toContain("mt-5 inline-flex");
     expect(html).not.toContain(">task-newer</p>");

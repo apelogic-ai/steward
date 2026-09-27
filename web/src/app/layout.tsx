@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import { Inconsolata, Space_Grotesk } from "next/font/google";
-import { headers } from "next/headers";
+import { cookies, headers } from "next/headers";
 import type { ReactNode } from "react";
 
 import { AppShell } from "@/components/app-shell";
@@ -20,16 +20,21 @@ const inconsolata = Inconsolata({
 
 export const metadata: Metadata = {
   title: {
-    default: "Steward",
-    template: "%s · Steward",
+    default: "HyperShell",
+    template: "%s · HyperShell",
   },
   description: "Governed agent runtimes and authority envelopes.",
+  icons: { icon: "/brand/logo" },
 };
 
 export default async function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
   await headers();
+  const themePreference = (await cookies()).get("hypershell-theme")?.value;
+  const initialTheme = themePreference === "light" || themePreference === "dark"
+    ? themePreference
+    : undefined;
   return (
-    <html className={`${spaceGrotesk.variable} ${inconsolata.variable}`} lang="en">
+    <html className={`${spaceGrotesk.variable} ${inconsolata.variable}`} data-theme={initialTheme} lang="en">
       <body>
         <SessionProvider>
           <AppShell>{children}</AppShell>
