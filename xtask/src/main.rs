@@ -1101,6 +1101,7 @@ mod tests {
         git_command_in_repository, migration_changes, provider_profile_bundle_directory_for_inputs,
         root, should_skip_directory, validate_conformance_test_result,
     };
+    use std::collections::BTreeSet;
     use std::fs;
     use std::io::ErrorKind;
     use std::path::{Path, PathBuf};
@@ -2301,6 +2302,83 @@ mod tests {
         assert!(
             !tasks.contains("TokenReviewSpec"),
             "Task authentication must not grow an independent TokenReview request path"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nullable_chart_defaults_are_not_unconditionally_required() -> Result<(), String> {
+        fn schema_allows_null(schema: &serde_json::Value) -> bool {
+            schema
+                .get("type")
+                .is_some_and(|schema_type| match schema_type {
+                    serde_json::Value::String(value) => value == "null",
+                    serde_json::Value::Array(values) => values.iter().any(|value| value == "null"),
+                    _ => false,
+                })
+        }
+
+        fn collect_violations(
+            values: &serde_json::Value,
+            schema: &serde_json::Value,
+            path: &str,
+            violations: &mut Vec<String>,
+        ) {
+            let Some(values) = values.as_object() else {
+                return;
+            };
+            let Some(properties) = schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+            else {
+                return;
+            };
+            let required = schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<BTreeSet<_>>();
+
+            for (name, value) in values {
+                let Some(property_schema) = properties.get(name) else {
+                    continue;
+                };
+                let property_path = if path.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{path}.{name}")
+                };
+                if value.is_null()
+                    && schema_allows_null(property_schema)
+                    && required.contains(name.as_str())
+                {
+                    violations.push(property_path);
+                } else if value.is_object() {
+                    collect_violations(value, property_schema, &property_path, violations);
+                }
+            }
+        }
+
+        let chart = root().join("charts/steward");
+        let values = fs::read_to_string(chart.join("values.yaml"))
+            .map_err(|error| format!("published Steward chart values are required: {error}"))?;
+        let values = serde_saphyr::from_str::<serde_json::Value>(&values).map_err(|error| {
+            format!("published Steward chart values must be valid YAML: {error}")
+        })?;
+        let schema = fs::read_to_string(chart.join("values.schema.json"))
+            .map_err(|error| format!("published Steward values schema is required: {error}"))?;
+        let schema = serde_json::from_str::<serde_json::Value>(&schema).map_err(|error| {
+            format!("published Steward values schema must be valid JSON: {error}")
+        })?;
+
+        let mut violations = Vec::new();
+        collect_violations(&values, &schema, "", &mut violations);
+        assert!(
+            violations.is_empty(),
+            "nullable chart defaults cannot also be unconditionally required because Helm drops null values during coalescing: {}",
+            violations.join(", ")
         );
         Ok(())
     }

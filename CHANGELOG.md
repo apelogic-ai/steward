@@ -49,6 +49,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- Helm now accepts the documented `null` or omitted custom Envelope ceiling and
+  steward-run release projection while browser administration is disabled.
+  Enabling browser administration still requires a complete, schema-valid
+  steward-run release projection.
 - Replaced Steward's source-pinned cross-product deployment lock with an
   attested product-compatibility contract. It declares `steward.task/v2` and a
   `steward-run` v0.7.0 minimum for `envelopeDigest`; release/integration

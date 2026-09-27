@@ -476,8 +476,6 @@
             "jiraAccountEmail",
             "kubernetesTokenReviewAudience",
             "capabilityCatalog",
-            "customEnvelopeSafetyCeiling",
-            "stewardRunRelease",
             "defaultLlmTemplate",
             "executionBindingsMode",
             "executionBindings",
@@ -1169,6 +1167,7 @@
           "config": {
             "properties": {
               "apiserver": {
+                "required": ["stewardRunRelease"],
                 "properties": {"stewardRunRelease": {"type": "object"}}
               }
             }

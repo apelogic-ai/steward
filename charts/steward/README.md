@@ -401,9 +401,10 @@ that allowlist remain inaccessible to both service accounts.
   custom requests fail closed.
 - `config.apiserver.stewardRunRelease` is the exact verified steward-run handoff selected by the
   installation BOM: manifest schema, semantic version, reusable-workflow repository and commit,
-  action commit, and governed job-container digest. Browser workflow generation requires v0.7.0 or later and
-  fails closed when this value is null or malformed. Steward validates and renders these
-  deployment coordinates; its source and chart defaults do not select them.
+  action commit, and governed job-container digest. The default `null` value is valid while browser
+  administration is disabled. Enabling browser administration requires a complete v0.7.0-or-later
+  object and fails schema validation when the value is absent, null, or malformed. Steward validates
+  and renders these deployment coordinates; its source and chart defaults do not select them.
 - `config.apiserver.executionBindings` is the structured, deployment-owned coding-agent
   catalog. The default `bindings: []` advertises no agents and creates no fallback.
   The chart validates it, renders it into an immutable content-addressed ConfigMap,
