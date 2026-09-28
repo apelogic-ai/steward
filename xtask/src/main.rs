@@ -3157,6 +3157,45 @@ mod tests {
     }
 
     #[test]
+    fn every_public_apiserver_edge_route_is_rendered_and_documented() -> Result<(), String> {
+        let templates = fs::read_to_string(root().join("charts/steward/templates/all.yaml"))
+            .map_err(|error| format!("published Steward templates are required: {error}"))?;
+        let preflight = fs::read_to_string(root().join("scripts/steward-platform-preflight.py"))
+            .map_err(|error| format!("platform preflight generator is required: {error}"))?;
+        let readme =
+            fs::read_to_string(root().join("charts/steward/README.md")).map_err(|error| {
+                format!("published Steward chart documentation is required: {error}")
+            })?;
+
+        for (path, ingress_type, gateway_type) in [
+            ("/.well-known/oauth-protected-resource", "Exact", "Exact"),
+            ("/admin/api", "Prefix", "PathPrefix"),
+            ("/admin/auth", "Prefix", "PathPrefix"),
+            ("/admin/connections/github/callback", "Exact", "Exact"),
+            ("/admin/operator", "Prefix", "PathPrefix"),
+            ("/app/api", "Prefix", "PathPrefix"),
+            ("/v1", "Prefix", "PathPrefix"),
+        ] {
+            let ingress = format!("path: {path}, pathType: {ingress_type}");
+            let gateway = format!("{{\"type\": \"{gateway_type}\", \"value\": \"{path}\"}}");
+            let documented = format!("{{ type: {gateway_type}, value: {path} }}");
+            assert!(
+                templates.contains(&ingress),
+                "legacy Ingress is missing `{path}`"
+            );
+            assert!(
+                preflight.contains(&gateway),
+                "platform preflight is missing `{path}`"
+            );
+            assert!(
+                readme.contains(&documented),
+                "chart documentation is missing `{path}`"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn shellcheck_uses_one_discovered_script_set_before_release() -> Result<(), String> {
         let xtask = fs::read_to_string(root().join("xtask/src/main.rs"))
             .map_err(|error| format!("xtask source is required: {error}"))?;

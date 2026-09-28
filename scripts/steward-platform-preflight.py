@@ -605,9 +605,11 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
                 "parentRefs": [parent],
                 "hostname": endpoint["hostname"],
                 "apiPaths": [
+                    {"type": "Exact", "value": "/.well-known/oauth-protected-resource"},
                     {"type": "PathPrefix", "value": "/admin/api"},
                     {"type": "PathPrefix", "value": "/admin/auth"},
                     {"type": "Exact", "value": "/admin/connections/github/callback"},
+                    {"type": "PathPrefix", "value": "/admin/operator"},
                     {"type": "PathPrefix", "value": "/app/api"},
                     {"type": "PathPrefix", "value": "/v1"},
                 ],

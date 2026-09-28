@@ -361,9 +361,11 @@ class PlatformPreflightTests(unittest.TestCase):
             self.assertEqual(
                 values["web"]["httpRoute"]["apiPaths"],
                 [
+                    {"type": "Exact", "value": "/.well-known/oauth-protected-resource"},
                     {"type": "PathPrefix", "value": "/admin/api"},
                     {"type": "PathPrefix", "value": "/admin/auth"},
                     {"type": "Exact", "value": "/admin/connections/github/callback"},
+                    {"type": "PathPrefix", "value": "/admin/operator"},
                     {"type": "PathPrefix", "value": "/app/api"},
                     {"type": "PathPrefix", "value": "/v1"},
                 ],
