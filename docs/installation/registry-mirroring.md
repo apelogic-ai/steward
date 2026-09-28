@@ -17,7 +17,7 @@ Download `release-handoff.json`, the mirror tool, and its checksum from the same
 GitHub release. Verify the handoff attestation as described in that release,
 then verify the tool:
 
-The mirror accepts historical `steward.release-handoff/v1` and the v0.3.0
+The mirror accepts historical `steward.release-handoff/v1` and the v0.3.1
 `steward.release-handoff/v2`; v2 replaces the old combined-platform member with
 the independently attested Steward product-compatibility reference.
 
@@ -35,13 +35,13 @@ missing and extra entries are rejected.
 {
   "schemaVersion": "steward.registry-mappings/v1",
   "artifacts": {
-    "chart": "registry.example.test/team-a/charts/steward:0.3.0",
-    "images.apiserver": "registry.example.test/team-a/steward:0.3.0-apiserver",
-    "images.bridge": "registry.example.test/team-a/steward:0.3.0-bridge",
-    "images.controller": "registry.example.test/team-a/steward:0.3.0-controller",
-    "images.mint": "registry.example.test/team-a/steward:0.3.0-mint",
-    "images.web": "registry.example.test/team-a/steward:0.3.0-web",
-    "referenceRuntimes.codex": "registry.example.test/team-a/steward-codex-runtime:0.140.0-steward-0.3.0"
+    "chart": "registry.example.test/team-a/charts/steward:0.3.1",
+    "images.apiserver": "registry.example.test/team-a/steward:0.3.1-apiserver",
+    "images.bridge": "registry.example.test/team-a/steward:0.3.1-bridge",
+    "images.controller": "registry.example.test/team-a/steward:0.3.1-controller",
+    "images.mint": "registry.example.test/team-a/steward:0.3.1-mint",
+    "images.web": "registry.example.test/team-a/steward:0.3.1-web",
+    "referenceRuntimes.codex": "registry.example.test/team-a/steward-codex-runtime:0.140.0-steward-0.3.1"
   }
 }
 ```
