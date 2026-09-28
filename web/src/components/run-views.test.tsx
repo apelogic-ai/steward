@@ -21,24 +21,24 @@ function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   };
 }
 
-describe("run cards", () => {
-  test("renders one column newest-first with conventional outcome colors", () => {
+describe("run table", () => {
+  test("renders newest-first in an internally scrollable table with conventional outcome colors", () => {
     const html = renderToStaticMarkup(<RunCards runs={[
       run({ taskUid: "task-older", runtimeUid: "oldruntime-0000-0000-0000-000000000000", updatedAt: "2026-08-25T20:00:00Z", phase: "failed" }),
       run({ taskUid: "task-newer", runtimeUid: "newruntime-0000-0000-0000-000000000000", updatedAt: "2026-08-25T21:00:00Z", phase: "succeeded" }),
     ]} />);
 
     expect(html.indexOf("newruntime")).toBeLessThan(html.indexOf("oldruntime"));
-    expect(html).toContain('<ul class="grid gap-4">');
-    expect(html).toContain("rounded-panel border bg-panel px-5 py-4 shadow-sm");
-    expect(html).toContain("status-badge-success");
-    expect(html).toContain("status-badge-error");
-    expect(html).toContain('<div class="mt-4"><dl');
-    expect(html).not.toContain("mt-5 inline-flex");
-    expect(html).not.toContain(">task-newer</p>");
-    expect(html).not.toContain(">task-older</p>");
-    expect(html).not.toContain("newruntime-0000");
-    expect(html).not.toContain("oldruntime-0000");
+    expect(html).toContain('aria-label="Runs"');
+    expect(html).toContain('class="overflow-x-auto rounded-panel border bg-panel"');
+    expect(html).toContain('role="table"');
+    expect(html).toContain('href="/runs/task-newer"');
+    expect(html).toContain('data-tone="ok"');
+    expect(html).toContain('data-tone="err"');
+    expect(html).toContain("task-newer");
+    expect(html).toContain("task-older");
+    expect(html).toContain("newruntime-0000-0000-0000-000000000000");
+    expect(html).toContain("oldruntime-0000-0000-0000-000000000000");
     expect(html).not.toContain("uppercase");
   });
 });

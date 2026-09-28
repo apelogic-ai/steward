@@ -2,17 +2,18 @@ import Link from "next/link";
 import type { ReactNode } from "react";
 
 import type { ResourceState } from "@/data/use-api-resource";
+import { StatusPill } from "@/components/hs/status-pill";
 
 export function PageHeader({ actions, description, title }: Readonly<{
   actions?: ReactNode;
   description: string;
-  title: string;
+  title: ReactNode;
 }>) {
   return (
     <header className="flex flex-wrap items-end justify-between gap-4">
-      <div className="max-w-3xl space-y-2">
-        <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl" id="page-title">{title}</h1>
-        <p className="text-base leading-7 text-muted-ink">{description}</p>
+      <div className="max-w-3xl">
+        <h1 className="text-[28px] font-semibold leading-[34px] tracking-[-0.02em]" id="page-title">{title}</h1>
+        <p className="mt-1.5 text-sm leading-5 text-muted-ink">{description}</p>
       </div>
       {actions}
     </header>
@@ -20,24 +21,11 @@ export function PageHeader({ actions, description, title }: Readonly<{
 }
 
 export function PrimaryLink({ children, href }: Readonly<{ children: ReactNode; href: string }>) {
-  return <Link className="inline-flex min-h-11 items-center rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white hover:bg-brand-strong" href={href}>{children}</Link>;
+  return <Link className="inline-flex h-10 items-center rounded-control bg-brand px-4 text-sm font-semibold text-on-brand hover:bg-brand-hover" href={href}>{children}</Link>;
 }
 
 export function StatusBadge({ value }: Readonly<{ value: string }>) {
-  const badgeClass = {
-    failed: "status-badge-error",
-    "credential expired": "status-badge-error",
-    reauth_required: "status-badge-error",
-    "expiring soon": "status-badge-warning",
-    connected: "status-badge-success",
-    provisioned: "status-badge-success",
-    succeeded: "status-badge-success",
-  }[value.toLowerCase()] ?? "bg-canvas text-muted-ink";
-  return (
-    <span className={`inline-flex w-fit shrink-0 self-start rounded-full border px-2.5 py-1 text-xs font-semibold capitalize ${badgeClass}`}>
-      {value.replaceAll("_", " ")}
-    </span>
-  );
+  return <StatusPill value={value} />;
 }
 
 export function EmptyState({ children, title }: Readonly<{ children?: ReactNode; title: string }>) {
@@ -55,11 +43,11 @@ export function ResourceBoundary<T>({ children, state }: Readonly<{
 }>) {
   if (state.status === "ready") return children(state.value);
   const messages = {
-    loading: ["Loading authoritative data", "Steward is reading the current server-owned record."],
+    loading: ["Loading authoritative data", "HyperShell is reading the current server-owned record."],
     "not-found": ["Not found", "The requested record does not exist in your server-authorized scope."],
     forbidden: ["Forbidden", "The Rust authorization boundary did not permit this request."],
     unavailable: ["Authoritative data unavailable", "The source of truth could not be reached. No placeholder data is shown."],
-    error: ["Data could not be accepted", "Steward received an unexpected response and has not inferred a successful state."],
+    error: ["Data could not be accepted", "HyperShell received an unexpected response and has not inferred a successful state."],
   } as const;
   const [title, detail] = messages[state.status];
   return <EmptyState title={title}><p role="status">{detail}</p></EmptyState>;

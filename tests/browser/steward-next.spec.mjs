@@ -218,11 +218,11 @@ const approval = {
 
 const presentationRoutes = [
   { path: "/envelopes", heading: "Envelopes", activeNavigation: "Envelopes" },
-  { path: "/envelopes/new", heading: "New envelope", activeNavigation: "Envelopes" },
-  { path: `/envelopes/${envelopeId}`, heading: "Envelope", activeNavigation: "Envelopes" },
+  { path: "/envelopes/new", heading: "Request an envelope", activeNavigation: "Envelopes" },
+  { path: `/envelopes/${envelopeId}`, heading: "developer", activeNavigation: "Envelopes" },
   { path: `/envelopes/${envelopeId}/runs`, heading: "Recent runs", activeNavigation: "Envelopes" },
   { path: "/runs", heading: "Runs", activeNavigation: "Runs" },
-  { path: `/runs/${taskUid}`, heading: "Run detail", activeNavigation: "Runs" },
+  { path: `/runs/${taskUid}`, heading: "repository-review@1", activeNavigation: "Runs" },
   { path: "/connections", heading: "Connections", activeNavigation: "Connections" },
   { path: "/settings", heading: "Settings", activeNavigation: "Settings" },
   { path: "/admin/envelopes/templates", heading: "Envelope templates", activeNavigation: "Templates" },
@@ -233,8 +233,9 @@ const presentationRoutes = [
   { path: "/admin/workflows/repository-review/versions/1", heading: "Workflow", activeNavigation: "Workflows" },
   { path: "/admin/workflows/repository-review/new-version", heading: "New repository-review version", activeNavigation: "Workflows" },
   { path: "/admin/runs", heading: "All runs", activeNavigation: "Runs" },
-  { path: `/admin/runs/${taskUid}`, heading: "Run detail", activeNavigation: "Runs" },
+  { path: `/admin/runs/${taskUid}`, heading: "repository-review@1", activeNavigation: "Runs" },
   { path: "/admin/approvals", heading: "Requests", activeNavigation: "Approvals" },
+  { path: `/admin/approvals/${unifiedEnvelopeRequest.id}`, heading: /Developer · above ceiling/i, activeNavigation: "Approvals" },
   { path: "/admin/settings", heading: "Settings", activeNavigation: "Settings" },
 ];
 
@@ -305,6 +306,7 @@ async function startWeb() {
         || requestUrl.pathname.endsWith("/versions")
         || requestUrl.pathname === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`
         || requestUrl.pathname === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/reject`
+        || requestUrl.pathname === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/file`
         || requestUrl.pathname === `/admin/api/v1/approvals/${approvalId}/approve`
         || requestUrl.pathname === `/admin/api/v1/approvals/${approvalId}/file`
         || requestUrl.pathname === "/app/api/v1/connections/github/start"
@@ -395,6 +397,11 @@ async function startWeb() {
           response.end(JSON.stringify({ apiVersion: "steward.envelope-requests/v1", workflow: { schemaVersion: "v2", contentType: "application/yaml", suggestedPath: ".github/workflows/steward-repository-review.yml", sha256: "abc123", yaml: ["name: Steward governed run", "on:", "  workflow_dispatch:", "jobs:", "  governed:", "    with:", "      workflow: repository-review@1", ""].join("\n") } }));
           return;
         }
+        if (requestUrl.pathname.endsWith("/file")) {
+          response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+          response.end(JSON.stringify({ apiVersion: "steward.browser-admin/v1", approvalId, decisionKey: "PROJ-123", evidenceUrl: "https://example.com/decisions/PROJ-123" }));
+          return;
+        }
         if (requestUrl.pathname.startsWith("/admin/api/v1/envelope-requests/")) {
           const provisioned = requestUrl.pathname.endsWith("/approve");
           response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
@@ -420,11 +427,6 @@ async function startWeb() {
         if (requestUrl.pathname.endsWith("/approve")) {
           response.writeHead(204, { "cache-control": "no-store" });
           response.end();
-          return;
-        }
-        if (requestUrl.pathname.endsWith("/file")) {
-          response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-          response.end(JSON.stringify({ apiVersion: "steward.browser-admin/v1", approvalId, decisionKey: "PROJ-123", evidenceUrl: "https://example.com/decisions/PROJ-123" }));
           return;
         }
         if (requestUrl.pathname.endsWith("/connections/github/start")) {
@@ -517,8 +519,10 @@ async function stopWeb(instance) {
 }
 
 async function guardedPage(browser, {
+  adminTemplateAutoProvisionThreshold = null,
   adminTemplateModels = adminEnvelope.spec.llms,
   adminTemplateTools = adminEnvelope.spec.tools,
+  adminPagination = false,
   legacyAdminTemplate = false,
   malformedAdminTemplate = false,
   mockSignIn = true,
@@ -531,6 +535,8 @@ async function guardedPage(browser, {
     stderr: { body: "agent stderr\n", status: 200 },
   },
   includeSampleWorkflow = false,
+  initialOnboardingDismissed = false,
+  initialWorkflowAcknowledged = false,
   onboardingPagination = false,
   mutationFailures = {},
   rerunResponses = [
@@ -707,7 +713,7 @@ async function guardedPage(browser, {
       ? { apiVersion: "steward.browser-admin/v1", memberRole }
       : legacyAdminTemplate
         ? { apiVersion: "steward.admin/v1", template: { id: memberRole, revision: 4, envelope } }
-        : { apiVersion: "steward.browser-admin/v1", id: memberRole, displayName: `${memberRole.charAt(0).toUpperCase()}${memberRole.slice(1)}`, memberRoles: [memberRole], envelope: {
+        : { apiVersion: "steward.browser-admin/v1", id: memberRole, displayName: `${memberRole.charAt(0).toUpperCase()}${memberRole.slice(1)}`, memberRoles: [memberRole], autoProvisionThreshold: adminTemplateAutoProvisionThreshold, envelope: {
           ...adminEnvelope,
           spec: { ...adminEnvelope.spec, llms: adminTemplateModels, tools: adminTemplateTools },
         } });
@@ -750,10 +756,26 @@ async function guardedPage(browser, {
     approvals: emptyCollections ? [] : [approval],
     envelopeRequests: emptyCollections ? [] : [pendingEnvelopeRequest],
   }));
-  await context.route(`${origin}/admin/api/v1/requests*`, (route) => json(route, {
+  await context.route(`${origin}/admin/api/v1/requests*`, (route) => {
+    if (adminPagination) {
+      const cursor = new URL(route.request().url()).searchParams.get("cursor");
+      return json(route, cursor
+        ? { apiVersion: "steward.browser-admin/v1", requests: [{ ...unifiedEnvelopeRequest, id: "00000000-0000-0000-0000-000000000008" }], nextCursor: null }
+        : { apiVersion: "steward.browser-admin/v1", requests: [unifiedRuntimeApproval], nextCursor: unifiedRuntimeApproval.id });
+    }
+    return json(route, {
+      apiVersion: "steward.browser-admin/v1",
+      requests: emptyCollections ? [] : [unifiedEnvelopeRequest, unifiedRuntimeApproval],
+      nextCursor: null,
+    });
+  });
+  await context.route(`${origin}/admin/api/v1/requests/${unifiedEnvelopeRequest.id}`, (route) => json(route, {
     apiVersion: "steward.browser-admin/v1",
-    requests: emptyCollections ? [] : [unifiedEnvelopeRequest, unifiedRuntimeApproval],
-    nextCursor: null,
+    request: unifiedEnvelopeRequest,
+  }));
+  await context.route(`${origin}/admin/api/v1/requests/${unifiedRuntimeApproval.id}`, (route) => json(route, {
+    apiVersion: "steward.browser-admin/v1",
+    request: unifiedRuntimeApproval,
   }));
   await context.route(`${origin}/admin/api/v1/requests/summary`, (route) => json(route, {
     apiVersion: "steward.browser-admin/v1",
@@ -783,10 +805,10 @@ async function guardedPage(browser, {
   }));
   let browserPreferences = {
     apiVersion: ["steward", "preferences/v1"].join("."),
-    onboardingDismissed: false,
+    onboardingDismissed: initialOnboardingDismissed,
     revision: 0,
     theme: null,
-    workflowAcknowledged: false,
+    workflowAcknowledged: initialWorkflowAcknowledged,
   };
   await context.route(`${origin}/app/api/v1/preferences`, async (route) => {
     if (route.request().method() === "PUT") {
@@ -873,50 +895,100 @@ test("Next pages carry one strict nonce and nested developer navigation", async 
     expect(scriptNonces.length).toBeGreaterThan(0);
     expect(scriptNonces.every((value) => value === nonce)).toBe(true);
 
-    await session.page.getByRole("button", { name: "Account menu" }).click();
-    await expect(session.page.getByRole("menu", { name: "Account" }).getByText("Alice Example", { exact: true })).toBeVisible();
-    await session.page.getByRole("button", { name: "Account menu" }).click();
-    await expect(session.page.getByRole("link", { name: "Envelopes", exact: true })).toHaveAttribute("aria-current", "page");
-    await session.page.getByRole("link", { name: "Runs", exact: true }).click();
+    const accountMenu = session.page.getByRole("button", { name: "Account menu" });
+    await expect(accountMenu.getByText("Alice Example", { exact: true })).toBeVisible();
+    await accountMenu.click();
+    await expect(session.page.getByRole("menu", { name: "Account" }).getByText("Mode", { exact: true })).toBeVisible();
+    await accountMenu.click();
+    const navigation = session.page.getByRole("navigation", { name: "Primary navigation" });
+    await expect(navigation.getByRole("link", { name: "Envelopes", exact: true })).toHaveAttribute("aria-current", "page");
+    await navigation.getByRole("link", { name: "Runs", exact: true }).click();
     await expect(session.page).toHaveURL(`${origin}/runs`);
-    await expect(session.page.getByRole("link", { name: "Runs", exact: true })).toHaveAttribute("aria-current", "page");
+    await expect(navigation.getByRole("link", { name: "Runs", exact: true })).toHaveAttribute("aria-current", "page");
   } finally {
     await closeGuardedPage(session);
   }
 });
 
-test("the shell carries the ApeLogic visual system from the db-mcp web app", async ({ browser }) => {
+test("the shell carries the HyperShell visual system", async ({ browser }) => {
   const session = await guardedPage(browser);
   try {
     await session.page.goto(`${origin}/envelopes`);
-    await expect(session.page.getByRole("img", { name: "ApeLogic" })).toHaveAttribute("src", "/icon.svg");
-    await expect(session.page.getByRole("link", { name: /ApeLogic Steward/ })).toHaveAttribute("href", "/envelopes");
-    await expect(session.page.locator("link[rel='icon'][href*='favicon.ico']")).toHaveCount(1);
-    const favicon = await session.page.request.get(`${origin}/favicon.ico`);
+    await expect(session.page.getByRole("img", { name: "HyperShell" })).toHaveAttribute("src", "/brand/logo");
+    await expect(session.page.getByRole("link", { name: "HyperShell home" })).toHaveAttribute("href", "/envelopes");
+    await expect(session.page.locator("link[rel='icon'][href*='/brand/logo']")).toHaveCount(1);
+    const favicon = await session.page.request.get(`${origin}/brand/logo`);
     expect(favicon.status()).toBe(200);
-    expect(favicon.headers()["content-type"]).toContain("image/x-icon");
+    expect(favicon.headers()["content-type"]).toContain("image/jpeg");
 
     const brand = await session.page.evaluate(() => {
       const body = getComputedStyle(document.body);
-      const header = getComputedStyle(document.querySelector("body > div > header"));
+      const sidebar = getComputedStyle(document.querySelector("aside"));
       const primary = getComputedStyle(document.querySelector("a[href='/envelopes/new']"));
       return {
         background: body.backgroundColor,
         foreground: body.color,
         font: body.fontFamily,
-        headerBorder: header.borderBottomColor,
+        sidebarBorder: sidebar.borderRightColor,
         primary: primary.backgroundColor,
       };
     });
     expect(brand).toEqual({
-      background: "rgb(18, 18, 18)",
-      foreground: "rgb(250, 250, 250)",
+      background: "rgb(21, 23, 24)",
+      foreground: "rgb(236, 238, 239)",
       font: expect.stringContaining("Space Grotesk"),
-      headerBorder: "rgb(46, 46, 46)",
-      primary: "rgb(239, 134, 38)",
+      sidebarBorder: "rgb(47, 52, 55)",
+      primary: "rgb(251, 81, 8)",
     });
+    await expect(session.page.getByRole("link", { name: "HyperShell home" })).toHaveCSS("color", "rgb(236, 238, 239)");
+    await expect(session.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Runs", exact: true })).toHaveCSS("color", "rgb(162, 168, 171)");
   } finally {
     await closeGuardedPage(session);
+  }
+});
+
+test("the HyperShell handoff structure is preserved on primary workspaces", async ({ browser }) => {
+  const developer = await guardedPage(browser, { colorScheme: "light", includeSampleWorkflow: true });
+  try {
+    await developer.page.goto(`${origin}/envelopes`);
+    await expect(developer.page.getByText("Budget, models and tools your agents are allowed to use.")).toBeVisible();
+    for (const label of ["All", "Provisioned", "Pending", "Rejected"]) {
+      await expect(developer.page.getByRole("tab", { name: new RegExp(`^${label}\\s+\\d+$`) })).toBeVisible();
+    }
+    for (const label of ["Template", "Status", "Spend this month", "Per run", "TTL", "Tools"]) {
+      await expect(developer.page.getByRole("columnheader", { name: label })).toBeVisible();
+    }
+
+    await developer.page.goto(`${origin}/runs`);
+    await expect(developer.page.getByText("Agent runs executed under your envelopes.")).toBeVisible();
+    for (const label of ["All", "Running", "Queued", "Parked", "Succeeded", "Failed"]) {
+      await expect(developer.page.getByRole("button", { name: new RegExp(`^${label}\\s+\\d+$`) })).toBeVisible();
+    }
+
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByRole("heading", { name: "repository-review@1", exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("navigation", { name: "Run jobs" })).toBeVisible();
+    await expect(developer.page.getByText("Sensitivity notice", { exact: true })).toBeVisible();
+
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.getByText("Five steps to your first governed agent run. An envelope is the budget, models and tools an agent may use; the workflow runs your agent inside it.")).toBeVisible();
+    for (const title of ["Connect GitHub", "Get your first envelope", "Add the workflow to your repository", "Trigger a test run", "See the result"]) {
+      await expect(developer.page.getByRole("button", { name: new RegExp(title) })).toBeVisible();
+    }
+  } finally {
+    await closeGuardedPage(developer);
+  }
+
+  const administrator = await guardedPage(browser, { colorScheme: "light", session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/approvals`);
+    await expect(administrator.page.getByText(/Requests above a template’s auto-approval threshold/)).toBeVisible();
+    await expect(administrator.page.getByRole("table", { name: "Requests" })).toBeVisible();
+    await administrator.page.getByRole("link", { name: /Developer/ }).click();
+    await expect(administrator.page).toHaveURL(`${origin}/admin/approvals/${unifiedEnvelopeRequest.id}`);
+    await expect(administrator.page.getByRole("heading", { name: /Developer · above ceiling/i })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
   }
 });
 
@@ -982,24 +1054,19 @@ test("the account menu identifies the user and exposes only server-authorized wo
   try {
     await developer.page.goto(`${origin}/envelopes`);
     const accountButton = developer.page.getByRole("button", { name: "Account menu" });
-    await expect(accountButton).toHaveText("A");
-    const accountButtonBox = await accountButton.boundingBox();
-    expect(accountButtonBox?.width).toBe(accountButtonBox?.height);
-    expect(accountButtonBox?.width ?? 0).toBeGreaterThanOrEqual(40);
+    await expect(accountButton.getByText("Alice Example", { exact: true })).toBeVisible();
+    await expect(accountButton.getByText("alice@example.com", { exact: true })).toBeVisible();
     await accountButton.click();
     const account = developer.page.getByRole("menu", { name: "Account" });
-    await expect(account.getByText("Alice Example", { exact: true })).toBeVisible();
-    await expect(account.getByText("alice@example.com", { exact: true })).toBeVisible();
     await expect(account.getByLabel("Workspace view")).toHaveCount(0);
     await expect(account.getByText("Mode", { exact: true })).toBeVisible();
     await expect(account.getByText("APPEARANCE", { exact: true })).toHaveCount(0);
-    await account.getByRole("button", { name: "Switch to dark mode" }).click();
+    await account.getByRole("button", { name: "dark", exact: true }).click();
     await expect(developer.page.locator("html")).toHaveAttribute("data-theme", "dark");
-    await expect(account.getByRole("button", { name: "Switch to light mode" })).toBeVisible();
+    await expect(account.getByRole("button", { name: "light", exact: true })).toBeVisible();
 
     const logoutButton = account.getByRole("button", { name: "Log out" });
-    await expect(logoutButton).toHaveCSS("background-color", "rgb(239, 134, 38)");
-    await expect(logoutButton.locator("xpath=..")).toHaveCSS("border-top-style", "solid");
+    await expect(logoutButton).toHaveCSS("color", "rgb(255, 139, 125)");
     await logoutButton.click();
     await expect(developer.page).toHaveURL(`${origin}/admin/sign-in`);
     await expect(developer.page.getByRole("heading", { name: "Signed out" })).toBeVisible();
@@ -1013,23 +1080,15 @@ test("the account menu identifies the user and exposes only server-authorized wo
   const dualRole = await guardedPage(browser, { session: administratorSession });
   try {
     await dualRole.page.goto(`${origin}/envelopes`);
-    await dualRole.page.getByRole("button", { name: "Account menu" }).click();
-    const account = dualRole.page.getByRole("menu", { name: "Account" });
-    const workspace = account.getByLabel("Workspace view");
-    await expect(workspace).toHaveValue("user");
-    await expect(workspace.locator("option")).toHaveText(["User", "Admin"]);
-    await expect(workspace.locator("xpath=..")).toHaveCSS("border-top-style", "solid");
-    await workspace.selectOption("admin");
+    const workspace = dualRole.page.getByRole("group", { name: "Workspace view" });
+    await expect(workspace.getByRole("button", { name: "user", exact: true })).toHaveAttribute("aria-pressed", "true");
+    await workspace.getByRole("button", { name: "admin", exact: true }).click();
     await expect(dualRole.page).toHaveURL(`${origin}/admin/envelopes/templates`);
-    await dualRole.page.getByRole("button", { name: "Account menu" }).click();
-    await expect(dualRole.page.getByRole("menu", { name: "Account" }).getByLabel("Workspace view")).toHaveValue("admin");
-    await expect(dualRole.page.getByRole("link", { name: "Templates", exact: true })).toHaveAttribute("aria-current", "page");
-    await dualRole.page.getByRole("button", { name: "Account menu" }).click();
+    await expect(dualRole.page.getByRole("group", { name: "Workspace view" }).getByRole("button", { name: "admin", exact: true })).toHaveAttribute("aria-pressed", "true");
+    await expect(dualRole.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Templates", exact: true })).toHaveAttribute("aria-current", "page");
     await dualRole.page.goBack();
     await expect(dualRole.page).toHaveURL(`${origin}/envelopes`);
-    await dualRole.page.getByRole("button", { name: "Account menu" }).click();
-    await expect(dualRole.page.getByRole("menu", { name: "Account" }).getByLabel("Workspace view")).toHaveValue("user");
-    await dualRole.page.getByRole("button", { name: "Account menu" }).click();
+    await expect(dualRole.page.getByRole("group", { name: "Workspace view" }).getByRole("button", { name: "user", exact: true })).toHaveAttribute("aria-pressed", "true");
     await dualRole.page.goForward();
     await expect(dualRole.page).toHaveURL(`${origin}/admin/envelopes/templates`);
   } finally {
@@ -1075,8 +1134,7 @@ test("a rolling local session contract falls back to the authenticated email wit
   const session = await guardedPage(browser, { session: previousSessionContract });
   try {
     await session.page.goto(`${origin}/envelopes`);
-    await session.page.getByRole("button", { name: "Account menu" }).click();
-    const email = session.page.getByRole("menu", { name: "Account" }).getByText("alice@example.com", { exact: true });
+    const email = session.page.getByRole("button", { name: "Account menu" }).locator(".text-muted-ink");
     await expect(email).toBeVisible();
     await expect(email).toHaveCSS("font-weight", "400");
   } finally {
@@ -1091,9 +1149,10 @@ test("every presentation route remains navigable at a narrow viewport", async ({
       await test.step(route.path, async () => {
         await session.page.goto(`${origin}${route.path}`);
         await expect(session.page.getByRole("heading", { name: route.heading, exact: true }).first()).toBeVisible();
-        const activeLink = route.activeNavigation === "Approvals"
-          ? session.page.getByRole("link", { name: /^Approvals/ })
-          : session.page.getByRole("link", { name: route.activeNavigation, exact: true });
+        await session.page.getByRole("button", { name: "Open navigation" }).click();
+        const navigation = session.page.getByRole("navigation", { name: "Primary navigation" });
+        const activeLabel = route.activeNavigation === "Approvals" ? "Requests" : route.activeNavigation === "Provision" ? "Templates" : route.activeNavigation;
+        const activeLink = navigation.getByRole("link", { name: activeLabel, exact: true });
         await expect(activeLink).toHaveAttribute("aria-current", "page");
         const dimensions = await session.page.evaluate(() => ({
           clientWidth: document.documentElement.clientWidth,
@@ -1121,26 +1180,24 @@ test("page headers omit superheaders across user and administrator workspaces", 
   }
 });
 
-test("empty entity collections show only No data", async ({ browser }) => {
+test("empty entity collections show contextual product copy", async ({ browser }) => {
   const session = await guardedPage(browser, { emptyCollections: true, session: administratorSession });
   try {
-    for (const path of [
-      "/envelopes",
-      `/envelopes/${envelopeId}/runs`,
-      "/runs",
-      `/runs/${taskUid}`,
-      "/admin/runs",
-      `/admin/runs/${taskUid}`,
-      "/admin/envelopes/templates",
-      "/admin/envelopes/provision",
-      "/admin/workflows",
-      "/admin/approvals",
+    for (const [path, copy] of [
+      ["/envelopes", "No envelopes yet."],
+      [`/envelopes/${envelopeId}/runs`, "No runs yet."],
+      ["/runs", "No runs yet."],
+      [`/runs/${taskUid}`, "No steps reported"],
+      ["/admin/runs", "No runs yet."],
+      [`/admin/runs/${taskUid}`, "No steps reported"],
+      ["/admin/envelopes/templates", "No templates yet."],
+      ["/admin/envelopes/provision", "No templates"],
+      ["/admin/workflows", "No workflows yet"],
+      ["/admin/approvals", "Nothing needs action."],
     ]) {
       await test.step(path, async () => {
         await session.page.goto(`${origin}${path}`);
-        const emptyState = session.page.getByRole("heading", { name: "No data", exact: true });
-        await expect(emptyState).toBeVisible();
-        expect(await emptyState.locator("..").innerText()).toBe("No data");
+        await expect(session.page.getByText(copy, { exact: true }).first()).toBeVisible();
       });
     }
   } finally {
@@ -1152,8 +1209,8 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
   const developer = await guardedPage(browser);
   try {
     await developer.page.goto(`${origin}/envelopes`);
-    await expect(developer.page.getByRole("heading", { name: "developer" })).toBeVisible();
-    await expect(developer.page.getByText("25.00 USD")).toBeVisible();
+    await expect(developer.page.getByRole("link", { name: /Developer/ })).toBeVisible();
+    await expect(developer.page.getByText("5.00 USD")).toBeVisible();
 
     await developer.page.goto(`${origin}/envelopes/new`);
     const template = developer.page.locator("label").filter({ hasText: /^Template/ }).locator("select");
@@ -1166,10 +1223,8 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await expect(developer.page.getByLabel("Time to live")).toHaveValue("4h");
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
-    const provisioned = developer.page.getByRole("article").getByText("provisioned", { exact: true });
-    await expect(provisioned).toHaveCSS("background-color", "rgb(18, 53, 36)");
-    await expect(provisioned).toHaveCSS("border-color", "rgb(47, 128, 85)");
-    await expect(provisioned).toHaveCSS("color", "rgb(134, 239, 172)");
+    const provisioned = developer.page.locator("#page-title").getByText("provisioned", { exact: true });
+    await expect(provisioned).toHaveAttribute("data-tone", "ok");
     const envelopeMutation = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/envelope-requests");
     expectMutationProof(envelopeMutation);
     expect(envelopeMutation.body.requestedEnvelope.spec.budget.singleRunLimit).toBe("5.00");
@@ -1193,18 +1248,18 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await developer.page.goto(`${origin}/runs/${taskUid}`);
     await expect(developer.page.getByRole("heading", { name: "repository-review@1" })).toBeVisible();
     await expect(developer.page.getByText("1.25 USD")).toBeVisible();
-    await expect(developer.page.getByRole("heading", { name: "Timeline" })).toBeVisible();
+    await expect(developer.page.getByRole("navigation", { name: "Run jobs" })).toBeVisible();
 
     await developer.page.goto(`${origin}/connections`);
     await expect(developer.page.getByRole("heading", { name: "GitHub" })).toBeVisible();
     await expect(developer.page.getByText("alice@example.com").last()).toBeVisible();
-    await developer.page.getByRole("checkbox", { name: "I understand this revokes the shared Steward connection." }).check();
+    await developer.page.getByRole("button", { name: "Disconnect…" }).click();
     await developer.page.getByRole("button", { name: "Disconnect GitHub" }).click();
     await expect.poll(() => developer.mutations.some((mutation) => mutation.path.endsWith("/disconnect"))).toBe(true);
     expectMutationProof(developer.mutations.find((mutation) => mutation.path.endsWith("/disconnect")));
 
     await developer.page.goto(`${origin}/settings`);
-    await expect(developer.page.getByRole("heading", { name: "Server-owned session" })).toBeVisible();
+    await expect(developer.page.getByRole("heading", { name: /Alice Example/ })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -1215,7 +1270,7 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await expect(administrator.page.getByRole("heading", { name: "All runs" })).toBeVisible();
     await expect(administrator.page.getByText("repository-review@1")).toBeVisible();
     await administrator.page.goto(`${origin}/admin/runs/${taskUid}`);
-    await expect(administrator.page.getByRole("heading", { name: "Timeline" })).toBeVisible();
+    await expect(administrator.page.getByRole("navigation", { name: "Run jobs" })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1300,13 +1355,13 @@ test("onboarding persists workflow acknowledgement and ignores unrelated runs", 
   const developer = await guardedPage(browser, { includeSampleWorkflow: true });
   try {
     await developer.page.goto(`${origin}/get-started`);
-    const workflowStep = developer.page.getByRole("listitem").filter({ hasText: "3. Add the generated workflow" });
-    const runStep = developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" });
-    await expect(workflowStep.getByText("pending", { exact: true })).toBeVisible();
-    await expect(runStep.getByText("pending", { exact: true })).toBeVisible();
+    const workflowStep = developer.page.getByRole("listitem").filter({ hasText: "Add the workflow to your repository" });
+    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" });
+    await expect(workflowStep.getByText("Copy a read-only sample workflow into a repository", { exact: true })).toBeVisible();
+    await expect(runStep.getByText("Run the sample from GitHub", { exact: true })).toBeVisible();
 
-    await developer.page.getByRole("button", { name: "I added the sample workflow" }).click();
-    await expect(workflowStep.getByText("done", { exact: true })).toBeVisible();
+    await developer.page.getByRole("button", { name: "I've committed it" }).click();
+    await expect(workflowStep.getByText("Done", { exact: true })).toBeVisible();
     const acknowledgement = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/preferences");
     expect(acknowledgement, "expected the durable preference mutation").toBeTruthy();
     expect(acknowledgement.headers["x-steward-csrf"]).toBe("test-csrf");
@@ -1315,8 +1370,56 @@ test("onboarding persists workflow acknowledgement and ignores unrelated runs", 
     expect(acknowledgement.body).toEqual({ workflowAcknowledged: true });
 
     await developer.page.reload();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "3. Add the generated workflow" }).getByText("done", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" }).getByText("pending", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Add the workflow to your repository" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" }).getByText("Run the sample from GitHub", { exact: true })).toBeVisible();
+
+    await developer.page.getByRole("button", { name: /Hide this guide/ }).click();
+    await expect(developer.page.getByText("The onboarding guide is hidden. Your progress is preserved.")).toBeVisible();
+    await expect(developer.page.getByRole("link", { name: "Get started" })).toHaveCount(0);
+    const dismissal = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
+    expect(dismissal.body).toEqual({ onboardingDismissed: true });
+
+    await developer.page.getByRole("button", { name: "Show guide again" }).click();
+    await expect(developer.page.getByRole("heading", { name: "Get started" })).toBeVisible();
+    await expect(developer.page.getByRole("link", { name: "Get started" })).toBeVisible();
+    const restored = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
+    expect(restored.body).toEqual({ onboardingDismissed: false });
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("onboarding navigation shows progress and disappears when all five steps are complete", async ({ browser }) => {
+  const inProgress = await guardedPage(browser, { includeSampleWorkflow: true });
+  try {
+    await inProgress.page.goto(`${origin}/envelopes`);
+    await expect(inProgress.page.getByRole("link", { name: /Get started/ })).toContainText("2/5");
+  } finally {
+    await closeGuardedPage(inProgress);
+  }
+
+  const complete = await guardedPage(browser, {
+    includeSampleWorkflow: true,
+    initialWorkflowAcknowledged: true,
+    onboardingPagination: true,
+  });
+  try {
+    await complete.page.goto(`${origin}/envelopes`);
+    await expect(complete.page.getByRole("link", { name: /Get started/ })).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(complete);
+  }
+});
+
+test("onboarding lets the user choose which first envelope template to request", async ({ browser }) => {
+  const developer = await guardedPage(browser, { includeSampleWorkflow: true });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    const step = developer.page.getByRole("listitem").filter({ hasText: "Get your first envelope" });
+    await step.getByRole("button", { name: /Get your first envelope/ }).click();
+    await step.getByRole("button", { name: /Developer/ }).click();
+    await expect(step.getByRole("link", { name: "Request Developer envelope" })).toBeVisible();
+    await expect(step).toContainText("Requests within a template's ceiling are approved and provisioned right away.");
   } finally {
     await closeGuardedPage(developer);
   }
@@ -1327,7 +1430,7 @@ test("onboarding cannot acknowledge an absent sample", async ({ browser }) => {
   try {
     await developer.page.goto(`${origin}/get-started`);
     await expect(developer.page.getByText("The deployment has no executable onboarding sample.")).toBeVisible();
-    await expect(developer.page.getByRole("button", { name: "I added the sample workflow" })).toHaveCount(0);
+    await expect(developer.page.getByRole("button", { name: "I've committed it" })).toBeDisabled();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -1340,11 +1443,34 @@ test("onboarding follows paginated envelope and run evidence", async ({ browser 
   });
   try {
     await developer.page.goto(`${origin}/get-started`);
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "2. Provision an envelope" }).getByText("done", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "4. Run the test workflow" }).getByText("done", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "5. Inspect the governed run" }).getByText("done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Get your first envelope" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "See the result" }).getByText("Done", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
+  }
+});
+
+test("entity lists follow every authoritative cursor", async ({ browser }) => {
+  const developer = await guardedPage(browser, { onboardingPagination: true });
+  try {
+    await developer.page.goto(`${origin}/envelopes`);
+    await expect(developer.page.getByText("00000000-0000-0000-0000-000000000006", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText(envelopeRequest.id, { exact: true })).toBeVisible();
+    await developer.page.goto(`${origin}/runs`);
+    await expect(developer.page.getByText(taskUid, { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("00000000-0000-0000-0000-000000000007", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+
+  const administrator = await guardedPage(browser, { adminPagination: true, session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/approvals`);
+    await expect(administrator.page.getByText(unifiedRuntimeApproval.id, { exact: true })).toBeVisible();
+    await expect(administrator.page.getByText("00000000-0000-0000-0000-000000000008", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
   }
 });
 
@@ -1396,11 +1522,10 @@ test("failed run phases expose stdout and stderr as escaped sensitive output", a
   try {
     await developer.context.addCookies([{ name: "execution-log-session", value: "present", url: origin }]);
     await developer.page.goto(`${origin}/runs/${taskUid}`);
-    const failedPhase = developer.page.locator("li").filter({ has: developer.page.getByText("failed", { exact: true }) });
-    const stdoutLink = failedPhase.getByRole("link", { name: "View stdout" });
-    const stderrLink = failedPhase.getByRole("link", { name: "View stderr" });
+    await developer.page.getByRole("button", { name: /Agent execution/ }).click();
+    await developer.page.getByText("Execution", { exact: true }).click();
+    const stdoutLink = developer.page.getByRole("link", { name: "Open full page" });
     await expect(stdoutLink).toHaveAttribute("href", `/runs/${taskUid}/logs/stdout`);
-    await expect(stderrLink).toHaveAttribute("href", `/runs/${taskUid}/logs/stderr`);
 
     await stdoutLink.click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}/logs/stdout`);
@@ -1412,15 +1537,21 @@ test("failed run phases expose stdout and stderr as escaped sensitive output", a
 
     await developer.page.getByRole("link", { name: "Back to run" }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
-    await developer.page.getByRole("link", { name: "View stderr" }).click();
+    await developer.page.getByRole("button", { name: /Agent execution/ }).click();
+    await developer.page.getByText("Execution", { exact: true }).click();
+    await developer.page.getByRole("tab", { name: "stderr" }).click();
+    const stderrLink = developer.page.getByRole("link", { name: "Open full page" });
+    await expect(stderrLink).toHaveAttribute("href", `/runs/${taskUid}/logs/stderr`);
+    await stderrLink.click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}/logs/stderr`);
     await expect(viewer.getByRole("heading", { name: "stderr log" })).toBeVisible();
     await expect(viewer.locator("pre")).toHaveText("tool call failed: example\n");
 
-    expect(developer.executionLogRequests.map((request) => new URL(request.url()).pathname)).toEqual([
+    const requestedStreams = new Set(developer.executionLogRequests.map((request) => new URL(request.url()).pathname));
+    expect(requestedStreams).toEqual(new Set([
       `/app/api/v1/runs/${taskUid}/logs/stdout`,
       `/app/api/v1/runs/${taskUid}/logs/stderr`,
-    ]);
+    ]));
     for (const request of developer.executionLogRequests) {
       expect(new URL(request.url()).origin).toBe(origin);
       expect(request.headers().accept).toBe("application/json");
@@ -1443,14 +1574,15 @@ test("administrator run logs use the administrator boundary and report unavailab
   });
   try {
     await administrator.page.goto(`${origin}/admin/runs/${taskUid}`);
-    const succeededPhase = administrator.page.locator("li").filter({ has: administrator.page.getByText("succeeded", { exact: true }) });
-    await succeededPhase.getByRole("link", { name: "View stderr" }).click();
+    await administrator.page.getByRole("button", { name: /Agent execution/ }).click();
+    await administrator.page.getByText("Execution", { exact: true }).click();
+    await administrator.page.getByRole("tab", { name: "stderr" }).click();
+    await administrator.page.getByRole("link", { name: "Open full page" }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/runs/${taskUid}/logs/stderr`);
     await expect(administrator.page.getByRole("status")).toHaveText("stderr log is unavailable for this run.");
-    expect(administrator.executionLogRequests).toHaveLength(1);
-    expect(new URL(administrator.executionLogRequests[0].url()).pathname).toBe(
-      `/admin/api/v1/all-runs/${taskUid}/logs/stderr`,
-    );
+    const requestedPaths = administrator.executionLogRequests.map((request) => new URL(request.url()).pathname);
+    expect(requestedPaths).toContain(`/admin/api/v1/all-runs/${taskUid}/logs/stderr`);
+    expect(requestedPaths.every((path) => path.startsWith(`/admin/api/v1/all-runs/${taskUid}/logs/`))).toBe(true);
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1508,46 +1640,23 @@ test("administrator templates and approvals use typed browser authority", async 
     await administrator.page.getByRole("link", { name: /Analyst/ }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/envelopes/templates/analyst`);
     await expect(administrator.page.getByText("Current revision 4")).toBeVisible();
-    const limitType = administrator.page.getByRole("combobox", { name: "Limit type" });
-    const limitAmount = administrator.page.getByRole("textbox", { name: "Limit amount (USD)" });
-    await expect(limitType.locator("option")).toHaveText(["Single run", "Monthly"]);
-    await expect(limitAmount).toHaveValue("2.50");
-    await limitType.selectOption("monthly");
-    await expect(limitAmount).toHaveValue("25.00");
-    await limitAmount.fill("30.00");
-    await limitType.selectOption("singleRun");
-    await limitAmount.fill("3.00");
+    await expect(administrator.page.getByRole("combobox", { name: "Limit type" })).toHaveCount(0);
+    await expect(administrator.page.getByRole("textbox", { name: "Per run (USD)" })).toHaveValue("2.50");
+    await expect(administrator.page.getByRole("textbox", { name: "Monthly (USD)" })).toHaveValue("25.00");
+    await administrator.page.getByRole("textbox", { name: "Monthly (USD)" }).fill("30.00");
+    await administrator.page.getByRole("textbox", { name: "Per run (USD)" }).fill("3.00");
     await expect(administrator.page.getByRole("textbox", { name: "TTL" })).toHaveValue("4h");
-    await expect(administrator.page.getByRole("combobox", { name: "Currency" })).toHaveValue("USD");
-    await expect(administrator.page.getByRole("combobox", { name: "Currency" }).locator("option")).toHaveText(["USD"]);
-    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["provider-a/model-a"]);
-    const model = administrator.page.getByRole("combobox", { name: "Model" });
-    await expect(model).toHaveValue(JSON.stringify(["provider-a", "model-a"]));
-    await expect(model.locator("option")).toHaveText([
-      "provider-a/model-a",
-      "provider-b/model-b",
-    ]);
-    await expect(model.locator("option").nth(0)).toBeEnabled();
-    await expect(model.locator("option").nth(1)).toBeEnabled();
-    await expect(model.locator("option", { hasText: "openai/gpt-5.4" })).toHaveCount(0);
-    await model.selectOption(JSON.stringify(["provider-b", "model-b"]));
-    await administrator.page.getByRole("button", { name: "Add model" }).click();
-    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText([
-      "provider-a/model-a",
-      "provider-b/model-b",
-    ]);
+    const model = administrator.page.getByRole("combobox", { name: "Models" });
+    await expect(model).toBeVisible();
+    await expect(administrator.page.getByText("provider-a/model-a", { exact: true })).toBeVisible();
+    await model.fill("provider-b/model-b");
+    await model.press("Enter");
+    await expect(administrator.page.getByText("provider-b/model-b", { exact: true })).toBeVisible();
 
-    const toolProvider = administrator.page.getByRole("combobox", { name: "Tool provider" });
-    await expect(toolProvider).toHaveValue("github");
-    await expect(toolProvider.locator("option")).toHaveText(["GitHub"]);
-
-    const tool = administrator.page.getByRole("combobox", { exact: true, name: "Tool" });
-    await expect(tool).toHaveValue(JSON.stringify(["github", "repository", "get_file_contents"]));
-    await expect(tool.locator("option")).toHaveText(["repository:get_file_contents"]);
-    await expect(tool.locator("option").nth(0)).toBeEnabled();
-    await expect(administrator.page.getByRole("button", { name: "Add tool" })).toBeDisabled();
-    const advanced = administrator.page.getByText("Advanced", { exact: true }).locator("..");
-    await expect(advanced).not.toHaveAttribute("open", "");
+    const tool = administrator.page.getByRole("combobox", { name: "Tools" });
+    await expect(tool).toBeVisible();
+    await expect(administrator.page.getByText("repository:get_file_contents", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByRole("heading", { name: "Runner" })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByText("Template revision accepted by the Rust authority.")).toBeVisible();
     await expect(administrator.page.getByText("Current revision 5")).toBeVisible();
@@ -1562,6 +1671,7 @@ test("administrator templates and approvals use typed browser authority", async 
       singleRunLimit: "3.00",
     });
     expect(templateMutation.body.envelope.spec.llms).toEqual(capabilityCatalog.models);
+    expect(templateMutation.body.autoProvisionThreshold).toBeNull();
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("reviewer");
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
     await expect.poll(() => administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/reviewer")).toBe(true);
@@ -1570,44 +1680,76 @@ test("administrator templates and approvals use typed browser authority", async 
     expect(copiedTemplate.body.envelope.revision).toBe(1);
 
     await administrator.page.goto(`${origin}/admin/envelopes/templates/new`);
-    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["provider-a/model-a"]);
-    await expect(administrator.page.getByRole("combobox", { name: "Model" }).locator("option")).toHaveText([
-      "provider-a/model-a",
-      "provider-b/model-b",
-    ]);
+    const createModels = administrator.page.getByRole("combobox", { name: "Models" });
+    await expect(administrator.page.getByText("provider-a/model-a", { exact: true })).toBeVisible();
+    await createModels.focus();
+    await expect(administrator.page.getByRole("option", { name: "provider-b/model-b" })).toBeVisible();
+    await createModels.press("Enter");
+    await expect(administrator.page.getByText("provider-b/model-b", { exact: true })).toBeVisible();
 
     await administrator.page.goto(`${origin}/admin/approvals`);
     await expect(administrator.page.getByRole("heading", { name: "Requests" })).toBeVisible();
-    const envelopeRequestCard = administrator.page.getByRole("listitem").filter({
-      has: administrator.page.getByText(pendingEnvelopeRequest.requestId, { exact: true }),
-    });
-    await expect(envelopeRequestCard).toBeVisible();
+    await administrator.page.getByRole("link").filter({ hasText: pendingEnvelopeRequest.requestId }).click();
+    await expect(administrator.page).toHaveURL(`${origin}/admin/approvals/${pendingEnvelopeRequest.requestId}`);
+    const envelopeRequestCard = administrator.page.locator("main");
     await expect(envelopeRequestCard.getByText("alice@example.com")).toBeVisible();
-    await expect(envelopeRequestCard.getByText("envelope_request", { exact: true })).toBeVisible();
-    await expect(envelopeRequestCard.getByRole("heading", { name: "Requested changes" })).toBeVisible();
-    await expect(envelopeRequestCard.getByRole("button", { name: "Reject request" })).toBeVisible();
+    await expect(envelopeRequestCard.getByRole("heading", { name: "Requested vs template ceiling" })).toBeVisible();
+    await expect(envelopeRequestCard.getByRole("button", { name: "Reject" })).toBeDisabled();
+    await envelopeRequestCard.getByRole("button", { name: "File reference" }).click();
     await envelopeRequestCard.getByLabel("Rationale", { exact: true }).fill("Approved for the requested bounded envelope.");
-    await envelopeRequestCard.getByRole("button", { name: "Approve", exact: true }).click();
+    await envelopeRequestCard.getByRole("button", { name: "Approve exception" }).click();
     await expect(envelopeRequestCard.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
     const envelopeApprovalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`);
     expectMutationProof(envelopeApprovalMutation);
     expect(envelopeApprovalMutation.body.rationale).toBe("Approved for the requested bounded envelope.");
-    const runtimeApprovalCard = administrator.page.getByRole("listitem").filter({
-      has: administrator.page.getByText(approvalId, { exact: true }),
-    });
-    await runtimeApprovalCard.getByRole("button", { name: "File decision reference" }).click();
+    await administrator.page.getByRole("link", { name: "Back to requests" }).click();
+    await administrator.page.getByRole("link").filter({ hasText: approvalId }).click();
+    const runtimeApprovalCard = administrator.page.locator("main");
+    await runtimeApprovalCard.getByRole("button", { name: "File reference" }).click();
     await expect(runtimeApprovalCard.getByText("Decision reference filed through the server-owned channel.")).toBeVisible();
     expectMutationProof(administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/approvals/${approvalId}/file`));
     await runtimeApprovalCard.getByLabel("Rationale", { exact: true }).fill("Approved for one bounded investigation.");
     await runtimeApprovalCard.getByLabel("Expires at (RFC 3339)").fill("2026-08-25T17:00:00Z");
-    await runtimeApprovalCard.getByRole("button", { name: "Approve", exact: true }).click();
+    await runtimeApprovalCard.getByRole("button", { name: "Approve exception" }).click();
     await expect(runtimeApprovalCard.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
     const approvalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/approvals/${approvalId}/approve`);
     expectMutationProof(approvalMutation);
     expect(approvalMutation.body.evidenceUrl).toBe("https://example.com/decisions/PROJ-123");
 
     await administrator.page.goto(`${origin}/admin/settings`);
-    await expect(administrator.page.getByRole("heading", { name: "Administrator session" })).toBeVisible();
+    await expect(administrator.page.getByRole("heading", { name: /Alice Example/ })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator preserves a narrower auto-provision threshold when revising a template", async ({ browser }) => {
+  const threshold = {
+    ...adminEnvelope,
+    spec: {
+      ...adminEnvelope.spec,
+      budget: {
+        ...adminEnvelope.spec.budget,
+        monthlyLimit: "10.00",
+        singleRunLimit: "1.00",
+      },
+    },
+  };
+  const administrator = await guardedPage(browser, {
+    adminTemplateAutoProvisionThreshold: threshold,
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    const autoApproveToCeiling = administrator.page.getByRole("checkbox", { name: "Auto-approve every request within the ceiling" });
+    await expect(autoApproveToCeiling).not.toBeChecked();
+    await expect(administrator.page.getByRole("textbox", { name: "Auto-approve up to (complete envelope JSON)" })).toHaveValue(JSON.stringify(threshold, null, 2));
+
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
+    const mutation = administrator.mutations.find((item) => item.path === "/admin/api/v1/envelope-templates/analyst");
+    expectMutationProof(mutation);
+    expect(mutation.body.autoProvisionThreshold).toEqual(threshold);
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1620,12 +1762,9 @@ test("administrator template model controls fail closed when the capability cata
   });
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
-    const model = administrator.page.getByRole("combobox", { name: "Model" });
+    const model = administrator.page.getByRole("combobox", { name: "Models" });
     await expect(model).toBeDisabled();
-    await expect(model.locator("option")).toHaveText(["No models available"]);
-    await expect(administrator.page.getByRole("button", { name: "Add model" })).toBeDisabled();
-    await expect(administrator.page.getByText("No models are listed in the deployment capability catalog.", { exact: true })).toBeVisible();
-    await expect(model.locator("option", { hasText: "openai/gpt-5.4" })).toHaveCount(0);
+    await expect(administrator.page.getByText("1 selected model is not listed in the deployment capability catalog. Remove or replace before saving.", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1640,8 +1779,7 @@ test("administrator can revise and copy a ten-grant template listed in the capab
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/developer`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
-    await expect(tools.getByRole("listitem")).toHaveCount(10);
-    await expect(tools.getByRole("combobox", { name: "Tool", exact: true }).locator("option")).toHaveCount(10);
+    await expect(tools.getByRole("button", { name: /^Remove / })).toHaveCount(10);
 
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")).toBeTruthy();
@@ -1672,13 +1810,16 @@ test("administrator can replace a template tool absent from the capability catal
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
     await expect(tools.getByText("Not listed in the deployment capability catalog")).toBeVisible();
-    await expect(tools.getByRole("combobox", { name: "Tool", exact: true }).locator("option")).toHaveText(["actions_get:read"]);
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByRole("alert").filter({ hasText: "no authority was changed" })).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
 
-    await tools.getByRole("button", { name: "Remove tool github:repository:get_file_contents" }).click();
-    await tools.getByRole("button", { name: "Add tool" }).click();
+    const tool = tools.getByRole("combobox", { name: "Tools" });
+    await tool.focus();
+    await tool.press("Backspace");
+    await expect(tools.getByRole("button", { name: "Remove github:repository:get_file_contents" })).toHaveCount(0);
+    await tool.fill("actions_get:read");
+    await tool.press("Enter");
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.tools).toEqual([
@@ -1698,9 +1839,7 @@ test("administrator template tool controls offer no fallback when the capability
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
-    await expect(tools.getByRole("combobox", { name: "Tool provider" })).toBeDisabled();
-    await expect(tools.getByRole("combobox", { name: "Tool", exact: true })).toBeDisabled();
-    await expect(tools.getByRole("button", { name: "Add tool" })).toBeDisabled();
+    await expect(tools.getByRole("combobox", { name: "Tools" })).toBeDisabled();
     await expect(tools.getByText("No tools are listed in the deployment capability catalog.")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
@@ -1734,17 +1873,17 @@ test("administrator can replace a template model absent from the capability cata
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const models = administrator.page.getByRole("group", { name: "Models" });
-    await expect(models.getByRole("listitem")).toContainText("openai/gpt-5.4");
+    await expect(models.getByText("openai/gpt-5.4", { exact: true })).toBeVisible();
     await expect(models.getByText("Not listed in the deployment capability catalog")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByText("The template ID or envelope fields are invalid, so no authority was changed.", { exact: true })).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
 
-    await models.getByRole("button", { name: "Remove model gpt-5.4 from provider openai" }).click();
-    await expect(models.getByRole("listitem")).toHaveCount(0);
-    await models.getByRole("combobox", { name: "Model" }).selectOption(JSON.stringify(["anthropic", "claude-sonnet-4"]));
-    await models.getByRole("button", { name: "Add model" }).click();
-    await expect(models.getByRole("listitem")).toHaveCount(1);
+    await models.getByRole("button", { name: "Remove openai/gpt-5.4" }).click();
+    const model = models.getByRole("combobox", { name: "Models" });
+    await model.fill("anthropic/claude-sonnet-4");
+    await model.press("Enter");
+    await expect(models.getByText("anthropic/claude-sonnet-4", { exact: true })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     const mutation = administrator.mutations.find((entry) => entry.path === "/admin/api/v1/envelope-templates/analyst");
@@ -1766,15 +1905,13 @@ test("administrator template model identity does not collide across provider and
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const models = administrator.page.getByRole("group", { name: "Models" });
-    await expect(models.getByRole("combobox", { name: "Model" }).locator("option")).toHaveText([
-      "Provider: provider-a · Model: part/model-a",
-      "Provider: provider-a/part · Model: model-a",
-    ]);
-    await models.getByRole("combobox", { name: "Model" }).selectOption(JSON.stringify([second.provider, second.model]));
-    await models.getByRole("button", { name: "Add model" }).click();
-    await expect(models.getByRole("listitem")).toHaveCount(2);
-    await models.getByRole("listitem").first().getByRole("button", { name: "Remove model part/model-a from provider provider-a" }).click();
-    await expect(models.getByRole("listitem")).toHaveCount(1);
+    const model = models.getByRole("combobox", { name: "Models" });
+    await model.fill("Provider: provider-a/part · Model: model-a");
+    await expect(models.getByRole("option", { name: /Provider: provider-a\/part · Model: model-a/ })).toBeVisible();
+    await model.press("Enter");
+    await expect(models.getByRole("button", { name: /^Remove / })).toHaveCount(2);
+    await models.getByRole("button", { name: "Remove Provider: provider-a · Model: part/model-a" }).click();
+    await expect(models.getByRole("button", { name: /^Remove / })).toHaveCount(1);
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.llms).toEqual([second]);
@@ -1791,8 +1928,8 @@ test("administrator template model identity does not collide across provider and
     await stale.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const models = stale.page.getByRole("group", { name: "Models" });
     await expect(models.getByText("Not listed in the deployment capability catalog")).toHaveCount(1);
-    await models.getByRole("listitem").first().getByRole("button", { name: "Remove model part/model-a from provider provider-a" }).click();
-    await expect(models.getByRole("listitem")).toHaveCount(1);
+    await models.getByRole("button", { name: "Remove Provider: provider-a · Model: part/model-a" }).click();
+    await expect(models.getByRole("button", { name: /^Remove / })).toHaveCount(1);
     await stale.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => stale.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     expect(stale.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.llms).toEqual([second]);
@@ -1821,11 +1958,14 @@ test("administrator can reject a pending envelope request with an optional reaso
   const administrator = await guardedPage(browser, { session: administratorSession });
   try {
     await administrator.page.goto(`${origin}/admin/approvals`);
-    const envelopeRequestCard = administrator.page.getByRole("listitem").filter({
-      has: administrator.page.getByText(pendingEnvelopeRequest.requestId, { exact: true }),
-    });
+    await administrator.page.getByRole("link").filter({ hasText: pendingEnvelopeRequest.requestId }).click();
+    const envelopeRequestCard = administrator.page.locator("main");
+    await envelopeRequestCard.getByRole("button", { name: "File reference" }).click();
     await envelopeRequestCard.getByLabel("Rejection reason (optional)").fill("Authority is not appropriate for this user.");
-    await envelopeRequestCard.getByRole("button", { name: "Reject request" }).click();
+    await envelopeRequestCard.getByRole("button", { name: "Reject" }).click();
+    const confirmation = administrator.page.getByRole("alertdialog", { name: "Reject this request?" });
+    await expect(confirmation).toBeVisible();
+    await confirmation.getByRole("button", { name: "Reject request" }).click();
     await expect(envelopeRequestCard.getByText("The envelope request was rejected through the governed Rust admission path.")).toBeVisible();
     const rejection = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/reject`);
     expectMutationProof(rejection);
@@ -1856,9 +1996,8 @@ test("the deployed admin template contract is accepted during the rolling Next c
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     await expect(administrator.page.getByText("Current revision 4")).toBeVisible();
-    await administrator.page.getByRole("combobox", { name: "Limit type" }).selectOption("monthly");
-    await expect(administrator.page.getByRole("textbox", { name: "Limit amount (USD)" })).toHaveValue("25.00");
-    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["provider-a/model-a"]);
+    await expect(administrator.page.getByRole("textbox", { name: "Monthly (USD)" })).toHaveValue("25.00");
+    await expect(administrator.page.getByText("provider-a/model-a", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }

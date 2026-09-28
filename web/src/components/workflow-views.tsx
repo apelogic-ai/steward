@@ -26,7 +26,7 @@ export function AdminWorkflowsView() {
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader actions={<PrimaryLink href="/admin/workflows/new">Create workflow</PrimaryLink>} description="Publish immutable, versioned agent definitions." title="Workflows" />
       <ResourceBoundary state={state}>{({ workflows }) => workflows.length === 0 ? (
-        <EmptyState title="No data" />
+        <EmptyState title="No workflows yet"><p>Publish the first immutable workflow definition to make it available for governed runs.</p></EmptyState>
       ) : (
         <ul className="grid gap-4 lg:grid-cols-2">
           {workflows.map((workflow) => (
@@ -109,7 +109,7 @@ function WorkflowForm({ agents, from }: Readonly<{ agents: WorkflowListResponse[
         <label className="grid gap-2 text-sm font-semibold">Agent<select className="min-h-11 rounded-md border bg-panel px-3 font-normal" defaultValue={from?.agent ?? agents[0].agentRef} name="agent" required>{agents.map((agent) => <option key={agent.agentRef} value={agent.agentRef}>{agent.displayName ?? agent.agentRef} · {agent.agentRef}</option>)}</select></label>
         <label className="grid gap-2 text-sm font-semibold">Prompt<textarea className="min-h-52 rounded-md border p-3 font-normal" defaultValue={from?.prompt ?? ""} name="prompt" required /></label>
         {submission !== "idle" && submission !== "submitting" ? <p className="text-sm text-red-800" role="alert">{{ conflict: "This Workflow name or version was published concurrently.", rejected: "The Workflow content was rejected.", forbidden: "The authorization boundary rejected publication.", unavailable: "The Workflow service is unavailable.", error: "The Workflow could not be published." }[submission]}</p> : null}
-        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Publishing…" : from ? "Publish new version" : "Publish workflow"}</button>
+        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Publishing…" : from ? "Publish new version" : "Publish workflow"}</button>
       </form>
     </section>
   );
@@ -121,6 +121,6 @@ export function NewWorkflowVersionView({ name }: Readonly<{ name: string }>) {
   return <ResourceBoundary state={state}>{({ agents, workflows }) => {
     const current = workflows.find((workflow) => workflow.name === name);
     if (agents.length === 0) return <EmptyState title="No coding agents configured" />;
-    return current ? <WorkflowForm agents={agents} from={current} /> : <EmptyState title="No data" />;
+    return current ? <WorkflowForm agents={agents} from={current} /> : <EmptyState title="Workflow not found"><p>The requested workflow has no published revision.</p></EmptyState>;
   }}</ResourceBoundary>;
 }

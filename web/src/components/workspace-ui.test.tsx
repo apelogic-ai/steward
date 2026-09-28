@@ -10,13 +10,13 @@ describe("status badges", () => {
     expect(html).toContain("self-start");
     expect(html).toContain("w-fit");
     expect(html).toContain("shrink-0");
-    expect(html).toContain("rounded-full border px-2.5 py-1");
-    expect(html).toContain("status-badge-success");
+    expect(html).toContain("rounded-full px-2.5 py-[3px]");
+    expect(html).toContain('data-tone="ok"');
   });
 
   test("distinguishes healthy, expiring, and expired connections", () => {
-    expect(renderToStaticMarkup(<StatusBadge value="Connected" />)).toContain("status-badge-success");
-    expect(renderToStaticMarkup(<StatusBadge value="Expiring soon" />)).toContain("status-badge-warning");
-    expect(renderToStaticMarkup(<StatusBadge value="Credential expired" />)).toContain("status-badge-error");
+    expect(renderToStaticMarkup(<StatusBadge value="Connected" />)).toContain('data-tone="ok"');
+    expect(renderToStaticMarkup(<StatusBadge value="Expiring soon" />)).toContain('data-tone="warn"');
+    expect(renderToStaticMarkup(<StatusBadge value="Credential expired" />)).toContain('data-tone="err"');
   });
 });

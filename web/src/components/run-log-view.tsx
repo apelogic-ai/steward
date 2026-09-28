@@ -95,26 +95,63 @@ export function RunLogView({
       />
       <section aria-label="Execution log" className="space-y-4 rounded-panel border bg-panel p-6 shadow-sm">
         <h2 className="text-xl font-semibold">{stream} log</h2>
-        {state.status === "loading" ? (
-          <p className="text-sm text-muted-ink" role="status">Loading {stream} log…</p>
-        ) : null}
-        {state.status === "unavailable" ? (
-          <p className="text-sm text-muted-ink" role="status">{stream} log is unavailable for this run.</p>
-        ) : null}
-        {state.status === "error" ? (
-          <p className="text-sm text-red-800" role="alert">The {stream} log could not be loaded.</p>
-        ) : null}
-        {state.status === "ready" ? (
-          <>
-            <div className="rounded-md border border-amber-700/60 bg-amber-950/20 p-3 text-sm">
-              <p className="font-semibold">Sensitive output warning</p>
-              <p className="mt-1 text-muted-ink">Execution logs may reproduce arbitrary user, tool, or agent output.</p>
-            </div>
-            <pre className="max-h-[70vh] overflow-auto whitespace-pre-wrap break-words rounded-md border bg-canvas p-4 font-mono text-xs">{state.text}</pre>
-            {!state.complete ? <p className="text-xs text-muted-ink" role="status">Live log · polling for new output…</p> : null}
-          </>
-        ) : null}
+        <ExecutionLogContent state={state} stream={stream} warning />
       </section>
     </section>
   );
+}
+
+function ExecutionLogContent({ state, stream, warning = false }: Readonly<{
+  state: ExecutionLogState;
+  stream: ExecutionLogStream;
+  warning?: boolean;
+}>) {
+  if (state.status === "loading") return <p className="text-sm text-muted-ink" role="status">Loading {stream} log…</p>;
+  if (state.status === "unavailable") return <p className="text-sm text-muted-ink" role="status">{stream} log is unavailable for this run.</p>;
+  if (state.status === "error") return <p className="text-sm text-err" role="alert">The {stream} log could not be loaded.</p>;
+  const lines = state.text === "" ? [""] : state.text.match(/[^\n]*\n|[^\n]+$/g) ?? [state.text];
+  return (
+    <>
+      {warning ? <div className="rounded-control border border-warn/30 bg-warn-soft p-3 text-sm"><p className="font-semibold text-warn">Sensitive output warning</p><p className="mt-1 text-muted-ink">Execution logs may reproduce arbitrary user, tool, or agent output.</p></div> : null}
+      <pre aria-label={`${stream} log lines`} className="max-h-[70vh] min-w-0 overflow-auto rounded-control border border-line bg-[#111318] py-3 font-mono text-xs leading-5 text-[#e8eaf0] [counter-reset:line]">{lines.map((line, index) => <span className="grid min-w-max grid-cols-[3.5rem_minmax(0,1fr)] [counter-increment:line] before:select-none before:border-r before:border-white/10 before:px-3 before:text-right before:text-white/35 before:content-[counter(line)]" key={`${index}:${line}`}><span className="whitespace-pre-wrap break-words px-3">{line || " "}</span></span>)}</pre>
+      {!state.complete ? <p className="text-xs text-muted-ink" role="status">Live log · polling for new output…</p> : null}
+    </>
+  );
+}
+
+export function ExecutionLogPanel({ admin = false, stream, taskUid }: Readonly<{
+  admin?: boolean;
+  stream: ExecutionLogStream;
+  taskUid: string;
+}>) {
+  const [state, setState] = useState<ExecutionLogState>({ status: "loading" });
+
+  useEffect(() => {
+    let active = true;
+    const controller = new AbortController();
+    const apiPrefix = admin ? "/admin/api/v1/all-runs" : "/app/api/v1/runs";
+    let offset = 0;
+    let content = "";
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function load() {
+      try {
+        const response = await fetch(`${apiPrefix}/${encodeURIComponent(taskUid)}/logs/${stream}?after=${offset}`, { cache: "no-store", credentials: "same-origin", headers: { accept: "application/json" }, signal: controller.signal });
+        if (!active) return;
+        if (response.status === 401) { window.location.replace(authStartPath(window.location.pathname)); return; }
+        if (response.status === 404) { setState({ status: "unavailable" }); return; }
+        if (!response.ok) { setState({ status: "error" }); return; }
+        const chunk = await response.json() as BrowserExecutionLogResponse;
+        content += chunk.content;
+        offset = chunk.truncated ? offset + new TextEncoder().encode(chunk.content).byteLength : chunk.sizeBytes;
+        setState({ status: "ready", complete: chunk.complete, text: content });
+        if (!chunk.complete || chunk.truncated) timer = setTimeout(() => void load(), chunk.truncated ? 0 : 2000);
+      } catch (error) {
+        if (active && !(error instanceof DOMException && error.name === "AbortError")) setState({ status: "error" });
+      }
+    }
+    void load();
+    return () => { active = false; if (timer) clearTimeout(timer); controller.abort(); };
+  }, [admin, stream, taskUid]);
+
+  return <ExecutionLogContent state={state} stream={stream} />;
 }
