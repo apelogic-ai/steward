@@ -13,6 +13,7 @@ import {
 import { Breadcrumbs, type BreadcrumbItem } from "@/components/hs/breadcrumbs";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { authStartPath } from "@/session/auth-redirect";
+import { deriveOnboardingProgress, loadOnboardingEvidence } from "@/data/onboarding-progress";
 import { useSession, type SessionState } from "@/session/session-context";
 
 const userNavigation = [
@@ -270,16 +271,18 @@ function ProfileMenu({ adminMode, session }: Readonly<{
   );
 }
 
-function AppSidebar({ adminMode, mobile = false, needsAction, onNavigate, onboardingDismissed, session }: Readonly<{
+function AppSidebar({ adminMode, mobile = false, needsAction, onNavigate, onboardingCompleted, onboardingDismissed, session }: Readonly<{
   adminMode: boolean;
   mobile?: boolean;
   needsAction: number | null;
   onNavigate?: () => void;
+  onboardingCompleted: number | null;
   onboardingDismissed: boolean;
   session: Extract<SessionState, { status: "authenticated" }>;
 }>) {
   const pathname = usePathname();
-  const navigation = adminMode ? adminNavigation : userNavigation.filter((item) => !onboardingDismissed || item.href !== "/get-started");
+  const onboardingComplete = onboardingCompleted === 5;
+  const navigation = adminMode ? adminNavigation : userNavigation.filter((item) => !(onboardingDismissed || onboardingComplete) || item.href !== "/get-started");
   return (
     <aside className={mobile ? "flex h-full w-[216px] flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 shadow-xl" : "sticky top-0 hidden h-screen flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 md:flex"}>
       <Link aria-label="HyperShell home" className="flex items-center gap-2.5 px-2 pb-[22px] text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"} onClick={onNavigate}>
@@ -291,7 +294,7 @@ function AppSidebar({ adminMode, mobile = false, needsAction, onNavigate, onboar
       <nav aria-label="Primary navigation" className="space-y-0.5">
         {navigation.map(({ href, label }) => {
           const active = isActive(pathname, href);
-          const count = href === "/admin/approvals" ? needsAction : null;
+          const count = href === "/admin/approvals" ? needsAction : href === "/get-started" && onboardingCompleted !== null ? `${onboardingCompleted}/5` : null;
           return (
             <Link
               aria-current={active ? "page" : undefined}
@@ -302,7 +305,7 @@ function AppSidebar({ adminMode, mobile = false, needsAction, onNavigate, onboar
             >
               <span aria-hidden="true" className={`size-1.5 rounded-[2px] ${active ? "bg-brand" : "bg-field"}`} />
               <span>{label}</span>
-              {count ? <span aria-hidden="true" className="ms-auto min-w-5 rounded-full bg-brand px-1.5 py-0.5 text-center text-[11px] font-bold text-on-brand">{count}</span> : null}
+              {count !== null && count !== 0 ? <span aria-hidden={href === "/admin/approvals" || undefined} className="ms-auto min-w-5 rounded-full bg-brand px-1.5 py-0.5 text-center text-[11px] font-bold text-on-brand">{count}</span> : null}
             </Link>
           );
         })}
@@ -321,6 +324,7 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
   const adminMode = pathname === "/admin" || pathname.startsWith("/admin/");
   const workspaceAuthorized = session.status === "authenticated" && (!adminMode || session.value.role === "admin");
   const [needsAction, setNeedsAction] = useState<number | null>(null);
+  const [onboardingCompleted, setOnboardingCompleted] = useState<number | null>(null);
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const mobileMenuButtonRef = useRef<HTMLButtonElement>(null);
@@ -358,13 +362,18 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
   useEffect(() => {
     if (adminMode || !workspaceAuthorized) return;
     let active = true;
-    void getBrowserPreferences({ cache: "no-store", credentials: "same-origin" }).then((result) => {
-      if (active && result.data && result.response?.ok) setOnboardingDismissed(result.data.onboardingDismissed);
+    const refreshProgress = () => void loadOnboardingEvidence().then((result) => {
+      if (active && result.data && result.response?.ok) {
+        setOnboardingDismissed(result.data.preferences.onboardingDismissed);
+        setOnboardingCompleted(deriveOnboardingProgress(result.data).completed);
+      }
     });
+    refreshProgress();
     const preferencesUpdated = (event: Event) => {
       if (event instanceof CustomEvent && typeof event.detail?.onboardingDismissed === "boolean") {
         setOnboardingDismissed(event.detail.onboardingDismissed);
       }
+      refreshProgress();
     };
     window.addEventListener("hypershell:preferences-updated", preferencesUpdated);
     return () => {
@@ -377,10 +386,10 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
     <TooltipProvider>
       <div className="min-h-screen md:grid md:grid-cols-[216px_minmax(0,1fr)]">
         <a className="sr-only focus:not-sr-only focus:fixed focus:start-4 focus:top-4 focus:z-50 focus:rounded-control focus:bg-panel focus:px-4 focus:py-3" href="#workspace">Skip to workspace</a>
-        {session.status === "authenticated" && workspaceAuthorized ? <AppSidebar adminMode={adminMode} needsAction={needsAction} onboardingDismissed={onboardingDismissed} session={session} /> : <div className="hidden md:block" />}
+        {session.status === "authenticated" && workspaceAuthorized ? <AppSidebar adminMode={adminMode} needsAction={needsAction} onboardingCompleted={onboardingCompleted} onboardingDismissed={onboardingDismissed} session={session} /> : <div className="hidden md:block" />}
         {session.status === "authenticated" && workspaceAuthorized ? <header className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-line bg-panel px-4 md:hidden"><Link aria-label="HyperShell home" className="flex items-center gap-2 text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"}>{/* eslint-disable-next-line @next/next/no-img-element */}
         <img alt="HyperShell" className="size-7 rounded-control bg-white object-cover" height="28" src="/brand/logo" width="28" /><span className="text-base font-semibold">HyperShell</span></Link><button aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} aria-label="Open navigation" className="grid size-10 place-items-center rounded-control border bg-panel text-xl" onClick={() => setMobileMenuOpen(true)} ref={mobileMenuButtonRef} type="button">☰</button></header> : null}
-        {mobileMenuOpen && session.status === "authenticated" && workspaceAuthorized ? <div aria-label="Navigation" aria-modal="true" className="fixed inset-0 z-50 flex bg-black/30 md:hidden" id="mobile-navigation" ref={mobileNavigationRef} role="dialog"><AppSidebar adminMode={adminMode} mobile needsAction={needsAction} onNavigate={closeMobileMenu} onboardingDismissed={onboardingDismissed} session={session} /><button aria-label="Close navigation" className="flex-1" onClick={closeMobileMenu} type="button" /></div> : null}
+        {mobileMenuOpen && session.status === "authenticated" && workspaceAuthorized ? <div aria-label="Navigation" aria-modal="true" className="fixed inset-0 z-50 flex bg-black/30 md:hidden" id="mobile-navigation" ref={mobileNavigationRef} role="dialog"><AppSidebar adminMode={adminMode} mobile needsAction={needsAction} onNavigate={closeMobileMenu} onboardingCompleted={onboardingCompleted} onboardingDismissed={onboardingDismissed} session={session} /><button aria-label="Close navigation" className="flex-1" onClick={closeMobileMenu} type="button" /></div> : null}
         <main className="min-w-0 px-4 pt-[18px] pb-16 sm:px-7" id="workspace">
           <div className="mx-auto max-w-[1180px]">
             {session.status === "loading" ? <StatePanel title="Loading HyperShell"><p>Checking the server-owned session…</p></StatePanel> : null}

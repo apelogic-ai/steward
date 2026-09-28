@@ -69,6 +69,22 @@ describe("envelope request approval controls", () => {
     expect(html).not.toContain('name="expiresAt" placeholder="2026-08-25T17:00:00Z" required=""');
   });
 
+  test("shows the full requested authority for a template-free custom request", () => {
+    const custom: AdminRequestView = {
+      ...unifiedRequest,
+      kind: "custom",
+      requestedEnvelope: request.requestedEnvelope,
+      template: {},
+    };
+
+    const html = renderToStaticMarkup(<UnifiedRequestCard request={custom} />);
+
+    expect(html).toContain("Requested authority");
+    expect(html).toContain("300.00 USD");
+    expect(html).toContain("provider-a/model-b");
+    expect(html).toContain("36h");
+  });
+
   test("offer governed approve and reject mutations with an optional rejection reason", () => {
     const html = renderToStaticMarkup(<EnvelopeRequestCard request={request} />);
 

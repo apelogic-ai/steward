@@ -522,6 +522,7 @@ async function guardedPage(browser, {
   adminTemplateAutoProvisionThreshold = null,
   adminTemplateModels = adminEnvelope.spec.llms,
   adminTemplateTools = adminEnvelope.spec.tools,
+  adminPagination = false,
   legacyAdminTemplate = false,
   malformedAdminTemplate = false,
   mockSignIn = true,
@@ -534,6 +535,8 @@ async function guardedPage(browser, {
     stderr: { body: "agent stderr\n", status: 200 },
   },
   includeSampleWorkflow = false,
+  initialOnboardingDismissed = false,
+  initialWorkflowAcknowledged = false,
   onboardingPagination = false,
   mutationFailures = {},
   rerunResponses = [
@@ -753,11 +756,19 @@ async function guardedPage(browser, {
     approvals: emptyCollections ? [] : [approval],
     envelopeRequests: emptyCollections ? [] : [pendingEnvelopeRequest],
   }));
-  await context.route(`${origin}/admin/api/v1/requests*`, (route) => json(route, {
-    apiVersion: "steward.browser-admin/v1",
-    requests: emptyCollections ? [] : [unifiedEnvelopeRequest, unifiedRuntimeApproval],
-    nextCursor: null,
-  }));
+  await context.route(`${origin}/admin/api/v1/requests*`, (route) => {
+    if (adminPagination) {
+      const cursor = new URL(route.request().url()).searchParams.get("cursor");
+      return json(route, cursor
+        ? { apiVersion: "steward.browser-admin/v1", requests: [{ ...unifiedEnvelopeRequest, id: "00000000-0000-0000-0000-000000000008" }], nextCursor: null }
+        : { apiVersion: "steward.browser-admin/v1", requests: [unifiedRuntimeApproval], nextCursor: unifiedRuntimeApproval.id });
+    }
+    return json(route, {
+      apiVersion: "steward.browser-admin/v1",
+      requests: emptyCollections ? [] : [unifiedEnvelopeRequest, unifiedRuntimeApproval],
+      nextCursor: null,
+    });
+  });
   await context.route(`${origin}/admin/api/v1/requests/${unifiedEnvelopeRequest.id}`, (route) => json(route, {
     apiVersion: "steward.browser-admin/v1",
     request: unifiedEnvelopeRequest,
@@ -794,10 +805,10 @@ async function guardedPage(browser, {
   }));
   let browserPreferences = {
     apiVersion: ["steward", "preferences/v1"].join("."),
-    onboardingDismissed: false,
+    onboardingDismissed: initialOnboardingDismissed,
     revision: 0,
     theme: null,
-    workflowAcknowledged: false,
+    workflowAcknowledged: initialWorkflowAcknowledged,
   };
   await context.route(`${origin}/app/api/v1/preferences`, async (route) => {
     if (route.request().method() === "PUT") {
@@ -951,7 +962,7 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
     await developer.page.goto(`${origin}/runs`);
     await expect(developer.page.getByText("Agent runs executed under your envelopes.")).toBeVisible();
     for (const label of ["All", "Running", "Queued", "Parked", "Succeeded", "Failed"]) {
-      await expect(developer.page.getByRole("tab", { name: new RegExp(`^${label}\\s+\\d+$`) })).toBeVisible();
+      await expect(developer.page.getByRole("button", { name: new RegExp(`^${label}\\s+\\d+$`) })).toBeVisible();
     }
 
     await developer.page.goto(`${origin}/runs/${taskUid}`);
@@ -971,7 +982,7 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
   const administrator = await guardedPage(browser, { colorScheme: "light", session: administratorSession });
   try {
     await administrator.page.goto(`${origin}/admin/approvals`);
-    await expect(administrator.page.getByText(/Envelope requests within a template ceiling are approved and provisioned automatically/)).toBeVisible();
+    await expect(administrator.page.getByText(/Requests above a template’s auto-approval threshold/)).toBeVisible();
     await expect(administrator.page.getByRole("table", { name: "Requests" })).toBeVisible();
     await administrator.page.getByRole("link", { name: /Developer/ }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/approvals/${unifiedEnvelopeRequest.id}`);
@@ -1237,7 +1248,7 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await developer.page.goto(`${origin}/runs/${taskUid}`);
     await expect(developer.page.getByRole("heading", { name: "repository-review@1" })).toBeVisible();
     await expect(developer.page.getByText("1.25 USD")).toBeVisible();
-    await expect(developer.page.getByRole("heading", { name: "Timeline" })).toBeVisible();
+    await expect(developer.page.getByRole("navigation", { name: "Run jobs" })).toBeVisible();
 
     await developer.page.goto(`${origin}/connections`);
     await expect(developer.page.getByRole("heading", { name: "GitHub" })).toBeVisible();
@@ -1259,7 +1270,7 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await expect(administrator.page.getByRole("heading", { name: "All runs" })).toBeVisible();
     await expect(administrator.page.getByText("repository-review@1")).toBeVisible();
     await administrator.page.goto(`${origin}/admin/runs/${taskUid}`);
-    await expect(administrator.page.getByRole("heading", { name: "Timeline" })).toBeVisible();
+    await expect(administrator.page.getByRole("navigation", { name: "Run jobs" })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1378,6 +1389,42 @@ test("onboarding persists workflow acknowledgement and ignores unrelated runs", 
   }
 });
 
+test("onboarding navigation shows progress and disappears when all five steps are complete", async ({ browser }) => {
+  const inProgress = await guardedPage(browser, { includeSampleWorkflow: true });
+  try {
+    await inProgress.page.goto(`${origin}/envelopes`);
+    await expect(inProgress.page.getByRole("link", { name: /Get started/ })).toContainText("2/5");
+  } finally {
+    await closeGuardedPage(inProgress);
+  }
+
+  const complete = await guardedPage(browser, {
+    includeSampleWorkflow: true,
+    initialWorkflowAcknowledged: true,
+    onboardingPagination: true,
+  });
+  try {
+    await complete.page.goto(`${origin}/envelopes`);
+    await expect(complete.page.getByRole("link", { name: /Get started/ })).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(complete);
+  }
+});
+
+test("onboarding lets the user choose which first envelope template to request", async ({ browser }) => {
+  const developer = await guardedPage(browser, { includeSampleWorkflow: true });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    const step = developer.page.getByRole("listitem").filter({ hasText: "Get your first envelope" });
+    await step.getByRole("button", { name: /Get your first envelope/ }).click();
+    await step.getByRole("button", { name: /Developer/ }).click();
+    await expect(step.getByRole("link", { name: "Request Developer envelope" })).toBeVisible();
+    await expect(step).toContainText("Requests within a template's ceiling are approved and provisioned right away.");
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("onboarding cannot acknowledge an absent sample", async ({ browser }) => {
   const developer = await guardedPage(browser);
   try {
@@ -1401,6 +1448,29 @@ test("onboarding follows paginated envelope and run evidence", async ({ browser 
     await expect(developer.page.getByRole("listitem").filter({ hasText: "See the result" }).getByText("Done", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
+  }
+});
+
+test("entity lists follow every authoritative cursor", async ({ browser }) => {
+  const developer = await guardedPage(browser, { onboardingPagination: true });
+  try {
+    await developer.page.goto(`${origin}/envelopes`);
+    await expect(developer.page.getByText("00000000-0000-0000-0000-000000000006", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText(envelopeRequest.id, { exact: true })).toBeVisible();
+    await developer.page.goto(`${origin}/runs`);
+    await expect(developer.page.getByText(taskUid, { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("00000000-0000-0000-0000-000000000007", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+
+  const administrator = await guardedPage(browser, { adminPagination: true, session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/approvals`);
+    await expect(administrator.page.getByText(unifiedRuntimeApproval.id, { exact: true })).toBeVisible();
+    await expect(administrator.page.getByText("00000000-0000-0000-0000-000000000008", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
   }
 });
 
@@ -1452,11 +1522,10 @@ test("failed run phases expose stdout and stderr as escaped sensitive output", a
   try {
     await developer.context.addCookies([{ name: "execution-log-session", value: "present", url: origin }]);
     await developer.page.goto(`${origin}/runs/${taskUid}`);
-    const failedPhase = developer.page.locator("li").filter({ has: developer.page.getByText("failed", { exact: true }) });
-    const stdoutLink = failedPhase.getByRole("link", { name: "View stdout" });
-    const stderrLink = failedPhase.getByRole("link", { name: "View stderr" });
+    await developer.page.getByRole("button", { name: /Agent execution/ }).click();
+    await developer.page.getByText("Execution", { exact: true }).click();
+    const stdoutLink = developer.page.getByRole("link", { name: "Open full page" });
     await expect(stdoutLink).toHaveAttribute("href", `/runs/${taskUid}/logs/stdout`);
-    await expect(stderrLink).toHaveAttribute("href", `/runs/${taskUid}/logs/stderr`);
 
     await stdoutLink.click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}/logs/stdout`);
@@ -1468,15 +1537,21 @@ test("failed run phases expose stdout and stderr as escaped sensitive output", a
 
     await developer.page.getByRole("link", { name: "Back to run" }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
-    await developer.page.getByRole("link", { name: "View stderr" }).click();
+    await developer.page.getByRole("button", { name: /Agent execution/ }).click();
+    await developer.page.getByText("Execution", { exact: true }).click();
+    await developer.page.getByRole("tab", { name: "stderr" }).click();
+    const stderrLink = developer.page.getByRole("link", { name: "Open full page" });
+    await expect(stderrLink).toHaveAttribute("href", `/runs/${taskUid}/logs/stderr`);
+    await stderrLink.click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}/logs/stderr`);
     await expect(viewer.getByRole("heading", { name: "stderr log" })).toBeVisible();
     await expect(viewer.locator("pre")).toHaveText("tool call failed: example\n");
 
-    expect(developer.executionLogRequests.map((request) => new URL(request.url()).pathname)).toEqual([
+    const requestedStreams = new Set(developer.executionLogRequests.map((request) => new URL(request.url()).pathname));
+    expect(requestedStreams).toEqual(new Set([
       `/app/api/v1/runs/${taskUid}/logs/stdout`,
       `/app/api/v1/runs/${taskUid}/logs/stderr`,
-    ]);
+    ]));
     for (const request of developer.executionLogRequests) {
       expect(new URL(request.url()).origin).toBe(origin);
       expect(request.headers().accept).toBe("application/json");
@@ -1499,14 +1574,15 @@ test("administrator run logs use the administrator boundary and report unavailab
   });
   try {
     await administrator.page.goto(`${origin}/admin/runs/${taskUid}`);
-    const succeededPhase = administrator.page.locator("li").filter({ has: administrator.page.getByText("succeeded", { exact: true }) });
-    await succeededPhase.getByRole("link", { name: "View stderr" }).click();
+    await administrator.page.getByRole("button", { name: /Agent execution/ }).click();
+    await administrator.page.getByText("Execution", { exact: true }).click();
+    await administrator.page.getByRole("tab", { name: "stderr" }).click();
+    await administrator.page.getByRole("link", { name: "Open full page" }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/runs/${taskUid}/logs/stderr`);
     await expect(administrator.page.getByRole("status")).toHaveText("stderr log is unavailable for this run.");
-    expect(administrator.executionLogRequests).toHaveLength(1);
-    expect(new URL(administrator.executionLogRequests[0].url()).pathname).toBe(
-      `/admin/api/v1/all-runs/${taskUid}/logs/stderr`,
-    );
+    const requestedPaths = administrator.executionLogRequests.map((request) => new URL(request.url()).pathname);
+    expect(requestedPaths).toContain(`/admin/api/v1/all-runs/${taskUid}/logs/stderr`);
+    expect(requestedPaths.every((path) => path.startsWith(`/admin/api/v1/all-runs/${taskUid}/logs/`))).toBe(true);
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1564,46 +1640,23 @@ test("administrator templates and approvals use typed browser authority", async 
     await administrator.page.getByRole("link", { name: /Analyst/ }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/envelopes/templates/analyst`);
     await expect(administrator.page.getByText("Current revision 4")).toBeVisible();
-    const limitType = administrator.page.getByRole("combobox", { name: "Limit type" });
-    const limitAmount = administrator.page.getByRole("textbox", { name: "Limit amount (USD)" });
-    await expect(limitType.locator("option")).toHaveText(["Single run", "Monthly"]);
-    await expect(limitAmount).toHaveValue("2.50");
-    await limitType.selectOption("monthly");
-    await expect(limitAmount).toHaveValue("25.00");
-    await limitAmount.fill("30.00");
-    await limitType.selectOption("singleRun");
-    await limitAmount.fill("3.00");
+    await expect(administrator.page.getByRole("combobox", { name: "Limit type" })).toHaveCount(0);
+    await expect(administrator.page.getByRole("textbox", { name: "Per run (USD)" })).toHaveValue("2.50");
+    await expect(administrator.page.getByRole("textbox", { name: "Monthly (USD)" })).toHaveValue("25.00");
+    await administrator.page.getByRole("textbox", { name: "Monthly (USD)" }).fill("30.00");
+    await administrator.page.getByRole("textbox", { name: "Per run (USD)" }).fill("3.00");
     await expect(administrator.page.getByRole("textbox", { name: "TTL" })).toHaveValue("4h");
-    await expect(administrator.page.getByRole("combobox", { name: "Currency" })).toHaveValue("USD");
-    await expect(administrator.page.getByRole("combobox", { name: "Currency" }).locator("option")).toHaveText(["USD"]);
-    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["provider-a/model-a"]);
-    const model = administrator.page.getByRole("combobox", { name: "Model" });
-    await expect(model).toHaveValue(JSON.stringify(["provider-a", "model-a"]));
-    await expect(model.locator("option")).toHaveText([
-      "provider-a/model-a",
-      "provider-b/model-b",
-    ]);
-    await expect(model.locator("option").nth(0)).toBeEnabled();
-    await expect(model.locator("option").nth(1)).toBeEnabled();
-    await expect(model.locator("option", { hasText: "openai/gpt-5.4" })).toHaveCount(0);
-    await model.selectOption(JSON.stringify(["provider-b", "model-b"]));
-    await administrator.page.getByRole("button", { name: "Add model" }).click();
-    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText([
-      "provider-a/model-a",
-      "provider-b/model-b",
-    ]);
+    const model = administrator.page.getByRole("combobox", { name: "Models" });
+    await expect(model).toBeVisible();
+    await expect(administrator.page.getByText("provider-a/model-a", { exact: true })).toBeVisible();
+    await model.fill("provider-b/model-b");
+    await model.press("Enter");
+    await expect(administrator.page.getByText("provider-b/model-b", { exact: true })).toBeVisible();
 
-    const toolProvider = administrator.page.getByRole("combobox", { name: "Tool provider" });
-    await expect(toolProvider).toHaveValue("github");
-    await expect(toolProvider.locator("option")).toHaveText(["GitHub"]);
-
-    const tool = administrator.page.getByRole("combobox", { exact: true, name: "Tool" });
-    await expect(tool).toHaveValue(JSON.stringify(["github", "repository", "get_file_contents"]));
-    await expect(tool.locator("option")).toHaveText(["repository:get_file_contents"]);
-    await expect(tool.locator("option").nth(0)).toBeEnabled();
-    await expect(administrator.page.getByRole("button", { name: "Add tool" })).toBeDisabled();
-    const advanced = administrator.page.getByText("Advanced", { exact: true }).locator("..");
-    await expect(advanced).not.toHaveAttribute("open", "");
+    const tool = administrator.page.getByRole("combobox", { name: "Tools" });
+    await expect(tool).toBeVisible();
+    await expect(administrator.page.getByText("repository:get_file_contents", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByRole("heading", { name: "Runner" })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByText("Template revision accepted by the Rust authority.")).toBeVisible();
     await expect(administrator.page.getByText("Current revision 5")).toBeVisible();
@@ -1709,12 +1762,9 @@ test("administrator template model controls fail closed when the capability cata
   });
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
-    const model = administrator.page.getByRole("combobox", { name: "Model" });
+    const model = administrator.page.getByRole("combobox", { name: "Models" });
     await expect(model).toBeDisabled();
-    await expect(model.locator("option")).toHaveText(["No models available"]);
-    await expect(administrator.page.getByRole("button", { name: "Add model" })).toBeDisabled();
-    await expect(administrator.page.getByText("No models are listed in the deployment capability catalog.", { exact: true })).toBeVisible();
-    await expect(model.locator("option", { hasText: "openai/gpt-5.4" })).toHaveCount(0);
+    await expect(administrator.page.getByText("1 selected model is not listed in the deployment capability catalog. Remove or replace before saving.", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1729,8 +1779,7 @@ test("administrator can revise and copy a ten-grant template listed in the capab
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/developer`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
-    await expect(tools.getByRole("listitem")).toHaveCount(10);
-    await expect(tools.getByRole("combobox", { name: "Tool", exact: true }).locator("option")).toHaveCount(10);
+    await expect(tools.getByRole("button", { name: /^Remove / })).toHaveCount(10);
 
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")).toBeTruthy();
@@ -1761,13 +1810,16 @@ test("administrator can replace a template tool absent from the capability catal
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
     await expect(tools.getByText("Not listed in the deployment capability catalog")).toBeVisible();
-    await expect(tools.getByRole("combobox", { name: "Tool", exact: true }).locator("option")).toHaveText(["actions_get:read"]);
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByRole("alert").filter({ hasText: "no authority was changed" })).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
 
-    await tools.getByRole("button", { name: "Remove tool github:repository:get_file_contents" }).click();
-    await tools.getByRole("button", { name: "Add tool" }).click();
+    const tool = tools.getByRole("combobox", { name: "Tools" });
+    await tool.focus();
+    await tool.press("Backspace");
+    await expect(tools.getByRole("button", { name: "Remove github:repository:get_file_contents" })).toHaveCount(0);
+    await tool.fill("actions_get:read");
+    await tool.press("Enter");
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.tools).toEqual([
@@ -1787,9 +1839,7 @@ test("administrator template tool controls offer no fallback when the capability
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
-    await expect(tools.getByRole("combobox", { name: "Tool provider" })).toBeDisabled();
-    await expect(tools.getByRole("combobox", { name: "Tool", exact: true })).toBeDisabled();
-    await expect(tools.getByRole("button", { name: "Add tool" })).toBeDisabled();
+    await expect(tools.getByRole("combobox", { name: "Tools" })).toBeDisabled();
     await expect(tools.getByText("No tools are listed in the deployment capability catalog.")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
@@ -1823,17 +1873,17 @@ test("administrator can replace a template model absent from the capability cata
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const models = administrator.page.getByRole("group", { name: "Models" });
-    await expect(models.getByRole("listitem")).toContainText("openai/gpt-5.4");
+    await expect(models.getByText("openai/gpt-5.4", { exact: true })).toBeVisible();
     await expect(models.getByText("Not listed in the deployment capability catalog")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByText("The template ID or envelope fields are invalid, so no authority was changed.", { exact: true })).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
 
-    await models.getByRole("button", { name: "Remove model gpt-5.4 from provider openai" }).click();
-    await expect(models.getByRole("listitem")).toHaveCount(0);
-    await models.getByRole("combobox", { name: "Model" }).selectOption(JSON.stringify(["anthropic", "claude-sonnet-4"]));
-    await models.getByRole("button", { name: "Add model" }).click();
-    await expect(models.getByRole("listitem")).toHaveCount(1);
+    await models.getByRole("button", { name: "Remove openai/gpt-5.4" }).click();
+    const model = models.getByRole("combobox", { name: "Models" });
+    await model.fill("anthropic/claude-sonnet-4");
+    await model.press("Enter");
+    await expect(models.getByText("anthropic/claude-sonnet-4", { exact: true })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     const mutation = administrator.mutations.find((entry) => entry.path === "/admin/api/v1/envelope-templates/analyst");
@@ -1855,15 +1905,13 @@ test("administrator template model identity does not collide across provider and
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const models = administrator.page.getByRole("group", { name: "Models" });
-    await expect(models.getByRole("combobox", { name: "Model" }).locator("option")).toHaveText([
-      "Provider: provider-a · Model: part/model-a",
-      "Provider: provider-a/part · Model: model-a",
-    ]);
-    await models.getByRole("combobox", { name: "Model" }).selectOption(JSON.stringify([second.provider, second.model]));
-    await models.getByRole("button", { name: "Add model" }).click();
-    await expect(models.getByRole("listitem")).toHaveCount(2);
-    await models.getByRole("listitem").first().getByRole("button", { name: "Remove model part/model-a from provider provider-a" }).click();
-    await expect(models.getByRole("listitem")).toHaveCount(1);
+    const model = models.getByRole("combobox", { name: "Models" });
+    await model.fill("Provider: provider-a/part · Model: model-a");
+    await expect(models.getByRole("option", { name: /Provider: provider-a\/part · Model: model-a/ })).toBeVisible();
+    await model.press("Enter");
+    await expect(models.getByRole("button", { name: /^Remove / })).toHaveCount(2);
+    await models.getByRole("button", { name: "Remove Provider: provider-a · Model: part/model-a" }).click();
+    await expect(models.getByRole("button", { name: /^Remove / })).toHaveCount(1);
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.llms).toEqual([second]);
@@ -1880,8 +1928,8 @@ test("administrator template model identity does not collide across provider and
     await stale.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const models = stale.page.getByRole("group", { name: "Models" });
     await expect(models.getByText("Not listed in the deployment capability catalog")).toHaveCount(1);
-    await models.getByRole("listitem").first().getByRole("button", { name: "Remove model part/model-a from provider provider-a" }).click();
-    await expect(models.getByRole("listitem")).toHaveCount(1);
+    await models.getByRole("button", { name: "Remove Provider: provider-a · Model: part/model-a" }).click();
+    await expect(models.getByRole("button", { name: /^Remove / })).toHaveCount(1);
     await stale.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => stale.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     expect(stale.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.llms).toEqual([second]);
@@ -1948,9 +1996,8 @@ test("the deployed admin template contract is accepted during the rolling Next c
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     await expect(administrator.page.getByText("Current revision 4")).toBeVisible();
-    await administrator.page.getByRole("combobox", { name: "Limit type" }).selectOption("monthly");
-    await expect(administrator.page.getByRole("textbox", { name: "Limit amount (USD)" })).toHaveValue("25.00");
-    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["provider-a/model-a"]);
+    await expect(administrator.page.getByRole("textbox", { name: "Monthly (USD)" })).toHaveValue("25.00");
+    await expect(administrator.page.getByText("provider-a/model-a", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }

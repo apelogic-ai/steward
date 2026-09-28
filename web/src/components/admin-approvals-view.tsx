@@ -10,7 +10,6 @@ import {
   fileAdminApprovalDecision,
   fileAdminEnvelopeRequest,
   getAdminRequest,
-  listAdminRequests,
   topUpAdminEscalation,
   rejectAdminEnvelopeRequest,
   type BrowserApprovalView,
@@ -22,11 +21,12 @@ import {
   type AdminRequestResponse,
   type AdminRequestsResponse,
 } from "@/api-client";
-import { DataTable, FilterTabs, GrantChipList, Meter, SectionCard, grantKindForAction } from "@/components/hs";
+import { DataTable, FilterChips, GrantChipList, Meter, SectionCard, grantKindForAction } from "@/components/hs";
 import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
 import { DefinitionList, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
+import { loadAllAdminRequests } from "@/data/paginated-api";
 import { useSession } from "@/session/session-context";
 
 type ApprovalActionState = "idle" | "filing" | "filed" | "approving" | "approved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
@@ -65,11 +65,11 @@ function envelopeAuthorityItems(spec: BrowserEnvelopeSpec): [string, string][] {
 
 export function AdminApprovalsView() {
   const [filter, setFilter] = useState("needs_action");
-  const load = useCallback(() => listAdminRequests({ cache: "no-store", credentials: "same-origin", query: { state: "all", limit: 100 } }), []);
+  const load = useCallback(() => loadAllAdminRequests(), []);
   const state = useApiResource<AdminRequestsResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Envelope requests within a template ceiling are approved and provisioned automatically. Requests above a ceiling, and runtimes that exhaust a cumulative limit, wait here for a decision." title="Requests" />
+      <PageHeader description="Requests above a template’s auto-approval threshold, custom authority requests, and runs that exhaust a cumulative limit wait here for a decision." title="Requests" />
       <ResourceBoundary state={state}>{({ requests }) => {
         if (requests.length === 0) return <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">Nothing needs action.</p>;
         const counts = {
@@ -81,7 +81,7 @@ export function AdminApprovalsView() {
         const visible = filter === "all" ? requests : filter === "needs_action"
           ? requests.filter((request) => request.state === "requested" || request.state === "escalated")
           : requests.filter((request) => request.state === filter);
-        return <div className="space-y-5"><FilterTabs active={filter} items={[
+        return <div className="space-y-5"><FilterChips active={filter} items={[
           { count: counts.needs_action, label: "Needs action", value: "needs_action" },
           { count: counts.all, label: "All", value: "all" },
           { count: counts.auto_approved, label: "Auto-approved", value: "auto_approved" },
@@ -175,7 +175,8 @@ function numericDelta(delta: AdminRequestView["deltas"][number]): string | null 
 }
 
 function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>) {
-  if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">{request.kind === "custom" ? "This custom request has no governing template." : "This request is within the configured ceiling."}</p>;
+  if (request.kind === "custom" && request.requestedEnvelope) return <SectionCard title="Requested authority"><DefinitionList items={envelopeAuthorityItems(request.requestedEnvelope.spec)} /><p className="mt-4 rounded-control bg-notice p-4 text-sm">This custom request has no governing template and always requires administrator approval.</p></SectionCard>;
+  if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">This request is within the configured ceiling but above its automatic approval threshold.</p>;
   return (
     <SectionCard title="Requested vs template ceiling">
       <div className="overflow-x-auto">

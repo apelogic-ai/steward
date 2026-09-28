@@ -1,32 +1,28 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useRef, useState, type FormEvent } from "react";
 
 import {
   createRequest,
-  getBrowserPreferences,
   getRequest,
-  listProviderConnections,
-  listRequests,
   listTemplates,
   myRuns,
   type AvailableEnvelopeTemplate,
-  type BrowserPreferencesView,
   type BrowserEnvelope,
   type EnvelopeRequestResponse,
   type EnvelopeTemplatesResponse,
-  type ConnectionsCollectionResponse,
   type GithubActionsWorkflowResponse,
   type MyRunsResponse,
-  type PublishedWorkflowsResponse,
   type UserEnvelopeRequest,
 } from "@/api-client";
 import { RunCards } from "@/components/run-views";
 import { CodeBlock, DataTable, FilterTabs, GrantChipList, Meter, SectionCard, StatStrip, TagSelect, grantKindForAction } from "@/components/hs";
 import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
+import { deriveOnboardingProgress, loadOnboardingEvidence } from "@/data/onboarding-progress";
+import { loadAllEnvelopeRequests } from "@/data/paginated-api";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 import { listPublishedWorkflows, renderWorkflowForEnvelope, type PublishedWorkflowListResponse } from "@/workflows/api";
@@ -41,7 +37,7 @@ export function EnvelopesView() {
   const [status, setStatus] = useState("all");
   const load = useCallback(async () => {
     const [requests, templates] = await Promise.all([
-      listRequests({ cache: "no-store", credentials: "same-origin" }),
+      loadAllEnvelopeRequests(),
       listTemplates({ cache: "no-store", credentials: "same-origin" }),
     ]);
     return {
@@ -54,7 +50,7 @@ export function EnvelopesView() {
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader actions={<PrimaryLink href="/envelopes/new">Request envelope</PrimaryLink>} description="Budget, models and tools your agents are allowed to use." title="Envelopes" />
       <ResourceBoundary state={state}>{({ requests, templates }) => {
-        const onboarding = <EnvelopesOnboardingBanner requests={requests} />;
+        const onboarding = <EnvelopesOnboardingBanner />;
         if (requests.length === 0) return <div className="space-y-5">{onboarding}<p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">No envelopes yet.</p></div>;
         const count = (value: string) => requests.filter((request) => value === "pending" ? request.status !== "provisioned" && request.status !== "rejected" : request.status === value).length;
         const filtered = status === "all" ? requests : requests.filter((request) => status === "pending" ? request.status !== "provisioned" && request.status !== "rejected" : request.status === status);
@@ -73,36 +69,12 @@ export function EnvelopesView() {
   );
 }
 
-type EnvelopesOnboardingData = {
-  connections: ConnectionsCollectionResponse;
-  preferences: BrowserPreferencesView;
-  runs: MyRunsResponse;
-  workflows: PublishedWorkflowsResponse;
-};
-
-function EnvelopesOnboardingBanner({ requests }: Readonly<{ requests: Array<UserEnvelopeRequest> }>) {
-  const load = useCallback(async () => {
-    const [connections, preferences, runs, workflows] = await Promise.all([
-      listProviderConnections({ cache: "no-store", credentials: "same-origin" }),
-      getBrowserPreferences({ cache: "no-store", credentials: "same-origin" }),
-      myRuns({ cache: "no-store", credentials: "same-origin", query: { limit: 100 } }),
-      listPublishedWorkflows(),
-    ]);
-    const results = [connections, preferences, runs, workflows];
-    return {
-      data: connections.data && preferences.data && runs.data && workflows.data ? { connections: connections.data, preferences: preferences.data, runs: runs.data, workflows: workflows.data } : undefined,
-      response: results.find((result) => !result.response?.ok)?.response ?? connections.response,
-    };
-  }, []);
-  const state = useApiResource<EnvelopesOnboardingData>(load);
+function EnvelopesOnboardingBanner() {
+  const load = useCallback(() => loadOnboardingEvidence(), []);
+  const state = useApiResource(load);
   if (state.status !== "ready" || state.value.preferences.onboardingDismissed) return null;
   const data = state.value;
-  const sample = data.workflows.workflows.find((workflow) => workflow.sample);
-  const sampleReference = sample ? `${sample.name}@${sample.version}` : null;
-  const envelopeIds = new Set(requests.filter((request) => request.status === "provisioned" && request.envelopeInstanceId).map((request) => String(request.envelopeInstanceId)));
-  const run = sampleReference ? data.runs.runs.find((candidate) => `${candidate.workflowName}@${candidate.workflowVersion}` === sampleReference && candidate.userEnvelopeInstanceId && envelopeIds.has(candidate.userEnvelopeInstanceId)) : undefined;
-  const done = [data.connections.connections.some((connection) => connection.status.phase === "connected"), envelopeIds.size > 0, data.preferences.workflowAcknowledged, Boolean(run), Boolean(run && ["succeeded", "failed", "cancelled"].includes(run.phase))];
-  const complete = done.filter(Boolean).length;
+  const { completed: complete, done } = deriveOnboardingProgress(data);
   if (complete === done.length) return null;
   const titles = ["Connect GitHub", "Get your first envelope", "Add the workflow to your repository", "Trigger a test run", "See the result"];
   return <div className="flex flex-wrap items-center gap-4 rounded-card bg-brand-soft px-[18px] py-3.5"><div className="min-w-48 flex-1"><p className="text-sm font-semibold">Get started</p><p className="mt-0.5 text-[13px] text-muted-ink">{complete} of 5 done · next: {titles[done.findIndex((value) => !value)]}</p><div aria-label={`${complete} of 5 onboarding steps complete`} aria-valuemax={5} aria-valuemin={0} aria-valuenow={complete} className="mt-2 h-[5px] overflow-hidden rounded-full bg-line-soft" role="progressbar"><div className="h-full rounded-full bg-brand" style={{ width: `${complete * 20}%` }} /></div></div><Link className="inline-flex h-[34px] items-center rounded-control bg-brand px-3.5 text-[13px] font-semibold text-on-brand hover:bg-brand-hover" href="/get-started">Continue</Link></div>;
@@ -147,7 +119,10 @@ export function NewEnvelopeView() {
 }
 
 function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<AvailableEnvelopeTemplate> }>) {
-  const [requestType, setRequestType] = useState<"template" | "custom">(templates.length ? "template" : "custom");
+  const searchParams = useSearchParams();
+  const requestedTemplate = searchParams.get("template");
+  const initialTemplateId = templates.some((template) => template.id === requestedTemplate) ? requestedTemplate ?? undefined : undefined;
+  const [requestType, setRequestType] = useState<"template" | "custom">(searchParams.get("type") === "custom" || !templates.length ? "custom" : "template");
   const [submitting, setSubmitting] = useState(false);
   return (
     <div className="space-y-5">
@@ -158,16 +133,16 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
         </select>
       </label>
       {requestType === "template" && templates.length
-        ? <TemplateEnvelopeRequestForm onSubmittingChange={setSubmitting} templates={templates} />
+        ? <TemplateEnvelopeRequestForm initialTemplateId={initialTemplateId} onSubmittingChange={setSubmitting} templates={templates} />
         : <CustomEnvelopeRequestForm onSubmittingChange={setSubmitting} />}
     </div>
   );
 }
 
-function TemplateEnvelopeRequestForm({ onSubmittingChange, templates }: Readonly<{ onSubmittingChange: (submitting: boolean) => void; templates: Array<AvailableEnvelopeTemplate> }>) {
+function TemplateEnvelopeRequestForm({ initialTemplateId, onSubmittingChange, templates }: Readonly<{ initialTemplateId?: string; onSubmittingChange: (submitting: boolean) => void; templates: Array<AvailableEnvelopeTemplate> }>) {
   const router = useRouter();
   const session = useSession();
-  const [templateId, setTemplateId] = useState(templates[0]?.id ?? "");
+  const [templateId, setTemplateId] = useState(initialTemplateId ?? templates[0]?.id ?? "");
   const template = templates.find((item) => item.id === templateId) ?? templates[0];
   const [budget, setBudget] = useState(template.ceiling.spec.budget.monthlyLimit);
   const [runtimeMinutes, setRuntimeMinutes] = useState(template.ceiling.spec.runtimeMinutesLimit ?? "");
@@ -307,7 +282,7 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
     : submission !== "idle" && submission !== "submitting"
       ? {
           conflict: "An equivalent envelope request already exists. Reload before retrying.",
-          rejected: "Steward rejected the custom authority. It must fit the deployment safety ceiling and capability catalog.",
+          rejected: "HyperShell rejected the custom authority. It must fit the deployment safety ceiling and capability catalog.",
           forbidden: "The Rust authorization boundary rejected the request.",
           unavailable: "The authoritative request service is unavailable.",
           error: "The request could not be accepted.",
@@ -318,7 +293,7 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
     <form className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
       <div>
         <h2 className="font-semibold">Complete requested authority</h2>
-        <p className="mt-1 text-sm text-muted-ink">Custom requests have no governing template and always require administrator approval. Steward validates the complete envelope against the deployment safety ceiling; model, tool, and limit values are specific to this deployment.</p>
+        <p className="mt-1 text-sm text-muted-ink">Custom requests have no governing template and always require administrator approval. HyperShell validates the complete envelope against the deployment safety ceiling; model, tool, and limit values are specific to this deployment.</p>
       </div>
       <label className="grid gap-2 text-sm font-semibold">Complete envelope JSON
         <textarea

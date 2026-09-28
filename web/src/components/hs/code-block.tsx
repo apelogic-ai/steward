@@ -34,7 +34,7 @@ export function CodeBlock({ code, language = "text", path }: Readonly<{
           {copied ? "Copied" : "Copy"}
         </button>
       </header>
-      <pre className="overflow-x-auto py-4 font-mono text-[13px] leading-5"><code>{code.split("\n").map((line, index) => <span className="grid grid-cols-[3rem_minmax(max-content,1fr)] px-4" key={`${index}-${line}`}><span aria-hidden="true" className="select-none border-r border-code-line pr-3 text-right text-code-muted">{index + 1}</span><span className="pl-4">{language === "yaml" ? highlightedYamlLine(line) : line || " "}</span></span>)}</code></pre>
+      <pre className="overflow-x-auto py-4 font-mono text-[13px] leading-5"><code>{code.split("\n").map((line, index) => <span className="grid grid-cols-[3rem_minmax(max-content,1fr)] px-4" key={`${index}-${line}`}><span aria-hidden="true" className="select-none border-r border-code-line pr-3 text-right text-code-muted">{index + 1}</span><span className="pl-4">{language === "yaml" ? highlightedYamlLine(line) : language === "shell" ? <><span aria-hidden="true" className="select-none text-code-muted">$ </span>{line || " "}</> : line || " "}</span></span>)}</code></pre>
     </section>
   );
 }

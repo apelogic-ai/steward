@@ -22,7 +22,6 @@ import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
 type TemplateMutationState = "idle" | "saving" | "saved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
-type LimitType = "singleRun" | "monthly";
 
 type AdminTemplateListItem = {
   autoProvisionThreshold?: BrowserEnvelope | null;
@@ -409,19 +408,14 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
   const allowedModels = new Set(modelCatalog.map(modelKey));
   const toolCatalog = capabilities.tools;
   const allowedTools = new Set(toolCatalog.map(toolKey));
-  const toolProviders = [...new Set(toolCatalog.map((tool) => tool.provider))];
   const [status, setStatus] = useState<TemplateMutationState>("idle");
   const [currentRevision, setCurrentRevision] = useState(template.revision);
   const [models, setModels] = useState<Array<ModelRef>>(template.spec.llms);
-  const [modelInput, setModelInput] = useState(modelCatalog[0] ? modelKey(modelCatalog[0]) : "");
   const [tools, setTools] = useState<Array<ToolGrant>>(template.spec.tools.map((tool) => ({
     provider: tool.provider,
     resource: tool.resource,
     action: tool.action,
   })));
-  const [toolProviderInput, setToolProviderInput] = useState(toolProviders[0] ?? "");
-  const [toolInput, setToolInput] = useState(toolCatalog[0] ? toolKey(toolCatalog[0]) : "");
-  const [limitType, setLimitType] = useState<LimitType>("singleRun");
   const [monthlyLimit, setMonthlyLimit] = useState(template.spec.budget.monthlyLimit);
   const [singleRunLimit, setSingleRunLimit] = useState(template.spec.budget.singleRunLimit ?? "");
   const [runtimeMinutesLimit, setRuntimeMinutesLimit] = useState(template.spec.runtimeMinutesLimit ?? "");
@@ -429,27 +423,25 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
   const [roles, setRoles] = useState(memberRoles.join(", "));
   const [autoApproveToCeiling, setAutoApproveToCeiling] = useState(autoProvisionThreshold === null || autoProvisionThreshold === undefined);
   const [thresholdJson, setThresholdJson] = useState(JSON.stringify(autoProvisionThreshold ?? template, null, 2));
-  const limitAmount = limitType === "singleRun" ? singleRunLimit : monthlyLimit;
-
-  function addModel() {
-    const selected = modelCatalog.find((model) => modelKey(model) === modelInput);
-    if (!selected || models.some((model) => modelKey(model) === modelInput)) return;
-    setModels([...models, selected]);
-  }
-
-  function removeModel(index: number) {
-    setModels(models.filter((_, modelIndex) => modelIndex !== index));
-  }
-
-  function addTool() {
-    const selected = toolCatalog.find((tool) => toolKey(tool) === toolInput && tool.provider === toolProviderInput);
-    if (!selected || tools.some((tool) => toolKey(tool) === toolInput)) return;
-    setTools([...tools, { provider: selected.provider, resource: selected.resource, action: selected.action }]);
-  }
-
-  function removeTool(index: number) {
-    setTools(tools.filter((_, toolIndex) => toolIndex !== index));
-  }
+  const missingModels = models.filter((model) => !allowedModels.has(modelKey(model)));
+  const missingTools = tools.filter((tool) => !allowedTools.has(toolKey(tool)));
+  const modelOptions = [...modelCatalog, ...missingModels].map((model) => ({
+    disabled: !allowedModels.has(modelKey(model)),
+    key: modelKey(model),
+    kind: "model" as const,
+    label: modelLabel(model, [...modelCatalog, ...missingModels]),
+    note: allowedModels.has(modelKey(model)) ? undefined : "Not listed in the deployment capability catalog",
+  }));
+  const toolOptions = [...toolCatalog, ...missingTools].map((tool) => {
+    const catalogTool = toolCatalog.find((candidate) => toolKey(candidate) === toolKey(tool));
+    return {
+      disabled: !catalogTool,
+      key: toolKey(tool),
+      kind: catalogTool?.accessClass ?? grantKindForAction(tool.action),
+      label: toolLabel(tool, [...toolCatalog, ...missingTools]),
+      note: catalogTool ? displayName(tool.provider) : "Not listed in the deployment capability catalog",
+    };
+  });
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -552,28 +544,32 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
           <TagSelect
             addPlaceholder="Add…"
             emptyPlaceholder="Search models…"
+            inputDisabled={modelCatalog.length === 0}
             label="Models"
             onChange={(keys) => setModels(keys.flatMap((key) => {
               const model = modelCatalog.find((candidate) => modelKey(candidate) === key);
               return model ? [model] : [];
             }))}
-            options={modelCatalog.map((model) => ({ key: modelKey(model), kind: "model", label: modelLabel(model, modelCatalog) }))}
+            options={modelOptions}
             value={models.map(modelKey)}
           />
+          {missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}
         </FormSection>
         <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Write and destructive tools are labelled.`} title="Tools">
           <div className="space-y-2">
             <TagSelect
               addPlaceholder="Add another tool…"
               emptyPlaceholder="Search GitHub tools…"
+              inputDisabled={toolCatalog.length === 0}
               label="Tools"
               onChange={(keys) => setTools(keys.flatMap((key) => {
                 const tool = toolCatalog.find((candidate) => toolKey(candidate) === key);
                 return tool ? [{ provider: tool.provider, resource: tool.resource, action: tool.action }] : [];
               }))}
-              options={toolCatalog.map((tool) => ({ key: toolKey(tool), kind: tool.accessClass, label: toolLabel(tool, toolCatalog), note: displayName(tool.provider) }))}
+              options={toolOptions}
               value={tools.map(toolKey)}
             />
+            {missingTools.length ? <p className="text-sm text-warn">{missingTools.length} selected tool{missingTools.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : toolCatalog.length === 0 ? <p className="text-sm text-muted-ink">No tools are listed in the deployment capability catalog.</p> : null}
             <p className="text-xs text-muted-ink">Type to filter. ↑ ↓ to move, Enter to add, Backspace removes the last tag.</p>
           </div>
         </FormSection>
@@ -596,126 +592,17 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
         <p className="mt-1 text-sm text-muted-ink">{create ? "Initial revision 1" : `Current revision ${currentRevision}`}</p>
       </div>
 
-      <fieldset className="grid gap-4 sm:grid-cols-2">
-        <legend className="mb-3 text-base font-semibold">Template identity and eligibility</legend>
-        <label className="grid gap-2 text-sm font-semibold">Display name
-          <input className={fieldClass} name="displayName" onChange={(event) => setName(event.target.value)} required value={name} />
-        </label>
-        <label className="grid gap-2 text-sm font-semibold">Eligible member roles
-          <input className={fieldClass} name="memberRoles" onChange={(event) => setRoles(event.target.value)} placeholder="developer, analyst" required value={roles} />
-        </label>
-      </fieldset>
+      <FormSection description="The member roles allowed to request this template." title="Template identity and eligibility">
+        <div className="grid gap-4 sm:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Display name<input className={fieldClass} name="displayName" onChange={(event) => setName(event.target.value)} required value={name} /></label><label className="grid gap-2 text-sm font-semibold">Eligible member roles<TagSelect addPlaceholder="Add another role…" allowCreate emptyPlaceholder="Add member role…" label="Eligible member roles" onChange={(next) => setRoles(next.join(", "))} options={roles.split(",").map((role) => role.trim()).filter(Boolean).map((role) => ({ key: role, kind: "neutral", label: role }))} value={roles.split(",").map((role) => role.trim()).filter(Boolean)} /></label></div>
+      </FormSection>
 
-      <fieldset className="grid gap-4 sm:grid-cols-5">
-        <legend className="mb-3 text-base font-semibold">Cumulative usage and TTL</legend>
-        <label className="grid gap-2 text-sm font-semibold">Currency
-          <select className={fieldClass} defaultValue="USD" name="currency"><option value="USD">USD</option></select>
-        </label>
-        <label className="grid gap-2 text-sm font-semibold">Limit type
-          <select className={fieldClass} onChange={(event) => setLimitType(event.target.value as LimitType)} value={limitType}>
-            <option value="singleRun">Single run</option>
-            <option value="monthly">Monthly</option>
-          </select>
-        </label>
-        <label className="grid gap-2 text-sm font-semibold">Limit amount (USD)
-          <input
-            className={fieldClass}
-            inputMode="decimal"
-            onChange={(event) => {
-              if (limitType === "singleRun") setSingleRunLimit(event.target.value);
-              else setMonthlyLimit(event.target.value);
-            }}
-            required
-            value={limitAmount}
-          />
-        </label>
-        <label className="grid gap-2 text-sm font-semibold">TTL
-          <input className={fieldClass} defaultValue={template.spec.ttl} name="ttl" required />
-        </label>
-        <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month
-          <input className={fieldClass} inputMode="decimal" onChange={(event) => setRuntimeMinutesLimit(event.target.value)} placeholder="Unlimited" value={runtimeMinutesLimit} />
-        </label>
-        <p className="text-sm text-muted-ink sm:col-span-5">
-          Single run: {singleRunLimit || "Not set"} USD · Monthly: {monthlyLimit || "Not set"} USD · Runtime: {runtimeMinutesLimit || "Unlimited"} min
-        </p>
-      </fieldset>
+      <FormSection description="Inference spend limits in USD and how long an envelope stays valid." title="Budget and lifetime">
+        <div className="grid gap-4 sm:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Per run (USD)<input className={fieldClass} inputMode="decimal" onChange={(event) => setSingleRunLimit(event.target.value)} required value={singleRunLimit} /></label><label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input className={fieldClass} inputMode="decimal" onChange={(event) => setMonthlyLimit(event.target.value)} required value={monthlyLimit} /></label><label className="grid gap-2 text-sm font-semibold">TTL<input className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" required /></label><label className="grid gap-2 text-sm font-semibold">Runtime minutes<input className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => setRuntimeMinutesLimit(event.target.value)} placeholder="60" value={runtimeMinutesLimit} /></label></div>
+      </FormSection>
 
-      <fieldset className="space-y-3">
-        <legend className="text-base font-semibold">Models</legend>
-        <div className="flex flex-wrap items-end gap-3">
-          <label className="grid min-w-64 flex-1 gap-2 text-sm font-semibold">Model
-            <select className={fieldClass} disabled={modelCatalog.length === 0} onChange={(event) => setModelInput(event.target.value)} value={modelInput}>
-              {modelCatalog.length === 0
-                ? <option value="">No models available</option>
-                : modelCatalog.map((model) => {
-                  const key = modelKey(model);
-                  return <option key={key} value={key}>{modelLabel(model, modelCatalog)}</option>;
-                })}
-            </select>
-          </label>
-          <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-50" disabled={!modelInput || models.some((model) => modelKey(model) === modelInput)} onClick={addModel} type="button">Add model</button>
-        </div>
-        {modelCatalog.length === 0 ? <p className="text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}
-        <ul className="flex flex-wrap gap-2" role="list">
-          {models.map((model, index) => {
-            const allowed = allowedModels.has(modelKey(model));
-            return (
-              <li className={allowed ? "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm" : "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm text-muted-ink"} key={`${modelKey(model)}:${index}`}>
-                <span>{modelLabel(model, models)}</span>
-                {!allowed ? <span className="text-xs">Not listed in the deployment capability catalog</span> : null}
-                <button aria-label={`Remove model ${model.model} from provider ${model.provider}`} className="rounded-full p-1 hover:bg-canvas" onClick={() => removeModel(index)} type="button">
-                  <svg aria-hidden="true" className="size-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 12 12">
-                    <path d="M2 2l8 8M10 2l-8 8" />
-                  </svg>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      </fieldset>
+      <FormSection description="Only models supported by the inference gateway can be selected." title="Models"><fieldset><legend className="sr-only">Models</legend><TagSelect addPlaceholder="Add…" emptyPlaceholder="Search models…" inputDisabled={modelCatalog.length === 0} label="Models" onChange={(keys) => setModels(keys.flatMap((key) => { const model = [...modelCatalog, ...missingModels].find((candidate) => modelKey(candidate) === key); return model ? [model] : []; }))} options={modelOptions} value={models.map(modelKey)} />{missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}</fieldset></FormSection>
 
-      <fieldset className="space-y-3">
-        <legend className="text-base font-semibold">Tools</legend>
-        <div className="grid gap-3 sm:grid-cols-[1fr_2fr_auto] sm:items-end">
-          <label className="grid gap-2 text-sm font-semibold">Tool provider
-            <select className={fieldClass} disabled={toolProviders.length === 0} onChange={(event) => {
-              const provider = event.target.value;
-              setToolProviderInput(provider);
-              const first = toolCatalog.find((tool) => tool.provider === provider);
-              setToolInput(first ? toolKey(first) : "");
-            }} value={toolProviderInput}>
-              {toolProviders.length === 0
-                ? <option value="">No tool providers available</option>
-                : toolProviders.map((provider) => <option key={provider} value={provider}>{provider === "github" ? "GitHub" : provider}</option>)}
-            </select>
-          </label>
-          <label className="grid gap-2 text-sm font-semibold">Tool
-            <select className={fieldClass} disabled={toolCatalog.length === 0} onChange={(event) => setToolInput(event.target.value)} value={toolInput}>
-              {toolCatalog.length === 0
-                ? <option value="">No tools available</option>
-                : toolCatalog.filter((tool) => tool.provider === toolProviderInput).map((tool) => <option key={toolKey(tool)} value={toolKey(tool)}>{toolLabel(tool, toolCatalog)}</option>)}
-            </select>
-          </label>
-          <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:cursor-not-allowed disabled:opacity-50" disabled={!toolInput || tools.some((tool) => toolKey(tool) === toolInput)} onClick={addTool} type="button">Add tool</button>
-        </div>
-        {toolCatalog.length === 0 ? <p className="text-sm text-muted-ink">No tools are listed in the deployment capability catalog.</p> : null}
-        <ul className="flex flex-wrap gap-2" role="list">
-          {tools.map((tool, index) => {
-            const allowed = allowedTools.has(toolKey(tool));
-            return (
-              <li className={allowed ? "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm" : "flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm text-muted-ink"} key={`${toolKey(tool)}:${index}`}>
-                <span>{toolValue(tool)}</span>
-                {!allowed ? <span className="text-xs">Not listed in the deployment capability catalog</span> : null}
-                <button aria-label={`Remove tool ${toolValue(tool)}`} className="rounded-full p-1 hover:bg-canvas" onClick={() => removeTool(index)} type="button">
-                  <svg aria-hidden="true" className="size-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 12 12">
-                    <path d="M2 2l8 8M10 2l-8 8" />
-                  </svg>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      </fieldset>
+      <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Write and destructive tools are labelled.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><TagSelect addPlaceholder="Add another tool…" emptyPlaceholder="Search tools…" inputDisabled={toolCatalog.length === 0} label="Tools" onChange={(keys) => setTools(keys.flatMap((key) => { const tool = [...toolCatalog, ...missingTools].find((candidate) => toolKey(candidate) === key); return tool ? [{ provider: tool.provider, resource: tool.resource, action: tool.action }] : []; }))} options={toolOptions} value={tools.map(toolKey)} />{missingTools.length ? <p className="mt-2 text-sm text-warn">{missingTools.length} selected tool{missingTools.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : toolCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No tools are listed in the deployment capability catalog.</p> : null}<p className="mt-2 text-xs text-muted-ink">Type to filter. ↑ ↓ to move, Enter to add, Backspace removes the last tag.</p></fieldset></FormSection>
 
       <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
         <div className="space-y-4">
@@ -724,24 +611,7 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
         </div>
       </FormSection>
 
-      <details className="rounded-md border p-4">
-        <summary className="cursor-pointer font-semibold">Advanced</summary>
-        <fieldset className="mt-5 space-y-4">
-          <legend className="text-base font-semibold">Runner config</legend>
-          <div className="flex flex-wrap gap-5">
-            {(["linux", "mac", "windows"] as const).map((platform) => (
-              <label className="flex min-h-11 items-center gap-2 text-sm capitalize" key={platform}>
-                <input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}
-              </label>
-            ))}
-          </div>
-          <div className="grid gap-4 sm:grid-cols-3">
-            <label className="grid gap-2 text-sm font-semibold">Memory<input className={fieldClass} defaultValue={runner?.memory ?? ""} name="memory" placeholder="2Gi" /></label>
-            <label className="grid gap-2 text-sm font-semibold">Compute<input className={fieldClass} defaultValue={runner?.compute ?? ""} name="compute" placeholder="1000m" /></label>
-            <label className="grid gap-2 text-sm font-semibold">Storage<input className={fieldClass} defaultValue={runner?.storage ?? ""} name="storage" placeholder="10Gi" /></label>
-          </div>
-        </fieldset>
-      </details>
+      <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" placeholder="2Gi" /></label><label className="grid gap-2 text-sm font-semibold">Compute<input className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" placeholder="1000m" /></label><label className="grid gap-2 text-sm font-semibold">Storage<input className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" placeholder="10Gi" /></label></div></fieldset></FormSection>
 
       {status !== "idle" && status !== "saving" ? (
         <p className={status === "saved" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status)}</p>

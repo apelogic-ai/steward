@@ -10,7 +10,7 @@ import {
   type ProviderConnectionView,
 } from "@/api-client";
 import { connectionHealth } from "@/components/connection-health";
-import { SectionCard } from "@/components/hs";
+import { ConfirmationDialog, SectionCard } from "@/components/hs";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -73,7 +73,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
         <button className="h-9 rounded-control border bg-panel px-3 text-sm font-semibold disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">Reconnect</button>
         <button className="h-9 rounded-control border border-err px-3 text-sm font-semibold text-err hover:bg-err-soft" onClick={() => setDisconnectOpen(true)} type="button">Disconnect…</button>
       </div>
-      {disconnectOpen ? <div aria-modal="true" className="fixed inset-0 z-50 grid place-items-center bg-black/20 p-4" role="alertdialog"><div className="w-full max-w-sm rounded-card border bg-panel p-5 shadow-lg"><h2 className="text-base font-semibold">Disconnect {connection?.displayName ?? "GitHub"}?</h2><p className="mt-2 text-sm text-muted-ink">This revokes the shared connection for every current and future runtime using your identity.</p><div className="mt-5 flex justify-end gap-2"><button className="h-9 rounded-control border px-3 text-sm font-semibold" onClick={() => setDisconnectOpen(false)} type="button">Keep connection</button><button className="h-9 rounded-control bg-err px-3 text-sm font-semibold text-white disabled:opacity-50" disabled={action === "working"} onClick={() => void disconnect()} type="button">Disconnect GitHub</button></div></div></div> : null}
+      <ConfirmationDialog cancelLabel="Keep connection" confirmLabel="Disconnect GitHub" description="This revokes the shared connection for every current and future runtime using your identity." onConfirm={() => void disconnect()} onOpenChange={setDisconnectOpen} open={disconnectOpen} pending={action === "working"} title={`Disconnect ${connection?.displayName ?? "GitHub"}?`} />
     </div>
   ) : null;
 

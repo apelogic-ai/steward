@@ -5,11 +5,9 @@ import { useCallback, useState } from "react";
 
 import {
   allRun,
-  allRuns,
   allRunTimeline,
   cancelMyRun,
   myRun,
-  myRuns,
   myRunTimeline,
   rerunMyRun,
   type AllRunsResponse,
@@ -18,12 +16,13 @@ import {
   type BrowserRunView,
   type MyRunsResponse,
 } from "@/api-client";
-import { DataTable, FilterTabs } from "@/components/hs";
+import { DataTable, FilterChips } from "@/components/hs";
 import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
 import { ExecutionLogPanel } from "@/components/run-log-view";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import type { ExecutionLogStream } from "@/data/execution-log";
 import { useApiResource } from "@/data/use-api-resource";
+import { loadAllMyRuns, loadAllRuns } from "@/data/paginated-api";
 import { useSession } from "@/session/session-context";
 import { EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 
@@ -112,23 +111,6 @@ export async function pollRerun(
   return { failure: "unavailable" };
 }
 
-function TerminalPhaseLogs({ admin, taskUid }: Readonly<{ admin: boolean; taskUid: string }>) {
-  const runPath = `${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}`;
-  return (
-    <div className="mt-3 flex flex-wrap gap-2">
-      {(["stdout", "stderr"] as const).map((stream) => (
-        <a
-          className="inline-flex min-h-11 items-center rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas"
-          href={`${runPath}/logs/${stream}`}
-          key={stream}
-        >
-          View {stream}
-        </a>
-      ))}
-    </div>
-  );
-}
-
 function RunStepRow({ admin, step, taskUid }: Readonly<{
   admin: boolean;
   step: BrowserRunView["stages"][number]["steps"][number];
@@ -184,8 +166,8 @@ export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; ru
 export function RunsView({ admin = false }: Readonly<{ admin?: boolean }>) {
   const [phase, setPhase] = useState("all");
   const load = useCallback(() => admin
-    ? allRuns({ cache: "no-store", credentials: "same-origin" }) as Promise<{ data?: AllRunsResponse; response?: Response }>
-    : myRuns({ cache: "no-store", credentials: "same-origin" }) as Promise<{ data?: MyRunsResponse; response?: Response }>, [admin]);
+    ? loadAllRuns() as Promise<{ data?: AllRunsResponse; response?: Response }>
+    : loadAllMyRuns() as Promise<{ data?: MyRunsResponse; response?: Response }>, [admin]);
   const state = useApiResource<AllRunsResponse | MyRunsResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
@@ -195,7 +177,7 @@ export function RunsView({ admin = false }: Readonly<{ admin?: boolean }>) {
       />
       <ResourceBoundary state={state}>{(data) => (
         <div className="space-y-5">
-          <FilterTabs
+          <FilterChips
             active={phase}
             items={[
               { count: data.runs.length, label: "All", value: "all" },
@@ -289,28 +271,6 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
           </article>
         );
       }}</ResourceBoundary>
-      <div className="space-y-3">
-        <h2 className="text-xl font-semibold">Timeline</h2>
-        <ResourceBoundary state={timelineState}>{({ events }) => events.length === 0 ? (
-          <p className="text-sm text-muted-ink">No timeline events yet.</p>
-        ) : (
-          <ol className="space-y-3 border-s-2 ps-5">
-            {events.map((event, index) => (
-              <li className="relative rounded-panel border bg-panel p-4" key={`${event.at}-${index}`}>
-                <span aria-hidden="true" className="absolute -start-[1.63rem] top-5 size-3 rounded-full bg-brand" />
-                <p className="font-semibold capitalize">{event.kind.replaceAll(/([A-Z])/g, " $1")}</p>
-                {event.kind === "phase" ? (
-                  <>
-                    <StatusBadge value={event.phase} />
-                    {isTerminalPhase(event.phase) ? <TerminalPhaseLogs admin={admin} taskUid={taskUid} /> : null}
-                  </>
-                ) : null}
-                <time className="mt-2 block text-xs text-muted-ink">{dateTime(event.at)}</time>
-              </li>
-            ))}
-          </ol>
-        )}</ResourceBoundary>
-      </div>
     </section>
   );
 }

@@ -4,79 +4,32 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
-  getBrowserPreferences,
-  listProviderConnections,
-  listPublishedWorkflows,
-  listRequests,
   listTemplates,
-  myRuns,
   updateBrowserPreferences,
-  type BrowserPreferencesView,
-  type ConnectionsCollectionResponse,
-  type EnvelopeRequestsResponse,
   type EnvelopeTemplatesResponse,
   type GithubActionsWorkflowResponse,
-  type MyRunsResponse,
-  type PublishedWorkflowsResponse,
 } from "@/api-client";
 import { CodeBlock } from "@/components/hs";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { type MutationFailureState } from "@/data/mutation-state";
+import { deriveOnboardingProgress, loadOnboardingEvidence, matchingSampleRun, type OnboardingEvidence } from "@/data/onboarding-progress";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 import { renderWorkflowForEnvelope } from "@/workflows/api";
 
-type OnboardingData = {
-  connections: ConnectionsCollectionResponse;
-  envelopes: EnvelopeRequestsResponse;
-  preferences: BrowserPreferencesView;
-  workflows: PublishedWorkflowsResponse;
-  runs: MyRunsResponse;
+type OnboardingData = OnboardingEvidence & {
   templates: EnvelopeTemplatesResponse;
 };
 
-async function loadAllProvisionedEnvelopes() {
-  const requests: EnvelopeRequestsResponse["requests"] = [];
-  const seen = new Set<string>();
-  let cursor: string | undefined;
-  for (;;) {
-    const page = await listRequests({ cache: "no-store", credentials: "same-origin", query: { cursor, limit: 100, status: "provisioned" } });
-    if (!page.data || !page.response?.ok) return page;
-    requests.push(...page.data.requests);
-    const nextCursor = page.data.nextCursor ?? undefined;
-    if (!nextCursor) return { data: { ...page.data, nextCursor: null, requests }, response: page.response };
-    if (seen.has(nextCursor)) return { data: undefined, response: new Response(null, { status: 502 }) };
-    seen.add(nextCursor);
-    cursor = nextCursor;
-  }
-}
-
-async function loadAllRuns() {
-  const runs: MyRunsResponse["runs"] = [];
-  const seen = new Set<string>();
-  let cursor: string | undefined;
-  for (;;) {
-    const page = await myRuns({ cache: "no-store", credentials: "same-origin", query: { cursor, limit: 100 } });
-    if (!page.data || !page.response?.ok) return page;
-    runs.push(...page.data.runs);
-    const nextCursor = page.data.nextCursor ?? undefined;
-    if (!nextCursor) return { data: { ...page.data, nextCursor: null, runs }, response: page.response };
-    if (seen.has(nextCursor)) return { data: undefined, response: new Response(null, { status: 502 }) };
-    seen.add(nextCursor);
-    cursor = nextCursor;
-  }
-}
-
-function matchingSampleRun(
-  runs: MyRunsResponse["runs"],
-  sampleWorkflow: string | null,
-  provisionedEnvelopeIds: ReadonlySet<string>,
-) {
-  if (!sampleWorkflow) return undefined;
-  return runs.find((run) => run.trigger?.provider === "github"
-    && `${run.workflowName}@${run.workflowVersion}` === sampleWorkflow
-    && Boolean(run.userEnvelopeInstanceId)
-    && provisionedEnvelopeIds.has(String(run.userEnvelopeInstanceId)));
+function runDuration(createdAt: string, updatedAt: string): string {
+  const start = new Date(createdAt).valueOf();
+  const end = new Date(updatedAt).valueOf();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "duration unavailable";
+  const seconds = Math.round((end - start) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
 }
 
 export function sampleRunDone(
@@ -84,23 +37,18 @@ export function sampleRunDone(
   sampleWorkflow: string | null,
   provisionedEnvelopeIds: ReadonlySet<string>,
 ) {
-  return Boolean(matchingSampleRun(runs as MyRunsResponse["runs"], sampleWorkflow, provisionedEnvelopeIds));
+  return Boolean(matchingSampleRun(runs as OnboardingEvidence["runs"]["runs"], sampleWorkflow, provisionedEnvelopeIds));
 }
 
 export function OnboardingView() {
   const load = useCallback(async () => {
-    const [connections, envelopes, preferences, workflows, runs, templates] = await Promise.all([
-      listProviderConnections({ cache: "no-store", credentials: "same-origin" }),
-      loadAllProvisionedEnvelopes(),
-      getBrowserPreferences({ cache: "no-store", credentials: "same-origin" }),
-      listPublishedWorkflows({ cache: "no-store", credentials: "same-origin" }),
-      loadAllRuns(),
+    const [evidence, templates] = await Promise.all([
+      loadOnboardingEvidence(),
       listTemplates({ cache: "no-store", credentials: "same-origin" }),
     ]);
-    const results = [connections, envelopes, preferences, workflows, runs, templates];
-    const response = results.find((result) => !result.response?.ok)?.response ?? connections.response;
-    const data = connections.data && envelopes.data && preferences.data && workflows.data && runs.data && templates.data
-      ? { connections: connections.data, envelopes: envelopes.data, preferences: preferences.data, workflows: workflows.data, runs: runs.data, templates: templates.data }
+    const response = !evidence.response?.ok ? evidence.response : templates.response;
+    const data = evidence.data && templates.data
+      ? { ...evidence.data, templates: templates.data }
       : undefined;
     return { data, response };
   }, []);
@@ -119,14 +67,14 @@ function OnboardingChecklist({ data }: Readonly<{ data: OnboardingData }>) {
   const [dismissal, setDismissal] = useState<"idle" | "working" | "done" | "shown" | MutationFailureState>("idle");
   const [listening, setListening] = useState(false);
   const [renderedWorkflow, setRenderedWorkflow] = useState<GithubActionsWorkflowResponse | null>(null);
+  const [selectedTemplateId, setSelectedTemplateId] = useState(data.templates.templates[0]?.id ?? "");
   const connectedConnection = data.connections.connections.find((connection) => connection.status.phase === "connected");
   const provisionedRequest = data.envelopes.requests.find((request) => request.status === "provisioned" && request.envelopeInstanceId);
-  const provisionedEnvelopeIds = useMemo(() => new Set(data.envelopes.requests.filter((request) => request.status === "provisioned" && request.envelopeInstanceId).map((request) => String(request.envelopeInstanceId))), [data.envelopes.requests]);
-  const sample = data.workflows.workflows.find((workflow) => workflow.sample);
-  const sampleWorkflow = sample ? `${sample.name}@${sample.version}` : null;
+  const progress = useMemo(() => deriveOnboardingProgress(data), [data]);
+  const { sample, sampleRun, sampleWorkflow } = progress;
   const workflowReady = data.preferences.workflowAcknowledged || workflowAcknowledgement === "done";
-  const sampleRun = matchingSampleRun(data.runs.runs, sampleWorkflow, provisionedEnvelopeIds);
-  const done = [Boolean(connectedConnection), Boolean(provisionedRequest), workflowReady, Boolean(sampleRun), Boolean(sampleRun && ["succeeded", "failed", "cancelled"].includes(sampleRun.phase))];
+  const done = [...progress.done];
+  done[2] = workflowReady;
   const completed = done.filter(Boolean).length;
   const current = done.findIndex((value) => !value);
   const [openStep, setOpenStep] = useState(current === -1 ? 4 : current);
@@ -163,7 +111,7 @@ function OnboardingChecklist({ data }: Readonly<{ data: OnboardingData }>) {
     {
       title: "Get your first envelope",
       status: done[1] ? `${provisionedRequest?.templateId ?? "Custom"} envelope ${provisionedRequest?.envelopeInstanceId} provisioned` : "Pick a template; within the ceiling it is provisioned instantly",
-      body: <div className="space-y-4"><div className="grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">{data.templates.templates.map((template, index) => <div className={`rounded-tile border p-4 ${index === 0 ? "border-brand bg-brand-soft" : ""}`} key={template.id}><div className="flex justify-between gap-3"><strong className="text-sm">{template.displayName}</strong><span className="font-mono text-xs text-muted-ink">rev {template.revision}</span></div><p className="mt-2 text-xs text-muted-ink">Up to {template.ceiling.spec.budget.monthlyLimit} {template.ceiling.spec.budget.currency}/mo · {template.ceiling.spec.ttl}</p></div>)}</div><div className="flex flex-wrap gap-3"><Link className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href="/envelopes/new">Request {data.templates.templates[0]?.displayName ?? "an"} envelope</Link><Link className="self-center text-sm font-semibold" href="/envelopes/new">Customize limits instead</Link></div></div>,
+      body: <div className="space-y-4"><p className="text-sm text-muted-ink">Requests within a template&apos;s ceiling are approved and provisioned right away.</p><div className="grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">{data.templates.templates.map((template) => <button aria-pressed={template.id === selectedTemplateId} className={`rounded-tile border p-4 text-left ${template.id === selectedTemplateId ? "border-brand bg-brand-soft" : "hover:bg-subtle"}`} key={template.id} onClick={() => setSelectedTemplateId(template.id)} type="button"><span className="flex justify-between gap-3"><strong className="text-sm">{template.displayName}</strong><span className="font-mono text-xs text-muted-ink">rev {template.revision}</span></span><span className="mt-2 block text-xs text-muted-ink">Up to {template.ceiling.spec.budget.monthlyLimit} {template.ceiling.spec.budget.currency}/mo · {template.ceiling.spec.ttl}</span></button>)}</div><div className="flex flex-wrap gap-3"><Link className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href={`/envelopes/new?template=${encodeURIComponent(selectedTemplateId)}`}>Request {data.templates.templates.find((template) => template.id === selectedTemplateId)?.displayName ?? "an"} envelope</Link><Link className="self-center text-sm font-semibold" href="/envelopes/new?type=custom">Customize limits instead</Link></div></div>,
     },
     {
       title: "Add the workflow to your repository",
@@ -177,7 +125,7 @@ function OnboardingChecklist({ data }: Readonly<{ data: OnboardingData }>) {
     },
     {
       title: "See the result",
-      status: done[4] && sampleRun ? `${sampleRun.phase.charAt(0).toUpperCase()}${sampleRun.phase.slice(1)} · ${sampleRun.observedSpend?.observedAmount ?? "—"} ${sampleRun.observedSpend?.currency ?? ""}` : "Watch the run and open its log",
+      status: done[4] && sampleRun ? `${sampleRun.phase.charAt(0).toUpperCase()}${sampleRun.phase.slice(1)} in ${runDuration(sampleRun.createdAt, sampleRun.updatedAt)} · ${sampleRun.observedSpend?.observedAmount ?? "—"} ${sampleRun.observedSpend?.currency ?? ""}` : "Watch the run and open its log",
       body: sampleRun ? <div className="space-y-4 rounded-tile border p-4"><div className="flex flex-wrap items-start justify-between gap-4"><div><div className="flex items-center gap-2"><StatusBadge value={sampleRun.phase} /><strong>{sampleRun.workflow}</strong></div><p className="mt-1 font-mono text-xs text-muted-ink">{sampleRun.taskUid}</p></div><p className="text-sm text-muted-ink">{sampleRun.observedSpend ? `${sampleRun.observedSpend.observedAmount} ${sampleRun.observedSpend.currency}` : "Spend not reported"}</p></div><div className="rounded-control bg-code p-3 font-mono text-xs leading-5 text-code-ink">admission complete<br />runtime provisioned<br />agent execution {sampleRun.phase}</div><div className="flex flex-wrap gap-3"><Link className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href={`/runs/${sampleRun.taskUid}`}>Open run</Link><Link className="rounded-control border px-4 py-2 text-sm font-semibold" href="/envelopes">Go to envelopes</Link></div></div> : <p className="text-sm text-muted-ink">The run appears here as soon as it starts.</p>,
     },
   ];
