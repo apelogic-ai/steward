@@ -626,7 +626,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.0"
+          test "$version" = "0.3.1"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
@@ -736,14 +736,13 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.0 completes the User Envelope catalog redesign and HyperShell browser/API surface. It adds template-free reviewed requests, exact administrator provisioning, enforced auto-provision thresholds, multiple active Envelopes with owner-scoped digest selection, typed run observability, governed cancellation and re-run, and supported operator RBAC/template/provisioning commands.\n\n'
-            printf 'Day-two operator commands call versioned bearer-authenticated administrative contracts; Steward records the server-verified operator identity as actor and does not accept a caller-selected audit identity.\n\n'
-            printf 'Template revisions are now the sole authority for new writes. Legacy role-keyed Envelope rows remain read-only for one compatibility window, and mixed-version template authoring is unsupported.\n\n'
-            printf 'An optional disabled-by-default LLM-only smoke template uses the ordinary catalog and User Envelope paths with an exact configured model, bounded budget and TTL, eligible roles, empty tools, and threshold equal to ceiling.\n\n'
+            printf 'Steward v0.3.1 completes the HyperShell browser workspace across request review, Envelope management, governed runs and logs, connections, settings, and guided onboarding.\n\n'
+            printf 'The platform preflight now enforces the same Steward organization identifier contract as the API, emits the five supported public HTTP routes, and ships corrected neutral examples.\n\n'
+            printf 'Core-mode installation guidance now states that external Task submission is rejected before Task or runtime creation until orchestration is enabled, while browser authentication remains optional for core binaries.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'Before rollout, upgrade capability catalog v1 to v2, stop template authoring during mixed-version operation, and keep optional v3 identity and active orchestration staged until every component is upgraded.\n\n'
-            printf 'Rollback to v0.2.6 is supported only before custom requests, multiple active Envelopes, new catalog-only template revisions, or required v3 identity state exist. Preserve every migration and append-only history; see docs/installation/upgrade-v0.3.0.md.\n\n'
+            printf 'This patch adds no migration. Installations upgrading from v0.2.6 must still complete the v0.3 prerequisites before rollout.\n\n'
+            printf 'Rollback from v0.3.1 to v0.3.0 requires no database rollback. The broader v0.2.6 rollback boundary remains unchanged; see docs/installation/upgrade-v0.3.0.md.\n\n'
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
@@ -813,7 +812,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.0.json
+          subject-path: dist/steward-product-compatibility-0.3.1.json
 
       - name: Archive product compatibility verification material
         env:
@@ -823,7 +822,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.0.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.1.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 

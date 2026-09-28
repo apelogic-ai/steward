@@ -2,7 +2,7 @@
 
 Status: **Reference**
 
-Applies to Steward v0.3.0 and its User-Envelope-only Task authority model. An
+Applies to Steward v0.3.1 and its User-Envelope-only Task authority model. An
 installation still on v0.1.23 first follows the [v0.2 upgrade](upgrade-v0.2.0.md),
 and an installation on v0.2.6 follows the [v0.3 upgrade](upgrade-v0.3.0.md)
 before using this page.

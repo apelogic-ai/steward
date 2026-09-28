@@ -7,6 +7,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-27
+
+### Changed
+
+- Completed the HyperShell browser workspace across request review, Envelope
+  management, governed runs and logs, connections, settings, and guided
+  onboarding with a consistent responsive component system.
+
+### Fixed
+
+- Enforced the API's `org_` organization identifier contract in the Helm schema,
+  platform preflight, and shipped examples.
+- Generated only the five supported public HTTP routes instead of the obsolete
+  catch-all `/api` route.
+- Corrected core-mode installation guidance: external Task submission is
+  rejected before Task or runtime creation until orchestration is enabled, and
+  browser authentication is not a core-binary prerequisite.
+
 ## [0.3.0] - 2026-09-27
 
 ### Added
@@ -233,7 +251,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/apelogic-ai/steward/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/apelogic-ai/steward/compare/v0.2.6...v0.3.0
 [0.2.6]: https://github.com/apelogic-ai/steward/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/apelogic-ai/steward/compare/v0.2.4...v0.2.5

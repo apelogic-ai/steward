@@ -15,12 +15,13 @@ write_fixture() {
   local app="$2"
   local readme="$3"
   local guide="$4"
+  local upgrade="${5:-$4}"
   printf 'apiVersion: v2\nname: steward\nversion: %s\nappVersion: %s\n' "${chart}" "${app}" > "${fixture}/charts/steward/Chart.yaml"
   printf 'Current installation contract: chart \x60%s\x60.\n' "${readme}" > "${fixture}/README.md"
   printf 'Release contract: chart \x60%s\x60.\n' "${guide}" > "${fixture}/docs/installation/installation-guide.md"
   printf 'Current release contract: chart \x60%s\x60.\n' "${guide}" > "${fixture}/charts/steward/README.md"
   printf '## [%s] - 2026-09-22\n' "${guide}" > "${fixture}/CHANGELOG.md"
-  printf '# Upgrade to Steward v%s\n' "${guide}" > "${fixture}/docs/installation/upgrade-v0.3.0.md"
+  printf '# Upgrade to Steward v%s\n' "${upgrade}" > "${fixture}/docs/installation/upgrade-v0.3.0.md"
 }
 
 write_fixture 0.1.23 0.1.23 0.1.23 0.1.23
@@ -47,13 +48,13 @@ for mismatch in app readme guide tag; do
   fi
 done
 
-write_fixture 0.3.0 0.3.0 0.3.0 0.3.0
-test "$(bash "${root}/scripts/validate-release-version.sh" "${fixture}")" = 0.3.0
+write_fixture 0.3.1 0.3.1 0.3.1 0.3.1 0.3.0
+test "$(bash "${root}/scripts/validate-release-version.sh" "${fixture}")" = 0.3.1
 for mismatch in chart-readme changelog upgrade; do
-  write_fixture 0.3.0 0.3.0 0.3.0 0.3.0
+  write_fixture 0.3.1 0.3.1 0.3.1 0.3.1 0.3.0
   case "${mismatch}" in
-    chart-readme) sed -i.bak "s/chart \`0.3.0\`/chart \`0.1.23\`/" "${fixture}/charts/steward/README.md" ;;
-    changelog) sed -i.bak 's/\[0.3.0\]/[0.1.23]/' "${fixture}/CHANGELOG.md" ;;
+    chart-readme) sed -i.bak "s/chart \`0.3.1\`/chart \`0.1.23\`/" "${fixture}/charts/steward/README.md" ;;
+    changelog) sed -i.bak 's/\[0.3.1\]/[0.1.23]/' "${fixture}/CHANGELOG.md" ;;
     upgrade) sed -i.bak 's/v0.3.0/v0.1.23/' "${fixture}/docs/installation/upgrade-v0.3.0.md" ;;
   esac
   if bash "${root}/scripts/validate-release-version.sh" "${fixture}" >/dev/null 2>&1; then
