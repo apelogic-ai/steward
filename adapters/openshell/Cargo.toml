@@ -13,7 +13,7 @@ s0-spike = ["dep:openshell-sdk", "dep:tokio"]
 
 [dependencies]
 kube = { workspace = true, features = ["client"], optional = true } # Resolves OpenShell's immutable sandbox UUID inside the vendor adapter.
-openshell-sdk = { git = "https://github.com/NVIDIA/OpenShell", rev = "832841295992f0112f43f27de5d68213376ff3cb", version = "=0.0.0", optional = true }
+openshell-sdk = { git = "https://github.com/NVIDIA/OpenShell", rev = "6648bd0c290efbc41ba131ee9831ee45cd431f94", version = "=0.0.0", optional = true }
 reqwest = { workspace = true, features = ["stream"], optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }

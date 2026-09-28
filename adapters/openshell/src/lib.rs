@@ -20,7 +20,9 @@ use kube::core::DynamicObject;
 #[cfg(feature = "identity")]
 use kube::discovery::Discovery;
 #[cfg(feature = "runtime")]
-use openshell_sdk::raw::proto::datamodel::v1::{ObjectMeta, Provider};
+use openshell_sdk::raw::proto::datamodel::v1::{
+    ObjectMeta, Provider, WorkspaceSelector, workspace_selector,
+};
 #[cfg(feature = "runtime")]
 use openshell_sdk::raw::proto::{
     AttachSandboxProviderRequest, CreateProviderRequest, DetachSandboxProviderRequest,
@@ -30,7 +32,8 @@ use openshell_sdk::raw::proto::{
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
-    EdgeAuthInterceptor, ExecOptions, OpenShellClient, SandboxPhase, SandboxSpec, SdkError,
+    DeleteOptions, EdgeAuthInterceptor, ExecOptions, OpenShellClient, SandboxPhase, SandboxSpec,
+    SdkError,
 };
 #[cfg(feature = "runtime")]
 use reqwest::header::CACHE_CONTROL;
@@ -87,6 +90,15 @@ const TOOL_PROVIDER: &str = "steward-mcp-gw";
 const INFERENCE_PROVIDER: &str = "steward-litellm";
 #[cfg(feature = "runtime")]
 const GRPC_NOT_FOUND: i32 = 5;
+
+#[cfg(feature = "runtime")]
+fn named_workspace_scope(workspace: &str) -> Option<WorkspaceSelector> {
+    Some(WorkspaceSelector {
+        selection: Some(workspace_selector::Selection::Workspace(
+            workspace.to_owned(),
+        )),
+    })
+}
 #[cfg(feature = "runtime")]
 const GRPC_ALREADY_EXISTS: i32 = 6;
 #[cfg(feature = "runtime")]
@@ -1539,7 +1551,8 @@ impl OpenShellRuntime {
 
     async fn exec_task_process(
         &self,
-        sandbox_id: &str,
+        workspace: &str,
+        sandbox: &str,
         command: &[String],
         environment: HashMap<String, String>,
         execution_class: SandboxExecutionClass,
@@ -1548,15 +1561,22 @@ impl OpenShellRuntime {
         let mut client = self.authenticated_client().await?.raw_grpc();
         let response = client
             .exec_sandbox(ExecSandboxRequest {
-                sandbox_id: sandbox_id.to_owned(),
+                workspace_scope: named_workspace_scope(workspace),
+                sandbox: sandbox.to_owned(),
                 command: command.to_vec(),
                 workdir: "/sandbox/steward-input".to_owned(),
                 environment,
-                timeout_seconds: 30 * 60,
+                execution_timeout: Some(StdDuration::from_secs(30 * 60).try_into().map_err(
+                    |error| PortError::Failed {
+                        reason: format!("OpenShell execution timeout is invalid: {error}"),
+                    },
+                )?),
                 stdin: Vec::new(),
                 tty: false,
                 cols: 0,
                 rows: 0,
+                no_login_shell: false,
+                request_id: String::new(),
             })
             .await
             .map_err(raw_port_failure)?;
@@ -1723,7 +1743,7 @@ impl OpenShellRuntime {
         let snapshot = client
             .get_sandbox(GetSandboxRequest {
                 name: sandbox.to_owned(),
-                workspace: workspace.to_owned(),
+                workspace_scope: named_workspace_scope(workspace),
             })
             .await
             .map_err(raw_port_failure)?
@@ -1788,7 +1808,7 @@ impl OpenShellRuntime {
         match client
             .get_provider(GetProviderRequest {
                 name: provider_name.to_owned(),
-                workspace: workspace.to_owned(),
+                workspace_scope: named_workspace_scope(workspace),
             })
             .await
         {
@@ -1824,7 +1844,8 @@ impl OpenShellRuntime {
                     profile_workspace: String::new(),
                     ..Provider::default()
                 }),
-                workspace: workspace.to_owned(),
+                workspace_scope: named_workspace_scope(workspace),
+                request_id: String::new(),
             })
             .await;
         match response {
@@ -1861,10 +1882,11 @@ impl OpenShellRuntime {
         let mut client = self.authenticated_client().await?.raw_grpc();
         client
             .attach_sandbox_provider(AttachSandboxProviderRequest {
-                sandbox_name: sandbox.to_owned(),
-                provider_name: provider_name.to_owned(),
+                workspace_scope: named_workspace_scope(workspace),
+                sandbox: sandbox.to_owned(),
+                provider: provider_name.to_owned(),
                 expected_resource_version: resource_version,
-                workspace: workspace.to_owned(),
+                request_id: String::new(),
             })
             .await
             .map(|_| ())
@@ -1879,8 +1901,10 @@ impl OpenShellRuntime {
         let mut client = self.authenticated_client().await?.raw_grpc();
         let response = client
             .list_sandbox_providers(ListSandboxProvidersRequest {
-                sandbox_name: sandbox.to_owned(),
-                workspace: workspace.to_owned(),
+                workspace_scope: named_workspace_scope(workspace),
+                sandbox: sandbox.to_owned(),
+                page_size: 0,
+                page_token: String::new(),
             })
             .await
             .map_err(raw_port_failure)?;
@@ -1897,10 +1921,11 @@ impl OpenShellRuntime {
         let mut client = self.authenticated_client().await?.raw_grpc();
         client
             .detach_sandbox_provider(DetachSandboxProviderRequest {
-                sandbox_name: sandbox.to_owned(),
-                provider_name: provider_name.to_owned(),
+                workspace_scope: named_workspace_scope(workspace),
+                sandbox: sandbox.to_owned(),
+                provider: provider_name.to_owned(),
                 expected_resource_version: resource_version,
-                workspace: workspace.to_owned(),
+                request_id: String::new(),
             })
             .await
             .map(|_| ())
@@ -2050,10 +2075,10 @@ impl SandboxDeleteClient for RuntimeDeleteClient<'_> {
             .authenticated_client()
             .await?
             .workspace(self.workspace)
-            .delete_sandbox(name)
+            .delete_sandbox(name, DeleteOptions::default())
             .await
         {
-            Ok(deleted) => Ok(deleted),
+            Ok(_) => Ok(true),
             Err(SdkError::NotFound { .. }) => Ok(false),
             Err(error) => Err(port_failure(error)),
         }
@@ -2318,15 +2343,14 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         }
         self.stage_input_archive(workspace, sandbox, input_archive)
             .await?;
-        let sandbox_id = self
-            .resolve_raw_sandbox_binding(
-                workspace,
-                sandbox,
-                &request.runtime.0,
-                expected_image.as_deref(),
-                true,
-            )
-            .await?;
+        self.resolve_raw_sandbox_binding(
+            workspace,
+            sandbox,
+            &request.runtime.0,
+            expected_image.as_deref(),
+            true,
+        )
+        .await?;
         let mut environment = HashMap::new();
         environment.insert(
             "STEWARD_OUTPUT_DIR".to_owned(),
@@ -2359,7 +2383,8 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         );
         let executed = self
             .exec_task_process(
-                &sandbox_id,
+                workspace,
+                sandbox,
                 &["/bin/sh".to_owned(), "-c".to_owned(), wrapped_command],
                 environment,
                 request.execution_class,
@@ -3208,7 +3233,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn task_execution_resolves_the_verified_sandbox_id_after_staging() -> Result<(), String> {
+    fn task_execution_revalidates_the_sandbox_binding_after_staging() -> Result<(), String> {
         let source = include_str!("lib.rs");
         let implementation = source
             .split("impl SandboxTaskRuntime for OpenShellRuntime")
@@ -3225,7 +3250,7 @@ mod tests {
         let resolution = start_task
             .rfind(".resolve_raw_sandbox_binding(")
             .ok_or_else(|| {
-                "task sandbox ID is not re-resolved and verified after staging".to_owned()
+                "task sandbox binding is not re-resolved and verified after staging".to_owned()
             })?;
         let execution = start_task
             .find(".exec_task_process(")
@@ -3233,16 +3258,12 @@ mod tests {
 
         assert!(
             staging < resolution && resolution < execution,
-            "the exact sandbox ID must be resolved after name-based staging and before raw execution"
+            "the sandbox binding must be revalidated after staging and before raw execution"
         );
         assert!(
-            start_task[staging..resolution].contains("let sandbox_id =")
-                && start_task[execution..].contains("&sandbox_id,"),
-            "raw execution must use the post-staging verified sandbox ID"
-        );
-        assert!(
-            !start_task[execution..].contains("&snapshot.id,"),
-            "raw execution must not reuse the pre-staging sandbox ID"
+            start_task[execution..].contains("workspace,")
+                && start_task[execution..].contains("sandbox,"),
+            "raw execution must use the revalidated workspace-scoped sandbox name"
         );
         Ok(())
     }
@@ -4500,6 +4521,7 @@ mod tests {
                 phase: RawSandboxPhase::Ready as i32,
                 ..RawSandboxStatus::default()
             }),
+            created_from_workload_template: None,
         };
         assert!(
             validate_raw_sandbox_binding(&valid, "runtime-uid-a", Some(expected_image), true)
