@@ -1119,7 +1119,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.3.1" => Ok(true),
+            "0.3.2" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -3157,9 +3157,42 @@ mod tests {
     }
 
     #[test]
+    fn published_chart_requires_the_tested_kubernetes_floor() -> Result<(), String> {
+        let chart = fs::read_to_string(root().join("charts/steward/Chart.yaml"))
+            .map_err(|error| format!("published Steward chart metadata is required: {error}"))?;
+        let release = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("Steward release workflow is required: {error}"))?;
+        let core_install = fs::read_to_string(root().join("scripts/customer-core-install-e2e.sh"))
+            .map_err(|error| format!("Steward core-install E2E is required: {error}"))?;
+        let readme = fs::read_to_string(root().join("README.md"))
+            .map_err(|error| format!("Steward README is required: {error}"))?;
+        let guide = fs::read_to_string(root().join("docs/installation/installation-guide.md"))
+            .map_err(|error| format!("Steward installation guide is required: {error}"))?;
+
+        assert!(
+            chart.contains("kubeVersion: \">=1.32.0-0\""),
+            "the chart must reject Kubernetes releases below 1.32"
+        );
+        assert!(
+            release.contains("bash scripts/customer-core-install-e2e.sh")
+                && core_install.contains("kindest/node:v1.32.1@sha256:"),
+            "the release lane must exercise the published Kubernetes 1.32 floor"
+        );
+        assert!(
+            readme.contains("Kubernetes `>=1.32`")
+                && guide.contains("Kubernetes 1.32 or newer")
+                && guide.contains("Chart accepts 1.32+"),
+            "public installation guidance must state the Kubernetes 1.32 floor"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn every_public_apiserver_edge_route_is_rendered_and_documented() -> Result<(), String> {
         let templates = fs::read_to_string(root().join("charts/steward/templates/all.yaml"))
             .map_err(|error| format!("published Steward templates are required: {error}"))?;
+        let schema = fs::read_to_string(root().join("charts/steward/values.schema.json"))
+            .map_err(|error| format!("published Steward values schema is required: {error}"))?;
         let preflight = fs::read_to_string(root().join("scripts/steward-platform-preflight.py"))
             .map_err(|error| format!("platform preflight generator is required: {error}"))?;
         let readme =
@@ -3191,7 +3224,16 @@ mod tests {
                 readme.contains(&documented),
                 "chart documentation is missing `{path}`"
             );
+            let schema_path = format!("\"value\": \"{path}\"");
+            assert!(
+                schema.contains(&schema_path),
+                "chart schema does not require `{path}` in the exact API route list"
+            );
         }
+        assert!(
+            schema.contains("\"apiPaths\": {\n                    \"const\": ["),
+            "chart schema must enforce one exact, complete API route list"
+        );
         Ok(())
     }
 
@@ -3885,7 +3927,7 @@ mod tests {
             manifest
                 .pointer("/stewardVersion")
                 .and_then(serde_json::Value::as_str),
-            Some("0.3.1")
+            Some("0.3.2")
         );
         assert_eq!(
             manifest

@@ -8,7 +8,7 @@ import { useSession } from "@/session/session-context";
 function applyTheme(theme: BrowserTheme) {
   if (theme === "system") delete document.documentElement.dataset.theme;
   else document.documentElement.dataset.theme = theme;
-  document.cookie = `hypershell-theme=${theme}; Path=/; Max-Age=31536000; SameSite=Lax`;
+  document.cookie = `steward-theme=${theme}; Path=/; Max-Age=31536000; SameSite=Lax`;
 }
 
 export function ThemeControl() {

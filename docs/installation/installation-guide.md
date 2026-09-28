@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.3.1`. The release workflow pulls the published OCI
+Release contract: chart `0.3.2`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -24,7 +24,7 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
 
 ## Prerequisites
 
-1. Kubernetes 1.30 or newer, Helm 3.17.0 or newer, `kubectl`, and cluster-admin
+1. Kubernetes 1.32 or newer, Helm 3.17.0 or newer, `kubectl`, and cluster-admin
    authority for the Steward CRD, cluster roles, and validating webhook. Select
    an explicit kubeconfig and context; do not use an ambient or unrelated cluster.
 2. A reachable, separately operated PostgreSQL database and an existing
@@ -92,7 +92,7 @@ again in the target cluster before enabling governed execution.
 
 | Component | Supported / tested now |
 |---|---|
-| Kubernetes | Chart accepts 1.30+; test lane uses Kind 1.32.1 |
+| Kubernetes | Chart accepts 1.32+; test lane uses Kind 1.32.1 |
 | Helm | 3.17+; tested with 3.17.1 |
 | PostgreSQL | 16 |
 | OpenShell | 0.0.98 |

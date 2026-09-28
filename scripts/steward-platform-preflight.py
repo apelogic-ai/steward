@@ -23,7 +23,7 @@ RESULT_CONTRACT = "steward.platform-preflight-result/v1"
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 DNS_NAME = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 K8S_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
-ORGANIZATION_ID = re.compile(r"^org_[a-z0-9_-]{0,60}$")
+ORGANIZATION_ID = re.compile(r"^org_[a-z0-9_-]{1,60}$")
 REQUIRED_NAMESPACES = (
     "steward",
     "runtime",
