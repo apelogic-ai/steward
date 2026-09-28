@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 
 import {
   getAdminRequestsSummary,
@@ -270,17 +270,19 @@ function ProfileMenu({ adminMode, session }: Readonly<{
   );
 }
 
-function AppSidebar({ adminMode, needsAction, onboardingDismissed, session }: Readonly<{
+function AppSidebar({ adminMode, mobile = false, needsAction, onNavigate, onboardingDismissed, session }: Readonly<{
   adminMode: boolean;
+  mobile?: boolean;
   needsAction: number | null;
+  onNavigate?: () => void;
   onboardingDismissed: boolean;
   session: Extract<SessionState, { status: "authenticated" }>;
 }>) {
   const pathname = usePathname();
   const navigation = adminMode ? adminNavigation : userNavigation.filter((item) => !onboardingDismissed || item.href !== "/get-started");
   return (
-    <aside className="flex min-h-full flex-col border-b border-line bg-panel px-3 pt-[18px] pb-3 md:sticky md:top-0 md:h-screen md:border-e md:border-b-0">
-      <Link aria-label="HyperShell home" className="flex items-center gap-2.5 px-2 pb-[22px] text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"}>
+    <aside className={mobile ? "flex h-full w-[216px] flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 shadow-xl" : "sticky top-0 hidden h-screen flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 md:flex"}>
+      <Link aria-label="HyperShell home" className="flex items-center gap-2.5 px-2 pb-[22px] text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"} onClick={onNavigate}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img alt="HyperShell" className="size-8 rounded-control bg-white object-cover" height="32" src="/brand/logo" width="32" />
         <span className="text-[17px] font-semibold tracking-[-0.02em]">HyperShell</span>
@@ -296,6 +298,7 @@ function AppSidebar({ adminMode, needsAction, onboardingDismissed, session }: Re
               className="flex min-h-9 items-center gap-2.5 rounded-control px-3 py-2 text-sm font-medium text-muted-ink hover:bg-line-soft hover:text-ink aria-[current=page]:bg-brand-soft aria-[current=page]:text-ink"
               href={href}
               key={href}
+              onClick={onNavigate}
             >
               <span aria-hidden="true" className={`size-1.5 rounded-[2px] ${active ? "bg-brand" : "bg-field"}`} />
               <span>{label}</span>
@@ -319,6 +322,29 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
   const workspaceAuthorized = session.status === "authenticated" && (!adminMode || session.value.role === "admin");
   const [needsAction, setNeedsAction] = useState<number | null>(null);
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const mobileMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const mobileNavigationRef = useRef<HTMLDivElement>(null);
+
+  const closeMobileMenu = useCallback(() => {
+    setMobileMenuOpen(false);
+    requestAnimationFrame(() => mobileMenuButtonRef.current?.focus());
+  }, []);
+
+  useEffect(() => {
+    if (!mobileMenuOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeMobileMenu();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    requestAnimationFrame(() => mobileNavigationRef.current?.querySelector<HTMLElement>("a")?.focus());
+    return () => {
+      document.removeEventListener("keydown", closeOnEscape);
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [closeMobileMenu, mobileMenuOpen]);
 
   useEffect(() => {
     if (!adminMode || !workspaceAuthorized) return;
@@ -352,6 +378,9 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
       <div className="min-h-screen md:grid md:grid-cols-[216px_minmax(0,1fr)]">
         <a className="sr-only focus:not-sr-only focus:fixed focus:start-4 focus:top-4 focus:z-50 focus:rounded-control focus:bg-panel focus:px-4 focus:py-3" href="#workspace">Skip to workspace</a>
         {session.status === "authenticated" && workspaceAuthorized ? <AppSidebar adminMode={adminMode} needsAction={needsAction} onboardingDismissed={onboardingDismissed} session={session} /> : <div className="hidden md:block" />}
+        {session.status === "authenticated" && workspaceAuthorized ? <header className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-line bg-panel px-4 md:hidden"><Link aria-label="HyperShell home" className="flex items-center gap-2 text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"}>{/* eslint-disable-next-line @next/next/no-img-element */}
+        <img alt="HyperShell" className="size-7 rounded-control bg-white object-cover" height="28" src="/brand/logo" width="28" /><span className="text-base font-semibold">HyperShell</span></Link><button aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} aria-label="Open navigation" className="grid size-10 place-items-center rounded-control border bg-panel text-xl" onClick={() => setMobileMenuOpen(true)} ref={mobileMenuButtonRef} type="button">☰</button></header> : null}
+        {mobileMenuOpen && session.status === "authenticated" && workspaceAuthorized ? <div aria-label="Navigation" aria-modal="true" className="fixed inset-0 z-50 flex bg-black/30 md:hidden" id="mobile-navigation" ref={mobileNavigationRef} role="dialog"><AppSidebar adminMode={adminMode} mobile needsAction={needsAction} onNavigate={closeMobileMenu} onboardingDismissed={onboardingDismissed} session={session} /><button aria-label="Close navigation" className="flex-1" onClick={closeMobileMenu} type="button" /></div> : null}
         <main className="min-w-0 px-4 pt-[18px] pb-16 sm:px-7" id="workspace">
           <div className="mx-auto max-w-[1180px]">
             {session.status === "loading" ? <StatePanel title="Loading HyperShell"><p>Checking the server-owned session…</p></StatePanel> : null}

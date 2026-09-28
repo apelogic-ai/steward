@@ -306,6 +306,7 @@ async function startWeb() {
         || requestUrl.pathname.endsWith("/versions")
         || requestUrl.pathname === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`
         || requestUrl.pathname === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/reject`
+        || requestUrl.pathname === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/file`
         || requestUrl.pathname === `/admin/api/v1/approvals/${approvalId}/approve`
         || requestUrl.pathname === `/admin/api/v1/approvals/${approvalId}/file`
         || requestUrl.pathname === "/app/api/v1/connections/github/start"
@@ -396,6 +397,11 @@ async function startWeb() {
           response.end(JSON.stringify({ apiVersion: "steward.envelope-requests/v1", workflow: { schemaVersion: "v2", contentType: "application/yaml", suggestedPath: ".github/workflows/steward-repository-review.yml", sha256: "abc123", yaml: ["name: Steward governed run", "on:", "  workflow_dispatch:", "jobs:", "  governed:", "    with:", "      workflow: repository-review@1", ""].join("\n") } }));
           return;
         }
+        if (requestUrl.pathname.endsWith("/file")) {
+          response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+          response.end(JSON.stringify({ apiVersion: "steward.browser-admin/v1", approvalId, decisionKey: "PROJ-123", evidenceUrl: "https://example.com/decisions/PROJ-123" }));
+          return;
+        }
         if (requestUrl.pathname.startsWith("/admin/api/v1/envelope-requests/")) {
           const provisioned = requestUrl.pathname.endsWith("/approve");
           response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
@@ -421,11 +427,6 @@ async function startWeb() {
         if (requestUrl.pathname.endsWith("/approve")) {
           response.writeHead(204, { "cache-control": "no-store" });
           response.end();
-          return;
-        }
-        if (requestUrl.pathname.endsWith("/file")) {
-          response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-          response.end(JSON.stringify({ apiVersion: "steward.browser-admin/v1", approvalId, decisionKey: "PROJ-123", evidenceUrl: "https://example.com/decisions/PROJ-123" }));
           return;
         }
         if (requestUrl.pathname.endsWith("/connections/github/start")) {
@@ -1137,6 +1138,7 @@ test("every presentation route remains navigable at a narrow viewport", async ({
       await test.step(route.path, async () => {
         await session.page.goto(`${origin}${route.path}`);
         await expect(session.page.getByRole("heading", { name: route.heading, exact: true }).first()).toBeVisible();
+        await session.page.getByRole("button", { name: "Open navigation" }).click();
         const navigation = session.page.getByRole("navigation", { name: "Primary navigation" });
         const activeLabel = route.activeNavigation === "Approvals" ? "Requests" : route.activeNavigation === "Provision" ? "Templates" : route.activeNavigation;
         const activeLink = navigation.getByRole("link", { name: activeLabel, exact: true });
@@ -1167,26 +1169,24 @@ test("page headers omit superheaders across user and administrator workspaces", 
   }
 });
 
-test("empty entity collections show only No data", async ({ browser }) => {
+test("empty entity collections show contextual product copy", async ({ browser }) => {
   const session = await guardedPage(browser, { emptyCollections: true, session: administratorSession });
   try {
-    for (const path of [
-      "/envelopes",
-      `/envelopes/${envelopeId}/runs`,
-      "/runs",
-      `/runs/${taskUid}`,
-      "/admin/runs",
-      `/admin/runs/${taskUid}`,
-      "/admin/envelopes/templates",
-      "/admin/envelopes/provision",
-      "/admin/workflows",
-      "/admin/approvals",
+    for (const [path, copy] of [
+      ["/envelopes", "No envelopes yet."],
+      [`/envelopes/${envelopeId}/runs`, "No runs yet."],
+      ["/runs", "No runs yet."],
+      [`/runs/${taskUid}`, "No steps reported"],
+      ["/admin/runs", "No runs yet."],
+      [`/admin/runs/${taskUid}`, "No steps reported"],
+      ["/admin/envelopes/templates", "No templates yet."],
+      ["/admin/envelopes/provision", "No templates"],
+      ["/admin/workflows", "No workflows yet"],
+      ["/admin/approvals", "Nothing needs action."],
     ]) {
       await test.step(path, async () => {
         await session.page.goto(`${origin}${path}`);
-        const emptyState = session.page.getByRole("heading", { name: "No data", exact: true });
-        await expect(emptyState).toBeVisible();
-        expect(await emptyState.locator("..").innerText()).toBe("No data");
+        await expect(session.page.getByText(copy, { exact: true }).first()).toBeVisible();
       });
     }
   } finally {
@@ -1627,41 +1627,37 @@ test("administrator templates and approvals use typed browser authority", async 
     expect(copiedTemplate.body.envelope.revision).toBe(1);
 
     await administrator.page.goto(`${origin}/admin/envelopes/templates/new`);
-    await expect(administrator.page.getByRole("group", { name: "Models" }).getByRole("listitem")).toHaveText(["provider-a/model-a"]);
-    await expect(administrator.page.getByRole("combobox", { name: "Model" }).locator("option")).toHaveText([
-      "provider-a/model-a",
-      "provider-b/model-b",
-    ]);
+    const createModels = administrator.page.getByRole("combobox", { name: "Models" });
+    await expect(administrator.page.getByText("provider-a/model-a", { exact: true })).toBeVisible();
+    await createModels.focus();
+    await expect(administrator.page.getByRole("option", { name: "provider-b/model-b" })).toBeVisible();
+    await createModels.press("Enter");
+    await expect(administrator.page.getByText("provider-b/model-b", { exact: true })).toBeVisible();
 
     await administrator.page.goto(`${origin}/admin/approvals`);
     await expect(administrator.page.getByRole("heading", { name: "Requests" })).toBeVisible();
     await administrator.page.getByRole("link").filter({ hasText: pendingEnvelopeRequest.requestId }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/approvals/${pendingEnvelopeRequest.requestId}`);
-    const envelopeRequestCard = administrator.page.getByRole("listitem").filter({
-      has: administrator.page.getByText(pendingEnvelopeRequest.requestId, { exact: true }),
-    });
-    await expect(envelopeRequestCard).toBeVisible();
+    const envelopeRequestCard = administrator.page.locator("main");
     await expect(envelopeRequestCard.getByText("alice@example.com")).toBeVisible();
-    await expect(envelopeRequestCard.getByText("Envelope", { exact: true })).toBeVisible();
-    await expect(envelopeRequestCard.getByRole("heading", { name: "Requested changes" })).toBeVisible();
-    await expect(envelopeRequestCard.getByRole("button", { name: "Reject request" })).toBeVisible();
+    await expect(envelopeRequestCard.getByRole("heading", { name: "Requested vs template ceiling" })).toBeVisible();
+    await expect(envelopeRequestCard.getByRole("button", { name: "Reject" })).toBeDisabled();
+    await envelopeRequestCard.getByRole("button", { name: "File reference" }).click();
     await envelopeRequestCard.getByLabel("Rationale", { exact: true }).fill("Approved for the requested bounded envelope.");
-    await envelopeRequestCard.getByRole("button", { name: "Approve", exact: true }).click();
+    await envelopeRequestCard.getByRole("button", { name: "Approve exception" }).click();
     await expect(envelopeRequestCard.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
     const envelopeApprovalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`);
     expectMutationProof(envelopeApprovalMutation);
     expect(envelopeApprovalMutation.body.rationale).toBe("Approved for the requested bounded envelope.");
     await administrator.page.getByRole("link", { name: "Back to requests" }).click();
     await administrator.page.getByRole("link").filter({ hasText: approvalId }).click();
-    const runtimeApprovalCard = administrator.page.getByRole("listitem").filter({
-      has: administrator.page.getByText(approvalId, { exact: true }),
-    });
-    await runtimeApprovalCard.getByRole("button", { name: "File decision reference" }).click();
+    const runtimeApprovalCard = administrator.page.locator("main");
+    await runtimeApprovalCard.getByRole("button", { name: "File reference" }).click();
     await expect(runtimeApprovalCard.getByText("Decision reference filed through the server-owned channel.")).toBeVisible();
     expectMutationProof(administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/approvals/${approvalId}/file`));
     await runtimeApprovalCard.getByLabel("Rationale", { exact: true }).fill("Approved for one bounded investigation.");
     await runtimeApprovalCard.getByLabel("Expires at (RFC 3339)").fill("2026-08-25T17:00:00Z");
-    await runtimeApprovalCard.getByRole("button", { name: "Approve", exact: true }).click();
+    await runtimeApprovalCard.getByRole("button", { name: "Approve exception" }).click();
     await expect(runtimeApprovalCard.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
     const approvalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/approvals/${approvalId}/approve`);
     expectMutationProof(approvalMutation);
@@ -1915,11 +1911,13 @@ test("administrator can reject a pending envelope request with an optional reaso
   try {
     await administrator.page.goto(`${origin}/admin/approvals`);
     await administrator.page.getByRole("link").filter({ hasText: pendingEnvelopeRequest.requestId }).click();
-    const envelopeRequestCard = administrator.page.getByRole("listitem").filter({
-      has: administrator.page.getByText(pendingEnvelopeRequest.requestId, { exact: true }),
-    });
+    const envelopeRequestCard = administrator.page.locator("main");
+    await envelopeRequestCard.getByRole("button", { name: "File reference" }).click();
     await envelopeRequestCard.getByLabel("Rejection reason (optional)").fill("Authority is not appropriate for this user.");
-    await envelopeRequestCard.getByRole("button", { name: "Reject request" }).click();
+    await envelopeRequestCard.getByRole("button", { name: "Reject" }).click();
+    const confirmation = administrator.page.getByRole("alertdialog", { name: "Reject this request?" });
+    await expect(confirmation).toBeVisible();
+    await confirmation.getByRole("button", { name: "Reject request" }).click();
     await expect(envelopeRequestCard.getByText("The envelope request was rejected through the governed Rust admission path.")).toBeVisible();
     const rejection = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/reject`);
     expectMutationProof(rejection);

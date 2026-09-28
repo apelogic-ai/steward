@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useState, type FormEvent } from "react";
+import { useCallback, useState, type FormEvent, type ReactNode } from "react";
 
 import {
   approveAdminApproval,
@@ -22,8 +22,9 @@ import {
   type AdminRequestResponse,
   type AdminRequestsResponse,
 } from "@/api-client";
-import { DataTable, FilterTabs, SectionCard } from "@/components/hs";
-import { DefinitionList, EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
+import { DataTable, FilterTabs, GrantChipList, Meter, SectionCard, grantKindForAction } from "@/components/hs";
+import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
+import { DefinitionList, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
@@ -70,7 +71,7 @@ export function AdminApprovalsView() {
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader description="Envelope requests within a template ceiling are approved and provisioned automatically. Requests above a ceiling, and runtimes that exhaust a cumulative limit, wait here for a decision." title="Requests" />
       <ResourceBoundary state={state}>{({ requests }) => {
-        if (requests.length === 0) return <EmptyState title="No data" />;
+        if (requests.length === 0) return <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">Nothing needs action.</p>;
         const counts = {
           needs_action: requests.filter((request) => request.state === "requested" || request.state === "escalated").length,
           all: requests.length,
@@ -85,18 +86,10 @@ export function AdminApprovalsView() {
           { count: counts.all, label: "All", value: "all" },
           { count: counts.auto_approved, label: "Auto-approved", value: "auto_approved" },
           { count: counts.rejected, label: "Rejected", value: "rejected" },
-        ]} onChange={setFilter} />{visible.length ? <RequestTable requests={visible} /> : <EmptyState title="Nothing needs action" />}</div>;
+        ]} onChange={setFilter} />{visible.length ? <RequestTable requests={visible} /> : <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">Nothing needs action.</p>}</div>;
       }}</ResourceBoundary>
     </section>
   );
-}
-
-function requestSourceLabel(source: AdminRequestView["source"]): string {
-  return {
-    envelope_request: "Envelope",
-    runtime_exception: "Exception",
-    escalation: "Limit",
-  }[source];
 }
 
 function requestReason(request: AdminRequestView): string {
@@ -147,6 +140,61 @@ function deltaValue(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function deltaLabel(dimension: AdminRequestView["deltas"][number]["dimension"]): string {
+  return {
+    budget: "Monthly limit",
+    singleRunBudget: "Per-run limit",
+    runtimeMinutes: "Runtime minutes",
+    ttl: "TTL",
+    models: "Models",
+    tools: "Tools",
+    runnerPlatforms: "Platforms",
+    runnerMemory: "Memory",
+    runnerCompute: "Compute",
+    runnerStorage: "Storage",
+  }[dimension];
+}
+
+function deltaSide(delta: AdminRequestView["deltas"][number], side: "ceiling" | "requested"): ReactNode {
+  if (delta.dimension === "models") {
+    return <GrantChipList grants={delta[side].map((model) => ({ kind: "model", name: `${model.provider}/${model.model}` }))} />;
+  }
+  if (delta.dimension === "tools") {
+    return <GrantChipList grants={delta[side].map((tool) => ({ kind: grantKindForAction(tool.action), name: `${tool.resource}:${tool.action}` }))} />;
+  }
+  const value = delta[side];
+  const suffix = "currency" in delta ? ` ${delta.currency}` : "";
+  return <span className="font-mono text-sm">{deltaValue(value)}{value === null || value === undefined ? "" : suffix}</span>;
+}
+
+function numericDelta(delta: AdminRequestView["deltas"][number]): string | null {
+  if (!(delta.dimension === "budget" || delta.dimension === "singleRunBudget" || delta.dimension === "runtimeMinutes")) return null;
+  if (delta.requested === null || delta.requested === undefined) return null;
+  const difference = Number(delta.requested) - Number(delta.ceiling);
+  return Number.isFinite(difference) && difference > 0 ? `+${difference.toFixed(2).replace(/\.00$/, "")}` : null;
+}
+
+function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>) {
+  if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">{request.kind === "custom" ? "This custom request has no governing template." : "This request is within the configured ceiling."}</p>;
+  return (
+    <SectionCard title="Requested vs template ceiling">
+      <div className="overflow-x-auto">
+        <div className="min-w-[520px]">
+          <div className="grid grid-cols-[minmax(90px,130px)_1fr_1fr] gap-4 border-b border-line-soft pb-2 text-xs font-medium text-muted-ink"><span>Field</span><span>Requested</span><span>{request.template.id ? `${request.template.id} rev ${request.template.revision ?? "—"}` : "Ceiling"}</span></div>
+          {request.deltas.map((delta, index) => {
+            const over = numericDelta(delta);
+            return <div className="grid grid-cols-[minmax(90px,130px)_1fr_1fr] gap-4 border-b border-line-soft py-3 last:border-0" key={`${delta.dimension}-${index}`}><strong className="text-sm">{deltaLabel(delta.dimension)}</strong><div className={over ? "font-semibold text-err" : ""}>{deltaSide(delta, "requested")}{over ? <span className="ms-2 rounded-full bg-err-soft px-2 py-0.5 text-xs font-semibold text-err">{over}</span> : null}</div><div className="opacity-80">{deltaSide(delta, "ceiling")}</div></div>;
+          })}
+        </div>
+      </div>
+    </SectionCard>
+  );
+}
+
+function RequestHistory({ request }: Readonly<{ request: AdminRequestView }>) {
+  return <SectionCard title="History"><ol className="space-y-4">{request.history.map((event, index) => <li className="relative ps-5" key={`${event.at}-${index}`}><span aria-hidden="true" className={`absolute start-0 top-1 size-2.5 rounded-full border-2 ${event.state === "rejected" || event.state === "expired" ? "border-err" : event.state === "approved" || event.state === "auto_approved" ? "border-ok" : "border-faint-ink"}`} /><p className="text-sm font-semibold">{event.state.replaceAll("_", " ")}</p><p className="mt-0.5 text-[13px] text-muted-ink">by {event.actor} · {new Date(event.at).toLocaleString()}{event.reason ? ` · “${event.reason}”` : ""}</p></li>)}</ol></SectionCard>;
+}
+
 export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequestView }>) {
   const session = useSession();
   const [reference, setReference] = useState<{ decisionKey: string; evidenceUrl: string } | null>(request.decision?.decisionKey && request.decision.evidenceUrl ? {
@@ -154,6 +202,9 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
     evidenceUrl: request.decision.evidenceUrl,
   } : null);
   const [status, setStatus] = useState<UnifiedRequestActionState>("idle");
+  const [denial, setDenial] = useState<string | null>(null);
+  const [rejection, setRejection] = useState<string | null>(null);
+  const terminal = request.state === "approved" || request.state === "auto_approved" || request.state === "rejected" || request.state === "expired";
 
   async function fileDecision() {
     if (session.status !== "authenticated") return;
@@ -200,11 +251,9 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
     else setStatus(classifyMutationFailure(result.response?.status));
   }
 
-  async function rejectEnvelope(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function rejectEnvelope(reason: string) {
     if (session.status !== "authenticated" || request.source !== "envelope_request") return;
-    const fields = new FormData(event.currentTarget);
-    const reason = String(fields.get("reason") ?? "").trim();
+    setRejection(null);
     setStatus("rejecting");
     const result = await rejectAdminEnvelopeRequest({
       body: { reason: reason || null },
@@ -238,13 +287,12 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
     setStatus(result.data && result.response?.ok ? "approved" : classifyMutationFailure(result.response?.status));
   }
 
-  async function deny(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function deny(rationale: string) {
     if (session.status !== "authenticated") return;
-    const fields = new FormData(event.currentTarget);
+    setDenial(null);
     setStatus("approving");
     const result = await denyAdminEscalation({
-      body: { rationale: String(fields.get("denyRationale") ?? "").trim() },
+      body: { rationale },
       cache: "no-store",
       credentials: "same-origin",
       headers: { "X-Steward-CSRF": session.value.csrf },
@@ -256,38 +304,35 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
   if (request.source === "escalation" && request.escalation) {
     return (
       <li className="space-y-5">
-        <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="text-xl font-semibold">{request.template.displayName}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">Escalation {request.id}</p></div><StatusBadge value={status === "approved" ? "approved" : status === "rejected" ? "rejected" : request.state} /></div>
-        <DefinitionList items={[["Requested by", request.requester.displayEmail], ["Envelope instance", request.escalation.envelopeInstanceId], ["Blocked task", request.escalation.blockedTaskUid], ["Parked", request.escalation.parkedAt]]} />
-        <ul className="space-y-2">{request.escalation.meters.map((meter) => <li className="rounded-md border p-4" key={meter.dimension}><p className="font-semibold">{meter.dimension === "llm_spend" ? "LLM spend" : "Runtime minutes"}</p><p className="mt-1 text-sm">{meter.used} / {meter.limit} {meter.unit}</p><p className="mt-1 text-xs text-muted-ink">Observed {meter.observedAt}</p></li>)}</ul>
-        <form className="grid gap-3 border-t pt-5 sm:grid-cols-2" onSubmit={topUp}>
+        <SectionCard title="Cumulative usage this period">
+          <ul className="space-y-5">{request.escalation.meters.map((meter) => <li key={meter.dimension}><Meter label={meter.dimension === "llm_spend" ? "LLM spend" : "Runtime minutes"} limit={Number(meter.limit)} limitLabel={meter.limit} unit={meter.unit} used={Number(meter.used)} usedLabel={meter.used} /><p className="mt-1 text-xs text-muted-ink">Observed {new Date(meter.observedAt).toLocaleString()}</p></li>)}</ul>
+          <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-line-soft pt-4 text-sm text-muted-ink"><span>Blocked run <span className="font-mono text-ink">{request.escalation.blockedTaskUid}</span> · parked since {new Date(request.escalation.parkedAt).toLocaleString()}</span><Link className="font-semibold text-ink" href={`/admin/runs/${encodeURIComponent(request.escalation.blockedTaskUid)}`}>Open run →</Link></div>
+        </SectionCard>
+        {terminal ? <RequestHistory request={request} /> : <SectionCard title="Decision"><form className="grid gap-3 sm:grid-cols-2" onSubmit={topUp}>
           <label className="grid gap-2 text-sm font-semibold">Top-up amount ({request.escalation.meters[0]?.unit ?? "units"})<input className="min-h-11 rounded-md border px-3 font-normal" inputMode="decimal" name="amount" required /></label>
           <label className="grid gap-2 text-sm font-semibold">Valid until (RFC 3339)<input className="min-h-11 rounded-md border px-3 font-normal" name="validUntil" placeholder="2026-08-25T17:00:00Z" required /></label>
-          <label className="grid gap-2 text-sm font-semibold sm:col-span-2">Rationale<textarea className="min-h-20 rounded-md border p-3 font-normal" name="rationale" required /></label>
-          <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 sm:justify-self-start" disabled={status === "approving" || status === "approved" || status === "rejected"} type="submit">Top up and resume</button>
+          <label className="grid gap-2 text-sm font-semibold sm:col-span-2">Rationale<textarea className="min-h-20 rounded-md border p-3 font-normal" name="rationale" placeholder="Why is additional authority appropriate?" required /></label>
+          <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50 sm:justify-self-end" disabled={status === "approving" || status === "approved" || status === "rejected"} type="submit">Approve top-up and resume</button>
         </form>
-        <form className="grid gap-3" onSubmit={deny}>
-          <label className="grid gap-2 text-sm font-semibold">Denial rationale<textarea className="min-h-20 rounded-md border p-3 font-normal" name="denyRationale" required /></label>
-          <button className="min-h-11 rounded-md border border-red-700 px-4 py-2 text-sm font-semibold text-red-800 disabled:opacity-50 sm:justify-self-start" disabled={status === "approving" || status === "approved" || status === "rejected"} type="submit">Deny and cancel task</button>
-        </form>
+        <form className="mt-4 grid gap-3 border-t border-line-soft pt-4" onSubmit={(event) => { event.preventDefault(); const fields = new FormData(event.currentTarget); setDenial(String(fields.get("denyRationale") ?? "").trim()); }}><label className="grid gap-2 text-sm font-semibold">Denial rationale<textarea className="min-h-20 rounded-md border p-3 font-normal" name="denyRationale" required /></label><button className="min-h-11 rounded-md border border-danger-line px-4 py-2 text-sm font-semibold text-err disabled:opacity-50 sm:justify-self-start" disabled={status === "approving" || status === "approved" || status === "rejected"} type="submit">Deny and cancel run</button></form>
+        <ConfirmationDialog cancelLabel="Keep pending" confirmLabel="Deny and cancel run" description="The parked run will be cancelled and finalized. This action cannot be undone." onConfirm={() => void deny(denial ?? "")} onOpenChange={(open) => { if (!open) setDenial(null); }} open={denial !== null} pending={status === "approving"} title="Deny and cancel this run?" /></SectionCard>}
       </li>
     );
   }
 
   return (
     <li className="space-y-5">
-      <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="text-xl font-semibold">{request.template.displayName ?? "Custom envelope request"}</h2><p className="mt-1 break-all font-mono text-xs text-muted-ink">{request.id}</p></div><StatusBadge value={status === "approved" ? "approved" : status === "rejection-complete" ? "rejected" : request.state} /></div>
-      <SectionCard title="Request"><DefinitionList items={[["Kind", request.kind], ["Source", requestSourceLabel(request.source)], ["Requested by", request.requester.displayEmail], ["Created", request.createdAt], ["State actor", request.stateActor]]} /></SectionCard>
-      {request.deltas.length ? <SectionCard title="Requested changes"><ul className="divide-y divide-line-soft">{request.deltas.map((delta, index) => <li className="grid gap-1 py-3 text-sm first:pt-0 last:pb-0 sm:grid-cols-[minmax(140px,0.7fr)_1fr_1fr]" key={`${delta.dimension}-${index}`}><strong>{delta.dimension}</strong><span>Requested <strong>{deltaValue(delta.requested)}</strong></span><span className="text-muted-ink">Ceiling {deltaValue(delta.ceiling)}</span></li>)}</ul></SectionCard> : <p className="rounded-control border border-line bg-notice p-4 text-sm">{request.kind === "custom" ? "This custom request has no governing template." : "This request is within the configured ceiling."}</p>}
-      {reference ? <DefinitionList items={[["Decision key", reference.decisionKey], ["Evidence URL", reference.evidenceUrl]]} /> : <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={status === "filing"} onClick={() => void fileDecision()} type="button">{status === "filing" ? "Filing…" : "File decision reference"}</button>}
-      <form className="grid gap-4 border-t pt-5 sm:grid-cols-2" onSubmit={approve}>
+      <RequestComparison request={request} />
+      {terminal ? <RequestHistory request={request} /> : <SectionCard title="Decision"><div className="grid gap-5"><div className="grid grid-cols-[24px_minmax(0,1fr)] gap-3"><span className="grid size-6 place-items-center rounded-full bg-line-soft font-mono text-xs font-semibold">1</span><div><h3 className="text-sm font-semibold">File a decision reference</h3><p className="mt-1 text-[13px] text-muted-ink">Creates the governed record that serves as evidence for the exception.</p>{reference ? <div className="mt-3"><DefinitionList items={[["Decision key", reference.decisionKey], ["Evidence URL", reference.evidenceUrl]]} /></div> : <button className="mt-3 min-h-10 rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={status === "filing"} onClick={() => void fileDecision()} type="button">{status === "filing" ? "Filing…" : "File reference"}</button>}</div></div><div className={`grid grid-cols-[24px_minmax(0,1fr)] gap-3 ${reference ? "" : "opacity-55"}`}><span className="grid size-6 place-items-center rounded-full bg-line-soft font-mono text-xs font-semibold">2</span><div><h3 className="text-sm font-semibold">Approve or reject</h3><form className="mt-3 grid gap-4 sm:grid-cols-2" onSubmit={approve}>
         <label className="grid gap-2 text-sm font-semibold sm:col-span-2">Rationale<textarea className="min-h-24 rounded-md border p-3 font-normal" name="rationale" required /></label>
         <label className="grid gap-2 text-sm font-semibold">Expires at{request.source === "envelope_request" ? " (optional)" : " (RFC 3339)"}<input className="min-h-11 rounded-md border px-3 font-normal" name="expiresAt" placeholder="2026-08-25T17:00:00Z" required={request.source !== "envelope_request"} /></label>
-        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 sm:self-end" disabled={(request.source !== "envelope_request" && !reference) || status === "approving" || status === "rejecting" || status === "approved" || status === "rejection-complete"} type="submit">{status === "approving" ? "Approving…" : status === "approved" ? "Approved" : "Approve"}</button>
+        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50 sm:self-end" disabled={!reference || status === "approving" || status === "rejecting" || status === "approved" || status === "rejection-complete"} type="submit">{status === "approving" ? "Approving…" : status === "approved" ? "Approved" : "Approve exception"}</button>
       </form>
-      {request.source === "envelope_request" ? <form className="grid gap-3" onSubmit={rejectEnvelope}>
+      {request.source === "envelope_request" ? <form className="grid gap-3" onSubmit={(event) => { event.preventDefault(); const fields = new FormData(event.currentTarget); setRejection(String(fields.get("reason") ?? "").trim()); }}>
         <label className="grid gap-2 text-sm font-semibold">Rejection reason (optional)<textarea className="min-h-20 rounded-md border p-3 font-normal" maxLength={2000} name="reason" /></label>
-        <button className="min-h-11 rounded-md border border-red-700 px-4 py-2 text-sm font-semibold text-red-800 disabled:opacity-50 sm:justify-self-start" disabled={status === "approving" || status === "rejecting" || status === "approved" || status === "rejection-complete"} type="submit">{status === "rejecting" ? "Rejecting…" : "Reject request"}</button>
-      </form> : null}
+        <button className="min-h-11 rounded-md border border-danger-line px-4 py-2 text-sm font-semibold text-err disabled:opacity-50 sm:justify-self-start" disabled={!reference || status === "approving" || status === "rejecting" || status === "approved" || status === "rejection-complete"} type="submit">{status === "rejecting" ? "Rejecting…" : "Reject"}</button>
+      </form> : null}</div></div></div>
+      <ConfirmationDialog cancelLabel="Keep pending" confirmLabel="Reject request" description="The requested authority will not be provisioned. The decision and optional reason will remain in the request history." onConfirm={() => void rejectEnvelope(rejection ?? "")} onOpenChange={(open) => { if (!open) setRejection(null); }} open={rejection !== null} pending={status === "rejecting"} title="Reject this request?" /></SectionCard>}
       {status !== "idle" && status !== "filing" && status !== "approving" && status !== "rejecting" ? <p className={status === "approved" || status === "filed" || status === "rejection-complete" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "approved" || status === "filed" || status === "rejection-complete" ? "status" : "alert"}>{actionMessage(status)}</p> : null}
     </li>
   );
@@ -384,7 +429,7 @@ export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnve
             <input className="min-h-11 rounded-md border px-3 font-normal" disabled={terminal} name="expiresAt" type="datetime-local" />
           </label>
         </div>
-        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 sm:justify-self-start" disabled={terminal || status === "approving" || status === "rejecting"} type="submit">{status === "approving" ? "Approving…" : "Approve request"}</button>
+        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50 sm:justify-self-start" disabled={terminal || status === "approving" || status === "rejecting"} type="submit">{status === "approving" ? "Approving…" : "Approve request"}</button>
       </form>
       <form className="grid gap-3" onSubmit={rejectRequest}>
         <label className="grid gap-2 text-sm font-semibold">Rejection reason (optional)
@@ -494,7 +539,7 @@ export function ApprovalCard({ approval }: Readonly<{ approval: BrowserApprovalV
         <label className="grid gap-2 text-sm font-semibold">Evidence URL
           <input className="min-h-11 rounded-md border bg-canvas px-3 font-normal" readOnly value={reference?.evidenceUrl ?? "Not filed"} />
         </label>
-        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 sm:col-span-2 sm:justify-self-start" disabled={!reference || status === "approving" || status === "approved"} type="submit">{status === "approving" ? "Approving…" : status === "approved" ? "Approved" : "Approve exception"}</button>
+        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50 sm:col-span-2 sm:justify-self-start" disabled={!reference || status === "approving" || status === "approved"} type="submit">{status === "approving" ? "Approving…" : status === "approved" ? "Approved" : "Approve exception"}</button>
       </form>
       {status !== "idle" && status !== "filing" && status !== "approving" ? (
         <p className={status === "approved" || status === "filed" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "approved" || status === "filed" ? "status" : "alert"}>{actionMessage(status)}</p>

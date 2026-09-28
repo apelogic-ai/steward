@@ -1,6 +1,6 @@
 import { cn } from "@/lib/utils";
 
-export type GrantKind = "model" | "read" | "write" | "destructive";
+export type GrantKind = "model" | "neutral" | "read" | "write" | "destructive";
 
 export function grantKindForAction(action: string): GrantKind {
   const normalized = action.toLowerCase();
@@ -11,6 +11,7 @@ export function grantKindForAction(action: string): GrantKind {
 
 const kindClasses: Record<GrantKind, string> = {
   model: "bg-info-soft text-info",
+  neutral: "bg-line-soft text-muted-ink",
   read: "bg-ok-soft text-ok",
   write: "bg-warn-soft text-warn",
   destructive: "bg-err-soft text-err",
@@ -25,7 +26,7 @@ export function GrantChip({ className, kind, name, onRemove }: Readonly<{
   return (
     <span className={cn("inline-flex h-6.5 items-center gap-1.5 rounded-full px-2.5", kindClasses[kind], className)}>
       <span className="font-mono text-sm text-ink">{name}</span>
-      <span className="text-[11px] font-semibold">{kind}</span>
+      {kind === "neutral" ? null : <span className="text-[11px] font-semibold">{kind}</span>}
       {onRemove ? (
         <button
           aria-label={`Remove ${name}`}

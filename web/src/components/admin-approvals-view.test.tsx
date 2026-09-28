@@ -61,7 +61,9 @@ describe("envelope request approval controls", () => {
   test("unified queue preserves rejection and optional approval evidence", () => {
     const html = renderToStaticMarkup(<UnifiedRequestCard request={unifiedRequest} />);
 
-    expect(html).toContain("Reject request");
+    expect(html).toContain("File a decision reference");
+    expect(html).toContain("Approve or reject");
+    expect(html).toContain(">Reject</button>");
     expect(html).toContain('name="reason"');
     expect(html).toContain("Expires at (optional)");
     expect(html).not.toContain('name="expiresAt" placeholder="2026-08-25T17:00:00Z" required=""');

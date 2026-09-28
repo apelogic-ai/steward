@@ -6,16 +6,21 @@ import { useCallback, useRef, useState, type FormEvent } from "react";
 
 import {
   createRequest,
+  getBrowserPreferences,
   getRequest,
+  listProviderConnections,
   listRequests,
   listTemplates,
   myRuns,
   type AvailableEnvelopeTemplate,
+  type BrowserPreferencesView,
   type BrowserEnvelope,
   type EnvelopeRequestResponse,
   type EnvelopeTemplatesResponse,
+  type ConnectionsCollectionResponse,
   type GithubActionsWorkflowResponse,
   type MyRunsResponse,
+  type PublishedWorkflowsResponse,
   type UserEnvelopeRequest,
 } from "@/api-client";
 import { RunCards } from "@/components/run-views";
@@ -49,11 +54,12 @@ export function EnvelopesView() {
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader actions={<PrimaryLink href="/envelopes/new">Request envelope</PrimaryLink>} description="Budget, models and tools your agents are allowed to use." title="Envelopes" />
       <ResourceBoundary state={state}>{({ requests, templates }) => {
-        if (requests.length === 0) return <EmptyState title="No data" />;
+        const onboarding = <EnvelopesOnboardingBanner requests={requests} />;
+        if (requests.length === 0) return <div className="space-y-5">{onboarding}<p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">No envelopes yet.</p></div>;
         const count = (value: string) => requests.filter((request) => value === "pending" ? request.status !== "provisioned" && request.status !== "rejected" : request.status === value).length;
         const filtered = status === "all" ? requests : requests.filter((request) => status === "pending" ? request.status !== "provisioned" && request.status !== "rejected" : request.status === status);
         const names = new Map(templates.map((template) => [template.id, template.displayName]));
-        return <div className="space-y-5">
+        return <div className="space-y-5">{onboarding}
           <FilterTabs active={status} items={[
             { count: requests.length, label: "All", value: "all" },
             { count: count("provisioned"), label: "Provisioned", value: "provisioned" },
@@ -65,6 +71,41 @@ export function EnvelopesView() {
       }}</ResourceBoundary>
     </section>
   );
+}
+
+type EnvelopesOnboardingData = {
+  connections: ConnectionsCollectionResponse;
+  preferences: BrowserPreferencesView;
+  runs: MyRunsResponse;
+  workflows: PublishedWorkflowsResponse;
+};
+
+function EnvelopesOnboardingBanner({ requests }: Readonly<{ requests: Array<UserEnvelopeRequest> }>) {
+  const load = useCallback(async () => {
+    const [connections, preferences, runs, workflows] = await Promise.all([
+      listProviderConnections({ cache: "no-store", credentials: "same-origin" }),
+      getBrowserPreferences({ cache: "no-store", credentials: "same-origin" }),
+      myRuns({ cache: "no-store", credentials: "same-origin", query: { limit: 100 } }),
+      listPublishedWorkflows(),
+    ]);
+    const results = [connections, preferences, runs, workflows];
+    return {
+      data: connections.data && preferences.data && runs.data && workflows.data ? { connections: connections.data, preferences: preferences.data, runs: runs.data, workflows: workflows.data } : undefined,
+      response: results.find((result) => !result.response?.ok)?.response ?? connections.response,
+    };
+  }, []);
+  const state = useApiResource<EnvelopesOnboardingData>(load);
+  if (state.status !== "ready" || state.value.preferences.onboardingDismissed) return null;
+  const data = state.value;
+  const sample = data.workflows.workflows.find((workflow) => workflow.sample);
+  const sampleReference = sample ? `${sample.name}@${sample.version}` : null;
+  const envelopeIds = new Set(requests.filter((request) => request.status === "provisioned" && request.envelopeInstanceId).map((request) => String(request.envelopeInstanceId)));
+  const run = sampleReference ? data.runs.runs.find((candidate) => `${candidate.workflowName}@${candidate.workflowVersion}` === sampleReference && candidate.userEnvelopeInstanceId && envelopeIds.has(candidate.userEnvelopeInstanceId)) : undefined;
+  const done = [data.connections.connections.some((connection) => connection.status.phase === "connected"), envelopeIds.size > 0, data.preferences.workflowAcknowledged, Boolean(run), Boolean(run && ["succeeded", "failed", "cancelled"].includes(run.phase))];
+  const complete = done.filter(Boolean).length;
+  if (complete === done.length) return null;
+  const titles = ["Connect GitHub", "Get your first envelope", "Add the workflow to your repository", "Trigger a test run", "See the result"];
+  return <div className="flex flex-wrap items-center gap-4 rounded-card bg-brand-soft px-[18px] py-3.5"><div className="min-w-48 flex-1"><p className="text-sm font-semibold">Get started</p><p className="mt-0.5 text-[13px] text-muted-ink">{complete} of 5 done · next: {titles[done.findIndex((value) => !value)]}</p><div aria-label={`${complete} of 5 onboarding steps complete`} aria-valuemax={5} aria-valuemin={0} aria-valuenow={complete} className="mt-2 h-[5px] overflow-hidden rounded-full bg-line-soft" role="progressbar"><div className="h-full rounded-full bg-brand" style={{ width: `${complete * 20}%` }} /></div></div><Link className="inline-flex h-[34px] items-center rounded-control bg-brand px-3.5 text-[13px] font-semibold text-on-brand hover:bg-brand-hover" href="/get-started">Continue</Link></div>;
 }
 
 function EnvelopeTable({ names, requests }: Readonly<{ names: ReadonlyMap<string, string>; requests: Array<UserEnvelopeRequest> }>) {
@@ -196,8 +237,8 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, templates }: Readonly
           <div className="grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">{templates.map((item) => <button aria-pressed={item.id === template.id} className={`rounded-tile border p-4 text-left ${item.id === template.id ? "border-brand bg-brand-soft" : "hover:bg-subtle"}`} disabled={submission === "submitting"} key={item.id} onClick={() => selectTemplate(item.id)} type="button"><span className="flex items-center justify-between gap-3"><strong className="text-[15px]">{item.displayName}</strong><span className="font-mono text-xs text-muted-ink">rev {item.revision}</span></span><span className="mt-2 block text-xs text-muted-ink">Up to {item.ceiling.spec.budget.monthlyLimit} {item.ceiling.spec.budget.currency}/mo · {item.ceiling.spec.ttl} · {item.ceiling.spec.tools.length} tools</span></button>)}</div>
         </SectionCard>
         <SectionCard title={stepTitle("02", "Budget and lifetime")}><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})<input className="min-h-11 rounded-control border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setBudget(event.target.value)} required value={budget} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.budget.monthlyLimit} {template.ceiling.spec.budget.currency}</span></label><label className="grid gap-2 text-sm font-semibold">Time to live<input className="min-h-11 rounded-control border px-3 font-mono font-normal" disabled={submission === "submitting"} onChange={(event) => setTtl(event.target.value)} required value={ttl} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.ttl}</span></label>{template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month<input className="min-h-11 rounded-control border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setRuntimeMinutes(event.target.value)} required value={runtimeMinutes} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.runtimeMinutesLimit}</span></label> : null}</div></SectionCard>
-        <SectionCard title={stepTitle("03", "Models")}><TagSelect disabled={submission === "submitting"} label="Models" onChange={(next) => setModels(new Set(next))} options={modelOptions} value={[...models]} /></SectionCard>
-        <SectionCard title={stepTitle("04", "Tools")}><TagSelect disabled={submission === "submitting"} label="Tools" onChange={(next) => setTools(new Set(next))} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools in the template ceiling are offered.</p></SectionCard>
+        <SectionCard title={stepTitle("03", "Models")}><TagSelect addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" onChange={(next) => setModels(new Set(next))} options={modelOptions} value={[...models]} /></SectionCard>
+        <SectionCard title={stepTitle("04", "Tools")}><TagSelect addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search GitHub tools…" label="Tools" onChange={(next) => setTools(new Set(next))} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools in the template ceiling are offered.</p></SectionCard>
       </div>
       <SectionCard className="sticky top-7 flex-[1_1_280px] lg:max-w-[380px]" title="Summary">
         <dl className="space-y-3 text-sm">{[["Template", template.displayName], ["Monthly limit", `${budget} ${template.ceiling.spec.budget.currency}`], ["Per run", template.ceiling.spec.budget.singleRunLimit ?? "Not set"], ["TTL", ttl], ["Models", String(models.size)], ["Tools", String(tools.size)]].map(([label, value]) => <div className="flex justify-between gap-4" key={label}><dt className="text-muted-ink">{label}</dt><dd className="text-right font-medium">{value}</dd></div>)}</dl>
@@ -291,7 +332,7 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
         />
       </label>
       {failure ? <p className="text-sm text-red-800" role="alert">{failure}</p> : null}
-      <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
+      <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
     </form>
   );
 }
@@ -367,10 +408,10 @@ function WorkflowGenerator({ requestId }: Readonly<{ requestId: string }>) {
   return (
     <SectionCard title="GitHub Actions workflow">
       <p className="mb-4 text-sm text-muted-ink">Render a published workflow bound to this envelope.</p>
-      <ResourceBoundary state={workflows}>{(data) => data.workflows.length === 0 ? <EmptyState title="No data" /> : (
+      <ResourceBoundary state={workflows}>{(data) => data.workflows.length === 0 ? <p className="text-sm text-muted-ink">No published workflows yet.</p> : (
         <form className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end" onSubmit={(event) => void submit(event, data.workflows)}>
           <label className="grid gap-2 text-sm font-semibold">Workflow<select className="min-h-11 rounded-md border bg-panel px-3 font-normal" name="workflow" required>{data.workflows.map((item) => <option key={workflowReference(item)} value={workflowReference(item)}>{item.displayName} · {workflowReference(item)}</option>)}</select></label>
-          <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={status === "loading"} type="submit">{status === "loading" ? "Rendering…" : "Render workflow"}</button>
+          <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "loading"} type="submit">{status === "loading" ? "Rendering…" : "Render workflow"}</button>
         </form>
       )}</ResourceBoundary>
       {status !== "idle" && status !== "loading" ? <p role="alert" className="text-sm text-red-800">{{ conflict: "The envelope changed before the workflow could be rendered. Reload before retrying.", rejected: "Rust rejected the workflow inputs.", forbidden: "The Rust authorization boundary rejected workflow rendering.", unavailable: "The authoritative workflow service is unavailable.", error: "The workflow response could not be accepted." }[status]}</p> : null}

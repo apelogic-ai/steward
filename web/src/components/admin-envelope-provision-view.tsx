@@ -42,7 +42,7 @@ export function AdminEnvelopeProvisionView() {
         <EmptyState title="Session unavailable"><p>The authoritative administrator session is not available.</p></EmptyState>
       ) : (
         <ResourceBoundary state={state}>{(options) => options.templates.length === 0 ? (
-          <EmptyState title="No data" />
+          <EmptyState title="No templates"><p>Create an envelope template before provisioning authority directly to a user.</p></EmptyState>
         ) : <ProvisionForm csrf={session.value.csrf} options={options} />}</ResourceBoundary>
       )}
     </section>
@@ -114,7 +114,7 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
       <p className="text-sm text-muted-ink">The selected user remains the immutable owner. Your canonical administrator identity is recorded as the actor.</p>
       {status === "provisioned" ? <p className="rounded-md bg-notice p-4 text-sm" role="status"><strong>Envelope provisioned.</strong>{provisionedId ? ` Instance ${provisionedId}.` : ""}</p> : null}
       {failure ? <p className="text-sm text-red-800" role="alert">{failure}</p> : null}
-      <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50" disabled={status === "submitting"} type="submit">{status === "submitting" ? "Provisioning…" : "Provision envelope"}</button>
+      <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={status === "submitting"} type="submit">{status === "submitting" ? "Provisioning…" : "Provision envelope"}</button>
     </form>
   );
 }

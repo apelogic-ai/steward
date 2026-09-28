@@ -15,7 +15,7 @@ import {
   type RunnerPlatform,
   type ToolGrant,
 } from "@/api-client";
-import { DataTable, FormSection, GrantChipList, SectionCard, grantKindForAction } from "@/components/hs";
+import { DataTable, FormSection, GrantChipList, SectionCard, TagSelect, grantKindForAction } from "@/components/hs";
 import { EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -271,13 +271,13 @@ function AuthenticatedTemplateList() {
       <PageHeader
         actions={<div className="flex flex-wrap gap-3">
           <Link className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas" href="/admin/envelopes/provision">Provision envelope</Link>
-          <Link className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-brand-strong" href="/admin/envelopes/templates/new">Create template</Link>
+          <Link className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand shadow-sm hover:bg-brand-strong" href="/admin/envelopes/templates/new">Create template</Link>
         </div>}
         description="The most a member role can request. Each save creates a new immutable revision."
         title="Envelope templates"
       />
       <ResourceBoundary state={acceptedState}>{({ templates }) => templates.length === 0 ? (
-        <EmptyState title="No data" />
+        <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">No templates yet.</p>
       ) : (
         <DataTable
           ariaLabel="Envelope templates"
@@ -537,7 +537,7 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
           <div className="grid gap-4 sm:grid-cols-3">
             <label className="grid gap-2 text-sm font-semibold">Template ID<input className={`${fieldClass} font-mono`} name="newTemplateId" placeholder="developer" required /></label>
             <label className="grid gap-2 text-sm font-semibold">Display name<input className={fieldClass} name="displayName" onChange={(event) => setName(event.target.value)} required value={name} /></label>
-            <label className="grid gap-2 text-sm font-semibold">Eligible member roles<input className={fieldClass} name="memberRoles" onChange={(event) => setRoles(event.target.value)} placeholder="developer, analyst" required value={roles} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Eligible member roles<TagSelect addPlaceholder="Add another role…" allowCreate emptyPlaceholder="Add member role…" label="Eligible member roles" onChange={(next) => setRoles(next.join(", "))} options={roles.split(",").map((role) => role.trim()).filter(Boolean).map((role) => ({ key: role, kind: "neutral", label: role }))} value={roles.split(",").map((role) => role.trim()).filter(Boolean)} /></label>
           </div>
         </FormSection>
         <FormSection description="Inference spend limits in USD and how long an envelope stays valid." title="Budget and lifetime">
@@ -549,10 +549,33 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
           </div>
         </FormSection>
         <FormSection description="Only models supported by the inference gateway can be selected." title="Models">
-          <div className="space-y-3"><div className="flex flex-wrap items-end gap-3"><label className="grid min-w-64 flex-1 gap-2 text-sm font-semibold">Model<select className={fieldClass} disabled={modelCatalog.length === 0} onChange={(event) => setModelInput(event.target.value)} value={modelInput}>{modelCatalog.length === 0 ? <option value="">No models available</option> : modelCatalog.map((model) => <option key={modelKey(model)} value={modelKey(model)}>{modelLabel(model, modelCatalog)}</option>)}</select></label><button className="min-h-11 rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!modelInput || models.some((model) => modelKey(model) === modelInput)} onClick={addModel} type="button">Add model</button></div><ul className="flex flex-wrap gap-2" role="list">{models.map((model, index) => <li className="flex items-center gap-2 rounded-full bg-info-soft px-3 py-1.5 font-mono text-xs" key={`${modelKey(model)}:${index}`}>{modelValue(model)}<button aria-label={`Remove model ${model.model} from provider ${model.provider}`} onClick={() => removeModel(index)} type="button"><svg aria-hidden="true" className="size-3" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8" /></svg></button></li>)}</ul></div>
+          <TagSelect
+            addPlaceholder="Add…"
+            emptyPlaceholder="Search models…"
+            label="Models"
+            onChange={(keys) => setModels(keys.flatMap((key) => {
+              const model = modelCatalog.find((candidate) => modelKey(candidate) === key);
+              return model ? [model] : [];
+            }))}
+            options={modelCatalog.map((model) => ({ key: modelKey(model), kind: "model", label: modelLabel(model, modelCatalog) }))}
+            value={models.map(modelKey)}
+          />
         </FormSection>
         <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Write and destructive tools are labelled.`} title="Tools">
-          <div className="space-y-3"><div className="grid gap-3 sm:grid-cols-[1fr_2fr_auto] sm:items-end"><label className="grid gap-2 text-sm font-semibold">Tool provider<select className={fieldClass} disabled={toolProviders.length === 0} onChange={(event) => { const provider = event.target.value; setToolProviderInput(provider); const first = toolCatalog.find((tool) => tool.provider === provider); setToolInput(first ? toolKey(first) : ""); }} value={toolProviderInput}>{toolProviders.length === 0 ? <option value="">No tool providers available</option> : toolProviders.map((provider) => <option key={provider} value={provider}>{displayName(provider)}</option>)}</select></label><label className="grid gap-2 text-sm font-semibold">Tool<select className={fieldClass} disabled={toolCatalog.length === 0} onChange={(event) => setToolInput(event.target.value)} value={toolInput}>{toolCatalog.filter((tool) => tool.provider === toolProviderInput).map((tool) => <option key={toolKey(tool)} value={toolKey(tool)}>{toolLabel(tool, toolCatalog)}</option>)}</select></label><button className="min-h-11 rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!toolInput || tools.some((tool) => toolKey(tool) === toolInput)} onClick={addTool} type="button">Add tool</button></div><ul className="flex flex-wrap gap-2" role="list">{tools.map((tool, index) => <li className="flex items-center gap-2 rounded-full bg-ok-soft px-3 py-1.5 font-mono text-xs" key={`${toolKey(tool)}:${index}`}>{toolValue(tool)} <span className="font-sans text-ok">{grantKindForAction(tool.action)}</span><button aria-label={`Remove tool ${toolValue(tool)}`} onClick={() => removeTool(index)} type="button">×</button></li>)}</ul><p className="text-xs text-muted-ink">Type to filter. ↑ ↓ to move, Enter to add, Backspace removes the last tag.</p></div>
+          <div className="space-y-2">
+            <TagSelect
+              addPlaceholder="Add another tool…"
+              emptyPlaceholder="Search GitHub tools…"
+              label="Tools"
+              onChange={(keys) => setTools(keys.flatMap((key) => {
+                const tool = toolCatalog.find((candidate) => toolKey(candidate) === key);
+                return tool ? [{ provider: tool.provider, resource: tool.resource, action: tool.action }] : [];
+              }))}
+              options={toolCatalog.map((tool) => ({ key: toolKey(tool), kind: tool.accessClass, label: toolLabel(tool, toolCatalog), note: displayName(tool.provider) }))}
+              value={tools.map(toolKey)}
+            />
+            <p className="text-xs text-muted-ink">Type to filter. ↑ ↓ to move, Enter to add, Backspace removes the last tag.</p>
+          </div>
         </FormSection>
         <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
           <div className="space-y-4"><label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => setAutoApproveToCeiling(event.target.checked)} type="checkbox" />Auto-approve every request within the ceiling</label>{!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => setThresholdJson(event.target.value)} spellCheck={false} value={thresholdJson} /></label> : null}</div>
@@ -725,7 +748,7 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
       ) : null}
 
       <div className="flex flex-wrap items-end gap-3 border-t pt-5">
-        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value={create ? "create" : "version"}>{status === "saving" ? "Saving…" : create ? "Create template" : "Save new version"}</button>
+        <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value={create ? "create" : "version"}>{status === "saving" ? "Saving…" : create ? "Create template" : "Save new version"}</button>
         <label className="grid min-w-56 flex-1 gap-2 text-sm font-semibold">{create ? "Template ID" : "New template ID"}
           <input className={fieldClass} name="newTemplateId" placeholder="developer" required={create} />
         </label>
