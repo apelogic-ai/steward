@@ -24,11 +24,14 @@ use openshell_sdk::raw::proto::datamodel::v1::{
     ObjectMeta, Provider, WorkspaceSelector, workspace_selector,
 };
 #[cfg(feature = "runtime")]
+use openshell_sdk::raw::proto::sandbox::v1::{FilesystemPolicy, LandlockPolicy, SandboxPolicy};
+#[cfg(feature = "runtime")]
 use openshell_sdk::raw::proto::{
-    AttachSandboxProviderRequest, CreateProviderRequest, DetachSandboxProviderRequest,
-    ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxRequest,
-    ListSandboxProvidersRequest, Sandbox as RawSandbox, SandboxPhase as RawSandboxPhase,
-    exec_sandbox_event,
+    AttachSandboxProviderRequest, CreateProviderRequest, CreateSandboxRequest,
+    DetachSandboxProviderRequest, ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest,
+    GetSandboxRequest, ListSandboxProvidersRequest, Sandbox as RawSandbox,
+    SandboxPhase as RawSandboxPhase, SandboxSpec as RawSandboxSpec,
+    SandboxTemplate as RawSandboxTemplate, exec_sandbox_event,
 };
 #[cfg(feature = "runtime")]
 use openshell_sdk::{
@@ -845,6 +848,51 @@ fn sandbox_spec(projection: &OpenShellProjection) -> SandboxSpec {
         labels,
         providers: projection.providers.clone(),
         ..SandboxSpec::default()
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn sandbox_create_request(projection: &OpenShellProjection) -> CreateSandboxRequest {
+    let spec = sandbox_spec(projection);
+    CreateSandboxRequest {
+        workspace_scope: named_workspace_scope(&projection.workspace),
+        spec: Some(RawSandboxSpec {
+            template: spec.image.map(|image| RawSandboxTemplate {
+                image,
+                ..RawSandboxTemplate::default()
+            }),
+            providers: spec.providers,
+            policy: Some(SandboxPolicy {
+                version: 1,
+                filesystem: Some(FilesystemPolicy {
+                    include_workdir: true,
+                    read_only: [
+                        "/bin",
+                        "/usr",
+                        "/lib",
+                        "/proc",
+                        "/dev/urandom",
+                        "/etc",
+                        "/var/log",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                    read_write: ["/tmp", "/dev/null"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                }),
+                landlock: Some(LandlockPolicy {
+                    compatibility: "best_effort".to_owned(),
+                }),
+                ..SandboxPolicy::default()
+            }),
+            ..RawSandboxSpec::default()
+        }),
+        name: spec.name.unwrap_or_default(),
+        labels: spec.labels,
+        ..CreateSandboxRequest::default()
     }
 }
 
@@ -2132,23 +2180,21 @@ impl SandboxRuntime for OpenShellRuntime {
         {
             Ok(snapshot) => snapshot,
             Err(SdkError::NotFound { .. }) => {
-                match self
-                    .authenticated_client()
-                    .await?
-                    .workspace(&projection.workspace)
-                    .create_sandbox(sandbox_spec(&projection))
+                let client = self.authenticated_client().await?;
+                let mut grpc = client.raw_grpc();
+                match grpc
+                    .create_sandbox(sandbox_create_request(&projection))
                     .await
                 {
-                    Ok(snapshot) => snapshot,
-                    Err(SdkError::AlreadyExists { .. }) => self
-                        .authenticated_client()
-                        .await?
-                        .workspace(&projection.workspace)
-                        .get_sandbox(&projection.sandbox)
-                        .await
-                        .map_err(port_failure)?,
-                    Err(error) => return Err(port_failure(error)),
+                    Ok(_) => {}
+                    Err(error) if error.code() == tonic::Code::AlreadyExists => {}
+                    Err(error) => return Err(raw_port_failure(error)),
                 }
+                client
+                    .workspace(&projection.workspace)
+                    .get_sandbox(&projection.sandbox)
+                    .await
+                    .map_err(port_failure)?
             }
             Err(error) => return Err(port_failure(error)),
         };
@@ -2827,9 +2873,9 @@ mod tests {
         attach_task_agent_failure_category, collect_task_process_stream, delete_owned_sandbox,
         deletion_names, load_source_credential, output_archive_command, project_request,
         provider_reconciliation, provider_reconciliation_plan, provider_reconciliation_targets,
-        sandbox_spec, staging_append_command, staging_archive_chunks, staging_extract_command,
-        staging_prepare_command, task_agent_failure_category, task_attempt_directory,
-        task_attempt_execution_command, task_attempt_observation_command,
+        sandbox_create_request, sandbox_spec, staging_append_command, staging_archive_chunks,
+        staging_extract_command, staging_prepare_command, task_agent_failure_category,
+        task_attempt_directory, task_attempt_execution_command, task_attempt_observation_command,
         task_attempt_transcript_stream_command, task_process_log_record, task_transcript_requested,
         validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
@@ -4024,6 +4070,50 @@ mod tests {
             "the gateway's configured default sandbox image must remain authoritative"
         );
         assert_eq!(projection.runtime_uid, "runtime-uid-a");
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn sandbox_creation_carries_an_enforceable_base_policy() -> Result<(), String> {
+        let projection = project_request(
+            &SandboxRequest {
+                runtime: RuntimeId("runtime-uid-a".to_owned()),
+                workspace_key: "team-a".to_owned(),
+                execution_class: SandboxExecutionClass::Agent,
+                agent_type: AgentType {
+                    name: "base".to_owned(),
+                },
+                models: Vec::new(),
+                tools: Vec::new(),
+                refs: RuntimeRefs::default(),
+                execution_binding: None,
+            },
+            None,
+            None,
+        )
+        .map_err(|error| format!("runtime projection failed: {error:?}"))?;
+
+        let request = sandbox_create_request(&projection);
+        let policy = request
+            .spec
+            .and_then(|spec| spec.policy)
+            .ok_or_else(|| "sandbox creation omitted its base policy".to_owned())?;
+        assert_eq!(policy.version, 1);
+        assert!(
+            policy
+                .filesystem
+                .as_ref()
+                .is_some_and(|filesystem| filesystem.include_workdir),
+            "the base policy must make the sandbox workdir writable"
+        );
+        assert_eq!(
+            policy
+                .landlock
+                .as_ref()
+                .map(|landlock| landlock.compatibility.as_str()),
+            Some("best_effort")
+        );
         Ok(())
     }
 
