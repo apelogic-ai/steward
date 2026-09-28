@@ -125,7 +125,7 @@
   "browserAuth": {
     "clientId": "example.apps.example.com",
     "workspaceDomain": "example.com",
-    "organizationId": "example-org",
+    "organizationId": "org_example",
     "clientSecretName": "steward-browser-auth",
     "clientSecretKey": "client-secret",
     "egressCidrs": ["192.0.2.0/24"]

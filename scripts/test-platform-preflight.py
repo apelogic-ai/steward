@@ -152,6 +152,15 @@ class PlatformPreflightTests(unittest.TestCase):
         result = self.run_validate(separated)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_rejects_browser_organization_id_outside_steward_namespace(self) -> None:
+        self.input["browserAuth"]["organizationId"] = "example-org"
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "browserAuth.organizationId must use org_ and lowercase ASCII letters, digits, _ or -",
+            result.stderr,
+        )
+
     def test_examples_use_released_codex_executable(self) -> None:
         separated = json.loads(SEPARATED.read_text(encoding="utf-8"))
         self.assertEqual(self.input["execution"]["binding"]["executable"], "/usr/bin/codex")
@@ -348,6 +357,16 @@ class PlatformPreflightTests(unittest.TestCase):
                     "hostname": "steward-apiserver.steward-system.svc.cluster.local",
                     "caConfigMap": {"name": "steward-apiserver-ca", "key": "ca.crt"},
                 },
+            )
+            self.assertEqual(
+                values["web"]["httpRoute"]["apiPaths"],
+                [
+                    {"type": "PathPrefix", "value": "/admin/api"},
+                    {"type": "PathPrefix", "value": "/admin/auth"},
+                    {"type": "Exact", "value": "/admin/connections/github/callback"},
+                    {"type": "PathPrefix", "value": "/app/api"},
+                    {"type": "PathPrefix", "value": "/v1"},
+                ],
             )
             self.assertEqual(
                 values["connectionsBridge"]["mcpGatewayAuthorityContract"],

@@ -57,7 +57,7 @@ only.
 
 | Mode | Additional products required |
 |---|---|
-| Core (`execution.enabled=false`) | PostgreSQL only. Governed submission, admission, approval, and audit work; Task execution stays staged. |
+| Core (`execution.enabled=false`) | PostgreSQL only. The API, webhook, browser administration when enabled, and AgentRuntime validation work; new Task submission is disabled while orchestration is staged. |
 | Governed execution (`execution.enabled=true`) | OpenShell, agent-sandbox, SPIRE CSI and `ClusterSPIFFEID`, a Mint signing Secret, LiteLLM, the Identity product's **workload** exchange mode, and optionally MCP-GW. |
 
 An existing MCP-GW and LiteLLM deployment does not by itself satisfy governed
@@ -65,12 +65,13 @@ execution. The Identity product's baseline quickstart also deliberately
 excludes the workload exchange that OpenShell requires; governed execution uses
 that product's full installation guide, not its quickstart.
 
-Both modes additionally require the human browser path. Envelope templates and
-User Envelope operations are protected by the browser session and administrator
-boundaries, and the installation guide documents no non-browser substitute, so
-`browserAuth.enabled=true` and its Google OIDC client, HTTPS edge, and exact
-callback are prerequisites for any external Task submission — not an optional
-presentation layer.
+Browser authentication is not a prerequisite for installing or verifying core
+mode. Enable it only when the deployment uses Steward's human browser
+administration path. The browser-assisted sequence below uses that path to
+discover a canonical user, publish governance data, and provision authority;
+those steps therefore require `browserAuth.enabled=true`, its Google OIDC
+client, HTTPS edge, and exact callback. They do not make browser authentication
+a dependency of the core binaries themselves.
 
 ## Step 1: record the version set
 
@@ -264,23 +265,18 @@ the append-only audit endpoint. Never use actor login, display name, or email
 similarity as association proof. A complete valid v2 compatibility identity
 may seed only that same verified issuer/subject association.
 
-## Step 7: accept authentication and admission in core mode
+## Step 7: verify Task submission remains disabled in core mode
 
-Submit one direct Git package invocation while Steward remains in core mode.
-The caller references the exact package source through a checked-in invocation
-manifest. Steward must authenticate the caller, admit the Task against the
-selected active provisioned User Envelope, and record the exact User Envelope
-evidence without creating a runtime. Supply `envelopeDigest` when several are
-active; omission is supported only when exactly one is active. A published
-Workflow revision remains an optional curation layer over the same immutable
-package, not a registration prerequisite.
+Submit one otherwise-valid direct Git package invocation while Steward remains
+in core mode. Steward must reject it with the staged-orchestration runtime
+contract error before creating a Task, reserving authority, or creating an
+AgentRuntime. Core mode can verify the API, webhook, browser administration
+when enabled, and AgentRuntime admission; it does not admit or queue Tasks.
 
-Repeat with a wrong audience, an untrusted issuer or CA, an unauthorized
-repository, ref, and actor, and a canonical user with no active Envelope. Each
-must fail closed before a Task is created. This step proves identity and
-authority only; core mode deliberately cannot prove agent execution or output.
-After recording the accepted Task's evidence, request its cleanup and confirm
-it is finalized so enabling execution cannot later start this staged test Task.
+Also exercise a wrong audience and untrusted issuer or CA. Those credentials
+must fail authentication, while the otherwise-valid request must fail at the
+staged orchestration boundary. Record the distinct public error categories and
+confirm that no Task or runtime record was created by any attempt.
 
 ## Step 8: governed execution, if in scope
 

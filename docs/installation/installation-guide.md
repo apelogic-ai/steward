@@ -13,7 +13,7 @@ requires an order those products do not own; see
 
 | Mode | What starts | Additional prerequisites |
 |---|---|---|
-| Core (default, `execution.enabled=false`) | API, admission webhook, and AgentRuntime controller with Task orchestration staged | None of Jira, an inference endpoint, LiteLLM, OpenShell, SPIRE, a Mint Secret, or a RuntimeClass |
+| Core (default, `execution.enabled=false`) | API, admission webhook, and AgentRuntime controller; new Task submission is disabled while orchestration is staged | None of Jira, an inference endpoint, LiteLLM, OpenShell, SPIRE, a Mint Secret, or a RuntimeClass |
 | Governed execution (`execution.enabled=true`) | Core plus Mint, OpenShell reconciliation, LiteLLM inference, and workload identity | OpenShell gateway/client mTLS, LiteLLM, workload exchange, SPIRE CSI and ClusterSPIFFEID, Mint signing material and trust |
 
 Jira is a separate opt-in decision-channel integration (`jira.enabled=true`) in
@@ -584,8 +584,9 @@ Do not hand off merely because `helm template` or `helm lint` passed.
 4. In core mode, confirm there are no Mint pods, no OpenShell or LiteLLM
    credential projections, no Jira Secret or Jira egress, and no Task owner
    loop. Confirm the API/controller are usable with only PostgreSQL, the
-   Kubernetes API, and TLS supplied. A Task execution attempt must fail
-   closed, not start a sandbox or call a model.
+   Kubernetes API, and TLS supplied. An otherwise-valid Task submission must
+   fail at the staged-orchestration boundary before creating a Task or runtime;
+   it must not start a sandbox or call a model.
 5. For governed mode, first confirm OpenShell mTLS, workload exchange,
    SPIRE identity, LiteLLM, and Mint readiness. Activate execution bindings and Task
    orchestration only in their documented staged rollout sequence. Run one
@@ -621,9 +622,10 @@ drain and staged phases. Enabling `steward-task-v3` has a separate
 apply migration 0040 while v3 remains disabled, then activate discovery and
 subject observation. Run `helm template` and the preflight/key-presence
 checks with the new immutable handoff before `helm upgrade --atomic --wait`.
-Then repeat the delivery tests, including model-free/core or governed Tasks as
-appropriate. A Helm rollback cannot reverse SQL migrations or restore external
-state; do not equate an `--atomic` return with a safe data rollback.
+Then repeat the delivery tests, including the rejected core-mode submission or
+governed Task execution as appropriate. A Helm rollback cannot reverse SQL
+migrations or restore external state; do not equate an `--atomic` return with a
+safe data rollback.
 
 For rollback, first stop submissions and prove in-flight Tasks are finalized
 or safely fenced. Use the documented compatibility of the previous binaries
