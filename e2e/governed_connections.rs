@@ -494,9 +494,13 @@ impl Harness {
                 "--no-tty",
                 "--",
                 "curl",
-                "-sS",
+                "--silent",
+                "--show-error",
+                "--fail-with-body",
                 "--max-time",
                 "20",
+                "--write-out",
+                "\nhttp_status=%{http_code}\n",
                 "-H",
                 "Content-Type: application/json",
                 "-H",
@@ -506,6 +510,35 @@ impl Harness {
                 "-d",
                 &request,
                 MCP_URL,
+            ])
+            .output()?;
+        Ok(format!(
+            "status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
+    fn sandbox_logs(&self, namespace: &str, name: &str) -> Result<String, Box<dyn Error>> {
+        let workspace = self.runtime_ref(namespace, name, "workspace")?;
+        let sandbox = self.runtime_ref(namespace, name, "sandbox")?;
+        let output = Command::new(&self.openshell)
+            .args(["--gateway-endpoint"])
+            .arg(required("STEWARD_OPENSHELL_ENDPOINT")?)
+            .args([
+                "--workspace",
+                &workspace,
+                "logs",
+                &sandbox,
+                "--since",
+                "5m",
+                "--source",
+                "sandbox",
+                "--level",
+                "debug",
+                "-n",
+                "400",
             ])
             .output()?;
         Ok(format!(
@@ -532,8 +565,9 @@ impl Harness {
             }
             std::thread::sleep(Duration::from_millis(500));
         }
+        let logs = self.sandbox_logs(namespace, name)?;
         Err(io::Error::other(format!(
-            "tool result for {namespace}/{name} did not contain {expected:?}; last={last}"
+            "tool result for {namespace}/{name} did not contain {expected:?}; last={last}; logs={logs}"
         ))
         .into())
     }
