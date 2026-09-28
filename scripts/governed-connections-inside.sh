@@ -69,8 +69,26 @@ trap 'exit 143' TERM
 docker pull "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}"
 docker tag "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}" "${mcp_gw_local_image}"
 kind load docker-image "${mcp_gw_local_image}" --name "${cluster_name}"
+
+docker build \
+  --label "steward.test/run-id=${run_id}" \
+  --file "${ROOT}/config/s1/steward-mint.Dockerfile" \
+  --tag "${STEWARD_CONNECTIONS_TEST_MINT_IMAGE}" \
+  "${ROOT}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_MINT_IMAGE}" --name "${cluster_name}"
+
+docker build \
+  --label "steward.test/run-id=${run_id}" \
+  --file "${ROOT}/build/connections-bridge.Dockerfile" \
+  --tag "${STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE}" \
+  "${ROOT}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE}" --name "${cluster_name}"
+
+docker build \
+  --label "steward.test/run-id=${run_id}" \
+  --file "${ROOT}/e2e/Dockerfile.governed-connections-webhook" \
+  --tag "${STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE}" \
+  "${ROOT}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE}" --name "${cluster_name}"
 
 bridge_containerd_name="docker.io/${STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE}"

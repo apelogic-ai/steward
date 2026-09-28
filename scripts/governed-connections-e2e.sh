@@ -36,21 +36,6 @@ trap 'exit 143' TERM
 
 docker build \
   --label "steward.test/run-id=${RUN_ID}" \
-  --file "${ROOT}/config/s1/steward-mint.Dockerfile" \
-  --tag "${MINT_IMAGE}" \
-  "${ROOT}"
-docker build \
-  --label "steward.test/run-id=${RUN_ID}" \
-  --file "${ROOT}/build/connections-bridge.Dockerfile" \
-  --tag "${BRIDGE_IMAGE}" \
-  "${ROOT}"
-docker build \
-  --label "steward.test/run-id=${RUN_ID}" \
-  --file "${ROOT}/e2e/Dockerfile.governed-connections-webhook" \
-  --tag "${WEBHOOK_IMAGE}" \
-  "${ROOT}"
-docker build \
-  --label "steward.test/run-id=${RUN_ID}" \
   --file "${ROOT}/e2e/Dockerfile.workflow-sandbox" \
   --tag "${SANDBOX_IMAGE}" \
   "${ROOT}"
