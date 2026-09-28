@@ -272,6 +272,7 @@ networkPolicy:
     identityExchange: 8443
     mcpGateway: 8080
 spire:
+  className: spire-spire
   csiDriver: csi.spiffe.io
   socketPath: /run/spire/sockets
   identityPath: /steward/mint

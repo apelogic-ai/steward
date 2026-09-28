@@ -484,7 +484,9 @@ that allowlist remain inaccessible to both service accounts.
   checked-in OpenShell provider contract (`audience=steward-mcp`, `scope=mcp`)
   and the inference exchange on the same Mint instance.
 - `spire.csiDriver` and `spire.socketPath` mount the SPIFFE Workload API only in
-  the mint pod. The chart creates a `ClusterSPIFFEID` selecting the release
+  the mint pod. `spire.className` must match the SPIRE controller-manager class
+  (`spire-spire` for the documented SPIRE release). The chart creates a
+  `ClusterSPIFFEID` selecting the release
   namespace and Mint pod labels, with trust domain
   `config.mint.spiffeTrustDomain` and stable path `spire.identityPath`
   (`/steward/mint` by default).
