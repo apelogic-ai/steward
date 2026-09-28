@@ -288,7 +288,7 @@ the exact MCP-GW origin, and a dedicated runtime namespace. Authority v1 also
 requires the named `connectionsBridge.mcpGatewayAuthorityContract` selector:
 `steward.connections.github/v1` for the legacy status route or
 `steward.connections.github/v2` for the lifecycle status contract used by
-MCP-GW 0.4.9 through 0.4.11. The deprecated `mcpGatewayVersion` input remains
+MCP-GW 0.4.9 through 0.5.0. The deprecated `mcpGatewayVersion` input remains
 available for an existing values file and must not be set together with the
 named selector. Another configured contract fails closed. The apiserver records
 the frozen internal authority snapshot on each operation; the controller
