@@ -316,8 +316,6 @@ curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
 )
 OPEN_SHELL="${STEWARD_RUN_DIR}/openshell"
 "${OPEN_SHELL}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
-  settings set --global --key providers_v2_enabled --value true --yes
-"${OPEN_SHELL}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   provider profile lint --global -f "${profile}"
 "${OPEN_SHELL}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   provider profile import --global -f "${profile}"

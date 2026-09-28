@@ -19,7 +19,6 @@ endpoints:
   - host: hop1-capture-tools.steward-system.svc.cluster.local
     port: 8085
     protocol: rest
-    tls: none
     access: read-write
     enforcement: enforce
     allowed_ips:

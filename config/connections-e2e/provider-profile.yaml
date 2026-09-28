@@ -19,7 +19,6 @@ endpoints:
   - host: mcp-gw.steward-system.svc.cluster.local
     port: 8080
     protocol: rest
-    tls: none
     access: read-write
     enforcement: enforce
     allowed_ips:
