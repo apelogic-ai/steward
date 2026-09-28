@@ -156,9 +156,11 @@ web:
         sectionName: https
     hostname: steward.example.com
     apiPaths:
+      - { type: Exact, value: /.well-known/oauth-protected-resource }
       - { type: PathPrefix, value: /admin/api }
       - { type: PathPrefix, value: /admin/auth }
       - { type: Exact, value: /admin/connections/github/callback }
+      - { type: PathPrefix, value: /admin/operator }
       - { type: PathPrefix, value: /app/api }
       - { type: PathPrefix, value: /v1 }
     webPaths:
@@ -235,10 +237,14 @@ when disabled, every Google/OIDC value and Secret reference must be empty and
 the chart renders no browser-auth environment variables or Secret projection.
 When enabled, the chart requires an exact HTTPS browser origin, Google client
 ID, hosted Workspace domain, Steward organization ID, and an existing Secret
-name/key for the Google client secret. The chart never creates the Secret or a
-public edge. A deployment adapter supplies the HTTPS route, certificate and
-network policy appropriate to its platform (for example, a local Kind adapter
-or a DEV gateway); those controls do not belong in this portable chart.
+name/key for the Google client secret. The organization ID is a Steward-chosen
+stable namespace, not a Google, cloud, or identity-provider organization ID. It
+must be 4–64 characters, start with `org_`, and contain only lowercase ASCII
+letters, digits, `_`, or `-` (for example, `org_example`). The chart never
+creates the Secret or a public edge. A deployment adapter supplies the HTTPS
+route, certificate and network policy appropriate to its platform (for
+example, a local Kind adapter or a DEV gateway); those controls do not belong
+in this portable chart.
 When the legacy `web.ingress.enabled=true` interface is selected, `web.host`
 must exactly match the browser origin host and the Ingress class and TLS Secret
 are required. With it disabled, those Ingress-only inputs may be empty and no

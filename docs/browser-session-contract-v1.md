@@ -165,5 +165,9 @@ The apiserver activates the Google browser surface only when
 stops rather than exposing an unverifiable sign-in route. Illustrative values are origin
 `https://steward.example.test`, callback
 `https://steward.example.test/admin/auth/callback`, Workspace domain `example.test`, and opaque
-organization ID `org_example`. Client ID and the origin/domain/organization values are non-secret
-runtime configuration; the client secret remains secret-projected only.
+organization ID `org_example`. This opaque ID is chosen and kept stable by the
+Steward operator; it is not a Google, cloud, or identity-provider organization
+identifier. It starts with `org_` and uses only lowercase ASCII letters,
+digits, `_`, or `-`, with a maximum length of 64 characters. Client ID and the
+origin/domain/organization values are non-secret runtime configuration; the
+client secret remains secret-projected only.

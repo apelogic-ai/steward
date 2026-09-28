@@ -777,6 +777,22 @@ if helm template steward "${root}/charts/steward" \
   --namespace steward \
   --include-crds \
   "${image_values[@]}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=example-org \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' >/dev/null 2>&1
+then
+  echo "browser authentication must reject an organization ID outside the Steward org_ namespace" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
   --set browserAuth.enabled=false \
   --set-string browserAuth.google.clientId=stale-client >/dev/null 2>&1
 then

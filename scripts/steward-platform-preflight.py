@@ -23,6 +23,7 @@ RESULT_CONTRACT = "steward.platform-preflight-result/v1"
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 DNS_NAME = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 K8S_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
+ORGANIZATION_ID = re.compile(r"^org_[a-z0-9_-]{0,60}$")
 REQUIRED_NAMESPACES = (
     "steward",
     "runtime",
@@ -603,7 +604,15 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
                 "enabled": True,
                 "parentRefs": [parent],
                 "hostname": endpoint["hostname"],
-                "apiPaths": [{"type": "PathPrefix", "value": "/api"}],
+                "apiPaths": [
+                    {"type": "Exact", "value": "/.well-known/oauth-protected-resource"},
+                    {"type": "PathPrefix", "value": "/admin/api"},
+                    {"type": "PathPrefix", "value": "/admin/auth"},
+                    {"type": "Exact", "value": "/admin/connections/github/callback"},
+                    {"type": "PathPrefix", "value": "/admin/operator"},
+                    {"type": "PathPrefix", "value": "/app/api"},
+                    {"type": "PathPrefix", "value": "/v1"},
+                ],
                 "webPaths": [{"type": "PathPrefix", "value": "/"}],
                 "backendTls": {
                     "hostname": f"steward-apiserver.{data['namespaces']['steward']}.svc.cluster.local",
@@ -823,6 +832,10 @@ def validate_browser(data: dict[str, Any]) -> None:
     browser = require_object(data, "browserAuth", "input")
     for key in ("clientId", "workspaceDomain", "organizationId", "clientSecretName", "clientSecretKey"):
         require_string(browser, key, "browserAuth")
+    if not ORGANIZATION_ID.fullmatch(browser["organizationId"]):
+        raise ValidationError(
+            "browserAuth.organizationId must use org_ and lowercase ASCII letters, digits, _ or -"
+        )
     egress_cidrs = browser.get("egressCidrs")
     if not isinstance(egress_cidrs, list) or not egress_cidrs or not all(isinstance(value, str) and value for value in egress_cidrs):
         raise ValidationError("browserAuth.egressCidrs must be a non-empty string array")
