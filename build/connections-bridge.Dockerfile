@@ -6,7 +6,7 @@ RUN cargo build --locked --release --bin steward-connections-bridge
 FROM ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254
 
 RUN apt-get update \
-  && apt-get install --yes --no-install-recommends iproute2 \
+  && apt-get install --yes --no-install-recommends iproute2 curl \
   && rm -rf /var/lib/apt/lists/* \
   && test -x /bin/cat \
   && test -x /bin/find \
@@ -19,6 +19,7 @@ RUN apt-get update \
   && test -x /bin/sleep \
   && test -x /bin/tar \
   && test -x /bin/touch \
+  && test -x /usr/bin/curl \
   && mkdir -p /sandbox \
   && chown 65532:65532 /sandbox
 
