@@ -199,6 +199,14 @@ if [[ "${chart_contract_mode}" == legacy ]]; then
   done
 else
   core_values=("${core_image_values[@]}" --set-string tls.webhook.caBundlePem=public-validation-ca)
+  if helm template steward "${root}/charts/steward" --namespace steward \
+    "${core_values[@]}" --kube-version 1.31.0 >/dev/null 2>&1
+  then
+    echo "release chart must reject Kubernetes releases below 1.32" >&2
+    exit 1
+  fi
+  helm template steward "${root}/charts/steward" --namespace steward \
+    "${core_values[@]}" --kube-version 1.32.0 >/dev/null
   helm lint "${root}/charts/steward" "${core_values[@]}"
   helm template steward "${root}/charts/steward" \
     --namespace steward \
@@ -547,8 +555,20 @@ http_route_values=(
   --set-string 'web.httpRoute.parentRefs[0].name=shared-gateway' \
   --set-string 'web.httpRoute.parentRefs[0].namespace=envoy-gateway-system' \
   --set-string 'web.httpRoute.parentRefs[0].sectionName=https' \
-  --set-string 'web.httpRoute.apiPaths[0].type=PathPrefix' \
-  --set-string 'web.httpRoute.apiPaths[0].value=/admin/api' \
+  --set-string 'web.httpRoute.apiPaths[0].type=Exact' \
+  --set-string 'web.httpRoute.apiPaths[0].value=/.well-known/oauth-protected-resource' \
+  --set-string 'web.httpRoute.apiPaths[1].type=PathPrefix' \
+  --set-string 'web.httpRoute.apiPaths[1].value=/admin/api' \
+  --set-string 'web.httpRoute.apiPaths[2].type=PathPrefix' \
+  --set-string 'web.httpRoute.apiPaths[2].value=/admin/auth' \
+  --set-string 'web.httpRoute.apiPaths[3].type=Exact' \
+  --set-string 'web.httpRoute.apiPaths[3].value=/admin/connections/github/callback' \
+  --set-string 'web.httpRoute.apiPaths[4].type=PathPrefix' \
+  --set-string 'web.httpRoute.apiPaths[4].value=/admin/operator' \
+  --set-string 'web.httpRoute.apiPaths[5].type=PathPrefix' \
+  --set-string 'web.httpRoute.apiPaths[5].value=/app/api' \
+  --set-string 'web.httpRoute.apiPaths[6].type=PathPrefix' \
+  --set-string 'web.httpRoute.apiPaths[6].value=/v1' \
   --set-string 'web.httpRoute.webPaths[0].type=PathPrefix' \
   --set-string 'web.httpRoute.webPaths[0].value=/' \
   --set-string web.httpRoute.backendTls.hostname=steward-apiserver.steward.svc.cluster.local \
@@ -565,6 +585,25 @@ http_route_values=(
   --set-string browserAuth.google.clientSecret.key=client-secret \
   --set networkPolicy.ingressNamespace=envoy-gateway-system \
   --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24'
+)
+incomplete_http_route_values=(
+  --set web.enabled=true
+  --set web.httpRoute.enabled=true
+  --set-string web.host=steward.example.test
+  --set-string web.httpRoute.hostname=steward.example.test
+  --set-string 'web.httpRoute.parentRefs[0].name=shared-gateway'
+  --set-string 'web.httpRoute.parentRefs[0].namespace=envoy-gateway-system'
+  --set-string 'web.httpRoute.parentRefs[0].sectionName=https'
+  --set-string 'web.httpRoute.apiPaths[0].type=PathPrefix'
+  --set-string 'web.httpRoute.apiPaths[0].value=/admin/api'
+  --set-string 'web.httpRoute.webPaths[0].type=PathPrefix'
+  --set-string 'web.httpRoute.webPaths[0].value=/'
+  --set-string web.httpRoute.backendTls.hostname=steward-apiserver.steward.svc.cluster.local
+  --set-string web.httpRoute.backendTls.caConfigMap.name=steward-apiserver-ca
+  --set-string web.httpRoute.backendTls.caConfigMap.key=ca.crt
+  --set images.web.tag=validation-web
+  --set "images.web.digest=${digest3}"
+  --set networkPolicy.ingressNamespace=envoy-gateway-system
 )
 helm template steward "${root}/charts/steward" \
   --namespace steward \
@@ -583,7 +622,13 @@ for required in \
   'namespace: "envoy-gateway-system"' \
   'sectionName: "https"' \
   'hostnames: ["steward.example.test"]' \
+  'path: { type: Exact, value: "/.well-known/oauth-protected-resource" }' \
   'path: { type: PathPrefix, value: "/admin/api" }' \
+  'path: { type: PathPrefix, value: "/admin/auth" }' \
+  'path: { type: Exact, value: "/admin/connections/github/callback" }' \
+  'path: { type: PathPrefix, value: "/admin/operator" }' \
+  'path: { type: PathPrefix, value: "/app/api" }' \
+  'path: { type: PathPrefix, value: "/v1" }' \
   'path: { type: PathPrefix, value: "/" }' \
   'name: steward-apiserver' \
   'port: 443' \
@@ -605,6 +650,14 @@ do
 done
 if grep -Fq 'kind: Ingress' "${http_route_rendered}"; then
   echo "Gateway API routing must not render a legacy Ingress" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  "${image_values[@]}" \
+  "${incomplete_http_route_values[@]}" >/dev/null 2>&1
+then
+  echo "an incomplete Gateway API apiserver route list must fail chart validation" >&2
   exit 1
 fi
 if helm template steward "${root}/charts/steward" \
@@ -787,6 +840,22 @@ if helm template steward "${root}/charts/steward" \
   --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' >/dev/null 2>&1
 then
   echo "browser authentication must reject an organization ID outside the Steward org_ namespace" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_ \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' >/dev/null 2>&1
+then
+  echo "browser authentication must reject an organization ID without a suffix" >&2
   exit 1
 fi
 if helm template steward "${root}/charts/steward" \

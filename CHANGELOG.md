@@ -7,11 +7,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-28
+
+### Changed
+
+- Raised the supported Kubernetes floor to 1.32 and aligned the chart and
+  installation guidance with the tested Kind 1.32.1 lane.
+- Presented the public web application consistently as Steward and reused the
+  shipped Steward icon for the application brand and favicon.
+
+### Fixed
+
+- Required the complete seven-route public apiserver path set whenever the
+  chart renders Gateway API HTTPRoutes, preventing an incomplete edge from
+  silently routing API requests to the web frontend.
+- Rejected the empty-suffix organization identifier `org_` consistently in
+  the runtime parser, Helm schema, and platform preflight.
+
 ## [0.3.1] - 2026-09-27
 
 ### Changed
 
-- Completed the HyperShell browser workspace across request review, Envelope
+- Completed the Steward browser workspace across request review, Envelope
   management, governed runs and logs, connections, settings, and guided
   onboarding with a consistent responsive component system.
 
@@ -19,7 +36,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - Enforced the API's `org_` organization identifier contract in the Helm schema,
   platform preflight, and shipped examples.
-- Generated only the five supported public HTTP routes instead of the obsolete
+- Generated only the seven supported public HTTP routes instead of the obsolete
   catch-all `/api` route.
 - Corrected core-mode installation guidance: external Task submission is
   rejected before Task or runtime creation until orchestration is enabled, and
@@ -29,7 +46,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
-- Added the HyperShell browser/API redesign: one typed administrator request
+- Added the Steward browser/API redesign: one typed administrator request
   queue with history and structured deltas; cumulative spend and runtime-minute
   escalation controls; Envelope usage; trigger provenance; run stages, steps,
   incremental logs, cancellation and GitHub re-run operations; phase facets;
@@ -251,7 +268,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/apelogic-ai/steward/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/apelogic-ai/steward/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/apelogic-ai/steward/compare/v0.2.6...v0.3.0
 [0.2.6]: https://github.com/apelogic-ai/steward/compare/v0.2.5...v0.2.6

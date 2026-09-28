@@ -20,16 +20,16 @@ const inconsolata = Inconsolata({
 
 export const metadata: Metadata = {
   title: {
-    default: "HyperShell",
-    template: "%s · HyperShell",
+    default: "Steward",
+    template: "%s · Steward",
   },
   description: "Governed agent runtimes and authority envelopes.",
-  icons: { icon: "/brand/logo" },
+  icons: { icon: "/icon.svg" },
 };
 
 export default async function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
   await headers();
-  const themePreference = (await cookies()).get("hypershell-theme")?.value;
+  const themePreference = (await cookies()).get("steward-theme")?.value;
   const initialTheme = themePreference === "light" || themePreference === "dark"
     ? themePreference
     : undefined;

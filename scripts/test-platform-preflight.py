@@ -161,6 +161,15 @@ class PlatformPreflightTests(unittest.TestCase):
             result.stderr,
         )
 
+    def test_rejects_browser_organization_id_without_a_suffix(self) -> None:
+        self.input["browserAuth"]["organizationId"] = "org_"
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "browserAuth.organizationId must use org_ and lowercase ASCII letters, digits, _ or -",
+            result.stderr,
+        )
+
     def test_examples_use_released_codex_executable(self) -> None:
         separated = json.loads(SEPARATED.read_text(encoding="utf-8"))
         self.assertEqual(self.input["execution"]["binding"]["executable"], "/usr/bin/codex")

@@ -119,7 +119,7 @@ function subscribeToPreferredTheme(onChange: () => void): () => void {
 function applyThemePreference(preference: BrowserTheme): void {
   if (preference === "system") delete document.documentElement.dataset.theme;
   else document.documentElement.dataset.theme = preference;
-  document.cookie = `hypershell-theme=${preference}; Path=/; Max-Age=31536000; SameSite=Lax`;
+  document.cookie = `steward-theme=${preference}; Path=/; Max-Age=31536000; SameSite=Lax`;
 }
 
 function StatePanel({ children, title }: Readonly<{ children: ReactNode; title: string }>) {
@@ -285,10 +285,10 @@ function AppSidebar({ adminMode, mobile = false, needsAction, onNavigate, onboar
   const navigation = adminMode ? adminNavigation : userNavigation.filter((item) => !(onboardingDismissed || onboardingComplete) || item.href !== "/get-started");
   return (
     <aside className={mobile ? "flex h-full w-[216px] flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 shadow-xl" : "sticky top-0 hidden h-screen flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 md:flex"}>
-      <Link aria-label="HyperShell home" className="flex items-center gap-2.5 px-2 pb-[22px] text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"} onClick={onNavigate}>
+      <Link aria-label="Steward home" className="flex items-center gap-2.5 px-2 pb-[22px] text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"} onClick={onNavigate}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img alt="HyperShell" className="size-8 rounded-control bg-white object-cover" height="32" src="/brand/logo" width="32" />
-        <span className="text-[17px] font-semibold tracking-[-0.02em]">HyperShell</span>
+        <img alt="Steward" className="size-8 rounded-control bg-white object-cover" height="32" src="/icon.svg" width="32" />
+        <span className="text-[17px] font-semibold tracking-[-0.02em]">Steward</span>
       </Link>
       <p className="px-3 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.06em] text-faint-ink">{adminMode ? "Admin workspace" : "User workspace"}</p>
       <nav aria-label="Primary navigation" className="space-y-0.5">
@@ -375,10 +375,10 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
       }
       refreshProgress();
     };
-    window.addEventListener("hypershell:preferences-updated", preferencesUpdated);
+    window.addEventListener("steward:preferences-updated", preferencesUpdated);
     return () => {
       active = false;
-      window.removeEventListener("hypershell:preferences-updated", preferencesUpdated);
+      window.removeEventListener("steward:preferences-updated", preferencesUpdated);
     };
   }, [adminMode, workspaceAuthorized]);
 
@@ -387,19 +387,19 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
       <div className="min-h-screen md:grid md:grid-cols-[216px_minmax(0,1fr)]">
         <a className="sr-only focus:not-sr-only focus:fixed focus:start-4 focus:top-4 focus:z-50 focus:rounded-control focus:bg-panel focus:px-4 focus:py-3" href="#workspace">Skip to workspace</a>
         {session.status === "authenticated" && workspaceAuthorized ? <AppSidebar adminMode={adminMode} needsAction={needsAction} onboardingCompleted={onboardingCompleted} onboardingDismissed={onboardingDismissed} session={session} /> : <div className="hidden md:block" />}
-        {session.status === "authenticated" && workspaceAuthorized ? <header className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-line bg-panel px-4 md:hidden"><Link aria-label="HyperShell home" className="flex items-center gap-2 text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"}>{/* eslint-disable-next-line @next/next/no-img-element */}
-        <img alt="HyperShell" className="size-7 rounded-control bg-white object-cover" height="28" src="/brand/logo" width="28" /><span className="text-base font-semibold">HyperShell</span></Link><button aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} aria-label="Open navigation" className="grid size-10 place-items-center rounded-control border bg-panel text-xl" onClick={() => setMobileMenuOpen(true)} ref={mobileMenuButtonRef} type="button">☰</button></header> : null}
+        {session.status === "authenticated" && workspaceAuthorized ? <header className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-line bg-panel px-4 md:hidden"><Link aria-label="Steward home" className="flex items-center gap-2 text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"}>{/* eslint-disable-next-line @next/next/no-img-element */}
+        <img alt="Steward" className="size-7 rounded-control bg-white object-cover" height="28" src="/icon.svg" width="28" /><span className="text-base font-semibold">Steward</span></Link><button aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} aria-label="Open navigation" className="grid size-10 place-items-center rounded-control border bg-panel text-xl" onClick={() => setMobileMenuOpen(true)} ref={mobileMenuButtonRef} type="button">☰</button></header> : null}
         {mobileMenuOpen && session.status === "authenticated" && workspaceAuthorized ? <div aria-label="Navigation" aria-modal="true" className="fixed inset-0 z-50 flex bg-black/30 md:hidden" id="mobile-navigation" ref={mobileNavigationRef} role="dialog"><AppSidebar adminMode={adminMode} mobile needsAction={needsAction} onNavigate={closeMobileMenu} onboardingCompleted={onboardingCompleted} onboardingDismissed={onboardingDismissed} session={session} /><button aria-label="Close navigation" className="flex-1" onClick={closeMobileMenu} type="button" /></div> : null}
         <main className="min-w-0 px-4 pt-[18px] pb-16 sm:px-7" id="workspace">
           <div className="mx-auto max-w-[1180px]">
-            {session.status === "loading" ? <StatePanel title="Loading HyperShell"><p>Checking the server-owned session…</p></StatePanel> : null}
+            {session.status === "loading" ? <StatePanel title="Loading Steward"><p>Checking the server-owned session…</p></StatePanel> : null}
             {session.status === "unauthorized" ? (
               <StatePanel title="Sign in required">
-                <p>Your browser does not have a valid HyperShell session.</p>
+                <p>Your browser does not have a valid Steward session.</p>
                 <a className="mt-5 inline-flex h-10 items-center rounded-control bg-brand px-4 text-sm font-semibold text-on-brand hover:bg-brand-hover" href={authStartPath(pathname)}>Continue with Google</a>
               </StatePanel>
             ) : null}
-            {session.status === "unavailable" ? <StatePanel title="Session unavailable"><p>HyperShell could not reach the authoritative session service. Try again shortly.</p></StatePanel> : null}
+            {session.status === "unavailable" ? <StatePanel title="Session unavailable"><p>Steward could not reach the authoritative session service. Try again shortly.</p></StatePanel> : null}
             {session.status === "error" ? <StatePanel title="Session error"><p>The session response was not accepted. No workspace data has been loaded.</p></StatePanel> : null}
             {session.status === "authenticated" && adminMode && session.value.role !== "admin" ? <StatePanel title="Forbidden"><p>Your server-owned session does not grant administrator access.</p></StatePanel> : null}
             {session.status === "authenticated" && workspaceAuthorized ? (

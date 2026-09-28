@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.1` and application `0.3.1`.
+Current release contract: chart `0.3.2` and application `0.3.2`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -45,7 +45,7 @@ digests and the OCI chart digest published to GHCR.
 ## Installation contract
 
 Steward is a Kubernetes control plane, not a self-contained database or
-identity bundle. A core-only installation needs Kubernetes 1.30 or later,
+identity bundle. A core-only installation needs Kubernetes 1.32 or later,
 an external PostgreSQL database, immutable images, and TLS for the API and
 webhook. It does **not** need Jira, a model endpoint, LiteLLM, OpenShell,
 SPIRE, a sandbox RuntimeClass, or a Mint Secret. Set `execution.enabled=true`
@@ -239,7 +239,7 @@ When enabled, the chart requires an exact HTTPS browser origin, Google client
 ID, hosted Workspace domain, Steward organization ID, and an existing Secret
 name/key for the Google client secret. The organization ID is a Steward-chosen
 stable namespace, not a Google, cloud, or identity-provider organization ID. It
-must be 4–64 characters, start with `org_`, and contain only lowercase ASCII
+must be 5–64 characters, start with `org_`, and contain only lowercase ASCII
 letters, digits, `_`, or `-` (for example, `org_example`). The chart never
 creates the Secret or a public edge. A deployment adapter supplies the HTTPS
 route, certificate and network policy appropriate to its platform (for
@@ -288,7 +288,7 @@ the exact MCP-GW origin, and a dedicated runtime namespace. Authority v1 also
 requires the named `connectionsBridge.mcpGatewayAuthorityContract` selector:
 `steward.connections.github/v1` for the legacy status route or
 `steward.connections.github/v2` for the lifecycle status contract used by
-MCP-GW 0.4.9 through 0.4.11. The deprecated `mcpGatewayVersion` input remains
+MCP-GW 0.4.9 through 0.5.0. The deprecated `mcpGatewayVersion` input remains
 available for an existing values file and must not be set together with the
 named selector. Another configured contract fails closed. The apiserver records
 the frozen internal authority snapshot on each operation; the controller

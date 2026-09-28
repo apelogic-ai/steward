@@ -93,7 +93,7 @@ function OnboardingChecklist({ data }: Readonly<{ data: OnboardingData }>) {
     const result = await updateBrowserPreferences({ body, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf } });
     const accepted = Boolean(result.data && result.response?.ok);
     if (accepted && typeof body.onboardingDismissed === "boolean") {
-      window.dispatchEvent(new CustomEvent("hypershell:preferences-updated", { detail: { onboardingDismissed: body.onboardingDismissed } }));
+      window.dispatchEvent(new CustomEvent("steward:preferences-updated", { detail: { onboardingDismissed: body.onboardingDismissed } }));
     }
     return accepted;
   }
@@ -116,12 +116,12 @@ function OnboardingChecklist({ data }: Readonly<{ data: OnboardingData }>) {
     {
       title: "Add the workflow to your repository",
       status: done[2] ? renderedWorkflow?.workflow.suggestedPath ?? "Workflow committed" : "Copy a read-only sample workflow into a repository",
-      body: <div className="space-y-4">{renderedWorkflow ? <CodeBlock code={renderedWorkflow.workflow.yaml} language="yaml" path={renderedWorkflow.workflow.suggestedPath} /> : !sample ? <p className="text-sm text-muted-ink">The deployment has no executable onboarding sample.</p> : <p className="text-sm text-muted-ink">Provision an envelope to render the published sample workflow.</p>}<button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!sampleWorkflow || workflowAcknowledgement === "working"} onClick={async () => { setWorkflowAcknowledgement("working"); setWorkflowAcknowledgement(await updatePreferences({ workflowAcknowledged: true }) ? "done" : "error"); }} type="button">I&apos;ve committed it</button><p className="text-xs text-muted-ink">HyperShell also detects it automatically on the first run.</p></div>,
+      body: <div className="space-y-4">{renderedWorkflow ? <CodeBlock code={renderedWorkflow.workflow.yaml} language="yaml" path={renderedWorkflow.workflow.suggestedPath} /> : !sample ? <p className="text-sm text-muted-ink">The deployment has no executable onboarding sample.</p> : <p className="text-sm text-muted-ink">Provision an envelope to render the published sample workflow.</p>}<button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!sampleWorkflow || workflowAcknowledgement === "working"} onClick={async () => { setWorkflowAcknowledgement("working"); setWorkflowAcknowledgement(await updatePreferences({ workflowAcknowledged: true }) ? "done" : "error"); }} type="button">I&apos;ve committed it</button><p className="text-xs text-muted-ink">Steward also detects it automatically on the first run.</p></div>,
     },
     {
       title: "Trigger a test run",
       status: done[3] ? `Run ${sampleRun?.taskUid} detected` : "Run the sample from GitHub",
-      body: <div className="space-y-4"><p className="text-sm text-muted-ink">Start the workflow from GitHub. HyperShell detects the run automatically once it reaches admission.</p><div className="rounded-tile border p-4"><strong className="text-sm">From GitHub</strong><p className="mt-1 text-sm text-muted-ink">Actions → HyperShell · {sample?.name ?? "repo-summary"} → Run workflow, or from a terminal:</p><div className="mt-3"><CodeBlock code={`gh workflow run ${renderedWorkflow?.workflow.suggestedPath.split("/").at(-1) ?? `${sample?.name ?? "repo-summary"}.yml`}`} language="shell" /></div></div><button className="rounded-control border px-4 py-2 text-sm font-semibold" onClick={() => setListening(true)} type="button">I&apos;ve started it</button>{listening && !sampleRun ? <p className="text-sm text-info" role="status">● Listening for a run from this envelope…</p> : null}</div>,
+      body: <div className="space-y-4"><p className="text-sm text-muted-ink">Start the workflow from GitHub. Steward detects the run automatically once it reaches admission.</p><div className="rounded-tile border p-4"><strong className="text-sm">From GitHub</strong><p className="mt-1 text-sm text-muted-ink">Actions → Steward · {sample?.name ?? "repo-summary"} → Run workflow, or from a terminal:</p><div className="mt-3"><CodeBlock code={`gh workflow run ${renderedWorkflow?.workflow.suggestedPath.split("/").at(-1) ?? `${sample?.name ?? "repo-summary"}.yml`}`} language="shell" /></div></div><button className="rounded-control border px-4 py-2 text-sm font-semibold" onClick={() => setListening(true)} type="button">I&apos;ve started it</button>{listening && !sampleRun ? <p className="text-sm text-info" role="status">● Listening for a run from this envelope…</p> : null}</div>,
     },
     {
       title: "See the result",

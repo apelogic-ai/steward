@@ -200,7 +200,7 @@ pub struct OrganizationId(String);
 impl OrganizationId {
     pub fn parse(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
-        if value.len() < 3
+        if value.len() < 5
             || value.len() > 64
             || !value.starts_with("org_")
             || !value.bytes().all(|byte| {
@@ -1348,7 +1348,13 @@ mod tests {
         ] {
             assert!(CanonicalUserId::parse(value).is_err(), "accepted {value}");
         }
-        for value in ["", "example org", "alice@example.com", "org_/example"] {
+        for value in [
+            "",
+            "org_",
+            "example org",
+            "alice@example.com",
+            "org_/example",
+        ] {
             assert!(OrganizationId::parse(value).is_err(), "accepted {value}");
         }
     }

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { displayStatus, toneForAdminRequest, toneForEnvelopeRequest, toneForTaskPhase } from "./tone";
 
-describe("HyperShell status tones", () => {
+describe("Steward status tones", () => {
   test("maps every task phase", () => {
     expect(toneForTaskPhase("succeeded")).toBe("ok");
     expect(toneForTaskPhase("failed")).toBe("err");

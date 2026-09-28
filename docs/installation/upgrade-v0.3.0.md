@@ -35,6 +35,9 @@ that handoff.
    `workflowCommit`, `actionCommit`, and `governedJobContainerImage`. Install
    `steward-run` v0.7.0 or later; apiserver startup fails closed on a missing,
    malformed, mutable, or older handoff.
+9. Before upgrading to 0.3.2 or later with Gateway API enabled, configure the
+   complete seven-entry `web.httpRoute.apiPaths` list from the chart README;
+   incomplete route sets are rejected instead of silently reaching the web frontend.
 
 ## Migration and activation
 
