@@ -38,6 +38,11 @@ if [[ "${cluster_name}" == "${STEWARD_TEST_KUBE_CONTEXT}" || ! "${cluster_name}"
   exit 1
 fi
 run_id="${cluster_name#steward-}"
+if [[ ! "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+  echo "STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE must use an immutable digest" >&2
+  exit 2
+fi
+mcp_gw_local_image="steward/mcp-gw-github-wrapper:${run_id}"
 KUBECTL=(
   kubectl
   --kubeconfig "${STEWARD_TEST_KUBECONFIG}"
@@ -54,6 +59,7 @@ cleanup() {
       wait "${pid}" >/dev/null 2>&1 || true
     fi
   done
+  docker image rm "${mcp_gw_local_image}" >/dev/null 2>&1 || true
   exit "${status}"
 }
 trap 'cleanup "$?"' EXIT
@@ -61,7 +67,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 docker pull "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}"
-kind load docker-image "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}" --name "${cluster_name}"
+docker tag "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}" "${mcp_gw_local_image}"
+kind load docker-image "${mcp_gw_local_image}" --name "${cluster_name}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_MINT_IMAGE}" --name "${cluster_name}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE}" --name "${cluster_name}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE}" --name "${cluster_name}"
@@ -163,7 +170,7 @@ done
 rendered_stack="${STEWARD_RUN_DIR}/governed-connections-stack.yaml"
 sed \
   -e "s#RUN_ID_PLACEHOLDER#${run_id}#g" \
-  -e "s#MCP_GW_IMAGE_PLACEHOLDER#${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}#g" \
+  -e "s#MCP_GW_IMAGE_PLACEHOLDER#${mcp_gw_local_image}#g" \
   -e "s#MINT_IMAGE_PLACEHOLDER#${STEWARD_CONNECTIONS_TEST_MINT_IMAGE}#g" \
   "${ROOT}/config/connections-e2e/stack.yaml" >"${rendered_stack}"
 "${KUBECTL[@]}" apply -f "${rendered_stack}"
@@ -251,7 +258,20 @@ webhooks:
 YAML
 "${KUBECTL[@]}" -n steward-system rollout status \
   deployment/steward-connections-webhook --timeout=180s
-"${KUBECTL[@]}" -n steward-system wait --for=condition=complete job/oauth-migrations --timeout=180s
+if ! "${KUBECTL[@]}" -n steward-system wait \
+  --for=condition=complete \
+  job/oauth-migrations \
+  --timeout=180s; then
+  "${KUBECTL[@]}" -n steward-system get job/oauth-migrations -o wide >&2 || true
+  "${KUBECTL[@]}" -n steward-system get pods \
+    -l job-name=oauth-migrations \
+    -o wide >&2 || true
+  "${KUBECTL[@]}" -n steward-system logs \
+    job/oauth-migrations \
+    --all-containers \
+    --tail=100 >&2 || true
+  exit 1
+fi
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-opa --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/provider-fixture --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-mint --timeout=180s
