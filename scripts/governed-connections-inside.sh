@@ -60,6 +60,7 @@ trap 'cleanup "$?"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+docker pull "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}" --name "${cluster_name}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_MINT_IMAGE}" --name "${cluster_name}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE}" --name "${cluster_name}"
@@ -281,11 +282,12 @@ else
   checksum_command=(shasum -a 256 -c -)
 fi
 openshell_archive="openshell-${openshell_target}.tar.gz"
+openshell_release="${STEWARD_OPEN_SHELL_RELEASE:?STEWARD_OPEN_SHELL_RELEASE is required}"
 curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
-  "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.98/${openshell_archive}" \
+  "https://github.com/NVIDIA/OpenShell/releases/download/${openshell_release}/${openshell_archive}" \
   -o "${STEWARD_RUN_DIR}/${openshell_archive}"
 curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
-  "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.98/openshell-checksums-sha256.txt" \
+  "https://github.com/NVIDIA/OpenShell/releases/download/${openshell_release}/openshell-checksums-sha256.txt" \
   -o "${STEWARD_RUN_DIR}/openshell-checksums-sha256.txt"
 (
   cd "${STEWARD_RUN_DIR}"
@@ -323,7 +325,7 @@ done
 postgres_port="$(sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' "${postgres_forward_log}" | head -1)"
 mcp_port="$(sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' "${mcp_forward_log}" | head -1)"
 
-STEWARD_OPEN_SHELL_RELEASE=v0.0.98 \
+STEWARD_OPEN_SHELL_RELEASE="${openshell_release}" \
 STEWARD_OPENSHELL_CLI="${OPEN_SHELL}" \
 STEWARD_CONNECTIONS_TEST_DATABASE_URL="postgres://steward@127.0.0.1:${postgres_port}/steward" \
 STEWARD_CONNECTIONS_TEST_MCP_FORWARD="127.0.0.1:${mcp_port}" \

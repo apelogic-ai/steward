@@ -111,9 +111,12 @@ if [[ -n "${STEWARD_OPENSHELL_SANDBOX_IMAGE:-}" ]]; then
   kind load docker-image \
     "${STEWARD_OPENSHELL_SANDBOX_IMAGE}" \
     --name "${CLUSTER_NAME}"
+  sandbox_repository="${STEWARD_OPENSHELL_SANDBOX_IMAGE%:*}"
+  sandbox_tag="${STEWARD_OPENSHELL_SANDBOX_IMAGE##*:}"
   sandbox_image_args=(
-    --set-string "server.sandboxImage=${STEWARD_OPENSHELL_SANDBOX_IMAGE}"
-    --set-string "server.sandboxImagePullPolicy=IfNotPresent"
+    --set-string "sandbox.image.repository=${sandbox_repository}"
+    --set-string "sandbox.image.tag=${sandbox_tag}"
+    --set-string "sandbox.image.pullPolicy=IfNotPresent"
   )
 fi
 
@@ -125,12 +128,55 @@ if [[ "${actual_context}" != "${KUBE_CONTEXT}" ]]; then
   exit 1
 fi
 
-oidc_issuer="http://oidc.openshell.svc.cluster.local:8000"
+oidc_issuer="https://oidc.openshell.svc.cluster.local:8443"
 oidc_private_key="${RUN_DIR}/oidc-private.pem"
 oidc_discovery="${RUN_DIR}/openid-configuration"
 oidc_jwks="${RUN_DIR}/jwks.json"
+oidc_ca_private_key="${RUN_DIR}/oidc-ca.key"
+oidc_ca_certificate="${RUN_DIR}/oidc-ca.crt"
+oidc_tls_private_key="${RUN_DIR}/oidc-tls.key"
+oidc_tls_request="${RUN_DIR}/oidc-tls.csr"
+oidc_tls_certificate="${RUN_DIR}/oidc-tls.crt"
+oidc_tls_extensions="${RUN_DIR}/oidc-tls-extensions.cnf"
 openssl genrsa -out "${oidc_private_key}" 2048 >/dev/null 2>&1
-chmod 600 "${oidc_private_key}"
+openssl req \
+  -new \
+  -newkey rsa:2048 \
+  -x509 \
+  -nodes \
+  -days 1 \
+  -subj /CN=steward-test-oidc-ca \
+  -addext basicConstraints=critical,CA:TRUE \
+  -addext keyUsage=critical,keyCertSign,cRLSign \
+  -keyout "${oidc_ca_private_key}" \
+  -out "${oidc_ca_certificate}" >/dev/null 2>&1
+openssl req \
+  -new \
+  -newkey rsa:2048 \
+  -nodes \
+  -subj /CN=oidc.openshell.svc.cluster.local \
+  -keyout "${oidc_tls_private_key}" \
+  -out "${oidc_tls_request}" >/dev/null 2>&1
+cat >"${oidc_tls_extensions}" <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:oidc,DNS:oidc.openshell,DNS:oidc.openshell.svc,DNS:oidc.openshell.svc.cluster.local
+EOF
+openssl x509 \
+  -req \
+  -in "${oidc_tls_request}" \
+  -CA "${oidc_ca_certificate}" \
+  -CAkey "${oidc_ca_private_key}" \
+  -CAcreateserial \
+  -days 1 \
+  -sha256 \
+  -extfile "${oidc_tls_extensions}" \
+  -out "${oidc_tls_certificate}" >/dev/null 2>&1
+chmod 600 \
+  "${oidc_private_key}" \
+  "${oidc_ca_private_key}" \
+  "${oidc_tls_private_key}"
 kubectl \
   --kubeconfig "${KUBECONFIG_PATH}" \
   --context "${KUBE_CONTEXT}" \
@@ -173,6 +219,43 @@ kubectl \
 kubectl \
   --kubeconfig "${KUBECONFIG_PATH}" \
   --context "${KUBE_CONTEXT}" \
+  -n openshell \
+  create configmap test-oidc-ca \
+  --from-file=ca.crt="${oidc_ca_certificate}" \
+  --dry-run=client \
+  -o yaml |
+  kubectl \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --context "${KUBE_CONTEXT}" \
+    apply -f -
+kubectl \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --context "${KUBE_CONTEXT}" \
+  -n openshell \
+  create secret tls test-oidc-tls \
+  --cert="${oidc_tls_certificate}" \
+  --key="${oidc_tls_private_key}" \
+  --dry-run=client \
+  -o yaml |
+  kubectl \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --context "${KUBE_CONTEXT}" \
+    apply -f -
+kubectl \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --context "${KUBE_CONTEXT}" \
+  -n openshell \
+  create configmap test-oidc-nginx \
+  --from-literal=default.conf="server { listen 8443 ssl; ssl_certificate /tls/tls.crt; ssl_certificate_key /tls/tls.key; root /srv; default_type application/json; location / { try_files \$uri =404; } }" \
+  --dry-run=client \
+  -o yaml |
+  kubectl \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --context "${KUBE_CONTEXT}" \
+    apply -f -
+kubectl \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --context "${KUBE_CONTEXT}" \
   apply -f - <<'YAML'
 apiVersion: apps/v1
 kind: Deployment
@@ -191,17 +274,20 @@ spec:
     spec:
       containers:
         - name: server
-          image: python:3.13.5-alpine3.22@sha256:37b14db89f587f9eaa890e4a442a3fe55db452b69cca1403cc730bd0fbdc8aaf
-          args: ["python3", "-m", "http.server", "8000", "--directory", "/srv"]
+          image: nginx:1.27.5-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
           ports:
-            - { name: http, containerPort: 8000 }
+            - { name: https, containerPort: 8443 }
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
             runAsNonRoot: true
-            runAsUser: 65534
+            runAsUser: 101
           volumeMounts:
             - { name: documents, mountPath: /srv, readOnly: true }
+            - { name: tls, mountPath: /tls, readOnly: true }
+            - { name: nginx, mountPath: /etc/nginx/conf.d, readOnly: true }
+            - { name: nginx-cache, mountPath: /var/cache/nginx }
+            - { name: nginx-run, mountPath: /var/run }
       volumes:
         - name: documents
           configMap:
@@ -209,6 +295,16 @@ spec:
             items:
               - { key: openid-configuration, path: .well-known/openid-configuration }
               - { key: jwks.json, path: jwks.json }
+        - name: tls
+          secret:
+            secretName: test-oidc-tls
+        - name: nginx
+          configMap:
+            name: test-oidc-nginx
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -219,7 +315,7 @@ spec:
   selector:
     app: test-oidc
   ports:
-    - { name: http, port: 8000, targetPort: http }
+    - { name: https, port: 8443, targetPort: https }
 YAML
 kubectl \
   --kubeconfig "${KUBECONFIG_PATH}" \
@@ -298,6 +394,7 @@ openshell_helm_args+=(
   --set-string server.defaultRuntimeClassName=
   --set server.auth.allowUnauthenticatedUsers=false
   --set-string "server.oidc.issuer=${oidc_issuer}"
+  --set-string server.oidc.caConfigMapName=test-oidc-ca
   --set-string "server.oidc.audience=${OIDC_AUDIENCE}"
   --set-string server.oidc.rolesClaim=roles
   --set-string server.oidc.adminRole=openshell-admin

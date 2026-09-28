@@ -143,9 +143,9 @@ impl Harness {
     }
 
     async fn from_environment() -> Result<Self, Box<dyn Error>> {
-        if required("STEWARD_OPEN_SHELL_RELEASE")? != "v0.0.98" {
+        if required("STEWARD_OPEN_SHELL_RELEASE")? != "v0.1.2" {
             return Err(
-                io::Error::other("governed Connections E2E requires OpenShell v0.0.98").into(),
+                io::Error::other("governed Connections E2E requires OpenShell v0.1.2").into(),
             );
         }
         let context = required("STEWARD_TEST_KUBE_CONTEXT")?;
