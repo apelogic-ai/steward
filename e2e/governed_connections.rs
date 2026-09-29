@@ -970,22 +970,6 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         Some(started) => started,
         None => connection_result(start_task.await?)?,
     };
-    harness
-        .wait_operation_finalized(start_operation, Duration::from_secs(90))
-        .await?;
-    harness.assert_bridge_runtime_absent(&bridge_workspace, &bridge_sandbox, &bridge_uid)?;
-
-    let reused = connection_result(broker.start(&alice).await)?;
-    assert_eq!(
-        reused.authorization_url.as_str(),
-        started.authorization_url.as_str(),
-        "duplicate starts must reuse one unexpired real MCP-GW flow"
-    );
-    assert_eq!(
-        harness.operation_count(&alice_id, "start").await?,
-        start_count + 1
-    );
-
     let state = oauth_state(started.authorization_url.as_str())?;
     let oauth_row = sqlx::query(
         "SELECT hop1_issuer, hop1_subject, email, \
@@ -1012,6 +996,22 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         (585.0..=600.0).contains(&remaining),
         "real MCP-GW 0.4.9 OAuth state must have its pinned 600-second lifetime"
     );
+    harness
+        .wait_operation_finalized(start_operation, Duration::from_secs(90))
+        .await?;
+    harness.assert_bridge_runtime_absent(&bridge_workspace, &bridge_sandbox, &bridge_uid)?;
+
+    let reused = connection_result(broker.start(&alice).await)?;
+    assert_eq!(
+        reused.authorization_url.as_str(),
+        started.authorization_url.as_str(),
+        "duplicate starts must reuse one unexpired real MCP-GW flow"
+    );
+    assert_eq!(
+        harness.operation_count(&alice_id, "start").await?,
+        start_count + 1
+    );
+
     let steward_lifetime: f64 = sqlx::query_scalar(
         "SELECT EXTRACT(EPOCH FROM (flow_expires_at - flow_created_at))::float8 \
          FROM connection_operations WHERE operation_id = $1",
