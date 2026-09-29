@@ -3848,9 +3848,17 @@ mod tests {
         );
         assert!(
             script.contains(
-                "if [[ \"${denied_exit}\" -ne 56 || \"${denied_connect_status}\" != \"403\" ]]; then"
+                "if [[ \"${denied_exit}\" -eq 0 || \"${denied_connect_status}\" != \"000\" ]]; then"
             ),
-            "G-1 must pass only on curl's failed CONNECT exit paired with OpenShell's explicit 403 denial"
+            "G-1 must reject a successful curl or an HTTP CONNECT response from the forbidden destination"
+        );
+        assert!(
+            script.contains(
+                "NET:REFUSE [MED] DENIED docs.rs [reason:policy_dns_ineligible]"
+            ) && script.contains(
+                "NET:OPEN [MED] DENIED /usr/bin/curl(0) -> docs.rs:443 [reason:transparent_tcp_policy_denied]"
+            ),
+            "G-1 must require OpenShell's explicit DNS and transparent-TCP denial evidence"
         );
         Ok(())
     }

@@ -111,20 +111,29 @@ denied_connect_status="$(
 )"
 denied_exit="$?"
 set -e
-if [[ "${denied_exit}" -ne 56 || "${denied_connect_status}" != "403" ]]; then
-  echo "OpenShell unlisted HTTPS probe returned CONNECT ${denied_connect_status:-none} with curl exit ${denied_exit}; expected CONNECT 403 with exit 56" >&2
-  denial_diagnostic=""
-  for _ in {1..40}; do
-    denial_diagnostic="$(
-      "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
-        --workspace "${WORKSPACE}" logs "${SANDBOX}" \
-        -n 500 --since 2m --source sandbox 2>&1 || true
-    )"
-    if [[ "${denial_diagnostic}" == *DENIED* && "${denial_diagnostic}" == *docs.rs* ]]; then
-      break
-    fi
-    sleep 0.25
-  done
+if [[ "${denied_exit}" -eq 0 || "${denied_connect_status}" != "000" ]]; then
+  echo "OpenShell unlisted HTTPS probe unexpectedly returned CONNECT ${denied_connect_status:-none} with curl exit ${denied_exit}" >&2
+  exit 1
+fi
+
+denial_diagnostic=""
+for _ in {1..40}; do
+  denial_diagnostic="$(
+    "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+      --workspace "${WORKSPACE}" logs "${SANDBOX}" \
+      -n 500 --since 2m --source sandbox 2>&1 || true
+  )"
+  if [[ "${denial_diagnostic}" == *"NET:REFUSE [MED] DENIED docs.rs [reason:policy_dns_ineligible]"* && \
+    "${denial_diagnostic}" == *"NET:OPEN [MED] DENIED /usr/bin/curl(0) -> docs.rs:443 [reason:transparent_tcp_policy_denied]"* ]]
+  then
+    break
+  fi
+  sleep 0.25
+done
+if [[ "${denial_diagnostic}" != *"NET:REFUSE [MED] DENIED docs.rs [reason:policy_dns_ineligible]"* || \
+  "${denial_diagnostic}" != *"NET:OPEN [MED] DENIED /usr/bin/curl(0) -> docs.rs:443 [reason:transparent_tcp_policy_denied]"* ]]
+then
+  echo "OpenShell did not emit the required explicit policy-denial evidence for docs.rs" >&2
   printf '%s\n' "${denial_diagnostic}" >&2
   exit 1
 fi
