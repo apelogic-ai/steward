@@ -18,9 +18,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Fixed
 
 - Made the platform preflight inspect the rendered tools profile, require its
-  MCP-GW endpoint to match the connections bridge, reject every OpenShell
-  always-blocked CIDR overlap, and require the released connections-bridge
-  binary.
+  MCP-GW endpoint to match the connections bridge, reject unsupported
+  unrestricted, IPv4 loopback, IPv4 link-local, IPv6 unspecified, and IPv6
+  loopback CIDRs, and require the released connections-bridge binary.
 - Published provider-profile bundle 1.2.1, which permits the POST transport
   required by read-only MCP operations and renders one deployment-configured
   Mint audience for both MCP and inference grants, with an exact 1.2.0 upgrade
@@ -30,7 +30,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Returned bounded, versioned connection-operation errors that distinguish an
   OpenShell proxy policy denial from an MCP-GW runtime-authorization denial.
 
-This patch changes no chart defaults and adds no database migration.
+### Upgrade from 0.3.2
+
+This patch has no breaking chart or runtime change, changes no chart default,
+and adds no database migration. It does tighten the installation preflight:
+
+- `execution.endpoints.mintAudience` is now required and must equal
+  `config.mint.audience` (`steward-mcp` by default);
+- provider CIDRs must pass the stricter checks listed above; and
+- provider-profile bundle 1.2.1 is required.
+
+Before the Helm upgrade, follow the bundle 1.2.1 transition: use a checkout of
+the Steward v0.3.3 tag to render the exact 1.2.0-to-1.2.1 upgrade, re-apply both
+profiles under their existing IDs, and rerun the platform preflight. Then use
+the regenerated values and execution-binding digests for the Helm upgrade and
+restart the profile consumer. See the
+[bundle upgrade procedure](config/provider-profile-bundle/v1.2.1/README.md).
 
 ## [0.3.2] - 2026-09-28
 

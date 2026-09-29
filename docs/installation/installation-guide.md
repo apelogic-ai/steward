@@ -447,9 +447,20 @@ preserve the same immutable coordinates and cross-component relationships.
    immutable and verify the rendered bytes against the recorded digest.
    Bundle 1.2.1 uses the single `config.mint.audience` for both inference and
    MCP token grants, permits POST transport for read-only MCP JSON-RPC, and
-   rejects CIDRs that overlap OpenShell's unconditional deny ranges. Upgrade
-   1.2.0 with the explicit transition in the bundle guide; do not mutate the
-   existing profile IDs in place.
+   rejects unsupported unrestricted, IPv4 loopback, IPv4 link-local, IPv6
+   unspecified, and IPv6 loopback CIDRs. For a fresh installation, do not
+   mutate an installed profile ID in place.
+
+   Upgrading an existing v0.3.2 installation is a governed exception. Before
+   the Helm upgrade, check out the exact Steward `v0.3.3` tag and run the bundle
+   guide's `cargo xtask provider-profile-bundle upgrade` transition. Stop the
+   profile consumers, re-apply both rendered profiles under their existing IDs,
+   rerun platform preflight with `execution.endpoints.mintAudience` set equal
+   to `config.mint.audience`, and use the regenerated Helm values and
+   execution-binding digests for `helm upgrade`. Restart the consumers only
+   after the upgrade succeeds. The released standalone installer remains the
+   no-checkout path for fresh installs; it does not implement this transition.
+   See the [exact upgrade sequence](../../config/provider-profile-bundle/v1.2.1/README.md).
    For `codex@0.140.0`, use or mirror the digest-selected image and run the
    [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 
