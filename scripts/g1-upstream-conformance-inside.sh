@@ -89,15 +89,17 @@ then
   :
 fi
 
+readiness_diagnostic="${STEWARD_RUN_DIR}/g1-readiness-diagnostic.log"
 for attempt in {1..120}; do
   if "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
     --workspace "${WORKSPACE}" sandbox exec --name "${SANDBOX}" --no-tty -- \
-    true >/dev/null 2>&1
+    true >"${readiness_diagnostic}" 2>&1
   then
     break
   fi
   if [[ "${attempt}" == 120 ]]; then
     echo "OpenShell sandbox did not become ready for the G-1 probe" >&2
+    cat "${readiness_diagnostic}" >&2
     exit 1
   fi
   sleep 1
