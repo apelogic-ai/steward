@@ -13,8 +13,8 @@ name = "task_orchestration"
 path = "task_orchestration.rs"
 
 [[test]]
-name = "openshell_adapter_v0098"
-path = "openshell_adapter_v0098.rs"
+name = "openshell_adapter_v012"
+path = "openshell_adapter_v012.rs"
 
 [[test]]
 name = "postgres_tls"

@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.3.2`. The release workflow pulls the published OCI
+Release contract: chart `0.3.3`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -29,7 +29,9 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
    an explicit kubeconfig and context; do not use an ambient or unrelated cluster.
 2. A reachable, separately operated PostgreSQL database and an existing
    `steward-database` Secret with key `url` in the installation namespace.
-   PostgreSQL 16 is the tested line. Give a dedicated database role `CONNECT`
+   PostgreSQL 16 is the minimum and release-tested line. PostgreSQL 17 is
+   expected to work but is not yet exercised by the Steward release lane. Give
+   a dedicated database role `CONNECT`
    plus the schema DDL/DML authority needed to run Steward's embedded,
    append-only migrations; both binaries migrate on startup, so a read-only
    application role is insufficient. Use a URI with the customer's required
@@ -94,8 +96,8 @@ again in the target cluster before enabling governed execution.
 |---|---|
 | Kubernetes | Chart accepts 1.32+; test lane uses Kind 1.32.1 |
 | Helm | 3.17+; tested with 3.17.1 |
-| PostgreSQL | 16 |
-| OpenShell | 0.0.98 |
+| PostgreSQL | 16 minimum and release-tested; 17 expected compatible but not release-lane tested |
+| OpenShell | 0.1.2 |
 | agent-sandbox | 0.5.0 |
 | Runtime | Cluster/OpenShell default; no VM-isolation claim |
 | SPIRE | Mint identity contract documented below; exact charts/images come from the installation BOM |
@@ -125,7 +127,7 @@ Do not reuse one credential for these unrelated boundaries:
 
 | Integration | Required when | Owner, minimum authority, and verification |
 |---|---|---|
-| GitHub Actions OIDC → Identity → `steward-run` | Governed submission from Actions | Runner operator grants `id-token: write`; Identity trusts `https://token.actions.githubusercontent.com` and enforces repository/ref policy. Steward either uses the existing TokenReview path or verifies Identity's short-lived ES256 Task token directly when `taskIdentity.enabled=true`. The direct path keeps `steward-task-v2` by default; opt-in v3 uses the stable numeric GitHub actor subject. This is not a GitHub OAuth App. Verify issuer, audience, HTTPS CA, discovery metadata when configured, and one denied wrong-repository/ref request before submission. |
+| GitHub Actions OIDC → Identity → `steward-run` | Governed submission from Actions | Runner operator grants `id-token: write`; Identity trusts `https://token.actions.githubusercontent.com` and enforces repository/ref policy. Steward either uses the existing TokenReview path or verifies Identity's short-lived ES256 Task token directly when `taskIdentity.enabled=true`. New installations should use Identity policy v6 with `steward-task-v3` and its stable numeric GitHub actor subject. Policy v5 with `steward-task-v2` remains supported and is not deprecated in 0.3.3; it remains the chart default for rolling compatibility. This is not a GitHub OAuth App. Verify issuer, audience, HTTPS CA, discovery metadata when configured, and one denied wrong-repository/ref request before submission. |
 | ARC GitHub App | Only an ARC-based runner installation | Runner-platform owner supplies the App ID, installation ID, and key with the minimum ARC repository/organization permissions. Steward neither reads nor creates this credential. Verify runner registration and job pickup in that product's handoff. |
 | Read-only GitHub source App | `githubSource.enabled=true` direct packages | Steward source operator supplies the configured App ID and PEM Secret; install it only on approved repositories with read-only Contents. Verify resolution of one exact allowed commit and denial of an unbound repository. |
 | Google OAuth/OIDC client | `browserAuth.enabled=true` | Browser-identity owner supplies the client ID/Secret, allowed workspace/organization, and the exact HTTPS callback derived from `browserAuth.google.origin`. Verify login, callback, wrong-domain denial, and logout. |
@@ -412,6 +414,15 @@ preserve the same immutable coordinates and cross-component relationships.
    the Anthropic-compatible API base URL; and `config.controller.litellmUrl` is
    the LiteLLM management API base URL with no operation path appended.
 
+   `config.mint.issuer` is the canonical, stable HTTPS issuer copied exactly
+   into every Mint token's `iss` claim. Configure the identical value in
+   MCP-GW 0.5.0 at `hop1.issuers[].issuer`. The issuer string itself is not
+   dereferenced; MCP-GW fetches the separately configured HTTPS `jwksUrl` and
+   calls the optional HTTPS introspection URL. The recommended layout uses the
+   same origin shown above with `/.well-known/jwks.json` and `/introspect`.
+   See the [chart reference](../../charts/steward/README.md#runtime-configuration)
+   for the complete matching MCP-GW entry and private-CA trust requirement.
+
    The complete preflight input makes the ownership boundaries explicit:
 
    - the capability catalog is the bounded set of models and tools administrators
@@ -435,7 +446,7 @@ preserve the same immutable coordinates and cross-component relationships.
    Record each installed profile ID and immutable policy digest in the
    [execution binding](execution-bindings.md); a model-free copy task attaches
    neither tool nor inference profile, while an approved model/tool requires
-   the corresponding category. Pinned OpenShell v0.0.98 cannot attest profile
+   the corresponding category. Pinned OpenShell v0.1.2 cannot attest profile
    content itself, so the deployment system must keep each installed ID
    immutable and verify the rendered bytes against the recorded digest.
    For `codex@0.140.0`, use or mirror the digest-selected image and run the

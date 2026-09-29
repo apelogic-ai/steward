@@ -1100,8 +1100,9 @@
     "spire": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["csiDriver", "socketPath", "identityPath"],
+      "required": ["className", "csiDriver", "socketPath", "identityPath"],
       "properties": {
+        "className": {"$ref": "#/definitions/nonempty"},
         "csiDriver": {"$ref": "#/definitions/nonempty"},
         "socketPath": {"type": "string", "pattern": "^/", "minLength": 2},
         "identityPath": {"type": "string", "pattern": "^/[a-z0-9/_-]+$", "minLength": 2}

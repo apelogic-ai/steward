@@ -178,6 +178,7 @@ kind: ClusterSPIFFEID
 metadata:
   name: steward-mint
 spec:
+  className: {{ .Values.spire.className }}
   spiffeIDTemplate: spiffe://{{ .Values.config.mint.spiffeTrustDomain }}{{ .Values.spire.identityPath }}
   namespaceSelector:
     matchLabels:

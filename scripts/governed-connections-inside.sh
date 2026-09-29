@@ -38,6 +38,11 @@ if [[ "${cluster_name}" == "${STEWARD_TEST_KUBE_CONTEXT}" || ! "${cluster_name}"
   exit 1
 fi
 run_id="${cluster_name#steward-}"
+if [[ ! "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}" =~ @sha256:[0-9a-f]{64}$ ]]; then
+  echo "STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE must use an immutable digest" >&2
+  exit 2
+fi
+mcp_gw_local_image="steward/mcp-gw-github-wrapper:${run_id}"
 KUBECTL=(
   kubectl
   --kubeconfig "${STEWARD_TEST_KUBECONFIG}"
@@ -54,15 +59,36 @@ cleanup() {
       wait "${pid}" >/dev/null 2>&1 || true
     fi
   done
+  docker image rm "${mcp_gw_local_image}" >/dev/null 2>&1 || true
   exit "${status}"
 }
 trap 'cleanup "$?"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-kind load docker-image "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}" --name "${cluster_name}"
+docker pull "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}"
+docker tag "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}" "${mcp_gw_local_image}"
+kind load docker-image "${mcp_gw_local_image}" --name "${cluster_name}"
+
+docker build \
+  --label "steward.test/run-id=${run_id}" \
+  --file "${ROOT}/config/s1/steward-mint.Dockerfile" \
+  --tag "${STEWARD_CONNECTIONS_TEST_MINT_IMAGE}" \
+  "${ROOT}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_MINT_IMAGE}" --name "${cluster_name}"
+
+docker build \
+  --label "steward.test/run-id=${run_id}" \
+  --file "${ROOT}/build/connections-bridge.Dockerfile" \
+  --tag "${STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE}" \
+  "${ROOT}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE}" --name "${cluster_name}"
+
+docker build \
+  --label "steward.test/run-id=${run_id}" \
+  --file "${ROOT}/e2e/Dockerfile.governed-connections-webhook" \
+  --tag "${STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE}" \
+  "${ROOT}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE}" --name "${cluster_name}"
 
 bridge_containerd_name="docker.io/${STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE}"
@@ -162,9 +188,36 @@ done
 rendered_stack="${STEWARD_RUN_DIR}/governed-connections-stack.yaml"
 sed \
   -e "s#RUN_ID_PLACEHOLDER#${run_id}#g" \
-  -e "s#MCP_GW_IMAGE_PLACEHOLDER#${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}#g" \
+  -e "s#MCP_GW_IMAGE_PLACEHOLDER#${mcp_gw_local_image}#g" \
   -e "s#MINT_IMAGE_PLACEHOLDER#${STEWARD_CONNECTIONS_TEST_MINT_IMAGE}#g" \
   "${ROOT}/config/connections-e2e/stack.yaml" >"${rendered_stack}"
+spire_webhook_ready=false
+for _ in $(seq 1 15); do
+  if cat <<YAML | "${KUBECTL[@]}" apply --dry-run=server -f - >/dev/null 2>&1
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: steward-connections-e2e-webhook-readiness
+spec:
+  className: spire-spire
+  spiffeIDTemplate: spiffe://openshell.local/test/readiness
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: steward-system
+  podSelector:
+    matchLabels:
+      steward.test/run-id: "${run_id}"
+YAML
+  then
+    spire_webhook_ready=true
+    break
+  fi
+  sleep 2
+done
+if [[ "${spire_webhook_ready}" != true ]]; then
+  echo "SPIRE ClusterSPIFFEID admission webhook did not become ready" >&2
+  exit 1
+fi
 "${KUBECTL[@]}" apply -f "${rendered_stack}"
 "${KUBECTL[@]}" -n steward-system rollout status deployment/postgres --timeout=180s
 controller_username="$(
@@ -250,7 +303,20 @@ webhooks:
 YAML
 "${KUBECTL[@]}" -n steward-system rollout status \
   deployment/steward-connections-webhook --timeout=180s
-"${KUBECTL[@]}" -n steward-system wait --for=condition=complete job/oauth-migrations --timeout=180s
+if ! "${KUBECTL[@]}" -n steward-system wait \
+  --for=condition=complete \
+  job/oauth-migrations \
+  --timeout=180s; then
+  "${KUBECTL[@]}" -n steward-system get job/oauth-migrations -o wide >&2 || true
+  "${KUBECTL[@]}" -n steward-system get pods \
+    -l job-name=oauth-migrations \
+    -o wide >&2 || true
+  "${KUBECTL[@]}" -n steward-system logs \
+    job/oauth-migrations \
+    --all-containers \
+    --tail=100 >&2 || true
+  exit 1
+fi
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-opa --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/provider-fixture --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-mint --timeout=180s
@@ -281,11 +347,12 @@ else
   checksum_command=(shasum -a 256 -c -)
 fi
 openshell_archive="openshell-${openshell_target}.tar.gz"
+openshell_release="${STEWARD_OPEN_SHELL_RELEASE:?STEWARD_OPEN_SHELL_RELEASE is required}"
 curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
-  "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.98/${openshell_archive}" \
+  "https://github.com/NVIDIA/OpenShell/releases/download/${openshell_release}/${openshell_archive}" \
   -o "${STEWARD_RUN_DIR}/${openshell_archive}"
 curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
-  "https://github.com/NVIDIA/OpenShell/releases/download/v0.0.98/openshell-checksums-sha256.txt" \
+  "https://github.com/NVIDIA/OpenShell/releases/download/${openshell_release}/openshell-checksums-sha256.txt" \
   -o "${STEWARD_RUN_DIR}/openshell-checksums-sha256.txt"
 (
   cd "${STEWARD_RUN_DIR}"
@@ -293,8 +360,6 @@ curl -fsSL --retry 4 --retry-delay 2 --retry-all-errors \
   tar -xzf "${openshell_archive}"
 )
 OPEN_SHELL="${STEWARD_RUN_DIR}/openshell"
-"${OPEN_SHELL}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
-  settings set --global --key providers_v2_enabled --value true --yes
 "${OPEN_SHELL}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   provider profile lint --global -f "${profile}"
 "${OPEN_SHELL}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
@@ -323,7 +388,7 @@ done
 postgres_port="$(sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' "${postgres_forward_log}" | head -1)"
 mcp_port="$(sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' "${mcp_forward_log}" | head -1)"
 
-STEWARD_OPEN_SHELL_RELEASE=v0.0.98 \
+STEWARD_OPEN_SHELL_RELEASE="${openshell_release}" \
 STEWARD_OPENSHELL_CLI="${OPEN_SHELL}" \
 STEWARD_CONNECTIONS_TEST_DATABASE_URL="postgres://steward@127.0.0.1:${postgres_port}/steward" \
 STEWARD_CONNECTIONS_TEST_MCP_FORWARD="127.0.0.1:${mcp_port}" \

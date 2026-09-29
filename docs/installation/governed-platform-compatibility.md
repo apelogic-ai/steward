@@ -1,6 +1,6 @@
 # Product compatibility and installation BOM
 
-Status: **Current release contract for Steward v0.3.2**
+Status: **Current release contract for Steward v0.3.3**
 
 Steward publishes a product-compatibility contract. Release/integration
 packaging publishes the installation bill of materials (BOM). These are
@@ -18,12 +18,12 @@ than treating the Steward repository as a cross-product deployment lock.
 
 ## Product compatibility
 
-The Steward v0.3.2 release includes the attested asset
-`steward-product-compatibility-0.3.2.json`. Its source is
+The Steward v0.3.3 release includes the attested asset
+`steward-product-compatibility-0.3.3.json`. Its source is
 `config/product-compatibility/v1/compatibility.json` and its schema identity is
 `steward.product-compatibility/v1`.
 
-For v0.3.2 it declares:
+For v0.3.3 it declares:
 
 - Task API contract `steward.task/v2`;
 - the `envelopeDigest` selector requires `steward-run` v0.7.0 or later;
@@ -37,16 +37,16 @@ For v0.3.2 it declares:
 Download and verify it from the Steward release:
 
 ```sh
-gh release download v0.3.2 \
+gh release download v0.3.3 \
   --repo apelogic-ai/steward \
-  --pattern steward-product-compatibility-0.3.2.json \
-  --pattern steward-product-compatibility-0.3.2.json.sha256 \
+  --pattern steward-product-compatibility-0.3.3.json \
+  --pattern steward-product-compatibility-0.3.3.json.sha256 \
   --pattern release-handoff.json
 
-sha256sum --check steward-product-compatibility-0.3.2.json.sha256
-gh attestation verify steward-product-compatibility-0.3.2.json \
+sha256sum --check steward-product-compatibility-0.3.3.json.sha256
+gh attestation verify steward-product-compatibility-0.3.3.json \
   --repo apelogic-ai/steward \
-  --cert-identity https://github.com/apelogic-ai/steward/.github/workflows/release.yml@refs/tags/v0.3.2
+  --cert-identity https://github.com/apelogic-ai/steward/.github/workflows/release.yml@refs/tags/v0.3.3
 ```
 
 Compare the calculated digest with `productCompatibility.digest` in
@@ -62,7 +62,7 @@ have published their immutable release handoffs. At minimum, it records:
 ```json
 {
   "steward": {
-    "version": "0.3.2",
+    "version": "0.3.3",
     "image": "registry.example.com/steward@sha256:<digest>"
   },
   "stewardRun": {
@@ -126,7 +126,7 @@ real HTTP operation for each admitted model.
 ### MCP-GW authority
 
 `connectionsBridge.mcpGatewayAuthorityContract` selects an authority contract,
-not a product version. Steward v0.3.2 uses
+not a product version. Steward v0.3.3 uses
 `steward.connections.github/v2`. Release/integration packaging chooses and
 records an MCP-GW release that implements that contract.
 
@@ -144,3 +144,7 @@ product contract, SPIRE identity, inference operation shapes, MCP-GW authority,
 and the selected OpenShell/agent-sandbox runtime. The
 [platform preflight](platform-preflight.md) validates composed non-secret
 configuration; it does not select cross-product versions.
+
+Steward v0.3.3 validates the governed runtime path against OpenShell v0.1.2 and
+agent-sandbox v0.5.0. LiteLLM remains on the existing behavioral contract; the
+OpenShell migration did not require a LiteLLM version change.

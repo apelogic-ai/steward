@@ -40,4 +40,7 @@ assert_rejected
 printf 'apiVersion: v2\nname: steward\nversion: 0.3.2\nannotations:\n  steward.apelogic.ai/customer-install-contract: steward.customer-install/v1\n' > "${fixture}/Chart.yaml"
 assert_mode customer-v1
 
+printf 'apiVersion: v2\nname: steward\nversion: 0.3.3\nannotations:\n  steward.apelogic.ai/customer-install-contract: steward.customer-install/v1\n' > "${fixture}/Chart.yaml"
+assert_mode customer-v1
+
 echo 'release chart contract transition passed'

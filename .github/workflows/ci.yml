@@ -73,7 +73,7 @@ jobs:
         run: cargo xtask conformance --pinned
 
   openshell-adapter:
-    name: integration / OpenShell 0.0.98 adapter
+    name: integration / OpenShell 0.1.2 adapter
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

@@ -15,19 +15,7 @@ for command in bash docker; do
 done
 docker info >/dev/null
 
-SUPERVISOR_IMAGE="$(
-  "${ROOT}/scripts/build-patched-openshell-supervisor.sh" --print-contract |
-    sed -n 's/^image=//p'
-)"
-if [[ -z "${SUPERVISOR_IMAGE}" ]]; then
-  echo "patched OpenShell supervisor contract omitted its image" >&2
-  exit 1
-fi
-if ! "${ROOT}/scripts/build-patched-openshell-supervisor.sh" --image-is-current; then
-  "${ROOT}/scripts/build-patched-openshell-supervisor.sh"
-fi
-
-MCP_GW_LOCAL_IMAGE="steward/mcp-gw-github-wrapper:${RUN_ID}"
+MCP_GW_RELEASE_IMAGE="ghcr.io/apelogic-ai/mcp-gw-github-wrapper@sha256:80bef7bee93482c8091335ae27c3c3e968e5c78c2bb4a40b401e6af36f70f993"
 MINT_IMAGE="steward/mint:${RUN_ID}"
 BRIDGE_IMAGE="steward/connections-bridge:${RUN_ID}"
 WEBHOOK_IMAGE="steward/connections-webhook:${RUN_ID}"
@@ -36,7 +24,6 @@ SANDBOX_IMAGE="steward/workflow-sandbox:${RUN_ID}"
 cleanup() {
   status="$1"
   trap - EXIT INT TERM
-  docker image rm "${MCP_GW_LOCAL_IMAGE}" >/dev/null 2>&1 || true
   docker image rm "${MINT_IMAGE}" >/dev/null 2>&1 || true
   docker image rm "${BRIDGE_IMAGE}" >/dev/null 2>&1 || true
   docker image rm "${WEBHOOK_IMAGE}" >/dev/null 2>&1 || true
@@ -47,25 +34,6 @@ trap 'cleanup "$?"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-MCP_GW_RELEASE_IMAGE="ghcr.io/apelogic-ai/mcp-gw-github-wrapper@sha256:80bef7bee93482c8091335ae27c3c3e968e5c78c2bb4a40b401e6af36f70f993"
-
-docker pull "${MCP_GW_RELEASE_IMAGE}"
-docker tag "${MCP_GW_RELEASE_IMAGE}" "${MCP_GW_LOCAL_IMAGE}"
-docker build \
-  --label "steward.test/run-id=${RUN_ID}" \
-  --file "${ROOT}/config/s1/steward-mint.Dockerfile" \
-  --tag "${MINT_IMAGE}" \
-  "${ROOT}"
-docker build \
-  --label "steward.test/run-id=${RUN_ID}" \
-  --file "${ROOT}/build/connections-bridge.Dockerfile" \
-  --tag "${BRIDGE_IMAGE}" \
-  "${ROOT}"
-docker build \
-  --label "steward.test/run-id=${RUN_ID}" \
-  --file "${ROOT}/e2e/Dockerfile.governed-connections-webhook" \
-  --tag "${WEBHOOK_IMAGE}" \
-  "${ROOT}"
 docker build \
   --label "steward.test/run-id=${RUN_ID}" \
   --file "${ROOT}/e2e/Dockerfile.workflow-sandbox" \
@@ -73,12 +41,11 @@ docker build \
   "${ROOT}"
 
 STEWARD_RUN_ID="${RUN_ID}" \
-STEWARD_OPEN_SHELL_RELEASE=v0.0.98 \
-STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE="${MCP_GW_LOCAL_IMAGE}" \
+STEWARD_OPEN_SHELL_RELEASE=v0.1.2 \
+STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE="${MCP_GW_RELEASE_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_MINT_IMAGE="${MINT_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE="${BRIDGE_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE="${WEBHOOK_IMAGE}" \
-STEWARD_OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
 STEWARD_OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE}" \
 bash "${ROOT}/scripts/openshell-testbed.sh" \
   bash "${ROOT}/scripts/governed-connections-inside.sh"

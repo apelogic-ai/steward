@@ -45,6 +45,12 @@ allow = ["CDLA-Permissive-2.0"]
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+  # OpenShell v0.1.2 transitively uses the archived rustls-pemfile wrapper.
+  # Remove this exception when the pinned OpenShell SDK migrates to
+  # rustls-pki-types' PemObject API.
+  { id = "RUSTSEC-2025-0134", reason = "transitive dependency of pinned OpenShell v0.1.2; no safe upstream upgrade is available" },
+]
 
 [bans]
 multiple-versions = "warn"

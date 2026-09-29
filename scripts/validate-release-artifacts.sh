@@ -1203,6 +1203,7 @@ test "$(grep -c '^kind: NetworkPolicy$' "${rendered}")" -eq 8
 test "$(grep -c '^kind: Role$' "${rendered}")" -eq 2
 test "$(grep -c '^kind: RoleBinding$' "${rendered}")" -eq 2
 test "$(grep -c '^kind: ClusterSPIFFEID$' "${rendered}")" -eq 1
+grep -q '^  className: spire-spire$' "${rendered}"
 test "$(grep -c '^  namespace: team-a$' "${rendered}")" -eq 4
 grep -q '^kind: CustomResourceDefinition$' "${rendered}"
 grep -q 'failurePolicy: Fail' "${rendered}"

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OPEN_SHELL_RELEASE="${STEWARD_OPEN_SHELL_RELEASE:-v0.0.90}"
+OPEN_SHELL_RELEASE="${STEWARD_OPEN_SHELL_RELEASE:-v0.1.2}"
 if [[ ! "${OPEN_SHELL_RELEASE}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "STEWARD_OPEN_SHELL_RELEASE must be a semantic release tag" >&2
   exit 2
@@ -84,6 +84,31 @@ kind create cluster \
   --wait 120s
 CLUSTER_CREATED=1
 
+if [[ -n "${STEWARD_OPENSHELL_PRELOAD_IMAGE:-}" ]]; then
+  if [[ "${STEWARD_OPENSHELL_PRELOAD_IMAGE}" != *@sha256:* ]]; then
+    echo "STEWARD_OPENSHELL_PRELOAD_IMAGE must be digest-pinned" >&2
+    exit 2
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "required command is missing: docker" >&2
+    exit 2
+  fi
+  kind_node="${CLUSTER_NAME}-control-plane"
+  actual_nodes="$(kind get nodes --name "${CLUSTER_NAME}")"
+  if [[ "${actual_nodes}" != "${kind_node}" ]]; then
+    echo "OpenShell testbed Kind node mismatch: expected ${kind_node}" >&2
+    exit 1
+  fi
+  docker exec "${kind_node}" crictl pull "${STEWARD_OPENSHELL_PRELOAD_IMAGE}"
+  docker exec "${kind_node}" \
+    crictl inspecti --output json "${STEWARD_OPENSHELL_PRELOAD_IMAGE}" |
+    jq -e --arg image "${STEWARD_OPENSHELL_PRELOAD_IMAGE}" \
+      '.status.repoDigests | type == "array" and index($image) != null' >/dev/null || {
+        echo "OpenShell testbed pinned image digest is absent from the owned Kind node" >&2
+        exit 1
+      }
+fi
+
 supervisor_image_args=()
 if [[ -n "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
   if [[ "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE}" != *:* || "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE}" == *@* ]]; then
@@ -111,9 +136,12 @@ if [[ -n "${STEWARD_OPENSHELL_SANDBOX_IMAGE:-}" ]]; then
   kind load docker-image \
     "${STEWARD_OPENSHELL_SANDBOX_IMAGE}" \
     --name "${CLUSTER_NAME}"
+  sandbox_repository="${STEWARD_OPENSHELL_SANDBOX_IMAGE%:*}"
+  sandbox_tag="${STEWARD_OPENSHELL_SANDBOX_IMAGE##*:}"
   sandbox_image_args=(
-    --set-string "server.sandboxImage=${STEWARD_OPENSHELL_SANDBOX_IMAGE}"
-    --set-string "server.sandboxImagePullPolicy=IfNotPresent"
+    --set-string "sandbox.image.repository=${sandbox_repository}"
+    --set-string "sandbox.image.tag=${sandbox_tag}"
+    --set-string "sandbox.image.pullPolicy=IfNotPresent"
   )
 fi
 
@@ -125,12 +153,55 @@ if [[ "${actual_context}" != "${KUBE_CONTEXT}" ]]; then
   exit 1
 fi
 
-oidc_issuer="http://oidc.openshell.svc.cluster.local:8000"
+oidc_issuer="https://oidc.openshell.svc.cluster.local:8443"
 oidc_private_key="${RUN_DIR}/oidc-private.pem"
 oidc_discovery="${RUN_DIR}/openid-configuration"
 oidc_jwks="${RUN_DIR}/jwks.json"
+oidc_ca_private_key="${RUN_DIR}/oidc-ca.key"
+oidc_ca_certificate="${RUN_DIR}/oidc-ca.crt"
+oidc_tls_private_key="${RUN_DIR}/oidc-tls.key"
+oidc_tls_request="${RUN_DIR}/oidc-tls.csr"
+oidc_tls_certificate="${RUN_DIR}/oidc-tls.crt"
+oidc_tls_extensions="${RUN_DIR}/oidc-tls-extensions.cnf"
 openssl genrsa -out "${oidc_private_key}" 2048 >/dev/null 2>&1
-chmod 600 "${oidc_private_key}"
+openssl req \
+  -new \
+  -newkey rsa:2048 \
+  -x509 \
+  -nodes \
+  -days 1 \
+  -subj /CN=steward-test-oidc-ca \
+  -addext basicConstraints=critical,CA:TRUE \
+  -addext keyUsage=critical,keyCertSign,cRLSign \
+  -keyout "${oidc_ca_private_key}" \
+  -out "${oidc_ca_certificate}" >/dev/null 2>&1
+openssl req \
+  -new \
+  -newkey rsa:2048 \
+  -nodes \
+  -subj /CN=oidc.openshell.svc.cluster.local \
+  -keyout "${oidc_tls_private_key}" \
+  -out "${oidc_tls_request}" >/dev/null 2>&1
+cat >"${oidc_tls_extensions}" <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:oidc,DNS:oidc.openshell,DNS:oidc.openshell.svc,DNS:oidc.openshell.svc.cluster.local
+EOF
+openssl x509 \
+  -req \
+  -in "${oidc_tls_request}" \
+  -CA "${oidc_ca_certificate}" \
+  -CAkey "${oidc_ca_private_key}" \
+  -CAcreateserial \
+  -days 1 \
+  -sha256 \
+  -extfile "${oidc_tls_extensions}" \
+  -out "${oidc_tls_certificate}" >/dev/null 2>&1
+chmod 600 \
+  "${oidc_private_key}" \
+  "${oidc_ca_private_key}" \
+  "${oidc_tls_private_key}"
 kubectl \
   --kubeconfig "${KUBECONFIG_PATH}" \
   --context "${KUBE_CONTEXT}" \
@@ -173,6 +244,43 @@ kubectl \
 kubectl \
   --kubeconfig "${KUBECONFIG_PATH}" \
   --context "${KUBE_CONTEXT}" \
+  -n openshell \
+  create configmap test-oidc-ca \
+  --from-file=ca.crt="${oidc_ca_certificate}" \
+  --dry-run=client \
+  -o yaml |
+  kubectl \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --context "${KUBE_CONTEXT}" \
+    apply -f -
+kubectl \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --context "${KUBE_CONTEXT}" \
+  -n openshell \
+  create secret tls test-oidc-tls \
+  --cert="${oidc_tls_certificate}" \
+  --key="${oidc_tls_private_key}" \
+  --dry-run=client \
+  -o yaml |
+  kubectl \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --context "${KUBE_CONTEXT}" \
+    apply -f -
+kubectl \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --context "${KUBE_CONTEXT}" \
+  -n openshell \
+  create configmap test-oidc-nginx \
+  --from-literal=default.conf="server { listen 8443 ssl; ssl_certificate /tls/tls.crt; ssl_certificate_key /tls/tls.key; root /srv; default_type application/json; location / { try_files \$uri =404; } }" \
+  --dry-run=client \
+  -o yaml |
+  kubectl \
+    --kubeconfig "${KUBECONFIG_PATH}" \
+    --context "${KUBE_CONTEXT}" \
+    apply -f -
+kubectl \
+  --kubeconfig "${KUBECONFIG_PATH}" \
+  --context "${KUBE_CONTEXT}" \
   apply -f - <<'YAML'
 apiVersion: apps/v1
 kind: Deployment
@@ -191,17 +299,20 @@ spec:
     spec:
       containers:
         - name: server
-          image: python:3.13.5-alpine3.22@sha256:37b14db89f587f9eaa890e4a442a3fe55db452b69cca1403cc730bd0fbdc8aaf
-          args: ["python3", "-m", "http.server", "8000", "--directory", "/srv"]
+          image: nginx:1.27.5-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
           ports:
-            - { name: http, containerPort: 8000 }
+            - { name: https, containerPort: 8443 }
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: { drop: ["ALL"] }
             runAsNonRoot: true
-            runAsUser: 65534
+            runAsUser: 101
           volumeMounts:
             - { name: documents, mountPath: /srv, readOnly: true }
+            - { name: tls, mountPath: /tls, readOnly: true }
+            - { name: nginx, mountPath: /etc/nginx/conf.d, readOnly: true }
+            - { name: nginx-cache, mountPath: /var/cache/nginx }
+            - { name: nginx-run, mountPath: /var/run }
       volumes:
         - name: documents
           configMap:
@@ -209,6 +320,16 @@ spec:
             items:
               - { key: openid-configuration, path: .well-known/openid-configuration }
               - { key: jwks.json, path: jwks.json }
+        - name: tls
+          secret:
+            secretName: test-oidc-tls
+        - name: nginx
+          configMap:
+            name: test-oidc-nginx
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -219,7 +340,7 @@ spec:
   selector:
     app: test-oidc
   ports:
-    - { name: http, port: 8000, targetPort: http }
+    - { name: https, port: 8443, targetPort: https }
 YAML
 kubectl \
   --kubeconfig "${KUBECONFIG_PATH}" \
@@ -298,6 +419,7 @@ openshell_helm_args+=(
   --set-string server.defaultRuntimeClassName=
   --set server.auth.allowUnauthenticatedUsers=false
   --set-string "server.oidc.issuer=${oidc_issuer}"
+  --set-string server.oidc.caConfigMapName=test-oidc-ca
   --set-string "server.oidc.audience=${OIDC_AUDIENCE}"
   --set-string server.oidc.rolesClaim=roles
   --set-string server.oidc.adminRole=openshell-admin
@@ -346,7 +468,23 @@ extract_secret_key openshell-client-tls tls.key "${client_private_key}"
 printf '%s' "${oidc_token}" >"${bearer_token}"
 chmod 600 "${client_private_key}" "${bearer_token}"
 
+invalid_ca="${RUN_DIR}/invalid-ca.crt"
+invalid_client_certificate="${RUN_DIR}/invalid-client.crt"
+invalid_client_private_key="${RUN_DIR}/invalid-client.key"
+openssl req \
+  -new \
+  -newkey rsa:2048 \
+  -x509 \
+  -nodes \
+  -days 1 \
+  -subj /CN=untrusted-test-client \
+  -keyout "${invalid_client_private_key}" \
+  -out "${invalid_client_certificate}" >/dev/null 2>&1
+cp "${invalid_client_certificate}" "${invalid_ca}"
+chmod 600 "${invalid_client_private_key}"
+
 workload_source_file="${RUN_DIR}/workload-source-credential"
+workload_invalid_source_file="${RUN_DIR}/workload-source-credential-invalid"
 workload_exchange_ca_private_key="${RUN_DIR}/workload-exchange-ca.key"
 workload_exchange_ca_certificate="${RUN_DIR}/workload-exchange-ca.crt"
 workload_exchange_private_key="${RUN_DIR}/workload-exchange.key"
@@ -355,6 +493,7 @@ workload_exchange_certificate="${RUN_DIR}/workload-exchange.crt"
 workload_exchange_extensions="${RUN_DIR}/workload-exchange-extensions.cnf"
 workload_exchange_log="${RUN_DIR}/workload-exchange.log"
 printf '%s' obviously-fake-workload-source >"${workload_source_file}"
+printf '%s' obviously-fake-unmapped-source >"${workload_invalid_source_file}"
 openssl req \
   -new \
   -newkey rsa:2048 \
@@ -481,6 +620,8 @@ export STEWARD_WORKLOAD_EXCHANGE_ENDPOINT="${workload_exchange_endpoint}"
 export STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME="127.0.0.1"
 export STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE="${workload_exchange_ca_certificate}"
 export STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE="${workload_source_file}"
+export STEWARD_WORKLOAD_INVALID_SOURCE_CREDENTIAL_FILE="${workload_invalid_source_file}"
+export STEWARD_OPENSHELL_UNTRUSTED_CA_FILE="${invalid_ca}"
 export STEWARD_TEST_OPENSHELL_ACCESS_TOKEN_FILE="${bearer_token}"
 export STEWARD_OPENSHELL_SERVER_NAME="localhost"
 export STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=""

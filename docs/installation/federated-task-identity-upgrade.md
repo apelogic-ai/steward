@@ -3,7 +3,11 @@
 This guide enables the additive `steward-task-v3` identity contract. Existing
 `steward-task-v2` tokens, Tasks, runs, canonical authority bindings, User
 Envelopes, and in-flight retries remain on their existing path. The default
-chart configuration continues to accept v2 only.
+chart configuration continues to accept v2 only for rolling compatibility.
+New installations should enable Identity policy v6 and `steward-task-v3` so an
+authenticated but unassociated subject produces the distinct
+`403 task_identity_unassociated` result. Identity policy v5 and
+`steward-task-v2` remain supported and are not deprecated in Steward 0.3.3.
 
 ## Before the upgrade
 

@@ -316,11 +316,10 @@ impl GithubMcpGateway {
             };
             let status = response.status();
             let body = read_bounded(response).await?;
-            if pre_dispatch_provider_failure(status, &body)
-                && started.elapsed() < PROVIDER_TRANSPORT_READY_TIMEOUT
-            {
-                tokio::time::sleep(PROVIDER_TRANSPORT_RETRY_INTERVAL).await;
-                continue;
+            if missing_provider_credential(status, &body) {
+                return Err(failed(
+                    "OpenShell did not inject the MCP-GW provider credential",
+                ));
             }
             break (status, body);
         };
@@ -328,10 +327,7 @@ impl GithubMcpGateway {
     }
 }
 
-fn pre_dispatch_provider_failure(status: StatusCode, body: &[u8]) -> bool {
-    if status == StatusCode::UNAUTHORIZED {
-        return true;
-    }
+fn missing_provider_credential(status: StatusCode, body: &[u8]) -> bool {
     if status != StatusCode::BAD_GATEWAY {
         return false;
     }
@@ -781,13 +777,13 @@ fn failed(reason: &str) -> PortError {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpListener;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         GatewayContract, GithubBridgeOperation, GithubBridgeRequest, GithubMcpGateway,
-        GithubStatusCredential, GithubStatusReader, parse_response, pre_dispatch_provider_failure,
+        GithubStatusCredential, GithubStatusReader, missing_provider_credential, parse_response,
     };
     use reqwest::StatusCode;
     use steward_ports::PortError;
@@ -1244,19 +1240,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_control_retries_only_a_pre_dispatch_token_grant_failure() -> Result<(), String>
-    {
+    async fn missing_provider_credential_fails_fast_with_a_clear_error() -> Result<(), String> {
         let exact = br#"{"error":"token_grant_failed","detail":"dynamic token grant failed"}"#;
-        assert!(pre_dispatch_provider_failure(
-            StatusCode::BAD_GATEWAY,
-            exact
-        ));
+        assert!(missing_provider_credential(StatusCode::BAD_GATEWAY, exact));
         assert!(
-            !pre_dispatch_provider_failure(StatusCode::BAD_GATEWAY, b""),
+            !missing_provider_credential(StatusCode::BAD_GATEWAY, b""),
             "an indistinguishable generic upstream 502 must not retry a mutation"
         );
         assert!(
-            !pre_dispatch_provider_failure(
+            !missing_provider_credential(
                 StatusCode::BAD_GATEWAY,
                 br#"{"error":"upstream_unreachable","detail":"connection failed"}"#,
             ),
@@ -1268,42 +1260,41 @@ mod tests {
             .local_addr()
             .map_err(|error| format!("read the token-grant fixture address: {error}"))?;
         let server = thread::spawn(move || -> Result<(), String> {
-            for response in [
-                b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: 68\r\nConnection: close\r\n\r\n{\"error\":\"token_grant_failed\",\"detail\":\"dynamic token grant failed\"}"
-                    .as_slice(),
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 19\r\nConnection: close\r\n\r\n{\"connected\":false}"
-                    .as_slice(),
-            ] {
-                let (mut stream, _) = listener
-                    .accept()
-                    .map_err(|error| format!("accept provider request: {error}"))?;
-                let mut request = [0_u8; 2048];
-                stream
-                    .read(&mut request)
-                    .map_err(|error| format!("read provider request: {error}"))?;
-                stream
-                    .write_all(response)
-                    .map_err(|error| format!("write provider response: {error}"))?;
-            }
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept provider request: {error}"))?;
+            let mut request = [0_u8; 2048];
+            stream
+                .read(&mut request)
+                .map_err(|error| format!("read provider request: {error}"))?;
+            let response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: 68\r\nConnection: close\r\n\r\n{\"error\":\"token_grant_failed\",\"detail\":\"dynamic token grant failed\"}";
+            stream
+                .write_all(response)
+                .map_err(|error| format!("write provider response: {error}"))?;
             Ok(())
         });
         let gateway = GithubMcpGateway::new(&format!("http://{address}"), "0.3.2")
             .map_err(|error| format!("build the MCP-GW fixture adapter: {error:?}"))?;
 
+        let started = Instant::now();
         let result = gateway
             .execute(GithubBridgeOperation::Status, GithubBridgeRequest::Empty)
             .await;
-        if result.is_err() {
-            let _ = TcpStream::connect(address);
-        }
         server
             .join()
             .map_err(|_| "token-grant fixture thread panicked".to_owned())??;
 
-        assert_eq!(
-            result,
-            Ok(serde_json::json!({"connected": false})),
-            "OpenShell's exact synthetic token-grant 502 produced before dispatch must be retried"
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a missing provider credential must fail well inside the edge's 15-second timeout"
+        );
+        assert!(
+            matches!(
+                result,
+                Err(PortError::Failed { ref reason })
+                    if reason == "OpenShell did not inject the MCP-GW provider credential"
+            ),
+            "the adapter must expose a bounded, actionable credential-injection failure; got {result:?}"
         );
         Ok(())
     }

@@ -62,6 +62,11 @@ fn gateway_failure(error: &PortError) -> &'static str {
             "bridge MCP-GW rejected runtime authorization"
         }
         PortError::Failed { reason }
+            if reason == "OpenShell did not inject the MCP-GW provider credential" =>
+        {
+            "bridge OpenShell provider credential was not injected"
+        }
+        PortError::Failed { reason }
             if reason == "MCP-GW unavailable while attempting to call MCP-GW" =>
         {
             "bridge MCP-GW transport is unavailable"
@@ -367,6 +372,12 @@ mod tests {
 
     #[test]
     fn gateway_failures_preserve_only_actionable_non_secret_categories() {
+        assert_eq!(
+            gateway_failure(&PortError::Failed {
+                reason: "OpenShell did not inject the MCP-GW provider credential".to_owned(),
+            }),
+            "bridge OpenShell provider credential was not injected"
+        );
         assert_eq!(
             gateway_failure(&PortError::Failed {
                 reason: "MCP-GW unavailable while attempting to call MCP-GW".to_owned(),

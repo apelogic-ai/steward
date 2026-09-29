@@ -20,7 +20,6 @@ endpoints:
   - host: litellm-litellm.litellm.svc.cluster.local
     port: 4000
     protocol: rest
-    tls: none
     access: read-write
     enforcement: enforce
     allowed_ips:
