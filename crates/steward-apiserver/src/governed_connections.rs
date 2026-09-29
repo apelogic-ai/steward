@@ -641,7 +641,7 @@ impl<B> GovernedConnectionsBroker<B> {
             match record.operation_state {
                 ConnectionOperationState::Succeeded => return Ok(record),
                 ConnectionOperationState::Failed => {
-                    return Err(ConnectionBrokerError::Unavailable);
+                    return Err(connection_broker_error(record.failure_category.as_deref()));
                 }
                 ConnectionOperationState::Queued
                 | ConnectionOperationState::Provisioning
@@ -880,6 +880,20 @@ impl ConnectionOperationReconciler {
             .connection_operations_requiring_reconcile()
             .await?
         {
+            let task_failure_category = if matches!(
+                operation.task_phase,
+                steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled
+            ) {
+                self.store
+                    .task(operation.task_uid)
+                    .await?
+                    .and_then(|task| task.failure_reason)
+                    .map_or("bridge_failed", |reason| {
+                        connection_operation_failure_category(Some(reason.as_str()))
+                    })
+            } else {
+                "bridge_failed"
+            };
             if operation.oauth_phase == ConnectionOAuthPhase::Pending {
                 let _ = self
                     .store
@@ -890,6 +904,7 @@ impl ConnectionOperationReconciler {
                 operation.finalized,
                 operation.operation_state,
                 operation.task_phase,
+                task_failure_category,
             ) {
                 self.store
                     .fail_connection_operation(operation.operation_id, category)
@@ -976,7 +991,7 @@ impl ConnectionOperationReconciler {
                 }
                 steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled => {
                     self.store
-                        .fail_connection_operation(operation.operation_id, "bridge_failed")
+                        .fail_connection_operation(operation.operation_id, task_failure_category)
                         .await?;
                 }
                 steward_types::TaskPhase::Submitted
@@ -993,6 +1008,7 @@ fn finalized_nonterminal_failure(
     finalized: bool,
     operation_state: ConnectionOperationState,
     task_phase: steward_types::TaskPhase,
+    task_failure_category: &'static str,
 ) -> Option<&'static str> {
     if !finalized
         || matches!(
@@ -1004,7 +1020,9 @@ fn finalized_nonterminal_failure(
     }
     Some(match task_phase {
         steward_types::TaskPhase::Succeeded => "invalid_bridge_result",
-        steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled => "bridge_failed",
+        steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled => {
+            task_failure_category
+        }
         steward_types::TaskPhase::Submitted
         | steward_types::TaskPhase::Parked
         | steward_types::TaskPhase::Queued
@@ -1012,12 +1030,31 @@ fn finalized_nonterminal_failure(
     })
 }
 
+fn connection_operation_failure_category(failure_reason: Option<&str>) -> &'static str {
+    match failure_reason {
+        Some("bridge-proxy-policy") => "bridge-proxy-policy",
+        Some("bridge-runtime-authorization") => "bridge-runtime-authorization",
+        _ => "bridge_failed",
+    }
+}
+
+fn connection_broker_error(failure_category: Option<&str>) -> ConnectionBrokerError {
+    match failure_category {
+        Some("bridge-proxy-policy") => ConnectionBrokerError::ProxyPolicyDenied,
+        Some("bridge-runtime-authorization") => ConnectionBrokerError::ProviderAuthorizationFailed,
+        _ => ConnectionBrokerError::Unavailable,
+    }
+}
+
 #[cfg(test)]
 mod finalized_connection_operation_tests {
     use steward_store::ConnectionOperationState;
     use steward_types::TaskPhase;
 
-    use super::finalized_nonterminal_failure;
+    use super::{
+        connection_broker_error, connection_operation_failure_category,
+        finalized_nonterminal_failure,
+    };
 
     #[test]
     fn finalized_failed_bridge_terminalizes_its_connection_operation() {
@@ -1026,6 +1063,7 @@ mod finalized_connection_operation_tests {
                 true,
                 ConnectionOperationState::Queued,
                 TaskPhase::Failed,
+                "bridge_failed",
             ),
             Some("bridge_failed")
         );
@@ -1034,6 +1072,7 @@ mod finalized_connection_operation_tests {
                 true,
                 ConnectionOperationState::Succeeded,
                 TaskPhase::Succeeded,
+                "bridge_failed",
             ),
             None
         );
@@ -1042,9 +1081,40 @@ mod finalized_connection_operation_tests {
                 false,
                 ConnectionOperationState::Queued,
                 TaskPhase::Failed,
+                "bridge_failed",
             ),
             None
         );
+    }
+
+    #[test]
+    fn bridge_denials_remain_bounded_and_actionable_through_operation_failure() {
+        for (task_reason, operation_category, broker_error) in [
+            (
+                "bridge-proxy-policy",
+                "bridge-proxy-policy",
+                crate::connections::ConnectionBrokerError::ProxyPolicyDenied,
+            ),
+            (
+                "bridge-runtime-authorization",
+                "bridge-runtime-authorization",
+                crate::connections::ConnectionBrokerError::ProviderAuthorizationFailed,
+            ),
+            (
+                "opaque-agent-failure",
+                "bridge_failed",
+                crate::connections::ConnectionBrokerError::Unavailable,
+            ),
+        ] {
+            assert_eq!(
+                connection_operation_failure_category(Some(task_reason)),
+                operation_category
+            );
+            assert_eq!(
+                connection_broker_error(Some(operation_category)),
+                broker_error
+            );
+        }
     }
 }
 

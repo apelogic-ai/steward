@@ -491,6 +491,10 @@ fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
     {
         "bridge-runtime-authentication"
     } else if stderr.contains("steward-connections-bridge:")
+        && stderr.contains("openshell proxy denied provider request")
+    {
+        "bridge-proxy-policy"
+    } else if stderr.contains("steward-connections-bridge:")
         && stderr.contains("mcp-gw rejected runtime authorization")
     {
         "bridge-runtime-authorization"
@@ -4665,6 +4669,12 @@ mod tests {
                 b"steward-connections-bridge: bridge MCP-GW rejected runtime authentication"
             ),
             "bridge-runtime-authentication"
+        );
+        assert_eq!(
+            task_agent_failure_category(
+                b"steward-connections-bridge: bridge OpenShell proxy denied provider request"
+            ),
+            "bridge-proxy-policy"
         );
         assert_eq!(
             task_agent_failure_category(

@@ -172,6 +172,8 @@ pub struct StartedConnection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionBrokerError {
     OAuthFlowPending,
+    ProxyPolicyDenied,
+    ProviderAuthorizationFailed,
     Unavailable,
 }
 
@@ -306,7 +308,7 @@ where
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 502, description = "Provider continuation is invalid"),
-        (status = 503, description = "Connection broker is unavailable")
+        (status = 503, body = ConnectionOperationErrorResponse, description = "Connection broker is unavailable or denied")
     ),
     security(("browserSession" = []))
 )]
@@ -334,9 +336,7 @@ where
             expires_at: started.expires_at,
         })
         .into_response(),
-        Err(ConnectionBrokerError::OAuthFlowPending | ConnectionBrokerError::Unavailable) => {
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
+        Err(error) => connection_broker_error_response(error),
     }
 }
 
@@ -351,7 +351,7 @@ where
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Provider is unavailable"),
-        (status = 503, description = "Connection broker is unavailable")
+        (status = 503, body = ConnectionOperationErrorResponse, description = "Connection broker is unavailable or denied")
     ),
     security(("browserSession" = []))
 )]
@@ -384,7 +384,7 @@ where
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 409, body = ConnectionOperationErrorResponse, description = "An OAuth flow is still pending"),
         (status = 502, description = "Provider state is invalid"),
-        (status = 503, description = "Connection broker is unavailable")
+        (status = 503, body = ConnectionOperationErrorResponse, description = "Connection broker is unavailable or denied")
     ),
     security(("browserSession" = []))
 )]
@@ -410,7 +410,7 @@ where
     match state.broker.disconnect(&session).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(ConnectionBrokerError::OAuthFlowPending) => oauth_flow_pending_response(),
-        Err(ConnectionBrokerError::Unavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => connection_broker_error_response(error),
     }
 }
 
@@ -426,7 +426,7 @@ where
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Provider is unavailable"),
         (status = 409, body = ConnectionOperationErrorResponse),
-        (status = 503, description = "Connection broker is unavailable")
+        (status = 503, body = ConnectionOperationErrorResponse, description = "Connection broker is unavailable or denied")
     ),
     security(("browserSession" = []))
 )]
@@ -476,9 +476,7 @@ where
             status,
         })
         .into_response(),
-        Err(ConnectionBrokerError::OAuthFlowPending | ConnectionBrokerError::Unavailable) => {
-            unavailable_status_response()
-        }
+        Err(_) => unavailable_status_response(),
     }
 }
 
@@ -506,7 +504,7 @@ where
     };
     let status = match state.broker.status(&session).await {
         Ok(status) => status,
-        Err(ConnectionBrokerError::OAuthFlowPending | ConnectionBrokerError::Unavailable) => {
+        Err(_) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ConnectionsCollectionResponse {
@@ -549,6 +547,24 @@ fn oauth_flow_pending_response() -> Response {
         Json(ConnectionOperationErrorResponse {
             api_version: CONNECTIONS_API_VERSION,
             error: "oauth_flow_pending",
+        }),
+    )
+        .into_response()
+}
+
+fn connection_broker_error_response(error: ConnectionBrokerError) -> Response {
+    let error = match error {
+        ConnectionBrokerError::ProxyPolicyDenied => "proxy_policy_denied",
+        ConnectionBrokerError::ProviderAuthorizationFailed => "provider_authorization_failed",
+        ConnectionBrokerError::OAuthFlowPending | ConnectionBrokerError::Unavailable => {
+            "connection_broker_unavailable"
+        }
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ConnectionOperationErrorResponse {
+            api_version: CONNECTIONS_API_VERSION,
+            error,
         }),
     )
         .into_response()
@@ -1011,7 +1027,7 @@ mod tests {
             .lock()
             .map_err(|_| "fake broker state lock was poisoned".to_owned())?
             .unavailable = true;
-        let response = router(broker)
+        let response = router(broker.clone())
             .layer(axum::Extension(session()?))
             .oneshot(
                 Request::builder()
@@ -1031,6 +1047,61 @@ mod tests {
         let serialized = String::from_utf8_lossy(&body).to_lowercase();
         for forbidden in ["alice@example.com", "usr_", "session-a", "token", "secret"] {
             assert!(!serialized.contains(forbidden));
+        }
+
+        let start = router(broker)
+            .layer(axum::Extension(ConnectionMutationProof))
+            .layer(axum::Extension(session()?))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/connections/github/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build unavailable start request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request unavailable connection start: {error}"))?;
+        assert_eq!(start.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(start.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read unavailable start body: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("parse unavailable start body: {error}"))?,
+            serde_json::json!({
+                "apiVersion": CONNECTIONS_API_VERSION,
+                "error": "connection_broker_unavailable"
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connection_denials_have_distinct_bounded_problem_codes() -> Result<(), String> {
+        for (error, expected) in [
+            (
+                ConnectionBrokerError::ProxyPolicyDenied,
+                "proxy_policy_denied",
+            ),
+            (
+                ConnectionBrokerError::ProviderAuthorizationFailed,
+                "provider_authorization_failed",
+            ),
+        ] {
+            let response = connection_broker_error_response(error);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = to_bytes(response.into_body(), 1024)
+                .await
+                .map_err(|error| format!("read connection denial body: {error}"))?;
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body)
+                    .map_err(|error| format!("parse connection denial body: {error}"))?,
+                serde_json::json!({
+                    "apiVersion": CONNECTIONS_API_VERSION,
+                    "error": expected
+                })
+            );
         }
         Ok(())
     }
