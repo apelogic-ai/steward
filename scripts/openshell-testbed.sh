@@ -93,10 +93,20 @@ if [[ -n "${STEWARD_OPENSHELL_PRELOAD_IMAGE:-}" ]]; then
     echo "required command is missing: docker" >&2
     exit 2
   fi
-  docker pull "${STEWARD_OPENSHELL_PRELOAD_IMAGE}"
-  kind load docker-image \
-    "${STEWARD_OPENSHELL_PRELOAD_IMAGE}" \
-    --name "${CLUSTER_NAME}"
+  kind_node="${CLUSTER_NAME}-control-plane"
+  actual_nodes="$(kind get nodes --name "${CLUSTER_NAME}")"
+  if [[ "${actual_nodes}" != "${kind_node}" ]]; then
+    echo "OpenShell testbed Kind node mismatch: expected ${kind_node}" >&2
+    exit 1
+  fi
+  docker exec "${kind_node}" crictl pull "${STEWARD_OPENSHELL_PRELOAD_IMAGE}"
+  docker exec "${kind_node}" \
+    crictl inspecti --output json "${STEWARD_OPENSHELL_PRELOAD_IMAGE}" |
+    jq -e --arg image "${STEWARD_OPENSHELL_PRELOAD_IMAGE}" \
+      '.status.repoDigests | type == "array" and index($image) != null' >/dev/null || {
+        echo "OpenShell testbed pinned image digest is absent from the owned Kind node" >&2
+        exit 1
+      }
 fi
 
 supervisor_image_args=()
