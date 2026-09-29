@@ -76,18 +76,12 @@ YAML
 
 "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   workspace create --name "${WORKSPACE}"
-if ! "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+"${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   --workspace "${WORKSPACE}" sandbox create \
+  --detach \
   --name "${SANDBOX}" \
   --from "${STEWARD_G1_BASE_IMAGE:?G-1 pinned base image is required}" \
-  --policy "${policy}" \
-  --no-tty \
-  -- true
-then
-  # Sandbox creation may return before the initial exec observes readiness.
-  # The bounded probe below distinguishes that race from a failed provision.
-  :
-fi
+  --policy "${policy}"
 
 readiness_diagnostic="${STEWARD_RUN_DIR}/g1-readiness-diagnostic.log"
 for attempt in {1..120}; do
