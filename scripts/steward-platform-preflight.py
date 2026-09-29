@@ -867,13 +867,25 @@ def resolve_provider_profile_digests(
                 f"{(render_result.stderr or render_result.stdout).strip()}"
             )
         try:
-            rendered = json.loads(render_result.stdout)
+            render_document = json.loads(render_result.stdout)
         except json.JSONDecodeError as error:
             raise ValidationError(
                 f"released provider-profile renderer returned invalid JSON: {error}"
             ) from error
-        if not isinstance(rendered, dict):
+        if not isinstance(render_document, dict):
             raise ValidationError("released provider-profile renderer returned a non-object result")
+        render_report = render_document.get("result")
+        rendered = render_document.get("installation")
+        if (
+            not isinstance(render_report, dict)
+            or render_report.get("schemaVersion") != "steward.provider-profile-result/v1"
+            or render_report.get("operation") != "render"
+            or render_report.get("status") != "valid"
+            or not isinstance(rendered, dict)
+        ):
+            raise ValidationError(
+                "released provider-profile renderer returned an unexpected contract"
+            )
         validate_rendered_connections_profile(data, rendered)
 
         result = subprocess.run(
