@@ -113,5 +113,8 @@ denied_exit="$?"
 set -e
 if [[ "${denied_exit}" -ne 56 || "${denied_connect_status}" != "403" ]]; then
   echo "OpenShell unlisted HTTPS probe returned CONNECT ${denied_connect_status:-none} with curl exit ${denied_exit}; expected CONNECT 403 with exit 56" >&2
+  "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
+    --workspace "${WORKSPACE}" logs "${SANDBOX}" \
+    -n 500 --since 2m --source sandbox >&2 || true
   exit 1
 fi
