@@ -771,7 +771,9 @@ where
         if let Err(error) = state.github_rerunner.rerun(&session, &dispatch).await {
             return match error {
                 ConnectionBrokerError::OAuthFlowPending => StatusCode::CONFLICT.into_response(),
-                ConnectionBrokerError::Unavailable => {
+                ConnectionBrokerError::ProxyPolicyDenied
+                | ConnectionBrokerError::ProviderAuthorizationFailed
+                | ConnectionBrokerError::Unavailable => {
                     browser_runs_error(StatusCode::SERVICE_UNAVAILABLE)
                 }
             };

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from typing import Any
 
 
@@ -127,6 +128,53 @@ def validate_required_cidrs(parent: dict[str, Any], key: str, path: str) -> list
             raise ValidationError(f"{path}.{key} contains duplicate CIDR {normalized}")
         seen.add(normalized)
     return cidrs
+
+
+def validate_provider_cidrs(values: Any, path: str) -> list[str]:
+    if not isinstance(values, list) or not values:
+        raise ValidationError(f"{path} must be a non-empty CIDR array")
+    blocked = (
+        ipaddress.ip_network("0.0.0.0/32"),
+        ipaddress.ip_network("127.0.0.0/8"),
+        ipaddress.ip_network("169.254.0.0/16"),
+        ipaddress.ip_network("::/128"),
+        ipaddress.ip_network("::1/128"),
+    )
+    normalized: list[str] = []
+    for index, value in enumerate(values):
+        if not isinstance(value, str):
+            raise ValidationError(f"{path}[{index}] must be a CIDR string")
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except ValueError as error:
+            raise ValidationError(f"{path}[{index}] is not a valid CIDR: {value}") from error
+        if any(network.version == denied.version and network.overlaps(denied) for denied in blocked):
+            raise ValidationError(
+                f"{path}[{index}] overlaps an OpenShell always-blocked range"
+            )
+        normalized.append(str(network))
+    if len(set(normalized)) != len(normalized):
+        raise ValidationError(f"{path} contains duplicate CIDRs")
+    return normalized
+
+
+def https_host_and_port(value: str, path: str) -> tuple[str, int]:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port or 443
+    except ValueError as error:
+        raise ValidationError(f"{path} must be a valid HTTPS origin: {error}") from error
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValidationError(f"{path} must be an HTTPS origin")
+    return parsed.hostname, port
 
 
 def validate_capability_catalog(
@@ -456,9 +504,10 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
             value = require_string(inputs, key, f"providerProfiles[{index}].inputs")
             if not value.startswith("https://"):
                 raise ValidationError(f"providerProfiles[{index}].inputs.{key} must be an HTTPS origin")
-        cidrs = inputs.get("serviceCidrs")
-        if not isinstance(cidrs, list) or not cidrs or not all(isinstance(value, str) and value for value in cidrs):
-            raise ValidationError(f"providerProfiles[{index}].inputs.serviceCidrs must be a non-empty string array")
+        validate_provider_cidrs(
+            inputs.get("serviceCidrs"),
+            f"providerProfiles[{index}].inputs.serviceCidrs",
+        )
 
     arc = require_object(data, "arc", "input")
     identity = require_object(arc, "controllerServiceAccount", "arc")
@@ -500,6 +549,9 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
             raise ValidationError(f"execution.endpoints.{key} must use HTTPS")
     for key in ("openshellServerName", "workloadExchangeServerName", "spiffeTrustDomain"):
         require_string(endpoints, key, "execution.endpoints")
+    mint_audience = require_string(endpoints, "mintAudience", "execution.endpoints")
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", mint_audience):
+        raise ValidationError("execution.endpoints.mintAudience must be a bounded identifier")
     bridge = require_object(execution, "connectionsBridge", "execution")
     bridge_origin = require_string(bridge, "mcpGatewayOrigin", "execution.connectionsBridge")
     if not bridge_origin.startswith("https://"):
@@ -700,6 +752,7 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
             },
             "mint": {
                 "issuer": endpoints["mintIssuer"],
+                "audience": endpoints["mintAudience"],
                 "spiffeTrustDomain": endpoints["spiffeTrustDomain"],
                 "openshellNamespace": data["namespaces"]["openshell"],
             },
@@ -728,7 +781,7 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
 def provider_profile_inputs(data: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema": "steward.provider-profile-inputs/v1",
-        "bundle": {"id": "steward-runtime-providers", "version": "1.2.0"},
+        "bundle": {"id": "steward-runtime-providers", "version": "1.2.1"},
         "profiles": [
             {
                 "id": profile["name"],
@@ -736,11 +789,102 @@ def provider_profile_inputs(data: dict[str, Any]) -> dict[str, Any]:
                     "gateway-origin": profile["inputs"]["gatewayOrigin"],
                     "runtime-grant-origin": profile["inputs"]["runtimeGrantOrigin"],
                     "service-cidrs": profile["inputs"]["serviceCidrs"],
+                    "mint-audience": data["execution"]["endpoints"]["mintAudience"],
                 },
             }
             for profile in data["providerProfiles"]
         ],
     }
+
+
+def validate_rendered_connections_profile(
+    data: dict[str, Any], rendered: dict[str, Any]
+) -> None:
+    if (
+        rendered.get("schema") != "steward.provider-profile-install-state/v1"
+        or rendered.get("bundle")
+        != {"id": "steward-runtime-providers", "version": "1.2.1"}
+    ):
+        raise ValidationError("released provider-profile renderer returned an unexpected contract")
+    profiles = rendered.get("profiles")
+    if not isinstance(profiles, dict):
+        raise ValidationError("released provider-profile renderer requires a profiles object")
+
+    for profile_id, profile in profiles.items():
+        if not isinstance(profile, dict):
+            raise ValidationError(f"rendered provider profile {profile_id} must be an object")
+        endpoints = profile.get("endpoints")
+        if not isinstance(endpoints, list):
+            raise ValidationError(f"rendered provider profile {profile_id} requires endpoints")
+        for endpoint in endpoints:
+            if not isinstance(endpoint, dict):
+                raise ValidationError(
+                    f"rendered provider profile {profile_id} endpoints must be objects"
+                )
+            allowed_ips = endpoint.get("allowed_ips")
+            if not isinstance(allowed_ips, list):
+                raise ValidationError(
+                    f"rendered provider profile {profile_id} endpoint requires allowed_ips"
+                )
+            validate_provider_cidrs(
+                allowed_ips,
+                f"rendered provider profile {profile_id} allowed_ips",
+            )
+        credentials = profile.get("credentials")
+        if not isinstance(credentials, list) or len(credentials) != 1:
+            raise ValidationError(
+                f"rendered provider profile {profile_id} requires one credential"
+            )
+        token_grant = credentials[0].get("token_grant") if isinstance(credentials[0], dict) else None
+        if not isinstance(token_grant, dict) or token_grant.get("audience") != data["execution"]["endpoints"]["mintAudience"]:
+            raise ValidationError(
+                f"rendered provider profile {profile_id} audience must equal execution.endpoints.mintAudience"
+            )
+        if profile_id == "steward-mcp-gw" and any(
+            endpoint.get("access") != "read-write" for endpoint in endpoints
+        ):
+            raise ValidationError(
+                "rendered steward-mcp-gw endpoints must allow POST-capable read-write transport"
+            )
+
+    binding = data["execution"]["binding"]
+    tools_profile_id = binding.get("toolsProfile")
+    if tools_profile_id is None:
+        return
+    tools_profile = profiles.get(tools_profile_id)
+    if not isinstance(tools_profile, dict):
+        raise ValidationError(
+            f"released provider-profile renderer omitted tools profile {tools_profile_id}"
+        )
+    binaries = tools_profile.get("binaries")
+    if not isinstance(binaries, list) or "/usr/local/bin/steward-connections-bridge" not in binaries:
+        raise ValidationError(
+            f"rendered provider profile {tools_profile_id} must include "
+            "/usr/local/bin/steward-connections-bridge"
+        )
+
+    bridge_origin = data["execution"]["connectionsBridge"]["mcpGatewayOrigin"]
+    bridge_host, bridge_port = https_host_and_port(
+        bridge_origin, "execution.connectionsBridge.mcpGatewayOrigin"
+    )
+    rendered_endpoints = tools_profile.get("endpoints")
+    matching_endpoint = any(
+        isinstance(endpoint, dict)
+        and endpoint.get("host") == bridge_host
+        and endpoint.get("port") == bridge_port
+        for endpoint in rendered_endpoints
+    )
+    if not matching_endpoint:
+        actual = sorted(
+            f"{endpoint.get('host')}:{endpoint.get('port')}"
+            for endpoint in rendered_endpoints
+            if isinstance(endpoint, dict)
+        )
+        raise ValidationError(
+            "execution.connectionsBridge.mcpGatewayOrigin host and effective port "
+            f"{bridge_host}:{bridge_port} must match the rendered tools profile endpoint; "
+            f"rendered={actual}"
+        )
 
 
 def resolve_provider_profile_digests(
@@ -754,6 +898,46 @@ def resolve_provider_profile_digests(
     with tempfile.TemporaryDirectory(prefix="steward-provider-profile-") as temporary:
         inputs_path = pathlib.Path(temporary) / "inputs.json"
         inputs_path.write_text(canonical(inputs), encoding="utf-8")
+        render_result = subprocess.run(
+            [
+                str(installer),
+                "render",
+                "--bundle",
+                str(bundle),
+                "--inputs",
+                str(inputs_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if render_result.returncode != 0:
+            raise ValidationError(
+                "released provider-profile rendering failed: "
+                f"{(render_result.stderr or render_result.stdout).strip()}"
+            )
+        try:
+            render_document = json.loads(render_result.stdout)
+        except json.JSONDecodeError as error:
+            raise ValidationError(
+                f"released provider-profile renderer returned invalid JSON: {error}"
+            ) from error
+        if not isinstance(render_document, dict):
+            raise ValidationError("released provider-profile renderer returned a non-object result")
+        render_report = render_document.get("result")
+        rendered = render_document.get("installation")
+        if (
+            not isinstance(render_report, dict)
+            or render_report.get("schemaVersion") != "steward.provider-profile-result/v1"
+            or render_report.get("operation") != "render"
+            or render_report.get("status") != "valid"
+            or not isinstance(rendered, dict)
+        ):
+            raise ValidationError(
+                "released provider-profile renderer returned an unexpected contract"
+            )
+        validate_rendered_connections_profile(data, rendered)
+
         result = subprocess.run(
             [
                 str(installer),
@@ -784,7 +968,7 @@ def resolve_provider_profile_digests(
         or report.get("operation") != "validate"
         or report.get("status") != "valid"
         or report.get("bundle")
-        != {"id": "steward-runtime-providers", "version": "1.2.0"}
+        != {"id": "steward-runtime-providers", "version": "1.2.1"}
     ):
         raise ValidationError("released provider-profile installer returned an unexpected contract")
     reported_profiles = report.get("profiles")

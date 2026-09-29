@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.3.2`. The release workflow pulls the published OCI
+Release contract: chart `0.3.3`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -108,6 +108,12 @@ Runtime support is the Kubernetes/OpenShell default. Operators may set
 `config.controller.openshellRuntimeClassName` only when their platform requires
 an explicit class. That optional override is deployment configuration, not a
 separate Steward-supported runtime or an isolation certification.
+
+OpenShell v0.0.98 must use the supported sidecar topology, sandbox SPIFFE
+identity, and lazy provider-token-grant configuration described in
+[OpenShell 0.0.98 governed execution](openshell-v0.0.98.md). In particular,
+do not combine its stock `combined` supervisor topology with provider token
+grants.
 
 Integration ownership is explicit: core requires only PostgreSQL, Kubernetes
 TokenReview/API access, and service TLS; Jira adds a decision channel; browser
@@ -401,8 +407,9 @@ preserve the same immutable coordinates and cross-component relationships.
        litellmUrl: https://litellm.example.test
      mint:
        issuer: https://mint.example.test
-       spiffeTrustDomain: customer.example.test
-       openshellNamespace: customer-openshell
+       audience: steward-mcp
+       spiffeTrustDomain: trust.example.test
+       openshellNamespace: openshell
    runtimeNamespaces: [steward-tasks]
    ```
 
@@ -429,7 +436,7 @@ preserve the same immutable coordinates and cross-component relationships.
    versioned bundle, extract the attested release asset and use its bundled
    `bin/steward-provider-profile` executable to validate, install, and reconcile
    the deployment-neutral inputs as shown in the
-   [bundle guide](../../config/provider-profile-bundle/v1.2.0/README.md). The
+   [bundle guide](../../config/provider-profile-bundle/v1.2.1/README.md). The
    released tool is self-contained for `linux/amd64`; no Steward checkout or
    Rust toolchain is required.
    Record each installed profile ID and immutable policy digest in the
@@ -438,6 +445,22 @@ preserve the same immutable coordinates and cross-component relationships.
    the corresponding category. Pinned OpenShell v0.0.98 cannot attest profile
    content itself, so the deployment system must keep each installed ID
    immutable and verify the rendered bytes against the recorded digest.
+   Bundle 1.2.1 uses the single `config.mint.audience` for both inference and
+   MCP token grants, permits POST transport for read-only MCP JSON-RPC, and
+   rejects unsupported unrestricted, IPv4 loopback, IPv4 link-local, IPv6
+   unspecified, and IPv6 loopback CIDRs. For a fresh installation, do not
+   mutate an installed profile ID in place.
+
+   Upgrading an existing v0.3.2 installation is a governed exception. Before
+   the Helm upgrade, check out the exact Steward `v0.3.3` tag and run the bundle
+   guide's `cargo xtask provider-profile-bundle upgrade` transition. Stop the
+   profile consumers, re-apply both rendered profiles under their existing IDs,
+   rerun platform preflight with `execution.endpoints.mintAudience` set equal
+   to `config.mint.audience`, and use the regenerated Helm values and
+   execution-binding digests for `helm upgrade`. Restart the consumers only
+   after the upgrade succeeds. The released standalone installer remains the
+   no-checkout path for fresh installs; it does not implement this transition.
+   See the [exact upgrade sequence](../../config/provider-profile-bundle/v1.2.1/README.md).
    For `codex@0.140.0`, use or mirror the digest-selected image and run the
    [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 

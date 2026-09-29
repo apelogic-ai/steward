@@ -529,6 +529,9 @@ pub fn upgrade_rendered_provider_profile_bundle(
         ) | (
             ("steward-runtime-providers", "1.1.0"),
             ("steward-runtime-providers", "1.2.0")
+        ) | (
+            ("steward-runtime-providers", "1.2.0"),
+            ("steward-runtime-providers", "1.2.1")
         )
     );
     if !supported_transition {
@@ -698,6 +701,28 @@ fn validate_provider_profile_upgrade_delta(
         let replacement_profile = replacement.profiles.get(profile_id).ok_or_else(|| {
             format!("replacement provider profile {profile_id} is required for upgrade")
         })?;
+        if current_version == "1.2.0" && replacement_version == "1.2.1" {
+            let mut expected = current_profile.clone();
+            expected.as_object_mut().ok_or_else(|| {
+                format!("rendered provider profile {profile_id} must be an object")
+            })?;
+            expected
+                .pointer_mut("/credentials/0/token_grant/audience")
+                .ok_or_else(|| format!("provider profile {profile_id} requires an audience"))?
+                .clone_from(&Value::String("steward-mcp".to_owned()));
+            if profile_id == "steward-mcp-gw" {
+                expected
+                    .pointer_mut("/endpoints/0/access")
+                    .ok_or_else(|| "MCP provider profile requires endpoint access".to_owned())?
+                    .clone_from(&Value::String("read-write".to_owned()));
+            }
+            if &expected != replacement_profile {
+                return Err(format!(
+                    "provider profile upgrade for {profile_id} permits only the declared shared-audience and MCP transport-access correction"
+                ));
+            }
+            continue;
+        }
         let (expected_current_binaries, expected_replacement_binaries) = match (
             current_version,
             replacement_version,
@@ -878,6 +903,15 @@ fn validate_bound_inputs(
                     )
                 })?,
             )?),
+            "identifier" => {
+                let value = value.as_str().ok_or_else(|| {
+                    format!(
+                        "provider profile {profile_id} environment input {name} must be an identifier"
+                    )
+                })?;
+                ensure_identifier(value, "provider profile environment input identifier")?;
+                Value::String(value.to_owned())
+            }
             _ => {
                 return Err(format!(
                     "provider profile {profile_id} input {name} has unsupported kind {kind}"
@@ -948,13 +982,32 @@ fn render_provider_profile(
     let inference_capable = capabilities
         .iter()
         .any(|capability| capability.as_str() == Some("inference.completions"));
-    let access = if capabilities
-        .iter()
-        .any(|capability| capability.as_str() == Some("tool.read"))
-    {
-        "read-only"
+    let access = network
+        .get("access")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            if capabilities
+                .iter()
+                .any(|capability| capability.as_str() == Some("tool.read"))
+            {
+                "read-only"
+            } else {
+                "read-write"
+            }
+        });
+    let audience = if let Some(input) = authorization.get("audienceInput") {
+        let input = input.as_str().ok_or_else(|| {
+            "provider profile template authorization audienceInput must be a string".to_owned()
+        })?;
+        inputs.get(input).and_then(Value::as_str).ok_or_else(|| {
+            format!("provider profile {profile_id} is missing audience input {input}")
+        })?
     } else {
-        "read-write"
+        require_nonempty_string(
+            authorization,
+            "audience",
+            "provider profile template authorization",
+        )?
     };
     let binaries = require_array(
         runtime,
@@ -975,7 +1028,7 @@ fn render_provider_profile(
             "header_name": "Authorization",
             "token_grant": {
                 "token_endpoint": token_endpoint,
-                "audience": require_nonempty_string(authorization, "audience", "provider profile template authorization")?,
+                "audience": audience,
                 "jwt_svid_audience": require_nonempty_string(authorization, "jwtSvidAudience", "provider profile template authorization")?,
                 "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
                 "scopes": require_array(authorization, "scopes", "provider profile template authorization")?,
@@ -1119,6 +1172,27 @@ fn normalize_cidrs(values: &[Value]) -> Result<Vec<Value>, String> {
                             .to_owned(),
                     );
                 }
+                let mask = prefix_mask_v4(prefix);
+                let end = network | !mask;
+                if network == 0
+                    || cidr_ranges_overlap(
+                        network,
+                        end,
+                        u32::from(Ipv4Addr::LOCALHOST),
+                        u32::from(Ipv4Addr::new(127, 255, 255, 255)),
+                    )
+                    || cidr_ranges_overlap(
+                        network,
+                        end,
+                        u32::from(Ipv4Addr::new(169, 254, 0, 0)),
+                        u32::from(Ipv4Addr::new(169, 254, 255, 255)),
+                    )
+                {
+                    return Err(
+                        "provider profile CIDR list overlaps an OpenShell always-blocked IPv4 range"
+                            .to_owned(),
+                    );
+                }
                 format!("{address}/{prefix}")
             }
             IpAddr::V6(address) => {
@@ -1132,12 +1206,23 @@ fn normalize_cidrs(values: &[Value]) -> Result<Vec<Value>, String> {
                             .to_owned(),
                     );
                 }
+                let end = network | !prefix_mask_v6(prefix);
+                if network == 0 || (network <= 1 && end >= 1) {
+                    return Err(
+                        "provider profile CIDR list overlaps an OpenShell always-blocked IPv6 range"
+                            .to_owned(),
+                    );
+                }
                 format!("{address}/{prefix}")
             }
         };
         normalized.insert(canonical);
     }
     Ok(normalized.into_iter().map(Value::String).collect())
+}
+
+fn cidr_ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_end: u32) -> bool {
+    left_start <= right_end && right_start <= left_end
 }
 
 fn prefix_mask_v4(prefix: u8) -> u32 {
@@ -1216,6 +1301,16 @@ fn validate_provider_profile_template(
         .filter_map(|input| input.get("name").and_then(Value::as_str))
         .collect::<BTreeSet<_>>();
     let network = require_object(object, "network", "provider profile template")?;
+    let expected_network_keys = if network.contains_key("access") {
+        &["endpointInput", "allowedCidrsInput", "protocol", "access"][..]
+    } else {
+        &["endpointInput", "allowedCidrsInput", "protocol"][..]
+    };
+    require_exact_keys(
+        network,
+        expected_network_keys,
+        "provider profile template network",
+    )?;
     let endpoint_input = require_nonempty_string(
         network,
         "endpointInput",
@@ -1242,7 +1337,19 @@ fn validate_provider_profile_template(
         "https",
         "provider profile template network",
     )?;
+    if let Some(access) = network.get("access")
+        && !matches!(access.as_str(), Some("read-only" | "read-write"))
+    {
+        return Err(
+            "provider profile template network access must be read-only or read-write".to_owned(),
+        );
+    }
     let authorization = require_object(object, "authorization", "provider profile template")?;
+    let audience_key = if authorization.contains_key("audienceInput") {
+        "audienceInput"
+    } else {
+        "audience"
+    };
     require_exact_keys(
         authorization,
         &[
@@ -1250,7 +1357,7 @@ fn validate_provider_profile_template(
             "authDescription",
             "tokenGrantOriginInput",
             "tokenPath",
-            "audience",
+            audience_key,
             "jwtSvidAudience",
             "scopes",
             "cacheTtlSeconds",
@@ -1285,14 +1392,20 @@ fn validate_provider_profile_template(
             "provider profile template authorization",
         )?,
     )?;
-    ensure_identifier(
-        require_nonempty_string(
-            authorization,
-            "audience",
-            "provider profile template authorization",
-        )?,
-        "provider profile template authorization audience",
+    let audience = require_nonempty_string(
+        authorization,
+        audience_key,
+        "provider profile template authorization",
     )?;
+    if audience_key == "audienceInput" {
+        if !input_names.contains(audience) {
+            return Err(format!(
+                "provider profile template audienceInput {audience} is not a declared manifest input"
+            ));
+        }
+    } else {
+        ensure_identifier(audience, "provider profile template authorization audience")?;
+    }
     ensure_identifier(
         require_nonempty_string(
             authorization,
@@ -1389,7 +1502,7 @@ fn validate_input_declarations(inputs: &[Value], profile_id: &str) -> Result<(),
             ));
         }
         let kind = require_nonempty_string(input, "kind", "provider profile input")?;
-        if !matches!(kind, "https-origin" | "cidr-list") {
+        if !matches!(kind, "https-origin" | "cidr-list" | "identifier") {
             return Err(format!(
                 "provider profile {profile_id} input {name} uses unsupported portable input kind {kind}"
             ));
@@ -2376,7 +2489,7 @@ mod tests {
     use super::{
         RenderedProviderProfileBundle, install_rendered_provider_profile_bundle,
         local_test_context_is_safe, migration_base_candidates, migration_history_violations,
-        neutrality_violations, profile_without_binaries,
+        neutrality_violations, normalize_cidrs, profile_without_binaries,
         reconcile_rendered_provider_profile_bundle, render_provider_profile_bundle,
         render_provider_profile_bundle_directory, secret_violations, select_migration_base,
         upgrade_rendered_provider_profile_bundle, validate_provider_profile_bundle,
@@ -2917,6 +3030,34 @@ mod tests {
     }
 
     #[test]
+    fn provider_profile_render_rejects_unrestricted_ipv4_egress() {
+        let result = normalize_cidrs(&[serde_json::Value::String("0.0.0.0/0".to_owned())]);
+        assert!(
+            matches!(result, Err(ref error) if error.contains("OpenShell always-blocked")),
+            "the renderer must reject a CIDR OpenShell always blocks: {result:?}"
+        );
+    }
+
+    #[test]
+    fn provider_profile_render_rejects_openshell_always_blocked_networks() {
+        for cidr in [
+            "0.0.0.0/32",
+            "127.0.0.0/8",
+            "127.1.0.0/16",
+            "169.254.0.0/16",
+            "::/0",
+            "::/128",
+            "::1/128",
+        ] {
+            let result = normalize_cidrs(&[serde_json::Value::String(cidr.to_owned())]);
+            assert!(
+                matches!(result, Err(ref error) if error.contains("OpenShell always-blocked")),
+                "{cidr} must fail before a provider profile reaches OpenShell: {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn provider_profile_install_is_absent_only_and_reconcile_rejects_drift() -> Result<(), String> {
         let profile = serde_json::json!({"id": "steward-mcp-gw", "policy": "read-only"});
         let mut profiles = BTreeMap::new();
@@ -3070,6 +3211,58 @@ mod tests {
     }
 
     #[test]
+    fn provider_profile_upgrade_to_1_2_1_corrects_transport_and_shared_audience()
+    -> Result<(), String> {
+        let current = render_test_provider_profile_bundle(
+            "v1.2.0",
+            "1.2.0",
+            "https://mcp.gateway.test",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
+            "192.0.2.0/24",
+        )?;
+        let replacement = render_test_provider_profile_bundle(
+            "v1.2.1",
+            "1.2.1",
+            "https://mcp.gateway.test",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
+            "192.0.2.0/24",
+        )?;
+        assert_eq!(
+            replacement
+                .profiles
+                .get("steward-mcp-gw")
+                .and_then(|profile| profile.pointer("/endpoints/0/access"))
+                .and_then(serde_json::Value::as_str),
+            Some("read-write")
+        );
+        for profile in replacement.profiles.values() {
+            assert_eq!(
+                profile
+                    .pointer("/credentials/0/token_grant/audience")
+                    .and_then(serde_json::Value::as_str),
+                Some("steward-mcp")
+            );
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "steward-provider-profile-upgrade-1-2-1-test-{}-{}",
+            std::process::id(),
+            NEXT_RENDER_INSTALL_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&directory).map_err(|error| format!("create fixture: {error}"))?;
+        let output = directory.join("installed");
+        let result = (|| {
+            install_rendered_provider_profile_bundle(&output, &current)?;
+            upgrade_rendered_provider_profile_bundle(&output, &current, &replacement)?;
+            reconcile_rendered_provider_profile_bundle(&output, &replacement)
+        })();
+        fs::remove_dir_all(&directory).map_err(|error| format!("remove fixture: {error}"))?;
+        result
+    }
+
+    #[test]
     fn provider_profile_upgrade_requires_an_exact_supported_predecessor() -> Result<(), String> {
         let current = render_test_provider_profile_bundle(
             "v1",
@@ -3192,7 +3385,7 @@ mod tests {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .ok_or_else(|| "xtask manifest directory must have a repository parent".to_owned())?;
-        let inputs = serde_json::json!({
+        let mut inputs = serde_json::json!({
             "schema": "steward.provider-profile-inputs/v1",
             "bundle": {
                 "id": "steward-runtime-providers",
@@ -3217,6 +3410,15 @@ mod tests {
                 }
             ]
         });
+        if version == "1.2.1" {
+            for profile in inputs["profiles"]
+                .as_array_mut()
+                .ok_or_else(|| "test provider profile inputs require profiles".to_owned())?
+            {
+                profile["inputs"]["mint-audience"] =
+                    serde_json::Value::String("steward-mcp".to_owned());
+            }
+        }
         render_provider_profile_bundle_directory(
             &repository
                 .join("config/provider-profile-bundle")

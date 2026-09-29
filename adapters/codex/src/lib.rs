@@ -16,7 +16,7 @@ impl CodexTaskExecutionAdapter {
         {
             return Err(invalid_inference_endpoint());
         }
-        let endpoint =
+        let mut endpoint =
             reqwest::Url::parse(&inference_endpoint).map_err(|_| invalid_inference_endpoint())?;
         if !matches!(endpoint.scheme(), "http" | "https")
             || endpoint.host_str().is_none()
@@ -27,6 +27,12 @@ impl CodexTaskExecutionAdapter {
             || endpoint.port() == Some(0)
         {
             return Err(invalid_inference_endpoint());
+        }
+        let normalized_path = endpoint.path().trim_end_matches('/').to_owned();
+        if let Some(base_path) = normalized_path.strip_suffix("/responses") {
+            endpoint.set_path(if base_path.is_empty() { "/" } else { base_path });
+        } else {
+            endpoint.set_path(&normalized_path);
         }
         Ok(Self {
             inference_endpoint: endpoint.to_string().trim_end_matches('/').to_owned(),
@@ -225,6 +231,31 @@ mod tests {
         assert!(!plan.command[6].contains("[mcp_servers."));
         assert!(!plan.command[6].contains("STEWARD_MCP_GW_BEARER_TOKEN"));
         assert!(!plan.command[2].contains("STEWARD_MCP_GW_BEARER_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_responses_operation_is_normalized_to_the_codex_base_url() -> Result<(), String> {
+        let adapter = CodexTaskExecutionAdapter::new(
+            "https://inference.example.test/v1/responses".to_owned(),
+        )
+        .map_err(|error| format!("configure adapter: {error:?}"))?;
+        let binding = binding();
+        let plan = adapter
+            .render(TaskExecutionPlanRequest {
+                workflow_prompt: "Inspect input.",
+                model: &ModelRef {
+                    provider: "example-model".to_owned(),
+                    model: "small".to_owned(),
+                },
+                tools: &[],
+                tool_transport_endpoint: None,
+                binding: &binding,
+            })
+            .map_err(|error| format!("render adapter plan: {error:?}"))?;
+
+        assert!(plan.command[6].contains("base_url = \"https://inference.example.test/v1\""));
+        assert!(!plan.command[6].contains("/responses"));
         Ok(())
     }
 

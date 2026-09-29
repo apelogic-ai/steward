@@ -92,6 +92,7 @@
       "workloadExchangeServerName": "identity.example.test",
       "litellm": "https://inference.example.test",
       "mintIssuer": "https://mint.example.test",
+      "mintAudience": "steward-mcp",
       "spiffeTrustDomain": "example.test"
     },
     "connectionsBridge": {"mcpGatewayOrigin": "https://mcp.example.test", "mcpGatewayAuthorityContract": "steward.connections.github/v2"},

@@ -41,13 +41,13 @@ if [[ "$(<"$first_digest")" != "$actual_digest" ]]; then
 fi
 
 expected_entries=(
-  provider-profile-bundle/v1.2.0/README.md
-  provider-profile-bundle/v1.2.0/bundle.json
-  provider-profile-bundle/v1.2.0/profiles/steward-litellm.json
-  provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json
-  provider-profile-bundle/v1.2.0/examples/inputs.json
-  provider-profile-bundle/v1.2.0/release.json
-  provider-profile-bundle/v1.2.0/bin/steward-provider-profile
+  provider-profile-bundle/v1.2.1/README.md
+  provider-profile-bundle/v1.2.1/bundle.json
+  provider-profile-bundle/v1.2.1/profiles/steward-litellm.json
+  provider-profile-bundle/v1.2.1/profiles/steward-mcp-gw.json
+  provider-profile-bundle/v1.2.1/examples/inputs.json
+  provider-profile-bundle/v1.2.1/release.json
+  provider-profile-bundle/v1.2.1/bin/steward-provider-profile
 )
 actual_entries="$(tar -tzf "$first_archive")"
 expected_entries_text="$(printf '%s\n' "${expected_entries[@]}")"
@@ -57,7 +57,7 @@ if [[ "$actual_entries" != "$expected_entries_text" ]]; then
 fi
 
 tar -xzf "$first_archive" -C "${temporary_directory}"
-bundle="${temporary_directory}/provider-profile-bundle/v1.2.0"
+bundle="${temporary_directory}/provider-profile-bundle/v1.2.1"
 tool="${bundle}/bin/steward-provider-profile"
 inputs="${bundle}/examples/inputs.json"
 output="${temporary_directory}/rendered"

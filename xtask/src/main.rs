@@ -23,10 +23,11 @@ mod storage;
 
 type TaskResult = Result<(), String>;
 
-const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 3] = [
+const PROVIDER_PROFILE_BUNDLE_CATALOG: [(&str, &str); 4] = [
     ("1.0.0", "config/provider-profile-bundle/v1"),
     ("1.1.0", "config/provider-profile-bundle/v1.1.0"),
     ("1.2.0", "config/provider-profile-bundle/v1.2.0"),
+    ("1.2.1", "config/provider-profile-bundle/v1.2.1"),
 ];
 
 fn main() -> ExitCode {
@@ -1119,7 +1120,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.3.2" => Ok(true),
+            "0.3.3" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -1744,9 +1745,12 @@ mod tests {
 
     #[test]
     fn provider_profile_inputs_select_their_exact_immutable_bundle() -> Result<(), String> {
-        for (version, expected_suffix) in
-            [("1.0.0", "/v1"), ("1.1.0", "/v1.1.0"), ("1.2.0", "/v1.2.0")]
-        {
+        for (version, expected_suffix) in [
+            ("1.0.0", "/v1"),
+            ("1.1.0", "/v1.1.0"),
+            ("1.2.0", "/v1.2.0"),
+            ("1.2.1", "/v1.2.1"),
+        ] {
             let inputs = serde_json::json!({
                 "bundle": {"id": "steward-runtime-providers", "version": version}
             });
@@ -2811,7 +2815,7 @@ mod tests {
             "Verify authenticated OpenShell adapter on linux/amd64",
             "cargo xtask e2e-openshell-adapter",
             "Provider profile bundle asset:",
-            "Provider profile bundle identity: steward-runtime-providers@1.2.0",
+            "Provider profile bundle identity: steward-runtime-providers@1.2.1",
             "Provider profile bundle SHA-256:",
             "Provider profile bundle signer identity:",
             "Provider profile bundle source repository:",
@@ -2861,9 +2865,9 @@ mod tests {
             "--numeric-owner",
             "--format=ustar",
             "gzip -n",
-            "provider-profile-bundle/v1.2.0/bundle.json",
-            "provider-profile-bundle/v1.2.0/profiles/steward-litellm.json",
-            "provider-profile-bundle/v1.2.0/profiles/steward-mcp-gw.json",
+            "provider-profile-bundle/v1.2.1/bundle.json",
+            "provider-profile-bundle/v1.2.1/profiles/steward-litellm.json",
+            "provider-profile-bundle/v1.2.1/profiles/steward-mcp-gw.json",
             "sha256sum",
         ] {
             assert!(
@@ -2883,7 +2887,7 @@ mod tests {
             );
         }
         let bundle_readme =
-            fs::read_to_string(root().join("config/provider-profile-bundle/v1.2.0/README.md"))
+            fs::read_to_string(root().join("config/provider-profile-bundle/v1.2.1/README.md"))
                 .map_err(|error| format!("provider-profile bundle README is required: {error}"))?;
         for required in [
             "Verify a released bundle before rendering or installation",
@@ -3927,7 +3931,7 @@ mod tests {
             manifest
                 .pointer("/stewardVersion")
                 .and_then(serde_json::Value::as_str),
-            Some("0.3.2")
+            Some("0.3.3")
         );
         assert_eq!(
             manifest

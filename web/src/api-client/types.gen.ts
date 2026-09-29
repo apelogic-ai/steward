@@ -1634,9 +1634,9 @@ export type DisconnectConnectionErrors = {
      */
     502: unknown;
     /**
-     * Connection broker is unavailable
+     * Connection broker is unavailable or denied
      */
-    503: unknown;
+    503: ConnectionOperationErrorResponse;
 };
 
 export type DisconnectConnectionError = DisconnectConnectionErrors[keyof DisconnectConnectionErrors];
@@ -1678,10 +1678,12 @@ export type StartConnectionErrors = {
      */
     502: unknown;
     /**
-     * Connection broker is unavailable
+     * Connection broker is unavailable or denied
      */
-    503: unknown;
+    503: ConnectionOperationErrorResponse;
 };
+
+export type StartConnectionError = StartConnectionErrors[keyof StartConnectionErrors];
 
 export type StartConnectionResponses = {
     200: StartConnectionResponse;
@@ -3000,9 +3002,9 @@ export type DisconnectProviderConnectionErrors = {
     404: unknown;
     409: ConnectionOperationErrorResponse;
     /**
-     * Connection broker is unavailable
+     * Connection broker is unavailable or denied
      */
-    503: unknown;
+    503: ConnectionOperationErrorResponse;
 };
 
 export type DisconnectProviderConnectionError = DisconnectProviderConnectionErrors[keyof DisconnectProviderConnectionErrors];
@@ -3042,10 +3044,12 @@ export type StartProviderConnectionErrors = {
      */
     404: unknown;
     /**
-     * Connection broker is unavailable
+     * Connection broker is unavailable or denied
      */
-    503: unknown;
+    503: ConnectionOperationErrorResponse;
 };
+
+export type StartProviderConnectionError = StartProviderConnectionErrors[keyof StartProviderConnectionErrors];
 
 export type StartProviderConnectionResponses = {
     200: StartConnectionResponse;

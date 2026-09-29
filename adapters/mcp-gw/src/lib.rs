@@ -354,7 +354,12 @@ fn parse_response(
 ) -> Result<Value, PortError> {
     match operation {
         GithubBridgeOperation::Status => {
-            require_status(status, StatusCode::OK, "read GitHub connection status")?;
+            require_status(
+                status,
+                StatusCode::OK,
+                "read GitHub connection status",
+                body,
+            )?;
             let object = json_object(body, "GitHub status response")?;
             match contract {
                 GatewayContract::LegacyV032 => {
@@ -365,7 +370,7 @@ fn parse_response(
             }
         }
         GithubBridgeOperation::Start => {
-            require_status(status, StatusCode::OK, "start GitHub connection")?;
+            require_status(status, StatusCode::OK, "start GitHub connection", body)?;
             let object = json_object(body, "GitHub start response")?;
             let authorization_url = exact_string_field(&object, "authorizationUrl")?;
             validate_authorization_url(&authorization_url)?;
@@ -376,6 +381,7 @@ fn parse_response(
                 status,
                 StatusCode::NO_CONTENT,
                 "disconnect GitHub connection",
+                body,
             )?;
             if !body.is_empty() {
                 return Err(unavailable("disconnect GitHub connection"));
@@ -383,7 +389,7 @@ fn parse_response(
             Ok(json!({"disconnected": true}))
         }
         GithubBridgeOperation::Rerun => {
-            require_status(status, StatusCode::OK, "re-run GitHub workflow")?;
+            require_status(status, StatusCode::OK, "re-run GitHub workflow", body)?;
             let object = mcp_json_object(body, "GitHub rerun MCP response")?;
             if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
                 || object.get("id").and_then(Value::as_str) != Some(RERUN_REQUEST_ID)
@@ -414,13 +420,27 @@ fn require_status(
     actual: StatusCode,
     expected: StatusCode,
     operation: &str,
+    body: &[u8],
 ) -> Result<(), PortError> {
     if actual == expected {
         Ok(())
     } else if actual == StatusCode::UNAUTHORIZED {
         Err(failed("MCP-GW rejected runtime authentication"))
     } else if actual == StatusCode::FORBIDDEN {
-        Err(failed("MCP-GW rejected runtime authorization"))
+        let proxy_denial = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|error| matches!(error.as_str(), "policy_denied" | "ssrf_denied"));
+        if proxy_denial {
+            Err(failed("OpenShell proxy denied the provider request"))
+        } else {
+            Err(failed("MCP-GW rejected runtime authorization"))
+        }
     } else {
         Err(unavailable(operation))
     }
@@ -1099,6 +1119,23 @@ mod tests {
                 reason: "MCP-GW rejected runtime authorization".to_owned(),
             })
         );
+        for body in [
+            br#"{"error":"policy_denied"}"#.as_slice(),
+            br#"{"error":"ssrf_denied"}"#.as_slice(),
+        ] {
+            assert_eq!(
+                parse_response(
+                    GatewayContract::LegacyV032,
+                    GithubBridgeOperation::Status,
+                    StatusCode::FORBIDDEN,
+                    body,
+                ),
+                Err(PortError::Failed {
+                    reason: "OpenShell proxy denied the provider request".to_owned(),
+                }),
+                "a proxy policy denial must remain distinct from MCP-GW authorization"
+            );
+        }
         assert_eq!(
             parse_response(
                 GatewayContract::LegacyV032,

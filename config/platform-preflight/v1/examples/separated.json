@@ -63,7 +63,7 @@
   },
   "externalConfigMaps": {"workloadExchangeTrust": {"name": "workload-exchange-ca", "namespace": "steward-control", "key": "ca.crt"}},
   "execution": {
-    "endpoints": {"inference": "https://inference.example.test/v1/responses", "mcpGateway": "https://mcp.example.test/mcp", "openshell": "https://openshell.example.test:8080", "openshellServerName": "openshell.example.test", "workloadExchange": "https://identity.example.test/v1/workload/exchange", "workloadExchangeServerName": "identity.example.test", "litellm": "https://inference.example.test", "mintIssuer": "https://mint.example.test", "spiffeTrustDomain": "example.test"},
+    "endpoints": {"inference": "https://inference.example.test/v1/responses", "mcpGateway": "https://mcp.example.test/mcp", "openshell": "https://openshell.example.test:8080", "openshellServerName": "openshell.example.test", "workloadExchange": "https://identity.example.test/v1/workload/exchange", "workloadExchangeServerName": "identity.example.test", "litellm": "https://inference.example.test", "mintIssuer": "https://mint.example.test", "mintAudience": "steward-mcp", "spiffeTrustDomain": "example.test"},
     "connectionsBridge": {"mcpGatewayOrigin": "https://mcp.example.test", "mcpGatewayAuthorityContract": "steward.connections.github/v2"},
     "binding": {"agentRef": "codex@0.140.0", "displayName": "Codex 0.140.0", "adapter": "codex-v1", "runtimeName": "codex", "executable": "/usr/bin/codex", "expectedVersion": "codex-cli 0.140.0", "toolsProfile": "steward-mcp-gw", "inferenceProfile": "steward-litellm"}
   },

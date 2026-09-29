@@ -61,6 +61,9 @@ fn gateway_failure(error: &PortError) -> &'static str {
         PortError::Failed { reason } if reason == "MCP-GW rejected runtime authorization" => {
             "bridge MCP-GW rejected runtime authorization"
         }
+        PortError::Failed { reason } if reason == "OpenShell proxy denied the provider request" => {
+            "bridge OpenShell proxy denied provider request"
+        }
         PortError::Failed { reason }
             if reason == "MCP-GW unavailable while attempting to call MCP-GW" =>
         {
@@ -391,6 +394,12 @@ mod tests {
                 reason: "MCP-GW unavailable while attempting to read MCP-GW response".to_owned(),
             }),
             "bridge MCP-GW response body is unavailable"
+        );
+        assert_eq!(
+            gateway_failure(&PortError::Failed {
+                reason: "OpenShell proxy denied the provider request".to_owned(),
+            }),
+            "bridge OpenShell proxy denied provider request"
         );
     }
 }
