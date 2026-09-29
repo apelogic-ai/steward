@@ -191,6 +191,33 @@ sed \
   -e "s#MCP_GW_IMAGE_PLACEHOLDER#${mcp_gw_local_image}#g" \
   -e "s#MINT_IMAGE_PLACEHOLDER#${STEWARD_CONNECTIONS_TEST_MINT_IMAGE}#g" \
   "${ROOT}/config/connections-e2e/stack.yaml" >"${rendered_stack}"
+spire_webhook_ready=false
+for _ in $(seq 1 15); do
+  if cat <<YAML | "${KUBECTL[@]}" apply --dry-run=server -f - >/dev/null 2>&1
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: steward-connections-e2e-webhook-readiness
+spec:
+  className: spire-spire
+  spiffeIDTemplate: spiffe://openshell.local/test/readiness
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: steward-system
+  podSelector:
+    matchLabels:
+      steward.test/run-id: "${run_id}"
+YAML
+  then
+    spire_webhook_ready=true
+    break
+  fi
+  sleep 2
+done
+if [[ "${spire_webhook_ready}" != true ]]; then
+  echo "SPIRE ClusterSPIFFEID admission webhook did not become ready" >&2
+  exit 1
+fi
 "${KUBECTL[@]}" apply -f "${rendered_stack}"
 "${KUBECTL[@]}" -n steward-system rollout status deployment/postgres --timeout=180s
 controller_username="$(
