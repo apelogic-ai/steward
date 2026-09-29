@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OPEN_SHELL_RELEASE="${STEWARD_OPEN_SHELL_RELEASE:-v0.0.90}"
+OPEN_SHELL_RELEASE="${STEWARD_OPEN_SHELL_RELEASE:-v0.1.2}"
 if [[ ! "${OPEN_SHELL_RELEASE}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "STEWARD_OPEN_SHELL_RELEASE must be a semantic release tag" >&2
   exit 2
@@ -83,6 +83,21 @@ kind create cluster \
   --kubeconfig "${KUBECONFIG_PATH}" \
   --wait 120s
 CLUSTER_CREATED=1
+
+if [[ -n "${STEWARD_OPENSHELL_PRELOAD_IMAGE:-}" ]]; then
+  if [[ "${STEWARD_OPENSHELL_PRELOAD_IMAGE}" != *@sha256:* ]]; then
+    echo "STEWARD_OPENSHELL_PRELOAD_IMAGE must be digest-pinned" >&2
+    exit 2
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "required command is missing: docker" >&2
+    exit 2
+  fi
+  docker pull "${STEWARD_OPENSHELL_PRELOAD_IMAGE}"
+  kind load docker-image \
+    "${STEWARD_OPENSHELL_PRELOAD_IMAGE}" \
+    --name "${CLUSTER_NAME}"
+fi
 
 supervisor_image_args=()
 if [[ -n "${STEWARD_OPENSHELL_SUPERVISOR_IMAGE:-}" ]]; then
@@ -443,7 +458,23 @@ extract_secret_key openshell-client-tls tls.key "${client_private_key}"
 printf '%s' "${oidc_token}" >"${bearer_token}"
 chmod 600 "${client_private_key}" "${bearer_token}"
 
+invalid_ca="${RUN_DIR}/invalid-ca.crt"
+invalid_client_certificate="${RUN_DIR}/invalid-client.crt"
+invalid_client_private_key="${RUN_DIR}/invalid-client.key"
+openssl req \
+  -new \
+  -newkey rsa:2048 \
+  -x509 \
+  -nodes \
+  -days 1 \
+  -subj /CN=untrusted-test-client \
+  -keyout "${invalid_client_private_key}" \
+  -out "${invalid_client_certificate}" >/dev/null 2>&1
+cp "${invalid_client_certificate}" "${invalid_ca}"
+chmod 600 "${invalid_client_private_key}"
+
 workload_source_file="${RUN_DIR}/workload-source-credential"
+workload_invalid_source_file="${RUN_DIR}/workload-source-credential-invalid"
 workload_exchange_ca_private_key="${RUN_DIR}/workload-exchange-ca.key"
 workload_exchange_ca_certificate="${RUN_DIR}/workload-exchange-ca.crt"
 workload_exchange_private_key="${RUN_DIR}/workload-exchange.key"
@@ -452,6 +483,7 @@ workload_exchange_certificate="${RUN_DIR}/workload-exchange.crt"
 workload_exchange_extensions="${RUN_DIR}/workload-exchange-extensions.cnf"
 workload_exchange_log="${RUN_DIR}/workload-exchange.log"
 printf '%s' obviously-fake-workload-source >"${workload_source_file}"
+printf '%s' obviously-fake-unmapped-source >"${workload_invalid_source_file}"
 openssl req \
   -new \
   -newkey rsa:2048 \
@@ -578,6 +610,8 @@ export STEWARD_WORKLOAD_EXCHANGE_ENDPOINT="${workload_exchange_endpoint}"
 export STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME="127.0.0.1"
 export STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE="${workload_exchange_ca_certificate}"
 export STEWARD_WORKLOAD_SOURCE_CREDENTIAL_FILE="${workload_source_file}"
+export STEWARD_WORKLOAD_INVALID_SOURCE_CREDENTIAL_FILE="${workload_invalid_source_file}"
+export STEWARD_OPENSHELL_UNTRUSTED_CA_FILE="${invalid_ca}"
 export STEWARD_TEST_OPENSHELL_ACCESS_TOKEN_FILE="${bearer_token}"
 export STEWARD_OPENSHELL_SERVER_NAME="localhost"
 export STEWARD_OPENSHELL_RUNTIME_CLASS_NAME=""

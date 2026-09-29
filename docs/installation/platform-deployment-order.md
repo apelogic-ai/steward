@@ -2,7 +2,7 @@
 
 Status: **Reference**
 
-Applies to Steward v0.3.2 and its User-Envelope-only Task authority model. An
+Applies to Steward v0.3.3 and its User-Envelope-only Task authority model. An
 installation still on v0.1.23 first follows the [v0.2 upgrade](upgrade-v0.2.0.md),
 and an installation on v0.2.6 follows the [v0.3 upgrade](upgrade-v0.3.0.md)
 before using this page.
@@ -198,11 +198,15 @@ carries the exact issuer and audience, declares an enabled
 `identity_contract`, presents a bounded `jti`, and is current within the token
 age and clock-skew allowance. The default accepts only `steward-task-v2`; the
 opt-in accepts v2 and `steward-task-v3`. A verified token is authentication
-only; authority comes from Step 5.
+only; authority comes from Step 5. For a new installation, use Identity policy
+v6 and enable v3 so an authenticated but unassociated subject is distinguishable
+from an invalid credential. Identity policy v5 and v2 remain supported and are
+not deprecated in Steward 0.3.3; the v2 default preserves rolling compatibility.
 
-Steward's Mint publishes its own separate JWKS at
-`<mint-issuer>/.well-known/jwks.json` using EdDSA. It is unrelated to this
-ConfigMap; do not project one where the other is expected.
+Steward's Mint serves its own separate EdDSA JWKS at
+`/.well-known/jwks.json`. Route that handler at the configured canonical HTTPS
+Mint origin when MCP-GW consumes it. It is unrelated to this ConfigMap; do not
+project one where the other is expected.
 
 Rotate by refreshing the ConfigMap whenever the Identity issuer publishes a new
 `kid`, keeping every overlapping key until the old tokens and skew allowance

@@ -54,7 +54,7 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`admin-ui-contract-v1.md`](admin-ui-contract-v1.md) | **Current implementation** | Browser presentation and API boundary. |
 | [`browser-session-contract-v1.md`](browser-session-contract-v1.md) | **Current implementation, with stated activation dependency** | Browser authentication and session boundary. |
 | [`canonical-user-identity-v1.md`](canonical-user-identity-v1.md) | **Current implementation** | Canonical person identity and ownership keys. |
-| [`operator-envelope-administration.md`](operator-envelope-administration.md) | **Current release contract** | Steward v0.3.2 catalog authority, custom requests, multiple active Envelopes, digest selection, operator RBAC CLI, default smoke template, and migration 0051. |
+| [`operator-envelope-administration.md`](operator-envelope-administration.md) | **Current release contract** | Steward v0.3.3 catalog authority, custom requests, multiple active Envelopes, digest selection, operator RBAC CLI, default smoke template, and migration 0051. |
 | [`github-actions-generator.md`](github-actions-generator.md) | **Current implementation, renderer scope** | Bounded GitHub Actions YAML generation. |
 | [`installation/installation-guide.md`](installation/installation-guide.md) | **Current release contract** | Prerequisites, installation modes, Secret and integration inventory, post-install checks, and delivery tests. |
 | [`installation/registry-mirroring.md`](installation/registry-mirroring.md) | **Current release contract** | Manifest-preserving registry copy, target verification, and deterministic deployment-lock generation. |

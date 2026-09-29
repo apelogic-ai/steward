@@ -7,6 +7,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-28
+
+### Changed
+
+- Rebased the governed runtime integration on stock OpenShell v0.1.2 with
+  agent-sandbox v0.5.0 and removed the obsolete patched-supervisor build.
+- Bound Mint's `ClusterSPIFFEID` to the configured SPIRE controller class and
+  documented the exact HTTPS Mint issuer, JWKS, introspection, and MCP-GW 0.5.0
+  HOP-1 configuration contract.
+- Recommended Identity policy v6 with `steward-task-v3` for new installations
+  while retaining non-deprecated v5/v2 rolling compatibility, and clarified
+  that PostgreSQL 16 is the minimum release-tested line while PostgreSQL 17 is
+  expected compatible but not yet release-lane tested.
+
+### Fixed
+
+- Failed immediately with an explicit provider-credential error when OpenShell
+  did not inject the MCP-GW token grant instead of retrying into an opaque edge
+  timeout.
+
 ## [0.3.2] - 2026-09-28
 
 ### Changed
@@ -268,7 +288,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/apelogic-ai/steward/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/apelogic-ai/steward/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/apelogic-ai/steward/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/apelogic-ai/steward/compare/v0.2.6...v0.3.0

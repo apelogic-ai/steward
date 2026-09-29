@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.2` and application `0.3.2`.
+Current release contract: chart `0.3.3` and application `0.3.3`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -477,8 +477,43 @@ that allowlist remain inaccessible to both service accounts.
   sensitive information to anyone who can read or retain controller logs.
 - In governed mode, `config.mint.issuer`, `spiffeTrustDomain`, and
   `openshellNamespace` must be supplied for the target environment; none has
-  a usable default. The issuer must also be configured in MCP-GW.
-  Steward publishes JWKS at `<issuer>/.well-known/jwks.json` and uses EdDSA.
+  a usable default. Use a stable HTTPS origin such as
+  `https://mint.example.test` as the canonical issuer. Mint copies that string
+  byte-for-byte into the JWT `iss` claim; neither Mint nor MCP-GW performs
+  discovery by dereferencing the issuer string. MCP-GW must nevertheless use
+  the exact same string in `hop1.issuers[].issuer`. Its `jwksUrl` and optional
+  introspection URL are real network endpoints and must route over HTTPS to
+  Mint's `/.well-known/jwks.json` and `/introspect` handlers. Using the same
+  HTTPS origin for all three avoids split identity and routing configuration.
+
+  For MCP-GW 0.5.0, the matching entry is:
+
+  ```yaml
+  hop1:
+    issuers:
+      - name: steward
+        issuer: https://mint.example.test
+        audiences:
+          - steward-mcp
+        jwksUrl: https://mint.example.test/.well-known/jwks.json
+        allowedAlgorithms:
+          - EdDSA
+        discoverable: false
+        emailClaim: email
+        subjectClaim: sub
+        introspection:
+          url: https://mint.example.test/introspect
+          credentialSecretKeyRef:
+            name: steward-mint-introspection
+            key: introspection-credential
+  ```
+
+  The Secret reference must name an existing MCP-GW-namespace Secret whose
+  value matches Mint's configured introspection credential; do not copy the
+  example Secret name across namespaces without arranging that projection.
+  If private PKI protects the endpoint, configure MCP-GW's trust bundle with
+  the issuing CA. An `https://` issuer paired with an `http://` JWKS URL is not
+  the supported production contract.
 - `config.mint.audience` defaults to `steward-mcp` and
   `config.mint.allowedScopes` defaults to `mcp inference`. These include the
   checked-in OpenShell provider contract (`audience=steward-mcp`, `scope=mcp`)
@@ -503,7 +538,7 @@ value. Direct Git packages and immutable versioned Workflows are the supported
 Task paths; the removed unversioned workflow catalog has no chart setting.
 
 Run `cargo xtask e2e-openshell-adapter` to exercise the adapter against the
-exact OpenShell `v0.0.98` chart in an ephemeral kind cluster. The test verifies
+exact OpenShell `v0.1.2` chart in an ephemeral kind cluster. The test verifies
 authenticated TLS failures, CA and server-name validation, the
 cluster-default runtime is retained in the Sandbox pod template, input/output
 SHA-256 equality, and sandbox-last cleanup. This lane proves functional

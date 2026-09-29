@@ -16,9 +16,9 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 async fn main() -> Result<(), Box<dyn Error>> {
     let client = connect().await?;
     let health = client.health().await?;
-    if health.version != "0.0.98" {
+    if health.version != "0.1.2" {
         return Err(io::Error::other(format!(
-            "expected OpenShell 0.0.98, gateway reported {}",
+            "expected OpenShell 0.1.2, gateway reported {}",
             health.version
         ))
         .into());
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     result?;
 
     println!(
-        "OpenShell 0.0.98 workspace contract confirmed: scoped duplicate names, membership, 19-char cap, and sandbox-before-workspace teardown"
+        "OpenShell 0.1.2 workspace contract confirmed: scoped duplicate names, membership, 19-char cap, and sandbox-before-workspace teardown"
     );
     Ok(())
 }

@@ -84,7 +84,7 @@ if ! "${CLI}" --gateway-endpoint "${STEWARD_OPENSHELL_ENDPOINT}" \
   --no-tty \
   -- true
 then
-  # v0.0.90 can race its initial exec against the sandbox readiness update.
+  # Sandbox creation may return before the initial exec observes readiness.
   # The bounded probe below distinguishes that race from a failed provision.
   :
 fi

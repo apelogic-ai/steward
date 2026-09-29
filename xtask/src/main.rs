@@ -1119,7 +1119,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.3.2" => Ok(true),
+            "0.3.2" | "0.3.3" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -1918,7 +1918,7 @@ mod tests {
         );
         assert!(
             values.contains("openshell: 8080"),
-            "the default NetworkPolicy must permit the OpenShell v0.0.98 gateway TLS service port"
+            "the default NetworkPolicy must permit the OpenShell v0.1.2 gateway TLS service port"
         );
         for projected_token_contract in [
             "serviceAccountToken:",
@@ -2384,7 +2384,7 @@ mod tests {
     }
 
     #[test]
-    fn openshell_v0098_adapter_integration_is_a_required_ci_lane() -> Result<(), String> {
+    fn openshell_v012_adapter_integration_is_a_required_ci_lane() -> Result<(), String> {
         let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
             .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
         let adapter_manifest = fs::read_to_string(root().join("adapters/openshell/Cargo.toml"))
@@ -2392,7 +2392,7 @@ mod tests {
         let harness = fs::read_to_string(root().join("scripts/openshell-adapter-e2e.sh")).map_err(
             |error| format!("OpenShell adapter integration harness is required: {error}"),
         )?;
-        let e2e_source = fs::read_to_string(root().join("e2e/openshell_adapter_v0098.rs"))
+        let e2e_source = fs::read_to_string(root().join("e2e/openshell_adapter_v012.rs"))
             .map_err(|error| format!("OpenShell adapter integration test is required: {error}"))?;
         let chart_readme = fs::read_to_string(root().join("charts/steward/README.md"))
             .map_err(|error| format!("Steward chart README is required: {error}"))?;
@@ -2402,15 +2402,13 @@ mod tests {
             "CI must execute the real OpenShell adapter integration lane"
         );
         assert!(
-            adapter_manifest.contains("832841295992f0112f43f27de5d68213376ff3cb"),
-            "the runtime adapter must pin the exact OpenShell v0.0.98 source revision"
+            adapter_manifest.contains("6648bd0c290efbc41ba131ee9831ee45cd431f94"),
+            "the runtime adapter must pin the exact OpenShell v0.1.2 source revision"
         );
         for required in [
-            "OPEN_SHELL_RELEASE=\"v0.0.98\"",
-            "KIND_NODE_IMAGE=\"kindest/node:v1.32.1@sha256:6afef2b7f69d627ea7bf27ee6696b6868d18e03bf98167c420df486da4662db6\"",
-            "--image \"${KIND_NODE_IMAGE}\"",
-            "server.oidc.issuer=",
-            "--test openshell_adapter_v0098",
+            "OPEN_SHELL_RELEASE=\"v0.1.2\"",
+            "scripts/openshell-testbed.sh",
+            "--test openshell_adapter_v012",
         ] {
             assert!(
                 harness.contains(required),
@@ -2676,11 +2674,9 @@ mod tests {
             "xtask must expose the governed Connections real-stack harness"
         );
         for required in [
-            "STEWARD_OPEN_SHELL_RELEASE=v0.0.98",
+            "STEWARD_OPEN_SHELL_RELEASE=v0.1.2",
             "sha256:80bef7bee93482c8091335ae27c3c3e968e5c78c2bb4a40b401e6af36f70f993",
             "e2e/Dockerfile.workflow-sandbox",
-            "scripts/build-patched-openshell-supervisor.sh",
-            "STEWARD_OPENSHELL_SUPERVISOR_IMAGE",
             "STEWARD_OPENSHELL_SANDBOX_IMAGE",
             "scripts/openshell-testbed.sh",
         ] {
@@ -3927,7 +3923,7 @@ mod tests {
             manifest
                 .pointer("/stewardVersion")
                 .and_then(serde_json::Value::as_str),
-            Some("0.3.2")
+            Some("0.3.3")
         );
         assert_eq!(
             manifest

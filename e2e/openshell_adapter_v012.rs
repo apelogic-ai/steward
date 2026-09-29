@@ -19,7 +19,7 @@ use steward_types::direct_package::{
 use steward_types::{AgentType, RuntimeId, RuntimeRefs};
 use tokio::time::sleep;
 
-const EXPECTED_RELEASE: &str = "v0.0.98";
+const EXPECTED_RELEASE: &str = "v0.1.2";
 
 fn required(name: &str) -> Result<String, String> {
     env::var(name).map_err(|_| format!("{name} is required from the ephemeral OpenShell harness"))
@@ -82,7 +82,7 @@ fn make_input_archive(run_dir: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
             .ok_or_else(|| "input fixture has no parent directory".to_owned())?,
     )
     .map_err(|error| format!("failed to create input fixture directory: {error}"))?;
-    // OpenShell 0.0.98 caps each decoded gRPC message at 1 MiB. Keep this
+    // OpenShell caps each decoded gRPC message at 1 MiB. Keep this
     // fixture above that boundary so the adapter proves that task archives
     // are streamed instead of embedded in one ExecSandbox request.
     let payload = vec![b'x'; 1_100_000];
@@ -350,7 +350,7 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
         .await
         .map_err(|error| format!("authenticated OpenShell connection failed: {error:?}"))?;
     let mut request = SandboxRequest {
-        runtime: RuntimeId("runtime-adapter-v0098".to_owned()),
+        runtime: RuntimeId("runtime-adapter-v012".to_owned()),
         workspace_key: "team-a".to_owned(),
         execution_class: SandboxExecutionClass::Agent,
         agent_type: AgentType {

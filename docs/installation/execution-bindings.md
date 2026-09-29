@@ -105,7 +105,7 @@ For an interpreted or launcher-based agent, conformance must identify the proces
 opens the governed connection. The provider profile must authorize that executable identity; do
 not assume a configured launcher symlink is sufficient.
 
-Pinned OpenShell v0.0.98 exposes profile selection by exact ID but does not expose an authenticated
+Pinned OpenShell v0.1.2 exposes profile selection by exact ID but does not expose an authenticated
 content digest for an installed profile. Steward therefore persists the configured profile IDs and
 digests in the Task binding, incorporates them in the binding digest, labels the sandbox with that
 binding, selects only the exact IDs, and fails if an ID is unavailable or the sandbox binding

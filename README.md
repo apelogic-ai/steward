@@ -14,19 +14,23 @@ that immutable authority snapshot. Product-owned Connection operations use
 fixed internal authorities, while the deployment capability catalog describes
 available models and tools without granting authority.
 
-Task authentication keeps `steward-task-v2` as the default. Deployments may
-opt into `steward-task-v3`, where Steward observes the exact verified Identity
+Task authentication keeps `steward-task-v2` as the rolling-upgrade default.
+New installations should opt into Identity policy v6 and `steward-task-v3`,
+where Steward observes the exact verified Identity
 issuer plus stable GitHub actor subject, and an administrator associates that
 subject with an existing canonical user. Observation alone grants no Task or
-Envelope authority. See the [Task submission API](docs/task-submission-api.md)
+Envelope authority. Identity policy v5 and `steward-task-v2` are not deprecated
+in Steward 0.3.3; they remain supported for existing installations. See the
+[Task submission API](docs/task-submission-api.md)
 and [federated identity upgrade guide](docs/installation/federated-task-identity-upgrade.md).
 
 Steward is available under the [MIT License](LICENSE). Checked-in upstream
 patches retain their [third-party notices](THIRD_PARTY_NOTICES.md).
 
-Current installation contract: chart `0.3.2`, Kubernetes `>=1.32`, Helm 3.17+,
-and PostgreSQL 16 as the tested database line. Governed adapter evidence pins
-OpenShell `v0.0.98` with agent-sandbox `v0.5.0`. No registry is a default:
+Current installation contract: chart `0.3.3`, Kubernetes `>=1.32`, Helm 3.17+,
+and PostgreSQL 16 as the minimum and release-tested database line. PostgreSQL
+17 is expected to work but is not yet exercised by the release lane. Governed
+adapter evidence pins OpenShell `v0.1.2` with agent-sandbox `v0.5.0`. No registry is a default:
 release images and the OCI
 chart are published under the fork owner's GHCR namespace, and every customer
 installation supplies the exact image/chart digests from one handoff. OpenShell
