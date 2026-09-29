@@ -225,6 +225,7 @@ complete_values=(
   --set-string connectionsBridge.mcpGatewayVersion=0.4.9
   --set-string connectionsBridge.runtimeNamespace=steward-runtimes
   --set-string 'runtimeNamespaces[0]=steward-runtimes'
+  --set-string 'runtimeNamespaces[1]=steward-workflows'
 )
 helm lint "${chart_archive}" "${complete_values[@]}" >/dev/null
 helm template steward "${chart_archive}" --namespace steward \

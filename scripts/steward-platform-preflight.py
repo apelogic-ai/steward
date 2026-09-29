@@ -30,7 +30,6 @@ REQUIRED_NAMESPACES = (
     "runtime",
     "providers",
     "gateway",
-    "arc",
     "databaseTls",
     "mcpGateway",
     "litellm",
@@ -38,6 +37,7 @@ REQUIRED_NAMESPACES = (
     "openshell",
     "dns",
 )
+OPTIONAL_NAMESPACES = ("arc",)
 IMAGE_COMPONENTS = ("apiserver", "controller", "mint", "web", "bridge")
 
 
@@ -139,6 +139,10 @@ def validate_provider_cidrs(values: Any, path: str) -> list[str]:
         ipaddress.ip_network("169.254.0.0/16"),
         ipaddress.ip_network("::/128"),
         ipaddress.ip_network("::1/128"),
+        ipaddress.ip_network("fe80::/10"),
+        ipaddress.ip_network("::ffff:0:0/104"),
+        ipaddress.ip_network("::ffff:127.0.0.0/104"),
+        ipaddress.ip_network("::ffff:169.254.0.0/112"),
     )
     normalized: list[str] = []
     for index, value in enumerate(values):
@@ -156,6 +160,39 @@ def validate_provider_cidrs(values: Any, path: str) -> list[str]:
     if len(set(normalized)) != len(normalized):
         raise ValidationError(f"{path} contains duplicate CIDRs")
     return normalized
+
+
+def validate_litellm_management_url(value: str, namespace: str) -> None:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise ValidationError(
+            f"execution.endpoints.litellm must be a valid HTTP(S) URL: {error}"
+        ) from error
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValidationError(
+            "execution.endpoints.litellm must be an exact HTTP(S) origin"
+        )
+    if parsed.scheme == "https":
+        return
+    expected_hosts = {
+        f"litellm.{namespace}.svc",
+        f"litellm.{namespace}.svc.cluster.local",
+    }
+    if parsed.hostname not in expected_hosts or port != 4000:
+        raise ValidationError(
+            "execution.endpoints.litellm may use HTTP only for the in-cluster "
+            f"litellm Service at litellm.{namespace}.svc:4000"
+        )
 
 
 def https_host_and_port(value: str, path: str) -> tuple[str, int]:
@@ -321,9 +358,16 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
     )
 
     namespaces = require_object(data, "namespaces", "input")
-    require_exact_keys(namespaces, set(REQUIRED_NAMESPACES), "namespaces")
+    require_exact_keys(
+        namespaces,
+        set(REQUIRED_NAMESPACES) | set(OPTIONAL_NAMESPACES),
+        "namespaces",
+    )
     for key in REQUIRED_NAMESPACES:
         validate_name(require_string(namespaces, key, "namespaces"), f"namespaces.{key}")
+    for key in OPTIONAL_NAMESPACES:
+        if key in namespaces:
+            validate_name(require_string(namespaces, key, "namespaces"), f"namespaces.{key}")
 
     lock = require_object(data, "deploymentLock", "input")
     require_exact_keys(
@@ -509,12 +553,20 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
             f"providerProfiles[{index}].inputs.serviceCidrs",
         )
 
-    arc = require_object(data, "arc", "input")
-    identity = require_object(arc, "controllerServiceAccount", "arc")
-    for key in ("name", "namespace"):
-        validate_name(require_string(identity, key, "arc.controllerServiceAccount"), f"arc.controllerServiceAccount.{key}")
-    if identity["namespace"] != namespaces["arc"]:
-        raise ValidationError("arc.controllerServiceAccount.namespace must equal namespaces.arc")
+    arc = data.get("arc")
+    if arc is None:
+        if "arc" in namespaces:
+            raise ValidationError("namespaces.arc must be omitted when arc is omitted")
+    elif isinstance(arc, dict):
+        if "arc" not in namespaces:
+            raise ValidationError("namespaces.arc is required when arc is configured")
+        identity = require_object(arc, "controllerServiceAccount", "arc")
+        for key in ("name", "namespace"):
+            validate_name(require_string(identity, key, "arc.controllerServiceAccount"), f"arc.controllerServiceAccount.{key}")
+        if identity["namespace"] != namespaces["arc"]:
+            raise ValidationError("arc.controllerServiceAccount.namespace must equal namespaces.arc")
+    else:
+        raise ValidationError("input.arc must be an object when configured")
 
     external = require_object(data, "externalSecrets", "input")
     for purpose in ("database", "mint", "litellm", "openshellClient"):
@@ -541,12 +593,15 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
         "mcpGateway",
         "openshell",
         "workloadExchange",
-        "litellm",
         "mintIssuer",
     ):
         value = require_string(endpoints, key, "execution.endpoints")
         if not value.startswith("https://"):
             raise ValidationError(f"execution.endpoints.{key} must use HTTPS")
+    validate_litellm_management_url(
+        require_string(endpoints, "litellm", "execution.endpoints"),
+        namespaces["litellm"],
+    )
     for key in ("openshellServerName", "workloadExchangeServerName", "spiffeTrustDomain"):
         require_string(endpoints, key, "execution.endpoints")
     mint_audience = require_string(endpoints, "mintAudience", "execution.endpoints")
@@ -698,7 +753,9 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
             "issuerRef": data["gateway"]["issuerRef"],
             "webhook": {"secretName": data["webhookTlsSecretName"], "caBundlePem": ""},
         },
-        "runtimeNamespaces": [data["namespaces"]["runtime"]],
+        "runtimeNamespaces": sorted(
+            {data["namespaces"]["runtime"], "steward-workflows"}
+        ),
         "connectionsBridge": {
             "enabled": True,
             "artifactTrust": {"mode": "operator-pinned"},
@@ -761,12 +818,14 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
             "enabled": True,
             "dnsNamespace": data["namespaces"]["dns"],
             "ingressNamespace": data["namespaces"]["gateway"],
-            "arcNamespace": data["namespaces"]["arc"],
+            "arcNamespace": data["namespaces"].get("arc", ""),
             "mcpGatewayNamespace": data["namespaces"]["mcpGateway"],
             "litellmNamespace": data["namespaces"]["litellm"],
             "identityExchangeNamespace": data["namespaces"]["identityExchange"],
             "openshellNamespace": data["namespaces"]["openshell"],
-            "apiserverIngressNamespaces": [data["namespaces"]["arc"]],
+            "apiserverIngressNamespaces": (
+                [data["namespaces"]["arc"]] if "arc" in data["namespaces"] else []
+            ),
             "browserAuthEgressCidrs": data["browserAuth"]["egressCidrs"],
             "kubeApiCidrs": data["networkPolicy"]["kubeApiCidrs"],
             "postgresCidrs": data["networkPolicy"]["postgresCidrs"],
@@ -781,7 +840,7 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
 def provider_profile_inputs(data: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema": "steward.provider-profile-inputs/v1",
-        "bundle": {"id": "steward-runtime-providers", "version": "1.2.1"},
+        "bundle": {"id": "steward-runtime-providers", "version": "1.2.2"},
         "profiles": [
             {
                 "id": profile["name"],
@@ -803,7 +862,7 @@ def validate_rendered_connections_profile(
     if (
         rendered.get("schema") != "steward.provider-profile-install-state/v1"
         or rendered.get("bundle")
-        != {"id": "steward-runtime-providers", "version": "1.2.1"}
+        != {"id": "steward-runtime-providers", "version": "1.2.2"}
     ):
         raise ValidationError("released provider-profile renderer returned an unexpected contract")
     profiles = rendered.get("profiles")
@@ -840,12 +899,19 @@ def validate_rendered_connections_profile(
             raise ValidationError(
                 f"rendered provider profile {profile_id} audience must equal execution.endpoints.mintAudience"
             )
-        if profile_id == "steward-mcp-gw" and any(
-            endpoint.get("access") != "read-write" for endpoint in endpoints
-        ):
-            raise ValidationError(
-                "rendered steward-mcp-gw endpoints must allow POST-capable read-write transport"
-            )
+        if profile_id == "steward-mcp-gw":
+            required_methods = {"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"}
+            for endpoint in endpoints:
+                rules = endpoint.get("rules")
+                methods = {
+                    rule.get("allow", {}).get("method")
+                    for rule in rules
+                    if isinstance(rule, dict) and isinstance(rule.get("allow"), dict)
+                } if isinstance(rules, list) else set()
+                if not required_methods.issubset(methods):
+                    raise ValidationError(
+                        "rendered steward-mcp-gw endpoints must allow the exact MCP HTTP transport including DELETE"
+                    )
 
     binding = data["execution"]["binding"]
     tools_profile_id = binding.get("toolsProfile")
@@ -968,7 +1034,7 @@ def resolve_provider_profile_digests(
         or report.get("operation") != "validate"
         or report.get("status") != "valid"
         or report.get("bundle")
-        != {"id": "steward-runtime-providers", "version": "1.2.1"}
+        != {"id": "steward-runtime-providers", "version": "1.2.2"}
     ):
         raise ValidationError("released provider-profile installer returned an unexpected contract")
     reported_profiles = report.get("profiles")
@@ -999,7 +1065,6 @@ def namespace_references(data: dict[str, Any]) -> dict[str, Any]:
         "schemaVersion": "steward.namespace-references/v1",
         "namespaceMap": data["namespaces"],
         "gatewayParentRef": data["gateway"]["parentRef"],
-        "arcControllerServiceAccount": data["arc"]["controllerServiceAccount"],
         "externalSecrets": data["externalSecrets"],
         "externalConfigMaps": data["externalConfigMaps"],
         "providerProfiles": [
@@ -1009,6 +1074,8 @@ def namespace_references(data: dict[str, Any]) -> dict[str, Any]:
     }
     if tls["mode"] == "verify-full":
         references["databaseCa"] = tls["ca"]
+    if "arc" in data:
+        references["arcControllerServiceAccount"] = data["arc"]["controllerServiceAccount"]
     return references
 
 
@@ -1122,7 +1189,9 @@ def build_result(
             }
             for profile in data["providerProfiles"]
         ],
-        "arcControllerServiceAccount": data["arc"]["controllerServiceAccount"],
+        "arcControllerServiceAccount": (
+            data["arc"]["controllerServiceAccount"] if "arc" in data else None
+        ),
         "diagnostics": diagnostics,
     }
 
@@ -1309,16 +1378,17 @@ def gateway_check(args: argparse.Namespace) -> int:
             },
         ]
     )
-    arc = data["arc"]["controllerServiceAccount"]
-    diagnostics.append(
-        kubectl_metadata_check(
-            args,
-            "serviceaccount",
-            arc["namespace"],
-            arc["name"],
-            "ARC controller ServiceAccount",
+    if "arc" in data:
+        arc = data["arc"]["controllerServiceAccount"]
+        diagnostics.append(
+            kubectl_metadata_check(
+                args,
+                "serviceaccount",
+                arc["namespace"],
+                arc["name"],
+                "ARC controller ServiceAccount",
+            )
         )
-    )
     diagnostics.append(
         kubectl_metadata_check(
             args,

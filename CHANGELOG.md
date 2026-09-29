@@ -7,6 +7,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-09-29
+
+### Changed
+
+- Published provider-profile bundle 1.2.2 with the complete bounded MCP
+  transport method set, including `DELETE` for session close, and retained an
+  exact 1.2.1-to-1.2.2 upgrade transition.
+- Expanded platform preflight validation for cluster-local LiteLLM management
+  URLs, optional ARC installations, Workflow runtime namespaces, custom Mint
+  audiences, and OpenShell-blocked IPv6 and IPv4-mapped CIDRs.
+- Documented the tested MCP-GW 0.5.1, LiteLLM v1.93.0, SPIRE, edge-timeout,
+  resource, Pod Security, storage, pricing, and provider-consumer contracts.
+
+### Fixed
+
+- Allowed Codex-only generated configuration to omit the Anthropic inference
+  endpoint while retaining fail-closed validation when a Claude binding is
+  active.
+- Kept apiserver startup available when the immutable onboarding Workflow names
+  an execution binding not installed in the current deployment.
+- Corrected provider-profile upgrade validation for deployment-specific Mint
+  audiences and required MCP session-close transport.
+
+### Upgrade from 0.3.3
+
+This patch adds no database migration and changes no default runtime class.
+Before upgrading an execution-enabled installation, stop the controller and
+apiserver, enable OpenShell `providers_v2_enabled`, and apply the exact
+provider-profile bundle 1.2.1-to-1.2.2 transition. Rerun platform preflight,
+use the regenerated profile digests and Helm values, ensure the
+`steward-workflows` namespace exists and is listed in `runtimeNamespaces`, then
+restart both consumers. The temporary v0.3.3 requirement to populate
+`config.apiserver.anthropicInferenceEndpoint` for a Codex-only binding is no
+longer necessary.
+
 ## [0.3.3] - 2026-09-28
 
 ### Changed
@@ -308,7 +343,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/apelogic-ai/steward/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/apelogic-ai/steward/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/apelogic-ai/steward/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/apelogic-ai/steward/compare/v0.3.0...v0.3.1

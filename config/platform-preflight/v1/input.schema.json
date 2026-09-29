@@ -11,7 +11,6 @@
     "gateway",
     "publicEndpoints",
     "providerProfiles",
-    "arc",
     "externalSecrets",
     "externalConfigMaps",
     "execution",
@@ -26,7 +25,7 @@
     "schemaVersion": {"const": "steward.platform-input/v1"},
     "namespaces": {
       "type": "object",
-      "required": ["steward", "runtime", "providers", "gateway", "arc", "databaseTls", "mcpGateway", "litellm", "identityExchange", "openshell", "dns"],
+      "required": ["steward", "runtime", "providers", "gateway", "databaseTls", "mcpGateway", "litellm", "identityExchange", "openshell", "dns"],
       "additionalProperties": false,
       "properties": {
         "steward": {"$ref": "#/$defs/name"},

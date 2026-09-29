@@ -125,6 +125,7 @@ if [[ "${chart_contract_mode}" == customer-v1 ]]; then
 fi
 image_values+=(
   --set 'runtimeNamespaces[0]=team-a'
+  --set 'runtimeNamespaces[1]=steward-workflows'
   --set-string config.apiserver.mcpGatewayEndpoint=https://mcp-gw.example.test/mcp
 )
 task_execution_binding_values=(

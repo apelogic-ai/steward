@@ -8,7 +8,6 @@
     "runtime",
     "providers",
     "gateway",
-    "arc",
     "databaseTls",
     "mcpGateway",
     "litellm",

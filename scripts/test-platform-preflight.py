@@ -33,11 +33,15 @@ class PlatformPreflightTests(unittest.TestCase):
         self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.profile_bundle = pathlib.Path(self.temporary.name) / "provider-profile-bundle" / "v1.2.1"
+        self.profile_bundle = pathlib.Path(self.temporary.name) / "provider-profile-bundle" / "v1.2.2"
         self.write_profile_installer(include_bridge_binary=True)
 
     def write_profile_installer(
-        self, include_bridge_binary: bool, include_all_profiles: bool = True
+        self,
+        include_bridge_binary: bool,
+        include_all_profiles: bool = True,
+        include_delete: bool = True,
+        shared_audience: bool = True,
     ) -> None:
         installer = self.profile_bundle / "bin" / "steward-provider-profile"
         installer.parent.mkdir(parents=True, exist_ok=True)
@@ -60,13 +64,21 @@ class PlatformPreflightTests(unittest.TestCase):
             "    binaries = ['/usr/bin/curl']\n"
             f"    if profile['id'] == 'steward-mcp-gw' and {include_bridge_binary!r}:\n"
             "      binaries.append('/usr/local/bin/steward-connections-bridge')\n"
-            "    access = 'read-write' if profile['id'] == 'steward-mcp-gw' else 'read-write'\n"
+            "    endpoint = {'host': origin.hostname, 'port': origin.port or 443, 'allowed_ips': profile['inputs']['service-cidrs']}\n"
+            "    if profile['id'] == 'steward-mcp-gw':\n"
+            "      methods = ['GET', 'HEAD', 'OPTIONS', 'POST', 'PUT', 'PATCH']\n"
+            f"      if {include_delete!r}: methods.append('DELETE')\n"
+            "      endpoint['rules'] = [{'allow': {'method': method, 'path': '**'}} for method in methods]\n"
+            "    else:\n"
+            "      endpoint['access'] = 'read-write'\n"
+            "    audience = profile['inputs']['mint-audience']\n"
+            f"    if profile['id'] == 'steward-mcp-gw' and not {shared_audience!r}: audience = 'other-audience'\n"
             "    profiles[profile['id']] = {\n"
-            "      'endpoints': [{'host': origin.hostname, 'port': origin.port or 443, 'access': access, 'allowed_ips': profile['inputs']['service-cidrs']}],\n"
-            "      'credentials': [{'token_grant': {'audience': profile['inputs']['mint-audience']}}],\n"
+            "      'endpoints': [endpoint],\n"
+            "      'credentials': [{'token_grant': {'audience': audience}}],\n"
             "      'binaries': binaries,\n"
             "    }\n"
-            "  installation = {'schema': 'steward.provider-profile-install-state/v1', 'bundle': {'id': 'steward-runtime-providers', 'version': '1.2.1'}, 'profiles': profiles}\n"
+            "  installation = {'schema': 'steward.provider-profile-install-state/v1', 'bundle': {'id': 'steward-runtime-providers', 'version': '1.2.2'}, 'profiles': profiles}\n"
             "  result = {'schemaVersion': 'steward.provider-profile-result/v1', 'operation': 'render', 'status': 'valid'}\n"
             "  print(json.dumps({'result': result, 'installation': installation}, separators=(',', ':')))\n"
             "else:\n"
@@ -74,7 +86,7 @@ class PlatformPreflightTests(unittest.TestCase):
             "    'schemaVersion': 'steward.provider-profile-result/v1',\n"
             "    'operation': 'validate',\n"
             "    'status': 'valid',\n"
-            "    'bundle': {'id': 'steward-runtime-providers', 'version': '1.2.1'},\n"
+            "    'bundle': {'id': 'steward-runtime-providers', 'version': '1.2.2'},\n"
             f"    'profiles': {validated_profiles}\n"
             "  }, separators=(',', ':')))\n",
             encoding="utf-8",
@@ -354,6 +366,10 @@ class PlatformPreflightTests(unittest.TestCase):
             "::/0",
             "::/128",
             "::1/128",
+            "fe80::/10",
+            "::ffff:0.0.0.0/128",
+            "::ffff:127.0.0.1/128",
+            "::ffff:169.254.1.1/128",
         ):
             with self.subTest(cidr=cidr):
                 value = copy.deepcopy(self.input)
@@ -361,6 +377,45 @@ class PlatformPreflightTests(unittest.TestCase):
                 result = self.run_validate(value)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("overlaps an OpenShell always-blocked range", result.stderr)
+
+    def test_accepts_in_cluster_http_litellm_management_url(self) -> None:
+        self.input["execution"]["endpoints"]["litellm"] = (
+            "http://litellm.steward-system.svc:4000"
+        )
+        result = self.run_validate(self.input)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_external_or_mismatched_http_litellm_management_url(self) -> None:
+        for value in (
+            "http://inference.example.test:4000",
+            "http://litellm.other-system.svc:4000",
+            "http://litellm.steward-system.svc:8080",
+        ):
+            with self.subTest(value=value):
+                candidate = copy.deepcopy(self.input)
+                candidate["execution"]["endpoints"]["litellm"] = value
+                result = self.run_validate(candidate)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("may use HTTP only for the in-cluster", result.stderr)
+
+    def test_arc_is_optional_when_no_arc_runner_is_used(self) -> None:
+        del self.input["arc"]
+        del self.input["namespaces"]["arc"]
+        result = self.run_validate(self.input)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_arc_configuration_is_all_or_nothing(self) -> None:
+        without_namespace = copy.deepcopy(self.input)
+        del without_namespace["namespaces"]["arc"]
+        result = self.run_validate(without_namespace)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("namespaces.arc is required", result.stderr)
+
+        without_arc = copy.deepcopy(self.input)
+        del without_arc["arc"]
+        result = self.run_validate(without_arc)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("namespaces.arc must be omitted", result.stderr)
 
     def test_rejects_mcp_profile_without_connections_bridge_binary(self) -> None:
         self.write_profile_installer(include_bridge_binary=False)
@@ -370,6 +425,18 @@ class PlatformPreflightTests(unittest.TestCase):
             "must include /usr/local/bin/steward-connections-bridge",
             result.stderr,
         )
+
+    def test_rejects_rendered_profile_without_mcp_delete_transport(self) -> None:
+        self.write_profile_installer(include_bridge_binary=True, include_delete=False)
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("including DELETE", result.stderr)
+
+    def test_rejects_rendered_profile_with_mismatched_mint_audience(self) -> None:
+        self.write_profile_installer(include_bridge_binary=True, shared_audience=False)
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("audience must equal execution.endpoints.mintAudience", result.stderr)
 
     def test_generate_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -392,7 +459,7 @@ class PlatformPreflightTests(unittest.TestCase):
             self.assertEqual(profiles["tools"]["digest"], "sha256:" + "8" * 64)
             self.assertEqual(profiles["inference"]["digest"], "sha256:" + "7" * 64)
             profile_inputs = json.loads((base / "first" / "provider-profile-inputs.json").read_text(encoding="utf-8"))
-            self.assertEqual(profile_inputs["bundle"]["version"], "1.2.1")
+            self.assertEqual(profile_inputs["bundle"]["version"], "1.2.2")
             self.assertEqual(
                 {profile["inputs"]["mint-audience"] for profile in profile_inputs["profiles"]},
                 {"steward-mcp"},
@@ -468,7 +535,7 @@ class PlatformPreflightTests(unittest.TestCase):
                 "Capability models: 1",
                 "Capability tools: 1",
                 "Execution bindings: 1",
-                "Runtime namespaces: 1",
+                "Runtime namespaces: 2",
                 "API caller namespaces: 1",
                 "Kubernetes API CIDRs: 1",
                 "PostgreSQL CIDRs: 1",

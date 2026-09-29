@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.3` and application `0.3.3`.
+Current release contract: chart `0.3.4` and application `0.3.4`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -179,6 +179,14 @@ reports `BackendTLSPolicy` support are required. Envoy Gateway `v1.9.1` is the
 currently supported, tested controller line for this chart. The chart does not
 install Gateway API CRDs or a controller.
 
+The public edge must allow at least 60 seconds for
+`/admin/api/v1/connections/*` requests (60–90 seconds is the recommended
+operator range). A governed connection mutation may spend up to 40 seconds in
+Steward after runtime provisioning begins; Envoy Gateway's shorter default
+request timeout can otherwise terminate a valid request first. Configure this
+timeout on the platform-owned Gateway policy because the portable Steward
+chart does not own that controller-specific policy.
+
 Publish the CA ConfigMap through the platform's public trust-distribution
 controller (for example, a trust-manager `Bundle` whose ConfigMap target is in
 the Steward release namespace). That controller, not a human edit, must update
@@ -288,7 +296,7 @@ the exact MCP-GW origin, and a dedicated runtime namespace. Authority v1 also
 requires the named `connectionsBridge.mcpGatewayAuthorityContract` selector:
 `steward.connections.github/v1` for the legacy status route or
 `steward.connections.github/v2` for the lifecycle status contract used by
-MCP-GW 0.4.9 through 0.5.0. The deprecated `mcpGatewayVersion` input remains
+MCP-GW 0.4.9 through 0.5.1. The deprecated `mcpGatewayVersion` input remains
 available for an existing values file and must not be set together with the
 named selector. Another configured contract fails closed. The apiserver records
 the frozen internal authority snapshot on each operation; the controller
@@ -325,19 +333,29 @@ pending OAuth URL from the previous binding remains conflicting until its real
 expiry or another proven terminal transition and is never returned under the
 new binding.
 
-The browser never receives a HOP-1 token and the apiserver never calls MCP-GW
-directly. OpenShell attaches MCP-GW to the one-shot runtime and obtains its
-ordinary Steward Mint identity. The bridge has no inference provider, uses one
-fixed provider-control grant, and is finalized through the normal controller
-lifecycle. Changing a configured trust mode, image, endpoint, MCP-GW authority contract,
-namespace, or runtime class does not reinterpret an existing operation; it
-fails closed.
+The browser never receives a HOP-1 token. For display-only connection status,
+the apiserver mints a short-lived `connections_status` control-plane token and
+makes one metadata-only authenticated `GET /connections/github/status` request
+to the private MCP-GW origin with a one-second deadline. Configure apiserver
+egress and MCP-GW routing for that private call. Connect, reauthorize,
+disconnect, and rerun mutations still execute through the one-shot governed
+OpenShell bridge runtime. The bridge has no inference provider, uses one fixed
+provider-control grant, and is finalized through the normal controller
+lifecycle. Changing a configured trust mode, image, endpoint, MCP-GW authority
+contract, namespace, or runtime class does not reinterpret an existing
+operation; it fails closed.
 
 The globally bound controller and mint ClusterRoles have no Secret verbs.
 Runtime Secret access is granted by namespaced Roles and RoleBindings only for
 names listed in `runtimeNamespaces`. The default is an empty list, so a release
 consumer must explicitly authorize every runtime namespace; namespaces outside
 that allowlist remain inaccessible to both service accounts.
+
+The controller creates Workflow Task runtimes in the fixed
+`steward-workflows` namespace. That namespace must exist and must be included
+in `runtimeNamespaces`, in addition to any Connections/runtime namespace. The
+platform preflight emits both entries and never assumes that creating the
+Steward release namespace also creates `steward-workflows`.
 
 ## Runtime configuration
 
