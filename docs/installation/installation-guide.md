@@ -404,7 +404,7 @@ preserve the same immutable coordinates and cross-component relationships.
        openshellServerName: gateway.example.test
        workloadExchangeEndpoint: https://identity.example.test/v1/workload/exchange
        workloadExchangeServerName: identity.example.test
-       litellmUrl: https://litellm.example.test
+       litellmUrl: http://litellm.litellm.svc:4000
      mint:
        issuer: https://mint.example.test
        audience: steward-mcp
@@ -418,6 +418,10 @@ preserve the same immutable coordinates and cross-component relationships.
    `/v1/responses` for Codex); `config.apiserver.anthropicInferenceEndpoint` is
    the Anthropic-compatible API base URL; and `config.controller.litellmUrl` is
    the LiteLLM management API base URL with no operation path appended.
+   The example uses the chart-authorized in-cluster LiteLLM Service. An external
+   HTTPS management origin also requires an operator-owned, narrowly scoped
+   egress rule; the chart's default NetworkPolicy does not authorize arbitrary
+   external LiteLLM hosts.
 
    The complete preflight input makes the ownership boundaries explicit:
 
@@ -457,10 +461,12 @@ preserve the same immutable coordinates and cross-component relationships.
    mutate an installed profile ID in place.
 
    Upgrading an existing installation is a governed exception. Before the Helm
-   upgrade, stop both profile consumers and run the exact bundle transition
-   from a checkout of its owning Steward tag: v0.3.3 owns 1.2.0-to-1.2.1 and
-   v0.3.4 owns 1.2.1-to-1.2.2. Re-apply the rendered profiles under their
-   existing IDs, rerun platform preflight with
+   upgrade, stop both profile consumers and use a checkout of the exact
+   Steward v0.3.4 tag to run every required transition. A v0.3.2 installation
+   runs 1.2.0-to-1.2.1 and then 1.2.1-to-1.2.2; it does not require an
+   intermediate Helm upgrade to Steward v0.3.3. A v0.3.3 installation runs only
+   1.2.1-to-1.2.2. Re-apply the rendered profiles under their existing IDs,
+   rerun platform preflight with
    `execution.endpoints.mintAudience` equal to `config.mint.audience`, and use
    the regenerated Helm values and execution-binding digests for `helm
    upgrade`. Restart both consumers only after the upgrade succeeds. The

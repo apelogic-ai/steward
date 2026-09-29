@@ -76,6 +76,10 @@ accepts the generated Codex-only values without requiring it.
 operation path. HTTPS is required for an external origin; plain HTTP is
 accepted only for the exact in-cluster `litellm.<namespace>.svc` or
 `litellm.<namespace>.svc.cluster.local` service on port 4000.
+The generated NetworkPolicy authorizes that in-cluster service. Selecting an
+external HTTPS origin requires the operator to add a separate, narrowly scoped
+egress rule for that destination; preflight URL validation does not create or
+imply that network authority.
 
 ## Post-install inspection
 

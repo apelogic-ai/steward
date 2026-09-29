@@ -741,7 +741,10 @@ jobs:
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
             printf 'This patch adds no migration. Installations upgrading from v0.2.6 must still complete the v0.3 prerequisites before rollout.\n\n'
+            printf 'For a direct v0.3.2-to-v0.3.4 upgrade, use the exact Steward v0.3.4 tag to run the 1.2.0-to-1.2.1 and 1.2.1-to-1.2.2 provider-profile transitions in order; no intermediate Helm upgrade to Steward v0.3.3 is required.\n\n'
             printf 'Rollback from v0.3.4 to v0.3.3 requires no database rollback. Restore the prior provider-profile bundle as one stopped-consumer unit; see docs/installation/upgrade-v0.3.0.md.\n\n'
+            printf '## Required action\n\n'
+            printf "Before every execution-enabled v0.3.4 upgrade, create the fixed \`steward-workflows\` namespace and add it to \`runtimeNamespaces\`. Values copied from the earlier \`[steward-tasks]\` example must be updated before \`helm upgrade\`; the chart rejects execution-enabled values that omit this namespace.\n\n"
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'

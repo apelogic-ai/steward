@@ -39,11 +39,21 @@ This patch adds no database migration and changes no default runtime class.
 Before upgrading an execution-enabled installation, stop the controller and
 apiserver, enable OpenShell `providers_v2_enabled`, and apply the exact
 provider-profile bundle 1.2.1-to-1.2.2 transition. Rerun platform preflight,
-use the regenerated profile digests and Helm values, ensure the
-`steward-workflows` namespace exists and is listed in `runtimeNamespaces`, then
-restart both consumers. The temporary v0.3.3 requirement to populate
+use the regenerated profile digests and Helm values, then restart both
+consumers. The temporary v0.3.3 requirement to populate
 `config.apiserver.anthropicInferenceEndpoint` for a Codex-only binding is no
 longer necessary.
+
+For a direct v0.3.2-to-v0.3.4 upgrade, use the exact Steward v0.3.4 tag to run
+the 1.2.0-to-1.2.1 and 1.2.1-to-1.2.2 provider-profile transitions in order.
+No intermediate Helm upgrade to Steward v0.3.3 is required.
+
+#### Required action
+
+Before every execution-enabled v0.3.4 upgrade, create the fixed
+`steward-workflows` namespace and add it to `runtimeNamespaces`. The chart now
+rejects execution-enabled values that omit this namespace; values copied from
+the earlier `[steward-tasks]` example must be updated before `helm upgrade`.
 
 ## [0.3.3] - 2026-09-28
 
@@ -87,11 +97,12 @@ and adds no database migration. It does tighten the installation preflight:
 - provider CIDRs must pass the stricter checks listed above; and
 - provider-profile bundle 1.2.1 is required.
 
-Before the Helm upgrade, follow the bundle 1.2.1 transition: use a checkout of
-the Steward v0.3.3 tag to render the exact 1.2.0-to-1.2.1 upgrade, re-apply both
-profiles under their existing IDs, and rerun the platform preflight. Then use
-the regenerated values and execution-binding digests for the Helm upgrade and
-restart the profile consumer. See the
+For a v0.3.3-only rollout, the historical bundle 1.2.1 procedure uses the
+Steward v0.3.3 tag. A direct v0.3.2-to-v0.3.4 upgrade must instead use the exact
+v0.3.4 tag for both ordered bundle transitions and does not require an
+intermediate v0.3.3 Helm upgrade. Re-apply both profiles under their existing
+IDs, rerun platform preflight, and use the regenerated values and
+execution-binding digests for the Helm upgrade. See the
 [bundle upgrade procedure](config/provider-profile-bundle/v1.2.1/README.md).
 
 ## [0.3.2] - 2026-09-28
