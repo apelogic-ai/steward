@@ -1135,6 +1135,9 @@ fn normalize_cidrs(values: &[Value]) -> Result<Vec<Value>, String> {
                 format!("{address}/{prefix}")
             }
         };
+        if canonical == "0.0.0.0/0" {
+            return Err("provider profile CIDR list must not contain 0.0.0.0/0".to_owned());
+        }
         normalized.insert(canonical);
     }
     Ok(normalized.into_iter().map(Value::String).collect())
@@ -2376,7 +2379,7 @@ mod tests {
     use super::{
         RenderedProviderProfileBundle, install_rendered_provider_profile_bundle,
         local_test_context_is_safe, migration_base_candidates, migration_history_violations,
-        neutrality_violations, profile_without_binaries,
+        neutrality_violations, normalize_cidrs, profile_without_binaries,
         reconcile_rendered_provider_profile_bundle, render_provider_profile_bundle,
         render_provider_profile_bundle_directory, secret_violations, select_migration_base,
         upgrade_rendered_provider_profile_bundle, validate_provider_profile_bundle,
@@ -2913,6 +2916,15 @@ mod tests {
         assert!(
             matches!(result, Err(ref error) if error.contains("exactly match")),
             "extra inputs must be rejected before any profile is rendered: {result:?}"
+        );
+    }
+
+    #[test]
+    fn provider_profile_render_rejects_unrestricted_ipv4_egress() {
+        let result = normalize_cidrs(&[serde_json::Value::String("0.0.0.0/0".to_owned())]);
+        assert!(
+            matches!(result, Err(ref error) if error.contains("must not contain 0.0.0.0/0")),
+            "the renderer must reject a CIDR OpenShell always blocks: {result:?}"
         );
     }
 

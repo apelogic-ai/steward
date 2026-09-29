@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from typing import Any
 
 
@@ -127,6 +128,25 @@ def validate_required_cidrs(parent: dict[str, Any], key: str, path: str) -> list
             raise ValidationError(f"{path}.{key} contains duplicate CIDR {normalized}")
         seen.add(normalized)
     return cidrs
+
+
+def https_host_and_port(value: str, path: str) -> tuple[str, int]:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port or 443
+    except ValueError as error:
+        raise ValidationError(f"{path} must be a valid HTTPS origin: {error}") from error
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValidationError(f"{path} must be an HTTPS origin")
+    return parsed.hostname, port
 
 
 def validate_capability_catalog(
@@ -743,6 +763,80 @@ def provider_profile_inputs(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_rendered_connections_profile(
+    data: dict[str, Any], rendered: dict[str, Any]
+) -> None:
+    if (
+        rendered.get("schema") != "steward.provider-profile-install-state/v1"
+        or rendered.get("bundle")
+        != {"id": "steward-runtime-providers", "version": "1.2.0"}
+    ):
+        raise ValidationError("released provider-profile renderer returned an unexpected contract")
+    profiles = rendered.get("profiles")
+    if not isinstance(profiles, dict):
+        raise ValidationError("released provider-profile renderer requires a profiles object")
+
+    for profile_id, profile in profiles.items():
+        if not isinstance(profile, dict):
+            raise ValidationError(f"rendered provider profile {profile_id} must be an object")
+        endpoints = profile.get("endpoints")
+        if not isinstance(endpoints, list):
+            raise ValidationError(f"rendered provider profile {profile_id} requires endpoints")
+        for endpoint in endpoints:
+            if not isinstance(endpoint, dict):
+                raise ValidationError(
+                    f"rendered provider profile {profile_id} endpoints must be objects"
+                )
+            allowed_ips = endpoint.get("allowed_ips")
+            if not isinstance(allowed_ips, list):
+                raise ValidationError(
+                    f"rendered provider profile {profile_id} endpoint requires allowed_ips"
+                )
+            if "0.0.0.0/0" in allowed_ips:
+                raise ValidationError(
+                    f"rendered provider profile {profile_id} allowed_ips must not contain 0.0.0.0/0"
+                )
+
+    binding = data["execution"]["binding"]
+    tools_profile_id = binding.get("toolsProfile")
+    if tools_profile_id is None:
+        return
+    tools_profile = profiles.get(tools_profile_id)
+    if not isinstance(tools_profile, dict):
+        raise ValidationError(
+            f"released provider-profile renderer omitted tools profile {tools_profile_id}"
+        )
+    binaries = tools_profile.get("binaries")
+    if not isinstance(binaries, list) or "/usr/local/bin/steward-connections-bridge" not in binaries:
+        raise ValidationError(
+            f"rendered provider profile {tools_profile_id} must include "
+            "/usr/local/bin/steward-connections-bridge"
+        )
+
+    bridge_origin = data["execution"]["connectionsBridge"]["mcpGatewayOrigin"]
+    bridge_host, bridge_port = https_host_and_port(
+        bridge_origin, "execution.connectionsBridge.mcpGatewayOrigin"
+    )
+    rendered_endpoints = tools_profile.get("endpoints")
+    matching_endpoint = any(
+        isinstance(endpoint, dict)
+        and endpoint.get("host") == bridge_host
+        and endpoint.get("port") == bridge_port
+        for endpoint in rendered_endpoints
+    )
+    if not matching_endpoint:
+        actual = sorted(
+            f"{endpoint.get('host')}:{endpoint.get('port')}"
+            for endpoint in rendered_endpoints
+            if isinstance(endpoint, dict)
+        )
+        raise ValidationError(
+            "execution.connectionsBridge.mcpGatewayOrigin host and effective port "
+            f"{bridge_host}:{bridge_port} must match the rendered tools profile endpoint; "
+            f"rendered={actual}"
+        )
+
+
 def resolve_provider_profile_digests(
     data: dict[str, Any], bundle: pathlib.Path, inputs: dict[str, Any]
 ) -> dict[str, str]:
@@ -754,6 +848,34 @@ def resolve_provider_profile_digests(
     with tempfile.TemporaryDirectory(prefix="steward-provider-profile-") as temporary:
         inputs_path = pathlib.Path(temporary) / "inputs.json"
         inputs_path.write_text(canonical(inputs), encoding="utf-8")
+        render_result = subprocess.run(
+            [
+                str(installer),
+                "render",
+                "--bundle",
+                str(bundle),
+                "--inputs",
+                str(inputs_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if render_result.returncode != 0:
+            raise ValidationError(
+                "released provider-profile rendering failed: "
+                f"{(render_result.stderr or render_result.stdout).strip()}"
+            )
+        try:
+            rendered = json.loads(render_result.stdout)
+        except json.JSONDecodeError as error:
+            raise ValidationError(
+                f"released provider-profile renderer returned invalid JSON: {error}"
+            ) from error
+        if not isinstance(rendered, dict):
+            raise ValidationError("released provider-profile renderer returned a non-object result")
+        validate_rendered_connections_profile(data, rendered)
+
         result = subprocess.run(
             [
                 str(installer),
