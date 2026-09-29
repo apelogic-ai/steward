@@ -1,8 +1,8 @@
 # Platform preflight bundle
 
-Status: **Supported for Steward v0.3.3**
+Status: **Supported for Steward v0.3.4**
 
-The release asset `steward-platform-preflight-0.3.3.tar.gz` contains a
+The release asset `steward-platform-preflight-0.3.4.tar.gz` contains a
 dependency-free Python validator and generator, its input schema, and neutral
 examples. It converts one reviewed non-secret input into deterministic Steward
 Helm values, a Flux-compatible values `ConfigMap`, machine diagnostics, and a
@@ -10,18 +10,18 @@ human summary.
 
 The input names every namespace, immutable image digest, public hostname,
 Gateway parent, certificate DNS name, database CA reference, provider profile,
-ARC controller service account, external Secret, template capability catalog,
+optional ARC controller service account, external Secret, template capability catalog,
 the verified steward-run release projection selected by the installation BOM,
 and NetworkPolicy API/PostgreSQL destinations. Secret bodies are neither
 accepted nor emitted. Existing infrastructure remains operator-owned.
 
 ```sh
-tar -xzf steward-platform-preflight-0.3.3.tar.gz
-tar -xzf steward-runtime-providers-0.3.3.tar.gz
+tar -xzf steward-platform-preflight-0.3.4.tar.gz
+tar -xzf steward-runtime-providers-0.3.4.tar.gz
 cd platform-preflight/v1
 ./steward-platform-preflight generate \
   --input examples/governed-complete.json \
-  --provider-profile-bundle ../../provider-profile-bundle/v1.2.1 \
+  --provider-profile-bundle ../../provider-profile-bundle/v1.2.2 \
   --chart /path/to/steward-chart \
   --output rendered
 ```
@@ -37,8 +37,9 @@ installer in validation mode and puts its computed profile digests into the
 execution binding; deployment input cannot substitute unrelated profile
 digests. It also inspects the rendered profiles: the MCP-GW endpoint must
 match the connections-bridge origin by host and effective port, the MCP
-transport must admit POST, every token grant must use the configured single
-Mint audience, OpenShell always-blocked CIDR overlaps are rejected, and the
+transport must admit `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`, and
+`DELETE`, every token grant must use the configured single Mint audience,
+OpenShell always-blocked CIDR overlaps are rejected, and the
 bridge binary must be present. Mismatched MCP origins, Mint audiences, or
 provider CIDRs fail before Helm output is emitted. The input
 embeds the exact
@@ -69,8 +70,16 @@ and does not replace any of those deployment settings.
 `config.apiserver.inferenceEndpoint` is the exact OpenAI-compatible Responses
 operation URL (`https://inference.example.test/v1/responses` in the examples).
 `config.apiserver.anthropicInferenceEndpoint` is an Anthropic-compatible API
-base URL, while `config.controller.litellmUrl` is the LiteLLM management API
-base URL with no operation path.
+base URL and is omitted unless a Claude binding is selected. The apiserver
+accepts the generated Codex-only values without requiring it.
+`config.controller.litellmUrl` is the LiteLLM management API base URL with no
+operation path. HTTPS is required for an external origin; plain HTTP is
+accepted only for the exact in-cluster `litellm.<namespace>.svc` or
+`litellm.<namespace>.svc.cluster.local` service on port 4000.
+The generated NetworkPolicy authorizes that in-cluster service. Selecting an
+external HTTPS origin requires the operator to add a separate, narrowly scoped
+egress rule for that destination; preflight URL validation does not create or
+imply that network authority.
 
 ## Post-install inspection
 
@@ -125,7 +134,7 @@ a read-only lookup:
 
 The command uses `kubectl get` only. It verifies the exact Gateway namespace
 and name, HTTPS listener section, listener hostname, referenced TLS Secret,
-ARC controller ServiceAccount, external Secrets, workload-exchange trust
+the ARC controller ServiceAccount when ARC is configured, external Secrets, workload-exchange trust
 ConfigMap, and database CA source. It requests metadata only for Secret and
 ConfigMap existence checks and does not retrieve their bodies. It does not
 create DNS records, certificates, Gateways, or routes.

@@ -3,7 +3,8 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rendered="$(mktemp)"
-trap 'rm -f "${rendered}"' EXIT
+missing_namespace_error="$(mktemp)"
+trap 'rm -f "${rendered}" "${missing_namespace_error}"' EXIT
 
 customer_images=(
   --set-string images.repository=registry.example.test/customer/steward
@@ -61,6 +62,7 @@ fi
 governed_inputs=(
   --set-string tls.webhook.caBundlePem=public-test-ca
   --set execution.enabled=true
+  --set-string 'runtimeNamespaces[0]=steward-workflows'
   --set-string images.mint.tag=test-mint
   --set-string images.mint.digest=sha256:2222222222222222222222222222222222222222222222222222222222222222
   --set-string config.apiserver.inferenceEndpoint=https://inference.example.test/v1/responses
@@ -86,7 +88,14 @@ default_runtime_inputs=(
   --set-string config.mint.spiffeTrustDomain=customer.example.test
   --set-string config.mint.openshellNamespace=customer-openshell
 )
-helm_template "${default_runtime_inputs[@]}" > "${rendered}"
+if helm_template "${default_runtime_inputs[@]}" > /dev/null 2>"${missing_namespace_error}"; then
+  echo 'governed execution must reject a missing steward-workflows runtime namespace' >&2
+  exit 1
+fi
+grep -Fq 'execution.enabled requires steward-workflows in runtimeNamespaces' \
+  "${missing_namespace_error}"
+helm_template "${default_runtime_inputs[@]}" \
+  --set-string 'runtimeNamespaces[0]=steward-workflows' > "${rendered}"
 if rg -q 'STEWARD_OPENSHELL_RUNTIME_CLASS_NAME' "${rendered}"; then
   echo 'default runtime render must not request a RuntimeClass' >&2
   exit 1

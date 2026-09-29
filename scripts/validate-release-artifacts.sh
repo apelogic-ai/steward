@@ -125,6 +125,7 @@ if [[ "${chart_contract_mode}" == customer-v1 ]]; then
 fi
 image_values+=(
   --set 'runtimeNamespaces[0]=team-a'
+  --set 'runtimeNamespaces[1]=steward-workflows'
   --set-string config.apiserver.mcpGatewayEndpoint=https://mcp-gw.example.test/mcp
 )
 task_execution_binding_values=(
@@ -1200,10 +1201,11 @@ fi
 test "$(grep -c '^kind: Deployment$' "${rendered}")" -eq 3
 test "$(grep -c '^kind: ServiceAccount$' "${rendered}")" -eq 3
 test "$(grep -c '^kind: NetworkPolicy$' "${rendered}")" -eq 8
-test "$(grep -c '^kind: Role$' "${rendered}")" -eq 2
-test "$(grep -c '^kind: RoleBinding$' "${rendered}")" -eq 2
+test "$(grep -c '^kind: Role$' "${rendered}")" -eq 4
+test "$(grep -c '^kind: RoleBinding$' "${rendered}")" -eq 4
 test "$(grep -c '^kind: ClusterSPIFFEID$' "${rendered}")" -eq 1
 test "$(grep -c '^  namespace: team-a$' "${rendered}")" -eq 4
+test "$(grep -c '^  namespace: steward-workflows$' "${rendered}")" -eq 4
 grep -q '^kind: CustomResourceDefinition$' "${rendered}"
 grep -q 'failurePolicy: Fail' "${rendered}"
 grep -q 'driver: csi.spiffe.io' "${rendered}"

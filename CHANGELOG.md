@@ -7,6 +7,54 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-09-29
+
+### Changed
+
+- Published provider-profile bundle 1.2.2 with the complete bounded MCP
+  transport method set, including `DELETE` for session close, and retained an
+  exact 1.2.1-to-1.2.2 upgrade transition.
+- Expanded platform preflight validation for cluster-local LiteLLM management
+  URLs, optional ARC installations, Workflow runtime namespaces, custom Mint
+  audiences, and OpenShell-blocked IPv6 and IPv4-mapped CIDRs.
+- Documented the tested MCP-GW 0.5.1, LiteLLM v1.93.0, SPIRE, edge-timeout,
+  resource, Pod Security, storage, pricing, and provider-consumer contracts.
+- Restored the HyperShell public identity, logo, favicon, page titles, and
+  product-facing copy in the web UI while retaining `steward` for package,
+  chart, CLI, and API names.
+
+### Fixed
+
+- Allowed Codex-only generated configuration to omit the Anthropic inference
+  endpoint while retaining fail-closed validation when a Claude binding is
+  active.
+- Kept apiserver startup available when the immutable onboarding Workflow names
+  an execution binding not installed in the current deployment.
+- Corrected provider-profile upgrade validation for deployment-specific Mint
+  audiences and required MCP session-close transport.
+
+### Upgrade from 0.3.3
+
+This patch adds no database migration and changes no default runtime class.
+Before upgrading an execution-enabled installation, stop the controller and
+apiserver, enable OpenShell `providers_v2_enabled`, and apply the exact
+provider-profile bundle 1.2.1-to-1.2.2 transition. Rerun platform preflight,
+use the regenerated profile digests and Helm values, then restart both
+consumers. The temporary v0.3.3 requirement to populate
+`config.apiserver.anthropicInferenceEndpoint` for a Codex-only binding is no
+longer necessary.
+
+For a direct v0.3.2-to-v0.3.4 upgrade, use the exact Steward v0.3.4 tag to run
+the 1.2.0-to-1.2.1 and 1.2.1-to-1.2.2 provider-profile transitions in order.
+No intermediate Helm upgrade to Steward v0.3.3 is required.
+
+#### Required action
+
+Before every execution-enabled v0.3.4 upgrade, create the fixed
+`steward-workflows` namespace and add it to `runtimeNamespaces`. The chart now
+rejects execution-enabled values that omit this namespace; values copied from
+the earlier `[steward-tasks]` example must be updated before `helm upgrade`.
+
 ## [0.3.3] - 2026-09-28
 
 ### Changed
@@ -30,6 +78,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Returned bounded, versioned connection-operation errors that distinguish an
   OpenShell proxy policy denial from an MCP-GW runtime-authorization denial.
 
+### Known issues
+
+- The v0.3.3 apiserver rejects an empty
+  `config.apiserver.anthropicInferenceEndpoint` during startup even when no
+  `claude-code-v1` execution binding is configured. Before upgrading to
+  v0.3.3, set this field to the deployment's Anthropic-compatible LiteLLM base
+  URL. Steward v0.3.4 removes this temporary workaround for Codex-only
+  installations.
+
 ### Upgrade from 0.3.2
 
 This patch has no breaking chart or runtime change, changes no chart default,
@@ -40,11 +97,12 @@ and adds no database migration. It does tighten the installation preflight:
 - provider CIDRs must pass the stricter checks listed above; and
 - provider-profile bundle 1.2.1 is required.
 
-Before the Helm upgrade, follow the bundle 1.2.1 transition: use a checkout of
-the Steward v0.3.3 tag to render the exact 1.2.0-to-1.2.1 upgrade, re-apply both
-profiles under their existing IDs, and rerun the platform preflight. Then use
-the regenerated values and execution-binding digests for the Helm upgrade and
-restart the profile consumer. See the
+For a v0.3.3-only rollout, the historical bundle 1.2.1 procedure uses the
+Steward v0.3.3 tag. A direct v0.3.2-to-v0.3.4 upgrade must instead use the exact
+v0.3.4 tag for both ordered bundle transitions and does not require an
+intermediate v0.3.3 Helm upgrade. Re-apply both profiles under their existing
+IDs, rerun platform preflight, and use the regenerated values and
+execution-binding digests for the Helm upgrade. See the
 [bundle upgrade procedure](config/provider-profile-bundle/v1.2.1/README.md).
 
 ## [0.3.2] - 2026-09-28
@@ -308,7 +366,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/apelogic-ai/steward/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/apelogic-ai/steward/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/apelogic-ai/steward/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/apelogic-ai/steward/compare/v0.3.0...v0.3.1

@@ -38,6 +38,12 @@ that handoff.
 9. Before upgrading to 0.3.2 or later with Gateway API enabled, configure the
    complete seven-entry `web.httpRoute.apiPaths` list from the chart README;
    incomplete route sets are rejected instead of silently reaching the web frontend.
+10. Steward v0.3.3 has a known upgrade-only startup defect: the chart emits an
+    empty `config.apiserver.anthropicInferenceEndpoint`, but the apiserver
+    rejects that value even when no `claude-code-v1` binding exists. Before a
+    v0.3.3 Helm upgrade, set that field to the deployment's Anthropic-compatible
+    LiteLLM base URL. Steward v0.3.4 removes this workaround and requires the
+    field only when a Claude binding is active.
 
 ## Migration and activation
 

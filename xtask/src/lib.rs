@@ -532,6 +532,9 @@ pub fn upgrade_rendered_provider_profile_bundle(
         ) | (
             ("steward-runtime-providers", "1.2.0"),
             ("steward-runtime-providers", "1.2.1")
+        ) | (
+            ("steward-runtime-providers", "1.2.1"),
+            ("steward-runtime-providers", "1.2.2")
         )
     );
     if !supported_transition {
@@ -697,10 +700,63 @@ fn validate_provider_profile_upgrade_delta(
         "/usr/local/bin/curl",
         "/usr/local/bin/steward-connections-bridge"
     ]);
+    let replacement_audience = if current_version == "1.2.0" && replacement_version == "1.2.1" {
+        let audiences = replacement
+            .profiles
+            .values()
+            .map(|profile| {
+                profile
+                    .pointer("/credentials/0/token_grant/audience")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "replacement provider profiles require one shared Mint audience".to_owned()
+                    })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if audiences.len() != 1 {
+            return Err(
+                "replacement provider profiles must use one shared Mint audience".to_owned(),
+            );
+        }
+        audiences.into_iter().next()
+    } else {
+        None
+    };
     for (profile_id, current_profile) in &current.profiles {
         let replacement_profile = replacement.profiles.get(profile_id).ok_or_else(|| {
             format!("replacement provider profile {profile_id} is required for upgrade")
         })?;
+        if current_version == "1.2.1" && replacement_version == "1.2.2" {
+            let mut expected = current_profile.clone();
+            if profile_id == "steward-mcp-gw" {
+                let endpoint = expected
+                    .pointer_mut("/endpoints/0")
+                    .and_then(Value::as_object_mut)
+                    .ok_or_else(|| "MCP provider profile requires one endpoint".to_owned())?;
+                endpoint.remove("access").ok_or_else(|| {
+                    "MCP provider profile 1.2.1 requires endpoint access".to_owned()
+                })?;
+                endpoint.insert(
+                    "rules".to_owned(),
+                    Value::Array(
+                        ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
+                            .into_iter()
+                            .map(|method| {
+                                serde_json::json!({
+                                    "allow": {"method": method, "path": "**"}
+                                })
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            if &expected != replacement_profile {
+                return Err(format!(
+                    "provider profile upgrade for {profile_id} permits only the declared MCP DELETE transport correction"
+                ));
+            }
+            continue;
+        }
         if current_version == "1.2.0" && replacement_version == "1.2.1" {
             let mut expected = current_profile.clone();
             expected.as_object_mut().ok_or_else(|| {
@@ -709,7 +765,11 @@ fn validate_provider_profile_upgrade_delta(
             expected
                 .pointer_mut("/credentials/0/token_grant/audience")
                 .ok_or_else(|| format!("provider profile {profile_id} requires an audience"))?
-                .clone_from(&Value::String("steward-mcp".to_owned()));
+                .clone_from(&Value::String(
+                    replacement_audience
+                        .ok_or_else(|| "replacement Mint audience is required".to_owned())?
+                        .to_owned(),
+                ));
             if profile_id == "steward-mcp-gw" {
                 expected
                     .pointer_mut("/endpoints/0/access")
@@ -982,19 +1042,16 @@ fn render_provider_profile(
     let inference_capable = capabilities
         .iter()
         .any(|capability| capability.as_str() == Some("inference.completions"));
-    let access = network
-        .get("access")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            if capabilities
-                .iter()
-                .any(|capability| capability.as_str() == Some("tool.read"))
-            {
-                "read-only"
-            } else {
-                "read-write"
-            }
-        });
+    let access = network.get("access").and_then(Value::as_str);
+    let allowed_methods = network.get("allowedMethods").and_then(Value::as_array);
+    let default_access = if capabilities
+        .iter()
+        .any(|capability| capability.as_str() == Some("tool.read"))
+    {
+        "read-only"
+    } else {
+        "read-write"
+    };
     let audience = if let Some(input) = authorization.get("audienceInput") {
         let input = input.as_str().ok_or_else(|| {
             "provider profile template authorization audienceInput must be a string".to_owned()
@@ -1014,6 +1071,32 @@ fn render_provider_profile(
         "requiredBinaries",
         "provider profile template runtime",
     )?;
+
+    let mut endpoint_policy = serde_json::json!({
+        "host": endpoint.host,
+        "port": endpoint.port,
+        "protocol": "rest",
+        "tls": "required",
+        "enforcement": "enforce",
+        "allowed_ips": allowed_ips,
+    });
+    if let Some(methods) = allowed_methods {
+        endpoint_policy["rules"] = Value::Array(
+            methods
+                .iter()
+                .map(|method| {
+                    serde_json::json!({
+                        "allow": {
+                            "method": method,
+                            "path": "**",
+                        }
+                    })
+                })
+                .collect(),
+        );
+    } else {
+        endpoint_policy["access"] = Value::String(access.unwrap_or(default_access).to_owned());
+    }
 
     let mut profile = serde_json::json!({
         "id": profile_id,
@@ -1035,15 +1118,7 @@ fn render_provider_profile(
                 "cache_ttl_seconds": authorization.get("cacheTtlSeconds").cloned().ok_or_else(|| "provider profile template authorization must declare cacheTtlSeconds".to_owned())?,
             }
         }],
-        "endpoints": [{
-            "host": endpoint.host,
-            "port": endpoint.port,
-            "protocol": "rest",
-            "tls": "required",
-            "access": access,
-            "enforcement": "enforce",
-            "allowed_ips": allowed_ips,
-        }],
+        "endpoints": [endpoint_policy],
         "binaries": binaries,
     });
     if inference_capable {
@@ -1206,8 +1281,40 @@ fn normalize_cidrs(values: &[Value]) -> Result<Vec<Value>, String> {
                             .to_owned(),
                     );
                 }
-                let end = network | !prefix_mask_v6(prefix);
-                if network == 0 || (network <= 1 && end >= 1) {
+                let mask = prefix_mask_v6(prefix);
+                let end = network | !mask;
+                let ipv6_link_local_start = u128::from(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0));
+                let ipv6_link_local_end = ipv6_link_local_start | !prefix_mask_v6(10);
+                let mapped_unspecified = u128::from(Ipv4Addr::UNSPECIFIED.to_ipv6_mapped());
+                let mapped_loopback_start = u128::from(Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+                let mapped_loopback_end =
+                    u128::from(Ipv4Addr::new(127, 255, 255, 255).to_ipv6_mapped());
+                let mapped_link_local_start =
+                    u128::from(Ipv4Addr::new(169, 254, 0, 0).to_ipv6_mapped());
+                let mapped_link_local_end =
+                    u128::from(Ipv4Addr::new(169, 254, 255, 255).to_ipv6_mapped());
+                if network == 0
+                    || (network <= 1 && end >= 1)
+                    || cidr_ranges_overlap_u128(
+                        network,
+                        end,
+                        ipv6_link_local_start,
+                        ipv6_link_local_end,
+                    )
+                    || (network <= mapped_unspecified && end >= mapped_unspecified)
+                    || cidr_ranges_overlap_u128(
+                        network,
+                        end,
+                        mapped_loopback_start,
+                        mapped_loopback_end,
+                    )
+                    || cidr_ranges_overlap_u128(
+                        network,
+                        end,
+                        mapped_link_local_start,
+                        mapped_link_local_end,
+                    )
+                {
                     return Err(
                         "provider profile CIDR list overlaps an OpenShell always-blocked IPv6 range"
                             .to_owned(),
@@ -1222,6 +1329,15 @@ fn normalize_cidrs(values: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 fn cidr_ranges_overlap(left_start: u32, left_end: u32, right_start: u32, right_end: u32) -> bool {
+    left_start <= right_end && right_start <= left_end
+}
+
+fn cidr_ranges_overlap_u128(
+    left_start: u128,
+    left_end: u128,
+    right_start: u128,
+    right_end: u128,
+) -> bool {
     left_start <= right_end && right_start <= left_end
 }
 
@@ -1301,8 +1417,21 @@ fn validate_provider_profile_template(
         .filter_map(|input| input.get("name").and_then(Value::as_str))
         .collect::<BTreeSet<_>>();
     let network = require_object(object, "network", "provider profile template")?;
+    if network.contains_key("access") && network.contains_key("allowedMethods") {
+        return Err(
+            "provider profile template network must choose access or allowedMethods, not both"
+                .to_owned(),
+        );
+    }
     let expected_network_keys = if network.contains_key("access") {
         &["endpointInput", "allowedCidrsInput", "protocol", "access"][..]
+    } else if network.contains_key("allowedMethods") {
+        &[
+            "endpointInput",
+            "allowedCidrsInput",
+            "protocol",
+            "allowedMethods",
+        ][..]
     } else {
         &["endpointInput", "allowedCidrsInput", "protocol"][..]
     };
@@ -1343,6 +1472,25 @@ fn validate_provider_profile_template(
         return Err(
             "provider profile template network access must be read-only or read-write".to_owned(),
         );
+    }
+    if let Some(methods) = network.get("allowedMethods") {
+        let methods = methods.as_array().ok_or_else(|| {
+            "provider profile template network allowedMethods must be an array".to_owned()
+        })?;
+        let allowed = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
+        let mut unique = BTreeSet::new();
+        if methods.is_empty()
+            || methods.iter().any(|method| {
+                method
+                    .as_str()
+                    .is_none_or(|method| !allowed.contains(&method) || !unique.insert(method))
+            })
+        {
+            return Err(
+                "provider profile template network allowedMethods must contain unique supported HTTP methods"
+                    .to_owned(),
+            );
+        }
     }
     let authorization = require_object(object, "authorization", "provider profile template")?;
     let audience_key = if authorization.contains_key("audienceInput") {
@@ -2493,9 +2641,10 @@ mod tests {
         reconcile_rendered_provider_profile_bundle, render_provider_profile_bundle,
         render_provider_profile_bundle_directory, secret_violations, select_migration_base,
         upgrade_rendered_provider_profile_bundle, validate_provider_profile_bundle,
-        validate_register_content,
+        validate_provider_profile_upgrade_delta, validate_register_content,
     };
-    use std::collections::BTreeMap;
+    use serde_json::Value;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3048,6 +3197,10 @@ mod tests {
             "::/0",
             "::/128",
             "::1/128",
+            "fe80::/10",
+            "::ffff:0.0.0.0/128",
+            "::ffff:127.0.0.1/128",
+            "::ffff:169.254.1.1/128",
         ] {
             let result = normalize_cidrs(&[serde_json::Value::String(cidr.to_owned())]);
             assert!(
@@ -3246,6 +3399,33 @@ mod tests {
             );
         }
 
+        let mut custom_audience_replacement = render_test_provider_profile_bundle(
+            "v1.2.1",
+            "1.2.1",
+            "https://mcp.gateway.test",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
+            "192.0.2.0/24",
+        )?;
+        for profile in custom_audience_replacement.profiles.values_mut() {
+            profile["credentials"][0]["token_grant"]["audience"] =
+                Value::String("custom-mint-audience".to_owned());
+        }
+        for profile in custom_audience_replacement.state["profiles"]
+            .as_object_mut()
+            .ok_or_else(|| "test install state requires profiles".to_owned())?
+            .values_mut()
+        {
+            profile["credentials"][0]["token_grant"]["audience"] =
+                Value::String("custom-mint-audience".to_owned());
+        }
+        validate_provider_profile_upgrade_delta(
+            &current,
+            &custom_audience_replacement,
+            "1.2.0",
+            "1.2.1",
+        )?;
+
         let directory = std::env::temp_dir().join(format!(
             "steward-provider-profile-upgrade-1-2-1-test-{}-{}",
             std::process::id(),
@@ -3410,7 +3590,7 @@ mod tests {
                 }
             ]
         });
-        if version == "1.2.1" {
+        if matches!(version, "1.2.1" | "1.2.2") {
             for profile in inputs["profiles"]
                 .as_array_mut()
                 .ok_or_else(|| "test provider profile inputs require profiles".to_owned())?
@@ -3425,6 +3605,56 @@ mod tests {
                 .join(bundle_directory),
             &inputs.to_string(),
         )
+    }
+
+    #[test]
+    fn provider_profile_upgrade_to_1_2_2_adds_only_mcp_delete_transport() -> Result<(), String> {
+        let current = render_test_provider_profile_bundle(
+            "v1.2.1",
+            "1.2.1",
+            "https://mcp.gateway.test",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
+            "192.0.2.0/24",
+        )?;
+        let replacement = render_test_provider_profile_bundle(
+            "v1.2.2",
+            "1.2.2",
+            "https://mcp.gateway.test",
+            "https://inference.gateway.test",
+            "https://mint.gateway.test",
+            "192.0.2.0/24",
+        )?;
+        let methods = replacement
+            .profiles
+            .get("steward-mcp-gw")
+            .and_then(|profile| profile.pointer("/endpoints/0/rules"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| "1.2.2 MCP profile requires explicit transport rules".to_owned())?
+            .iter()
+            .filter_map(|rule| rule.pointer("/allow/method").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+        assert!(methods.contains("DELETE"));
+        assert_eq!(
+            current.profiles.get("steward-litellm"),
+            replacement.profiles.get("steward-litellm"),
+            "the MCP session-close correction must not change inference policy"
+        );
+
+        let directory = std::env::temp_dir().join(format!(
+            "steward-provider-profile-upgrade-1-2-2-test-{}-{}",
+            std::process::id(),
+            NEXT_RENDER_INSTALL_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&directory).map_err(|error| format!("create fixture: {error}"))?;
+        let output = directory.join("installed");
+        let result = (|| {
+            install_rendered_provider_profile_bundle(&output, &current)?;
+            upgrade_rendered_provider_profile_bundle(&output, &current, &replacement)?;
+            reconcile_rendered_provider_profile_bundle(&output, &replacement)
+        })();
+        fs::remove_dir_all(&directory).map_err(|error| format!("remove fixture: {error}"))?;
+        result
     }
 
     #[test]

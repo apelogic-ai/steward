@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.3.3`. The release workflow pulls the published OCI
+Release contract: chart `0.3.4`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -98,9 +98,9 @@ again in the target cluster before enabling governed execution.
 | OpenShell | 0.0.98 |
 | agent-sandbox | 0.5.0 |
 | Runtime | Cluster/OpenShell default; no VM-isolation claim |
-| SPIRE | Mint identity contract documented below; exact charts/images come from the installation BOM |
-| MCP-GW | Must implement `steward.connections.github/v2` |
-| LiteLLM | Must implement the documented Responses and Anthropic Messages URL contracts |
+| SPIRE | `spire` chart 0.29.0, `spire-crds` chart 0.5.0, SPIRE image 1.15.2 |
+| MCP-GW | 0.5.1; must implement `steward.connections.github/v2` |
+| LiteLLM | v1.93.0; must implement the documented Responses and Anthropic Messages URL contracts |
 | Gateway API edge | `gateway.networking.k8s.io/v1`; selected GatewayClass reports `BackendTLSPolicy` |
 | Companion products | `steward-run` 0.7.0+ for `envelopeDigest`; exact `steward-run` and Identity coordinates come from the installation BOM |
 
@@ -404,13 +404,13 @@ preserve the same immutable coordinates and cross-component relationships.
        openshellServerName: gateway.example.test
        workloadExchangeEndpoint: https://identity.example.test/v1/workload/exchange
        workloadExchangeServerName: identity.example.test
-       litellmUrl: https://litellm.example.test
+       litellmUrl: http://litellm.litellm.svc:4000
      mint:
        issuer: https://mint.example.test
        audience: steward-mcp
        spiffeTrustDomain: trust.example.test
        openshellNamespace: openshell
-   runtimeNamespaces: [steward-tasks]
+   runtimeNamespaces: [steward-tasks, steward-workflows]
    ```
 
    The endpoint fields have different contracts: `config.apiserver.inferenceEndpoint`
@@ -418,6 +418,10 @@ preserve the same immutable coordinates and cross-component relationships.
    `/v1/responses` for Codex); `config.apiserver.anthropicInferenceEndpoint` is
    the Anthropic-compatible API base URL; and `config.controller.litellmUrl` is
    the LiteLLM management API base URL with no operation path appended.
+   The example uses the chart-authorized in-cluster LiteLLM Service. An external
+   HTTPS management origin also requires an operator-owned, narrowly scoped
+   egress rule; the chart's default NetworkPolicy does not authorize arbitrary
+   external LiteLLM hosts.
 
    The complete preflight input makes the ownership boundaries explicit:
 
@@ -436,7 +440,7 @@ preserve the same immutable coordinates and cross-component relationships.
    versioned bundle, extract the attested release asset and use its bundled
    `bin/steward-provider-profile` executable to validate, install, and reconcile
    the deployment-neutral inputs as shown in the
-   [bundle guide](../../config/provider-profile-bundle/v1.2.1/README.md). The
+   [bundle guide](../../config/provider-profile-bundle/v1.2.2/README.md). The
    released tool is self-contained for `linux/amd64`; no Steward checkout or
    Rust toolchain is required.
    Record each installed profile ID and immutable policy digest in the
@@ -445,28 +449,52 @@ preserve the same immutable coordinates and cross-component relationships.
    the corresponding category. Pinned OpenShell v0.0.98 cannot attest profile
    content itself, so the deployment system must keep each installed ID
    immutable and verify the rendered bytes against the recorded digest.
-   Bundle 1.2.1 uses the single `config.mint.audience` for both inference and
-   MCP token grants, permits POST transport for read-only MCP JSON-RPC, and
-   rejects unsupported unrestricted, IPv4 loopback, IPv4 link-local, IPv6
-   unspecified, and IPv6 loopback CIDRs. For a fresh installation, do not
+   Before importing profiles, enable OpenShell's global
+   `providers_v2_enabled=true` setting. Both the controller and apiserver are
+   profile consumers: stop both for the bounded in-place transition, then
+   restart both only after the profiles and regenerated execution-binding
+   digests agree. Bundle 1.2.2 uses the single `config.mint.audience` for both
+   inference and MCP token grants; permits the complete MCP transport set,
+   including `DELETE` for session close; and rejects unsupported unrestricted,
+   IPv4 loopback, IPv4 link-local, IPv6 unspecified, IPv6 loopback, IPv6
+   link-local, and IPv4-mapped blocked CIDRs. For a fresh installation, do not
    mutate an installed profile ID in place.
 
-   Upgrading an existing v0.3.2 installation is a governed exception. Before
-   the Helm upgrade, check out the exact Steward `v0.3.3` tag and run the bundle
-   guide's `cargo xtask provider-profile-bundle upgrade` transition. Stop the
-   profile consumers, re-apply both rendered profiles under their existing IDs,
-   rerun platform preflight with `execution.endpoints.mintAudience` set equal
-   to `config.mint.audience`, and use the regenerated Helm values and
-   execution-binding digests for `helm upgrade`. Restart the consumers only
-   after the upgrade succeeds. The released standalone installer remains the
-   no-checkout path for fresh installs; it does not implement this transition.
-   See the [exact upgrade sequence](../../config/provider-profile-bundle/v1.2.1/README.md).
+   Upgrading an existing installation is a governed exception. Before the Helm
+   upgrade, stop both profile consumers and use a checkout of the exact
+   Steward v0.3.4 tag to run every required transition. A v0.3.2 installation
+   runs 1.2.0-to-1.2.1 and then 1.2.1-to-1.2.2; it does not require an
+   intermediate Helm upgrade to Steward v0.3.3. A v0.3.3 installation runs only
+   1.2.1-to-1.2.2. Re-apply the rendered profiles under their existing IDs,
+   rerun platform preflight with
+   `execution.endpoints.mintAudience` equal to `config.mint.audience`, and use
+   the regenerated Helm values and execution-binding digests for `helm
+   upgrade`. Restart both consumers only after the upgrade succeeds. The
+   released standalone installer remains the no-checkout path for fresh
+   installs; it does not implement either transition. A v0.3.2 installation
+   must apply both transitions in order. See the
+   [current upgrade sequence](../../config/provider-profile-bundle/v1.2.2/README.md).
    For `codex@0.140.0`, use or mirror the digest-selected image and run the
    [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 
    `config.controller.litellmUrl` is the LiteLLM management API base URL. The
    controller appends `/key/delete`, `/key/list`, `/key/generate`, and
    `/v1/model/info`; do not add an operation path to that value.
+
+   Every model admitted by the capability catalog must have pricing configured
+   in LiteLLM. LiteLLM `model_name` must equal the exact catalog model string,
+   including its provider prefix (for example `openai/model-name`). In this
+   contract, “provider-qualified” means that exact catalog string and routing
+   alias; Steward does not strip, add, or remap the prefix.
+
+   Governed dependencies remain platform-owned. Set resource requests and
+   limits for the OpenShell gateway, sandbox workloads, SPIRE components, and
+   the agent-sandbox controller. The sandbox execution namespace must permit
+   the required privileged Pod Security profile: the OpenShell sandbox needs
+   `NET_ADMIN`, `SYS_PTRACE`, and `DAC_READ_SEARCH`, plus an Unconfined AppArmor
+   profile. OpenShell gateway persistence also requires a default StorageClass
+   unless its operator supplies an explicit class. Verify these prerequisites
+   before activating execution; the Steward chart does not create them.
 
 2. Verify the named Secret objects and certificate SANs without displaying
    their data. When using platform preflight, run its `gateway-check` against
@@ -492,6 +520,9 @@ preserve the same immutable coordinates and cross-component relationships.
 3. Install using only the selected cluster. Example for customer TLS mode:
 
    ```sh
+   kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" \
+     create namespace steward-workflows --dry-run=client -o yaml | \
+     kubectl --kubeconfig "$CLUSTER_KUBECONFIG" --context "$CLUSTER_CONTEXT" apply -f -
    helm --kubeconfig "$CLUSTER_KUBECONFIG" --kube-context "$CLUSTER_CONTEXT" \
      upgrade --install steward "${STEWARD_CHART_PACKAGE}" --namespace steward \
      --create-namespace --atomic --wait --timeout 10m \
@@ -503,6 +534,10 @@ preserve the same immutable coordinates and cross-component relationships.
    placed from `crds/`. Review CRD compatibility before upgrades. For
    cert-manager, wait until both Certificate resources are Ready before
    treating deployment readiness as meaningful.
+   Versioned Workflow Tasks run in `steward-workflows`; the namespace creation
+   and its `runtimeNamespaces` entry are mandatory whenever execution is
+   enabled. Platform automation may own the namespace instead, but it must
+   exist before the first Task.
 
 ## Post-install administration (not Helm installation)
 

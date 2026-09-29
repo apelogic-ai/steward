@@ -47,7 +47,7 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ -z "$output_directory" ]
 fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-bundle_directory="${root}/config/provider-profile-bundle/v1.2.1"
+bundle_directory="${root}/config/provider-profile-bundle/v1.2.2"
 archive_name="steward-runtime-providers-${version}.tar.gz"
 archive_path="${output_directory}/${archive_name}"
 digest_path="${output_directory}/provider-profile-bundle.digest"
@@ -71,16 +71,16 @@ if [[ -e "$archive_path" || -e "$digest_path" ]]; then
 fi
 
 bundle_paths=(
-  provider-profile-bundle/v1.2.1/README.md
-  provider-profile-bundle/v1.2.1/bundle.json
-  provider-profile-bundle/v1.2.1/profiles/steward-litellm.json
-  provider-profile-bundle/v1.2.1/profiles/steward-mcp-gw.json
-  provider-profile-bundle/v1.2.1/examples/inputs.json
-  provider-profile-bundle/v1.2.1/release.json
-  provider-profile-bundle/v1.2.1/bin/steward-provider-profile
+  provider-profile-bundle/v1.2.2/README.md
+  provider-profile-bundle/v1.2.2/bundle.json
+  provider-profile-bundle/v1.2.2/profiles/steward-litellm.json
+  provider-profile-bundle/v1.2.2/profiles/steward-mcp-gw.json
+  provider-profile-bundle/v1.2.2/examples/inputs.json
+  provider-profile-bundle/v1.2.2/release.json
+  provider-profile-bundle/v1.2.2/bin/steward-provider-profile
 )
 
-staged_bundle="${staging_directory}/provider-profile-bundle/v1.2.1"
+staged_bundle="${staging_directory}/provider-profile-bundle/v1.2.2"
 mkdir -p "${staged_bundle}/profiles" "${staged_bundle}/examples" "${staged_bundle}/bin"
 cp "${bundle_directory}/README.md" "${staged_bundle}/README.md"
 cp "${bundle_directory}/bundle.json" "${staged_bundle}/bundle.json"
@@ -117,13 +117,13 @@ else
 fi
 
 expected_entries="$(cat <<'ENTRIES'
-provider-profile-bundle/v1.2.1/README.md
-provider-profile-bundle/v1.2.1/bundle.json
-provider-profile-bundle/v1.2.1/profiles/steward-litellm.json
-provider-profile-bundle/v1.2.1/profiles/steward-mcp-gw.json
-provider-profile-bundle/v1.2.1/examples/inputs.json
-provider-profile-bundle/v1.2.1/release.json
-provider-profile-bundle/v1.2.1/bin/steward-provider-profile
+provider-profile-bundle/v1.2.2/README.md
+provider-profile-bundle/v1.2.2/bundle.json
+provider-profile-bundle/v1.2.2/profiles/steward-litellm.json
+provider-profile-bundle/v1.2.2/profiles/steward-mcp-gw.json
+provider-profile-bundle/v1.2.2/examples/inputs.json
+provider-profile-bundle/v1.2.2/release.json
+provider-profile-bundle/v1.2.2/bin/steward-provider-profile
 ENTRIES
 )"
 actual_entries="$(tar -tzf "$archive_path")"
@@ -140,14 +140,14 @@ for archived_file in \
   examples/inputs.json
 do
   if ! cmp -s "${bundle_directory}/${archived_file}" \
-    <(tar -xOzf "$archive_path" "provider-profile-bundle/v1.2.1/${archived_file}")
+    <(tar -xOzf "$archive_path" "provider-profile-bundle/v1.2.2/${archived_file}")
   then
     echo "provider-profile bundle archive content does not match ${archived_file}" >&2
     exit 1
   fi
 done
 if ! cmp -s "$installer" \
-  <(tar -xOzf "$archive_path" "provider-profile-bundle/v1.2.1/bin/steward-provider-profile")
+  <(tar -xOzf "$archive_path" "provider-profile-bundle/v1.2.2/bin/steward-provider-profile")
 then
   echo "provider-profile bundle archive installer does not match the released binary" >&2
   exit 1

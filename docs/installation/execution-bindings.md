@@ -101,13 +101,14 @@ under the exact configured IDs. Compute the configured digest from the immutable
 used by that installation and promote ID plus digest together; never mutate an installed ID in
 place.
 
-The documented provider-profile bundle 1.2.0-to-1.2.1 transition is the sole
-exception for this release. Connection operations select the fixed
-`steward-mcp-gw` ID without an execution binding, so that transition must stop
-the consumers, replace both policies under their existing IDs, rerun platform
-preflight to regenerate the binding digests, upgrade Steward, and then restart
-the consumers. Do not generalize that bounded transition to other profile
-changes.
+The documented 1.2.0-to-1.2.1 and 1.2.1-to-1.2.2 provider-profile transitions
+are the sole exceptions for this release. Connection operations select the
+fixed `steward-mcp-gw` ID without an execution binding, so each transition must
+stop both consumers (controller and apiserver), replace the bounded policies
+under their existing IDs, rerun platform preflight to regenerate the binding
+digests, upgrade Steward, and then restart both consumers. Bundle 1.2.2 adds
+only the missing MCP `DELETE` session-close transport rule. Do not generalize
+these bounded transitions to other profile changes.
 
 For an interpreted or launcher-based agent, conformance must identify the process that actually
 opens the governed connection. The provider profile must authorize that executable identity; do

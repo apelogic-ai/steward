@@ -30,6 +30,9 @@
 {{- if and .Values.web.ingress.enabled .Values.web.httpRoute.enabled }}
 {{- fail "choose exactly one edge route interface: web.ingress or web.httpRoute" }}
 {{- end }}
+{{- if and .Values.execution.enabled (not (has "steward-workflows" .Values.runtimeNamespaces)) }}
+{{- fail "execution.enabled requires steward-workflows in runtimeNamespaces" }}
+{{- end }}
 {{- if and .Values.connectionsBridge.enabled (not (has .Values.connectionsBridge.runtimeNamespace .Values.runtimeNamespaces)) }}
 {{- fail "connectionsBridge.runtimeNamespace must be one of runtimeNamespaces" }}
 {{- end }}

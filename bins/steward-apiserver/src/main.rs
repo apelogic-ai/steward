@@ -358,7 +358,7 @@ fn with_claude_code_execution_adapter(
     config: TaskApiConfig,
     inference_endpoint: Option<String>,
 ) -> Result<TaskApiConfig, io::Error> {
-    let Some(inference_endpoint) = inference_endpoint else {
+    let Some(inference_endpoint) = inference_endpoint.filter(|value| !value.is_empty()) else {
         return Ok(config);
     };
     let adapter = ClaudeCodeTaskExecutionAdapter::new(inference_endpoint).map_err(|error| {
@@ -722,9 +722,15 @@ async fn browser_application_router(
     .map_err(io::Error::other)?;
     let connections =
         governed_connections_configuration(&origin, store.clone(), task_orchestration_mode)?;
-    workflows::ensure_sample_workflow(&store, &workflow_agents)
+    if workflows::ensure_sample_workflow(&store, &workflow_agents)
         .await
-        .map_err(|error| io::Error::other(format!("sample Workflow bootstrap failed: {error}")))?;
+        .map_err(|error| io::Error::other(format!("sample Workflow bootstrap failed: {error}")))?
+        .is_none()
+    {
+        eprintln!(
+            "warning: onboarding sample Workflow is unavailable because no configured execution binding advertises its immutable agent"
+        );
+    }
     let app = browser_auth::browser_auth_router(auth.clone())
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(
@@ -1696,7 +1702,11 @@ impl Listener for TlsListener {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use axum::serve::Listener;
@@ -1720,6 +1730,16 @@ mod tests {
         stable_bridge_configuration_from_values, validate_execution_bindings,
         with_claude_code_execution_adapter,
     };
+
+    static NEXT_PREFLIGHT_CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct OwnedTestDirectory(std::path::PathBuf);
+
+    impl Drop for OwnedTestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn effective_access_human_output_names_eligible_templates() {
@@ -1970,6 +1990,130 @@ autoProvisionThreshold: null
             unavailable.is_err_and(|reason| reason.contains("claude-code-v1")),
             "an active Claude binding must fail startup when its endpoint-backed adapter is absent"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_claude_endpoint_is_absent_until_a_claude_binding_is_activated() -> Result<(), String> {
+        let codex_catalog = r#"{
+          "apiVersion": "steward.execution-bindings/v1",
+          "bindings": [{
+            "agentRef": "codex@1.2.3",
+            "displayName": "Codex",
+            "adapter": "codex-v1",
+            "image": "registry.example.test/agents/codex@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "executable": "/usr/bin/codex",
+            "versionProbe": {"arguments": ["--version"], "expectedStdout": "codex 1.2.3"},
+            "providerProfiles": {}
+          }]
+        }"#;
+        let codex = CodexTaskExecutionAdapter::new("https://inference.example.test/v1".to_owned())
+            .map_err(|error| format!("configure Codex adapter: {error:?}"))?;
+        let configured = with_claude_code_execution_adapter(
+            TaskApiConfig::default().with_execution_adapter(Arc::new(codex))?,
+            Some(String::new()),
+        )
+        .map_err(|error| error.to_string())?
+        .with_execution_bindings_json(Some(codex_catalog))?
+        .with_execution_bindings_active(true)?;
+
+        assert_eq!(configured.execution_binding_refs(), ["codex@1.2.3"]);
+        Ok(())
+    }
+
+    #[test]
+    fn generated_preflight_values_pass_apiserver_execution_config_validation() -> Result<(), String>
+    {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let directory = OwnedTestDirectory(std::env::temp_dir().join(format!(
+            "steward-preflight-apiserver-config-{}-{}",
+            std::process::id(),
+            NEXT_PREFLIGHT_CONFIG_TEST_ID.fetch_add(1, Ordering::Relaxed),
+        )));
+        let bundle = directory.0.join("provider-profile-bundle/v1.2.2");
+        let installer = bundle.join("bin/steward-provider-profile");
+        let output = directory.0.join("rendered");
+        fs::create_dir_all(
+            installer
+                .parent()
+                .ok_or_else(|| "installer has no parent".to_owned())?,
+        )
+        .map_err(|error| format!("create preflight fixture: {error}"))?;
+        fs::write(
+            &installer,
+            r##"#!/bin/sh
+set -eu
+if [ "$1" = "validate" ]; then
+  printf '%s\n' '{"schemaVersion":"steward.provider-profile-result/v1","operation":"validate","status":"valid","bundle":{"id":"steward-runtime-providers","version":"1.2.2"},"profiles":[{"id":"steward-litellm","digest":"sha256:7777777777777777777777777777777777777777777777777777777777777777"},{"id":"steward-mcp-gw","digest":"sha256:8888888888888888888888888888888888888888888888888888888888888888"}]}'
+else
+  printf '%s\n' '{"result":{"schemaVersion":"steward.provider-profile-result/v1","operation":"render","status":"valid"},"installation":{"schema":"steward.provider-profile-install-state/v1","bundle":{"id":"steward-runtime-providers","version":"1.2.2"},"profiles":{"steward-litellm":{"endpoints":[{"host":"inference.example.test","port":443,"allowed_ips":["192.0.2.0/24"],"access":"read-write"}],"credentials":[{"token_grant":{"audience":"steward-mcp"}}],"binaries":["/usr/bin/curl"]},"steward-mcp-gw":{"endpoints":[{"host":"mcp.example.test","port":443,"allowed_ips":["192.0.2.0/24"],"rules":[{"allow":{"method":"GET","path":"**"}},{"allow":{"method":"HEAD","path":"**"}},{"allow":{"method":"OPTIONS","path":"**"}},{"allow":{"method":"POST","path":"**"}},{"allow":{"method":"PUT","path":"**"}},{"allow":{"method":"PATCH","path":"**"}},{"allow":{"method":"DELETE","path":"**"}}]}],"credentials":[{"token_grant":{"audience":"steward-mcp"}}],"binaries":["/usr/bin/curl","/usr/local/bin/steward-connections-bridge"]}}}}'
+fi
+"##,
+        )
+        .map_err(|error| format!("write preflight fixture: {error}"))?;
+        let mut permissions = fs::metadata(&installer)
+            .map_err(|error| format!("read preflight fixture permissions: {error}"))?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&installer, permissions)
+            .map_err(|error| format!("make preflight fixture executable: {error}"))?;
+
+        let generated = Command::new("python3")
+            .arg(root.join("scripts/steward-platform-preflight.py"))
+            .args(["generate", "--input"])
+            .arg(root.join("config/platform-preflight/v1/examples/compact.json"))
+            .arg("--provider-profile-bundle")
+            .arg(&bundle)
+            .arg("--output")
+            .arg(&output)
+            .output()
+            .map_err(|error| format!("run platform preflight: {error}"))?;
+        if !generated.status.success() {
+            return Err(format!(
+                "platform preflight failed: {}",
+                String::from_utf8_lossy(&generated.stderr)
+            ));
+        }
+        let values: serde_json::Value = serde_json::from_slice(
+            &fs::read(output.join("steward-values.json"))
+                .map_err(|error| format!("read generated Steward values: {error}"))?,
+        )
+        .map_err(|error| format!("parse generated Steward values: {error}"))?;
+        let apiserver = values
+            .pointer("/config/apiserver")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| "generated values require config.apiserver".to_owned())?;
+        let inference_endpoint = apiserver
+            .get("inferenceEndpoint")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "generated values require inferenceEndpoint".to_owned())?;
+        let anthropic_endpoint = apiserver
+            .get("anthropicInferenceEndpoint")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let bindings_value = apiserver
+            .get("executionBindings")
+            .ok_or_else(|| "generated values require executionBindings".to_owned())?;
+        let expected_agent_ref = bindings_value
+            .pointer("/bindings/0/agentRef")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "generated execution binding requires an agentRef".to_owned())?
+            .to_owned();
+        let bindings = bindings_value.to_string();
+        let codex = CodexTaskExecutionAdapter::new(inference_endpoint.to_owned())
+            .map_err(|error| format!("configure generated Codex adapter: {error:?}"))?;
+        let configured = with_claude_code_execution_adapter(
+            TaskApiConfig::default().with_execution_adapter(Arc::new(codex))?,
+            Some(anthropic_endpoint.to_owned()),
+        )
+        .map_err(|error| error.to_string())?
+        .with_execution_bindings_json(Some(&bindings))?
+        .with_execution_bindings_active(true)?;
+        assert_eq!(
+            configured.execution_binding_refs(),
+            [expected_agent_ref.as_str()]
+        );
+
         Ok(())
     }
 

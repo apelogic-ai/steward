@@ -227,7 +227,7 @@ where
         .workflow_revision(SAMPLE_WORKFLOW_NAME, 1)
         .await?
     {
-        return sample_workflow_record(existing, agents).map(Some);
+        return sample_workflow_record(existing, agents);
     }
     if agents.is_empty() {
         return Ok(None);
@@ -247,13 +247,12 @@ where
         published_by: SAMPLE_WORKFLOW_ACTOR,
     };
     match repository.publish_initial_workflow(publication).await {
-        Ok(record) => sample_workflow_record(record, agents).map(Some),
+        Ok(record) => sample_workflow_record(record, agents),
         Err(StoreError::WorkflowAlreadyExists) => repository
             .workflow_revision(SAMPLE_WORKFLOW_NAME, 1)
             .await?
             .ok_or(StoreError::WorkflowNotFound)
-            .and_then(|record| sample_workflow_record(record, agents))
-            .map(Some),
+            .and_then(|record| sample_workflow_record(record, agents)),
         Err(error) => Err(error),
     }
 }
@@ -270,13 +269,14 @@ pub(crate) fn is_onboarding_sample_workflow(record: &WorkflowRevisionRecord) -> 
 fn sample_workflow_record(
     record: WorkflowRevisionRecord,
     agents: &[ExecutionBindingAdvertisement],
-) -> Result<WorkflowRevisionRecord, StoreError> {
-    let advertised = agents.iter().any(|agent| agent.agent_ref == record.agent);
-    if advertised && is_onboarding_sample_workflow(&record) {
-        Ok(record)
-    } else {
-        Err(StoreError::InvalidWorkflow)
+) -> Result<Option<WorkflowRevisionRecord>, StoreError> {
+    if !is_onboarding_sample_workflow(&record) {
+        return Err(StoreError::InvalidWorkflow);
     }
+    Ok(agents
+        .iter()
+        .any(|agent| agent.agent_ref == record.agent)
+        .then_some(record))
 }
 
 #[derive(Clone)]
@@ -821,8 +821,8 @@ mod tests {
         );
         assert_eq!(
             ensure_sample_workflow(&repository, &[]).await,
-            Err(StoreError::InvalidWorkflow),
-            "removing every advertised binding must not leave an unexecutable sample available"
+            Ok(None),
+            "removing every advertised binding must hide the immutable sample without blocking startup"
         );
         Ok(())
     }
