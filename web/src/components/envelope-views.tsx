@@ -282,7 +282,7 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
     : submission !== "idle" && submission !== "submitting"
       ? {
           conflict: "An equivalent envelope request already exists. Reload before retrying.",
-          rejected: "Steward rejected the custom authority. It must fit the deployment safety ceiling and capability catalog.",
+          rejected: "HyperShell rejected the custom authority. It must fit the deployment safety ceiling and capability catalog.",
           forbidden: "The Rust authorization boundary rejected the request.",
           unavailable: "The authoritative request service is unavailable.",
           error: "The request could not be accepted.",
@@ -293,7 +293,7 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
     <form className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
       <div>
         <h2 className="font-semibold">Complete requested authority</h2>
-        <p className="mt-1 text-sm text-muted-ink">Custom requests have no governing template and always require administrator approval. Steward validates the complete envelope against the deployment safety ceiling; model, tool, and limit values are specific to this deployment.</p>
+        <p className="mt-1 text-sm text-muted-ink">Custom requests have no governing template and always require administrator approval. HyperShell validates the complete envelope against the deployment safety ceiling; model, tool, and limit values are specific to this deployment.</p>
       </div>
       <label className="grid gap-2 text-sm font-semibold">Complete envelope JSON
         <textarea

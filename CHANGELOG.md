@@ -19,6 +19,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   audiences, and OpenShell-blocked IPv6 and IPv4-mapped CIDRs.
 - Documented the tested MCP-GW 0.5.1, LiteLLM v1.93.0, SPIRE, edge-timeout,
   resource, Pod Security, storage, pricing, and provider-consumer contracts.
+- Restored the HyperShell public identity, logo, favicon, page titles, and
+  product-facing copy in the web UI while retaining `steward` for package,
+  chart, CLI, and API names.
 
 ### Fixed
 
@@ -64,6 +67,15 @@ longer necessary.
   Codex does not append a second `/responses` path segment.
 - Returned bounded, versioned connection-operation errors that distinguish an
   OpenShell proxy policy denial from an MCP-GW runtime-authorization denial.
+
+### Known issues
+
+- The v0.3.3 apiserver rejects an empty
+  `config.apiserver.anthropicInferenceEndpoint` during startup even when no
+  `claude-code-v1` execution binding is configured. Before upgrading to
+  v0.3.3, set this field to the deployment's Anthropic-compatible LiteLLM base
+  URL. Steward v0.3.4 removes this temporary workaround for Codex-only
+  installations.
 
 ### Upgrade from 0.3.2
 

@@ -24,13 +24,13 @@ export function ConnectionsView() {
   }, [generation]);
   const state = useApiResource<ConnectionsCollectionResponse>(load);
   if (state.status === "forbidden" || state.status === "not-found") {
-    return <section aria-labelledby="page-title" className="space-y-6"><PageHeader description="Accounts your agents act through. Steward holds the credentials; agents never see them." title="Connections" /><ResourceBoundary state={state}>{() => null}</ResourceBoundary></section>;
+    return <section aria-labelledby="page-title" className="space-y-6"><PageHeader description="Accounts your agents act through. HyperShell holds the credentials; agents never see them." title="Connections" /><ResourceBoundary state={state}>{() => null}</ResourceBoundary></section>;
   }
   const canAdd = state.status === "ready" && state.value.available.some((candidate) => candidate.enabled
     && !state.value.connections.some((connection) => connection.provider === candidate.provider));
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader actions={<button className="h-10 rounded-control bg-brand px-4 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-40" disabled={!canAdd} type="button">+ Add connection</button>} description="Accounts your agents act through. Steward holds the credentials; agents never see them." title="Connections" />
+      <PageHeader actions={<button className="h-10 rounded-control bg-brand px-4 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-40" disabled={!canAdd} type="button">+ Add connection</button>} description="Accounts your agents act through. HyperShell holds the credentials; agents never see them." title="Connections" />
       {state.status === "ready" ? state.value.connections.map((connection) => <ProviderConnection connection={connection} key={connection.provider} refresh={() => setGeneration((value) => value + 1)} />) : <ProviderConnection metadataState={state.status} refresh={() => setGeneration((value) => value + 1)} />}
     </section>
   );

@@ -910,16 +910,17 @@ test("Next pages carry one strict nonce and nested developer navigation", async 
   }
 });
 
-test("the shell carries the Steward visual system", async ({ browser }) => {
+test("the shell carries the HyperShell visual system", async ({ browser }) => {
   const session = await guardedPage(browser);
   try {
     await session.page.goto(`${origin}/envelopes`);
-    await expect(session.page.getByRole("img", { name: "Steward" })).toHaveAttribute("src", "/icon.svg");
-    await expect(session.page.getByRole("link", { name: "Steward home" })).toHaveAttribute("href", "/envelopes");
-    await expect(session.page.locator("link[rel='icon'][href*='/icon.svg']")).toHaveCount(1);
-    const favicon = await session.page.request.get(`${origin}/icon.svg`);
+    await expect(session.page).toHaveTitle("Envelopes · HyperShell");
+    await expect(session.page.getByRole("img", { name: "HyperShell" })).toHaveAttribute("src", "/brand/logo");
+    await expect(session.page.getByRole("link", { name: "HyperShell home" })).toHaveAttribute("href", "/envelopes");
+    await expect(session.page.locator("link[rel='icon'][href*='/brand/logo']")).toHaveCount(1);
+    const favicon = await session.page.request.get(`${origin}/brand/logo`);
     expect(favicon.status()).toBe(200);
-    expect(favicon.headers()["content-type"]).toContain("image/svg+xml");
+    expect(favicon.headers()["content-type"]).toContain("image/jpeg");
 
     const brand = await session.page.evaluate(() => {
       const body = getComputedStyle(document.body);
@@ -940,14 +941,14 @@ test("the shell carries the Steward visual system", async ({ browser }) => {
       sidebarBorder: "rgb(47, 52, 55)",
       primary: "rgb(251, 81, 8)",
     });
-    await expect(session.page.getByRole("link", { name: "Steward home" })).toHaveCSS("color", "rgb(236, 238, 239)");
+    await expect(session.page.getByRole("link", { name: "HyperShell home" })).toHaveCSS("color", "rgb(236, 238, 239)");
     await expect(session.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Runs", exact: true })).toHaveCSS("color", "rgb(162, 168, 171)");
   } finally {
     await closeGuardedPage(session);
   }
 });
 
-test("the Steward handoff structure is preserved on primary workspaces", async ({ browser }) => {
+test("the HyperShell handoff structure is preserved on primary workspaces", async ({ browser }) => {
   const developer = await guardedPage(browser, { colorScheme: "light", includeSampleWorkflow: true });
   try {
     await developer.page.goto(`${origin}/envelopes`);
