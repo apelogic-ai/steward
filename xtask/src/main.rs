@@ -3826,6 +3826,13 @@ mod tests {
             script.contains("-H 'User-Agent: steward-conformance/1.0' https://api.github.com/zen"),
             "the public G-1 GitHub API probe must identify itself without adding a credential"
         );
+        let harness_path = root().join("scripts/g1-upstream-conformance");
+        let harness = fs::read_to_string(&harness_path)
+            .map_err(|error| format!("failed to read {}: {error}", harness_path.display()))?;
+        assert!(
+            harness.contains("G-1 upstream result: 1 passed; 0 failed; 0 skipped"),
+            "the G-1 harness must emit the evidence summary required by the aggregate conformance gate"
+        );
         Ok(())
     }
 

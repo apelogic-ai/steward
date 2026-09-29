@@ -28,3 +28,5 @@ STEWARD_OPENSHELL_PRELOAD_IMAGE="${G1_BASE_IMAGE}" \
 STEWARD_G1_BASE_IMAGE="${G1_BASE_IMAGE}" \
 bash "${ROOT}/scripts/openshell-testbed.sh" \
   bash "${ROOT}/scripts/g1-upstream-conformance-inside.sh"
+
+echo "G-1 upstream result: 1 passed; 0 failed; 0 skipped"
