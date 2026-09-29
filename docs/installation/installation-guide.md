@@ -407,8 +407,9 @@ preserve the same immutable coordinates and cross-component relationships.
        litellmUrl: https://litellm.example.test
      mint:
        issuer: https://mint.example.test
-       spiffeTrustDomain: customer.example.test
-       openshellNamespace: customer-openshell
+       audience: steward-mcp
+       spiffeTrustDomain: trust.example.test
+       openshellNamespace: openshell
    runtimeNamespaces: [steward-tasks]
    ```
 
@@ -435,7 +436,7 @@ preserve the same immutable coordinates and cross-component relationships.
    versioned bundle, extract the attested release asset and use its bundled
    `bin/steward-provider-profile` executable to validate, install, and reconcile
    the deployment-neutral inputs as shown in the
-   [bundle guide](../../config/provider-profile-bundle/v1.2.0/README.md). The
+   [bundle guide](../../config/provider-profile-bundle/v1.2.1/README.md). The
    released tool is self-contained for `linux/amd64`; no Steward checkout or
    Rust toolchain is required.
    Record each installed profile ID and immutable policy digest in the
@@ -444,6 +445,11 @@ preserve the same immutable coordinates and cross-component relationships.
    the corresponding category. Pinned OpenShell v0.0.98 cannot attest profile
    content itself, so the deployment system must keep each installed ID
    immutable and verify the rendered bytes against the recorded digest.
+   Bundle 1.2.1 uses the single `config.mint.audience` for both inference and
+   MCP token grants, permits POST transport for read-only MCP JSON-RPC, and
+   rejects CIDRs that overlap OpenShell's unconditional deny ranges. Upgrade
+   1.2.0 with the explicit transition in the bundle guide; do not mutate the
+   existing profile IDs in place.
    For `codex@0.140.0`, use or mirror the digest-selected image and run the
    [released runtime conformance](codex-reference-runtime.md) before activating its binding.
 

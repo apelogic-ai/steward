@@ -33,7 +33,7 @@ class PlatformPreflightTests(unittest.TestCase):
         self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.profile_bundle = pathlib.Path(self.temporary.name) / "provider-profile-bundle" / "v1.2.0"
+        self.profile_bundle = pathlib.Path(self.temporary.name) / "provider-profile-bundle" / "v1.2.1"
         self.write_profile_installer(include_bridge_binary=True)
 
     def write_profile_installer(
@@ -60,11 +60,13 @@ class PlatformPreflightTests(unittest.TestCase):
             "    binaries = ['/usr/bin/curl']\n"
             f"    if profile['id'] == 'steward-mcp-gw' and {include_bridge_binary!r}:\n"
             "      binaries.append('/usr/local/bin/steward-connections-bridge')\n"
+            "    access = 'read-write' if profile['id'] == 'steward-mcp-gw' else 'read-write'\n"
             "    profiles[profile['id']] = {\n"
-            "      'endpoints': [{'host': origin.hostname, 'port': origin.port or 443, 'allowed_ips': profile['inputs']['service-cidrs']}],\n"
+            "      'endpoints': [{'host': origin.hostname, 'port': origin.port or 443, 'access': access, 'allowed_ips': profile['inputs']['service-cidrs']}],\n"
+            "      'credentials': [{'token_grant': {'audience': profile['inputs']['mint-audience']}}],\n"
             "      'binaries': binaries,\n"
             "    }\n"
-            "  installation = {'schema': 'steward.provider-profile-install-state/v1', 'bundle': {'id': 'steward-runtime-providers', 'version': '1.2.0'}, 'profiles': profiles}\n"
+            "  installation = {'schema': 'steward.provider-profile-install-state/v1', 'bundle': {'id': 'steward-runtime-providers', 'version': '1.2.1'}, 'profiles': profiles}\n"
             "  result = {'schemaVersion': 'steward.provider-profile-result/v1', 'operation': 'render', 'status': 'valid'}\n"
             "  print(json.dumps({'result': result, 'installation': installation}, separators=(',', ':')))\n"
             "else:\n"
@@ -72,7 +74,7 @@ class PlatformPreflightTests(unittest.TestCase):
             "    'schemaVersion': 'steward.provider-profile-result/v1',\n"
             "    'operation': 'validate',\n"
             "    'status': 'valid',\n"
-            "    'bundle': {'id': 'steward-runtime-providers', 'version': '1.2.0'},\n"
+            "    'bundle': {'id': 'steward-runtime-providers', 'version': '1.2.1'},\n"
             f"    'profiles': {validated_profiles}\n"
             "  }, separators=(',', ':')))\n",
             encoding="utf-8",
@@ -341,7 +343,24 @@ class PlatformPreflightTests(unittest.TestCase):
         self.input["providerProfiles"][1]["inputs"]["serviceCidrs"] = ["0.0.0.0/0"]
         result = self.run_validate(self.input)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("must not contain 0.0.0.0/0", result.stderr)
+        self.assertIn("overlaps an OpenShell always-blocked range", result.stderr)
+
+    def test_rejects_every_openshell_always_blocked_provider_cidr(self) -> None:
+        for cidr in (
+            "0.0.0.0/32",
+            "127.0.0.0/8",
+            "127.1.0.0/16",
+            "169.254.0.0/16",
+            "::/0",
+            "::/128",
+            "::1/128",
+        ):
+            with self.subTest(cidr=cidr):
+                value = copy.deepcopy(self.input)
+                value["providerProfiles"][1]["inputs"]["serviceCidrs"] = [cidr]
+                result = self.run_validate(value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("overlaps an OpenShell always-blocked range", result.stderr)
 
     def test_rejects_mcp_profile_without_connections_bridge_binary(self) -> None:
         self.write_profile_installer(include_bridge_binary=False)
@@ -373,7 +392,12 @@ class PlatformPreflightTests(unittest.TestCase):
             self.assertEqual(profiles["tools"]["digest"], "sha256:" + "8" * 64)
             self.assertEqual(profiles["inference"]["digest"], "sha256:" + "7" * 64)
             profile_inputs = json.loads((base / "first" / "provider-profile-inputs.json").read_text(encoding="utf-8"))
-            self.assertEqual(profile_inputs["bundle"]["version"], "1.2.0")
+            self.assertEqual(profile_inputs["bundle"]["version"], "1.2.1")
+            self.assertEqual(
+                {profile["inputs"]["mint-audience"] for profile in profile_inputs["profiles"]},
+                {"steward-mcp"},
+            )
+            self.assertEqual(rendered_values["config"]["mint"]["audience"], "steward-mcp")
 
     def test_complete_governed_example_emits_and_renders_all_required_values(self) -> None:
         complete = json.loads(COMPLETE.read_text(encoding="utf-8"))

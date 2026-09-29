@@ -18,8 +18,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Fixed
 
 - Made the platform preflight inspect the rendered tools profile, require its
-  MCP-GW endpoint to match the connections bridge, reject unrestricted IPv4
-  egress, and require the released connections-bridge binary.
+  MCP-GW endpoint to match the connections bridge, reject every OpenShell
+  always-blocked CIDR overlap, and require the released connections-bridge
+  binary.
+- Published provider-profile bundle 1.2.1, which permits the POST transport
+  required by read-only MCP operations and renders one deployment-configured
+  Mint audience for both MCP and inference grants, with an exact 1.2.0 upgrade
+  transition.
+- Normalized an exact OpenAI Responses operation URL to the Codex base URL so
+  Codex does not append a second `/responses` path segment.
 - Returned bounded, versioned connection-operation errors that distinguish an
   OpenShell proxy policy denial from an MCP-GW runtime-authorization denial.
 

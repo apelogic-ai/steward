@@ -16,7 +16,7 @@ installer_architecture="$(uname -m)"
   --installer-architecture "$installer_architecture" \
   --output "$temporary/provider-release" >/dev/null
 tar -xzf "$temporary/provider-release/steward-runtime-providers-0.3.3.tar.gz" -C "$temporary"
-provider_bundle="$temporary/provider-profile-bundle/v1.2.0"
+provider_bundle="$temporary/provider-profile-bundle/v1.2.1"
 for name in first second; do
   "$root/scripts/package-platform-preflight.sh" 0.3.3 "$temporary/$name"
 done

@@ -88,10 +88,12 @@ change before using it as acceptance evidence.
 Inspect the supervisor decisions with:
 
 ```sh
-openshell logs <sandbox-name> --level info
+openshell logs <sandbox-name> --source sandbox --level info
 ```
 
-Read the `openshell-supervisor-network` records for the first provider request.
+At info level, the supervisor decision is an OCSF record; the sidecar may also
+emit the corresponding warning. Read the `openshell-supervisor-network`
+records for the first provider request.
 A proxy policy or SSRF denial means the endpoint policy rejected the request.
 An MCP-GW authorization denial means the request reached MCP-GW but its runtime
 authority was rejected. Steward v0.3.3 preserves these as the distinct,
@@ -105,9 +107,20 @@ the following before it emits deployment values:
 
 - `execution.connectionsBridge.mcpGatewayOrigin` has the same host and
   effective port as the rendered tools-profile endpoint;
-- no rendered endpoint contains `allowed_ips: ["0.0.0.0/0"]`; and
+- no rendered endpoint CIDR overlaps `0.0.0.0`, IPv4 loopback,
+  IPv4 link-local, `::`, or `::1`, which OpenShell always blocks; and
 - the selected tools profile contains
   `/usr/local/bin/steward-connections-bridge`.
+
+The preflight also requires the exact same Mint audience in the MCP and
+inference profiles, and writes that value to `config.mint.audience`. The MCP
+profile uses POST-capable transport because MCP JSON-RPC and connection
+operations are POST requests; MCP-GW and Mint still enforce the declared
+read-only application authority.
+
+`namespaces.runtime` is the workflow sandbox namespace generated into Steward
+values. It may equal the control-plane namespace, but it must still be named
+explicitly so a separated layout cannot silently place workloads elsewhere.
 
 Use one exact MCP-GW origin in both the connection bridge and provider-profile
 input. Do not work around a mismatch by widening provider egress.

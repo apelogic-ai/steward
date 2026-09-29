@@ -52,7 +52,7 @@ release artifacts.
 | Connections bridge, when used | `build/connections-bridge.Dockerfile` |
 | Web, when used | `build/web.Dockerfile` |
 | Helm chart | `charts/steward` from the same source revision |
-| Runtime provider bundle | `scripts/package-provider-profile-bundle.sh`; currently packages `steward-runtime-providers@1.2.0` |
+| Runtime provider bundle | `scripts/package-provider-profile-bundle.sh`; currently packages `steward-runtime-providers@1.2.1` |
 
 The release workflow builds `linux/amd64` component images. Local Apple Silicon
 OpenShell agent verification needs native `linux/arm64` sandbox derivatives;

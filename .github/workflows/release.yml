@@ -692,10 +692,10 @@ jobs:
                 }
               },
               providerProfileBundle: {
-                identity: "steward-runtime-providers@1.2.0",
+                identity: "steward-runtime-providers@1.2.1",
                 digest: $provider_digest,
                 installer: {
-                  path: "provider-profile-bundle/v1.2.0/bin/steward-provider-profile",
+                  path: "provider-profile-bundle/v1.2.1/bin/steward-provider-profile",
                   os: "linux",
                   architecture: "amd64"
                 }
@@ -763,12 +763,12 @@ jobs:
             printf 'Bridge attestation bundle: bridge-attestation-bundle.jsonl\n\n'
             printf '\n## Provider-profile bundle provenance inputs\n\n'
             printf 'Provider profile bundle asset: %s\n\n' "$provider_profile_bundle_asset"
-            printf 'Provider profile bundle identity: steward-runtime-providers@1.2.0\n\n'
+            printf 'Provider profile bundle identity: steward-runtime-providers@1.2.1\n\n'
             printf 'Provider profile bundle SHA-256: %s\n\n' "$provider_profile_bundle_digest"
             printf 'Provider profile bundle signer identity: %s\n\n' "$bridge_signer_identity"
             printf 'Provider profile bundle source repository: %s\n\n' "$bridge_source_repository"
             printf 'Provider profile bundle source commit: %s\n\n' "$GITHUB_SHA"
-            printf 'Provider profile installer: provider-profile-bundle/v1.2.0/bin/steward-provider-profile (linux/amd64)\n\n'
+            printf 'Provider profile installer: provider-profile-bundle/v1.2.1/bin/steward-provider-profile (linux/amd64)\n\n'
             printf 'Provider profile bundle verification: pin the SHA-256 above; verify GitHub artifact provenance with this signer identity, repository, tag, and source commit; then verify the downloaded archive SHA-256 before render/install.\n\n'
             printf '\n## Registry mirror and deployment lock\n\n'
             printf 'Mirror tool asset: %s\n\n' "$mirror_asset"

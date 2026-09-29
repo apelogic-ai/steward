@@ -21,7 +21,7 @@ tar -xzf steward-runtime-providers-0.3.3.tar.gz
 cd platform-preflight/v1
 ./steward-platform-preflight generate \
   --input examples/governed-complete.json \
-  --provider-profile-bundle ../../provider-profile-bundle/v1.2.0 \
+  --provider-profile-bundle ../../provider-profile-bundle/v1.2.1 \
   --chart /path/to/steward-chart \
   --output rendered
 ```
@@ -35,9 +35,12 @@ the configured certificate names, or Helm lint/render failure. The generated
 the released provider-profile installer. The preflight invokes that released
 installer in validation mode and puts its computed profile digests into the
 execution binding; deployment input cannot substitute unrelated profile
-digests. It also inspects the rendered tools profile: the MCP-GW endpoint must
-match the connections-bridge origin by host and effective port, unrestricted
-IPv4 egress is rejected, and the bridge binary must be present. The input
+digests. It also inspects the rendered profiles: the MCP-GW endpoint must
+match the connections-bridge origin by host and effective port, the MCP
+transport must admit POST, every token grant must use the configured single
+Mint audience, OpenShell always-blocked CIDR overlaps are rejected, and the
+bridge binary must be present. Mismatched MCP origins, Mint audiences, or
+provider CIDRs fail before Helm output is emitted. The input
 embeds the exact
 `steward.deployment-lock/v1` document produced by the released registry mirror
 tool, so component, bridge, and coding-agent coordinates require no manual
