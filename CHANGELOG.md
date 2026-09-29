@@ -7,6 +7,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-28
+
+### Changed
+
+- Documented the supported stock OpenShell v0.0.98 sidecar topology, Kubernetes
+  1.35 init-container sideload setting, sandbox SPIFFE identity, lazy provider
+  token grants, and supervisor decision diagnostics.
+
+### Fixed
+
+- Made the platform preflight inspect the rendered tools profile, require its
+  MCP-GW endpoint to match the connections bridge, reject unrestricted IPv4
+  egress, and require the released connections-bridge binary.
+- Returned bounded, versioned connection-operation errors that distinguish an
+  OpenShell proxy policy denial from an MCP-GW runtime-authorization denial.
+
+This patch changes no chart defaults and adds no database migration.
+
 ## [0.3.2] - 2026-09-28
 
 ### Changed
@@ -268,7 +286,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/apelogic-ai/steward/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/apelogic-ai/steward/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/apelogic-ai/steward/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/apelogic-ai/steward/compare/v0.2.6...v0.3.0

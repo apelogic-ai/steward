@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.2` and application `0.3.2`.
+Current release contract: chart `0.3.3` and application `0.3.3`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -506,6 +506,13 @@ authenticated TLS failures, CA and server-name validation, the
 cluster-default runtime is retained in the Sandbox pod template, input/output
 SHA-256 equality, and sandbox-last cleanup. This lane proves functional
 execution. It does not prove a VM isolation boundary.
+
+The supported stock OpenShell v0.0.98 deployment uses the sidecar supervisor
+with process-binary-aware network policy. When provider token grants are
+enabled, configure the sandbox ClusterSPIFFEID and Workload API socket and use
+the `openshell.io/sandbox-id` annotation contract. See
+[OpenShell 0.0.98 governed execution](../../docs/installation/openshell-v0.0.98.md)
+for the exact values, Kubernetes 1.35 sideload setting, and diagnostic command.
 
 ## Network policy
 

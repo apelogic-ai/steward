@@ -626,7 +626,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.2"
+          test "$version" = "0.3.3"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
@@ -736,12 +736,12 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.2 requires the complete seven-route public apiserver edge contract and presents the OSS web application consistently as Steward.\n\n'
-            printf 'The chart, platform preflight, and runtime reject the empty-suffix organization identifier org_, and the supported Kubernetes floor is now 1.32.\n\n'
+            printf 'Steward v0.3.3 documents and validates the supported stock OpenShell v0.0.98 sidecar topology and provider-token-grant boundary.\n\n'
+            printf 'The platform preflight verifies MCP-GW endpoint coupling, rejects unrestricted provider egress, and connection failures distinguish proxy policy from provider authorization.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
             printf 'This patch adds no migration. Installations upgrading from v0.2.6 must still complete the v0.3 prerequisites before rollout.\n\n'
-            printf 'Rollback from v0.3.2 to v0.3.1 requires no database rollback. The broader v0.2.6 rollback boundary remains unchanged; see docs/installation/upgrade-v0.3.0.md.\n\n'
+            printf 'Rollback from v0.3.3 to v0.3.2 requires no database rollback. The broader v0.2.6 rollback boundary remains unchanged; see docs/installation/upgrade-v0.3.0.md.\n\n'
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
@@ -811,7 +811,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.2.json
+          subject-path: dist/steward-product-compatibility-0.3.3.json
 
       - name: Archive product compatibility verification material
         env:
@@ -821,7 +821,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.2.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.3.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 

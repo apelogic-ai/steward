@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.3.2`. The release workflow pulls the published OCI
+Release contract: chart `0.3.3`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -108,6 +108,12 @@ Runtime support is the Kubernetes/OpenShell default. Operators may set
 `config.controller.openshellRuntimeClassName` only when their platform requires
 an explicit class. That optional override is deployment configuration, not a
 separate Steward-supported runtime or an isolation certification.
+
+OpenShell v0.0.98 must use the supported sidecar topology, sandbox SPIFFE
+identity, and lazy provider-token-grant configuration described in
+[OpenShell 0.0.98 governed execution](openshell-v0.0.98.md). In particular,
+do not combine its stock `combined` supervisor topology with provider token
+grants.
 
 Integration ownership is explicit: core requires only PostgreSQL, Kubernetes
 TokenReview/API access, and service TLS; Jira adds a decision channel; browser
