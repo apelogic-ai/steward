@@ -182,6 +182,12 @@ pub enum ConnectionBrokerError {
     Unavailable,
 }
 
+impl IntoResponse for ConnectionBrokerError {
+    fn into_response(self) -> Response {
+        connection_broker_error_response(self)
+    }
+}
+
 pub trait ProviderConnectionBroker<B>: Clone + Send + Sync + 'static
 where
     B: Clone + Eq + Hash + Send + Sync + 'static,

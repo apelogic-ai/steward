@@ -514,63 +514,81 @@ fn sanitized_gateway_failure_detail(body: &[u8]) -> Option<String> {
         .clone();
     let value = object
         .get("error")
-        .or_else(|| object.get("code"))?
-        .as_str()?;
+        .and_then(Value::as_str)
+        .or_else(|| object.get("code").and_then(Value::as_str))?;
     sanitized_gateway_failure_scalar(value)
 }
 
 fn sanitized_gateway_failure_scalar(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty()
-        || value.chars().any(char::is_control)
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b' ' | b'.' | b',' | b':' | b';' | b'\'' | b'(' | b')' | b'_' | b'/' | b'-'
+                )
+        })
         || contains_sensitive_gateway_failure_material(value)
     {
         return None;
     }
-    let mut end = value.len().min(MAX_GATEWAY_FAILURE_DETAIL_BYTES);
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    Some(value[..end].to_owned())
+    let truncated = value[..value.len().min(MAX_GATEWAY_FAILURE_DETAIL_BYTES)].trim_end();
+    (!truncated.is_empty()).then(|| truncated.to_owned())
 }
 
 fn contains_sensitive_gateway_failure_material(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    if (lower.contains("http://") || lower.contains("https://")) && lower.contains('?') {
-        return true;
-    }
-    if lower.contains("bearer ")
-        || [
-            "authorization",
-            "token",
-            "secret",
-            "password",
-            "api_key",
-            "api-key",
-            "apikey",
-        ]
-        .iter()
-        .any(|key| {
-            lower.match_indices(key).any(|(index, _)| {
-                matches!(lower.as_bytes().get(index + key.len()), Some(b'=' | b':'))
-            })
-        })
+    if [
+        "authorization",
+        "bearer",
+        "cookie",
+        "token",
+        "secret",
+        "password",
+        "api_key",
+        "api-key",
+        "apikey",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
     {
         return true;
     }
+
+    let has_compact_high_entropy_word = value
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '_' && character != '-'
+        })
+        .any(|word| {
+            word.len() >= 20
+                && word.bytes().any(|byte| byte.is_ascii_alphabetic())
+                && word.bytes().any(|byte| byte.is_ascii_digit())
+        });
+    if has_compact_high_entropy_word {
+        return true;
+    }
+
     value
         .split(|character: char| {
             character.is_whitespace() || matches!(character, '"' | '\'' | '(' | ')' | ',' | ';')
         })
         .any(|word| {
             let segments = word.split('.').collect::<Vec<_>>();
-            segments.len() == 3
-                && segments.iter().all(|segment| {
+            segments.windows(3).any(|window| {
+                window.iter().all(|segment| {
                     segment.len() >= 8
                         && segment
                             .bytes()
                             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
                 })
+            })
         })
 }
 
@@ -1352,6 +1370,21 @@ mod tests {
             b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (https://provider.example.test/callback?token=obviously-fake-secret)".as_slice(),
             b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (authorization: Bearer obviously-fake-secret)".as_slice(),
             b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (aaaaaaaa.bbbbbbbb.cccccccc)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (/oauth/callback?code=abc&state=xyz)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (gh.example/cb?code=abc&state=xyz)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (code=abc)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (state=xyz)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (ghp_1234567890abcdef)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (gho_1234567890abcdef)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (token abcdefghijklmnop)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (Authorization : abc)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (Cookie: session=abc)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (set-cookie session=abc)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (alice@example.com)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (prefix.aaaaaaaa.bbbbbbbb.cccccccc)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (request Abcdefghijklmnop12345 rejected)".as_slice(),
+            "steward-connections-bridge: bridge MCP-GW returned HTTP 400 (unsafe\u{2028}detail)".as_bytes(),
         ] {
             assert_eq!(
                 github_bridge_failure_diagnostic(hostile),
@@ -1359,6 +1392,30 @@ mod tests {
                 "untrusted bridge stderr must not become a persisted diagnostic"
             );
         }
+
+        let userinfo = format!(
+            "steward-connections-bridge: bridge MCP-GW returned HTTP 400 ({}{}{}:{}{}host.example.test/path)",
+            "https", "://", "user", "pw", "@"
+        );
+        assert_eq!(
+            github_bridge_failure_diagnostic(userinfo.as_bytes()),
+            None,
+            "URL userinfo must never become a persisted diagnostic"
+        );
+
+        let trailing = serde_json::json!({"error": format!("{} zzz", "a".repeat(199))}).to_string();
+        assert_eq!(
+            parse_response(
+                GatewayContract::LifecycleV049,
+                GithubBridgeOperation::Start,
+                StatusCode::BAD_REQUEST,
+                trailing.as_bytes(),
+            ),
+            Err(PortError::Failed {
+                reason: format!("MCP-GW returned HTTP 400 ({})", "a".repeat(199)),
+            }),
+            "truncation must not retain trailing whitespace"
+        );
     }
 
     #[tokio::test]

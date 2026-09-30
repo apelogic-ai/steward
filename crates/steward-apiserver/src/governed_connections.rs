@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use reqwest::Url;
@@ -864,11 +865,23 @@ where
 #[derive(Clone)]
 pub struct ConnectionOperationReconciler {
     store: PgStore,
+    failure_reporter: Arc<dyn Fn(String) + Send + Sync>,
 }
 
 impl ConnectionOperationReconciler {
     pub fn new(store: PgStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            failure_reporter: Arc::new(|line| eprintln!("{line}")),
+        }
+    }
+
+    pub fn with_failure_reporter(
+        mut self,
+        reporter: impl Fn(String) + Send + Sync + 'static,
+    ) -> Self {
+        self.failure_reporter = Arc::new(reporter);
+        self
     }
 
     pub async fn run(self) {
@@ -892,10 +905,7 @@ impl ConnectionOperationReconciler {
         self.store
             .fail_connection_operation(operation_id, failure.category, detail.as_ref())
             .await?;
-        eprintln!(
-            "{}",
-            connection_operation_failure_log_line(operation_id, failure)
-        );
+        (self.failure_reporter)(connection_operation_failure_log_line(operation_id, failure));
         Ok(())
     }
 
