@@ -517,6 +517,14 @@ preserve the same immutable coordinates and cross-component relationships.
    The core render must contain no Mint Deployment or ClusterSPIFFEID, Jira
    token projection, OpenShell/LiteLLM credentials, or model endpoint.
 
+   The apiserver and controller ClusterRoles must not grant `impersonate` on
+   Kubernetes users or groups. They write AgentRuntime resources as their own
+   exact service-account identities; the validating webhook separately checks
+   principal immutability, the bound member-role annotation, Envelope and grant
+   limits, and immutable authority. Treat the remaining AgentRuntime
+   create/update permissions as control-plane authority, but do not grant
+   either service account broader cluster identity privileges.
+
 3. Install using only the selected cluster. Example for customer TLS mode:
 
    ```sh

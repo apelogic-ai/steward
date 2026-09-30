@@ -10,12 +10,10 @@ use std::time::Duration as StdDuration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::{HeaderName, HeaderValue};
 use axum::routing::post;
 use axum::{Json, Router};
 use futures::StreamExt;
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams, Preconditions};
-use kube::core::Request as KubeRequest;
 use kube::core::admission::{AdmissionRequest, AdmissionResponse, Operation};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::controller::{Action, Controller};
@@ -3791,7 +3789,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 .annotations
                                 .get_or_insert_default()
                                 .remove(PENDING_APPROVAL_ANNOTATION);
-                            replace_pending_as_controller(&context.client, &proposed).await?;
+                            replace_as_controller(&context.client, &proposed).await?;
                             return Ok(Action::requeue(StdDuration::from_secs(2)));
                         }
                     }
@@ -3901,13 +3899,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 AuthorityAction::Continue => {}
                                 AuthorityAction::Restore(mut restored) => {
                                     restored.metadata = runtime.metadata.clone();
-                                    replace_grant_as_authority(
-                                        &context.client,
-                                        &restored,
-                                        &reversion.actor,
-                                        &reversion.member_role,
-                                    )
-                                    .await?;
+                                    replace_as_controller(&context.client, &restored).await?;
                                     return Ok(Action::requeue(StdDuration::from_secs(2)));
                                 }
                                 AuthorityAction::Suspend => {
@@ -3944,13 +3936,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                         .annotations
                                         .get_or_insert_default()
                                         .remove(PENDING_APPROVAL_ANNOTATION);
-                                    replace_grant_as_authority(
-                                        &context.client,
-                                        &proposed,
-                                        &application.application.actor,
-                                        &application.application.member_role,
-                                    )
-                                    .await?;
+                                    replace_as_controller(&context.client, &proposed).await?;
                                     return Ok(Action::requeue(StdDuration::from_secs(2)));
                                 }
                                 AuthorityAction::Continue | AuthorityAction::Suspend => {}
@@ -4538,64 +4524,7 @@ fn suspended_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, Contro
     })
 }
 
-async fn replace_as_authority(
-    client: &Client,
-    runtime: &AgentRuntime,
-    actor: &str,
-    member_role: &str,
-) -> Result<(), ControllerError> {
-    if is_pending_approval(runtime) {
-        return replace_pending_as_controller(client, runtime).await;
-    }
-    let namespace = runtime
-        .namespace()
-        .ok_or(ControllerError::Reconcile(ReconcileError::MissingNamespace))?;
-    let body = serde_json::to_vec(runtime).map_err(|error| {
-        ControllerError::Reconcile(ReconcileError::InvalidSpec {
-            reason: error.to_string(),
-        })
-    })?;
-    let mut request = KubeRequest::new(format!(
-        "/apis/agents.apelogic.ai/v1alpha1/namespaces/{namespace}/agentruntimes"
-    ))
-    .replace(&runtime.name_any(), &PostParams::default(), body)
-    .map_err(|error| ControllerError::Reconcile(ReconcileError::Authority(error.to_string())))?;
-    request.headers_mut().insert(
-        HeaderName::from_static("impersonate-user"),
-        HeaderValue::from_str(actor).map_err(|error| {
-            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
-        })?,
-    );
-    request.headers_mut().insert(
-        HeaderName::from_static("impersonate-group"),
-        HeaderValue::from_str(&format!("{MEMBER_ROLE_GROUP_PREFIX}{member_role}")).map_err(
-            |error| ControllerError::Reconcile(ReconcileError::Authority(error.to_string())),
-        )?,
-    );
-    client
-        .request::<AgentRuntime>(request)
-        .await
-        .map(|_| ())
-        .map_err(ControllerError::Kubernetes)
-}
-
-async fn replace_grant_as_authority(
-    client: &Client,
-    runtime: &AgentRuntime,
-    actor: &str,
-    scope_ref: &str,
-) -> Result<(), ControllerError> {
-    match &runtime.spec.principal {
-        steward_types::Principal::User { .. } => {
-            replace_as_authority(client, runtime, actor, scope_ref).await
-        }
-        steward_types::Principal::Service { .. } => {
-            replace_pending_as_controller(client, runtime).await
-        }
-    }
-}
-
-async fn replace_pending_as_controller(
+async fn replace_as_controller(
     client: &Client,
     runtime: &AgentRuntime,
 ) -> Result<(), ControllerError> {
@@ -4728,13 +4657,15 @@ pub async fn validate_admission<R: WebhookEnvelopeReader>(
     request: &AdmissionRequest<AgentRuntime>,
     envelopes: &R,
 ) -> AdmissionResponse {
-    validate_admission_with_trusted_writers(request, envelopes, &BTreeSet::new()).await
+    validate_admission_with_trusted_writers(request, envelopes, &BTreeSet::new(), &BTreeSet::new())
+        .await
 }
 
 async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
     request: &AdmissionRequest<AgentRuntime>,
     envelopes: &R,
     trusted_writer_usernames: &BTreeSet<String>,
+    user_writer_usernames: &BTreeSet<String>,
 ) -> AdmissionResponse {
     let response = AdmissionResponse::from(request);
     if request.operation == Operation::Delete {
@@ -4799,11 +4730,12 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
             return response.deny("canonical runtime authority is immutable");
         }
     }
-    let trusted_canonical_user_write = matches!(
+    let trusted_user_write = matches!(
         &runtime.spec.principal,
         steward_types::Principal::User { .. }
-    ) && runtime.spec.canonical_authority.is_some()
-        && trusted_writer_usernames.contains(username);
+    ) && ((runtime.spec.canonical_authority.is_some()
+        && trusted_writer_usernames.contains(username))
+        || user_writer_usernames.contains(username));
     let pending = runtime
         .annotations()
         .get(PENDING_APPROVAL_ANNOTATION)
@@ -4846,7 +4778,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
                 .deny("pending AgentRuntime spec may be changed only by a trusted Steward writer");
         }
         trusted_pending_transition |= trusted_pending_writer;
-        if !trusted_pending_transition && !trusted_canonical_user_write {
+        if !trusted_pending_transition && !trusted_user_write {
             match &old_runtime.spec.principal {
                 steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
                 _ => {
@@ -4857,7 +4789,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
             }
         }
     }
-    if !trusted_pending_transition && !trusted_canonical_user_write {
+    if !trusted_pending_transition && !trusted_user_write {
         match &runtime.spec.principal {
             steward_types::Principal::User { acting_user } if acting_user.0 == username => {}
             _ => {
@@ -4881,7 +4813,7 @@ async fn validate_admission_with_trusted_writers<R: WebhookEnvelopeReader>(
                 return response
                     .deny("user AgentRuntime must not carry a service-principal annotation");
             }
-            let member_role = if trusted_pending_transition || trusted_canonical_user_write {
+            let member_role = if trusted_pending_transition || trusted_user_write {
                 let Some(member_role) = bound_role.filter(|role| !role.is_empty()) else {
                     return response.deny("AgentRuntime member-role annotation is required");
                 };
@@ -4958,7 +4890,14 @@ pub async fn validate_admission_with_catalog<R: WebhookEnvelopeReader, C: Webhoo
     envelopes: &R,
     catalog: &C,
 ) -> AdmissionResponse {
-    validate_admission_with_catalog_for_writers(request, envelopes, catalog, &BTreeSet::new()).await
+    validate_admission_with_catalog_for_writers(
+        request,
+        envelopes,
+        catalog,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    )
+    .await
 }
 
 async fn validate_admission_with_catalog_for_writers<
@@ -4969,9 +4908,15 @@ async fn validate_admission_with_catalog_for_writers<
     envelopes: &R,
     catalog: &C,
     trusted_writer_usernames: &BTreeSet<String>,
+    user_writer_usernames: &BTreeSet<String>,
 ) -> AdmissionResponse {
-    let response =
-        validate_admission_with_trusted_writers(request, envelopes, trusted_writer_usernames).await;
+    let response = validate_admission_with_trusted_writers(
+        request,
+        envelopes,
+        trusted_writer_usernames,
+        user_writer_usernames,
+    )
+    .await;
     if !response.allowed {
         return response;
     }
@@ -5014,6 +4959,7 @@ async fn validate_admission_for_controller<R: WebhookEnvelopeReader>(
         request,
         envelopes,
         &BTreeSet::from([controller_username.to_owned()]),
+        &BTreeSet::new(),
     )
     .await
 }
@@ -5067,10 +5013,17 @@ struct WebhookState<R, C> {
     catalog: C,
     controller_username: Option<String>,
     trusted_writer_usernames: BTreeSet<String>,
+    user_writer_usernames: BTreeSet<String>,
 }
 
 pub fn webhook_router<R: WebhookEnvelopeReader>(envelopes: R) -> Router {
-    webhook_router_with_controller(envelopes, AllowConfiguredModels, None, BTreeSet::new())
+    webhook_router_with_controller(
+        envelopes,
+        AllowConfiguredModels,
+        None,
+        BTreeSet::new(),
+        BTreeSet::new(),
+    )
 }
 
 pub fn webhook_router_for_controller<R: WebhookEnvelopeReader>(
@@ -5082,6 +5035,7 @@ pub fn webhook_router_for_controller<R: WebhookEnvelopeReader>(
         AllowConfiguredModels,
         Some(controller_username.clone()),
         BTreeSet::from([controller_username]),
+        BTreeSet::new(),
     )
 }
 
@@ -5089,11 +5043,13 @@ pub fn webhook_router_for_trusted_writer<R: WebhookEnvelopeReader>(
     envelopes: R,
     writer_username: String,
 ) -> Router {
+    let user_writer_usernames = BTreeSet::from([writer_username.clone()]);
     webhook_router_with_controller(
         envelopes,
         AllowConfiguredModels,
         None,
         BTreeSet::from([writer_username]),
+        user_writer_usernames,
     )
 }
 
@@ -5106,11 +5062,14 @@ pub fn webhook_router_for_controller_with_catalog<
     controller_username: String,
     apiserver_username: String,
 ) -> Router {
+    let user_writer_usernames =
+        BTreeSet::from([controller_username.clone(), apiserver_username.clone()]);
     webhook_router_with_controller(
         envelopes,
         catalog,
         Some(controller_username.clone()),
         BTreeSet::from([controller_username, apiserver_username]),
+        user_writer_usernames,
     )
 }
 
@@ -5119,6 +5078,7 @@ fn webhook_router_with_controller<R: WebhookEnvelopeReader, C: WebhookModelCatal
     catalog: C,
     controller_username: Option<String>,
     trusted_writer_usernames: BTreeSet<String>,
+    user_writer_usernames: BTreeSet<String>,
 ) -> Router {
     Router::new()
         .route("/validate-agent-runtime", post(webhook_handler::<R, C>))
@@ -5127,6 +5087,7 @@ fn webhook_router_with_controller<R: WebhookEnvelopeReader, C: WebhookModelCatal
             catalog,
             controller_username,
             trusted_writer_usernames,
+            user_writer_usernames,
         })
 }
 
@@ -5164,6 +5125,7 @@ async fn webhook_handler<R: WebhookEnvelopeReader, C: WebhookModelCatalog>(
                     &state.envelopes,
                     &state.catalog,
                     &state.trusted_writer_usernames,
+                    &state.user_writer_usernames,
                 )
                 .await
             }
@@ -5214,7 +5176,7 @@ mod tests {
         authority_application_action, classify_runtime_create_status, cleanup_runtime,
         connection_operation_authority_action, create_task_runtime_inner,
         exhausted_spend_to_preserve, inference_action, provider_control_bindings_match,
-        reconcile_once, replace_as_authority, runtime_authority_action, runtime_ttl_action,
+        reconcile_once, replace_as_controller, runtime_authority_action, runtime_ttl_action,
         runtime_with_spend_top_up, sandbox_execution_class, sandbox_task_diagnostics,
         server_task_runtime_manifest, status_merge_patch, suspend_runtime,
         suspend_runtime_with_inference_cleanup, task_output_archive_failure, task_runtime,
@@ -7286,12 +7248,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_marker_restoration_uses_the_controller_identity() -> Result<(), String> {
-        let mut runtime = fixture();
-        runtime.metadata.annotations.get_or_insert_default().insert(
-            "agents.apelogic.ai/pending-approval".to_owned(),
-            "request-digest".to_owned(),
-        );
+    async fn authority_replacement_uses_the_controller_identity() -> Result<(), String> {
+        let runtime = fixture();
         let serialized_runtime = serde_json::to_vec(&runtime)
             .map_err(|error| format!("fixture runtime must be serializable: {error}"))?;
         let impersonated = Arc::new(AtomicBool::new(false));
@@ -7299,7 +7257,9 @@ mod tests {
         let client = Client::new(
             service_fn(move |request: Request<KubeBody>| {
                 let serialized_runtime = serialized_runtime.clone();
-                if request.headers().contains_key("impersonate-user") {
+                if request.headers().contains_key("impersonate-user")
+                    || request.headers().contains_key("impersonate-group")
+                {
                     impersonated_for_service.store(true, Ordering::SeqCst);
                 }
                 async move {
@@ -7311,13 +7271,13 @@ mod tests {
             "team-a",
         );
 
-        replace_as_authority(&client, &runtime, "alice@example.com", "engineer")
+        replace_as_controller(&client, &runtime)
             .await
             .map_err(|error| format!("pending restoration must be writable: {error:?}"))?;
 
         assert!(
             !impersonated.load(Ordering::SeqCst),
-            "a pending marker must be restored by the trusted controller identity"
+            "an authority update must use the trusted controller identity"
         );
         Ok(())
     }
@@ -8418,6 +8378,27 @@ mod webhook_tests {
     }
 
     #[tokio::test]
+    async fn production_webhook_admits_controller_grant_expiry_rollback_for_legacy_user_runtime()
+    -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["userInfo"] = serde_json::json!({
+            "username": "system:serviceaccount:steward-system:steward-controller"
+        });
+        value["request"]["oldObject"]["spec"]["budget"]["monthlyLimit"] =
+            serde_json::json!("220.00");
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("200.00");
+
+        let review = call_controller_webhook(value, fake_envelopes()).await?;
+
+        assert_eq!(
+            review.pointer("/response/allowed"),
+            Some(&serde_json::json!(true)),
+            "the production webhook must admit the controller restoring a noncanonical user runtime to its Envelope after a grant expires: {review}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn webhook_admits_only_an_exact_persisted_external_task_create() -> Result<(), String> {
         let admission = persisted_task_runtime_admission()?;
         let value = task_runtime_create_value(&admission)?;
@@ -9310,6 +9291,7 @@ mod webhook_tests {
             &trusted_request,
             &fake_envelopes(),
             &BTreeSet::from([controller_username.to_owned()]),
+            &BTreeSet::new(),
         )
         .await;
         assert!(!trusted.allowed);
@@ -9344,11 +9326,42 @@ mod webhook_tests {
             &request,
             &fake_envelopes(),
             &BTreeSet::from([writer_username.to_owned()]),
+            &BTreeSet::new(),
         )
         .await;
         assert!(
             response.allowed,
             "the trusted API writer must be able to author the server-derived canonical user binding: {}",
+            response.result.message
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_allows_a_trusted_writer_to_author_a_bound_user_runtime_without_impersonation()
+    -> Result<(), String> {
+        let writer_username = "system:serviceaccount:steward-system:steward-apiserver";
+        let mut value = admission_review_value();
+        value["request"]["operation"] = serde_json::json!("CREATE");
+        value["request"]["oldObject"] = serde_json::Value::Null;
+        value["request"]["userInfo"] = serde_json::json!({"username": writer_username});
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("100.00");
+
+        let review = serde_json::from_value::<AdmissionReview<AgentRuntime>>(value)
+            .map_err(|error| format!("failed to construct trusted user CREATE review: {error}"))?;
+        let request: AdmissionRequest<AgentRuntime> = review
+            .try_into()
+            .map_err(|error| format!("failed to read trusted user CREATE request: {error}"))?;
+        let response = super::validate_admission_with_trusted_writers(
+            &request,
+            &fake_envelopes(),
+            &BTreeSet::from([writer_username.to_owned()]),
+            &BTreeSet::from([writer_username.to_owned()]),
+        )
+        .await;
+        assert!(
+            response.allowed,
+            "the trusted API writer must preserve legacy user admission without cluster-wide impersonation: {}",
             response.result.message
         );
         Ok(())
@@ -9375,6 +9388,7 @@ mod webhook_tests {
             &request,
             &fake_envelopes(),
             &BTreeSet::from([controller_username.to_owned()]),
+            &BTreeSet::new(),
         )
         .await;
 
@@ -9604,6 +9618,7 @@ mod webhook_tests {
             &request,
             &fake_envelopes(),
             &BTreeSet::from([controller_username.to_owned()]),
+            &BTreeSet::new(),
         )
         .await;
 
@@ -9700,6 +9715,7 @@ mod webhook_tests {
             &request,
             &fake_envelopes(),
             &BTreeSet::from([controller_username.to_owned()]),
+            &BTreeSet::new(),
         )
         .await;
 

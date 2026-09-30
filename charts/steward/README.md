@@ -345,7 +345,14 @@ lifecycle. Changing a configured trust mode, image, endpoint, MCP-GW authority
 contract, namespace, or runtime class does not reinterpret an existing
 operation; it fails closed.
 
-The globally bound controller and mint ClusterRoles have no Secret verbs.
+The globally bound apiserver, controller, and mint ClusterRoles have no Secret
+verbs and no Kubernetes user or group impersonation authority. The apiserver
+and controller write AgentRuntime resources as their own exact service-account
+identities. The validating webhook recognizes only those configured writers,
+then independently enforces principal immutability, the bound member-role
+annotation, Envelope and grant limits, and immutable authority before admitting
+the write. A compromised Steward pod therefore cannot use its RBAC to
+impersonate `system:masters` or another cluster principal.
 Runtime Secret access is granted by namespaced Roles and RoleBindings only for
 names listed in `runtimeNamespaces`. The default is an empty list, so a release
 consumer must explicitly authorize every runtime namespace; namespaces outside
