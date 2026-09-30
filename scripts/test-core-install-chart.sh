@@ -26,14 +26,6 @@ fi
 
 helm_template \
   --set-string tls.webhook.caBundlePem=public-test-ca > "${rendered}"
-if rg -q 'verbs: \["impersonate"\]' "${rendered}"; then
-  echo 'Steward service accounts must not receive Kubernetes impersonation authority' >&2
-  exit 1
-fi
-if rg -q 'verbs: \["impersonate"\]' "${root}/config/poc/api-stack.yaml"; then
-  echo 'the alternate API installation must not receive Kubernetes impersonation authority' >&2
-  exit 1
-fi
 for forbidden in \
   'kind: ClusterSPIFFEID' \
   'name: steward-mint' \

@@ -3789,7 +3789,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 .annotations
                                 .get_or_insert_default()
                                 .remove(PENDING_APPROVAL_ANNOTATION);
-                            replace_pending_as_controller(&context.client, &proposed).await?;
+                            replace_as_controller(&context.client, &proposed).await?;
                             return Ok(Action::requeue(StdDuration::from_secs(2)));
                         }
                     }
@@ -3899,13 +3899,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 AuthorityAction::Continue => {}
                                 AuthorityAction::Restore(mut restored) => {
                                     restored.metadata = runtime.metadata.clone();
-                                    replace_grant_as_authority(
-                                        &context.client,
-                                        &restored,
-                                        &reversion.actor,
-                                        &reversion.member_role,
-                                    )
-                                    .await?;
+                                    replace_as_controller(&context.client, &restored).await?;
                                     return Ok(Action::requeue(StdDuration::from_secs(2)));
                                 }
                                 AuthorityAction::Suspend => {
@@ -3942,13 +3936,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                         .annotations
                                         .get_or_insert_default()
                                         .remove(PENDING_APPROVAL_ANNOTATION);
-                                    replace_grant_as_authority(
-                                        &context.client,
-                                        &proposed,
-                                        &application.application.actor,
-                                        &application.application.member_role,
-                                    )
-                                    .await?;
+                                    replace_as_controller(&context.client, &proposed).await?;
                                     return Ok(Action::requeue(StdDuration::from_secs(2)));
                                 }
                                 AuthorityAction::Continue | AuthorityAction::Suspend => {}
@@ -4536,32 +4524,7 @@ fn suspended_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, Contro
     })
 }
 
-async fn replace_as_authority(
-    client: &Client,
-    runtime: &AgentRuntime,
-    _actor: &str,
-    _member_role: &str,
-) -> Result<(), ControllerError> {
-    replace_pending_as_controller(client, runtime).await
-}
-
-async fn replace_grant_as_authority(
-    client: &Client,
-    runtime: &AgentRuntime,
-    actor: &str,
-    scope_ref: &str,
-) -> Result<(), ControllerError> {
-    match &runtime.spec.principal {
-        steward_types::Principal::User { .. } => {
-            replace_as_authority(client, runtime, actor, scope_ref).await
-        }
-        steward_types::Principal::Service { .. } => {
-            replace_pending_as_controller(client, runtime).await
-        }
-    }
-}
-
-async fn replace_pending_as_controller(
+async fn replace_as_controller(
     client: &Client,
     runtime: &AgentRuntime,
 ) -> Result<(), ControllerError> {
@@ -5099,7 +5062,8 @@ pub fn webhook_router_for_controller_with_catalog<
     controller_username: String,
     apiserver_username: String,
 ) -> Router {
-    let user_writer_usernames = BTreeSet::from([apiserver_username.clone()]);
+    let user_writer_usernames =
+        BTreeSet::from([controller_username.clone(), apiserver_username.clone()]);
     webhook_router_with_controller(
         envelopes,
         catalog,
@@ -5212,7 +5176,7 @@ mod tests {
         authority_application_action, classify_runtime_create_status, cleanup_runtime,
         connection_operation_authority_action, create_task_runtime_inner,
         exhausted_spend_to_preserve, inference_action, provider_control_bindings_match,
-        reconcile_once, replace_as_authority, runtime_authority_action, runtime_ttl_action,
+        reconcile_once, replace_as_controller, runtime_authority_action, runtime_ttl_action,
         runtime_with_spend_top_up, sandbox_execution_class, sandbox_task_diagnostics,
         server_task_runtime_manifest, status_merge_patch, suspend_runtime,
         suspend_runtime_with_inference_cleanup, task_output_archive_failure, task_runtime,
@@ -7307,7 +7271,7 @@ mod tests {
             "team-a",
         );
 
-        replace_as_authority(&client, &runtime, "alice@example.com", "engineer")
+        replace_as_controller(&client, &runtime)
             .await
             .map_err(|error| format!("pending restoration must be writable: {error:?}"))?;
 
@@ -8411,6 +8375,27 @@ mod webhook_tests {
             .map_err(|error| format!("failed to read webhook response: {error}"))?;
         serde_json::from_slice::<serde_json::Value>(&body)
             .map_err(|error| format!("webhook response was not JSON: {error}"))
+    }
+
+    #[tokio::test]
+    async fn production_webhook_admits_controller_grant_expiry_rollback_for_legacy_user_runtime()
+    -> Result<(), String> {
+        let mut value = admission_review_value();
+        value["request"]["userInfo"] = serde_json::json!({
+            "username": "system:serviceaccount:steward-system:steward-controller"
+        });
+        value["request"]["oldObject"]["spec"]["budget"]["monthlyLimit"] =
+            serde_json::json!("220.00");
+        value["request"]["object"]["spec"]["budget"]["monthlyLimit"] = serde_json::json!("200.00");
+
+        let review = call_controller_webhook(value, fake_envelopes()).await?;
+
+        assert_eq!(
+            review.pointer("/response/allowed"),
+            Some(&serde_json::json!(true)),
+            "the production webhook must admit the controller restoring a noncanonical user runtime to its Envelope after a grant expires: {review}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

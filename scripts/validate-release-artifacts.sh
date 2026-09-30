@@ -1198,6 +1198,24 @@ then
   exit 1
 fi
 
+for rendered_manifest in \
+  "${default_rendered}" \
+  "${rendered}" \
+  "${github_source_rendered}" \
+  "${browser_auth_rendered}" \
+  "${task_identity_rendered}" \
+  "${connections_bridge_rendered}"
+do
+  if grep -Fqi 'impersonate' "${rendered_manifest}"; then
+    echo "rendered release manifests must not grant Kubernetes impersonation authority" >&2
+    exit 1
+  fi
+done
+if grep -Fqi 'impersonate' "${root}/config/poc/api-stack.yaml"; then
+  echo "the alternate API installation must not grant Kubernetes impersonation authority" >&2
+  exit 1
+fi
+
 test "$(grep -c '^kind: Deployment$' "${rendered}")" -eq 3
 test "$(grep -c '^kind: ServiceAccount$' "${rendered}")" -eq 3
 test "$(grep -c '^kind: NetworkPolicy$' "${rendered}")" -eq 8

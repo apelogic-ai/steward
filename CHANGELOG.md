@@ -7,6 +7,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Security
+
+- Removed unrestricted Kubernetes user and group impersonation from the
+  apiserver and controller ClusterRoles. AgentRuntime writes now use the exact
+  Steward service-account identities and remain subject to webhook Envelope,
+  grant, role-binding, principal-immutability, and authority checks.
+
+### Upgrade notes
+
+- `helm upgrade` removes the obsolete impersonation rules; no manual RBAC
+  action is required. During a rolling upgrade, an old apiserver may briefly
+  receive `403` responses after the ClusterRole changes, and a new apiserver
+  served by the old controller webhook may have noncanonical user-runtime
+  writes rejected until both components have rolled. Retry after the apiserver
+  and controller converge on the same version. Operators who added separate
+  impersonation grants for these service accounts may remove them.
+
 ## [0.3.4] - 2026-09-29
 
 ### Changed
