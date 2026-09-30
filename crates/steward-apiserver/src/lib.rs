@@ -48,7 +48,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
@@ -57,7 +57,6 @@ use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
 };
 use kube::api::{Api, ListParams, PostParams};
-use kube::core::Request as KubeRequest;
 use kube::{Client, ResourceExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -944,32 +943,11 @@ impl RuntimeRepository for KubeRuntimeRepository {
         &'a self,
         namespace: &'a str,
         runtime: &'a AgentRuntime,
-        context: &'a AdmissionContext,
+        _context: &'a AdmissionContext,
     ) -> BoxFuture<'a, Result<AgentRuntime, RuntimeCreateError>> {
         Box::pin(async move {
-            let unavailable = |error: String| RuntimeCreateError::Unavailable(error);
-            let body =
-                serde_json::to_vec(runtime).map_err(|error| unavailable(error.to_string()))?;
-            let mut request = KubeRequest::new(format!(
-                "/apis/agents.apelogic.ai/v1alpha1/namespaces/{namespace}/agentruntimes"
-            ))
-            .create(&PostParams::default(), body)
-            .map_err(|error| unavailable(error.to_string()))?;
-            request.headers_mut().insert(
-                HeaderName::from_static("impersonate-user"),
-                HeaderValue::from_str(&context.actor)
-                    .map_err(|error| unavailable(error.to_string()))?,
-            );
-            request.headers_mut().insert(
-                HeaderName::from_static("impersonate-group"),
-                HeaderValue::from_str(&format!(
-                    "agents.apelogic.ai/member-role:{}",
-                    context.member_role
-                ))
-                .map_err(|error| unavailable(error.to_string()))?,
-            );
-            self.client
-                .request::<AgentRuntime>(request)
+            Api::<AgentRuntime>::namespaced(self.client.clone(), namespace)
+                .create(&PostParams::default(), runtime)
                 .await
                 .map_err(|error| match error {
                     kube::Error::Api(response) => RuntimeCreateError::Kubernetes {
@@ -1061,33 +1039,15 @@ impl RuntimeRepository for KubeRuntimeRepository {
     fn replace<'a>(
         &'a self,
         runtime: &'a AgentRuntime,
-        context: &'a AdmissionContext,
+        _context: &'a AdmissionContext,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             let namespace = runtime
                 .namespace()
                 .ok_or_else(|| "AgentRuntime namespace is required".to_owned())?;
             let name = runtime.name_any();
-            let body = serde_json::to_vec(runtime).map_err(|error| error.to_string())?;
-            let mut request = KubeRequest::new(format!(
-                "/apis/agents.apelogic.ai/v1alpha1/namespaces/{namespace}/agentruntimes"
-            ))
-            .replace(&name, &PostParams::default(), body)
-            .map_err(|error| error.to_string())?;
-            request.headers_mut().insert(
-                HeaderName::from_static("impersonate-user"),
-                HeaderValue::from_str(&context.actor).map_err(|error| error.to_string())?,
-            );
-            request.headers_mut().insert(
-                HeaderName::from_static("impersonate-group"),
-                HeaderValue::from_str(&format!(
-                    "agents.apelogic.ai/member-role:{}",
-                    context.member_role
-                ))
-                .map_err(|error| error.to_string())?,
-            );
-            self.client
-                .request::<AgentRuntime>(request)
+            Api::<AgentRuntime>::namespaced(self.client.clone(), &namespace)
+                .replace(&name, &PostParams::default(), runtime)
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string())
@@ -3413,12 +3373,14 @@ fn spec_digest(spec: &AgentRuntimeSpec) -> Result<String, ApiError> {
 #[cfg(test)]
 mod tests {
     use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode, header};
+    use axum::http::{Request, Response as HttpResponse, StatusCode, header};
     use axum::response::Response;
     use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
-    use kube::ResourceExt;
+    use kube::client::Body as KubeBody;
+    use kube::{Client, ResourceExt};
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration as StdDuration;
 
@@ -3450,7 +3412,7 @@ mod tests {
         CanonicalUserId, Duration, Email, ModelRef, PENDING_APPROVAL_ANNOTATION, Principal,
         RuntimeOwnership, TaskPhase, ToolGrant,
     };
-    use tower::ServiceExt;
+    use tower::{ServiceExt, service_fn};
     use utoipa::OpenApi;
     use uuid::Uuid;
 
@@ -3462,13 +3424,60 @@ mod tests {
     use super::{
         AGENT_RUNS_API_VERSION, AdmissionContext, AdmissionLedger, AgentRunLedger, ApiDoc,
         ApiError, AuthenticatedCaller, AuthenticationError, BoxFuture, BudgetIncrease,
-        CreateRuntimeRequest, KubernetesTokenReviewAudience, RequestAuthenticator,
-        RuntimeCreateError, RuntimeRepository, SubmissionOutcome, TaskApiConfig,
-        TaskAuthenticationError, TaskIdentity, TaskIdentityResolver, TaskSubmissionLedger,
-        TaskSubmissionRequest, caller_from_kubernetes_user, caller_from_token_review, router,
-        spec_digest, submit_budget_increase, submit_runtime_request, task_router,
-        token_review_request,
+        CreateRuntimeRequest, KubeRuntimeRepository, KubernetesTokenReviewAudience,
+        RequestAuthenticator, RuntimeCreateError, RuntimeRepository, SubmissionOutcome,
+        TaskApiConfig, TaskAuthenticationError, TaskIdentity, TaskIdentityResolver,
+        TaskSubmissionLedger, TaskSubmissionRequest, caller_from_kubernetes_user,
+        caller_from_token_review, router, spec_digest, submit_budget_increase,
+        submit_runtime_request, task_router, token_review_request,
     };
+
+    #[tokio::test]
+    async fn kubernetes_runtime_writes_use_the_apiserver_service_account_identity()
+    -> Result<(), String> {
+        let runtime = runtime();
+        let serialized_runtime = serde_json::to_vec(&runtime)
+            .map_err(|error| format!("serialize runtime fixture: {error}"))?;
+        let impersonated = Arc::new(AtomicBool::new(false));
+        let impersonated_for_service = impersonated.clone();
+        let client = Client::new(
+            service_fn(move |request: Request<KubeBody>| {
+                let serialized_runtime = serialized_runtime.clone();
+                if request.headers().contains_key("impersonate-user")
+                    || request.headers().contains_key("impersonate-group")
+                {
+                    impersonated_for_service.store(true, Ordering::SeqCst);
+                }
+                async move {
+                    let mut response = HttpResponse::new(Body::from(serialized_runtime));
+                    *response.status_mut() = StatusCode::OK;
+                    Ok::<_, Infallible>(response)
+                }
+            }),
+            "team-a",
+        );
+        let repository = KubeRuntimeRepository::new(client);
+        let context = AdmissionContext {
+            actor: "alice@example.com".to_owned(),
+            member_role: "engineer".to_owned(),
+            canonical_user_id: None,
+        };
+
+        repository
+            .create("team-a", &runtime, &context)
+            .await
+            .map_err(|error| format!("create runtime: {error:?}"))?;
+        repository
+            .replace(&runtime, &context)
+            .await
+            .map_err(|error| format!("replace runtime: {error}"))?;
+
+        assert!(
+            !impersonated.load(Ordering::SeqCst),
+            "runtime writes must not use Kubernetes impersonation headers"
+        );
+        Ok(())
+    }
 
     const KUBERNETES_TOKEN_REVIEW_AUDIENCE: &str = "https://kubernetes.default.svc";
     const TEST_VERSIONED_AGENT: &str = "example-agent@1.0.0";

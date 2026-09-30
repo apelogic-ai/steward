@@ -82,9 +82,6 @@ rules:
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]
-  - apiGroups: [""]
-    resources: ["users", "groups"]
-    verbs: ["impersonate"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -93,9 +90,6 @@ rules:
   - apiGroups: ["agents.apelogic.ai"]
     resources: ["agentruntimes", "agentruntimes/status", "agentruntimes/finalizers"]
     verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
-  - apiGroups: [""]
-    resources: ["users", "groups"]
-    verbs: ["impersonate"]
 {{- if .Values.execution.enabled }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

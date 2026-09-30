@@ -16,14 +16,6 @@ rules:
   - apiGroups: ["agents.apelogic.ai"]
     resources: ["agentruntimes"]
     verbs: ["get", "list", "create", "update"]
-  - apiGroups: [""]
-    resources: ["users"]
-    resourceNames: ["alice@example.com"]
-    verbs: ["impersonate"]
-  - apiGroups: [""]
-    resources: ["groups"]
-    resourceNames: ["agents.apelogic.ai/member-role:engineer"]
-    verbs: ["impersonate"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
