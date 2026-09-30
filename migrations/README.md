@@ -121,3 +121,8 @@ revision snapshot becomes nullable; no existing request or history is rewritten.
 The catalog is documented as the sole authority for new template-backed writes,
 while legacy role-keyed Envelope rows remain read-only for one compatibility
 window.
+
+Migration 0052 adds a nullable, bounded failure detail to governed connection
+operations. Only the adapter-sanitized upstream HTTP status and optional reason
+may be stored for `bridge-gateway-http` failures; raw provider responses,
+request URLs, credentials, and arbitrary stderr remain outside this projection.

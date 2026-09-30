@@ -137,6 +137,10 @@ pub(crate) struct StartConnectionResponse {
 pub(crate) struct ConnectionOperationErrorResponse {
     api_version: &'static str,
     error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 /// One-time browser destination. It intentionally implements neither `Debug` nor `Display`.
@@ -169,11 +173,12 @@ pub struct StartedConnection {
     pub expires_at: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionBrokerError {
     OAuthFlowPending,
     ProxyPolicyDenied,
     ProviderAuthorizationFailed,
+    GatewayHttp { status: u16, reason: Option<String> },
     Unavailable,
 }
 
@@ -547,17 +552,24 @@ fn oauth_flow_pending_response() -> Response {
         Json(ConnectionOperationErrorResponse {
             api_version: CONNECTIONS_API_VERSION,
             error: "oauth_flow_pending",
+            upstream_status: None,
+            detail: None,
         }),
     )
         .into_response()
 }
 
 fn connection_broker_error_response(error: ConnectionBrokerError) -> Response {
-    let error = match error {
-        ConnectionBrokerError::ProxyPolicyDenied => "proxy_policy_denied",
-        ConnectionBrokerError::ProviderAuthorizationFailed => "provider_authorization_failed",
+    let (error, upstream_status, detail) = match error {
+        ConnectionBrokerError::ProxyPolicyDenied => ("proxy_policy_denied", None, None),
+        ConnectionBrokerError::ProviderAuthorizationFailed => {
+            ("provider_authorization_failed", None, None)
+        }
+        ConnectionBrokerError::GatewayHttp { status, reason } => {
+            ("gateway_http_error", Some(status), reason)
+        }
         ConnectionBrokerError::OAuthFlowPending | ConnectionBrokerError::Unavailable => {
-            "connection_broker_unavailable"
+            ("connection_broker_unavailable", None, None)
         }
     };
     (
@@ -565,6 +577,8 @@ fn connection_broker_error_response(error: ConnectionBrokerError) -> Response {
         Json(ConnectionOperationErrorResponse {
             api_version: CONNECTIONS_API_VERSION,
             error,
+            upstream_status,
+            detail,
         }),
     )
         .into_response()
@@ -1103,6 +1117,29 @@ mod tests {
                 })
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gateway_http_failure_has_an_actionable_bounded_problem_body() -> Result<(), String> {
+        let response = connection_broker_error_response(ConnectionBrokerError::GatewayHttp {
+            status: 400,
+            reason: Some("OAuth redirect target is not allowed".to_owned()),
+        });
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read gateway failure body: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("parse gateway failure body: {error}"))?,
+            serde_json::json!({
+                "apiVersion": CONNECTIONS_API_VERSION,
+                "error": "gateway_http_error",
+                "upstreamStatus": 400,
+                "detail": "OAuth redirect target is not allowed"
+            })
+        );
         Ok(())
     }
 }

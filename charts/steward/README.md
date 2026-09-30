@@ -345,6 +345,32 @@ lifecycle. Changing a configured trust mode, image, endpoint, MCP-GW authority
 contract, namespace, or runtime class does not reinterpret an existing
 operation; it fails closed.
 
+### Troubleshooting a failed Connect operation
+
+The Connect API returns a bounded problem body. `gateway_http_error` includes
+the upstream HTTP status and, only when MCP-GW supplied a safe JSON `error` or
+`code` string, a sanitized detail of at most 200 bytes. Steward never copies a
+token, an unselected response field, or a URL containing a query string into
+that response. The same evidence is retained in
+`connection_operations.failure_category` and
+`connection_operations.failure_detail`; the corresponding failed
+`task_execution_attempts.execution_stderr` contains the bridge's fixed,
+bounded diagnostic.
+
+| Failure category | Meaning |
+| --- | --- |
+| `bridge-gateway-http` | MCP-GW returned an unexpected non-2xx HTTP status. Read `failure_detail` for the status and optional sanitized reason. |
+| `bridge-proxy-policy` | OpenShell denied the provider request before MCP-GW handled it. |
+| `bridge-runtime-authorization` | MCP-GW rejected the runtime's authority. |
+| `bridge_failed` | The bridge failed without a recognized safe diagnostic. |
+| `deadline_exceeded` | The governed connection operation did not finish before its response deadline. |
+| `invalid_bridge_result` | The bridge exited successfully but its output violated the fixed result contract. |
+
+For a start failure whose reason says the OAuth redirect target is not allowed,
+configure MCP-GW `redirectAfterAllowedOrigins` with Steward's exact public
+origin. Do not add a wildcard or copy the one-time authorization URL into
+configuration or logs.
+
 The globally bound apiserver, controller, and mint ClusterRoles have no Secret
 verbs and no Kubernetes user or group impersonation authority. The apiserver
 and controller write AgentRuntime resources as their own exact service-account

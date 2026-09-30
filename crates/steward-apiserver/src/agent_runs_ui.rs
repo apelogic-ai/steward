@@ -773,6 +773,7 @@ where
                 ConnectionBrokerError::OAuthFlowPending => StatusCode::CONFLICT.into_response(),
                 ConnectionBrokerError::ProxyPolicyDenied
                 | ConnectionBrokerError::ProviderAuthorizationFailed
+                | ConnectionBrokerError::GatewayHttp { .. }
                 | ConnectionBrokerError::Unavailable => {
                     browser_runs_error(StatusCode::SERVICE_UNAVAILABLE)
                 }

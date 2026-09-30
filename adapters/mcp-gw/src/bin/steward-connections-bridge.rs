@@ -53,28 +53,31 @@ fn response_path() -> Result<PathBuf, String> {
     Ok(output_directory.join(RESPONSE_FILE))
 }
 
-fn gateway_failure(error: &PortError) -> &'static str {
+fn gateway_failure(error: &PortError) -> String {
     match error {
         PortError::Failed { reason } if reason == "MCP-GW rejected runtime authentication" => {
-            "bridge MCP-GW rejected runtime authentication"
+            "bridge MCP-GW rejected runtime authentication".to_owned()
         }
         PortError::Failed { reason } if reason == "MCP-GW rejected runtime authorization" => {
-            "bridge MCP-GW rejected runtime authorization"
+            "bridge MCP-GW rejected runtime authorization".to_owned()
         }
         PortError::Failed { reason } if reason == "OpenShell proxy denied the provider request" => {
-            "bridge OpenShell proxy denied provider request"
+            "bridge OpenShell proxy denied provider request".to_owned()
         }
         PortError::Failed { reason }
             if reason == "MCP-GW unavailable while attempting to call MCP-GW" =>
         {
-            "bridge MCP-GW transport is unavailable"
+            "bridge MCP-GW transport is unavailable".to_owned()
         }
         PortError::Failed { reason }
             if reason == "MCP-GW unavailable while attempting to read MCP-GW response"
                 || reason
                     == "MCP-GW unavailable while attempting to read bounded MCP-GW response" =>
         {
-            "bridge MCP-GW response body is unavailable"
+            "bridge MCP-GW response body is unavailable".to_owned()
+        }
+        PortError::Failed { reason } if reason.starts_with("MCP-GW returned HTTP ") => {
+            format!("bridge {reason}")
         }
         PortError::Failed { reason }
             if matches!(
@@ -85,11 +88,15 @@ fn gateway_failure(error: &PortError) -> &'static str {
                     | "MCP-GW unavailable while attempting to re-run GitHub workflow"
             ) =>
         {
-            "bridge MCP-GW returned an unexpected status"
+            "bridge MCP-GW returned an unexpected status".to_owned()
         }
-        PortError::Rejected { .. } => "bridge MCP-GW response violated its bounded contract",
-        PortError::Failed { .. } | PortError::Unsupported { .. } => "bridge MCP-GW is unavailable",
-        _ => "bridge MCP-GW is unavailable",
+        PortError::Rejected { .. } => {
+            "bridge MCP-GW response violated its bounded contract".to_owned()
+        }
+        PortError::Failed { .. } | PortError::Unsupported { .. } => {
+            "bridge MCP-GW is unavailable".to_owned()
+        }
+        _ => "bridge MCP-GW is unavailable".to_owned(),
     }
 }
 
@@ -121,7 +128,7 @@ async fn execute_at(
     let response = gateway
         .execute(invocation.operation, request)
         .await
-        .map_err(|error| gateway_failure(&error).to_owned())?;
+        .map_err(|error| gateway_failure(&error))?;
     let response = serde_json::to_vec(&response)
         .map_err(|_| "bridge response could not be serialized".to_owned())?;
     fs::write(response_path, response)
@@ -368,6 +375,70 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn gateway_rejection_preserves_only_its_status_and_sanitized_error() -> Result<(), String>
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind MCP-GW fixture: {error}"))?;
+        let origin = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .map_err(|error| format!("read MCP-GW fixture address: {error}"))?
+        );
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept MCP-GW fixture request: {error}"))?;
+            let mut bytes = [0_u8; 2048];
+            stream
+                .read(&mut bytes)
+                .map_err(|error| format!("read MCP-GW fixture request: {error}"))?;
+            let body = br#"{"error":"OAuth redirect target is not allowed","debug":"https://provider.example.test/callback?token=obviously-fake-secret"}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body)
+            );
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|error| format!("write MCP-GW fixture response: {error}"))
+        });
+        let directory = test_directory()?;
+        let input = directory.join("request.json");
+        let output = directory.join("response.json");
+        fs::write(
+            &input,
+            br#"{"redirectAfter":"https://steward.example.test/connections"}"#,
+        )
+        .map_err(|error| format!("write bridge request: {error}"))?;
+        let arguments = vec![
+            "steward-connections-bridge".to_owned(),
+            "--operation".to_owned(),
+            "github.start".to_owned(),
+            "--input".to_owned(),
+            "request.json".to_owned(),
+        ];
+
+        let result = execute_at(&arguments, input, origin, "0.4.9".to_owned(), output).await;
+        server
+            .join()
+            .map_err(|_| "MCP-GW fixture thread panicked".to_owned())??;
+        let Err(error) = result else {
+            return Err("the bridge accepted a gateway 400".to_owned());
+        };
+        assert_eq!(
+            error,
+            "bridge MCP-GW returned HTTP 400 (OAuth redirect target is not allowed)"
+        );
+        assert!(
+            !error.contains("obviously-fake-secret") && !error.contains("?token="),
+            "unselected response fields must not enter the bridge diagnostic"
+        );
+        fs::remove_dir_all(directory).map_err(|error| format!("remove bridge fixture: {error}"))?;
+        Ok(())
+    }
+
     #[test]
     fn gateway_failures_preserve_only_actionable_non_secret_categories() {
         assert_eq!(
@@ -400,6 +471,14 @@ mod tests {
                 reason: "OpenShell proxy denied the provider request".to_owned(),
             }),
             "bridge OpenShell proxy denied provider request"
+        );
+        assert_eq!(
+            gateway_failure(&PortError::Failed {
+                reason: "MCP-GW returned HTTP 400 (OAuth redirect target is not allowed)"
+                    .to_owned(),
+            }),
+            "bridge MCP-GW returned HTTP 400 (OAuth redirect target is not allowed)",
+            "the bridge must retain the adapter's already-sanitized bounded gateway diagnostic"
         );
     }
 }

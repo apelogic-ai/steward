@@ -507,6 +507,10 @@ fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
     {
         "bridge-gateway-transport"
     } else if stderr.contains("steward-connections-bridge:")
+        && stderr.contains("mcp-gw returned http ")
+    {
+        "bridge-gateway-http"
+    } else if stderr.contains("steward-connections-bridge:")
         && stderr.contains("mcp-gw returned an unexpected status")
     {
         "bridge-gateway-status"
@@ -886,7 +890,9 @@ fn task_transcript_requested(
     execution_class: SandboxExecutionClass,
     execution_log: ExecutionLogMode,
 ) -> bool {
-    execution_class == SandboxExecutionClass::Agent && execution_log == ExecutionLogMode::Full
+    execution_class == SandboxExecutionClass::ProviderControl
+        || (execution_class == SandboxExecutionClass::Agent
+            && execution_log == ExecutionLogMode::Full)
 }
 
 #[cfg(feature = "runtime")]
@@ -3179,7 +3185,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn connections_bridge_structurally_disables_full_task_output_logging() {
+    fn connections_bridge_disables_live_logging_but_retains_a_bounded_diagnostic() {
         assert_eq!(
             super::task_log_mode_for_execution(
                 OpenShellTaskLogMode::Full,
@@ -3196,9 +3202,13 @@ mod tests {
             OpenShellTaskLogMode::Full,
             "the provider-control logging override must not change long-running agent logging"
         );
-        assert!(!task_transcript_requested(
+        assert!(task_transcript_requested(
             SandboxExecutionClass::ProviderControl,
             ExecutionLogMode::Full,
+        ));
+        assert!(task_transcript_requested(
+            SandboxExecutionClass::ProviderControl,
+            ExecutionLogMode::Off,
         ));
         assert!(!task_transcript_requested(
             SandboxExecutionClass::Agent,
@@ -4693,6 +4703,13 @@ mod tests {
                 b"steward-connections-bridge: bridge MCP-GW returned an unexpected status"
             ),
             "bridge-gateway-status"
+        );
+        assert_eq!(
+            task_agent_failure_category(
+                b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (OAuth redirect target is not allowed)"
+            ),
+            "bridge-gateway-http",
+            "an actionable gateway response must not be mislabeled as a proxy-policy failure"
         );
         assert_eq!(
             task_agent_failure_category(

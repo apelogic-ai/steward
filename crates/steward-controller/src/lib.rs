@@ -1122,7 +1122,7 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
         let current = sandbox_runtime.provider_control_bindings();
         if !connection_operation_bindings_match(&connection, task, current.as_ref()) {
             authority
-                .fail_connection_operation(connection.operation_id, "binding_mismatch")
+                .fail_connection_operation(connection.operation_id, "binding_mismatch", None)
                 .await
                 .map_err(TaskControllerError::Store)?;
             authority
@@ -5805,6 +5805,7 @@ mod tests {
             cached_status: None,
             result: None,
             failure_category: None,
+            failure_detail: None,
             finalization_state: "not_requested".to_owned(),
             cleanup_state: "not_started".to_owned(),
             cleanup_finding: None,
@@ -8291,6 +8292,7 @@ mod webhook_tests {
             cached_status: None,
             result: None,
             failure_category: None,
+            failure_detail: None,
             finalization_state: "not_requested".to_owned(),
             cleanup_state: "pending".to_owned(),
             cleanup_finding: None,
