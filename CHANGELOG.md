@@ -33,6 +33,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   can be hidden or restored per browser. Migration 0056 backfills direct-package
   provenance; historical versioned Workflow rows remain unknown because their
   discarded identity evidence cannot be reconstructed safely.
+- Added authoritative optional toolset metadata to the deployment capability catalog and a
+  searchable template tool picker with read-only bulk selection, per-tool confirmation for
+  write/destructive grants, access-class counts, and exact revision diffs. Existing v2 catalog
+  tools without toolsets remain valid and use an ungrouped fallback.
 - Added opt-in MCP-GW connection-status v2 consumption and default-on GitHub
   Connect association for `steward-task-v3`, matching only the immutable numeric
   GitHub account ID and recording connection-verification evidence in additive

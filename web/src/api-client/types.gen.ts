@@ -675,6 +675,7 @@ export type CapabilityTool = {
     action: string;
     provider: string;
     resource: string;
+    toolsets?: Array<string>;
 };
 
 export type ClosureEntry = {

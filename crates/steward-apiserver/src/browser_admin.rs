@@ -38,6 +38,8 @@ pub const MAX_CAPABILITY_CATALOG_BYTES: usize = 256 * 1024;
 const MAX_CAPABILITY_MODELS: usize = 256;
 const MAX_CAPABILITY_TOOLS: usize = 1024;
 const MAX_CAPABILITY_CATALOGS: usize = 128;
+const MAX_TOOLSETS_PER_TOOL: usize = 16;
+const MAX_TOOLSET_NAME_CHARS: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -54,6 +56,9 @@ pub struct CapabilityTool {
     pub resource: String,
     pub action: String,
     pub access_class: ToolAccessClass,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(max_items = 16)]
+    pub toolsets: Vec<String>,
 }
 
 impl CapabilityTool {
@@ -263,6 +268,24 @@ impl CapabilityCatalog {
                 "capability catalog entries must contain bounded exact identifiers".to_owned(),
             );
         }
+        if self.tools.iter().any(|tool| {
+            if tool.toolsets.len() > MAX_TOOLSETS_PER_TOOL {
+                return true;
+            }
+            let mut names = std::collections::BTreeSet::new();
+            tool.toolsets.iter().any(|toolset| {
+                toolset.is_empty()
+                    || toolset.chars().count() > MAX_TOOLSET_NAME_CHARS
+                    || toolset.trim() != toolset
+                    || toolset.chars().any(char::is_control)
+                    || !names.insert(toolset)
+            })
+        }) {
+            return Err(
+                "capability toolsets must be unique bounded exact names with at most 16 memberships"
+                    .to_owned(),
+            );
+        }
         let mut model_keys = std::collections::BTreeSet::new();
         let mut tool_keys = std::collections::BTreeSet::new();
         let mut catalog_keys = std::collections::BTreeSet::new();
@@ -289,7 +312,8 @@ impl CapabilityCatalog {
 mod capability_catalog_tests {
     use super::{
         CapabilityCatalog, CapabilityProviderCatalog, CapabilityTool, MAX_CAPABILITY_CATALOG_BYTES,
-        MAX_CAPABILITY_MODELS, MAX_CAPABILITY_TOOLS, ToolAccessClass,
+        MAX_CAPABILITY_MODELS, MAX_CAPABILITY_TOOLS, MAX_TOOLSET_NAME_CHARS, MAX_TOOLSETS_PER_TOOL,
+        ToolAccessClass,
     };
     use steward_types::ModelRef;
 
@@ -305,6 +329,7 @@ mod capability_catalog_tests {
                 resource: "actions_get".to_owned(),
                 action: "read".to_owned(),
                 access_class: ToolAccessClass::Read,
+                toolsets: Vec::new(),
             }],
             catalogs: vec![CapabilityProviderCatalog {
                 provider: "github".to_owned(),
@@ -363,6 +388,7 @@ mod capability_catalog_tests {
                 resource: format!("resource-{index}"),
                 action: "read".to_owned(),
                 access_class: ToolAccessClass::Read,
+                toolsets: Vec::new(),
             })
             .collect();
         assert!(too_many_tools.validate().is_err());
@@ -378,7 +404,8 @@ mod capability_catalog_tests {
             "provider":"github",
             "resource":"actions_get",
             "action":"read",
-            "accessClass":"read"
+            "accessClass":"read",
+            "toolsets":["actions","search"]
           }],
           "catalogs":[{
             "provider":"github",
@@ -397,10 +424,57 @@ mod capability_catalog_tests {
             Some(&serde_json::json!("read"))
         );
         assert_eq!(
+            serialized.pointer("/tools/0/toolsets"),
+            Some(&serde_json::json!(["actions", "search"]))
+        );
+        assert_eq!(
             serialized.pointer("/catalogs/0/version"),
             Some(&serde_json::json!("1.6.0"))
         );
         Ok(())
+    }
+
+    #[test]
+    fn capability_catalog_accepts_legacy_tools_without_toolsets() -> Result<(), String> {
+        let value = r#"{
+          "schemaVersion":"steward.capability-catalog/v2",
+          "models":[],
+          "tools":[{
+            "provider":"github",
+            "resource":"actions_get",
+            "action":"read",
+            "accessClass":"read"
+          }],
+          "catalogs":[]
+        }"#;
+        let parsed = CapabilityCatalog::from_json(value)?;
+        assert!(parsed.tools[0].toolsets.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn capability_catalog_rejects_unbounded_or_ambiguous_toolsets() {
+        let mut duplicate = catalog();
+        duplicate.tools[0].toolsets = vec!["actions".to_owned(), "actions".to_owned()];
+        assert!(duplicate.validate().is_err());
+
+        let mut too_many = catalog();
+        too_many.tools[0].toolsets = (0..=MAX_TOOLSETS_PER_TOOL)
+            .map(|index| format!("group-{index}"))
+            .collect();
+        assert!(too_many.validate().is_err());
+
+        let invalid_names = vec![
+            " actions".to_owned(),
+            "actions ".to_owned(),
+            String::new(),
+            "x".repeat(MAX_TOOLSET_NAME_CHARS + 1),
+        ];
+        for invalid in invalid_names {
+            let mut malformed = catalog();
+            malformed.tools[0].toolsets = vec![invalid];
+            assert!(malformed.validate().is_err());
+        }
     }
 }
 

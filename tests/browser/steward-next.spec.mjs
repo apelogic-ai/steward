@@ -91,6 +91,13 @@ const githubReadTools = [
   "get_commit", "get_release", "list_releases", "get_workflow", "list_workflows",
 ].map((resource) => ({ provider: "github", resource, action: "read", accessClass: "read" }));
 
+const groupedGithubTools = [
+  { provider: "github", resource: "issues_get", action: "read", accessClass: "read", toolsets: ["issues"] },
+  { provider: "github", resource: "repository_get", action: "read", accessClass: "read", toolsets: ["repositories", "search"] },
+  { provider: "github", resource: "issues_update", action: "write", accessClass: "write", toolsets: ["issues"] },
+  { provider: "github", resource: "repository_delete", action: "delete", accessClass: "destructive" },
+];
+
 const envelopeRequest = {
   id: envelopeId,
   templateId: "developer",
@@ -1859,9 +1866,9 @@ test("administrator templates and approvals use typed browser authority", async 
     await model.press("Enter");
     await expect(administrator.page.getByText("provider-b/model-b", { exact: true })).toBeVisible();
 
-    const tool = administrator.page.getByRole("combobox", { name: "Tools" });
-    await expect(tool).toBeVisible();
-    await expect(administrator.page.getByText("repository:get_file_contents", { exact: true })).toBeVisible();
+    const tools = administrator.page.getByRole("group", { name: "Tools" });
+    await expect(tools.getByRole("searchbox", { name: "Search tools" })).toBeVisible();
+    await expect(tools.getByText("github:repository:get_file_contents", { exact: true })).toBeVisible();
     await expect(administrator.page.getByRole("heading", { name: "Runner" })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByText("Template revision accepted by the Rust authority.")).toBeVisible();
@@ -2092,7 +2099,7 @@ test("administrator can revise and copy a ten-grant template listed in the capab
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/developer`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
-    await expect(tools.getByRole("button", { name: /^Remove / })).toHaveCount(10);
+    await expect(tools.getByRole("checkbox", { checked: true })).toHaveCount(10);
 
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")).toBeTruthy();
@@ -2127,12 +2134,8 @@ test("administrator can replace a template tool absent from the capability catal
     await expect(tools.getByText("Remove or replace every tool not listed in the capability catalog.")).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
 
-    const tool = tools.getByRole("combobox", { name: "Tools" });
-    await tool.focus();
-    await tool.press("Backspace");
-    await expect(tools.getByRole("button", { name: "Remove github:repository:get_file_contents" })).toHaveCount(0);
-    await tool.fill("actions_get:read");
-    await tool.press("Enter");
+    await tools.getByRole("button", { name: "Remove unavailable github:repository:get_file_contents" }).click();
+    await tools.getByRole("checkbox", { name: "github:actions_get:read" }).check();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.tools).toEqual([
@@ -2152,11 +2155,92 @@ test("administrator template tool controls offer no fallback when the capability
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
-    await expect(tools.getByRole("combobox", { name: "Tools" })).toBeDisabled();
+    await expect(tools.getByRole("searchbox", { name: "Search tools" })).toBeDisabled();
     await expect(tools.getByText("No tools are listed in the deployment capability catalog.")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.tools).toEqual([]);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator selects every grouped read tool as exact authority tuples", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    adminTemplateTools: [],
+    capabilityCatalogTools: groupedGithubTools,
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/developer`);
+    const tools = administrator.page.getByRole("group", { name: "Tools" });
+    await expect(tools.getByRole("heading", { name: "issues" })).toBeVisible();
+    await expect(tools.getByRole("heading", { name: "repositories" })).toBeVisible();
+    await expect(tools.getByRole("heading", { name: "search" })).toBeVisible();
+    await expect(tools.getByRole("heading", { name: "Ungrouped" })).toBeVisible();
+
+    await tools.getByRole("button", { name: "Select all read-only" }).click();
+    await expect(tools.getByText("2 read · 0 write · 0 destructive", { exact: true })).toBeVisible();
+    await expect(tools.getByRole("checkbox", { name: "github:repository_get:read" })).toHaveCount(2);
+    await expect(tools.getByRole("checkbox", { name: "github:repository_get:read" }).first()).toBeChecked();
+    await expect(tools.getByRole("checkbox", { name: "github:issues_update:write" })).not.toBeChecked();
+
+    await tools.getByRole("button", { name: "Clear issues" }).click();
+    await expect(tools.getByText("1 read · 0 write · 0 destructive", { exact: true })).toBeVisible();
+    await tools.getByRole("button", { name: "Select read-only in issues" }).click();
+    await tools.getByRole("button", { name: "Clear all" }).click();
+    await expect(tools.getByText("0 read · 0 write · 0 destructive", { exact: true })).toBeVisible();
+    await tools.getByRole("button", { name: "Select all read-only" }).click();
+
+    await expect(tools.getByRole("region", { name: "Tool changes in next revision" }).getByText("Added (2)")).toBeVisible();
+
+    await tools.getByRole("searchbox", { name: "Search tools" }).fill("destructive");
+    await expect(tools.getByRole("checkbox", { name: "github:repository_delete:delete" })).toBeVisible();
+    await expect(tools.getByRole("checkbox", { name: "github:issues_get:read" })).toHaveCount(0);
+
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")).toBeTruthy();
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer").body.envelope.spec.tools).toEqual([
+      { provider: "github", resource: "issues_get", action: "read" },
+      { provider: "github", resource: "repository_get", action: "read" },
+    ]);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator confirms write and destructive tools one at a time", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    adminTemplateTools: [],
+    capabilityCatalogTools: groupedGithubTools,
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/developer`);
+    const tools = administrator.page.getByRole("group", { name: "Tools" });
+    const writeTool = tools.getByRole("checkbox", { name: "github:issues_update:write" });
+    const destructiveTool = tools.getByRole("checkbox", { name: "github:repository_delete:delete" });
+
+    administrator.page.once("dialog", (dialog) => dialog.dismiss());
+    await writeTool.click();
+    await expect(writeTool).not.toBeChecked();
+    administrator.page.once("dialog", (dialog) => dialog.accept());
+    await writeTool.click();
+
+    administrator.page.once("dialog", (dialog) => dialog.dismiss());
+    await destructiveTool.click();
+    await expect(destructiveTool).not.toBeChecked();
+    administrator.page.once("dialog", (dialog) => dialog.accept());
+    await destructiveTool.click();
+    await expect(tools.getByText("0 read · 1 write · 1 destructive", { exact: true })).toBeVisible();
+    await expect(tools.getByRole("region", { name: "Tool changes in next revision" }).getByText("Added (2)")).toBeVisible();
+
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")).toBeTruthy();
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer").body.envelope.spec.tools).toEqual([
+      { provider: "github", resource: "issues_update", action: "write" },
+      { provider: "github", resource: "repository_delete", action: "delete" },
+    ]);
   } finally {
     await closeGuardedPage(administrator);
   }

@@ -108,6 +108,18 @@ Template responses retain `memberRole`, set to the first eligible role, as a
 compatibility alias. Catalog-aware clients use the authoritative `memberRoles`
 array.
 
+#### Unreleased: capability tool picker
+
+The template editor presents the deployment capability catalog as a searchable
+tool picker. Optional `toolsets` on a catalog tool are authoritative,
+multi-membership presentation metadata; the UI never derives a group from a
+provider, resource, or action name. Tools without metadata remain selectable in
+a deterministic fallback group. Bulk actions may select read-only tools only.
+Write and destructive grants require an explicit per-tool confirmation, and a
+new revision displays its exact added and removed tool tuples before saving.
+The saved Envelope contains only the deduplicated `(provider, resource, action)`
+tuples, never the presentation metadata.
+
 Provisioned Envelope requests may include current-period spend usage. Usage is
 the sum of the latest observation for each runtime bound to that Envelope
 instance, plus active instance-scoped top-up grants in the effective limit. An
