@@ -373,6 +373,8 @@ export type BrowserFederatedSubjectAuditView = {
     action: string;
     actor: string;
     canonicalUserId?: null | CanonicalUserId;
+    connectionAccountId?: string | null;
+    connectionProvider?: string | null;
     createdAt: string;
     eventId: string;
     previousCanonicalUserId?: null | CanonicalUserId;
@@ -394,6 +396,7 @@ export type BrowserFederatedSubjectResponse = {
 
 export type BrowserFederatedSubjectView = {
     actorLogin?: string | null;
+    associationMethod?: string | null;
     canonicalUserId?: null | CanonicalUserId;
     displayName?: string | null;
     firstSeenAt: string;
@@ -989,8 +992,11 @@ export type Principal = {
 
 export type ProviderConnectionStatus = {
     accountEmail?: string | null;
+    accountId?: string | null;
+    accountLogin?: string | null;
     activeCredentialExpiresAt?: string | null;
     expiresAt?: string | null;
+    githubActionsIdentityLinked?: boolean | null;
     phase: ConnectionPhase;
     renewalCredentialExpiresAt?: string | null;
     scopesGranted: Array<string>;

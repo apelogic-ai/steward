@@ -296,7 +296,7 @@ the exact MCP-GW origin, and a dedicated runtime namespace. Authority v1 also
 requires the named `connectionsBridge.mcpGatewayAuthorityContract` selector:
 `steward.connections.github/v1` for the legacy status route or
 `steward.connections.github/v2` for the lifecycle status contract used by
-MCP-GW 0.4.9 through 0.5.1. The deprecated `mcpGatewayVersion` input remains
+MCP-GW 0.4.9 through 0.5.5. The deprecated `mcpGatewayVersion` input remains
 available for an existing values file and must not be set together with the
 named selector. Another configured contract fails closed. The apiserver records
 the frozen internal authority snapshot on each operation; the controller
@@ -344,6 +344,15 @@ provider-control grant, and is finalized through the normal controller
 lifecycle. Changing a configured trust mode, image, endpoint, MCP-GW authority
 contract, namespace, or runtime class does not reinterpret an existing
 operation; it fails closed.
+
+With MCP-GW 0.5.5+, Steward requests connection-status v2 and displays the
+GitHub login plus immutable numeric account ID. When federated Task identity is
+enabled, `taskIdentity.federatedSubjects.autoAssociateFromConnections=true`
+(the default) uses only that numeric ID to associate
+`github-actions:actor:<id>` with the signed-in canonical user. Login, display
+name, and email are never identity keys. Set the value to `false` to retain
+manual association. Disconnecting GitHub does not remove the association;
+administrators revoke it explicitly by disabling the federated subject.
 
 ### Troubleshooting a failed Connect operation
 

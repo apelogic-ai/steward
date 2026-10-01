@@ -397,6 +397,7 @@ spec:
             - { name: STEWARD_IDENTITY_TASK_AUDIENCE, value: {{ .Values.taskIdentity.audience | quote }} }
             - { name: STEWARD_IDENTITY_TASK_JWKS_FILE, value: /run/identity-task/jwks.json }
             - { name: STEWARD_FEDERATED_TASK_IDENTITY_ENABLED, value: {{ .Values.taskIdentity.federatedSubjects.enabled | quote }} }
+            - { name: STEWARD_FEDERATED_TASK_IDENTITY_AUTO_ASSOCIATE_FROM_CONNECTIONS, value: {{ .Values.taskIdentity.federatedSubjects.autoAssociateFromConnections | quote }} }
 {{- if .Values.taskIdentity.resource }}
             - { name: STEWARD_TASK_AUTH_RESOURCE, value: {{ .Values.taskIdentity.resource | quote }} }
 {{- end }}

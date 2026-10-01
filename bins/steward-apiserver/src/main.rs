@@ -149,6 +149,9 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     );
     let configured_task_identity =
         configured_task_identity_resolver(client.clone(), token_review_audience, store.clone())?;
+    let connection_auto_association_issuer = configured_task_identity
+        .connection_auto_association_issuer
+        .clone();
     let task_identities = configured_task_identity.resolver;
     let authenticator = IdentityOrKubernetesTokenAuthenticator::new(
         kubernetes_authenticator,
@@ -206,6 +209,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         decisions.clone(),
         workflow_agents,
         task_orchestration_mode,
+        connection_auto_association_issuer,
     )
     .await?;
     let app = router(
@@ -536,6 +540,7 @@ fn read_execution_binding_catalog(path: &str) -> Result<String, io::Error> {
 struct ConfiguredTaskIdentity {
     resolver: ConfiguredTaskIdentityResolver,
     discovery: Option<TaskAuthDiscoveryConfig>,
+    connection_auto_association_issuer: Option<String>,
 }
 
 fn configured_task_identity_resolver(
@@ -559,6 +564,18 @@ fn configured_task_identity_resolver(
             ));
         }
     };
+    let auto_associate_from_connections = match env::var(
+        "STEWARD_FEDERATED_TASK_IDENTITY_AUTO_ASSOCIATE_FROM_CONNECTIONS",
+    ) {
+        Ok(value) if value == "true" => true,
+        Ok(value) if value == "false" => false,
+        Err(env::VarError::NotPresent) => true,
+        _ => {
+            return Err(io::Error::other(
+                "STEWARD_FEDERATED_TASK_IDENTITY_AUTO_ASSOCIATE_FROM_CONNECTIONS must be true or false",
+            ));
+        }
+    };
     if values.iter().all(Option::is_none) {
         if resource.is_some() || federated_subjects_enabled {
             return Err(io::Error::other(
@@ -572,6 +589,7 @@ fn configured_task_identity_resolver(
                 store,
             ),
             discovery: None,
+            connection_auto_association_issuer: None,
         });
     }
     let [issuer, audience, jwks_file] = values;
@@ -596,7 +614,7 @@ fn configured_task_identity_resolver(
         None => None,
     };
     let resolver = ConfiguredTaskIdentityResolver::identity_from_jwks_file(
-        issuer,
+        issuer.clone(),
         required(audience)?,
         std::path::Path::new(&required(jwks_file)?),
         store,
@@ -606,6 +624,9 @@ fn configured_task_identity_resolver(
     Ok(ConfiguredTaskIdentity {
         resolver,
         discovery,
+        connection_auto_association_issuer: (federated_subjects_enabled
+            && auto_associate_from_connections)
+            .then_some(issuer),
     })
 }
 
@@ -664,6 +685,7 @@ async fn browser_application_router(
     decisions: JiraAdapter,
     workflow_agents: Vec<steward_apiserver::ExecutionBindingAdvertisement>,
     task_orchestration_mode: TaskOrchestrationMode,
+    connection_auto_association_issuer: Option<String>,
 ) -> Result<Option<axum::Router>, Box<dyn Error>> {
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
@@ -720,8 +742,12 @@ async fn browser_application_router(
         Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
     )
     .map_err(io::Error::other)?;
-    let connections =
-        governed_connections_configuration(&origin, store.clone(), task_orchestration_mode)?;
+    let connections = governed_connections_configuration(
+        &origin,
+        store.clone(),
+        task_orchestration_mode,
+        connection_auto_association_issuer,
+    )?;
     if workflows::ensure_sample_workflow(&store, &workflow_agents)
         .await
         .map_err(|error| io::Error::other(format!("sample Workflow bootstrap failed: {error}")))?
@@ -792,6 +818,7 @@ fn governed_connections_configuration(
     browser_origin: &str,
     store: PgStore,
     task_orchestration_mode: TaskOrchestrationMode,
+    connection_auto_association_issuer: Option<String>,
 ) -> Result<Option<GovernedConnectionsBroker>, io::Error> {
     let artifact_trust_mode = env::var("STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE").ok();
     let values = [
@@ -836,6 +863,7 @@ fn governed_connections_configuration(
                 "STEWARD_CONNECTIONS_CONTROL_PLANE_CREDENTIAL_FILE",
             )?),
             mint_origin: required("STEWARD_CONNECTIONS_MINT_ORIGIN")?,
+            federated_subject_issuer: connection_auto_association_issuer,
         },
         &bindings.mcp_gw_origin,
         &bindings.mcp_gw_version,

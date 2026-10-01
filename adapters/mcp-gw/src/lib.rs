@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use reqwest::header::AUTHORIZATION;
+use reqwest::header::{ACCEPT, AUTHORIZATION};
 use reqwest::{Client, Method, StatusCode, Url};
 use serde_json::{Map, Value, json};
 use steward_ports::PortError;
@@ -17,6 +17,7 @@ const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 const PROVIDER_TRANSPORT_READY_TIMEOUT: Duration = Duration::from_secs(12);
 const PROVIDER_TRANSPORT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const DIRECT_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
+const CONNECTION_STATUS_V2_MEDIA_TYPE: &str = "application/vnd.apelogic.connection-status.v2+json";
 pub const MAX_GATEWAY_FAILURE_DETAIL_BYTES: usize = 200;
 const BRIDGE_GATEWAY_HTTP_PREFIX: &str = "steward-connections-bridge: bridge MCP-GW returned HTTP ";
 
@@ -308,6 +309,7 @@ impl GithubStatusReader {
             .client
             .get(target)
             .header(AUTHORIZATION, format!("Bearer {}", credential.secret()))
+            .header(ACCEPT, CONNECTION_STATUS_V2_MEDIA_TYPE)
             .send()
             .await
             .map_err(|_| unavailable("read direct GitHub connection status"))?;
@@ -365,6 +367,9 @@ impl GithubMcpGateway {
                 AUTHORIZATION,
                 format!("Bearer {OPEN_SHELL_BEARER_PLACEHOLDER}"),
             );
+            if operation == GithubBridgeOperation::Status {
+                http = http.header(ACCEPT, CONNECTION_STATUS_V2_MEDIA_TYPE);
+            }
             if let Some(body) = &body {
                 http = http.json(body);
             }
@@ -632,9 +637,12 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
     // Validate only the fields Steward consumes. MCP-GW may add lifecycle metadata without
     // changing this contract, and the projection below prevents unconsumed values from entering
     // Steward's governed archive or browser response.
-    if object.get("version").and_then(Value::as_str) != Some("1")
-        || object.get("provider").and_then(Value::as_str) != Some("github")
-    {
+    let version = object
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|version| matches!(*version, "1" | "2"))
+        .ok_or_else(|| rejected("GitHub lifecycle status has an invalid identity or schema"))?;
+    if object.get("provider").and_then(Value::as_str) != Some("github") {
         return Err(rejected(
             "GitHub lifecycle status has an invalid identity or schema",
         ));
@@ -666,14 +674,48 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
         .map(|value| {
             let account = value
                 .as_object()
-                .filter(|account| account.len() == 1)
                 .ok_or_else(|| rejected("GitHub lifecycle account is invalid"))?;
-            account
+            let display_name = account
                 .get("displayName")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty() && name.len() <= 320)
                 .map(str::to_owned)
-                .ok_or_else(|| rejected("GitHub lifecycle account is invalid"))
+                .ok_or_else(|| rejected("GitHub lifecycle account is invalid"))?;
+            if version == "1" {
+                if account.len() != 1 {
+                    return Err(rejected("GitHub lifecycle account is invalid"));
+                }
+                return Ok((display_name, None, None));
+            }
+            if account.get("provider").and_then(Value::as_str) != Some("github") {
+                return Err(rejected("GitHub lifecycle account is invalid"));
+            }
+            let account_id = account
+                .get("id")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|id| {
+                            !id.is_empty()
+                                && id.len() <= 20
+                                && id.bytes().all(|byte| byte.is_ascii_digit())
+                                && !id.starts_with('0')
+                        })
+                        .map(str::to_owned)
+                        .ok_or_else(|| rejected("GitHub lifecycle account ID is invalid"))
+                })
+                .transpose()?;
+            let login = account
+                .get("login")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|login| !login.is_empty() && login.len() <= 128)
+                        .map(str::to_owned)
+                        .ok_or_else(|| rejected("GitHub lifecycle account login is invalid"))
+                })
+                .transpose()?;
+            Ok((display_name, account_id, login))
         })
         .transpose()?;
     let scopes_required = required_string_array(object, "requiredScopes")?;
@@ -723,8 +765,14 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
     let mut projection = Map::new();
     projection.insert("phase".to_owned(), Value::String(phase.to_owned()));
     projection.insert("connected".to_owned(), Value::Bool(connected));
-    if let Some(account) = account {
-        projection.insert("email".to_owned(), Value::String(account));
+    if let Some((display_name, account_id, login)) = account {
+        projection.insert("email".to_owned(), Value::String(display_name));
+        if let Some(account_id) = account_id {
+            projection.insert("accountId".to_owned(), Value::String(account_id));
+        }
+        if let Some(login) = login {
+            projection.insert("accountLogin".to_owned(), Value::String(login));
+        }
     }
     projection.insert("scopesRequired".to_owned(), scopes_required);
     projection.insert("scopesGranted".to_owned(), scopes_granted);
@@ -1243,6 +1291,84 @@ mod tests {
     }
 
     #[test]
+    fn normalized_v2_status_accepts_only_a_canonical_numeric_account_id() -> Result<(), String> {
+        let status = |id: Option<&str>| {
+            let mut account = serde_json::json!({
+                "provider": "github",
+                "displayName": "alice@example.com"
+            });
+            if let Some(id) = id {
+                account["id"] = serde_json::json!(id);
+                account["login"] = serde_json::json!("mutable-login");
+            }
+            serde_json::json!({
+                "version": "2",
+                "provider": "github",
+                "phase": "connected",
+                "connected": true,
+                "account": account,
+                "requiredScopes": ["repo"],
+                "grantedScopes": ["repo"],
+                "missingScopes": [],
+                "activeCredentialExpiresAt": null,
+                "renewalCredentialExpiresAt": null,
+                "lastAuthorizedAt": null,
+                "lastRenewedAt": null,
+                "lastValidatedAt": null,
+                "capabilities": {"interactiveAuthorization": true}
+            })
+        };
+
+        let projected = parse_response(
+            GatewayContract::LifecycleV049,
+            GithubBridgeOperation::Status,
+            StatusCode::OK,
+            status(Some("123456")).to_string().as_bytes(),
+        )
+        .map_err(|error| format!("valid v2 status was rejected: {error:?}"))?;
+        assert_eq!(projected["accountId"], "123456");
+        assert_eq!(projected["accountLogin"], "mutable-login");
+        let mut identity_without_login = status(Some("123456"));
+        identity_without_login["account"]
+            .as_object_mut()
+            .ok_or_else(|| "fixed v2 account fixture is not an object".to_owned())?
+            .remove("login");
+        identity_without_login["account"]["futureDisplayField"] = serde_json::json!("ignored");
+        let projected_without_login = parse_response(
+            GatewayContract::LifecycleV049,
+            GithubBridgeOperation::Status,
+            StatusCode::OK,
+            identity_without_login.to_string().as_bytes(),
+        )
+        .map_err(|error| format!("numeric ID without mutable login was rejected: {error:?}"))?;
+        assert_eq!(projected_without_login["accountId"], "123456");
+        assert!(projected_without_login.get("accountLogin").is_none());
+        assert!(
+            parse_response(
+                GatewayContract::LifecycleV049,
+                GithubBridgeOperation::Status,
+                StatusCode::OK,
+                status(None).to_string().as_bytes(),
+            )
+            .is_ok(),
+            "a best-effort MCP-GW backfill failure must leave status readable"
+        );
+        for invalid in ["0", "012345", "123456789012345678901", "123x"] {
+            assert!(
+                parse_response(
+                    GatewayContract::LifecycleV049,
+                    GithubBridgeOperation::Status,
+                    StatusCode::OK,
+                    status(Some(invalid)).to_string().as_bytes(),
+                )
+                .is_err(),
+                "invalid GitHub account ID {invalid} must not become identity evidence"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn provider_control_http_failures_are_reduced_to_non_secret_runtime_categories() {
         assert_eq!(
             parse_response(
@@ -1448,7 +1574,13 @@ mod tests {
                     .contains("\r\nauthorization: bearer aaa.bbb.ccc\r\n"),
                 "the direct reader must present the one-request HOP-1 credential"
             );
-            let body = r#"{"version":"1","provider":"github","phase":"disconnected","connected":false,"requiredScopes":["repo"],"grantedScopes":[],"missingScopes":["repo"],"activeCredentialExpiresAt":null,"renewalCredentialExpiresAt":null,"lastAuthorizedAt":null,"lastRenewedAt":null,"lastValidatedAt":null,"capabilities":{"interactiveAuthorization":true}}"#;
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("\r\naccept: application/vnd.apelogic.connection-status.v2+json\r\n"),
+                "the direct reader must explicitly request stable GitHub account identity"
+            );
+            let body = r#"{"version":"2","provider":"github","phase":"connected","connected":true,"account":{"provider":"github","id":"123456","login":"alice","displayName":"alice@example.com"},"requiredScopes":["repo"],"grantedScopes":["repo"],"missingScopes":[],"activeCredentialExpiresAt":null,"renewalCredentialExpiresAt":null,"lastAuthorizedAt":null,"lastRenewedAt":null,"lastValidatedAt":null,"capabilities":{"interactiveAuthorization":true}}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1473,11 +1605,14 @@ mod tests {
         assert_eq!(
             status,
             serde_json::json!({
-                "phase": "disconnected",
-                "connected": false,
+                "phase": "connected",
+                "connected": true,
+                "accountId": "123456",
+                "accountLogin": "alice",
+                "email": "alice@example.com",
                 "scopesRequired": ["repo"],
-                "scopesGranted": [],
-                "missingScopes": ["repo"],
+                "scopesGranted": ["repo"],
+                "missingScopes": [],
                 "activeCredentialExpiresAt": null,
                 "renewalCredentialExpiresAt": null
             })

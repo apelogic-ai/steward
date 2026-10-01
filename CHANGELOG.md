@@ -7,6 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in MCP-GW connection-status v2 consumption and default-on GitHub
+  Connect association for `steward-task-v3`, matching only the immutable numeric
+  GitHub account ID and recording connection-verification evidence in additive
+  migration 0053. Deployments can retain manual association with
+  `taskIdentity.federatedSubjects.autoAssociateFromConnections=false`.
+
 ### Fixed
 
 - Preserved bounded MCP-GW HTTP status and safe reason diagnostics for failed governed

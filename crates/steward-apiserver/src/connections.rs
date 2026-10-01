@@ -55,6 +55,9 @@ pub enum ConnectionPhase {
 pub struct ProviderConnectionStatus {
     pub phase: ConnectionPhase,
     pub account_email: Option<String>,
+    pub account_id: Option<String>,
+    pub account_login: Option<String>,
+    pub github_actions_identity_linked: Option<bool>,
     pub scopes_required: Vec<String>,
     pub scopes_granted: Vec<String>,
     pub scopes_missing: Vec<String>,
@@ -526,6 +529,9 @@ where
                         status: ProviderConnectionStatus {
                             phase: ConnectionPhase::Unavailable,
                             account_email: None,
+                            account_id: None,
+                            account_login: None,
+                            github_actions_identity_linked: None,
                             scopes_required: Vec::new(),
                             scopes_granted: Vec::new(),
                             scopes_missing: Vec::new(),
@@ -695,6 +701,9 @@ mod tests {
                         ConnectionPhase::Disconnected
                     },
                     account_email: connected.then(|| "alice@example.com".to_owned()),
+                    account_id: None,
+                    account_login: None,
+                    github_actions_identity_linked: None,
                     scopes_required: vec!["repo".to_owned()],
                     scopes_granted: connected.then(|| "repo".to_owned()).into_iter().collect(),
                     scopes_missing: (!connected)

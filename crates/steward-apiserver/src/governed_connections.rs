@@ -24,7 +24,8 @@ use steward_store::{
     ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase,
     ConnectionOperationKind as StoredOperationKind, ConnectionOperationRecord,
     ConnectionOperationReservationRequest, ConnectionOperationRetention, ConnectionOperationState,
-    PgStore, StoreError, TaskOrchestrationMode, TaskReservationRequest,
+    FederatedSubjectObservation, PgStore, StoreError, TaskOrchestrationMode,
+    TaskReservationRequest,
 };
 use steward_types::{
     AgentRuntimeSpec, AgentType, CanonicalAuthorityBinding, CanonicalUserId, Email, Principal,
@@ -63,6 +64,7 @@ const MAX_BRIDGE_RESULT_BYTES: usize = 32 * 1024;
 const TAR_BLOCK_BYTES: usize = 512;
 const RECONCILE_INTERVAL: StdDuration = StdDuration::from_millis(100);
 const DIRECT_STATUS_DEADLINE: StdDuration = StdDuration::from_secs(1);
+const CONNECTION_ASSOCIATION_DEADLINE: StdDuration = StdDuration::from_secs(1);
 const CONTROL_PLANE_STATUS_SCOPE: &str = "connections_status";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -237,6 +239,7 @@ pub struct GovernedConnectionsConfig {
 pub struct DirectConnectionStatusConfig {
     pub control_plane_credential_file: PathBuf,
     pub mint_origin: String,
+    pub federated_subject_issuer: Option<String>,
 }
 
 #[derive(Clone)]
@@ -246,6 +249,7 @@ pub struct DirectConnectionStatusReader {
     gateway: GithubStatusReader,
     mint_endpoint: Url,
     store: PgStore,
+    federated_subject_issuer: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -332,6 +336,14 @@ impl DirectConnectionStatusReader {
             || mint_origin.query().is_some()
             || mint_origin.fragment().is_some()
             || config.control_plane_credential_file.as_os_str().is_empty()
+            || config
+                .federated_subject_issuer
+                .as_deref()
+                .is_some_and(|issuer| {
+                    !issuer.starts_with("https://")
+                        || issuer.len() > 2_048
+                        || issuer.chars().any(char::is_whitespace)
+                })
         {
             return Err(GovernedConnectionPlanError::InvalidBindings);
         }
@@ -352,6 +364,7 @@ impl DirectConnectionStatusReader {
             gateway,
             mint_endpoint,
             store,
+            federated_subject_issuer: config.federated_subject_issuer,
         })
     }
 
@@ -359,9 +372,23 @@ impl DirectConnectionStatusReader {
         &self,
         session: &ConnectionSession<B>,
     ) -> Result<ProviderConnectionStatus, ConnectionBrokerError> {
-        tokio::time::timeout(DIRECT_STATUS_DEADLINE, self.read_inner(session))
+        let mut status = tokio::time::timeout(DIRECT_STATUS_DEADLINE, self.read_inner(session))
             .await
-            .map_err(|_| ConnectionBrokerError::Unavailable)?
+            .map_err(|_| ConnectionBrokerError::Unavailable)??;
+        if status.phase == ConnectionPhase::Connected {
+            status.github_actions_identity_linked = tokio::time::timeout(
+                CONNECTION_ASSOCIATION_DEADLINE,
+                self.associate_github_actions_identity(session, &status),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                eprintln!(
+                    "best-effort GitHub connection identity association failed: category=store_timeout"
+                );
+                None
+            });
+        }
+        Ok(status)
     }
 
     async fn read_inner<B>(
@@ -431,6 +458,49 @@ impl DirectConnectionStatusReader {
                 .map_err(|_| ConnectionBrokerError::Unavailable)?;
         }
         Ok(status)
+    }
+
+    async fn associate_github_actions_identity<B>(
+        &self,
+        session: &ConnectionSession<B>,
+        status: &ProviderConnectionStatus,
+    ) -> Option<bool> {
+        let (Some(issuer), Some(account_id)) = (
+            self.federated_subject_issuer.as_deref(),
+            status.account_id.as_deref(),
+        ) else {
+            return None;
+        };
+        let Some(subject) = github_actions_subject(account_id) else {
+            return None;
+        };
+        match self
+            .store
+            .associate_federated_subject_from_connection(
+                FederatedSubjectObservation {
+                    issuer,
+                    subject: &subject,
+                    actor_login: status.account_login.as_deref(),
+                    display_name: status.account_email.as_deref(),
+                },
+                &session.subject.canonical_user_id,
+                "github",
+                account_id,
+            )
+            .await
+        {
+            Ok(_) => Some(true),
+            Err(StoreError::FederatedSubjectConflict | StoreError::FederatedSubjectDisabled) => {
+                Some(false)
+            }
+            Err(error) => {
+                eprintln!(
+                    "best-effort GitHub connection identity association failed: category={}",
+                    connection_association_failure_category(&error)
+                );
+                None
+            }
+        }
     }
 }
 
@@ -1316,6 +1386,8 @@ fn provider_status(value: &Value) -> Result<ProviderConnectionStatus, Connection
             "phase"
                 | "connected"
                 | "email"
+                | "accountId"
+                | "accountLogin"
                 | "scopesRequired"
                 | "scopesGranted"
                 | "missingScopes"
@@ -1330,6 +1402,14 @@ fn provider_status(value: &Value) -> Result<ProviderConnectionStatus, Connection
         .and_then(Value::as_bool)
         .ok_or(ConnectionBrokerError::Unavailable)?;
     let email = optional_string(object, "email")?;
+    let account_id = optional_string(object, "accountId")?;
+    let account_login = optional_string(object, "accountLogin")?;
+    if account_id
+        .as_deref()
+        .is_some_and(|value| github_actions_subject(value).is_none())
+    {
+        return Err(ConnectionBrokerError::Unavailable);
+    }
     let scopes_required = string_array(object, "scopesRequired")?;
     let scopes_granted = string_array(object, "scopesGranted")?;
     let scopes_missing = string_array(object, "missingScopes")?;
@@ -1354,6 +1434,9 @@ fn provider_status(value: &Value) -> Result<ProviderConnectionStatus, Connection
     Ok(ProviderConnectionStatus {
         phase,
         account_email: email,
+        account_id,
+        account_login,
+        github_actions_identity_linked: None,
         scopes_required,
         scopes_granted,
         scopes_missing,
@@ -1361,6 +1444,27 @@ fn provider_status(value: &Value) -> Result<ProviderConnectionStatus, Connection
         active_credential_expires_at,
         renewal_credential_expires_at,
     })
+}
+
+fn github_actions_subject(account_id: &str) -> Option<String> {
+    (!account_id.is_empty()
+        && account_id.len() <= 20
+        && account_id.bytes().all(|byte| byte.is_ascii_digit())
+        && !account_id.starts_with('0'))
+    .then(|| format!("github-actions:actor:{account_id}"))
+}
+
+fn connection_association_failure_category(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::CanonicalIdentityNotFound | StoreError::CanonicalIdentityInactive => {
+            "canonical_identity_unavailable"
+        }
+        StoreError::InvalidFederatedSubject | StoreError::InvalidFederatedSubjectRecord => {
+            "invalid_identity_evidence"
+        }
+        StoreError::Database(_) => "store_unavailable",
+        _ => "association_rejected",
+    }
 }
 
 fn optional_expiry(
@@ -1632,6 +1736,9 @@ mod tests {
                 Ok(ProviderConnectionStatus {
                     phase: ConnectionPhase::Disconnected,
                     account_email: None,
+                    account_id: None,
+                    account_login: None,
+                    github_actions_identity_linked: None,
                     scopes_required: Vec::new(),
                     scopes_granted: Vec::new(),
                     scopes_missing: Vec::new(),
@@ -1992,6 +2099,8 @@ mod tests {
             "phase": "connected",
             "connected": true,
             "email": "alice@example.com",
+            "accountId": "123456",
+            "accountLogin": "mutable-login",
             "scopesRequired": ["repo"],
             "scopesGranted": ["repo"],
             "missingScopes": [],
@@ -2007,6 +2116,27 @@ mod tests {
             status.renewal_credential_expires_at.as_deref(),
             Some("2026-09-16T12:00:00.000Z")
         );
+        assert_eq!(status.account_id.as_deref(), Some("123456"));
+        assert_eq!(status.account_login.as_deref(), Some("mutable-login"));
+        assert!(status.github_actions_identity_linked.is_none());
+        for invalid in ["0", "012345", "123456789012345678901", "123x"] {
+            let invalid_status = serde_json::json!({
+                "phase": "connected",
+                "connected": true,
+                "email": "alice@example.com",
+                "accountId": invalid,
+                "accountLogin": "mutable-login",
+                "scopesRequired": ["repo"],
+                "scopesGranted": ["repo"],
+                "missingScopes": [],
+                "activeCredentialExpiresAt": null,
+                "renewalCredentialExpiresAt": null
+            });
+            assert!(
+                provider_status(&invalid_status).is_err(),
+                "invalid GitHub account ID {invalid} must not become identity evidence"
+            );
+        }
         Ok(())
     }
 

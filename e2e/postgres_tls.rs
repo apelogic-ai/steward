@@ -6,8 +6,9 @@ use std::io;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::PgPoolOptions;
 use steward_store::{
-    FederatedSubjectAssociation, FederatedSubjectAuditAction, FederatedSubjectDisable,
-    FederatedSubjectObservation, FederatedSubjectState, PgStore, StoreError,
+    FederatedSubjectAssociation, FederatedSubjectAssociationMethod, FederatedSubjectAuditAction,
+    FederatedSubjectDisable, FederatedSubjectObservation, FederatedSubjectState, PgStore,
+    StoreError,
 };
 use steward_types::CanonicalUserId;
 
@@ -286,6 +287,7 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
     let second = second?;
     assert_eq!(first.subject_id, second.subject_id);
     assert_eq!(first.state, FederatedSubjectState::Observed);
+    assert!(first.association_method.is_none());
     assert_eq!(first.revision, 1);
     assert_eq!(
         store
@@ -321,6 +323,10 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
     assert_eq!(seeded_first.revision, seeded_second.revision);
     assert_eq!(seeded_first.state, FederatedSubjectState::Associated);
     assert_eq!(seeded_first.canonical_user_id.as_ref(), Some(&alice));
+    assert_eq!(
+        seeded_first.association_method,
+        Some(FederatedSubjectAssociationMethod::V2Claim)
+    );
     assert_eq!(seeded_first.revision, 2);
     assert_eq!(
         store
@@ -359,6 +365,10 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
         })
         .await?;
     assert_eq!(replaced.canonical_user_id.as_ref(), Some(&bob));
+    assert_eq!(
+        replaced.association_method,
+        Some(FederatedSubjectAssociationMethod::Admin)
+    );
     assert_eq!(replaced.revision, 3);
     sqlx::query(
         "UPDATE canonical_users SET display_email = 'bob.updated@example.org' WHERE user_id = $1",
@@ -408,6 +418,108 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
             .await,
         Err(StoreError::FederatedSubjectDisabled)
     ));
+    assert!(matches!(
+        store
+            .associate_federated_subject_from_connection(
+                observation(),
+                &bob,
+                "github",
+                "16106037",
+            )
+            .await,
+        Err(StoreError::FederatedSubjectDisabled)
+    ));
+
+    let connected_account = FederatedSubjectObservation {
+        issuer: "https://identity.example.test",
+        subject: "github-actions:actor:424242",
+        actor_login: Some("alice-gh"),
+        display_name: Some("alice@example.com"),
+    };
+    let connected = store
+        .associate_federated_subject_from_connection(
+            connected_account,
+            &alice,
+            "github",
+            "424242",
+        )
+        .await?;
+    assert_eq!(connected.state, FederatedSubjectState::Associated);
+    assert_eq!(connected.canonical_user_id.as_ref(), Some(&alice));
+    assert_eq!(
+        connected.association_method,
+        Some(FederatedSubjectAssociationMethod::ConnectionVerification)
+    );
+    let connected_audit = store.federated_subject_audit(connected.subject_id).await?;
+    assert_eq!(
+        connected_audit
+            .iter()
+            .map(|event| event.action)
+            .collect::<Vec<_>>(),
+        [
+            FederatedSubjectAuditAction::Observed,
+            FederatedSubjectAuditAction::ConnectionVerified,
+        ]
+    );
+    let verification = connected_audit
+        .last()
+        .ok_or_else(|| io::Error::other("connection verification audit is missing"))?;
+    assert_eq!(verification.actor, "connection-verification");
+    assert_eq!(verification.connection_provider.as_deref(), Some("github"));
+    assert_eq!(verification.connection_account_id.as_deref(), Some("424242"));
+    assert!(matches!(
+        store
+            .associate_federated_subject_from_connection(
+                FederatedSubjectObservation {
+                    issuer: "https://identity.example.test",
+                    subject: "github-actions:actor:999999",
+                    actor_login: Some("alice-gh"),
+                    display_name: Some("alice@example.com"),
+                },
+                &alice,
+                "github",
+                "424242",
+            )
+            .await,
+        Err(StoreError::InvalidFederatedSubject)
+    ));
+    assert!(
+        store
+            .federated_subject_by_external_identity(
+                "https://identity.example.test",
+                "github-actions:actor:999999",
+            )
+            .await?
+            .is_none(),
+        "a connection for account A must not create or associate account B's subject"
+    );
+    assert!(matches!(
+        store
+            .associate_federated_subject_from_connection(
+                FederatedSubjectObservation {
+                    issuer: "https://identity.example.test",
+                    subject: "github-actions:actor:424242",
+                    actor_login: Some("alice-renamed"),
+                    display_name: Some("bob@example.org"),
+                },
+                &bob,
+                "github",
+                "424242",
+            )
+            .await,
+        Err(StoreError::FederatedSubjectConflict)
+    ));
+    assert_eq!(
+        store
+            .resolve_federated_subject(
+                "https://identity.example.test",
+                "github-actions:actor:424242",
+            )
+            .await?
+            .user_id,
+        alice,
+        "mutable login or display metadata must never move a numeric GitHub account association"
+    );
 
     let similarity = store
         .observe_federated_subject(FederatedSubjectObservation {

@@ -99,7 +99,7 @@ again in the target cluster before enabling governed execution.
 | agent-sandbox | 0.5.0 |
 | Runtime | Cluster/OpenShell default; no VM-isolation claim |
 | SPIRE | `spire` chart 0.29.0, `spire-crds` chart 0.5.0, SPIRE image 1.15.2 |
-| MCP-GW | 0.5.1; must implement `steward.connections.github/v2` |
+| MCP-GW | 0.5.5; must implement `steward.connections.github/v2` and connection-status v2 |
 | LiteLLM | v1.93.0; must implement the documented Responses and Anthropic Messages URL contracts |
 | Gateway API edge | `gateway.networking.k8s.io/v1`; selected GatewayClass reports `BackendTLSPolicy` |
 | Companion products | `steward-run` 0.7.0+ for `envelopeDigest`; exact `steward-run` and Identity coordinates come from the installation BOM |

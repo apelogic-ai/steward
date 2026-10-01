@@ -38,6 +38,7 @@ chart configuration continues to accept v2 only.
      resource: https://steward.example.test
      federatedSubjects:
        enabled: true
+       autoAssociateFromConnections: true
      publicJwksConfigMap:
        name: steward-task-identity-jwks
        key: jwks.json
@@ -46,21 +47,28 @@ chart configuration continues to accept v2 only.
 4. Verify `GET /.well-known/oauth-protected-resource` returns the exact
    resource and issuer, `Cache-Control: public, max-age=300`, bearer-header
    support, and both `steward-task-v2` and `steward-task-v3`.
-5. Submit one valid v3 credential for an unobserved actor. Expect
-   `403 task_identity_unassociated`, one observed subject, one `observed` audit
-   event, and no Task or Envelope creation.
-6. Through the browser administrator API, associate that subject with an
-   existing active canonical user using its current revision. Verify the audit
-   event and then submit again. Normal source authorization and active User
-   Envelope admission must still pass; association does not grant either.
-7. Prove wrong issuer, audience, signature, algorithm, key ID, expired or future
+5. Sign in as a new user and connect the same GitHub account that will trigger
+   the workflow. After connection status reports its numeric GitHub account ID,
+   verify Steward records `github-actions:actor:<id>` as associated with that
+   canonical user and audits `connection_verified` with provider `github` and
+   the exact numeric ID.
+6. Submit the first valid v3 credential for that actor. Normal source
+   authorization and active User Envelope admission must pass without an
+   administrator association or a retry. Association does not grant either
+   repository access or runtime authority.
+7. Set `autoAssociateFromConnections=false` to verify the manual-review mode:
+   an unobserved actor returns `403 task_identity_unassociated` until an
+   administrator associates the observed subject. Re-enable the default after
+   the check unless manual review is the intended policy.
+8. Prove wrong issuer, audience, signature, algorithm, key ID, expired or future
    time, malformed actor subject, caller-supplied canonical identity, disabled
    subject, and a canonical user without a matching active Envelope all fail
    before Task reservation.
 
 ## Rolling compatibility
 
-Migration 0040 is additive, so old v2-only binaries ignore its tables. New
+Migrations 0040 and 0053 are additive, so old v2-only binaries ignore their
+tables and columns. New
 binaries accept v2 throughout the rollout. Do not enable v3 until every
 apiserver that can receive Task traffic supports it; otherwise requests routed
 to an older pod will fail inconsistently. The database remains the only source
@@ -72,10 +80,10 @@ Before rolling back binaries, set
 `taskIdentity.federatedSubjects.enabled=false` and verify discovery advertises
 v2 only. Stop new submissions and drain or fence in-flight work under the
 ordinary Task rollback procedure. Previous v2-capable binaries may then run
-against the additive migration 0040 schema, but the federated-subject tables
+against the additive migration 0040 and 0053 schema, but the federated-subject tables
 and their audit history must remain intact.
 
-Do not reverse migration 0040, delete observed subjects, or restore a database
+Do not reverse migrations 0040 or 0053, delete observed subjects, or restore a database
 backup merely to remove v3. If rollback requires a pre-0040 database, restore
 the complete pre-upgrade backup to a separate target and switch all compatible
 components together; that discards every post-backup write, not only federated
