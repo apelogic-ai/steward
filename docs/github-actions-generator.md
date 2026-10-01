@@ -1,6 +1,6 @@
 # Steward GitHub Actions generator contract
 
-Status: unreleased contract targeting the Steward v0.3.6 renderer and browser integration
+Status: current main contract targeted for Steward v0.3.6
 
 The generator turns one authoritative Steward envelope selection and one bounded task template
 into workflow YAML that a developer may inspect, copy, commit, and dispatch. It never selects a
@@ -47,6 +47,16 @@ commit. The versioned generator requires structurally immutable coordinates and
 steward-run v0.7.0 or later. The deprecated `governedJobContainerImage` field
 remains accepted, but the versioned generator does not emit or consume it.
 
+`config.apiserver.stewardRunWorkflowInstallationMode` is a separate deployment
+choice. Its `remote` default renders the release's immutable repository and
+workflow commit. Explicit `vendored` mode renders
+`./.github/workflows/steward-task-vendored.yml` while retaining the verified
+remote coordinates in generated provenance. Operators install that exact
+checksum- and signature-verified release asset before committing or dispatching
+the generated caller. Vendored mode requires steward-run v0.7.6 or later;
+older release handoffs fail closed. Neither mode accepts a PAT or checkout-token
+input.
+
 The committed golden workflow uses reserved example coordinates. It tests
 deterministic rendering and is not an installation BOM or a deployable pin.
 
@@ -62,8 +72,12 @@ Repository administrators provide these non-secret Actions variables:
 
 - `STEWARD_RUNNER_LABEL`
 - `STEWARD_API_URL`
-- `IDENTITY_EXCHANGE_URL`
-- `STEWARD_CA_CERTIFICATE_FILE`
+
+When Steward task-auth discovery is not configured, compatibility callers also
+receive `IDENTITY_EXCHANGE_URL`, `IDENTITY_EXCHANGE_AUDIENCE`, and
+`STEWARD_CA_CERTIFICATE_FILE`. Once `taskIdentity.resource` enables discovery,
+the generator omits all three legacy inputs so stale repository or organization
+variables cannot disable discovery.
 
 The generator never resolves or persists their values.
 

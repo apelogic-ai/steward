@@ -167,6 +167,9 @@ config:
     # Exact verified steward-run release coordinates selected by the installation BOM. Required
     # when browser administration is enabled; null keeps the source chart product-neutral.
     stewardRunRelease: null
+    # Use the immutable remote reusable workflow by default. Select vendored only after installing
+    # the verified steward-task-vendored.yml release asset in every caller repository.
+    stewardRunWorkflowInstallationMode: remote
     # Optional ordinary catalog entry for an operator-selected LLM smoke test. Disabled by
     # default; every authority field is explicit and no model is inferred from the catalog.
     defaultLlmTemplate:

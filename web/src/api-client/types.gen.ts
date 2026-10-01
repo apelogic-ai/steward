@@ -1184,6 +1184,7 @@ export type TaskCreateRequest = TaskSubmissionRequest | DirectTaskSubmission;
 
 export type TaskErrorResponse = {
     error: string;
+    failureReason?: string | null;
 };
 
 /**
@@ -3677,7 +3678,7 @@ export type TaskSubmissionContractErrors = {
      */
     422: TaskErrorResponse;
     /**
-     * Identity, Kubernetes, persistence, or decision dependency unavailable
+     * Direct-package source support is disabled, or an Identity, Kubernetes, persistence, or decision dependency is unavailable
      */
     503: TaskErrorResponse;
 };
