@@ -600,6 +600,7 @@ async function guardedPage(browser, {
   const context = await browser.newContext({ colorScheme, viewport });
   const executionLogRequests = [];
   const mutations = [];
+  const setupStatusRequests = [];
   let currentAdminSetupStatus = adminSetupStatus;
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
@@ -610,6 +611,18 @@ async function guardedPage(browser, {
   });
   web.useRerunFixtures(rerunResponses);
   await context.addInitScript(() => {
+    const BrowserAbortController = AbortController;
+    Object.defineProperty(window, "__stewardAbortCount", { configurable: true, value: 0, writable: true });
+    Object.defineProperty(window, "AbortController", {
+      configurable: true,
+      value: class extends BrowserAbortController {
+        abort(reason) {
+          window.__stewardAbortCount += 1;
+          return super.abort(reason);
+        }
+      },
+      writable: true,
+    });
     const allowedPreference = (key) => typeof key === "string"
       && (key.startsWith("steward.ui.envelope-accordion.") || key === "steward.ui.admin-setup-dismissed");
     for (const method of ["getItem", "removeItem", "setItem"]) {
@@ -640,7 +653,16 @@ async function guardedPage(browser, {
       body: JSON.stringify(session),
     });
   });
-  await context.route(`${origin}/admin/api/v1/setup-status`, (route) => json(route, currentAdminSetupStatus));
+  await context.route(`${origin}/admin/api/v1/setup-status`, async (route) => {
+    setupStatusRequests.push(route.request());
+    try {
+      if (currentAdminSetupStatus.delayMs) await new Promise((resolve) => setTimeout(resolve, currentAdminSetupStatus.delayMs));
+      if (currentAdminSetupStatus.httpStatus) return route.fulfill({ status: currentAdminSetupStatus.httpStatus, body: "" });
+      return json(route, currentAdminSetupStatus.body ?? currentAdminSetupStatus);
+    } catch {
+      return undefined;
+    }
+  });
   await context.route(`${origin}/admin/auth/login*`, (route) => route.fulfill({
     status: 200,
     contentType: "text/html",
@@ -920,6 +942,7 @@ async function guardedPage(browser, {
     executionLogRequests,
     httpErrors,
     mutations,
+    setupStatusRequests,
     useAdminSetupStatus: (status) => { currentAdminSetupStatus = status; },
   };
 }
@@ -1024,7 +1047,7 @@ test("the shell carries the HyperShell visual system", async ({ browser }) => {
 });
 
 test("administrators get live prerequisite reasons and can restore the hidden setup guide", async ({ browser }) => {
-  const administrator = await guardedPage(browser, { session: administratorSession });
+  const administrator = await guardedPage(browser, { expectedHttpStatuses: [503], session: administratorSession });
   try {
     await administrator.page.goto(`${origin}/admin/get-started`);
     await expect(administrator.page.getByRole("heading", { name: "Get started" })).toBeVisible();
@@ -1039,9 +1062,24 @@ test("administrators get live prerequisite reasons and can restore the hidden se
     await administrator.page.getByRole("button", { name: "Refresh status" }).click();
     await expect(administrator.page.getByText("Orchestration and one resolvable execution binding are active.")).toBeVisible();
 
+    administrator.useAdminSetupStatus({ httpStatus: 503 });
+    await administrator.page.getByRole("button", { name: "Refresh status" }).click();
+    await expect(administrator.page.getByRole("heading", { name: "Setup status is unavailable" })).toBeVisible();
+    await expect(administrator.page.getByText("No prerequisite has been inferred. Retry when the authoritative service is available.", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByText("Orchestration and one resolvable execution binding are active.")).toHaveCount(0);
+
+    const abortsBeforeDismissal = await administrator.page.evaluate(() => window.__stewardAbortCount);
+    const requestsBeforeDismissal = administrator.setupStatusRequests.length;
+    administrator.useAdminSetupStatus({ delayMs: 3_000, body: { apiVersion: "steward.admin-setup/v1", checks: [] } });
+    await administrator.page.getByRole("button", { name: "Refresh status" }).click();
+    await expect.poll(() => administrator.setupStatusRequests.length).toBe(requestsBeforeDismissal + 1);
     await administrator.page.getByRole("button", { name: "Hide this guide" }).click();
     await expect(administrator.page.getByText("The administrator setup guide is hidden in this browser.")).toBeVisible();
+    await expect.poll(() => administrator.page.evaluate(() => window.__stewardAbortCount)).toBeGreaterThan(abortsBeforeDismissal);
     await expect(administrator.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Get started" })).toHaveCount(0);
+    const hiddenRequestCount = administrator.setupStatusRequests.length;
+    await administrator.page.waitForTimeout(15_500);
+    expect(administrator.setupStatusRequests).toHaveLength(hiddenRequestCount);
 
     await administrator.page.goto(`${origin}/admin/settings`);
     await administrator.page.getByRole("button", { name: "Reopen Get started" }).click();

@@ -6,13 +6,14 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde::Serialize;
-use steward_store::{AgentRunQuery, PgStore};
+use steward_store::{AgentRunQuery, PgStore, StoreError};
+use steward_types::CanonicalUserId;
 
-use crate::bounded_task_error_category;
 use crate::browser_admin::CapabilityCatalog;
 use crate::browser_auth::{
     BrowserAdminAuthority, BrowserAuthService, protect_browser_admin_routes,
 };
+use crate::{BoxFuture, bounded_task_error_category};
 
 const ADMIN_SETUP_API_VERSION: &str = "steward.admin-setup/v1";
 const CONNECTION_RESPONSE_DEADLINE_MS: i64 =
@@ -35,8 +36,8 @@ pub struct AdminSetupConfig {
 }
 
 #[derive(Clone)]
-pub(crate) struct AdminSetupState {
-    store: PgStore,
+pub(crate) struct AdminSetupState<R> {
+    repository: R,
     config: AdminSetupConfig,
 }
 
@@ -80,11 +81,84 @@ pub struct AdminSetupStatusResponse {
 }
 
 struct SetupFacts {
-    active_other_members: usize,
-    member_ready_templates: usize,
+    active_other_members: i64,
+    member_ready_templates: i64,
     connection_start_duration_ms: Option<i64>,
     latest_submission_error_category: Option<&'static str>,
     unassociated_github_actors: i64,
+    has_successful_submission: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RepositoryFacts {
+    active_other_members: i64,
+    member_ready_templates: i64,
+    connection_start_duration_ms: Option<i64>,
+    latest_submission_failure_reason: Option<String>,
+    unassociated_github_actors: i64,
+    has_successful_submission: bool,
+}
+
+trait AdminSetupRepository: Clone + Send + Sync + 'static {
+    fn setup_facts<'a>(
+        &'a self,
+        owner: &'a CanonicalUserId,
+        github_actor_issuer: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<RepositoryFacts, StoreError>>;
+}
+
+impl AdminSetupRepository for PgStore {
+    fn setup_facts<'a>(
+        &'a self,
+        owner: &'a CanonicalUserId,
+        github_actor_issuer: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<RepositoryFacts, StoreError>> {
+        Box::pin(async move {
+            let latest_run_query = AgentRunQuery {
+                limit: 1,
+                cursor: None,
+                phase: None,
+                workflow: None,
+                owner_user_id: Some(owner.as_str().to_owned()),
+                runtime_uid: None,
+                user_envelope_instance_id: None,
+                task_uid: None,
+            };
+            let unassociated_github_actors = async {
+                match github_actor_issuer {
+                    Some(issuer) => self.unassociated_federated_subject_count(issuer).await,
+                    None => Ok(0),
+                }
+            };
+            let (
+                active_other_members,
+                member_ready_templates,
+                connection_start_duration_ms,
+                latest_run,
+                has_successful_submission,
+                unassociated_github_actors,
+            ) = tokio::join!(
+                self.active_other_canonical_user_count(owner),
+                self.member_ready_envelope_template_count(),
+                self.latest_successful_connection_start_duration_ms(owner),
+                self.agent_runs(&latest_run_query),
+                self.has_successful_agent_run(owner),
+                unassociated_github_actors,
+            );
+            Ok(RepositoryFacts {
+                active_other_members: active_other_members?,
+                member_ready_templates: member_ready_templates?,
+                connection_start_duration_ms: connection_start_duration_ms?,
+                latest_submission_failure_reason: latest_run?
+                    .records
+                    .into_iter()
+                    .next()
+                    .and_then(|run| run.failure_reason),
+                unassociated_github_actors: unassociated_github_actors?,
+                has_successful_submission: has_successful_submission?,
+            })
+        })
+    }
 }
 
 pub fn protected_router(
@@ -95,7 +169,30 @@ pub fn protected_router(
     protect_browser_admin_routes(
         Router::new()
             .route("/admin/api/v1/setup-status", get(get_setup_status))
-            .with_state(AdminSetupState { store, config }),
+            .with_state(AdminSetupState {
+                repository: store,
+                config,
+            }),
+        auth,
+    )
+}
+
+#[cfg(test)]
+fn protected_router_with_repository<R>(
+    repository: R,
+    config: AdminSetupConfig,
+    auth: BrowserAuthService,
+) -> Router
+where
+    R: AdminSetupRepository,
+{
+    protect_browser_admin_routes(
+        Router::new()
+            .route(
+                "/admin/api/v1/setup-status",
+                get(get_setup_status_with_repository::<R>),
+            )
+            .with_state(AdminSetupState { repository, config }),
         auth,
     )
 }
@@ -114,73 +211,54 @@ pub fn protected_router(
 )]
 pub(crate) async fn get_setup_status(
     Extension(authority): Extension<BrowserAdminAuthority>,
-    State(state): State<AdminSetupState>,
+    State(state): State<AdminSetupState<PgStore>>,
 ) -> Response {
-    let users = match state.store.canonical_users().await {
-        Ok(users) => users,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let templates = match state.store.latest_envelope_templates().await {
-        Ok(templates) => templates,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let owner = &authority.principal().canonical_user_id;
-    let connection_start_duration_ms = match state
-        .store
-        .latest_successful_connection_start_duration_ms(owner)
+    setup_status_response(authority, state).await
+}
+
+#[cfg(test)]
+async fn get_setup_status_with_repository<R>(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    State(state): State<AdminSetupState<R>>,
+) -> Response
+where
+    R: AdminSetupRepository,
+{
+    setup_status_response(authority, state).await
+}
+
+async fn setup_status_response<R>(
+    authority: BrowserAdminAuthority,
+    state: AdminSetupState<R>,
+) -> Response
+where
+    R: AdminSetupRepository,
+{
+    let repository_facts = match state
+        .repository
+        .setup_facts(
+            &authority.principal().canonical_user_id,
+            state.config.github_actor_issuer.as_deref(),
+        )
         .await
     {
-        Ok(duration) => duration,
+        Ok(facts) => facts,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let latest_run = match state
-        .store
-        .agent_runs(&AgentRunQuery {
-            limit: 1,
-            cursor: None,
-            phase: None,
-            workflow: None,
-            owner_user_id: Some(owner.as_str().to_owned()),
-            runtime_uid: None,
-            user_envelope_instance_id: None,
-            task_uid: None,
-        })
-        .await
-    {
-        Ok(page) => page.records.into_iter().next(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let unassociated_github_actors = match state.config.github_actor_issuer.as_deref() {
-        Some(issuer) => match state
-            .store
-            .unassociated_federated_subject_count(issuer)
-            .await
-        {
-            Ok(count) => count,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    Json(build_status(
+        &state.config,
+        SetupFacts {
+            active_other_members: repository_facts.active_other_members,
+            member_ready_templates: repository_facts.member_ready_templates,
+            connection_start_duration_ms: repository_facts.connection_start_duration_ms,
+            latest_submission_error_category: bounded_task_error_category(
+                repository_facts.latest_submission_failure_reason.as_deref(),
+            ),
+            unassociated_github_actors: repository_facts.unassociated_github_actors,
+            has_successful_submission: repository_facts.has_successful_submission,
         },
-        None => 0,
-    };
-    let facts = SetupFacts {
-        active_other_members: users
-            .iter()
-            .filter(|user| user.state == "active" && user.user_id != *owner)
-            .count(),
-        member_ready_templates: templates
-            .iter()
-            .filter(|template| {
-                !template.member_roles.is_empty()
-                    && !template.ceiling.spec.llms.is_empty()
-                    && !template.ceiling.spec.tools.is_empty()
-            })
-            .count(),
-        connection_start_duration_ms,
-        latest_submission_error_category: latest_run
-            .as_ref()
-            .and_then(|run| bounded_task_error_category(run.failure_reason.as_deref())),
-        unassociated_github_actors,
-    };
-    Json(build_status(&state.config, facts)).into_response()
+    ))
+    .into_response()
 }
 
 fn check(
@@ -366,12 +444,21 @@ fn build_status(config: &AdminSetupConfig, facts: SetupFacts) -> AdminSetupStatu
             "/admin/runs",
             true,
         )
-    } else {
+    } else if facts.has_successful_submission {
         check(
             AdminSetupCheckId::GithubActions,
             "GitHub Actions automation",
             AdminSetupCheckStatus::Ready,
-            "Discovery metadata and githubSource are configured; no bounded error category is present on the latest owned submission.",
+            "Discovery metadata and githubSource are configured, and at least one owned submission has succeeded.",
+            "/admin/runs",
+            true,
+        )
+    } else {
+        check(
+            AdminSetupCheckId::GithubActions,
+            "GitHub Actions automation",
+            AdminSetupCheckStatus::Unknown,
+            "Discovery metadata and githubSource are configured, but no successful owned submission is recorded. Failures before reservation leave no AgentRun evidence.",
             "/admin/runs",
             true,
         )
@@ -401,7 +488,28 @@ fn build_status(config: &AdminSetupConfig, facts: SetupFacts) -> AdminSetupStatu
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use tower::ServiceExt;
+
+    use crate::browser_auth::{
+        BrowserAuthService, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
+    };
+
     use super::*;
+
+    #[derive(Clone)]
+    struct UnreachableRepository;
+
+    impl AdminSetupRepository for UnreachableRepository {
+        fn setup_facts<'a>(
+            &'a self,
+            _owner: &'a CanonicalUserId,
+            _github_actor_issuer: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<RepositoryFacts, StoreError>> {
+            Box::pin(async { Err(StoreError::InvalidRunQuery) })
+        }
+    }
 
     fn catalog(tool_count: usize) -> CapabilityCatalog {
         CapabilityCatalog {
@@ -417,6 +525,106 @@ mod tests {
                 .collect(),
             catalogs: Vec::new(),
         }
+    }
+
+    fn test_config() -> AdminSetupConfig {
+        AdminSetupConfig {
+            orchestration_active: false,
+            execution_bindings_active: false,
+            resolvable_execution_bindings: 0,
+            task_identity_discovery_enabled: false,
+            github_source_enabled: false,
+            github_actor_issuer: None,
+            capability_catalog: catalog(0),
+        }
+    }
+
+    fn response_cookie(response: &axum::response::Response, name: &str) -> Result<String, String> {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find(|value| value.starts_with(&format!("{name}=")))
+            .and_then(|value| value.split(';').next())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("response omitted {name} cookie"))
+    }
+
+    async fn signed_in_cookie(service: BrowserAuthService) -> Result<String, String> {
+        let login = browser_auth_router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/auth/login")
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let flow_cookie = response_cookie(&login, "steward-local-oidc-flow")?;
+        let authorize = login
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "login omitted authorize redirect".to_owned())?;
+        let authorized = browser_auth_router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(authorize)
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let callback = authorized
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| "authorize omitted callback redirect".to_owned())?;
+        let callback = browser_auth_router(service)
+            .oneshot(
+                Request::builder()
+                    .uri(callback)
+                    .header(header::COOKIE, flow_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        response_cookie(&callback, "steward-local-session")
+    }
+
+    #[tokio::test]
+    async fn setup_status_router_requires_an_administrator_session() -> Result<(), String> {
+        let service =
+            local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?;
+        let routes = || {
+            protected_router_with_repository(UnreachableRepository, test_config(), service.clone())
+        };
+        let unauthenticated = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/setup-status")
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = signed_in_cookie(service.clone()).await?;
+        let ordinary_user = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/setup-status")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(ordinary_user.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 
     #[test]
@@ -437,6 +645,7 @@ mod tests {
                 connection_start_duration_ms: None,
                 latest_submission_error_category: None,
                 unassociated_github_actors: 0,
+                has_successful_submission: false,
             },
         );
         assert_eq!(status.checks.len(), 7);
@@ -474,11 +683,25 @@ mod tests {
                 connection_start_duration_ms: Some(1_250),
                 latest_submission_error_category: None,
                 unassociated_github_actors: 0,
+                has_successful_submission: false,
             },
         );
-        for index in [0, 1, 3, 4, 5] {
+        for index in [0, 1, 3, 4] {
             assert_eq!(ready.checks[index].status, AdminSetupCheckStatus::Ready);
         }
+        assert_eq!(ready.checks[5].status, AdminSetupCheckStatus::Unknown);
+        let successful = build_status(
+            &config,
+            SetupFacts {
+                active_other_members: 2,
+                member_ready_templates: 1,
+                connection_start_duration_ms: Some(1_250),
+                latest_submission_error_category: None,
+                unassociated_github_actors: 0,
+                has_successful_submission: true,
+            },
+        );
+        assert_eq!(successful.checks[5].status, AdminSetupCheckStatus::Ready);
         let slow = build_status(
             &config,
             SetupFacts {
@@ -487,6 +710,7 @@ mod tests {
                 connection_start_duration_ms: Some(CONNECTION_NEAR_DEADLINE_MS),
                 latest_submission_error_category: None,
                 unassociated_github_actors: 0,
+                has_successful_submission: false,
             },
         );
         assert_eq!(slow.checks[1].status, AdminSetupCheckStatus::Attention);
@@ -516,6 +740,7 @@ mod tests {
                 connection_start_duration_ms: Some(1_000),
                 latest_submission_error_category: Some("other"),
                 unassociated_github_actors: 2,
+                has_successful_submission: false,
             },
         );
         assert_eq!(
@@ -531,6 +756,7 @@ mod tests {
                 connection_start_duration_ms: Some(1_000),
                 latest_submission_error_category: Some("sandbox-execution"),
                 unassociated_github_actors: 0,
+                has_successful_submission: false,
             },
         );
         assert_eq!(

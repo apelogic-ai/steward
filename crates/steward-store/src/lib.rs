@@ -793,6 +793,22 @@ impl PgStore {
         .collect()
     }
 
+    /// Count active canonical users other than the authenticated administrator.
+    pub async fn active_other_canonical_user_count(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+    ) -> Result<i64, StoreError> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM canonical_users \
+             WHERE state = 'active' AND user_id <> $1 \
+               AND organization_id = (SELECT organization_id FROM canonical_users WHERE user_id = $1)",
+        )
+        .bind(canonical_user_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
     pub async fn canonical_user(
         &self,
         user_id: &CanonicalUserId,
@@ -2975,6 +2991,25 @@ impl PgStore {
         })
     }
 
+    /// Whether an owner has durable evidence of at least one successful non-connection Task.
+    pub async fn has_successful_agent_run(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+    ) -> Result<bool, StoreError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM task_submissions tasks \
+                 WHERE tasks.owner_user_id = $1 AND tasks.phase = 'succeeded' \
+                   AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
+                                   WHERE operations.task_uid = tasks.task_uid) \
+             )",
+        )
+        .bind(canonical_user_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
     /// Count phases for the current run filters while deliberately excluding the phase filter
     /// and pagination cursor, so the browser can render stable facet chips.
     pub async fn agent_run_phase_facets(
@@ -4298,6 +4333,25 @@ impl PgStore {
         .into_iter()
         .map(envelope_template_revision_record)
         .collect()
+    }
+
+    /// Count latest template revisions that grant a role and nonempty model and tool sets.
+    pub async fn member_ready_envelope_template_count(&self) -> Result<i64, StoreError> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM ( \
+                 SELECT DISTINCT ON (template_id) member_roles, spec \
+                 FROM envelope_template_revisions \
+                 ORDER BY template_id, revision DESC \
+             ) latest \
+             WHERE cardinality(member_roles) > 0 \
+               AND jsonb_typeof(spec -> 'llms') = 'array' \
+               AND jsonb_array_length(spec -> 'llms') > 0 \
+               AND jsonb_typeof(spec -> 'tools') = 'array' \
+               AND jsonb_array_length(spec -> 'tools') > 0",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)
     }
 
     /// List current templates visible to any of the principal's active member roles.
