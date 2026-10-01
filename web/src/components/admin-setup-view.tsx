@@ -28,8 +28,15 @@ export function AdminSetupView() {
   const dismissed = useSyncExternalStore(subscribeToAdminSetupPreference, adminSetupDismissed, adminSetupVisibleOnServer);
   const [refreshing, setRefreshing] = useState(false);
   const activeRequest = useRef<AbortController | null>(null);
+  const pollTimer = useRef<number | null>(null);
+  const pollingEnabled = useRef(false);
+  const refreshRef = useRef<(() => Promise<void>) | null>(null);
 
   const refresh = useCallback(async () => {
+    if (pollTimer.current !== null) {
+      window.clearTimeout(pollTimer.current);
+      pollTimer.current = null;
+    }
     activeRequest.current?.abort();
     const controller = new AbortController();
     activeRequest.current = controller;
@@ -46,25 +53,38 @@ export function AdminSetupView() {
       if (activeRequest.current === controller) {
         activeRequest.current = null;
         setRefreshing(false);
+        if (pollingEnabled.current) {
+          pollTimer.current = window.setTimeout(() => void refreshRef.current?.(), 15_000);
+        }
       }
     }
   }, []);
 
   useEffect(() => {
+    refreshRef.current = refresh;
+    return () => {
+      refreshRef.current = null;
+    };
+  }, [refresh]);
+
+  useEffect(() => {
+    pollingEnabled.current = !dismissed;
     if (dismissed) {
+      if (pollTimer.current !== null) window.clearTimeout(pollTimer.current);
+      pollTimer.current = null;
       activeRequest.current?.abort();
       activeRequest.current = null;
       return;
     }
-    const initial = window.setTimeout(() => void refresh(), 0);
-    const interval = window.setInterval(() => void refresh(), 15_000);
+    pollTimer.current = window.setTimeout(() => void refreshRef.current?.(), 0);
     return () => {
-      window.clearTimeout(initial);
-      window.clearInterval(interval);
+      pollingEnabled.current = false;
+      if (pollTimer.current !== null) window.clearTimeout(pollTimer.current);
+      pollTimer.current = null;
       activeRequest.current?.abort();
       activeRequest.current = null;
     };
-  }, [dismissed, refresh]);
+  }, [dismissed]);
 
   if (dismissed) {
     return <EmptyState title="The administrator setup guide is hidden in this browser."><button className="mt-3 rounded-control border px-3 py-2 font-semibold" onClick={() => setAdminSetupDismissed(false)} type="button">Show guide again</button></EmptyState>;

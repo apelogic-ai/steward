@@ -20,7 +20,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Added an administrator Get started workspace backed by live, read-only setup
   checks for orchestration bindings, administrator-scoped GitHub Connect,
   capability-catalog coverage, member-ready templates, active members, and
-  optional GitHub Actions automation. The guide refreshes without an
+  optional GitHub Actions automation. Automation readiness uses only durable
+  GitHub-ratified Task provenance, and `githubSource` is required only after
+  direct-package use. The guide refreshes after each read settles without an
   apiserver restart and can be hidden or restored per browser.
 - Added opt-in MCP-GW connection-status v2 consumption and default-on GitHub
   Connect association for `steward-task-v3`, matching only the immutable numeric

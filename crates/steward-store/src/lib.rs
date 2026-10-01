@@ -10,7 +10,9 @@ use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec,
     add_budget_amount, envelope_is_within, evaluate, validate_envelope,
 };
-use steward_types::direct_package::{DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES};
+use steward_types::direct_package::{
+    DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES, TASK_BINDING_EVIDENCE_SCHEMA,
+};
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
     OrganizationIdentity, OrganizationIdentityMigration, TaskExecutionBinding,
@@ -40,6 +42,15 @@ impl TaskOrchestrationMode {
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
+}
+
+/// Bounded setup facts from Tasks whose persisted source-authority evidence was ratified as
+/// GitHub provenance during admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GithubAutomationSetupEvidence {
+    pub direct_packages_used: bool,
+    pub latest_owned_failure_reason: Option<String>,
+    pub has_successful_owned_submission: bool,
 }
 
 /// One immutable, administrator-published Workflow revision.
@@ -2991,23 +3002,43 @@ impl PgStore {
         })
     }
 
-    /// Whether an owner has durable evidence of at least one successful non-connection Task.
-    pub async fn has_successful_agent_run(
+    /// Return bounded GitHub Actions setup evidence without treating unrelated Tasks as proof.
+    pub async fn github_automation_setup_evidence(
         &self,
         canonical_user_id: &CanonicalUserId,
-    ) -> Result<bool, StoreError> {
-        sqlx::query_scalar(
-            "SELECT EXISTS( \
-                 SELECT 1 FROM task_submissions tasks \
-                 WHERE tasks.owner_user_id = $1 AND tasks.phase = 'succeeded' \
-                   AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
-                                   WHERE operations.task_uid = tasks.task_uid) \
-             )",
+    ) -> Result<GithubAutomationSetupEvidence, StoreError> {
+        let row = sqlx::query(
+            "WITH github_runs AS ( \
+                 SELECT owner_user_id, phase, failure_reason, created_at, task_uid \
+                 FROM task_submissions \
+                 WHERE direct_task_evidence ->> 'schemaVersion' = $2 \
+                   AND direct_task_evidence #>> '{sourceProvenance,provider}' = 'github' \
+             ) \
+             SELECT EXISTS(SELECT 1 FROM github_runs) AS direct_packages_used, \
+                    EXISTS(SELECT 1 FROM github_runs \
+                           WHERE owner_user_id = $1 AND phase = 'succeeded') \
+                        AS has_successful_owned_submission, \
+                    (SELECT failure_reason FROM github_runs \
+                     WHERE owner_user_id = $1 \
+                     ORDER BY created_at DESC, task_uid DESC LIMIT 1) \
+                        AS latest_owned_failure_reason",
         )
         .bind(canonical_user_id.as_str())
+        .bind(TASK_BINDING_EVIDENCE_SCHEMA)
         .fetch_one(&self.pool)
         .await
-        .map_err(database_error)
+        .map_err(database_error)?;
+        Ok(GithubAutomationSetupEvidence {
+            direct_packages_used: row
+                .try_get("direct_packages_used")
+                .map_err(database_error)?,
+            latest_owned_failure_reason: row
+                .try_get("latest_owned_failure_reason")
+                .map_err(database_error)?,
+            has_successful_owned_submission: row
+                .try_get("has_successful_owned_submission")
+                .map_err(database_error)?,
+        })
     }
 
     /// Count phases for the current run filters while deliberately excluding the phase filter

@@ -139,21 +139,22 @@ The response derives current checks from deployment configuration and live
 Steward records: active orchestration and resolvable execution bindings, the
 signed-in administrator's latest successful GitHub Connect start and duration,
 published capability count, member-ready templates, other active canonical
-users, configured task-identity discovery and `githubSource`, unassociated
-actors from the configured GitHub task-identity issuer, and the latest owned
-submission's bounded error category. It never returns provider tokens, OAuth
-continuations, raw task failure text, or credentials.
+users, configured task-identity discovery, whether direct-package use makes
+`githubSource` required, unassociated actors from the configured GitHub
+task-identity issuer, and bounded owner-scoped evidence from Tasks carrying
+durable GitHub-ratified source provenance. It never returns provider tokens,
+OAuth continuations, raw task failure text, or credentials.
 
-The UI refreshes the endpoint every 15 seconds and on explicit request, so an
-operator can correct a prerequisite and observe the check change without an
-apiserver restart. Each refresh enters an explicit loading state; a failed
-refresh discards prior cards and renders unavailable rather than retaining a
-stale ready result. Polling stops and its active request is aborted when the
-guide is hidden or unmounted. Hiding the administrator guide is deliberately a
-presentation-only preference stored under the exact browser-local key
-`steward.ui.admin-setup-dismissed`; it changes no server state or authority and
-can be restored from administrator settings. This differs from user onboarding,
-whose progress and dismissal are durable server preferences.
+The UI refreshes the endpoint 15 seconds after the preceding request settles
+and on explicit request, so a slow authoritative read is not repeatedly
+aborted by overlapping polls. Each refresh enters an explicit loading state; a
+failed refresh discards prior cards and renders unavailable rather than
+retaining a stale ready result. Polling stops and its active request is aborted
+when the guide is hidden or unmounted. Hiding the administrator guide is
+deliberately a presentation-only preference stored under the exact
+browser-local key `steward.ui.admin-setup-dismissed`; it changes no server state
+or authority and can be restored from administrator settings. This differs from
+user onboarding, whose progress and dismissal are durable server preferences.
 
 Capability-catalog v2 reports published tools but has no expected-tool count or
 authoritative gateway-publication provenance. Until that metadata exists, the
@@ -161,12 +162,15 @@ setup endpoint reports this check as `unknown` rather than inferring provenance
 from names or counts. Likewise, Steward can report that task-identity discovery
 is configured and whether recent identities are associated, but it cannot prove
 an installation-specific repository policy without a concrete repository
-submission. The check links to installation guidance and retains the latest
-bounded submission error as the operational signal. GitHub Actions automation
-is ready only after at least one owner-scoped Task has durably succeeded. When
-no such Task exists and no bounded failure is recorded, the status is `unknown`:
-authentication or policy failures before Task reservation leave no AgentRun
-record and therefore cannot truthfully be reported as ready.
+submission. The check links to installation guidance and retains only the
+latest bounded error from an owner-scoped Task with durable GitHub-ratified
+source provenance. GitHub Actions automation is ready only after at least one
+such Task has durably succeeded; unrelated Tasks are not evidence. Versioned
+workflow-only installations do not require the direct-package `githubSource`
+adapter. When no ratified Task exists and no bounded ratified failure is
+recorded, the status is `unknown`: authentication or policy failures before
+Task reservation leave no AgentRun record and therefore cannot truthfully be
+reported as ready.
 
 `GET /app/api/v1/connections` returns connected providers and the available
 provider catalog. GitHub is enabled; unavailable providers remain explicit and

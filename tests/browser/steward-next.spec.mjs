@@ -1068,6 +1068,15 @@ test("administrators get live prerequisite reasons and can restore the hidden se
     await expect(administrator.page.getByText("No prerequisite has been inferred. Retry when the authoritative service is available.", { exact: true })).toBeVisible();
     await expect(administrator.page.getByText("Orchestration and one resolvable execution binding are active.")).toHaveCount(0);
 
+    const requestsBeforeSlowRefresh = administrator.setupStatusRequests.length;
+    administrator.useAdminSetupStatus({ delayMs: 16_000, body: {
+      apiVersion: "steward.admin-setup/v1",
+      checks: [{ id: "orchestration", title: "Orchestration", status: "ready", detail: "A slow authoritative refresh settled successfully.", fixHref: "https://github.com/apelogic-ai/steward/blob/main/docs/installation/execution-bindings.md", optional: false }],
+    } });
+    await administrator.page.getByRole("button", { name: "Refresh status" }).click();
+    await expect(administrator.page.getByText("A slow authoritative refresh settled successfully.")).toBeVisible({ timeout: 17_500 });
+    expect(administrator.setupStatusRequests).toHaveLength(requestsBeforeSlowRefresh + 1);
+
     const abortsBeforeDismissal = await administrator.page.evaluate(() => window.__stewardAbortCount);
     const requestsBeforeDismissal = administrator.setupStatusRequests.length;
     administrator.useAdminSetupStatus({ delayMs: 3_000, body: { apiVersion: "steward.admin-setup/v1", checks: [] } });

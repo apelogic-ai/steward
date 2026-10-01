@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use serde::Serialize;
-use steward_store::{AgentRunQuery, PgStore, StoreError};
+use steward_store::{PgStore, StoreError};
 use steward_types::CanonicalUserId;
 
 use crate::browser_admin::CapabilityCatalog;
@@ -84,9 +84,10 @@ struct SetupFacts {
     active_other_members: i64,
     member_ready_templates: i64,
     connection_start_duration_ms: Option<i64>,
-    latest_submission_error_category: Option<&'static str>,
+    latest_github_submission_error_category: Option<&'static str>,
     unassociated_github_actors: i64,
-    has_successful_submission: bool,
+    direct_packages_used: bool,
+    has_successful_github_submission: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,9 +95,10 @@ struct RepositoryFacts {
     active_other_members: i64,
     member_ready_templates: i64,
     connection_start_duration_ms: Option<i64>,
-    latest_submission_failure_reason: Option<String>,
+    latest_github_submission_failure_reason: Option<String>,
     unassociated_github_actors: i64,
-    has_successful_submission: bool,
+    direct_packages_used: bool,
+    has_successful_github_submission: bool,
 }
 
 trait AdminSetupRepository: Clone + Send + Sync + 'static {
@@ -114,16 +116,6 @@ impl AdminSetupRepository for PgStore {
         github_actor_issuer: Option<&'a str>,
     ) -> BoxFuture<'a, Result<RepositoryFacts, StoreError>> {
         Box::pin(async move {
-            let latest_run_query = AgentRunQuery {
-                limit: 1,
-                cursor: None,
-                phase: None,
-                workflow: None,
-                owner_user_id: Some(owner.as_str().to_owned()),
-                runtime_uid: None,
-                user_envelope_instance_id: None,
-                task_uid: None,
-            };
             let unassociated_github_actors = async {
                 match github_actor_issuer {
                     Some(issuer) => self.unassociated_federated_subject_count(issuer).await,
@@ -134,28 +126,25 @@ impl AdminSetupRepository for PgStore {
                 active_other_members,
                 member_ready_templates,
                 connection_start_duration_ms,
-                latest_run,
-                has_successful_submission,
+                github_automation,
                 unassociated_github_actors,
             ) = tokio::join!(
                 self.active_other_canonical_user_count(owner),
                 self.member_ready_envelope_template_count(),
                 self.latest_successful_connection_start_duration_ms(owner),
-                self.agent_runs(&latest_run_query),
-                self.has_successful_agent_run(owner),
+                self.github_automation_setup_evidence(owner),
                 unassociated_github_actors,
             );
+            let github_automation = github_automation?;
             Ok(RepositoryFacts {
                 active_other_members: active_other_members?,
                 member_ready_templates: member_ready_templates?,
                 connection_start_duration_ms: connection_start_duration_ms?,
-                latest_submission_failure_reason: latest_run?
-                    .records
-                    .into_iter()
-                    .next()
-                    .and_then(|run| run.failure_reason),
+                latest_github_submission_failure_reason: github_automation
+                    .latest_owned_failure_reason,
                 unassociated_github_actors: unassociated_github_actors?,
-                has_successful_submission: has_successful_submission?,
+                direct_packages_used: github_automation.direct_packages_used,
+                has_successful_github_submission: github_automation.has_successful_owned_submission,
             })
         })
     }
@@ -251,11 +240,14 @@ where
             active_other_members: repository_facts.active_other_members,
             member_ready_templates: repository_facts.member_ready_templates,
             connection_start_duration_ms: repository_facts.connection_start_duration_ms,
-            latest_submission_error_category: bounded_task_error_category(
-                repository_facts.latest_submission_failure_reason.as_deref(),
+            latest_github_submission_error_category: bounded_task_error_category(
+                repository_facts
+                    .latest_github_submission_failure_reason
+                    .as_deref(),
             ),
             unassociated_github_actors: repository_facts.unassociated_github_actors,
-            has_successful_submission: repository_facts.has_successful_submission,
+            direct_packages_used: repository_facts.direct_packages_used,
+            has_successful_github_submission: repository_facts.has_successful_github_submission,
         },
     ))
     .into_response()
@@ -414,7 +406,7 @@ fn build_status(config: &AdminSetupConfig, facts: SetupFacts) -> AdminSetupStatu
             INSTALLATION_GUIDE,
             true,
         )
-    } else if !config.github_source_enabled {
+    } else if facts.direct_packages_used && !config.github_source_enabled {
         check(
             AdminSetupCheckId::GithubActions,
             "GitHub Actions automation",
@@ -435,21 +427,21 @@ fn build_status(config: &AdminSetupConfig, facts: SetupFacts) -> AdminSetupStatu
             "https://github.com/apelogic-ai/steward/issues/231",
             true,
         )
-    } else if let Some(category) = facts.latest_submission_error_category {
+    } else if let Some(category) = facts.latest_github_submission_error_category {
         check(
             AdminSetupCheckId::GithubActions,
             "GitHub Actions automation",
             AdminSetupCheckStatus::Attention,
-            format!("The latest owned submission has error category {category}."),
+            format!("The latest GitHub-ratified submission has error category {category}."),
             "/admin/runs",
             true,
         )
-    } else if facts.has_successful_submission {
+    } else if facts.has_successful_github_submission {
         check(
             AdminSetupCheckId::GithubActions,
             "GitHub Actions automation",
             AdminSetupCheckStatus::Ready,
-            "Discovery metadata and githubSource are configured, and at least one owned submission has succeeded.",
+            "Discovery metadata is configured, and at least one GitHub-ratified owned submission has succeeded.",
             "/admin/runs",
             true,
         )
@@ -458,7 +450,7 @@ fn build_status(config: &AdminSetupConfig, facts: SetupFacts) -> AdminSetupStatu
             AdminSetupCheckId::GithubActions,
             "GitHub Actions automation",
             AdminSetupCheckStatus::Unknown,
-            "Discovery metadata and githubSource are configured, but no successful owned submission is recorded. Failures before reservation leave no AgentRun evidence.",
+            "Discovery metadata is configured, but no GitHub-ratified owned submission is recorded. Failures before reservation leave no AgentRun evidence.",
             "/admin/runs",
             true,
         )
@@ -643,9 +635,10 @@ mod tests {
                 active_other_members: 0,
                 member_ready_templates: 0,
                 connection_start_duration_ms: None,
-                latest_submission_error_category: None,
+                latest_github_submission_error_category: None,
                 unassociated_github_actors: 0,
-                has_successful_submission: false,
+                direct_packages_used: false,
+                has_successful_github_submission: false,
             },
         );
         assert_eq!(status.checks.len(), 7);
@@ -681,9 +674,10 @@ mod tests {
                 active_other_members: 2,
                 member_ready_templates: 1,
                 connection_start_duration_ms: Some(1_250),
-                latest_submission_error_category: None,
+                latest_github_submission_error_category: None,
                 unassociated_github_actors: 0,
-                has_successful_submission: false,
+                direct_packages_used: false,
+                has_successful_github_submission: false,
             },
         );
         for index in [0, 1, 3, 4] {
@@ -696,9 +690,10 @@ mod tests {
                 active_other_members: 2,
                 member_ready_templates: 1,
                 connection_start_duration_ms: Some(1_250),
-                latest_submission_error_category: None,
+                latest_github_submission_error_category: None,
                 unassociated_github_actors: 0,
-                has_successful_submission: true,
+                direct_packages_used: true,
+                has_successful_github_submission: true,
             },
         );
         assert_eq!(successful.checks[5].status, AdminSetupCheckStatus::Ready);
@@ -708,9 +703,10 @@ mod tests {
                 active_other_members: 2,
                 member_ready_templates: 1,
                 connection_start_duration_ms: Some(CONNECTION_NEAR_DEADLINE_MS),
-                latest_submission_error_category: None,
+                latest_github_submission_error_category: None,
                 unassociated_github_actors: 0,
-                has_successful_submission: false,
+                direct_packages_used: false,
+                has_successful_github_submission: false,
             },
         );
         assert_eq!(slow.checks[1].status, AdminSetupCheckStatus::Attention);
@@ -738,9 +734,10 @@ mod tests {
                 active_other_members: 1,
                 member_ready_templates: 1,
                 connection_start_duration_ms: Some(1_000),
-                latest_submission_error_category: Some("other"),
+                latest_github_submission_error_category: Some("other"),
                 unassociated_github_actors: 2,
-                has_successful_submission: false,
+                direct_packages_used: true,
+                has_successful_github_submission: false,
             },
         );
         assert_eq!(
@@ -754,14 +751,60 @@ mod tests {
                 active_other_members: 1,
                 member_ready_templates: 1,
                 connection_start_duration_ms: Some(1_000),
-                latest_submission_error_category: Some("sandbox-execution"),
+                latest_github_submission_error_category: Some("sandbox-execution"),
                 unassociated_github_actors: 0,
-                has_successful_submission: false,
+                direct_packages_used: true,
+                has_successful_github_submission: false,
             },
         );
         assert_eq!(
             failed.checks[5].detail,
-            "The latest owned submission has error category sandbox-execution."
+            "The latest GitHub-ratified submission has error category sandbox-execution."
         );
+    }
+
+    #[test]
+    fn versioned_workflow_only_installation_does_not_require_github_source() {
+        let config = AdminSetupConfig {
+            orchestration_active: true,
+            execution_bindings_active: true,
+            resolvable_execution_bindings: 1,
+            task_identity_discovery_enabled: true,
+            github_source_enabled: false,
+            github_actor_issuer: Some("https://identity.example.com".to_owned()),
+            capability_catalog: catalog(1),
+        };
+        let status = build_status(
+            &config,
+            SetupFacts {
+                active_other_members: 1,
+                member_ready_templates: 1,
+                connection_start_duration_ms: Some(1_000),
+                latest_github_submission_error_category: None,
+                unassociated_github_actors: 0,
+                direct_packages_used: false,
+                has_successful_github_submission: false,
+            },
+        );
+        assert_eq!(status.checks[5].status, AdminSetupCheckStatus::Unknown);
+        assert!(status.checks[5].detail.contains("no GitHub-ratified"));
+
+        let direct_packages = build_status(
+            &config,
+            SetupFacts {
+                active_other_members: 1,
+                member_ready_templates: 1,
+                connection_start_duration_ms: Some(1_000),
+                latest_github_submission_error_category: None,
+                unassociated_github_actors: 0,
+                direct_packages_used: true,
+                has_successful_github_submission: false,
+            },
+        );
+        assert_eq!(
+            direct_packages.checks[5].status,
+            AdminSetupCheckStatus::Attention
+        );
+        assert!(direct_packages.checks[5].detail.contains("githubSource"));
     }
 }
