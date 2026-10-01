@@ -1186,6 +1186,8 @@ export type TaskErrorResponse = {
     error: string;
 };
 
+export type TaskIdentityErrorResponse = UnknownTaskIdentityErrorResponse | FederatedTaskIdentityErrorResponse;
+
 /**
  * Durable lifecycle state for one single-shot governed task.
  */
@@ -1224,6 +1226,11 @@ export type TriggerRepository = {
     id: StableProviderId;
     name: BoundedText;
     ownerId: StableProviderId;
+};
+
+export type UnknownTaskIdentityErrorResponse = {
+    error: string;
+    message: string;
 };
 
 export type UpdateBrowserPreferences = {
@@ -3657,9 +3664,9 @@ export type TaskSubmissionContractErrors = {
      */
     401: TaskErrorResponse;
     /**
-     * Federated subject is unassociated or disabled
+     * Authenticated canonical user is unknown, or federated subject is unassociated or disabled
      */
-    403: FederatedTaskIdentityErrorResponse;
+    403: TaskIdentityErrorResponse;
     /**
      * Selected workflow does not exist
      */

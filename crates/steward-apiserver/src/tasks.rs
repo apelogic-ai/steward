@@ -482,6 +482,7 @@ fn resolve_versioned_task_plan(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskAuthenticationError {
     InvalidCredentials,
+    UnknownUser,
     Unassociated { issuer: String, subject: String },
     Disabled { issuer: String, subject: String },
     Unavailable,
@@ -544,10 +545,7 @@ impl TaskIdentityResolver for KubernetesTaskIdentityResolver {
             self.canonical_identities
                 .resolve_canonical_principal(&identity.canonical_user_id, &identity.owner)
                 .await
-                .map_err(|error| match error {
-                    StoreError::Database(_) => TaskAuthenticationError::Unavailable,
-                    _ => TaskAuthenticationError::InvalidCredentials,
-                })?;
+                .map_err(map_canonical_identity_error)?;
             Ok(identity)
         })
     }
@@ -894,6 +892,7 @@ fn v2_seed_failure_category(error: &StoreError) -> &'static str {
 
 fn map_canonical_identity_error(error: StoreError) -> TaskAuthenticationError {
     match error {
+        StoreError::CanonicalIdentityNotFound => TaskAuthenticationError::UnknownUser,
         StoreError::Database(_) | StoreError::InvalidFederatedSubjectRecord => {
             TaskAuthenticationError::Unavailable
         }
@@ -1494,6 +1493,20 @@ pub struct FederatedTaskIdentityErrorResponse {
     pub issuer: String,
     pub subject: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UnknownTaskIdentityErrorResponse {
+    pub error: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum TaskIdentityErrorResponse {
+    Unknown(UnknownTaskIdentityErrorResponse),
+    Federated(FederatedTaskIdentityErrorResponse),
 }
 
 #[derive(utoipa::ToSchema)]
@@ -2901,6 +2914,7 @@ async fn resolve_task_identity<I: TaskIdentityResolver>(
         .await
         .map_err(|error| match error {
             TaskAuthenticationError::InvalidCredentials => ApiError::TaskAuthentication,
+            TaskAuthenticationError::UnknownUser => ApiError::TaskIdentityUnknownUser,
             TaskAuthenticationError::Unassociated { issuer, subject } => {
                 ApiError::TaskIdentityUnassociated { issuer, subject }
             }
@@ -3686,8 +3700,8 @@ mod identity_task_authentication_tests {
         BoxFuture, IDENTITY_CLOCK_SKEW_SECONDS, IdentityTaskClaims, IdentityTaskIdentityResolver,
         IdentityTaskStore, MAX_IDENTITY_TASK_TOKEN_AGE_SECONDS, TaskAuthenticationError,
         TaskIdentityResolver, compatibility_task_identity_from_claims,
-        task_identity_from_identity_claims, valid_identity_issuer, validate_identity_task_jwks,
-        verify_identity_task_token,
+        map_canonical_identity_error, task_identity_from_identity_claims, valid_identity_issuer,
+        validate_identity_task_jwks, verify_identity_task_token,
     };
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -3760,6 +3774,8 @@ mod identity_task_authentication_tests {
     struct PreassociatedFederatedStore {
         principal: CanonicalPrincipal,
     }
+
+    struct UnknownCanonicalUserStore;
 
     impl PreassociatedFederatedStore {
         fn record(&self) -> FederatedSubjectRecord {
@@ -3862,6 +3878,40 @@ mod identity_task_authentication_tests {
         }
     }
 
+    impl IdentityTaskStore for UnknownCanonicalUserStore {
+        fn resolve_canonical_principal<'a>(
+            &'a self,
+            _user_id: &'a CanonicalUserId,
+            _current_verified_email: &'a Email,
+        ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>> {
+            Box::pin(async { Err(StoreError::CanonicalIdentityNotFound) })
+        }
+
+        fn seed_federated_subject_association<'a>(
+            &'a self,
+            _observation: FederatedSubjectObservation<'a>,
+            _canonical_user_id: &'a CanonicalUserId,
+            _actor: &'a str,
+        ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>> {
+            Box::pin(async { Err(StoreError::CanonicalIdentityNotFound) })
+        }
+
+        fn observe_federated_subject<'a>(
+            &'a self,
+            _observation: FederatedSubjectObservation<'a>,
+        ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>> {
+            Box::pin(async { Err(StoreError::FederatedSubjectNotFound) })
+        }
+
+        fn resolve_federated_subject<'a>(
+            &'a self,
+            _issuer: &'a str,
+            _subject: &'a str,
+        ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>> {
+            Box::pin(async { Err(StoreError::FederatedSubjectNotFound) })
+        }
+    }
+
     fn key_material() -> Result<(EncodingKey, JwkSet), String> {
         let private = SecretKey::random(&mut OsRng);
         let der = private
@@ -3945,6 +3995,35 @@ mod identity_task_authentication_tests {
     fn federated_token(key: &EncodingKey) -> Result<String, String> {
         let now = jsonwebtoken::get_current_timestamp();
         federated_token_with(key, KID, federated_claims(now))
+    }
+
+    #[test]
+    fn authenticated_v2_unknown_user_is_not_an_invalid_credential() {
+        assert_eq!(
+            map_canonical_identity_error(StoreError::CanonicalIdentityNotFound),
+            TaskAuthenticationError::UnknownUser,
+            "a verified v2 credential naming an unknown canonical user must be distinguishable from an invalid credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_v2_token_reports_unknown_canonical_user_after_verification()
+    -> Result<(), String> {
+        let (key, jwks) = key_material()?;
+        let assertion = token(&key, ISSUER, AUDIENCE, "steward-task-v2")?;
+        let resolver = IdentityTaskIdentityResolver {
+            jwks,
+            issuer: ISSUER.to_owned(),
+            audience: AUDIENCE.to_owned(),
+            canonical_identities: Arc::new(UnknownCanonicalUserStore),
+            federated_subjects_enabled: false,
+        };
+
+        assert_eq!(
+            resolver.resolve(&assertion).await,
+            Err(TaskAuthenticationError::UnknownUser)
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -48,7 +48,9 @@ The default `steward-task-v2` path keeps the existing trusted TokenReview or
 direct Identity result: it must contain exactly one
 `agents.apelogic.ai/canonical-user:<user-id>` group in addition to the existing service and
 acting-user/owner groups. The Task request body rejects `canonicalUserId`, `actingUser`, and all
-other unknown fields, so the caller cannot select another person.
+other unknown fields, so the caller cannot select another person. After the
+credential is verified, a canonical user ID absent from Steward returns
+`403 task_identity_unknown_user`; invalid credentials retain `401`.
 
 The opt-in `steward-task-v3` path uses the exact verified `(issuer, subject)` as
 an upstream identity key. With the default connection-association setting, a

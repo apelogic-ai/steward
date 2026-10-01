@@ -96,6 +96,11 @@ Steward makes a best-effort attempt to seed an association for the same verified
 `(iss, sub)` and already-resolved canonical user. A conflicting or disabled
 federated-subject record, or a seeding-store failure, does not change v2
 authentication or admission; it only prevents that transition convenience.
+After the token has been verified, a v2 credential whose canonical-user group
+names no registered Steward user returns `403 task_identity_unknown_user` and
+creates no Task. A missing, malformed, expired, or otherwise unverifiable
+credential continues to return `401`; the unknown-user response does not relax
+token verification.
 
 `steward-task-v3` is accepted only when
 `taskIdentity.federatedSubjects.enabled=true`. It keeps the exact issuer,
@@ -116,6 +121,10 @@ administrator round trip. Only `account.id` is an identity key; login, display
 name, and email are display metadata and never participate in matching. The
 association audit records method `connection-verification`, provider `github`,
 the numeric account ID, and its timestamp.
+
+New installations should use the Identity v6 policy with
+`steward-task-v3`. The v5 policy with `steward-task-v2` remains a supported,
+non-deprecated compatibility path.
 
 If stable account metadata is unavailable, auto-association is disabled, or no
 GitHub connection was verified, the first valid submission records the subject

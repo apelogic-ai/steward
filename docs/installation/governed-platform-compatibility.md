@@ -34,6 +34,11 @@ For v0.3.5 it declares:
 - the exact-operation and base-URL semantics for the Codex and Claude inference
   adapters.
 
+The declared Identity v5 / `steward-task-v2` pair remains supported and is not
+deprecated. New installations should choose Identity policy v6 with
+`steward-task-v3` so first-run subject enrollment and connection-verified
+association have explicit outcomes.
+
 Download and verify it from the Steward release:
 
 ```sh

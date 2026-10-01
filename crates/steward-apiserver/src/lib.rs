@@ -37,8 +37,8 @@ pub use tasks::{
     ConfiguredTaskIdentityResolver, FederatedTaskIdentityErrorResponse,
     KubernetesTaskIdentityResolver, MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, TaskAdmissionDelta,
     TaskApiConfig, TaskArchive, TaskAuthenticationError, TaskCreateRequest, TaskErrorResponse,
-    TaskIdentity, TaskIdentityResolver, TaskStatusResponse, TaskSubmissionLedger,
-    TaskSubmissionRequest, task_router,
+    TaskIdentity, TaskIdentityErrorResponse, TaskIdentityResolver, TaskStatusResponse,
+    TaskSubmissionLedger, TaskSubmissionRequest, UnknownTaskIdentityErrorResponse, task_router,
 };
 pub use workflows::{WorkflowReference, WorkflowReferenceError};
 
@@ -219,6 +219,9 @@ impl RequestAuthenticator for IdentityOrKubernetesTokenAuthenticator {
                     .authenticated_user(bearer_token)
                     .map_err(|error| match error {
                         TaskAuthenticationError::InvalidCredentials => {
+                            AuthenticationError::InvalidCredentials
+                        }
+                        TaskAuthenticationError::UnknownUser => {
                             AuthenticationError::InvalidCredentials
                         }
                         TaskAuthenticationError::Unassociated { .. }
@@ -412,6 +415,8 @@ pub struct GrantRevocationRequest {
         TaskArchive,
         TaskErrorResponse,
         FederatedTaskIdentityErrorResponse,
+        TaskIdentityErrorResponse,
+        UnknownTaskIdentityErrorResponse,
         browser_auth::BrowserRole,
         browser_auth::SessionPrincipalResponse,
         browser_auth::SessionResponse,
@@ -538,7 +543,7 @@ pub async fn budget_increase_contract() {}
         (status = 202, description = "A new direct-package or versioned Workflow Task is accepted for controller-owned runtime creation; runtimeUid is null until controller binding", body = TaskStatusResponse, content_type = "application/json"),
         (status = 400, description = "Submission JSON is malformed", body = String, content_type = "text/plain"),
         (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
-        (status = 403, description = "Federated subject is unassociated or disabled", body = FederatedTaskIdentityErrorResponse, content_type = "application/json"),
+        (status = 403, description = "Authenticated canonical user is unknown, or federated subject is unassociated or disabled", body = TaskIdentityErrorResponse, content_type = "application/json"),
         (status = 404, description = "Selected workflow does not exist", body = TaskErrorResponse, content_type = "application/json"),
         (status = 409, description = "Idempotency key conflicts with an existing Task", body = TaskErrorResponse, content_type = "application/json"),
         (status = 415, description = "Content-Type is not application/json", body = String, content_type = "text/plain"),
@@ -860,6 +865,7 @@ pub enum ApiError {
     Conflict(String),
     NoActiveGrants,
     TaskAuthentication,
+    TaskIdentityUnknownUser,
     TaskIdentityUnassociated { issuer: String, subject: String },
     TaskIdentityDisabled { issuer: String, subject: String },
     TaskAuthenticationUnavailable,
@@ -2384,6 +2390,16 @@ where
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match &self {
+            Self::TaskIdentityUnknownUser => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "task_identity_unknown_user",
+                        "message": "The credential is valid, but its canonical user is not registered in Steward. Ask a Steward administrator to onboard the user.",
+                    })),
+                )
+                    .into_response();
+            }
             Self::TaskIdentityUnassociated { issuer, subject } => {
                 return (
                     StatusCode::FORBIDDEN,
@@ -2416,6 +2432,7 @@ impl IntoResponse for ApiError {
             }
             Self::PrincipalMismatch => StatusCode::FORBIDDEN,
             Self::TaskAuthentication => StatusCode::UNAUTHORIZED,
+            Self::TaskIdentityUnknownUser => StatusCode::FORBIDDEN,
             Self::TaskIdentityUnassociated { .. } | Self::TaskIdentityDisabled { .. } => {
                 StatusCode::FORBIDDEN
             }
@@ -3845,6 +3862,7 @@ mod tests {
                         issuer: "https://identity.example.test".to_owned(),
                         subject: "github-actions:actor:16106037".to_owned(),
                     }),
+                    "unknown-canonical-user-assertion" => Err(TaskAuthenticationError::UnknownUser),
                     _ => Err(TaskAuthenticationError::InvalidCredentials),
                 }
             })
@@ -10587,6 +10605,88 @@ mod tests {
             FakeTaskIdentityResolver,
             task_api_config()?.with_git_hosting_plane(git),
         ))
+    }
+
+    #[tokio::test]
+    async fn authenticated_unknown_canonical_user_returns_stable_actionable_error()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let git = direct_git_fixture(direct_manifest()?, direct_definition_no_skills()?, None)?;
+        let response = direct_test_app(ledger.clone(), git)?
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer unknown-canonical-user-assertion")
+                    .header("idempotency-key", "unknown-canonical-user")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build unknown-user request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit unknown-user request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read unknown-user response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("decode unknown-user response: {error}"))?,
+            serde_json::json!({
+                "error": "task_identity_unknown_user",
+                "message": "The credential is valid, but its canonical user is not registered in Steward. Ask a Steward administrator to onboard the user.",
+            })
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .is_empty(),
+            "an unknown canonical user must receive no Task authority"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_task_credential_remains_unauthorized() -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let git = direct_git_fixture(direct_manifest()?, direct_definition_no_skills()?, None)?;
+        let response = direct_test_app(ledger.clone(), git)?
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer invalid-assertion")
+                    .header("idempotency-key", "invalid-task-credential")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build invalid-credential request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit invalid-credential request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .is_empty(),
+            "an invalid credential must receive no Task authority"
+        );
+        Ok(())
     }
 
     #[tokio::test]
