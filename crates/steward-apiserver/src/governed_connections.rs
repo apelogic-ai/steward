@@ -1130,6 +1130,14 @@ impl ConnectionOperationReconciler {
                 }
                 continue;
             }
+            if matches!(
+                operation.task_phase,
+                steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled
+            ) {
+                self.fail_operation(operation.operation_id, &task_failure)
+                    .await?;
+                continue;
+            }
             if self
                 .store
                 .connection_operation_deadline_elapsed(operation.operation_id)
@@ -1190,10 +1198,7 @@ impl ConnectionOperationReconciler {
                         }
                     }
                 }
-                steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled => {
-                    self.fail_operation(operation.operation_id, &task_failure)
-                        .await?;
-                }
+                steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled => {}
                 steward_types::TaskPhase::Submitted
                 | steward_types::TaskPhase::Parked
                 | steward_types::TaskPhase::Queued
@@ -1241,9 +1246,14 @@ fn connection_operation_failure(
     execution_stderr: Option<&[u8]>,
 ) -> ConnectionOperationFailure {
     let category = match failure_reason {
+        Some("bridge-runtime-authentication") => "bridge-runtime-authentication",
         Some("bridge-proxy-policy") => "bridge-proxy-policy",
         Some("bridge-runtime-authorization") => "bridge-runtime-authorization",
+        Some("bridge-token-grant") => "bridge-token-grant",
         Some("bridge-gateway-http") => "bridge-gateway-http",
+        Some("runtime_create_admission_rejected") => "runtime_create_admission_rejected",
+        Some("runtime_start_failed") => "runtime_start_failed",
+        Some("deadline_exceeded") => "deadline_exceeded",
         _ => "bridge_failed",
     };
     let detail = (category == "bridge-gateway-http")
@@ -1278,8 +1288,13 @@ fn connection_broker_error(
     failure_detail: Option<&Value>,
 ) -> ConnectionBrokerError {
     match failure_category {
+        Some("bridge-runtime-authentication") => ConnectionBrokerError::RuntimeAuthenticationFailed,
         Some("bridge-proxy-policy") => ConnectionBrokerError::ProxyPolicyDenied,
         Some("bridge-runtime-authorization") => ConnectionBrokerError::ProviderAuthorizationFailed,
+        Some("bridge-token-grant") => ConnectionBrokerError::TokenGrantFailed,
+        Some("runtime_create_admission_rejected") => ConnectionBrokerError::RuntimeCreateFailed,
+        Some("runtime_start_failed") => ConnectionBrokerError::RuntimeStartFailed,
+        Some("deadline_exceeded") => ConnectionBrokerError::DeadlineExceeded,
         Some("bridge-gateway-http") => failure_detail
             .and_then(GithubBridgeFailureDiagnostic::from_value)
             .map_or(ConnectionBrokerError::Unavailable, |detail| {
@@ -1351,6 +1366,42 @@ mod finalized_connection_operation_tests {
                 "opaque-agent-failure",
                 "bridge_failed",
                 crate::connections::ConnectionBrokerError::Unavailable,
+            ),
+        ] {
+            assert_eq!(
+                connection_operation_failure(Some(task_reason), None).category,
+                operation_category
+            );
+            assert_eq!(
+                connection_broker_error(Some(operation_category), None),
+                broker_error
+            );
+        }
+        for (task_reason, operation_category, broker_error) in [
+            (
+                "bridge-runtime-authentication",
+                "bridge-runtime-authentication",
+                crate::connections::ConnectionBrokerError::RuntimeAuthenticationFailed,
+            ),
+            (
+                "bridge-token-grant",
+                "bridge-token-grant",
+                crate::connections::ConnectionBrokerError::TokenGrantFailed,
+            ),
+            (
+                "runtime_create_admission_rejected",
+                "runtime_create_admission_rejected",
+                crate::connections::ConnectionBrokerError::RuntimeCreateFailed,
+            ),
+            (
+                "runtime_start_failed",
+                "runtime_start_failed",
+                crate::connections::ConnectionBrokerError::RuntimeStartFailed,
+            ),
+            (
+                "deadline_exceeded",
+                "deadline_exceeded",
+                crate::connections::ConnectionBrokerError::DeadlineExceeded,
             ),
         ] {
             assert_eq!(

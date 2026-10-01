@@ -783,8 +783,13 @@ where
                     }),
                 )
                     .into_response(),
-                ConnectionBrokerError::ProxyPolicyDenied
+                ConnectionBrokerError::RuntimeAuthenticationFailed
+                | ConnectionBrokerError::ProxyPolicyDenied
                 | ConnectionBrokerError::ProviderAuthorizationFailed
+                | ConnectionBrokerError::TokenGrantFailed
+                | ConnectionBrokerError::RuntimeCreateFailed
+                | ConnectionBrokerError::RuntimeStartFailed
+                | ConnectionBrokerError::DeadlineExceeded
                 | ConnectionBrokerError::GatewayHttp { .. }
                 | ConnectionBrokerError::Unavailable => {
                     browser_runs_error(StatusCode::SERVICE_UNAVAILABLE)

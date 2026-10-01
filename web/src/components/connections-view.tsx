@@ -149,7 +149,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
         <dl className="grid gap-3 text-sm sm:grid-cols-2"><div><dt className="text-xs font-semibold text-muted-ink">Active credential expires</dt><dd className="mt-1">{status?.activeCredentialExpiresAt ?? "Not reported"}</dd></div><div><dt className="text-xs font-semibold text-muted-ink">Renewal credential expires</dt><dd className="mt-1">{status?.renewalCredentialExpiresAt ?? "Not reported"}</dd></div></dl>
         {!status ? <p className="text-sm text-muted-ink">Connection metadata is not currently available. Authorization can still be started safely.</p> : null}
         {status?.phase === "connected" ? reauthorizationRecommended ? <button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">Re-authorize GitHub</button> : null : <button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">{!status ? "Authorize / re-authorize GitHub" : status.phase === "reauth_required" || status.phase === "unavailable" ? "Re-authorize GitHub" : "Connect GitHub"}</button>}
-        {action !== "idle" && action !== "working" ? <p className="text-sm text-err" role="alert">{action !== "orchestration-not-active" && startFailure ? `GitHub authorization failed (${startFailure.error})${startFailure.detail ? `: ${startFailure.detail}` : "."}` : { "orchestration-not-active": "Connections are disabled until task orchestration is active (stage 2).", "oauth-pending": "Finish or wait for the pending GitHub authorization before disconnecting.", "poll-expired": "Authorization did not become ready in time. Retry the connection; if it continues, contact an administrator.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "Rust rejected the connection action.", forbidden: "The Rust authorization boundary rejected the connection action.", unavailable: "The authoritative connection service is unavailable.", error: "The server-owned connection action could not be completed." }[action]}</p> : null}
+        {action !== "idle" && action !== "working" ? <p className="text-sm text-err" role="alert">{action !== "orchestration-not-active" && startFailure ? connectionFailureMessage(startFailure) : { "orchestration-not-active": "Connections are disabled until task orchestration is active (stage 2).", "oauth-pending": "Finish or wait for the pending GitHub authorization before disconnecting.", "poll-expired": "Authorization did not become ready in time. Retry the connection; if it continues, contact an administrator.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "Rust rejected the connection action.", forbidden: "The Rust authorization boundary rejected the connection action.", unavailable: "The authoritative connection service is unavailable.", error: "The server-owned connection action could not be completed." }[action]}</p> : null}
       </div>
     </SectionCard>
   );
@@ -185,4 +185,17 @@ function connectionOperationError(value: unknown): ConnectionOperationErrorRespo
     upstreamStatus: typeof candidate.upstreamStatus === "number" ? candidate.upstreamStatus : undefined,
     detail: typeof candidate.detail === "string" ? candidate.detail : undefined,
   };
+}
+
+function connectionFailureMessage(failure: ConnectionOperationErrorResponse): string {
+  const messages: Record<string, string> = {
+    runtime_authentication_failed: "The governed runtime could not authenticate to GitHub. Re-authorize GitHub; if it continues, ask an administrator to verify runtime credential injection.",
+    token_grant_failed: "The governed runtime could not receive its GitHub credential. Retry once; if it continues, ask an administrator to inspect MCP-GW token grants.",
+    runtime_create_failed: "The governed connection runtime could not be created. Ask an administrator to inspect Steward runtime admission and controller events.",
+    runtime_start_failed: "The governed connection runtime failed to start. Ask an administrator to inspect the AgentRuntime and OpenShell sandbox status.",
+    connection_deadline_exceeded: "The governed connection did not become ready before its deadline. Retry once; if it continues, ask an administrator to inspect runtime health.",
+  };
+  const actionable = messages[failure.error];
+  if (actionable) return actionable;
+  return `GitHub authorization failed (${failure.error})${failure.detail ? `: ${failure.detail}` : "."}`;
 }

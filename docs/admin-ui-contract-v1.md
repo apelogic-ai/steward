@@ -145,8 +145,11 @@ runtime-response deadline; a reused, succeeded operation whose OAuth flow is
 still pending advertises the later flow expiry so a retry can retrieve the
 still-valid URL. The browser aborts the poll when its view is
 replaced, unmounted, or reaches the advertised deadline; a deadline leaves an
-actionable retry state. It never persists the authorization URL. The onboarding
-aggregate composes connection, Envelope, workflow,
+actionable retry state. It never persists the authorization URL. The Connections
+UI renders distinct recovery guidance for runtime authentication, token-grant,
+runtime creation, runtime start, and deadline failures. These bounded categories
+come from the durable operation record; arbitrary runtime diagnostics remain out
+of the browser response. The onboarding aggregate composes connection, Envelope, workflow,
 and run evidence; dismissal and the explicit "I added the workflow"
 acknowledgement are server-side preferences. When browser surfaces are enabled
 and at least one execution binding is advertised, Steward publishes the

@@ -28,6 +28,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   service outage. Governed connection mutations now return
   `connections.orchestration_not_active`, the browser explains that activation
   is required, and startup logs the staged bridge state once.
+- Failed governed connection starts promptly when their exact runtime reports a
+  terminal start failure, and preserved distinct runtime-authentication,
+  token-grant, runtime-create, runtime-start, and deadline categories through
+  audit records, API problem bodies, and actionable browser messages.
 - Published the immutable `repo-summary@2` onboarding Workflow with an explicit
   `out/summary.md` result and migrated existing revision-1 installations without
   rewriting their history. The Workflow authoring UI now states that governed

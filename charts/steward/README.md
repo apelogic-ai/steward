@@ -386,8 +386,12 @@ bounded diagnostic.
 | Failure category | Meaning |
 | --- | --- |
 | `bridge-gateway-http` | MCP-GW returned an unexpected non-2xx HTTP status. Read `failure_detail` for the status and optional sanitized reason. |
+| `bridge-runtime-authentication` | MCP-GW rejected the runtime credential. Re-authorize the connection, then verify runtime credential injection if it continues. |
 | `bridge-proxy-policy` | OpenShell denied the provider request before MCP-GW handled it. |
 | `bridge-runtime-authorization` | MCP-GW rejected the runtime's authority. |
+| `bridge-token-grant` | OpenShell could not exchange the placeholder for the runtime-bound GitHub credential. Retry once, then inspect MCP-GW token-grant health. |
+| `runtime_create_admission_rejected` | Kubernetes admission rejected creation of the governed connection runtime. Inspect Steward admission and controller events. |
+| `runtime_start_failed` | The exact governed connection runtime entered its terminal failed phase before it became ready. Inspect the AgentRuntime and OpenShell sandbox. |
 | `bridge_failed` | The bridge failed without a recognized safe diagnostic. |
 | `deadline_exceeded` | The governed connection operation did not finish before its response deadline. |
 | `invalid_bridge_result` | The bridge exited successfully but its output violated the fixed result contract. |

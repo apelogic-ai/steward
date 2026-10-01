@@ -407,6 +407,10 @@ fn pre_dispatch_provider_failure(status: StatusCode, body: &[u8]) -> bool {
     if status == StatusCode::UNAUTHORIZED {
         return true;
     }
+    token_grant_failure(status, body)
+}
+
+fn token_grant_failure(status: StatusCode, body: &[u8]) -> bool {
     if status != StatusCode::BAD_GATEWAY {
         return false;
     }
@@ -486,6 +490,8 @@ fn require_status(actual: StatusCode, expected: StatusCode, body: &[u8]) -> Resu
         Ok(())
     } else if actual == StatusCode::UNAUTHORIZED {
         Err(failed("MCP-GW rejected runtime authentication"))
+    } else if token_grant_failure(actual, body) {
+        Err(failed("MCP-GW token grant failed"))
     } else if actual == StatusCode::FORBIDDEN {
         let proxy_denial = serde_json::from_slice::<Value>(body)
             .ok()
@@ -1409,6 +1415,17 @@ mod tests {
                 "a proxy policy denial must remain distinct from MCP-GW authorization"
             );
         }
+        assert_eq!(
+            parse_response(
+                GatewayContract::LegacyV032,
+                GithubBridgeOperation::Status,
+                StatusCode::BAD_GATEWAY,
+                br#"{"error":"token_grant_failed","detail":"dynamic token grant failed"}"#,
+            ),
+            Err(PortError::Failed {
+                reason: "MCP-GW token grant failed".to_owned(),
+            })
+        );
         assert_eq!(
             parse_response(
                 GatewayContract::LegacyV032,

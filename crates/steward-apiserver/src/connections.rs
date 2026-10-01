@@ -222,8 +222,13 @@ pub enum ConnectionStartOperation {
 pub enum ConnectionBrokerError {
     OAuthFlowPending,
     OrchestrationNotActive,
+    RuntimeAuthenticationFailed,
     ProxyPolicyDenied,
     ProviderAuthorizationFailed,
+    TokenGrantFailed,
+    RuntimeCreateFailed,
+    RuntimeStartFailed,
+    DeadlineExceeded,
     GatewayHttp { status: u16, reason: Option<String> },
     Unavailable,
 }
@@ -762,10 +767,17 @@ fn connection_broker_error_response(error: ConnectionBrokerError) -> Response {
 
 fn connection_broker_problem(error: ConnectionBrokerError) -> ConnectionOperationErrorResponse {
     let (error, upstream_status, detail) = match error {
+        ConnectionBrokerError::RuntimeAuthenticationFailed => {
+            ("runtime_authentication_failed", None, None)
+        }
         ConnectionBrokerError::ProxyPolicyDenied => ("proxy_policy_denied", None, None),
         ConnectionBrokerError::ProviderAuthorizationFailed => {
             ("provider_authorization_failed", None, None)
         }
+        ConnectionBrokerError::TokenGrantFailed => ("token_grant_failed", None, None),
+        ConnectionBrokerError::RuntimeCreateFailed => ("runtime_create_failed", None, None),
+        ConnectionBrokerError::RuntimeStartFailed => ("runtime_start_failed", None, None),
+        ConnectionBrokerError::DeadlineExceeded => ("connection_deadline_exceeded", None, None),
         ConnectionBrokerError::GatewayHttp { status, reason } => {
             ("gateway_http_error", Some(status), reason)
         }
@@ -1460,8 +1472,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_denials_have_distinct_bounded_problem_codes() -> Result<(), String> {
+    async fn connection_failures_have_distinct_bounded_problem_codes() -> Result<(), String> {
         for (error, expected) in [
+            (
+                ConnectionBrokerError::RuntimeAuthenticationFailed,
+                "runtime_authentication_failed",
+            ),
             (
                 ConnectionBrokerError::ProxyPolicyDenied,
                 "proxy_policy_denied",
@@ -1469,6 +1485,22 @@ mod tests {
             (
                 ConnectionBrokerError::ProviderAuthorizationFailed,
                 "provider_authorization_failed",
+            ),
+            (
+                ConnectionBrokerError::TokenGrantFailed,
+                "token_grant_failed",
+            ),
+            (
+                ConnectionBrokerError::RuntimeCreateFailed,
+                "runtime_create_failed",
+            ),
+            (
+                ConnectionBrokerError::RuntimeStartFailed,
+                "runtime_start_failed",
+            ),
+            (
+                ConnectionBrokerError::DeadlineExceeded,
+                "connection_deadline_exceeded",
             ),
         ] {
             let response = connection_broker_error_response(error);

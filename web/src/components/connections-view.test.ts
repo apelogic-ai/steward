@@ -37,8 +37,18 @@ describe("governed provider connection controls", () => {
 
   test("shows the bounded terminal connection failure category", () => {
     expect(source).toContain("GitHub authorization failed");
-    expect(source).toContain("startFailure.error");
-    expect(source).toContain("startFailure.detail");
+    expect(source).toContain("failure.error");
+    expect(source).toContain("failure.detail");
+    expect(source).toContain("runtime_authentication_failed");
+    expect(source).toContain("verify runtime credential injection");
+    expect(source).toContain("token_grant_failed");
+    expect(source).toContain("inspect MCP-GW token grants");
+    expect(source).toContain("runtime_create_failed");
+    expect(source).toContain("inspect Steward runtime admission and controller events");
+    expect(source).toContain("runtime_start_failed");
+    expect(source).toContain("inspect the AgentRuntime and OpenShell sandbox status");
+    expect(source).toContain("connection_deadline_exceeded");
+    expect(source).toContain("inspect runtime health");
   });
 
   test("clears a stale authorization failure before disconnecting", () => {
