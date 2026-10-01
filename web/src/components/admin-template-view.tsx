@@ -237,7 +237,9 @@ export function validateTemplateFields({
   if (!templateId) errors.templateId = "Enter a template ID.";
   else if (!validTemplateIdentifier(templateId)) errors.templateId = identifierMessage;
   if (!templateDisplayName.trim()) errors.displayName = "Enter a display name.";
+  else if (Array.from(templateDisplayName.trim()).length > 128) errors.displayName = "Use at most 128 characters.";
   if (memberRoles.length === 0) errors.memberRoles = "Add at least one eligible member role.";
+  else if (memberRoles.length > 64) errors.memberRoles = "Use at most 64 eligible member roles.";
   else if (memberRoles.some((role) => !validTemplateIdentifier(role))) errors.memberRoles = "Use a valid identifier for every eligible member role.";
   if (!singleRunLimit.trim()) errors.singleRunLimit = "Enter a per-run budget.";
   else if (!validDecimal(singleRunLimit.trim())) errors.singleRunLimit = decimalMessage;

@@ -1728,7 +1728,7 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
   const administrator = await guardedPage(browser, {
     expectedHttpStatuses: [422],
     mutationFailures: {
-      "/admin/api/v1/envelope-templates/operator": { status: 422, body: { code: "template.invalid" } },
+      "/admin/api/v1/envelope-templates/operator": { status: 422, body: { code: "template_invalid" } },
     },
     session: administratorSession,
   });
@@ -1805,7 +1805,27 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await autoApprove.check();
     await administrator.page.getByRole("button", { name: "Create template" }).click();
 
-    await expect(administrator.page.getByText("The server rejected the template, so no authority was changed. Error code: template.invalid.")).toBeVisible();
+    await expect(administrator.page.getByText("The server rejected the template, so no authority was changed. Error code: template_invalid.")).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("new template reports display-name and member-role limits before submission", async ({ browser }) => {
+  const administrator = await guardedPage(browser, { session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/new`);
+    await administrator.page.getByRole("textbox", { name: "Template ID" }).fill("engineer");
+    await administrator.page.getByRole("textbox", { name: "Display name" }).fill("x".repeat(129));
+    const roles = administrator.page.getByRole("combobox", { name: "Eligible member roles" });
+    for (let index = 0; index < 64; index += 1) {
+      await roles.fill(`role-${index}`);
+      await roles.press("Enter");
+    }
+    await administrator.page.getByRole("button", { name: "Create template" }).click();
+    await expect(administrator.page.getByText("Use at most 128 characters.")).toBeVisible();
+    await expect(administrator.page.getByText("Use at most 64 eligible member roles.")).toBeVisible();
+    expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
   } finally {
     await closeGuardedPage(administrator);
   }

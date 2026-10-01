@@ -135,4 +135,25 @@ describe("first envelope template", () => {
       storage: "Use a positive binary quantity, such as 2Gi or 512Mi.",
     });
   });
+
+  test("matches the server limits for display names and member roles", () => {
+    const envelope = authoredEnvelope();
+    expect(validateTemplateFields({
+      allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
+      allowedTools: new Set(),
+      autoApproveToCeiling: true,
+      displayName: "x".repeat(129),
+      envelope,
+      memberRoles: Array.from({ length: 65 }, (_, index) => `role-${index}`),
+      models: envelope.spec.llms,
+      monthlyLimit: "10.00",
+      singleRunLimit: "1.00",
+      templateId: "engineer",
+      thresholdJson: "",
+      tools: [],
+    })).toEqual({
+      displayName: "Use at most 128 characters.",
+      memberRoles: "Use at most 64 eligible member roles.",
+    });
+  });
 });
