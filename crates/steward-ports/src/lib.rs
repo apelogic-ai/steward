@@ -510,6 +510,13 @@ pub struct GitFileRequest {
     pub max_bytes: u64,
 }
 
+/// Provider-neutral request to resolve a human-facing Git ref to one immutable commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitRevisionRequest {
+    pub repository: GitRepositoryIdentity,
+    pub reference: String,
+}
+
 /// Deterministic bytes plus the provider-neutral identity revalidated for the read.
 ///
 /// This type deliberately omits `Debug`: repository content must not enter logs through
@@ -532,4 +539,9 @@ pub trait GitHostingPlane: Send + Sync + 'static {
         &self,
         request: &GitFileRequest,
     ) -> impl Future<Output = Result<GitFile, PortError>> + Send;
+
+    fn resolve_revision(
+        &self,
+        request: &GitRevisionRequest,
+    ) -> impl Future<Output = Result<ExactGitCommit, PortError>> + Send;
 }

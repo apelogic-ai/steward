@@ -5460,6 +5460,8 @@ mod tests {
             execution_binding: None,
             source_provenance: None,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
             envelope_revision: None,
             orchestration_version: 3,
             orchestration_operation_id: Some(
@@ -8070,6 +8072,8 @@ mod webhook_tests {
             execution_binding: Some(execution_binding),
             source_provenance: None,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
             envelope_revision: None,
             orchestration_version: 3,
             orchestration_operation_id: Some(operation_id),

@@ -415,6 +415,7 @@ pub(crate) struct BrowserEnvelopeTemplateResponse {
     member_roles: Vec<String>,
     envelope: BrowserEnvelope,
     auto_provision_threshold: Option<BrowserEnvelope>,
+    allow_inline_browser_tasks: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -427,6 +428,7 @@ pub(crate) struct BrowserEnvelopeTemplateListItem {
     member_roles: Vec<String>,
     envelope: BrowserEnvelope,
     auto_provision_threshold: Option<BrowserEnvelope>,
+    allow_inline_browser_tasks: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -443,6 +445,12 @@ pub(crate) struct AuthorEnvelopeTemplateBody {
     member_roles: Vec<String>,
     envelope: BrowserEnvelope,
     auto_provision_threshold: Option<BrowserEnvelope>,
+    #[serde(default = "default_true")]
+    allow_inline_browser_tasks: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl From<EnvelopeTemplateRevisionRecord> for BrowserEnvelopeTemplateListItem {
@@ -455,6 +463,7 @@ impl From<EnvelopeTemplateRevisionRecord> for BrowserEnvelopeTemplateListItem {
             member_roles: template.member_roles,
             envelope: template.ceiling.into(),
             auto_provision_threshold: template.auto_provision_threshold.map(Into::into),
+            allow_inline_browser_tasks: template.allow_inline_browser_tasks,
         }
     }
 }
@@ -469,6 +478,7 @@ fn template_response(template: EnvelopeTemplateRevisionRecord) -> BrowserEnvelop
         member_roles: template.member_roles,
         envelope: template.ceiling.into(),
         auto_provision_threshold: template.auto_provision_threshold.map(Into::into),
+        allow_inline_browser_tasks: template.allow_inline_browser_tasks,
     }
 }
 
@@ -1824,6 +1834,7 @@ where
             member_roles: &body.member_roles,
             ceiling: &envelope,
             auto_provision_threshold: auto_provision_threshold.as_ref(),
+            allow_inline_browser_tasks: body.allow_inline_browser_tasks,
             authored_by: authority.principal().canonical_user_id.as_str(),
         })
         .await
@@ -1840,6 +1851,7 @@ where
                     member_roles: body.member_roles,
                     envelope: envelope.into(),
                     auto_provision_threshold: auto_provision_threshold.map(Into::into),
+                    allow_inline_browser_tasks: body.allow_inline_browser_tasks,
                 }),
             )
                 .into_response()
@@ -1888,6 +1900,7 @@ where
         member_roles: vec![template_id.clone()],
         envelope: browser_envelope,
         auto_provision_threshold: None,
+        allow_inline_browser_tasks: true,
     };
     author_envelope_template::<R, L, D>(
         Extension(authority),

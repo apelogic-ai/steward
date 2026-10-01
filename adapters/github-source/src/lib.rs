@@ -6,8 +6,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::{Client, Response, StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use steward_ports::{GitFile, GitFileRequest, GitHostingPlane, GitRepositoryIdentity, PortError};
-use steward_types::direct_package::{MAX_PACKAGE_FILE_BYTES, RepositoryUrl, StableProviderId};
+use steward_ports::{
+    GitFile, GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRevisionRequest, PortError,
+};
+use steward_types::direct_package::{
+    ExactGitCommit, MAX_PACKAGE_FILE_BYTES, RepositoryUrl, StableProviderId,
+};
 
 pub const IMPLEMENTED_PORTS: [&str; 1] = ["GitHostingPlane"];
 
@@ -460,6 +464,60 @@ impl GitHostingPlane for GitHubSourceAdapter {
             bytes,
         })
     }
+
+    async fn resolve_revision(
+        &self,
+        request: &GitRevisionRequest,
+    ) -> Result<ExactGitCommit, PortError> {
+        let reference = request
+            .reference
+            .strip_prefix("git:ref:")
+            .ok_or_else(|| rejected("Git reference is invalid"))?;
+        if reference.is_empty() || reference.len() > 512 || reference.chars().any(char::is_control)
+        {
+            return Err(rejected("Git reference is invalid"));
+        }
+        let coordinates =
+            RepositoryCoordinates::parse(&request.repository.repository, &self.clone_origin)?;
+        let authorized = self.authenticate_repository(&coordinates).await?;
+        if authorized.identity != request.repository {
+            return Err(rejected(
+                "GitHub repository stable identity does not match request",
+            ));
+        }
+        let encoded = percent_encode_path_segment(reference);
+        let commit: ResolvedCommit = self
+            .get_json(
+                &format!(
+                    "{}/repos/{}/{}/commits/{encoded}",
+                    self.api_origin, coordinates.owner, coordinates.name
+                ),
+                &authorized.token,
+                Authentication::Installation,
+                METADATA_RESPONSE_BYTES,
+                "resolve GitHub ref",
+            )
+            .await?;
+        if !valid_sha1(&commit.sha) {
+            return Err(rejected("GitHub returned an invalid commit identity"));
+        }
+        self.revalidate_repository(&coordinates, &authorized)
+            .await?;
+        ExactGitCommit::parse(format!("git:sha1:{}", commit.sha))
+            .map_err(|_| rejected("GitHub returned an invalid commit identity"))
+    }
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 #[derive(Clone, Copy)]
@@ -566,6 +624,11 @@ struct RepositoryMetadata {
 struct GitCommit {
     sha: String,
     tree: GitObjectReference,
+}
+
+#[derive(Deserialize)]
+struct ResolvedCommit {
+    sha: String,
 }
 
 #[derive(Deserialize)]
@@ -787,7 +850,9 @@ mod tests {
     };
 
     use serde_json::json;
-    use steward_ports::{GitFileRequest, GitHostingPlane, GitRepositoryIdentity, PortError};
+    use steward_ports::{
+        GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRevisionRequest, PortError,
+    };
     use steward_types::direct_package::{
         ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
     };
@@ -1078,6 +1143,30 @@ mod tests {
                 .iter()
                 .all(|request| !request.contains("caller-credential"))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolves_a_branch_to_one_exact_commit_before_package_reads() -> Result<(), String> {
+        let mut responses = authentication_responses();
+        responses.extend([
+            ResponseSpec::json(json!({"sha": COMMIT})),
+            metadata(1001, 1000, "example-org/source-a"),
+            installation(7001, 1000),
+        ]);
+        let mock = MockGitHub::start(responses)?;
+        let repository = identity(REPOSITORY, 1001, 1000)?;
+        let commit = port(
+            adapter(&mock)?
+                .resolve_revision(&GitRevisionRequest {
+                    repository,
+                    reference: "git:ref:release/v1".to_owned(),
+                })
+                .await,
+        )?;
+        assert_eq!(commit.as_str(), format!("git:sha1:{COMMIT}"));
+        let requests = mock.finish()?;
+        assert!(requests[3].contains("/commits/release%2Fv1"));
         Ok(())
     }
 

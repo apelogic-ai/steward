@@ -693,6 +693,8 @@ impl<B> GovernedConnectionsBroker<B> {
             execution_binding: None,
             source_provenance: None,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Connections,
+            browser_task_evidence: None,
             user_envelope_snapshot: None,
             candidate_digest: &orchestration.candidate_digest,
             admission_decision: &admission,

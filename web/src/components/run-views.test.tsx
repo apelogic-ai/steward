@@ -11,6 +11,7 @@ function run(overrides: Partial<BrowserRunView>): BrowserRunView {
     createdAt: "2026-08-25T20:00:00Z",
     finalizationRequested: false,
     finalized: true,
+    origin: "unknown",
     phase: "succeeded",
     runtimeOwnership: "provisioned",
     stages: [],
@@ -25,7 +26,15 @@ describe("run table", () => {
   test("renders newest-first in an internally scrollable table with conventional outcome colors", () => {
     const html = renderToStaticMarkup(<RunCards runs={[
       run({ taskUid: "task-older", runtimeUid: "oldruntime-0000-0000-0000-000000000000", updatedAt: "2026-08-25T20:00:00Z", phase: "failed" }),
-      run({ taskUid: "task-newer", runtimeUid: "newruntime-0000-0000-0000-000000000000", updatedAt: "2026-08-25T21:00:00Z", phase: "succeeded" }),
+      run({
+        taskUid: "task-newer",
+        runtimeUid: "newruntime-0000-0000-0000-000000000000",
+        updatedAt: "2026-08-25T21:00:00Z",
+        phase: "succeeded",
+        origin: "browser",
+        package: { source: "inline", revision: `steward:sha256:${"a".repeat(64)}`, path: "task-definition.json" },
+        userEnvelopeRevision: 7,
+      }),
     ]} />);
 
     expect(html.indexOf("newruntime")).toBeLessThan(html.indexOf("oldruntime"));
@@ -39,6 +48,10 @@ describe("run table", () => {
     expect(html).toContain("task-older");
     expect(html).toContain("newruntime-0000-0000-0000-000000000000");
     expect(html).toContain("oldruntime-0000-0000-0000-000000000000");
+    expect(html).toContain("Origin / package");
+    expect(html).toContain("browser");
+    expect(html).toContain("steward:sha256:");
+    expect(html).toContain("rev 7");
     expect(html).not.toContain("uppercase");
   });
 });

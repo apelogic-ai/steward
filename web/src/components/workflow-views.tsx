@@ -61,7 +61,7 @@ function WorkflowDetail({ workflow }: Readonly<{ workflow: WorkflowRevision }>) 
     <article className="space-y-6 rounded-panel border bg-panel p-6 shadow-sm">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div><h2 className="text-xl font-semibold">{workflow.displayName}</h2><p className="mt-1 font-mono text-xs text-muted-ink">{workflowReference(workflow)}</p></div>
-        <PrimaryLink href={`/admin/workflows/${workflow.name}/new-version`}>Create new version</PrimaryLink>
+        <div className="flex flex-wrap gap-3"><Link className="inline-flex min-h-11 items-center rounded-control border px-4 text-sm font-semibold" href={`/runs/new?workflow=${encodeURIComponent(workflowReference(workflow))}`}>Run now</Link><PrimaryLink href={`/admin/workflows/${workflow.name}/new-version`}>Create new version</PrimaryLink></div>
       </div>
       <DefinitionList items={[["Agent", workflow.agent], ["Content digest", workflow.contentDigest], ["Published", workflow.publishedAt]]} />
       <div><h3 className="text-sm font-semibold">Prompt</h3><pre className="mt-2 whitespace-pre-wrap rounded-md border bg-canvas p-4 text-sm">{workflow.prompt}</pre></div>

@@ -23,23 +23,26 @@ pub use execution_bindings::{
     ExecutionBindingValidation, MAX_EXECUTION_BINDING_CATALOG_BYTES,
 };
 pub use github_actions::{
+    DIRECT_PACKAGE_GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA, DirectPackageGithubActionsWorkflowContext,
     GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA, GITHUB_ACTIONS_RENDER_REQUEST_SCHEMA,
     GITHUB_FILE_READ_TEMPLATE, GeneratedGithubActionsWorkflow, GithubActionsEnvelopeSelection,
     GithubActionsRenderContext, GithubActionsRenderError, GithubActionsRenderRequest,
     GithubActionsTaskTemplate, MAX_STEWARD_RUN_RELEASE_BYTES, StewardRunRelease,
     StewardRunWorkflowInstallationMode, VERSIONED_GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA,
     VersionedGithubActionsWorkflowContext, parse_github_actions_render_request,
-    render_github_actions_workflow, render_versioned_github_actions_workflow,
-    steward_run_release_from_installation_bom, validate_generated_github_actions_yaml,
-    validate_steward_run_workflow_installation,
+    render_direct_package_github_actions_workflow, render_github_actions_workflow,
+    render_versioned_github_actions_workflow, steward_run_release_from_installation_bom,
+    validate_generated_github_actions_yaml, validate_steward_run_workflow_installation,
 };
 
 pub use tasks::{
+    BrowserResolvedEnvelope, BrowserResolvedPackage, BrowserRunSubmissionResponse,
     ConfiguredTaskIdentityResolver, FederatedTaskIdentityErrorResponse,
     KubernetesTaskIdentityResolver, MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, TaskAdmissionDelta,
     TaskApiConfig, TaskArchive, TaskAuthenticationError, TaskCreateRequest, TaskErrorResponse,
     TaskIdentity, TaskIdentityErrorResponse, TaskIdentityResolver, TaskStatusResponse,
-    TaskSubmissionLedger, TaskSubmissionRequest, UnknownTaskIdentityErrorResponse, task_router,
+    TaskSubmissionLedger, TaskSubmissionRequest, UnknownTaskIdentityErrorResponse,
+    browser_task_router, task_router,
 };
 pub use workflows::{WorkflowReference, WorkflowReferenceError};
 
@@ -79,6 +82,9 @@ use steward_store::{
     EnvelopeTemplateRevisionRecord, GrantApplication, GrantReversion, ParkRejection,
     ParkedAdmission, PendingApproval, PendingEnvelopeRequest, PgStore, StoreError,
     TaskAdmissionLookup, TaskAdmissionRecord, TaskRecord, TaskReservation, TaskReservationRequest,
+};
+use steward_types::direct_package::{
+    BrowserPackageLocator, BrowserTaskEvidence, BrowserTaskSubmission, TaskOrigin,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, Budget, CanonicalAuthorityBinding, CanonicalUserId, ModelRef,
@@ -351,17 +357,21 @@ pub struct GrantRevocationRequest {
         user_envelopes::get_request,
         user_envelopes::create_request,
         user_envelopes::render_github_actions_for_envelope,
+        user_envelopes::render_repository_bundle_for_envelope,
         user_envelopes::list_workflows,
         workflows::list_workflows,
         workflows::get_workflow_revision,
         workflows::publish_initial_workflow,
         workflows::publish_next_workflow,
+        tasks::submit_browser_run,
         agent_runs_ui::my_runs,
         agent_runs_ui::my_run,
         agent_runs_ui::cancel_my_run,
         agent_runs_ui::rerun_my_run,
         agent_runs_ui::my_run_timeline,
         agent_runs_ui::my_run_execution_log,
+        agent_runs_ui::my_run_outputs,
+        agent_runs_ui::download_my_run_output,
         agent_runs_ui::all_runs,
         agent_runs_ui::all_run,
         agent_runs_ui::all_run_timeline,
@@ -424,6 +434,13 @@ pub struct GrantRevocationRequest {
         FederatedTaskIdentityErrorResponse,
         TaskIdentityErrorResponse,
         UnknownTaskIdentityErrorResponse,
+        BrowserTaskSubmission,
+        BrowserPackageLocator,
+        BrowserTaskEvidence,
+        TaskOrigin,
+        BrowserRunSubmissionResponse,
+        BrowserResolvedPackage,
+        BrowserResolvedEnvelope,
         browser_auth::BrowserRole,
         browser_auth::SessionPrincipalResponse,
         browser_auth::SessionResponse,
@@ -462,7 +479,10 @@ pub struct GrantRevocationRequest {
         AgentRunResponse,
         AgentRunTimelineEventView,
         AgentRunTimelineProvenanceView,
-        AgentRunTimelineResponse
+        AgentRunTimelineResponse,
+        agent_runs_ui::BrowserRunOutputFile,
+        agent_runs_ui::BrowserRunOutputsResponse,
+        agent_runs_ui::BrowserRunPackageView
     )),
     modifiers(&TaskSecurity)
 )]
@@ -881,6 +901,7 @@ pub enum ApiError {
     TaskIdentityDisabled { issuer: String, subject: String },
     TaskAuthenticationUnavailable,
     TaskSourceUnauthorized(String),
+    BrowserTaskSourceUnauthorized,
     TaskWorkflowNotFound,
     TaskNotReady,
     TaskOutputNotReady,
@@ -1324,8 +1345,8 @@ pub trait AgentRunLedger: Clone + Send + Sync + 'static {
 
     fn cancel_agent_run<'a>(
         &'a self,
-        task_uid: Uuid,
-        owner_user_id: &'a str,
+        _task_uid: Uuid,
+        _owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>>;
 
     fn rerun_source<'a>(
@@ -1381,6 +1402,14 @@ pub trait AgentRunLedger: Clone + Send + Sync + 'static {
         owner_user_id: Option<&'a str>,
         stream: steward_store::AgentRunLogStream,
     ) -> BoxFuture<'a, Result<Option<AgentRunExecutionLog>, StoreError>>;
+
+    fn agent_run_output_archive<'a>(
+        &'a self,
+        _task_uid: Uuid,
+        _owner_user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 impl AgentRunLedger for PgStore {
@@ -1396,6 +1425,16 @@ impl AgentRunLedger for PgStore {
         task_uid: Uuid,
     ) -> BoxFuture<'_, Result<Option<AgentRunRecord>, StoreError>> {
         Box::pin(async move { PgStore::agent_run(self, task_uid).await })
+    }
+
+    fn agent_run_output_archive<'a>(
+        &'a self,
+        task_uid: Uuid,
+        owner_user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
+        Box::pin(
+            async move { PgStore::agent_run_output_archive(self, task_uid, owner_user_id).await },
+        )
     }
 
     fn agent_run_phase_facets<'a>(
@@ -2313,6 +2352,7 @@ where
             member_roles: std::slice::from_ref(&member_role),
             ceiling: &envelope,
             auto_provision_threshold: Some(&envelope),
+            allow_inline_browser_tasks: true,
             authored_by: &admin.actor,
         })
         .await
@@ -2446,6 +2486,16 @@ impl IntoResponse for ApiError {
                 )
                     .into_response();
             }
+            Self::BrowserTaskSourceUnauthorized => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "task.browser_source_not_allowed",
+                        "message": "The repository is not authorized as a browser Task source. Ask a Steward administrator to allow it.",
+                    })),
+                )
+                    .into_response();
+            }
             _ => {}
         }
         let status = match &self {
@@ -2459,6 +2509,7 @@ impl IntoResponse for ApiError {
                 StatusCode::FORBIDDEN
             }
             Self::TaskSourceUnauthorized(_) => StatusCode::FORBIDDEN,
+            Self::BrowserTaskSourceUnauthorized => StatusCode::FORBIDDEN,
             Self::TaskAuthenticationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::TaskWorkflowNotFound
             | Self::Store(
@@ -2479,6 +2530,7 @@ impl IntoResponse for ApiError {
             | Self::DirectPackageSourceDisabled
             | Self::TaskRuntimeContractUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::TaskOutputNotReady => StatusCode::CONFLICT,
+            Self::Store(StoreError::BrowserTaskConcurrencyLimit) => StatusCode::TOO_MANY_REQUESTS,
             Self::MissingEnvelope | Self::MissingRuntimeUid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidBudgetIncrease { .. } | Self::Admission(_) => {
                 StatusCode::UNPROCESSABLE_ENTITY
@@ -3427,8 +3479,8 @@ mod tests {
     use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec};
     use steward_ports::{
         DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitFile,
-        GitFileRequest, GitHostingPlane, GitRepositoryIdentity, PortError, TaskExecutionAdapter,
-        TaskExecutionPlan, TaskExecutionPlanRequest,
+        GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRevisionRequest, PortError,
+        TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
     };
     use steward_store::{
         AdminApprovalRecord, AdminEnvelopeProvisionRequest, AdminEnvelopeRequestRecord,
@@ -3446,6 +3498,7 @@ mod tests {
     };
     use steward_types::direct_package::{
         ExactGitCommit, RepositoryUrl, SourceProvenance, SourceProvider, StableProviderId,
+        TaskOrigin,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
@@ -3467,9 +3520,9 @@ mod tests {
         CreateRuntimeRequest, KubeRuntimeRepository, KubernetesTokenReviewAudience,
         RequestAuthenticator, RuntimeCreateError, RuntimeRepository, SubmissionOutcome,
         TaskApiConfig, TaskAuthenticationError, TaskIdentity, TaskIdentityResolver,
-        TaskSubmissionLedger, TaskSubmissionRequest, caller_from_kubernetes_user,
-        caller_from_token_review, router, spec_digest, submit_budget_increase,
-        submit_runtime_request, task_router, token_review_request,
+        TaskSubmissionLedger, TaskSubmissionRequest, browser_task_router,
+        caller_from_kubernetes_user, caller_from_token_review, router, spec_digest,
+        submit_budget_increase, submit_runtime_request, task_router, token_review_request,
     };
 
     #[tokio::test]
@@ -3727,6 +3780,14 @@ mod tests {
                 path: request.path.clone(),
                 bytes,
             })
+        }
+
+        async fn resolve_revision(
+            &self,
+            _request: &GitRevisionRequest,
+        ) -> Result<ExactGitCommit, PortError> {
+            ExactGitCommit::parse(format!("git:sha1:{}", "c".repeat(40)))
+                .map_err(|reason| PortError::Failed { reason })
         }
     }
 
@@ -6721,6 +6782,7 @@ mod tests {
                     member_roles: publication.member_roles.to_vec(),
                     ceiling: publication.ceiling.clone(),
                     auto_provision_threshold: publication.auto_provision_threshold.cloned(),
+                    allow_inline_browser_tasks: publication.allow_inline_browser_tasks,
                 });
                 Ok(())
             })
@@ -8013,6 +8075,29 @@ mod tests {
             })
         }
 
+        fn envelope_template_allows_inline_browser_tasks<'a>(
+            &'a self,
+            template_id: &'a str,
+            revision: i64,
+        ) -> BoxFuture<'a, Result<Option<bool>, StoreError>> {
+            Box::pin(async move {
+                self.envelope_templates
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database("fake envelope-template lock was poisoned".to_owned())
+                    })
+                    .map(|templates| {
+                        templates
+                            .iter()
+                            .find(|template| {
+                                template.template_id == template_id
+                                    && template.ceiling.revision == revision
+                            })
+                            .map(|template| template.allow_inline_browser_tasks)
+                    })
+            })
+        }
+
         fn task_by_idempotency<'a>(
             &'a self,
             submitter_service: &'a str,
@@ -8124,6 +8209,8 @@ mod tests {
                     execution_binding: request.execution_binding.cloned(),
                     source_provenance: request.source_provenance.cloned(),
                     direct_task_evidence: request.direct_task_evidence.cloned(),
+                    task_origin: request.task_origin,
+                    browser_task_evidence: request.browser_task_evidence.cloned(),
                     envelope_revision: None,
                     orchestration_version: 3,
                     orchestration_operation_id: Some(operation_id),
@@ -8376,6 +8463,7 @@ mod tests {
                         runner: steward_types::RunnerRequirements::default(),
                     },
                 }),
+                allow_inline_browser_tasks: true,
             }])),
             grants: Vec::new(),
             parked: Arc::new(Mutex::new(Vec::new())),
@@ -10708,6 +10796,584 @@ mod tests {
         ))
     }
 
+    fn enable_inline_for_versioned_task_fixture(
+        ledger: &FakeLedger,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let mut templates = ledger
+            .envelope_templates
+            .lock()
+            .map_err(|_| "fake Envelope template ledger lock was poisoned")?;
+        let mut template = templates
+            .first()
+            .cloned()
+            .ok_or_else(|| "fixture omitted Envelope template".to_owned())?;
+        template.ceiling.revision = 4;
+        if let Some(threshold) = template.auto_provision_threshold.as_mut() {
+            threshold.revision = 4;
+        }
+        template.allow_inline_browser_tasks = enabled;
+        templates.push(template);
+        Ok(())
+    }
+
+    fn inline_browser_package_files() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "task-definition.json".to_owned(),
+                serde_json::json!({
+                    "schemaVersion": "steward.task-definition/v2",
+                    "name": "hello-world",
+                    "version": 1,
+                    "runtime": { "agentRef": TEST_VERSIONED_AGENT },
+                    "prompt": "prompt.md",
+                    "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+                })
+                .to_string(),
+            ),
+            (
+                "prompt.md".to_owned(),
+                "Write hello to out/hello.txt.".to_owned(),
+            ),
+        ])
+    }
+
+    fn inline_browser_task_body() -> serde_json::Value {
+        serde_json::json!({
+            "package": {
+                "source": "inline",
+                "path": "task-definition.json",
+                "files": inline_browser_package_files()
+            },
+            "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64)),
+            "inputs": { "message": "hello" }
+        })
+    }
+
+    fn browser_git_fixture() -> Result<FakeDirectGit, String> {
+        let source = RepositoryUrl::parse("https://github.com/example-org/agentic-ops.git")?;
+        let source_identity = GitRepositoryIdentity {
+            repository: source.clone(),
+            repository_id: StableProviderId::parse("654321")?,
+            repository_owner_id: StableProviderId::parse("7890")?,
+        };
+        let commit = format!("git:sha1:{}", "c".repeat(40));
+        let files = inline_browser_package_files()
+            .into_iter()
+            .map(|(path, contents)| {
+                (
+                    (source.as_str().to_owned(), commit.clone(), path),
+                    contents.into_bytes(),
+                )
+            })
+            .collect();
+        Ok(FakeDirectGit {
+            repositories: Arc::new(BTreeMap::from([(
+                source.as_str().to_owned(),
+                source_identity,
+            )])),
+            files: Arc::new(files),
+            wrong_object_path: None,
+            reads: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    #[tokio::test]
+    async fn browser_repository_source_requires_an_operator_authorized_stable_identity()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let git = browser_git_fixture()?;
+        let reads = git.reads.clone();
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let response = browser_task_router(
+            ledger.clone(),
+            task_api_config()?.with_git_hosting_plane(git),
+            auth,
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/runs")
+                .header(header::COOKIE, session_cookie)
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", csrf)
+                .header("idempotency-key", "browser-repository-not-allowed")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "package": {
+                            "source": "https://github.com/example-org/agentic-ops.git",
+                            "revision": "git:ref:main",
+                            "path": "task-definition.json"
+                        },
+                        "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64)),
+                        "inputs": {}
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build browser repository request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("submit browser repository request: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read browser repository response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("decode browser repository response: {error}"))?,
+            serde_json::json!({
+                "error": "task.browser_source_not_allowed",
+                "message": "The repository is not authorized as a browser Task source. Ask a Steward administrator to allow it."
+            })
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?
+                .is_empty(),
+            "an unauthorized browser source must fail before Task reservation"
+        );
+        assert!(
+            reads
+                .lock()
+                .map_err(|_| "fake Git read ledger was poisoned")?
+                .is_empty(),
+            "source authorization must happen before reading repository content"
+        );
+        Ok(())
+    }
+
+    fn same_repository_direct_git_fixture() -> Result<FakeDirectGit, String> {
+        let repository = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
+        let identity = GitRepositoryIdentity {
+            repository: repository.clone(),
+            repository_id: StableProviderId::parse("123456")?,
+            repository_owner_id: StableProviderId::parse("7890")?,
+        };
+        let commit = format!("git:sha1:{}", "c".repeat(40));
+        let invocation_path = ".steward/invocations/browser-task.json";
+        let manifest = serde_json::json!({
+            "contractVersion": "steward.task/v2",
+            "package": {
+                "repository": repository.as_str(),
+                "commit": "git:trigger",
+                "path": "task-definition.json"
+            },
+            "diagnostics": { "executionLog": "full" }
+        });
+        let mut files = BTreeMap::from([(
+            (
+                repository.as_str().to_owned(),
+                commit.clone(),
+                invocation_path.to_owned(),
+            ),
+            serde_json::to_vec(&manifest).map_err(|error| error.to_string())?,
+        )]);
+        files.extend(
+            inline_browser_package_files()
+                .into_iter()
+                .map(|(path, contents)| {
+                    (
+                        (repository.as_str().to_owned(), commit.clone(), path),
+                        contents.into_bytes(),
+                    )
+                }),
+        );
+        Ok(FakeDirectGit {
+            repositories: Arc::new(BTreeMap::from([(repository.as_str().to_owned(), identity)])),
+            files: Arc::new(files),
+            wrong_object_path: None,
+            reads: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    #[tokio::test]
+    async fn browser_inline_task_is_resolved_admitted_and_reserved_with_immutable_evidence()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        enable_inline_for_versioned_task_fixture(&ledger, true)?;
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let response = browser_task_router(ledger.clone(), task_api_config()?, auth)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/runs")
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", csrf)
+                    .header("idempotency-key", "browser-inline-1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(inline_browser_task_body().to_string()))
+                    .map_err(|error| format!("build browser Task request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit browser Task: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read browser Task response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode browser Task response: {error}"))?;
+        assert_eq!(body["origin"], "browser");
+        assert_eq!(body["package"]["source"], "inline");
+        assert!(
+            body["package"]["revision"]
+                .as_str()
+                .is_some_and(|revision| revision.starts_with("steward:sha256:"))
+        );
+        let tasks = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake Task ledger lock was poisoned")?;
+        let task = tasks
+            .first()
+            .ok_or_else(|| "Task was not reserved".to_owned())?;
+        assert_eq!(task.task_origin, TaskOrigin::Browser);
+        assert_eq!(task.acting_user.as_deref(), Some("alice@example.com"));
+        assert_eq!(
+            task.acting_user_id.as_deref(),
+            Some("usr_0123456789abcdef0123456789abcdef")
+        );
+        assert!(task.user_envelope_snapshot.is_some());
+        assert_eq!(
+            task.browser_task_evidence
+                .as_ref()
+                .map(|evidence| evidence.source.as_str()),
+            Some("inline")
+        );
+        assert!(task.input_archive.is_some());
+        assert!(task.execute_requested);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_registry_alias_uses_the_existing_versioned_workflow_path() -> Result<(), String>
+    {
+        let ledger = versioned_task_ledger()?;
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let response = browser_task_router(ledger.clone(), task_api_config()?, auth)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/runs")
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", csrf)
+                    .header("idempotency-key", "browser-registry-1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "package": {
+                                "source": "steward:registry/repository-review",
+                                "revision": "steward:version:1",
+                                "path": "task-definition.json"
+                            },
+                            "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64)),
+                            "inputs": {}
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build browser registry request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit browser registry request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let tasks = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake Task ledger lock was poisoned")?;
+        let task = tasks
+            .first()
+            .ok_or_else(|| "registry alias did not reserve a Task".to_owned())?;
+        assert_eq!(task.workflow, "repository-review@1");
+        assert_eq!(task.task_origin, TaskOrigin::Browser);
+        assert_eq!(task.workflow_version, Some(1));
+        assert_eq!(
+            task.browser_task_evidence
+                .as_ref()
+                .map(|evidence| evidence.revision.as_str()),
+            Some("steward:version:1")
+        );
+        assert!(task.execute_requested);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn inline_repository_and_github_actions_packages_share_a_digest_while_the_template_switch_only_blocks_inline()
+    -> Result<(), String> {
+        let inline_ledger = versioned_task_ledger()?;
+        enable_inline_for_versioned_task_fixture(&inline_ledger, true)?;
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let inline_response = browser_task_router(inline_ledger.clone(), task_api_config()?, auth)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/runs")
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", csrf)
+                    .header("idempotency-key", "browser-inline-digest")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(inline_browser_task_body().to_string()))
+                    .map_err(|error| format!("build inline request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit inline request: {error}"))?;
+        assert_eq!(inline_response.status(), StatusCode::ACCEPTED);
+        let inline_digest = inline_ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake inline Task ledger lock was poisoned")?
+            .first()
+            .and_then(|task| task.browser_task_evidence.as_ref())
+            .map(|evidence| evidence.closure_digest.clone())
+            .ok_or_else(|| "inline Task omitted closure evidence".to_owned())?;
+
+        let repo_ledger = versioned_task_ledger()?;
+        enable_inline_for_versioned_task_fixture(&repo_ledger, false)?;
+        let (repo_auth, repo_cookie, repo_csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let repo_config = task_api_config()?
+            .with_git_hosting_plane(browser_git_fixture()?)
+            .with_source_repository_bindings_json(Some(&direct_source_bindings_json("654321")))?;
+        let repo_response = browser_task_router(repo_ledger.clone(), repo_config, repo_auth)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/runs")
+                    .header(header::COOKIE, repo_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", repo_csrf)
+                    .header("idempotency-key", "browser-repo-digest")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "package": {
+                                "source": "https://github.com/example-org/agentic-ops.git",
+                                "revision": "git:ref:main",
+                                "path": "task-definition.json"
+                            },
+                            "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64)),
+                            "inputs": { "message": "hello" }
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build repository request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit repository request: {error}"))?;
+        assert_eq!(repo_response.status(), StatusCode::ACCEPTED);
+        {
+            let repo_tasks = repo_ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake repository Task ledger lock was poisoned")?;
+            let repo_evidence = repo_tasks
+                .first()
+                .and_then(|task| task.browser_task_evidence.as_ref())
+                .ok_or_else(|| "repository Task omitted closure evidence".to_owned())?;
+            assert_eq!(repo_evidence.closure_digest, inline_digest);
+            assert_eq!(
+                repo_evidence.revision,
+                format!("git:sha1:{}", "c".repeat(40))
+            );
+        }
+
+        let github_actions_ledger = versioned_task_ledger()?;
+        let github_actions_response = direct_test_app(
+            github_actions_ledger.clone(),
+            same_repository_direct_git_fixture()?,
+        )?
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "github-actions-same-package")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "contractVersion": "steward.task/v2",
+                        "invocationPath": ".steward/invocations/browser-task.json",
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build GitHub Actions request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("submit GitHub Actions request: {error}"))?;
+        assert_eq!(github_actions_response.status(), StatusCode::ACCEPTED);
+        let github_actions_tasks = github_actions_ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake GitHub Actions Task ledger lock was poisoned")?;
+        let github_actions_digest = github_actions_tasks
+            .first()
+            .and_then(|task| task.direct_task_evidence.as_ref())
+            .map(|evidence| evidence.closure_digest.as_str())
+            .ok_or_else(|| "GitHub Actions Task omitted closure evidence".to_owned())?;
+        assert_eq!(github_actions_digest, inline_digest.as_str());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_package_above_the_selected_envelope_is_rejected_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        enable_inline_for_versioned_task_fixture(&ledger, true)?;
+        let mut request = inline_browser_task_body();
+        let definition = request
+            .pointer_mut("/package/files/task-definition.json")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "inline fixture omitted its definition".to_owned())?;
+        let mut definition: serde_json::Value = serde_json::from_str(definition)
+            .map_err(|error| format!("parse inline fixture definition: {error}"))?;
+        definition["runtime"]["model"] =
+            serde_json::json!({ "provider": "openai", "model": "gpt-5.4" });
+        definition["requires"] = serde_json::json!({
+            "authority": {
+                "llms": [{ "provider": "openai", "model": "gpt-5.4" }],
+                "tools": [],
+                "budget": {
+                    "monthlyLimit": "1000.00",
+                    "singleRunLimit": "20.00",
+                    "currency": "USD"
+                },
+                "ttl": "24h",
+                "runner": {
+                    "platforms": ["linux"],
+                    "memory": "4Gi",
+                    "compute": "2",
+                    "storage": "10Gi"
+                }
+            }
+        });
+        request["package"]["files"]["task-definition.json"] =
+            serde_json::Value::String(definition.to_string());
+
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let response = browser_task_router(ledger.clone(), task_api_config()?, auth)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/runs")
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", csrf)
+                    .header("idempotency-key", "browser-over-envelope")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .map_err(|error| format!("build over-envelope request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit over-envelope request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?
+                .is_empty(),
+            "an over-envelope browser package must fail before Task reservation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_idempotency_recovers_incomplete_submission_and_rejects_changed_content()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        enable_inline_for_versioned_task_fixture(&ledger, true)?;
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let app = browser_task_router(ledger.clone(), task_api_config()?, auth);
+        let request = |body: &serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/runs")
+                .header(header::COOKIE, &session_cookie)
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", &csrf)
+                .header("idempotency-key", "browser-recovery")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .map_err(|error| format!("build browser retry request: {error}"))
+        };
+
+        let initial = app
+            .clone()
+            .oneshot(request(&inline_browser_task_body())?)
+            .await
+            .map_err(|error| format!("submit initial browser Task: {error}"))?;
+        assert_eq!(initial.status(), StatusCode::ACCEPTED);
+        {
+            let mut tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            let task = tasks
+                .first_mut()
+                .ok_or_else(|| "initial browser Task was not reserved".to_owned())?;
+            task.input_archive = None;
+            task.execute_requested = false;
+        }
+
+        let recovered = app
+            .clone()
+            .oneshot(request(&inline_browser_task_body())?)
+            .await
+            .map_err(|error| format!("recover browser Task: {error}"))?;
+        assert_eq!(recovered.status(), StatusCode::ACCEPTED);
+        {
+            let tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            assert_eq!(tasks.len(), 1);
+            assert!(tasks[0].input_archive.is_some());
+            assert!(tasks[0].execute_requested);
+        }
+
+        let mut changed = inline_browser_task_body();
+        changed["package"]["files"]["prompt.md"] =
+            serde_json::Value::String("Write something else.".to_owned());
+        let conflict = app
+            .oneshot(request(&changed)?)
+            .await
+            .map_err(|error| format!("submit changed browser Task: {error}"))?;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn authenticated_unknown_canonical_user_returns_stable_actionable_error()
     -> Result<(), String> {
@@ -12075,6 +12741,8 @@ mod tests {
                 execution_binding: None,
                 source_provenance: None,
                 direct_task_evidence: None,
+                task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+                browser_task_evidence: None,
                 user_envelope_snapshot: Some(&user_envelope),
                 candidate_digest: &intent_digest,
                 admission_decision: &admission,
@@ -12617,6 +13285,8 @@ mod tests {
             }),
             history_partial: false,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
         }
     }
 

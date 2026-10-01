@@ -1,5 +1,6 @@
 //! Browser-session-bound user envelope request API.
 
+use std::collections::BTreeMap;
 use std::hash::Hash;
 
 use axum::extract::{Path, Query, Request, State};
@@ -17,6 +18,10 @@ use steward_store::{
     EnvelopeRequestRecord, EnvelopeRequestReservationRequest, EnvelopeRequestStatusEventRecord,
     EnvelopeRequestStatusUpdate, EnvelopeUsageRecord, PgStore, StoreError, WorkflowRevisionRecord,
 };
+use steward_types::direct_package::{
+    DIRECT_TASK_CONTRACT_VERSION, DiagnosticsRequest, ExecutionLogMode, InvocationManifest,
+    PackageCommit, PackageReference, RelativePath, RepositoryUrl,
+};
 use steward_types::{
     Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
 };
@@ -28,8 +33,9 @@ use crate::browser_auth::{
     protect_browser_routes,
 };
 use crate::{
-    AgentRunAvailability, AgentRunDataStatus, BoxFuture, GithubActionsEnvelopeSelection,
-    StewardRunRelease, StewardRunWorkflowInstallationMode, VersionedGithubActionsWorkflowContext,
+    AgentRunAvailability, AgentRunDataStatus, BoxFuture, DirectPackageGithubActionsWorkflowContext,
+    GithubActionsEnvelopeSelection, StewardRunRelease, StewardRunWorkflowInstallationMode,
+    VersionedGithubActionsWorkflowContext, render_direct_package_github_actions_workflow,
     render_versioned_github_actions_workflow,
 };
 
@@ -72,6 +78,7 @@ pub struct AvailableEnvelopeTemplate {
     pub ceiling: Envelope,
     #[schema(value_type = Option<BrowserEnvelope>)]
     pub auto_provision_threshold: Option<Envelope>,
+    pub allow_inline_browser_tasks: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
@@ -237,6 +244,13 @@ pub(crate) struct GithubActionsWorkflowResponse {
     workflow: crate::GeneratedGithubActionsWorkflow,
 }
 
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RepositoryBundleResponse {
+    api_version: &'static str,
+    files: BTreeMap<String, String>,
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CreateEnvelopeRequestBody {
@@ -252,6 +266,14 @@ pub(crate) struct CreateEnvelopeRequestBody {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RenderGithubActionsWorkflowBody {
     workflow: String,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RenderRepositoryBundleBody {
+    repository: RepositoryUrl,
+    package_path: RelativePath,
+    invocation_path: RelativePath,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -414,6 +436,7 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                             revision: template.ceiling.revision,
                             ceiling: template.ceiling,
                             auto_provision_threshold: template.auto_provision_threshold,
+                            allow_inline_browser_tasks: template.allow_inline_browser_tasks,
                         })
                         .collect()
                 })
@@ -450,6 +473,7 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                 revision,
                 ceiling: template.ceiling,
                 auto_provision_threshold: template.auto_provision_threshold,
+                allow_inline_browser_tasks: template.allow_inline_browser_tasks,
             }))
         })
     }
@@ -821,6 +845,10 @@ where
         .route(
             "/app/api/v1/envelope-requests/{request_id}/github-actions-workflow",
             post(render_github_actions_for_envelope::<P, B>),
+        )
+        .route(
+            "/app/api/v1/envelope-requests/{request_id}/repository-bundle",
+            post(render_repository_bundle_for_envelope::<P, B>),
         )
         .route("/app/api/v1/workflows", get(list_workflows::<P, B>))
         .with_state(UserEnvelopeState { broker })
@@ -1205,6 +1233,109 @@ where
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/app/api/v1/envelope-requests/{request_id}/repository-bundle",
+    params(
+        ("request_id" = String, Path),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    request_body = RenderRepositoryBundleBody,
+    responses(
+        (status = 200, body = RepositoryBundleResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Envelope request was not found"),
+        (status = 409, description = "Envelope request is not provisioned"),
+        (status = 422, description = "Repository bundle inputs are invalid"),
+        (status = 503, description = "Envelope request or release configuration is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn render_repository_bundle_for_envelope<P, B>(
+    session: Option<Extension<UserEnvelopeSession<B>>>,
+    proof: Option<Extension<UserEnvelopeMutationProof>>,
+    State(state): State<UserEnvelopeState<P>>,
+    Path(request_id): Path<Uuid>,
+    Json(body): Json<RenderRepositoryBundleBody>,
+) -> Response
+where
+    P: EnvelopeRequestBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if proof.is_none() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if !body.repository.as_str().starts_with("https://github.com/")
+        || body.package_path == body.invocation_path
+    {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let request = match state.broker.get(&session, request_id).await {
+        Ok(Some(request)) => request,
+        Ok(None) | Err(EnvelopeRequestBrokerError::NotFound) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Err(error) => return broker_error_response(error),
+    };
+    let Some(envelope) = github_actions_envelope(&request) else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    let Some(reviewed_release) = state.broker.steward_run_release() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let invocation = InvocationManifest {
+        contract_version: DIRECT_TASK_CONTRACT_VERSION.to_owned(),
+        package: PackageReference {
+            repository: body.repository.clone(),
+            commit: PackageCommit::Trigger,
+            path: body.package_path.clone(),
+        },
+        envelope: None,
+        diagnostics: Some(DiagnosticsRequest {
+            execution_log: ExecutionLogMode::Full,
+        }),
+    };
+    if invocation
+        .validate_for_invoking_repository(&body.repository)
+        .is_err()
+    {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let workflow = match render_direct_package_github_actions_workflow(
+        &DirectPackageGithubActionsWorkflowContext {
+            envelope,
+            invocation_path: body.invocation_path.as_str().to_owned(),
+            reviewed_release,
+            workflow_installation_mode: state.broker.workflow_installation_mode(),
+            task_identity_discovery_enabled: state.broker.task_identity_discovery_enabled(),
+        },
+    ) {
+        Ok(workflow) => workflow,
+        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+    };
+    let invocation_json = match serde_json::to_string_pretty(&invocation) {
+        Ok(value) => value + "\n",
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut files = BTreeMap::new();
+    files.insert(body.invocation_path.as_str().to_owned(), invocation_json);
+    if files
+        .insert(workflow.suggested_path, workflow.yaml)
+        .is_some()
+    {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    Json(RepositoryBundleResponse {
+        api_version: ENVELOPE_REQUESTS_API_VERSION,
+        files,
+    })
+    .into_response()
+}
+
 fn github_actions_envelope(
     request: &UserEnvelopeRequest,
 ) -> Option<GithubActionsEnvelopeSelection> {
@@ -1524,6 +1655,7 @@ mod tests {
                     ..ceiling.spec.clone()
                 },
             }),
+            allow_inline_browser_tasks: true,
             ceiling,
         }
     }
@@ -1879,6 +2011,59 @@ mod tests {
         assert!(!yaml.contains("identity-exchange-url:"));
         assert!(!yaml.contains("identity-exchange-audience:"));
         assert!(!yaml.contains("steward-ca-certificate-file:"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provisioned_envelope_renders_a_complete_direct_package_repository_bundle()
+    -> Result<(), String> {
+        let app = inner_router(TestBroker {
+            task_identity_discovery_enabled: true,
+            ..TestBroker::default()
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests/00000000-0000-0000-0000-000000000001/repository-bundle")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "repository": "https://github.com/example-org/agentic-ops.git",
+                            "packagePath": ".steward/tasks/browser-task/task-definition.json",
+                            "invocationPath": ".steward/invocations/browser-task.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build bundle request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("render bundle: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .map_err(|error| format!("read bundle response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse bundle response: {error}"))?;
+        let invocation = value["files"][".steward/invocations/browser-task.json"]
+            .as_str()
+            .ok_or_else(|| "bundle omitted invocation manifest".to_owned())?;
+        assert!(invocation.contains("\"commit\": \"git:trigger\""));
+        assert!(
+            invocation
+                .contains("\"repository\": \"https://github.com/example-org/agentic-ops.git\"")
+        );
+        assert!(!invocation.contains("envelope"));
+        let workflow = value["files"][".github/workflows/steward-browser-task.yml"]
+            .as_str()
+            .ok_or_else(|| "bundle omitted caller workflow".to_owned())?;
+        assert!(workflow.contains("invocation-path: .steward/invocations/browser-task.json"));
+        assert!(workflow.contains(
+            "uses: example-org/steward-run/.github/workflows/steward-task-self-hosted.yml@3333333333333333333333333333333333333333"
+        ));
+        assert!(!workflow.contains("identity-exchange-url:"));
         Ok(())
     }
 

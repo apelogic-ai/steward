@@ -4,11 +4,11 @@ use std::sync::Mutex;
 
 use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitFile,
-    GitFileRequest, GitHostingPlane, GitRepositoryIdentity, InferenceCapabilities,
-    InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest, Notification,
-    NotificationSink, PolicySink, PortError, ProvisionedInference, SessionEvent, SessionRelay,
-    StreamGranularity, SvidAssertion, SvidValidationError, ToolCapabilities, ToolPlane,
-    ValidatedWorkload, WorkloadIdentity,
+    GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRevisionRequest,
+    InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
+    InferenceRequest, Notification, NotificationSink, PolicySink, PortError, ProvisionedInference,
+    SessionEvent, SessionRelay, StreamGranularity, SvidAssertion, SvidValidationError,
+    ToolCapabilities, ToolPlane, ValidatedWorkload, WorkloadIdentity,
 };
 use steward_types::direct_package::{RepositoryUrl, StableProviderId};
 use steward_types::{RuntimeId, SpendSummary};
@@ -188,5 +188,13 @@ impl GitHostingPlane for FakeAdapter {
             path: request.path.clone(),
             bytes: Vec::new(),
         })
+    }
+
+    async fn resolve_revision(
+        &self,
+        _request: &GitRevisionRequest,
+    ) -> Result<steward_types::direct_package::ExactGitCommit, PortError> {
+        steward_types::direct_package::ExactGitCommit::parse(format!("git:sha1:{}", "a".repeat(40)))
+            .map_err(|reason| PortError::Failed { reason })
     }
 }

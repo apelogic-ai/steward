@@ -231,6 +231,8 @@ pub struct OperatorTemplateApplyRequest {
     pub member_roles: Vec<String>,
     pub ceiling: BrowserEnvelope,
     pub auto_provision_threshold: Option<BrowserEnvelope>,
+    #[serde(default = "default_true")]
+    pub allow_inline_browser_tasks: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -241,6 +243,11 @@ pub struct OperatorTemplateResponse {
     pub member_roles: Vec<String>,
     pub ceiling: BrowserEnvelope,
     pub auto_provision_threshold: Option<BrowserEnvelope>,
+    pub allow_inline_browser_tasks: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -579,6 +586,7 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
                 || existing.member_roles != request.member_roles
                 || existing.ceiling != ceiling
                 || existing.auto_provision_threshold != threshold
+                || existing.allow_inline_browser_tasks != request.allow_inline_browser_tasks
             {
                 return error(
                     StatusCode::CONFLICT,
@@ -594,6 +602,7 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
                 member_roles: &request.member_roles,
                 ceiling: &ceiling,
                 auto_provision_threshold: threshold.as_ref(),
+                allow_inline_browser_tasks: request.allow_inline_browser_tasks,
                 authored_by: &admin.actor,
             })
             .await
@@ -606,6 +615,7 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
                     member_roles: request.member_roles,
                     ceiling: request.ceiling,
                     auto_provision_threshold: request.auto_provision_threshold,
+                    allow_inline_browser_tasks: request.allow_inline_browser_tasks,
                 }),
             )
                 .into_response(),
@@ -693,6 +703,7 @@ fn template_view(template: EnvelopeTemplateRevisionRecord) -> OperatorTemplateRe
         member_roles: template.member_roles,
         ceiling: template.ceiling.into(),
         auto_provision_threshold: template.auto_provision_threshold.map(Into::into),
+        allow_inline_browser_tasks: template.allow_inline_browser_tasks,
     }
 }
 

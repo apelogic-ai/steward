@@ -76,7 +76,7 @@ function EnvelopesOnboardingBanner() {
   const data = state.value;
   const { completed: complete, done } = deriveOnboardingProgress(data);
   if (complete === done.length) return null;
-  const titles = ["Connect GitHub", "Get your first envelope", "Add the workflow to your repository", "Trigger a test run", "See the result"];
+  const titles = ["Connect GitHub", "Get your first envelope", "Choose the sample package", "Trigger a test run", "See the result"];
   return <div className="flex flex-wrap items-center gap-4 rounded-card bg-brand-soft px-[18px] py-3.5"><div className="min-w-48 flex-1"><p className="text-sm font-semibold">Get started</p><p className="mt-0.5 text-[13px] text-muted-ink">{complete} of 5 done · next: {titles[done.findIndex((value) => !value)]}</p><div aria-label={`${complete} of 5 onboarding steps complete`} aria-valuemax={5} aria-valuemin={0} aria-valuenow={complete} className="mt-2 h-[5px] overflow-hidden rounded-full bg-line-soft" role="progressbar"><div className="h-full rounded-full bg-brand" style={{ width: `${complete * 20}%` }} /></div></div><Link className="inline-flex h-[34px] items-center rounded-control bg-brand px-3.5 text-[13px] font-semibold text-on-brand hover:bg-brand-hover" href="/get-started">Continue</Link></div>;
 }
 

@@ -1,21 +1,18 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 
 import {
   listTemplates,
   updateBrowserPreferences,
   type EnvelopeTemplatesResponse,
-  type GithubActionsWorkflowResponse,
 } from "@/api-client";
-import { CodeBlock } from "@/components/hs";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { type MutationFailureState } from "@/data/mutation-state";
 import { deriveOnboardingProgress, loadOnboardingEvidence, matchingSampleRun, type OnboardingEvidence } from "@/data/onboarding-progress";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
-import { renderWorkflowForEnvelope } from "@/workflows/api";
 
 type OnboardingData = OnboardingEvidence & {
   templates: EnvelopeTemplatesResponse;
@@ -66,7 +63,6 @@ function OnboardingChecklist({ data }: Readonly<{ data: OnboardingData }>) {
   const [workflowAcknowledgement, setWorkflowAcknowledgement] = useState<"idle" | "working" | "done" | MutationFailureState>("idle");
   const [dismissal, setDismissal] = useState<"idle" | "working" | "done" | "shown" | MutationFailureState>("idle");
   const [listening, setListening] = useState(false);
-  const [renderedWorkflow, setRenderedWorkflow] = useState<GithubActionsWorkflowResponse | null>(null);
   const [selectedTemplateId, setSelectedTemplateId] = useState(data.templates.templates[0]?.id ?? "");
   const connectedConnection = data.connections.connections.find((connection) => connection.status.phase === "connected");
   const provisionedRequest = data.envelopes.requests.find((request) => request.status === "provisioned" && request.envelopeInstanceId);
@@ -78,15 +74,6 @@ function OnboardingChecklist({ data }: Readonly<{ data: OnboardingData }>) {
   const completed = done.filter(Boolean).length;
   const current = done.findIndex((value) => !value);
   const [openStep, setOpenStep] = useState(current === -1 ? 4 : current);
-
-  useEffect(() => {
-    if (!provisionedRequest || !sample || session.status !== "authenticated") return;
-    let cancelled = false;
-    void renderWorkflowForEnvelope(session.value.csrf, provisionedRequest.id, sample).then((result) => {
-      if (!cancelled && result.data && result.response?.ok) setRenderedWorkflow(result.data);
-    });
-    return () => { cancelled = true; };
-  }, [provisionedRequest, sample, session]);
 
   async function updatePreferences(body: { onboardingDismissed?: boolean; workflowAcknowledged?: boolean }) {
     if (session.status !== "authenticated") return false;
@@ -114,14 +101,14 @@ function OnboardingChecklist({ data }: Readonly<{ data: OnboardingData }>) {
       body: <div className="space-y-4"><p className="text-sm text-muted-ink">Requests within a template&apos;s ceiling are approved and provisioned right away.</p><div className="grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">{data.templates.templates.map((template) => <button aria-pressed={template.id === selectedTemplateId} className={`rounded-tile border p-4 text-left ${template.id === selectedTemplateId ? "border-brand bg-brand-soft" : "hover:bg-subtle"}`} key={template.id} onClick={() => setSelectedTemplateId(template.id)} type="button"><span className="flex justify-between gap-3"><strong className="text-sm">{template.displayName}</strong><span className="font-mono text-xs text-muted-ink">rev {template.revision}</span></span><span className="mt-2 block text-xs text-muted-ink">Up to {template.ceiling.spec.budget.monthlyLimit} {template.ceiling.spec.budget.currency}/mo · {template.ceiling.spec.ttl}</span></button>)}</div><div className="flex flex-wrap gap-3"><Link className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href={`/envelopes/new?template=${encodeURIComponent(selectedTemplateId)}`}>Request {data.templates.templates.find((template) => template.id === selectedTemplateId)?.displayName ?? "an"} envelope</Link><Link className="self-center text-sm font-semibold" href="/envelopes/new?type=custom">Customize limits instead</Link></div></div>,
     },
     {
-      title: "Add the workflow to your repository",
-      status: done[2] ? renderedWorkflow?.workflow.suggestedPath ?? "Workflow committed" : "Copy a read-only sample workflow into a repository",
-      body: <div className="space-y-4">{renderedWorkflow ? <CodeBlock code={renderedWorkflow.workflow.yaml} language="yaml" path={renderedWorkflow.workflow.suggestedPath} /> : !sample ? <p className="text-sm text-muted-ink">The deployment has no executable onboarding sample.</p> : <p className="text-sm text-muted-ink">Provision an envelope to render the published sample workflow.</p>}<button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!sampleWorkflow || workflowAcknowledgement === "working"} onClick={async () => { setWorkflowAcknowledgement("working"); setWorkflowAcknowledgement(await updatePreferences({ workflowAcknowledged: true }) ? "done" : "error"); }} type="button">I&apos;ve committed it</button><p className="text-xs text-muted-ink">HyperShell also detects it automatically on the first run.</p></div>,
+      title: "Choose the sample package",
+      status: done[2] ? sampleWorkflow ?? "Sample selected" : "Use the published sample now; a repository is optional",
+      body: <div className="space-y-4">{!sample ? <p className="text-sm text-muted-ink">The deployment has no executable onboarding sample.</p> : <p className="text-sm text-muted-ink">Run the immutable published sample directly. The Run now page also lets you copy an inline package into a repository later.</p>}<div className="flex flex-wrap gap-3"><Link className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href={`/runs/new${sampleWorkflow ? `?workflow=${encodeURIComponent(sampleWorkflow)}` : ""}`}>Open Run now</Link><button className="rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!sampleWorkflow || workflowAcknowledgement === "working"} onClick={async () => { setWorkflowAcknowledgement("working"); setWorkflowAcknowledgement(await updatePreferences({ workflowAcknowledged: true }) ? "done" : "error"); }} type="button">Use this sample</button></div></div>,
     },
     {
       title: "Trigger a test run",
-      status: done[3] ? `Run ${sampleRun?.taskUid} detected` : "Run the sample from GitHub",
-      body: <div className="space-y-4"><p className="text-sm text-muted-ink">Start the workflow from GitHub. HyperShell detects the run automatically once it reaches admission.</p><div className="rounded-tile border p-4"><strong className="text-sm">From GitHub</strong><p className="mt-1 text-sm text-muted-ink">Actions → HyperShell · {sample?.name ?? "repo-summary"} → Run workflow, or from a terminal:</p><div className="mt-3"><CodeBlock code={`gh workflow run ${renderedWorkflow?.workflow.suggestedPath.split("/").at(-1) ?? `${sample?.name ?? "repo-summary"}.yml`}`} language="shell" /></div></div><button className="rounded-control border px-4 py-2 text-sm font-semibold" onClick={() => setListening(true)} type="button">I&apos;ve started it</button>{listening && !sampleRun ? <p className="text-sm text-info" role="status">● Listening for a run from this envelope…</p> : null}</div>,
+      status: done[3] ? `Run ${sampleRun?.taskUid} detected` : "Start the sample from Steward",
+      body: <div className="space-y-4"><p className="text-sm text-muted-ink">Choose the provisioned Envelope, click Run now, and Steward resolves and records the immutable package pin before execution.</p><div className="flex flex-wrap gap-3"><Link className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href={`/runs/new${sampleWorkflow ? `?workflow=${encodeURIComponent(sampleWorkflow)}` : ""}`}>Run sample</Link><button className="rounded-control border px-4 py-2 text-sm font-semibold" onClick={() => setListening(true)} type="button">I&apos;ve started it</button></div>{listening && !sampleRun ? <p className="text-sm text-info" role="status">● Listening for a run from this envelope…</p> : null}</div>,
     },
     {
       title: "See the result",

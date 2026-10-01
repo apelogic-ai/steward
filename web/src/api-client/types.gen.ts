@@ -230,6 +230,7 @@ export type AssociateFederatedSubjectBody = {
 };
 
 export type AuthorEnvelopeTemplateBody = {
+    allowInlineBrowserTasks?: boolean;
     autoProvisionThreshold?: null | BrowserEnvelope;
     displayName: string;
     envelope: BrowserEnvelope;
@@ -245,6 +246,7 @@ export type AuthorityRequirements = {
 };
 
 export type AvailableEnvelopeTemplate = {
+    allowInlineBrowserTasks: boolean;
     autoProvisionThreshold?: null | BrowserEnvelope;
     ceiling: BrowserEnvelope;
     displayName: string;
@@ -345,6 +347,7 @@ export type BrowserEnvelopeSpec = {
 };
 
 export type BrowserEnvelopeTemplateListItem = {
+    allowInlineBrowserTasks: boolean;
     autoProvisionThreshold?: null | BrowserEnvelope;
     displayName: string;
     envelope: BrowserEnvelope;
@@ -362,6 +365,7 @@ export type BrowserEnvelopeTemplateListResponse = {
 };
 
 export type BrowserEnvelopeTemplateResponse = {
+    allowInlineBrowserTasks: boolean;
     apiVersion: string;
     autoProvisionThreshold?: null | BrowserEnvelope;
     displayName: string;
@@ -431,6 +435,15 @@ export type BrowserMutationRequest = {
     [key: string]: never;
 };
 
+export type BrowserPackageLocator = {
+    files?: {
+        [key: string]: unknown;
+    } | null;
+    path: RelativePath;
+    revision?: string | null;
+    source: string;
+};
+
 export type BrowserPreferencesView = {
     apiVersion: string;
     onboardingDismissed: boolean;
@@ -439,12 +452,41 @@ export type BrowserPreferencesView = {
     workflowAcknowledged: boolean;
 };
 
+export type BrowserResolvedEnvelope = {
+    digest: string;
+    instanceId: string;
+    revision: number;
+};
+
+export type BrowserResolvedPackage = {
+    path: RelativePath;
+    revision: string;
+    source: string;
+};
+
 export type BrowserRole = 'user' | 'admin';
 
 export type BrowserRunExitCategory = 'succeeded' | 'failed' | 'cancelled';
 
 export type BrowserRunFacets = {
     phase: BrowserRunPhaseFacets;
+};
+
+export type BrowserRunOutputFile = {
+    downloadUrl: string;
+    path: string;
+    sizeBytes: number;
+};
+
+export type BrowserRunOutputsResponse = {
+    files: Array<BrowserRunOutputFile>;
+    taskUid: string;
+};
+
+export type BrowserRunPackageView = {
+    path: string;
+    revision: string;
+    source: string;
 };
 
 export type BrowserRunPhaseFacets = {
@@ -478,6 +520,14 @@ export type BrowserRunStep = {
     id: string;
     logStreams: Array<string>;
     state: BrowserRunStageState;
+};
+
+export type BrowserRunSubmissionResponse = {
+    envelope: BrowserResolvedEnvelope;
+    origin: TaskOrigin;
+    package: BrowserResolvedPackage;
+    phase: TaskPhase;
+    taskUid: string;
 };
 
 export type BrowserRunTimelineEvent = {
@@ -535,6 +585,8 @@ export type BrowserRunView = {
     finalizationRequested: boolean;
     finalized: boolean;
     observedSpend?: null | AgentRunSpendView;
+    origin: TaskOrigin;
+    package?: null | BrowserRunPackageView;
     phase: TaskPhase;
     runtimeOwnership: RuntimeOwnership;
     runtimeUid?: string | null;
@@ -549,6 +601,23 @@ export type BrowserRunView = {
     workflowDigest?: string | null;
     workflowName?: string | null;
     workflowVersion?: number | null;
+};
+
+export type BrowserTaskEvidence = {
+    closure?: null | PackageClosure;
+    closureDigest: ContentDigest;
+    inlineFiles?: {
+        [key: string]: unknown;
+    } | null;
+    path: RelativePath;
+    revision: string;
+    source: string;
+};
+
+export type BrowserTaskSubmission = {
+    envelopeDigest?: null | EnvelopeDigest;
+    inputs?: unknown;
+    package: BrowserPackageLocator;
 };
 
 export type BrowserTheme = 'light' | 'dark' | 'system';
@@ -988,6 +1057,7 @@ export type OperatorRolesResponse = {
 };
 
 export type OperatorTemplateApplyRequest = {
+    allowInlineBrowserTasks?: boolean;
     autoProvisionThreshold?: null | BrowserEnvelope;
     ceiling: BrowserEnvelope;
     displayName: string;
@@ -995,6 +1065,7 @@ export type OperatorTemplateApplyRequest = {
 };
 
 export type OperatorTemplateResponse = {
+    allowInlineBrowserTasks: boolean;
     autoProvisionThreshold?: null | BrowserEnvelope;
     ceiling: BrowserEnvelope;
     displayName: string;
@@ -1090,6 +1161,19 @@ export type RelativePath = string;
 
 export type RenderGithubActionsWorkflowBody = {
     workflow: string;
+};
+
+export type RenderRepositoryBundleBody = {
+    invocationPath: RelativePath;
+    packagePath: RelativePath;
+    repository: RepositoryUrl;
+};
+
+export type RepositoryBundleResponse = {
+    apiVersion: string;
+    files: {
+        [key: string]: string;
+    };
 };
 
 export type RepositoryUrl = string;
@@ -1227,6 +1311,8 @@ export type TaskErrorResponse = {
 };
 
 export type TaskIdentityErrorResponse = UnknownTaskIdentityErrorResponse | FederatedTaskIdentityErrorResponse;
+
+export type TaskOrigin = 'browser' | 'github-actions' | 'connections' | 'unknown';
 
 /**
  * Durable lifecycle state for one single-shot governed task.
@@ -3357,6 +3443,51 @@ export type RenderGithubActionsForEnvelopeResponses = {
 
 export type RenderGithubActionsForEnvelopeResponse = RenderGithubActionsForEnvelopeResponses[keyof RenderGithubActionsForEnvelopeResponses];
 
+export type RenderRepositoryBundleForEnvelopeData = {
+    body: RenderRepositoryBundleBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        request_id: string;
+    };
+    query?: never;
+    url: '/app/api/v1/envelope-requests/{request_id}/repository-bundle';
+};
+
+export type RenderRepositoryBundleForEnvelopeErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Envelope request was not found
+     */
+    404: unknown;
+    /**
+     * Envelope request is not provisioned
+     */
+    409: unknown;
+    /**
+     * Repository bundle inputs are invalid
+     */
+    422: unknown;
+    /**
+     * Envelope request or release configuration is unavailable
+     */
+    503: unknown;
+};
+
+export type RenderRepositoryBundleForEnvelopeResponses = {
+    200: RepositoryBundleResponse;
+};
+
+export type RenderRepositoryBundleForEnvelopeResponse = RenderRepositoryBundleForEnvelopeResponses[keyof RenderRepositoryBundleForEnvelopeResponses];
+
 export type ListTemplatesData = {
     body?: never;
     path?: never;
@@ -3475,6 +3606,46 @@ export type MyRunsResponses = {
 
 export type MyRunsResponse2 = MyRunsResponses[keyof MyRunsResponses];
 
+export type SubmitBrowserRunData = {
+    body: BrowserTaskSubmission;
+    headers: {
+        'Idempotency-Key': string;
+        'X-Steward-CSRF': string;
+    };
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/runs';
+};
+
+export type SubmitBrowserRunErrors = {
+    /**
+     * Browser package request is invalid
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Envelope or idempotency selection is ambiguous
+     */
+    409: unknown;
+    /**
+     * Package authority exceeds the selected Envelope
+     */
+    422: unknown;
+    /**
+     * Task submission is unavailable
+     */
+    503: unknown;
+};
+
+export type SubmitBrowserRunResponses = {
+    202: BrowserRunSubmissionResponse;
+};
+
+export type SubmitBrowserRunResponse = SubmitBrowserRunResponses[keyof SubmitBrowserRunResponses];
+
 export type MyRunData = {
     body?: never;
     path: {
@@ -3584,6 +3755,70 @@ export type MyRunExecutionLogResponses = {
 };
 
 export type MyRunExecutionLogResponse = MyRunExecutionLogResponses[keyof MyRunExecutionLogResponses];
+
+export type MyRunOutputsData = {
+    body?: never;
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/outputs';
+};
+
+export type MyRunOutputsErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Completed run output is unavailable
+     */
+    404: unknown;
+    /**
+     * Run output is unavailable
+     */
+    503: unknown;
+};
+
+export type MyRunOutputsResponses = {
+    200: BrowserRunOutputsResponse;
+};
+
+export type MyRunOutputsResponse = MyRunOutputsResponses[keyof MyRunOutputsResponses];
+
+export type DownloadMyRunOutputData = {
+    body?: never;
+    path: {
+        task_uid: string;
+        path: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/outputs/{path}';
+};
+
+export type DownloadMyRunOutputErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Run output file is unavailable
+     */
+    404: unknown;
+    /**
+     * Run output is unavailable
+     */
+    503: unknown;
+};
+
+export type DownloadMyRunOutputResponses = {
+    /**
+     * Opaque run output file
+     */
+    200: Blob | File;
+};
+
+export type DownloadMyRunOutputResponse = DownloadMyRunOutputResponses[keyof DownloadMyRunOutputResponses];
 
 export type RerunMyRunData = {
     body: RerunRequest;
