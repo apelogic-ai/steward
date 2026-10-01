@@ -2,15 +2,72 @@ use std::borrow::Cow;
 use std::env;
 use std::error::Error;
 use std::io;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::Json;
+use axum::Router;
+use axum::routing::{get, post};
 use sqlx::migrate::Migrator;
 use sqlx::postgres::PgPoolOptions;
+use steward_apiserver::BoxFuture;
+use steward_apiserver::connections::{
+    ConnectionBrokerError, ConnectionSession, ConnectionSubject, ProviderConnectionBroker,
+    ProviderConnectionStatus, StartedConnection,
+};
+use steward_apiserver::governed_connections::{
+    DirectConnectionStatusConfig, DirectConnectionStatusReader, SplitConnectionsBroker,
+};
 use steward_store::{
     FederatedSubjectAssociation, FederatedSubjectAssociationMethod, FederatedSubjectAuditAction,
     FederatedSubjectDisable, FederatedSubjectObservation, FederatedSubjectState, PgStore,
     StoreError,
 };
 use steward_types::CanonicalUserId;
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+
+struct ServerGuard(JoinHandle<Result<(), io::Error>>);
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct TemporaryFile(PathBuf);
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[derive(Clone)]
+struct NoopConnectionMutations;
+
+impl ProviderConnectionBroker<String> for NoopConnectionMutations {
+    fn status<'a>(
+        &'a self,
+        _session: &'a ConnectionSession<String>,
+    ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
+        Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
+    }
+
+    fn start<'a>(
+        &'a self,
+        _session: &'a ConnectionSession<String>,
+    ) -> BoxFuture<'a, Result<StartedConnection, ConnectionBrokerError>> {
+        Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
+    }
+
+    fn disconnect<'a>(
+        &'a self,
+        _session: &'a ConnectionSession<String>,
+    ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
+        Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
+    }
+}
 
 fn migration_set(maximum_version: Option<i64>) -> Migrator {
     let embedded = sqlx::migrate!("../migrations");
@@ -122,12 +179,12 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
 
     assert_v02_upgrade_result(&store).await?;
     let historical_before_federated_identity = historical_task_identity_snapshot(&store).await?;
-    migration_set(None)
+    migration_set(Some(52))
         .run(store.pool())
         .await
         .map_err(|error| {
             io::Error::other(format!(
-                "Steward federated-subject migration must complete over the required TLS session: {error}"
+                "Steward pre-0053 migrations must complete over the required TLS session: {error}"
             ))
         })?;
     assert_eq!(
@@ -142,8 +199,19 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         0,
         "migration 0040 must not synthesize federated subjects from historical identity data"
     );
+    seed_connection_association_upgrade_fixture(&store).await?;
+    migration_set(None)
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward connection-verification migration must complete over the required TLS session: {error}"
+            ))
+        })?;
+    assert_connection_association_upgrade_result(&store).await?;
     assert_template_catalog_upgrade_result(&store).await?;
     verify_federated_subject_lifecycle(&store).await?;
+    verify_direct_connection_auto_association(&store).await?;
 
     let tls_active =
         sqlx::query_scalar::<_, bool>("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
@@ -247,6 +315,278 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     );
 
     Ok(())
+}
+
+async fn seed_connection_association_upgrade_fixture(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let seeded_user = "usr_11111111111111111111111111111111";
+    let replacement_user = "usr_22222222222222222222222222222222";
+    for (user_id, email) in [
+        (seeded_user, "carol@example.com"),
+        (replacement_user, "dave@example.org"),
+    ] {
+        sqlx::query(
+            "INSERT INTO canonical_users (user_id, organization_id, display_email) \
+             VALUES ($1, 'org_example', $2)",
+        )
+        .bind(user_id)
+        .bind(email)
+        .execute(store.pool())
+        .await?;
+    }
+
+    for (subject_id, observed_event_id, seeded_event_id, actor_id, current_user, revision) in [
+        (
+            "00000000-0000-0000-0000-000000000531",
+            "00000000-0000-0000-0000-000000001531",
+            "00000000-0000-0000-0000-000000002531",
+            "531",
+            replacement_user,
+            3_i64,
+        ),
+        (
+            "00000000-0000-0000-0000-000000000532",
+            "00000000-0000-0000-0000-000000001532",
+            "00000000-0000-0000-0000-000000002532",
+            "532",
+            seeded_user,
+            2_i64,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO federated_subjects \
+             (subject_id, issuer, subject, state, canonical_user_id, revision) \
+             VALUES ($1::text::uuid, 'https://identity.example.test', $2, \
+                     'associated', $3, $4)",
+        )
+        .bind(subject_id)
+        .bind(format!("github-actions:actor:{actor_id}"))
+        .bind(current_user)
+        .bind(revision)
+        .execute(store.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO federated_subject_audit \
+             (event_id, subject_id, action, actor, previous_canonical_user_id, \
+              canonical_user_id, previous_revision, revision) \
+             VALUES ($2::text::uuid, $1::text::uuid, 'observed', 'task-auth', \
+                     NULL, NULL, 0, 1), \
+                    ($3::text::uuid, $1::text::uuid, 'v2_seeded', 'steward-task-v2', \
+                     NULL, $4, 1, 2)",
+        )
+        .bind(subject_id)
+        .bind(observed_event_id)
+        .bind(seeded_event_id)
+        .bind(seeded_user)
+        .execute(store.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO federated_subject_audit \
+         (event_id, subject_id, action, actor, previous_canonical_user_id, \
+          canonical_user_id, previous_revision, revision) \
+         VALUES ('00000000-0000-0000-0000-000000003531', \
+                 '00000000-0000-0000-0000-000000000531', 'replaced', \
+                 'identity-admin', $1, $2, 2, 3)",
+    )
+    .bind(seeded_user)
+    .bind(replacement_user)
+    .execute(store.pool())
+    .await?;
+    Ok(())
+}
+
+async fn assert_connection_association_upgrade_result(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT subject, association_method \
+         FROM federated_subjects \
+         WHERE subject IN ('github-actions:actor:531', 'github-actions:actor:532') \
+         ORDER BY subject",
+    )
+    .fetch_all(store.pool())
+    .await?;
+    assert_eq!(
+        rows,
+        [
+            ("github-actions:actor:531".to_owned(), "admin".to_owned()),
+            ("github-actions:actor:532".to_owned(), "v2-claim".to_owned(),),
+        ],
+        "migration 0053 must classify the current association transition, not historical proof"
+    );
+    Ok(())
+}
+
+async fn verify_direct_connection_auto_association(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let issuer = "https://identity.example.test";
+    let alice =
+        CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef").map_err(io::Error::other)?;
+    let bob =
+        CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789").map_err(io::Error::other)?;
+
+    let linked = direct_connection_status(store, Some(issuer), &alice, "7001").await?;
+    assert_eq!(linked.github_actions_identity_linked, Some(true));
+    assert_eq!(
+        store
+            .resolve_federated_subject(issuer, "github-actions:actor:7001")
+            .await?
+            .user_id,
+        alice,
+        "a verified Connect status must make the first v3 subject resolution succeed"
+    );
+
+    let manual = direct_connection_status(store, None, &alice, "7002").await?;
+    assert!(manual.github_actions_identity_linked.is_none());
+    assert!(
+        store
+            .federated_subject_by_external_identity(issuer, "github-actions:actor:7002")
+            .await?
+            .is_none(),
+        "the manual-review setting must not create or associate a subject"
+    );
+
+    let conflict = FederatedSubjectObservation {
+        issuer,
+        subject: "github-actions:actor:7003",
+        actor_login: Some("bob-gh"),
+        display_name: Some("bob@example.org"),
+    };
+    store
+        .associate_federated_subject_from_connection(conflict, &bob, "github", "7003")
+        .await?;
+    assert_eq!(
+        direct_connection_status(store, Some(issuer), &alice, "7003")
+            .await?
+            .github_actions_identity_linked,
+        Some(false),
+        "Connect must report but never replace an association owned by another user"
+    );
+
+    let disabled = store
+        .associate_federated_subject_from_connection(
+            FederatedSubjectObservation {
+                issuer,
+                subject: "github-actions:actor:7004",
+                actor_login: Some("bob-gh"),
+                display_name: Some("bob@example.org"),
+            },
+            &bob,
+            "github",
+            "7004",
+        )
+        .await?;
+    store
+        .disable_federated_subject(FederatedSubjectDisable {
+            subject_id: disabled.subject_id,
+            expected_revision: disabled.revision,
+            actor: alice.as_str(),
+            reason: Some("PROJ-123 manual review"),
+        })
+        .await?;
+    assert_eq!(
+        direct_connection_status(store, Some(issuer), &alice, "7004")
+            .await?
+            .github_actions_identity_linked,
+        Some(false),
+        "Connect must report but never re-enable a disabled subject"
+    );
+    Ok(())
+}
+
+async fn direct_connection_status(
+    store: &PgStore,
+    issuer: Option<&str>,
+    canonical_user_id: &CanonicalUserId,
+    account_id: &str,
+) -> Result<ProviderConnectionStatus, Box<dyn Error>> {
+    let mint = Router::new().route(
+        "/control-plane/token",
+        post(|| async {
+            Json(serde_json::json!({
+                "access_token": "aaa.bbb.ccc",
+                "expires_in": 15,
+                "scope": "connections_status",
+                "token_type": "Bearer"
+            }))
+        }),
+    );
+    let account_id = account_id.to_owned();
+    let gateway = Router::new().route(
+        "/connections/github/status",
+        get(move || {
+            let account_id = account_id.clone();
+            async move {
+                Json(serde_json::json!({
+                    "version": "2",
+                    "provider": "github",
+                    "phase": "connected",
+                    "connected": true,
+                    "account": {
+                        "provider": "github",
+                        "id": account_id,
+                        "login": "mutable-login",
+                        "displayName": "alice@example.com"
+                    },
+                    "requiredScopes": ["repo"],
+                    "grantedScopes": ["repo"],
+                    "missingScopes": [],
+                    "activeCredentialExpiresAt": null,
+                    "renewalCredentialExpiresAt": null,
+                    "lastAuthorizedAt": null,
+                    "lastRenewedAt": null,
+                    "lastValidatedAt": null,
+                    "capabilities": {"interactiveAuthorization": true}
+                }))
+            }
+        }),
+    );
+    let (mint_origin, _mint_guard) = serve_http(mint).await?;
+    let (gateway_origin, _gateway_guard) = serve_http(gateway).await?;
+    let credential_path = env::temp_dir().join(format!(
+        "steward-connection-status-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    std::fs::write(&credential_path, "control-plane-fixture")?;
+    let _credential_guard = TemporaryFile(credential_path.clone());
+    let reader = DirectConnectionStatusReader::new(
+        store.clone(),
+        DirectConnectionStatusConfig {
+            control_plane_credential_file: credential_path,
+            mint_origin,
+            federated_subject_issuer: issuer.map(str::to_owned),
+        },
+        &gateway_origin,
+        "0.4.9",
+    )
+    .map_err(|error| {
+        io::Error::other(format!("direct status reader rejected fixture: {error:?}"))
+    })?;
+    let broker = SplitConnectionsBroker::new(NoopConnectionMutations, reader);
+    broker
+        .status(&ConnectionSession {
+            subject: ConnectionSubject {
+                canonical_user_id: canonical_user_id.clone(),
+                display_email: "alice@example.com".to_owned(),
+            },
+            binding: "browser-session".to_owned(),
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("direct status failed: {error:?}")))
+        .map_err(Into::into)
+}
+
+async fn serve_http(router: Router) -> Result<(String, ServerGuard), Box<dyn Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .map_err(io::Error::other)
+    });
+    Ok((format!("http://{address}"), ServerGuard(server)))
 }
 
 async fn historical_task_identity_snapshot(

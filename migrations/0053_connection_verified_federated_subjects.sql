@@ -9,6 +9,7 @@ SET association_method = CASE
         SELECT 1
         FROM federated_subject_audit AS audit
         WHERE audit.subject_id = subject.subject_id
+          AND audit.revision = subject.revision
           AND audit.action = 'v2_seeded'
     ) THEN 'v2-claim'
     ELSE 'admin'

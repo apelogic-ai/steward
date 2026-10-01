@@ -40,12 +40,19 @@ Steward's side of it is
 An external Task is admitted only by the authenticated user's exact active
 provisioned **User Envelope**. Its authority key is the opaque canonical user
 ID, and Steward allocates that ID on the person's *first browser login*. The
-Identity service must stamp that same ID into the token's `groups` claim.
+Identity service must stamp that same ID into a v2 token's `groups` claim. A v3
+token instead carries the stable numeric GitHub actor subject; by default,
+Steward associates it with the signed-in canonical user after GitHub Connect
+verifies the same immutable numeric account ID.
 
-Identity policy therefore cannot be finalized until Steward exists and the user
-has signed in once, while `steward-run` cannot authenticate until Identity
-policy is finalized. The order below resolves that by installing Identity early
-and enrolling it late.
+A v2 Identity policy therefore cannot be finalized until Steward exists and the
+user has signed in once. For the first valid v3 submission to proceed without an
+administrator round trip, the default v3 path requires that user to sign in and
+connect the GitHub account that will run the workflow. The manual v3 fallback
+instead observes the subject on the first valid submission and requires
+administrator association before a retry can proceed. `steward-run` cannot
+authenticate until Identity policy is finalized, so the order below installs
+Identity early and enrolls it late.
 
 ## Step 0: choose the Steward mode before ordering anything
 
@@ -182,6 +189,7 @@ object inventory row. The complete Steward-side procedure is:
      resource: https://steward.example.test
      federatedSubjects:
        enabled: true
+       autoAssociateFromConnections: true
      publicJwksConfigMap:
        name: steward-task-identity-jwks
        key: jwks.json
@@ -216,7 +224,15 @@ to enable the browser path, have the person sign in once, record the audited
 initial RBAC grant, verify the deployment capability catalog, author versioned
 Envelope templates, and complete one User Envelope request and approval.
 
-Two identity outputs of this step are inputs to Step 6:
+The verified GitHub connection is also part of the default v3 sequence. The
+signed-in person connects the same GitHub account that will trigger the workflow
+and waits for connection status to report its immutable numeric account ID.
+Steward associates the corresponding `github-actions:actor:<id>` subject with
+that person's canonical user. This does not create a User Envelope or grant Task
+authority.
+
+For v2 enrollment and the v3 manual fallback, two identity outputs of this step
+are inputs to Step 6:
 
 - the opaque `usr_<...>` canonical user ID the person reads from `/settings`;
 - the verified email bound to that canonical identity.
@@ -227,7 +243,7 @@ exact public `envelopeDigest` that the acceptance Task will select. The
 capability catalog advertises models and tools but grants no authority, and an
 empty catalog cannot narrow an Envelope that already admits a Task.
 
-## Step 6: enroll v2 identity or associate a v3 subject
+## Step 6: enroll v2 identity or verify a v3 association
 
 For v2, Identity policy admits exact observed values, not patterns. Using the claims
 observed from Step 3 and the canonical identity from Step 5, enroll the exact
@@ -257,13 +273,21 @@ are each denied with a fresh assertion.
 
 For v3, Identity issues the stable subject
 `github-actions:actor:<numeric-actor-id>` and need not stamp email or Steward
-canonical-user groups. The first valid submission records the subject and
-returns `task_identity_unassociated` without creating a Task. An authorized
-Steward browser administrator then inspects the observed subject, associates
-it with the canonical user from Step 5 using `expectedRevision`, and verifies
-the append-only audit endpoint. Never use actor login, display name, or email
-similarity as association proof. A complete valid v2 compatibility identity
-may seed only that same verified issuer/subject association.
+canonical-user groups. With the default connection-association setting, verify
+the connected numeric account ID from Step 5 matches this actor ID, the subject
+is already associated, and its audit records method `connection-verification`,
+provider `github`, and that numeric ID. The first valid v3 submission can then
+proceed without an administrator association or retry.
+
+If connection proof is unavailable or
+`taskIdentity.federatedSubjects.autoAssociateFromConnections=false`, the first
+valid submission instead records the subject and returns
+`task_identity_unassociated` without creating a Task. An authorized Steward
+browser administrator inspects the observed subject, associates it with the
+canonical user from Step 5 using `expectedRevision`, and verifies the append-only
+audit endpoint before retrying. Never use actor login, display name, or email
+similarity as association proof. A complete valid v2 compatibility identity may
+seed only that same verified issuer/subject association.
 
 ## Step 7: verify Task submission remains disabled in core mode
 

@@ -184,6 +184,15 @@ verified issuer/subject association only. They do not create a canonical user,
 approve a User Envelope, or authorize a Task. Mutation actor identity always
 comes from `BrowserAdminAuthority`; request bodies cannot name the actor.
 
+Subject list and detail responses expose `associationMethod` when a proof method
+is recorded: `admin`, `connection-verification`, or `v2-claim`. Audit responses for
+`connection_verified` expose `connectionProvider=github` and the immutable
+numeric `connectionAccountId`; those evidence fields are absent for every other
+action. Login, display name, and email remain display metadata rather than
+association evidence. The default GitHub Connect path may create the
+connection-verified association before any v3 Task observation. It never
+replaces a conflicting association or re-enables a disabled subject.
+
 An administrator should first inspect the observation and intended canonical
 user, then submit `expectedRevision` and `canonicalUserId`. A `409` requires a
 fresh read and review, not an automatic retry. Disabling may retain the former

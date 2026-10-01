@@ -22,12 +22,17 @@ chart configuration continues to accept v2 only.
 ## Upgrade and activate
 
 1. Upgrade all Steward components to the same immutable release. The apiserver
-   or controller applies migration `0040_federated_subject_identity.sql`.
-   Migration 0040 creates new federated-subject and audit tables only. It does
-   not update, backfill, or infer any historical identity, Task, run, runtime,
-   Envelope, or audit row.
-2. Verify migration 0040 completed and existing v2 submission, retry, source
-   provenance, and User Envelope admission still work.
+   or controller applies migrations `0040_federated_subject_identity.sql` and
+   `0053_connection_verified_federated_subjects.sql`. Migration 0040 creates the
+   federated-subject and audit tables. Migration 0053 adds association methods
+   and bounded connection-verification evidence; it classifies existing
+   associations without changing their canonical-user bindings or prior audit
+   rows. Neither migration infers an association from login, display name, or
+   email or rewrites historical Tasks, runs, runtimes, or Envelopes.
+2. Verify migrations 0040 and 0053 completed, including the 0053 association
+   method and connection-evidence columns and constraints, and confirm existing
+   v2 submission, retry, source provenance, and User Envelope admission still
+   work.
 3. Configure the exact public Steward origin and enable v3:
 
    ```yaml
