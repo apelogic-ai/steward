@@ -11,10 +11,11 @@ use axum::Router;
 use axum::routing::{get, post};
 use sqlx::migrate::Migrator;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::types::Uuid;
 use steward_apiserver::BoxFuture;
 use steward_apiserver::connections::{
-    ConnectionBrokerError, ConnectionSession, ConnectionSubject, ProviderConnectionBroker,
-    ProviderConnectionStatus, StartedConnection,
+    ConnectionBrokerError, ConnectionSession, ConnectionStartOperation, ConnectionSubject,
+    ProviderConnectionBroker, ProviderConnectionStatus, ReservedConnectionStart,
 };
 use steward_apiserver::governed_connections::{
     DirectConnectionStatusConfig, DirectConnectionStatusReader, SplitConnectionsBroker,
@@ -59,7 +60,15 @@ impl ProviderConnectionBroker<String> for NoopConnectionMutations {
     fn start<'a>(
         &'a self,
         _session: &'a ConnectionSession<String>,
-    ) -> BoxFuture<'a, Result<StartedConnection, ConnectionBrokerError>> {
+    ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
+        Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
+    }
+
+    fn start_operation<'a>(
+        &'a self,
+        _session: &'a ConnectionSession<String>,
+        _operation_id: Uuid,
+    ) -> BoxFuture<'a, Result<Option<ConnectionStartOperation>, ConnectionBrokerError>> {
         Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
     }
 

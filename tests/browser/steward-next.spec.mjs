@@ -292,6 +292,7 @@ async function startWeb() {
   let mutationSink;
   let rerunFixtures = [];
   let rerunFixtureIndex = 0;
+  let connectionStartPolls = 0;
   const proxy = createServer(async (request, response) => {
     try {
       const requestUrl = new URL(request.url ?? "/", nextOrigin);
@@ -430,8 +431,8 @@ async function startWeb() {
           return;
         }
         if (requestUrl.pathname.endsWith("/connections/github/start")) {
-          response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
-          response.end(JSON.stringify({ apiVersion: "steward.connections/v1", provider: "github", authorizationUrl: `${web.origin}/connections?oauth=started` }));
+          response.writeHead(202, { "content-type": "application/json", "cache-control": "no-store" });
+          response.end(JSON.stringify({ apiVersion: "steward.connections/v1", provider: "github", operationId: "00000000-0000-0000-0000-000000000225" }));
           return;
         }
         if (requestUrl.pathname.endsWith("/connections/github/disconnect")) {
@@ -446,6 +447,20 @@ async function startWeb() {
         }
         response.writeHead(201, { "content-type": "application/json", "cache-control": "no-store" });
         response.end(JSON.stringify({ apiVersion: "steward.envelope-requests/v1", request: envelopeRequest }));
+        return;
+      }
+
+      if (requestUrl.pathname === "/app/api/v1/connections/github/operations/00000000-0000-0000-0000-000000000225") {
+        connectionStartPolls += 1;
+        const pending = connectionStartPolls === 1;
+        response.writeHead(pending ? 202 : 200, { "content-type": "application/json", "cache-control": "no-store" });
+        response.end(JSON.stringify({
+          apiVersion: "steward.connections/v1",
+          provider: "github",
+          operationId: "00000000-0000-0000-0000-000000000225",
+          state: pending ? "pending" : "succeeded",
+          ...(pending ? {} : { authorizationUrl: `${web.origin}/connections?oauth=started`, expiresAt: "2026-09-01T12:10:30Z" }),
+        }));
         return;
       }
 
@@ -528,6 +543,7 @@ async function guardedPage(browser, {
   mockSignIn = true,
   colorScheme = "dark",
   connectionPhase = "connected",
+  connectionStartFailure = null,
   emptyCollections = false,
   expectedHttpStatuses = [],
   executionLogs = {
@@ -599,6 +615,17 @@ async function guardedPage(browser, {
     }));
   }
   const json = (route, body, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
+  if (connectionStartFailure) {
+    await context.route(`${origin}/app/api/v1/connections/github/operations/*`, (route) => json(route, {
+      apiVersion: "steward.connections/v1",
+      provider: "github",
+      operationId: "00000000-0000-0000-0000-000000000225",
+      state: "failed",
+      error: connectionStartFailure.error,
+      upstreamStatus: connectionStartFailure.upstreamStatus,
+      detail: connectionStartFailure.detail,
+    }));
+  }
   await context.route(`${origin}/app/api/v1/envelope-templates`, (route) => json(route, {
     apiVersion: "steward.envelope-requests/v1",
     templates: emptyCollections ? [] : [
@@ -2117,6 +2144,28 @@ test("connection OAuth starts through a same-origin Rust mutation", async ({ bro
     await developer.page.goto(`${origin}/connections`);
     await developer.page.getByRole("button", { name: "Connect GitHub" }).click();
     await expect(developer.page).toHaveURL(`${origin}/connections?oauth=started`);
+    expectMutationProof(developer.mutations.find((mutation) => mutation.path.endsWith("/start")));
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("connection OAuth polling keeps a bounded terminal failure explicit", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    connectionPhase: "disconnected",
+    connectionStartFailure: {
+      error: "gateway_http_error",
+      upstreamStatus: 503,
+      detail: "provider temporarily unavailable",
+    },
+  });
+  try {
+    await developer.page.goto(`${origin}/connections`);
+    await developer.page.getByRole("button", { name: "Connect GitHub" }).click();
+    await expect(developer.page.getByText(
+      "GitHub authorization failed (gateway_http_error): provider temporarily unavailable",
+      { exact: true },
+    )).toBeVisible();
     expectMutationProof(developer.mutations.find((mutation) => mutation.path.endsWith("/start")));
   } finally {
     await closeGuardedPage(developer);

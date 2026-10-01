@@ -3,7 +3,7 @@
 use std::hash::Hash;
 
 use axum::extract::{Path, Request, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -11,6 +11,7 @@ use axum::{Extension, Json, Router};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use steward_types::CanonicalUserId;
+use uuid::Uuid;
 
 use crate::BoxFuture;
 use crate::browser_auth::{
@@ -126,13 +127,41 @@ pub(crate) struct DisconnectConnectionRequest {
 
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct StartConnectionResponse {
+pub(crate) struct StartConnectionAcceptedResponse {
     api_version: &'static str,
     provider: &'static str,
+    #[schema(value_type = String, format = "uuid")]
+    operation_id: Uuid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionStartOperationState {
+    Pending,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConnectionStartOperationResponse {
+    api_version: &'static str,
+    provider: &'static str,
+    #[schema(value_type = String, format = "uuid")]
+    operation_id: Uuid,
+    state: ConnectionStartOperationState,
     /// One-time HTTPS destination. It must not be persisted or logged by clients.
-    authorization_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization_url: Option<String>,
     /// Conservative expiry for MCP-GW's pinned OAuth state lifetime plus clock skew.
-    expires_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -176,6 +205,16 @@ pub struct StartedConnection {
     pub expires_at: String,
 }
 
+pub struct ReservedConnectionStart {
+    pub operation_id: Uuid,
+}
+
+pub enum ConnectionStartOperation {
+    Pending,
+    Succeeded(StartedConnection),
+    Failed(ConnectionBrokerError),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionBrokerError {
     OAuthFlowPending,
@@ -204,7 +243,13 @@ where
     fn start<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
-    ) -> BoxFuture<'a, Result<StartedConnection, ConnectionBrokerError>>;
+    ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>>;
+
+    fn start_operation<'a>(
+        &'a self,
+        session: &'a ConnectionSession<B>,
+        operation_id: Uuid,
+    ) -> BoxFuture<'a, Result<Option<ConnectionStartOperation>, ConnectionBrokerError>>;
 
     fn disconnect<'a>(
         &'a self,
@@ -252,6 +297,10 @@ where
             post(start_provider_connection::<P, B>),
         )
         .route(
+            "/app/api/v1/connections/{provider}/operations/{operation_id}",
+            get(provider_connection_start_operation::<P, B>),
+        )
+        .route(
             "/app/api/v1/connections/{provider}/disconnect",
             post(disconnect_provider_connection::<P, B>),
         )
@@ -262,6 +311,10 @@ where
         .route(
             "/admin/api/v1/connections/github/start",
             post(start_connection::<P, B>),
+        )
+        .route(
+            "/admin/api/v1/connections/github/operations/{operation_id}",
+            get(connection_start_operation::<P, B>),
         )
         .route(
             "/admin/api/v1/connections/github/disconnect",
@@ -318,7 +371,7 @@ where
     params(("X-Steward-CSRF" = String, Header)),
     request_body = BrowserMutationRequest,
     responses(
-        (status = 200, body = StartConnectionResponse),
+        (status = 202, body = StartConnectionAcceptedResponse),
         (status = 400, description = "Mutation JSON is malformed"),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
@@ -338,19 +391,26 @@ where
     B: Clone + Eq + Hash + Send + Sync + 'static,
 {
     let Some(Extension(session)) = session else {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::CACHE_CONTROL, "no-store")],
+        )
+            .into_response();
     };
     if proof.is_none() {
         return StatusCode::FORBIDDEN.into_response();
     }
     match state.broker.start(&session).await {
-        Ok(started) => Json(StartConnectionResponse {
-            api_version: CONNECTIONS_API_VERSION,
-            provider: "github",
-            authorization_url: started.authorization_url.as_str().to_owned(),
-            expires_at: started.expires_at,
-        })
-        .into_response(),
+        Ok(reserved) => (
+            StatusCode::ACCEPTED,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(StartConnectionAcceptedResponse {
+                api_version: CONNECTIONS_API_VERSION,
+                provider: "github",
+                operation_id: reserved.operation_id,
+            }),
+        )
+            .into_response(),
         Err(error) => connection_broker_error_response(error),
     }
 }
@@ -362,7 +422,7 @@ where
     params(("provider" = String, Path), ("X-Steward-CSRF" = String, Header)),
     request_body = BrowserMutationRequest,
     responses(
-        (status = 200, body = StartConnectionResponse),
+        (status = 202, body = StartConnectionAcceptedResponse),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Provider is unavailable"),
@@ -385,6 +445,120 @@ where
         return StatusCode::NOT_FOUND.into_response();
     }
     start_connection(session, proof, State(state), Json(request)).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/api/v1/connections/github/operations/{operation_id}",
+    params(("operation_id" = String, Path)),
+    responses(
+        (status = 200, body = ConnectionStartOperationResponse),
+        (status = 202, body = ConnectionStartOperationResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Connection operation is unavailable"),
+        (status = 503, body = ConnectionOperationErrorResponse, description = "Connection broker is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn connection_start_operation<P, B>(
+    Path(operation_id): Path<Uuid>,
+    session: Option<Extension<ConnectionSession<B>>>,
+    State(state): State<ConnectionsState<P>>,
+) -> Response
+where
+    P: ProviderConnectionBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    let Some(Extension(session)) = session else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::CACHE_CONTROL, "no-store")],
+        )
+            .into_response();
+    };
+    match state.broker.start_operation(&session, operation_id).await {
+        Ok(Some(ConnectionStartOperation::Pending)) => (
+            StatusCode::ACCEPTED,
+            [
+                (header::CACHE_CONTROL, "no-store"),
+                (header::RETRY_AFTER, "1"),
+            ],
+            Json(start_operation_response(
+                operation_id,
+                ConnectionStartOperation::Pending,
+            )),
+        )
+            .into_response(),
+        Ok(Some(operation)) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(start_operation_response(operation_id, operation)),
+        )
+            .into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response(),
+        Err(error) => connection_broker_error_response(error),
+    }
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "getProviderConnectionStartOperation",
+    path = "/app/api/v1/connections/{provider}/operations/{operation_id}",
+    params(("provider" = String, Path), ("operation_id" = String, Path)),
+    responses(
+        (status = 200, body = ConnectionStartOperationResponse),
+        (status = 202, body = ConnectionStartOperationResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Provider or connection operation is unavailable"),
+        (status = 503, body = ConnectionOperationErrorResponse, description = "Connection broker is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn provider_connection_start_operation<P, B>(
+    Path((provider, operation_id)): Path<(String, Uuid)>,
+    session: Option<Extension<ConnectionSession<B>>>,
+    State(state): State<ConnectionsState<P>>,
+) -> Response
+where
+    P: ProviderConnectionBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    if provider != "github" {
+        return (StatusCode::NOT_FOUND, [(header::CACHE_CONTROL, "no-store")]).into_response();
+    }
+    connection_start_operation(Path(operation_id), session, State(state)).await
+}
+
+fn start_operation_response(
+    operation_id: Uuid,
+    operation: ConnectionStartOperation,
+) -> ConnectionStartOperationResponse {
+    let mut response = ConnectionStartOperationResponse {
+        api_version: CONNECTIONS_API_VERSION,
+        provider: "github",
+        operation_id,
+        state: ConnectionStartOperationState::Pending,
+        authorization_url: None,
+        expires_at: None,
+        error: None,
+        upstream_status: None,
+        detail: None,
+    };
+    match operation {
+        ConnectionStartOperation::Pending => {}
+        ConnectionStartOperation::Succeeded(started) => {
+            response.state = ConnectionStartOperationState::Succeeded;
+            response.authorization_url = Some(started.authorization_url.as_str().to_owned());
+            response.expires_at = Some(started.expires_at);
+        }
+        ConnectionStartOperation::Failed(error) => {
+            response.state = ConnectionStartOperationState::Failed;
+            let problem = connection_broker_problem(error);
+            response.error = Some(problem.error);
+            response.upstream_status = problem.upstream_status;
+            response.detail = problem.detail;
+        }
+    }
+    response
 }
 
 #[utoipa::path(
@@ -573,6 +747,16 @@ fn oauth_flow_pending_response() -> Response {
 }
 
 fn connection_broker_error_response(error: ConnectionBrokerError) -> Response {
+    let problem = connection_broker_problem(error);
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(problem),
+    )
+        .into_response()
+}
+
+fn connection_broker_problem(error: ConnectionBrokerError) -> ConnectionOperationErrorResponse {
     let (error, upstream_status, detail) = match error {
         ConnectionBrokerError::ProxyPolicyDenied => ("proxy_policy_denied", None, None),
         ConnectionBrokerError::ProviderAuthorizationFailed => {
@@ -588,16 +772,12 @@ fn connection_broker_error_response(error: ConnectionBrokerError) -> Response {
             ("connection_broker_unavailable", None, None)
         }
     };
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ConnectionOperationErrorResponse {
-            api_version: CONNECTIONS_API_VERSION,
-            error,
-            upstream_status,
-            detail,
-        }),
-    )
-        .into_response()
+    ConnectionOperationErrorResponse {
+        api_version: CONNECTIONS_API_VERSION,
+        error,
+        upstream_status,
+        detail,
+    }
 }
 
 fn unavailable_status_response() -> Response {
@@ -675,6 +855,8 @@ mod tests {
         flow: Option<(CanonicalUserId, TestSessionBinding)>,
         connected_user: Option<CanonicalUserId>,
         oauth_pending: bool,
+        operation_pending: bool,
+        operation_failure: Option<(u16, String)>,
         unavailable: bool,
     }
 
@@ -724,7 +906,7 @@ mod tests {
         fn start<'a>(
             &'a self,
             session: &'a ConnectionSession<TestSessionBinding>,
-        ) -> BoxFuture<'a, Result<StartedConnection, ConnectionBrokerError>> {
+        ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
             Box::pin(async move {
                 let mut state = self
                     .state
@@ -737,14 +919,56 @@ mod tests {
                     session.subject.canonical_user_id.clone(),
                     session.binding.clone(),
                 ));
+                Ok(ReservedConnectionStart {
+                    operation_id: Uuid::from_u128(1),
+                })
+            })
+        }
+
+        fn start_operation<'a>(
+            &'a self,
+            session: &'a ConnectionSession<TestSessionBinding>,
+            operation_id: Uuid,
+        ) -> BoxFuture<'a, Result<Option<ConnectionStartOperation>, ConnectionBrokerError>>
+        {
+            Box::pin(async move {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ConnectionBrokerError::Unavailable)?;
+                if state.unavailable {
+                    return Err(ConnectionBrokerError::Unavailable);
+                }
+                if operation_id != Uuid::from_u128(1)
+                    || state.flow.as_ref()
+                        != Some(&(
+                            session.subject.canonical_user_id.clone(),
+                            session.binding.clone(),
+                        ))
+                {
+                    return Ok(None);
+                }
+                if state.operation_pending {
+                    return Ok(Some(ConnectionStartOperation::Pending));
+                }
+                if let Some((status, detail)) = &state.operation_failure {
+                    return Ok(Some(ConnectionStartOperation::Failed(
+                        ConnectionBrokerError::GatewayHttp {
+                            status: *status,
+                            reason: Some(detail.clone()),
+                        },
+                    )));
+                }
                 let authorization_url = AuthorizationUrl::new(
                     "https://github.test/login/oauth/authorize?state=one-time".to_owned(),
                 )
                 .map_err(|_| ConnectionBrokerError::Unavailable)?;
-                Ok(StartedConnection {
-                    authorization_url,
-                    expires_at: "2026-09-01T12:10:30Z".to_owned(),
-                })
+                Ok(Some(ConnectionStartOperation::Succeeded(
+                    StartedConnection {
+                        authorization_url,
+                        expires_at: "2026-09-01T12:10:30Z".to_owned(),
+                    },
+                )))
             })
         }
 
@@ -861,7 +1085,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_requires_authenticated_session_and_mutation_proof_and_returns_only_one_time_url()
+    async fn start_accepts_immediately_and_owner_scoped_polling_returns_only_one_time_url()
     -> Result<(), String> {
         let broker = FakeBroker::default();
         let uri = "/admin/api/v1/connections/github/start";
@@ -901,13 +1125,14 @@ mod tests {
             "the browser may select only the fixed provider-control operation"
         );
 
-        let allowed = router(broker)
+        let allowed = router(broker.clone())
             .layer(axum::Extension(ConnectionMutationProof))
             .layer(axum::Extension(session()?))
             .oneshot(request("{}")?)
             .await
             .map_err(|error| format!("request proved connection start: {error}"))?;
-        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(allowed.status(), StatusCode::ACCEPTED);
+        assert_eq!(allowed.headers()[header::CACHE_CONTROL], "no-store");
         let body = to_bytes(allowed.into_body(), 16 * 1024)
             .await
             .map_err(|error| format!("read connection start response: {error}"))?;
@@ -915,10 +1140,8 @@ mod tests {
             .map_err(|error| format!("parse connection start response: {error}"))?;
         assert_eq!(value["apiVersion"], CONNECTIONS_API_VERSION);
         assert_eq!(value["provider"], "github");
-        assert_eq!(
-            value["authorizationUrl"],
-            "https://github.test/login/oauth/authorize?state=one-time"
-        );
+        assert_eq!(value["operationId"], Uuid::from_u128(1).to_string());
+        assert!(value.get("authorizationUrl").is_none());
         let serialized = String::from_utf8_lossy(&body).to_lowercase();
         for forbidden in ["alice@example.com", "usr_", "session-a", "token", "secret"] {
             assert!(
@@ -926,6 +1149,126 @@ mod tests {
                 "start response exposed forbidden identity/broker material: {forbidden}"
             );
         }
+
+        let operation_uri = format!(
+            "/admin/api/v1/connections/github/operations/{}",
+            Uuid::from_u128(1)
+        );
+        let operation = router(broker.clone())
+            .layer(axum::Extension(session()?))
+            .oneshot(
+                Request::builder()
+                    .uri(&operation_uri)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build connection operation request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request connection operation: {error}"))?;
+        assert_eq!(operation.status(), StatusCode::OK);
+        assert_eq!(operation.headers()[header::CACHE_CONTROL], "no-store");
+        let body = to_bytes(operation.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read connection operation response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse connection operation response: {error}"))?;
+        assert_eq!(value["state"], "succeeded");
+        assert_eq!(
+            value["authorizationUrl"],
+            "https://github.test/login/oauth/authorize?state=one-time"
+        );
+
+        let mut other_session = session()?;
+        other_session.subject.canonical_user_id =
+            CanonicalUserId::parse("usr_11111111111111111111111111111111")?;
+        let hidden = router(broker)
+            .layer(axum::Extension(other_session))
+            .oneshot(
+                Request::builder()
+                    .uri(&operation_uri)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build foreign operation request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request foreign connection operation: {error}"))?;
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connection_start_poll_distinguishes_pending_and_bounded_failure() -> Result<(), String>
+    {
+        let broker = FakeBroker::default();
+        broker
+            .start(&session()?)
+            .await
+            .map_err(|_| "could not reserve fake connection start".to_owned())?;
+        let operation_uri = format!(
+            "/app/api/v1/connections/github/operations/{}",
+            Uuid::from_u128(1)
+        );
+
+        broker
+            .state
+            .lock()
+            .map_err(|_| "fake broker state lock was poisoned".to_owned())?
+            .operation_pending = true;
+        let pending = router(broker.clone())
+            .layer(axum::Extension(session()?))
+            .oneshot(
+                Request::builder()
+                    .uri(&operation_uri)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build pending operation request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request pending connection operation: {error}"))?;
+        assert_eq!(pending.status(), StatusCode::ACCEPTED);
+        assert_eq!(pending.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(pending.headers()[header::RETRY_AFTER], "1");
+        let body = to_bytes(pending.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read pending operation response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("parse pending operation response: {error}"))?["state"],
+            "pending"
+        );
+
+        {
+            let mut state = broker
+                .state
+                .lock()
+                .map_err(|_| "fake broker state lock was poisoned".to_owned())?;
+            state.operation_pending = false;
+            state.operation_failure = Some((429, "bounded retry later".to_owned()));
+        }
+        let failed = router(broker)
+            .layer(axum::Extension(session()?))
+            .oneshot(
+                Request::builder()
+                    .uri(&operation_uri)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build failed operation request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request failed connection operation: {error}"))?;
+        assert_eq!(failed.status(), StatusCode::OK);
+        let body = to_bytes(failed.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read failed operation response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("parse failed operation response: {error}"))?,
+            serde_json::json!({
+                "apiVersion": CONNECTIONS_API_VERSION,
+                "provider": "github",
+                "operationId": Uuid::from_u128(1),
+                "state": "failed",
+                "error": "gateway_http_error",
+                "upstreamStatus": 429,
+                "detail": "bounded retry later"
+            })
+        );
         Ok(())
     }
 

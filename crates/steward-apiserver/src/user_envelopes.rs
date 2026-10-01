@@ -1246,8 +1246,9 @@ mod tests {
         envelope_usage_view, inner_router,
     };
     use crate::connections::{
-        ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionSubject,
-        ProviderConnectionBroker, ProviderConnectionStatus,
+        ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionStartOperation,
+        ConnectionSubject, ProviderConnectionBroker, ProviderConnectionStatus,
+        ReservedConnectionStart,
     };
     use crate::{BoxFuture, StewardRunRelease, StewardRunWorkflowInstallationMode};
     use steward_admission::{Envelope, EnvelopeSpec};
@@ -2159,7 +2160,15 @@ mod tests {
         fn start<'a>(
             &'a self,
             _session: &'a ConnectionSession<()>,
-        ) -> BoxFuture<'a, Result<crate::connections::StartedConnection, ConnectionBrokerError>>
+        ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
+            Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
+        }
+
+        fn start_operation<'a>(
+            &'a self,
+            _session: &'a ConnectionSession<()>,
+            _operation_id: Uuid,
+        ) -> BoxFuture<'a, Result<Option<ConnectionStartOperation>, ConnectionBrokerError>>
         {
             Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
         }

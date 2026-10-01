@@ -36,8 +36,8 @@ use uuid::Uuid;
 use crate::BoxFuture;
 use crate::connections::{
     AuthorizationUrl, ConnectionBrokerError, ConnectionPhase, ConnectionSession,
-    GithubWorkflowRerunBroker, GithubWorkflowRerunRequest, ProviderConnectionBroker,
-    ProviderConnectionStatus, StartedConnection,
+    ConnectionStartOperation, GithubWorkflowRerunBroker, GithubWorkflowRerunRequest,
+    ProviderConnectionBroker, ProviderConnectionStatus, ReservedConnectionStart, StartedConnection,
 };
 
 pub const CONNECTIONS_SERVICE: &str = steward_connections_v1::SERVICE;
@@ -530,8 +530,16 @@ where
     fn start<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
-    ) -> BoxFuture<'a, Result<StartedConnection, ConnectionBrokerError>> {
+    ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
         self.mutations.start(session)
+    }
+
+    fn start_operation<'a>(
+        &'a self,
+        session: &'a ConnectionSession<B>,
+        operation_id: Uuid,
+    ) -> BoxFuture<'a, Result<Option<ConnectionStartOperation>, ConnectionBrokerError>> {
+        self.mutations.start_operation(session, operation_id)
     }
 
     fn disconnect<'a>(
@@ -805,7 +813,7 @@ where
     fn start<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
-    ) -> BoxFuture<'a, Result<StartedConnection, ConnectionBrokerError>> {
+    ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
         Box::pin(async move {
             let record = self
                 .reserve(
@@ -817,28 +825,63 @@ where
                     None,
                 )
                 .await?;
-            let completed = if record.operation_state == ConnectionOperationState::Succeeded {
-                record
-            } else {
-                self.wait(&session.subject.canonical_user_id, record.operation_id)
-                    .await?
-            };
-            if completed.oauth_phase != ConnectionOAuthPhase::Pending {
-                return Err(ConnectionBrokerError::Unavailable);
-            }
-            let authorization_url = completed
-                .authorization_url
-                .ok_or(ConnectionBrokerError::Unavailable)
-                .and_then(|value| {
-                    AuthorizationUrl::new(value).map_err(|_| ConnectionBrokerError::Unavailable)
-                })?;
-            let expires_at = completed
-                .flow_expires_at
-                .ok_or(ConnectionBrokerError::Unavailable)?;
-            Ok(StartedConnection {
-                authorization_url,
-                expires_at,
+            Ok(ReservedConnectionStart {
+                operation_id: record.operation_id,
             })
+        })
+    }
+
+    fn start_operation<'a>(
+        &'a self,
+        session: &'a ConnectionSession<B>,
+        operation_id: Uuid,
+    ) -> BoxFuture<'a, Result<Option<ConnectionStartOperation>, ConnectionBrokerError>> {
+        Box::pin(async move {
+            let Some(record) = self
+                .store
+                .connection_operation(operation_id, &session.subject.canonical_user_id)
+                .await
+                .map_err(|_| ConnectionBrokerError::Unavailable)?
+            else {
+                return Ok(None);
+            };
+            if record.provider != "github" || record.operation_kind != StoredOperationKind::Start {
+                return Ok(None);
+            }
+            let operation = match record.operation_state {
+                ConnectionOperationState::Queued
+                | ConnectionOperationState::Provisioning
+                | ConnectionOperationState::Running => ConnectionStartOperation::Pending,
+                ConnectionOperationState::Failed => {
+                    ConnectionStartOperation::Failed(connection_broker_error(
+                        record.failure_category.as_deref(),
+                        record.failure_detail.as_ref(),
+                    ))
+                }
+                ConnectionOperationState::Succeeded => {
+                    if record.oauth_phase != ConnectionOAuthPhase::Pending {
+                        ConnectionStartOperation::Failed(ConnectionBrokerError::Unavailable)
+                    } else {
+                        match (record.authorization_url, record.flow_expires_at) {
+                            (Some(value), Some(expires_at)) => match AuthorizationUrl::new(value) {
+                                Ok(authorization_url) => {
+                                    ConnectionStartOperation::Succeeded(StartedConnection {
+                                        authorization_url,
+                                        expires_at,
+                                    })
+                                }
+                                Err(_) => ConnectionStartOperation::Failed(
+                                    ConnectionBrokerError::Unavailable,
+                                ),
+                            },
+                            _ => {
+                                ConnectionStartOperation::Failed(ConnectionBrokerError::Unavailable)
+                            }
+                        }
+                    }
+                }
+            };
+            Ok(Some(operation))
         })
     }
 
@@ -1688,11 +1731,13 @@ mod tests {
     use sha2::{Digest, Sha256};
     use steward_admission::{AdmissionDecision, evaluate};
     use steward_types::{CanonicalUserId, Email, Principal, ToolGrant};
+    use uuid::Uuid;
 
     use crate::BoxFuture;
     use crate::connections::{
-        ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionSubject,
-        ProviderConnectionBroker, ProviderConnectionStatus, StartedConnection,
+        ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionStartOperation,
+        ConnectionSubject, ProviderConnectionBroker, ProviderConnectionStatus,
+        ReservedConnectionStart,
     };
 
     use super::{
@@ -1723,7 +1768,16 @@ mod tests {
         fn start<'a>(
             &'a self,
             _session: &'a ConnectionSession<String>,
-        ) -> BoxFuture<'a, Result<StartedConnection, ConnectionBrokerError>> {
+        ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
+            Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
+        }
+
+        fn start_operation<'a>(
+            &'a self,
+            _session: &'a ConnectionSession<String>,
+            _operation_id: Uuid,
+        ) -> BoxFuture<'a, Result<Option<ConnectionStartOperation>, ConnectionBrokerError>>
+        {
             Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
         }
 
