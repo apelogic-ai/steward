@@ -786,9 +786,15 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
             "424241",
         )
         .await?;
-    assert_eq!(linked_observed.last_seen_at, observed_from_task.last_seen_at);
+    assert_eq!(
+        linked_observed.last_seen_at,
+        observed_from_task.last_seen_at
+    );
     assert_eq!(linked_observed.actor_login, observed_from_task.actor_login);
-    assert_eq!(linked_observed.display_name, observed_from_task.display_name);
+    assert_eq!(
+        linked_observed.display_name,
+        observed_from_task.display_name
+    );
 
     let connected_account = FederatedSubjectObservation {
         issuer: "https://identity.example.test",
