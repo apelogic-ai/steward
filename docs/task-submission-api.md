@@ -50,6 +50,13 @@ Envelope exists and returns `409` when several are active. Steward never selects
 by recency, template order, or another heuristic. The persisted Task binding still
 contains owner ID, Envelope instance ID, digest, and approved snapshot.
 
+A direct-package submission requires `githubSource.enabled=true`. When exact Git
+source retrieval is disabled, `POST /v1/tasks` returns `503` before reserving a
+Task, with stable code `task.direct_package_source_disabled` and an actionable
+`failureReason`. Steward emits the same code in one server log for that rejected
+submission. This is deployment capability state, not an Identity, GitHub network,
+or User Envelope failure.
+
 For a versioned Workflow, its stored agent reference is an opaque identifier advertised by the
 current deployment catalog. The submitter supplies the Workflow reference, not the agent image,
 executable, provider profile, endpoint, namespace, runtime class, or credential. Steward resolves
@@ -86,7 +93,10 @@ the configured Identity JWKS directly. The unauthenticated
 Steward resource origin, the trusted Identity issuer in
 `authorization_servers`, bearer-header transport, and the accepted contracts
 in `steward_task_token_contracts`. Successful metadata is cacheable for 300
-seconds. An unconfigured document returns `503`, `Cache-Control: no-store`,
+seconds. The additive boolean `steward_direct_packages_supported` reports
+whether this deployment has exact Git source retrieval configured, allowing a
+client to reject a direct-package request before obtaining a Task token. An
+unconfigured document returns `503`, `Cache-Control: no-store`,
 `Retry-After: 30`, and `task_auth.discovery_unavailable`.
 
 `steward-task-v2` remains accepted and is the only advertised contract by

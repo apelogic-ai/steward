@@ -288,6 +288,17 @@ when it changes. Repository names remain audit metadata and cannot substitute
 for these IDs. The deployment adapter resolves and maintains the approved
 GitHub API CIDRs; the portable chart opens HTTPS egress only to those entries.
 
+An in-repository Task package therefore requires all of the following before
+submission: `githubSource.enabled=true`, a read-only Contents GitHub App
+installed on the invoking repository, the referenced Secret, and nonempty
+`networkPolicy.githubApiCidrs` when NetworkPolicy is enabled. A package in the
+invoking repository needs no cross-repository binding. A package in another
+repository additionally needs its exact caller/source ID pair in
+`githubSource.bindings`. When protected-resource discovery is configured, it
+advertises the resulting capability as `steward_direct_packages_supported`;
+when the value is false, a direct submission returns
+`task.direct_package_source_disabled` without reserving a Task.
+
 ## Governed provider connections
 
 `connectionsBridge` is disabled by default. Enabling it requires browser
@@ -471,6 +482,14 @@ Steward release namespace also creates `steward-workflows`.
   administration is disabled. Enabling browser administration requires a complete v0.7.0-or-later
   object and fails schema validation when the value is absent, null, or malformed. Steward validates
   and renders these deployment coordinates; its source and chart defaults do not select them.
+- `config.apiserver.stewardRunWorkflowInstallationMode` controls only how generated callers
+  reference that verified release. `remote` is the default and renders the release handoff's exact
+  repository and workflow commit. `vendored` renders
+  `./.github/workflows/steward-task-vendored.yml`; select it only after each caller repository has
+  installed the checksum- and signature-verified steward-run v0.7.6-or-later release asset at that
+  exact path. Older release handoffs fail closed in this mode. The local mode does not add a PAT,
+  checkout token, or mutable action reference. See
+  [the installation guide](../../docs/installation/installation-guide.md#vendored-steward-run-workflow).
 - `config.apiserver.executionBindings` is the structured, deployment-owned coding-agent
   catalog. The default `bindings: []` advertises no agents and creates no fallback.
   The chart validates it, renders it into an immutable content-addressed ConfigMap,

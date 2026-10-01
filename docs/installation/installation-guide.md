@@ -133,7 +133,7 @@ Do not reuse one credential for these unrelated boundaries:
 |---|---|---|
 | GitHub Actions OIDC → Identity → `steward-run` | Governed submission from Actions | Runner operator grants `id-token: write`; Identity trusts `https://token.actions.githubusercontent.com` and enforces repository/ref policy. Steward either uses the existing TokenReview path or verifies Identity's short-lived ES256 Task token directly when `taskIdentity.enabled=true`. The direct path keeps `steward-task-v2` by default; opt-in v3 uses the stable numeric GitHub actor subject. This is not a GitHub OAuth App. Verify issuer, audience, HTTPS CA, discovery metadata when configured, and one denied wrong-repository/ref request before submission. |
 | ARC GitHub App | Only an ARC-based runner installation | Runner-platform owner supplies the App ID, installation ID, and key with the minimum ARC repository/organization permissions. Steward neither reads nor creates this credential. Verify runner registration and job pickup in that product's handoff. |
-| Read-only GitHub source App | `githubSource.enabled=true` direct packages | Steward source operator supplies the configured App ID and PEM Secret; install it only on approved repositories with read-only Contents. Verify resolution of one exact allowed commit and denial of an unbound repository. |
+| Read-only GitHub source App | In-repository direct Task packages | Steward source operator sets `githubSource.enabled=true`, supplies the configured App ID and PEM Secret, installs the App only on approved repositories with read-only Contents, and maintains `networkPolicy.githubApiCidrs` when NetworkPolicy is enabled. Same-repository packages need no binding; each cross-repository package source needs an exact stable-ID pair in `githubSource.bindings`. Verify resolution of one exact allowed commit and denial of an unbound repository. |
 | Google OAuth/OIDC client | `browserAuth.enabled=true` | Browser-identity owner supplies the client ID/Secret, allowed workspace/organization, and the exact HTTPS callback derived from `browserAuth.google.origin`. Verify login, callback, wrong-domain denial, and logout. |
 | MCP-GW downstream OAuth clients | Only selected MCP tools | MCP-GW operator owns Google/GitHub/provider consent clients, callbacks, and stored grants. They never go in the Steward chart. Verify consent and subject isolation through MCP-GW. |
 | Jira Cloud API token | `jira.enabled=true` only | Jira project owner supplies a dedicated account/token permitted to search/browse, create Task issues, and comment in the configured project. Verify create/search/comment and revocation. With Jira disabled, verify no Secret projection or Jira egress. |
@@ -158,6 +158,47 @@ required normalized fields are `manifestSchemaVersion`, `version`,
 `governedJobContainerImage`; Steward requires v0.7.0 or later and immutable
 commits/image digest. This value binds generated workflows to the same
 steward-run release selected for the installation.
+
+Set `config.apiserver.stewardRunWorkflowInstallationMode` independently from
+those signed coordinates. Its default, `remote`, renders the exact immutable
+repository and workflow commit. `vendored` renders the local path described
+below; it does not change the verified release coordinates retained in
+generated provenance.
+
+### Vendored steward-run workflow
+
+Use `vendored` only when a caller repository must consume the official local
+workflow asset from the same verified steward-run v0.7.6-or-later release named
+by the installation BOM. Steward fails startup when this mode is paired with an
+older release handoff. Follow that release's installation guide to verify its
+`oss-release-manifest.json`, `SHA256SUMS`, signature bundles, image, and chart.
+The checksum inventory must verify `steward-task-vendored.yml` before it is
+copied:
+
+```sh
+set -euo pipefail
+CALLER_REPOSITORY=/path/to/caller
+
+sha256sum -c SHA256SUMS
+mkdir -p "$CALLER_REPOSITORY/.github/workflows"
+install -m 0644 steward-task-vendored.yml \
+  "$CALLER_REPOSITORY/.github/workflows/steward-task-vendored.yml"
+```
+
+Configure Steward only after the verified file is committed at that exact
+path:
+
+```yaml
+config:
+  apiserver:
+    stewardRunWorkflowInstallationMode: vendored
+```
+
+Generated callers then use
+`./.github/workflows/steward-task-vendored.yml`. The released file contains
+the signed manifest's immutable direct action reference, so no PAT or checkout
+token is needed. Refresh and re-verify the local file whenever the installation
+BOM selects a steward-run release whose notes require a new vendored workflow.
 
 | Reference and namespace | Kubernetes type and keys | Producer and consumer | Rotation / condition |
 |---|---|---|---|
@@ -349,6 +390,19 @@ The recommended deployment path is:
    rather than assembling a partial governed values file; and
 4. install the generated `steward-values.json` only after static validation and
    the applicable live Gateway and network checks pass.
+
+If governed workflows use in-repository Task packages, treat Git source access
+as an install prerequisite rather than a later application setting. Enable
+`githubSource`, reference the existing App private-key Secret, install that App
+with read-only Contents on every allowed source repository, add exact
+caller/source stable-ID bindings for cross-repository packages, and configure
+`networkPolicy.githubApiCidrs` when NetworkPolicy is enabled. After rollout,
+prove one exact-commit read before activating the workflow. When
+`taskIdentity.resource` configures protected-resource discovery, also check
+`steward_direct_packages_supported: true` at
+`/.well-known/oauth-protected-resource`. A false capability produces
+`task.direct_package_source_disabled`; do not diagnose it as an Identity or
+User Envelope failure.
 
 This path binds the generated Helm values and execution binding to the verified
 destination artifacts. Manual values assembly remains possible, but it must

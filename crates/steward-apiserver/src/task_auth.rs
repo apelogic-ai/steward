@@ -13,6 +13,7 @@ pub struct TaskAuthDiscoveryConfig {
     resource: String,
     authorization_server: String,
     federated_subjects_enabled: bool,
+    direct_packages_supported: bool,
 }
 
 impl TaskAuthDiscoveryConfig {
@@ -27,7 +28,13 @@ impl TaskAuthDiscoveryConfig {
             resource,
             authorization_server,
             federated_subjects_enabled,
+            direct_packages_supported: false,
         })
+    }
+
+    pub fn with_direct_packages_supported(mut self, supported: bool) -> Self {
+        self.direct_packages_supported = supported;
+        self
     }
 
     #[cfg(test)]
@@ -42,6 +49,7 @@ impl TaskAuthDiscoveryConfig {
             resource,
             authorization_server,
             federated_subjects_enabled,
+            direct_packages_supported: false,
         })
     }
 }
@@ -57,6 +65,7 @@ struct ProtectedResourceMetadata<'a> {
     authorization_servers: [&'a str; 1],
     bearer_methods_supported: [&'static str; 1],
     steward_task_token_contracts: Vec<&'static str>,
+    steward_direct_packages_supported: bool,
 }
 
 pub fn task_auth_discovery_router(config: Option<TaskAuthDiscoveryConfig>) -> Router {
@@ -84,6 +93,7 @@ async fn protected_resource_metadata(State(state): State<DiscoveryState>) -> Res
             authorization_servers: [&config.authorization_server],
             bearer_methods_supported: ["header"],
             steward_task_token_contracts: contracts,
+            steward_direct_packages_supported: config.direct_packages_supported,
         }),
     )
         .into_response()
@@ -171,6 +181,7 @@ mod tests {
         let api = include_str!("../../../docs/task-submission-api.md");
         let upgrade = include_str!("../../../docs/installation/federated-task-identity-upgrade.md");
         let chart = include_str!("../../../charts/steward/README.md");
+        let installation = include_str!("../../../docs/installation/installation-guide.md");
 
         for required in [
             "resource: \"\"",
@@ -203,6 +214,23 @@ mod tests {
                 "Task API documentation omits {required}"
             );
         }
+        for document in [api, chart, installation] {
+            for required in [
+                "steward_direct_packages_supported",
+                "task.direct_package_source_disabled",
+            ] {
+                assert!(
+                    document.contains(required),
+                    "current direct-package operator documentation omits {required}"
+                );
+            }
+        }
+        for document in [chart, installation] {
+            assert!(
+                document.contains("networkPolicy.githubApiCidrs"),
+                "direct-package installation documentation omits GitHub API egress"
+            );
+        }
     }
 
     #[tokio::test]
@@ -212,7 +240,8 @@ mod tests {
             "https://steward.example.test".to_owned(),
             "https://identity.example.test".to_owned(),
             true,
-        )?;
+        )?
+        .with_direct_packages_supported(true);
         let response = task_auth_discovery_router(Some(config))
             .oneshot(
                 Request::builder()
@@ -255,6 +284,7 @@ mod tests {
             body["steward_task_token_contracts"],
             serde_json::json!(["steward-task-v2", "steward-task-v3"])
         );
+        assert_eq!(body["steward_direct_packages_supported"], true);
         Ok(())
     }
 
@@ -328,6 +358,7 @@ mod tests {
             body["steward_task_token_contracts"],
             serde_json::json!(["steward-task-v2"])
         );
+        assert_eq!(body["steward_direct_packages_supported"], false);
         Ok(())
     }
 

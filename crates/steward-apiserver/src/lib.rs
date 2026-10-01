@@ -26,10 +26,11 @@ pub use github_actions::{
     GITHUB_FILE_READ_TEMPLATE, GeneratedGithubActionsWorkflow, GithubActionsEnvelopeSelection,
     GithubActionsRenderContext, GithubActionsRenderError, GithubActionsRenderRequest,
     GithubActionsTaskTemplate, MAX_STEWARD_RUN_RELEASE_BYTES, StewardRunRelease,
-    VERSIONED_GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA, VersionedGithubActionsWorkflowContext,
-    parse_github_actions_render_request, render_github_actions_workflow,
-    render_versioned_github_actions_workflow, steward_run_release_from_installation_bom,
-    validate_generated_github_actions_yaml,
+    StewardRunWorkflowInstallationMode, VERSIONED_GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA,
+    VersionedGithubActionsWorkflowContext, parse_github_actions_render_request,
+    render_github_actions_workflow, render_versioned_github_actions_workflow,
+    steward_run_release_from_installation_bom, validate_generated_github_actions_yaml,
+    validate_steward_run_workflow_installation,
 };
 
 pub use tasks::{
@@ -85,6 +86,9 @@ use steward_types::{
 use uuid::Uuid;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+const DIRECT_PACKAGE_SOURCE_DISABLED_CODE: &str = "task.direct_package_source_disabled";
+const DIRECT_PACKAGE_SOURCE_DISABLED_REASON: &str = "Direct package source resolution is disabled on this Steward deployment; enable githubSource to accept in-repository Task packages.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdmissionContext {
@@ -542,7 +546,7 @@ pub async fn budget_increase_contract() {}
         (status = 409, description = "Idempotency key conflicts with an existing Task", body = TaskErrorResponse, content_type = "application/json"),
         (status = 415, description = "Content-Type is not application/json", body = String, content_type = "text/plain"),
         (status = 422, description = "Workflow, runtime version, User Envelope, or authority is invalid", body = TaskErrorResponse, content_type = "application/json"),
-        (status = 503, description = "Identity, Kubernetes, persistence, or decision dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+        (status = 503, description = "Direct-package source support is disabled, or an Identity, Kubernetes, persistence, or decision dependency is unavailable", body = TaskErrorResponse, content_type = "application/json")
     )
 )]
 #[doc(hidden)]
@@ -866,6 +870,7 @@ pub enum ApiError {
     TaskWorkflowNotFound,
     TaskNotReady,
     TaskOutputNotReady,
+    DirectPackageSourceDisabled,
     TaskRuntimeContractUnavailable(String),
 }
 
@@ -2407,6 +2412,16 @@ impl IntoResponse for ApiError {
                 )
                     .into_response();
             }
+            Self::DirectPackageSourceDisabled => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(TaskErrorResponse {
+                        error: DIRECT_PACKAGE_SOURCE_DISABLED_CODE.to_owned(),
+                        failure_reason: Some(DIRECT_PACKAGE_SOURCE_DISABLED_REASON.to_owned()),
+                    }),
+                )
+                    .into_response();
+            }
             _ => {}
         }
         let status = match &self {
@@ -2435,9 +2450,9 @@ impl IntoResponse for ApiError {
             Self::Store(
                 StoreError::FederatedSubjectUnassociated | StoreError::FederatedSubjectDisabled,
             ) => StatusCode::FORBIDDEN,
-            Self::TaskNotReady | Self::TaskRuntimeContractUnavailable(_) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::TaskNotReady
+            | Self::DirectPackageSourceDisabled
+            | Self::TaskRuntimeContractUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::TaskOutputNotReady => StatusCode::CONFLICT,
             Self::MissingEnvelope | Self::MissingRuntimeUid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidBudgetIncrease { .. } | Self::Admission(_) => {
@@ -5966,6 +5981,12 @@ mod tests {
                 "direct Task status is missing {property}"
             );
         }
+        assert!(
+            document
+                .pointer("/components/schemas/TaskErrorResponse/properties/failureReason")
+                .is_some(),
+            "Task errors must publish the optional actionable failure reason"
+        );
         assert_eq!(
             document.pointer("/components/schemas/TaskPhase/enum"),
             Some(&serde_json::json!([
@@ -10576,6 +10597,70 @@ mod tests {
                 .map_err(|_| "fake task-operation ledger lock was poisoned")?
                 .is_empty(),
             "a rejected direct package must not create a runtime operation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_package_source_disabled_returns_stable_actionable_error() -> Result<(), String>
+    {
+        let ledger = versioned_task_ledger()?;
+        let log_lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_log_lines = log_lines.clone();
+        let config = task_api_config()?.with_failure_reporter(Arc::new(move |line| {
+            if let Ok(mut lines) = captured_log_lines.lock() {
+                lines.push(line.to_owned());
+            }
+        }));
+        let response = task_router(ledger.clone(), FakeTaskIdentityResolver, config)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-source-disabled")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct-package request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct package: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read direct-package response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("parse direct-package response: {error}"))?,
+            serde_json::json!({
+                "error": "task.direct_package_source_disabled",
+                "failureReason": "Direct package source resolution is disabled on this Steward deployment; enable githubSource to accept in-repository Task packages.",
+            })
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .is_empty(),
+            "a disabled direct-package source must reject before Task reservation"
+        );
+        assert_eq!(
+            *log_lines
+                .lock()
+                .map_err(|_| "direct-package failure log lock was poisoned")?,
+            vec![
+                "task submission rejected code=task.direct_package_source_disabled failureReason=Direct package source resolution is disabled on this Steward deployment; enable githubSource to accept in-repository Task packages."
+                    .to_owned()
+            ],
+            "one submission must emit exactly one actionable server log"
         );
         Ok(())
     }

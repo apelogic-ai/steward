@@ -28,9 +28,9 @@ use steward_apiserver::{
     ConfiguredTaskIdentityResolver, ExecutionBindingCatalog,
     IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository, KubernetesTokenAuthenticator,
     KubernetesTokenReviewAudience, MAX_EXECUTION_BINDING_CATALOG_BYTES,
-    MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, TaskApiConfig, agent_runs_ui, browser_admin,
-    browser_auth, connections, google_oidc, governed_connections, operator_admin, router,
-    stable_runtime_bridge, task_router, user_envelopes, workflows,
+    MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, StewardRunWorkflowInstallationMode, TaskApiConfig,
+    agent_runs_ui, browser_admin, browser_auth, connections, google_oidc, governed_connections,
+    operator_admin, router, stable_runtime_bridge, task_router, user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
@@ -152,6 +152,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let connection_auto_association_issuer = configured_task_identity
         .connection_auto_association_issuer
         .clone();
+    let task_identity_discovery_enabled = configured_task_identity.discovery.is_some();
     let task_identities = configured_task_identity.resolver;
     let authenticator = IdentityOrKubernetesTokenAuthenticator::new(
         kubernetes_authenticator,
@@ -168,6 +169,9 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let task_execution_bindings_json = configured_execution_bindings_json()?;
     let source_repository_bindings_json = configured_source_repository_bindings_json()?;
     let github_source = configured_github_source_adapter()?;
+    let task_auth_discovery = configured_task_identity
+        .discovery
+        .map(|config| config.with_direct_packages_supported(github_source.is_some()));
     let task_execution_bindings_active = execution_bindings_active().map_err(io::Error::other)?;
     let mut task_api_config =
         TaskApiConfig::new(task_mcp_gateway_endpoint).map_err(io::Error::other)?;
@@ -210,6 +214,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         workflow_agents,
         task_orchestration_mode,
         connection_auto_association_issuer,
+        task_identity_discovery_enabled,
     )
     .await?;
     let app = router(
@@ -219,9 +224,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         decisions.clone(),
     )
     .merge(operator_admin::router(store.clone(), authenticator))
-    .merge(task_auth_discovery_router(
-        configured_task_identity.discovery,
-    ))
+    .merge(task_auth_discovery_router(task_auth_discovery))
     .merge(task_router(
         store.clone(),
         task_identities,
@@ -696,6 +699,7 @@ async fn browser_application_router(
     workflow_agents: Vec<steward_apiserver::ExecutionBindingAdvertisement>,
     task_orchestration_mode: TaskOrchestrationMode,
     connection_auto_association_issuer: Option<String>,
+    task_identity_discovery_enabled: bool,
 ) -> Result<Option<axum::Router>, Box<dyn Error>> {
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
@@ -732,6 +736,17 @@ async fn browser_application_router(
         steward_apiserver::steward_run_release_from_installation_bom(&document)
             .map_err(io::Error::other)
     })?;
+    let workflow_installation_mode = StewardRunWorkflowInstallationMode::parse(
+        env::var("STEWARD_RUN_WORKFLOW_INSTALLATION_MODE")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(io::Error::other)?;
+    steward_apiserver::validate_steward_run_workflow_installation(
+        workflow_installation_mode,
+        &steward_run_release,
+    )
+    .map_err(io::Error::other)?;
     let origin = required("STEWARD_BROWSER_ORIGIN")?;
     let config = browser_auth::GoogleOidcConfig::new(
         client_id,
@@ -774,6 +789,8 @@ async fn browser_application_router(
                 capability_catalog.clone(),
                 custom_envelope_safety_ceiling.clone(),
                 steward_run_release,
+                workflow_installation_mode,
+                task_identity_discovery_enabled,
             ),
             auth.clone(),
         ))
