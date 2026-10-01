@@ -2197,7 +2197,7 @@ test("connection OAuth polling keeps a bounded terminal failure explicit", async
   }
 });
 
-test("connection OAuth stops a perpetually pending poll at the advertised deadline", async ({ browser }) => {
+test("connection OAuth stops a perpetually pending poll after the bounded observation window", async ({ browser }) => {
   const developer = await guardedPage(browser, {
     connectionPhase: "disconnected",
     connectionStartPendingDeadlineMs: 250,
@@ -2207,7 +2207,7 @@ test("connection OAuth stops a perpetually pending poll at the advertised deadli
     const connect = developer.page.getByRole("button", { name: "Connect GitHub" });
     await connect.click();
     await expect(developer.page.getByText(
-      "Authorization did not become ready in time. Retry the connection; if it continues, contact an administrator.",
+      "The connection operation did not finish in time. Retry it; if it continues, contact an administrator.",
       { exact: true },
     )).toBeVisible();
     await expect(connect).toBeEnabled();
@@ -2228,13 +2228,13 @@ test("connection OAuth keeps its deadline failure when the operation request abo
     const connect = developer.page.getByRole("button", { name: "Connect GitHub" });
     await connect.click();
     await expect(developer.page.getByText(
-      "Authorization did not become ready in time. Retry the connection; if it continues, contact an administrator.",
+      "The connection operation did not finish in time. Retry it; if it continues, contact an administrator.",
       { exact: true },
     )).toBeVisible();
     await expect(connect).toBeEnabled();
     await developer.page.waitForTimeout(250);
     await expect(developer.page.getByText(
-      "Authorization did not become ready in time. Retry the connection; if it continues, contact an administrator.",
+      "The connection operation did not finish in time. Retry it; if it continues, contact an administrator.",
       { exact: true },
     )).toBeVisible();
   } finally {
