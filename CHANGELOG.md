@@ -17,6 +17,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Published the immutable `repo-summary@2` onboarding Workflow with an explicit
+  `out/summary.md` result and migrated existing revision-1 installations without
+  rewriting their history. The Workflow authoring UI now states that governed
+  results must be written beneath `out/`.
 - Made the deprecated steward-run governed job image optional in the chart,
   platform preflight, and versioned GitHub Actions generator. Existing pinned
   image values remain accepted for the lower-level v1 smoke renderer.

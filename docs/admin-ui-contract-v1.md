@@ -2,7 +2,7 @@
 
 Status: active browser and API boundary.
 
-Applies to Steward 0.3.3.
+Applies to Steward 0.3.6.
 
 ## Presentation ownership
 
@@ -137,17 +137,23 @@ CSRF scoped. The onboarding aggregate composes connection, Envelope, workflow,
 and run evidence; dismissal and the explicit "I added the workflow"
 acknowledgement are server-side preferences. When browser surfaces are enabled
 and at least one execution binding is advertised, Steward publishes the
-reserved immutable `repo-summary@1` sample once against the first binding in
-lexical order. An existing revision under that name must match the complete
+reserved immutable `repo-summary@2` sample against the first binding in
+lexical order. Revision 2 instructs the agent to write its Markdown result to
+`out/summary.md`; only files beneath `out/` are returned as governed Workflow
+output. Existing installations retain immutable revision 1 and append revision
+2 during startup. An existing reserved revision must match the complete
 system-authored identity and digest or startup fails closed. Administrator
-publication cannot use the reserved name, and removing its pinned execution
-binding also fails browser startup rather than advertising an unexecutable
-sample. The renderer
+publication cannot use the reserved name. Removing revision 2's pinned
+execution binding hides the sample without preventing browser startup. The renderer
 returns a deterministic suggested path, but callers may use any valid GitHub
 workflow filename. Steps four and five follow all result pages and complete only
 after a GitHub-triggered run pins that sample revision and one of the user's
 provisioned Envelope instances. Steward does not dispatch the run; it is
 launched from GitHub with `gh workflow run` or the Actions UI.
+
+The administrator Workflow form states the same output contract. A published
+Workflow prompt must tell its agent to create every result file beneath `out/`;
+stdout and the agent's final message do not implicitly become output files.
 
 ### Fleet and runs
 

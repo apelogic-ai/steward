@@ -21,7 +21,9 @@ use crate::{ApiError, BoxFuture};
 const BROWSER_WORKFLOW_API_VERSION: &str = "steward.workflows/v1";
 pub(crate) const SAMPLE_WORKFLOW_NAME: &str = "repo-summary";
 pub(crate) const SAMPLE_WORKFLOW_DISPLAY_NAME: &str = "Repository summary";
-pub(crate) const SAMPLE_WORKFLOW_PROMPT: &str = "Summarize the repository structure, its primary components, and the most important developer entry points. Do not modify repository contents.";
+pub(crate) const SAMPLE_WORKFLOW_VERSION: i64 = 2;
+const SAMPLE_WORKFLOW_V1_PROMPT: &str = "Summarize the repository structure, its primary components, and the most important developer entry points. Do not modify repository contents.";
+pub(crate) const SAMPLE_WORKFLOW_PROMPT: &str = "Summarize the repository structure, its primary components, and the most important developer entry points. Write the summary as Markdown to out/summary.md. Do not modify other repository contents.";
 pub(crate) const SAMPLE_WORKFLOW_ACTOR: &str = "system:sample-workflow";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,6 +181,12 @@ pub trait WorkflowRepository: Clone + Send + Sync + 'static {
         &'a self,
         publication: WorkflowPublication<'a>,
     ) -> BoxFuture<'a, Result<WorkflowRevisionRecord, StoreError>>;
+
+    fn publish_exact_workflow_revision<'a>(
+        &'a self,
+        publication: WorkflowPublication<'a>,
+        version: i64,
+    ) -> BoxFuture<'a, Result<WorkflowRevisionRecord, StoreError>>;
 }
 
 impl WorkflowRepository for PgStore {
@@ -209,13 +217,23 @@ impl WorkflowRepository for PgStore {
     ) -> BoxFuture<'a, Result<WorkflowRevisionRecord, StoreError>> {
         Box::pin(async move { PgStore::publish_next_workflow(self, publication).await })
     }
+
+    fn publish_exact_workflow_revision<'a>(
+        &'a self,
+        publication: WorkflowPublication<'a>,
+        version: i64,
+    ) -> BoxFuture<'a, Result<WorkflowRevisionRecord, StoreError>> {
+        Box::pin(async move {
+            PgStore::publish_exact_workflow_revision(self, publication, version).await
+        })
+    }
 }
 
-/// Ensure the browser onboarding catalog contains one executable, deployment-bound sample.
+/// Ensure the browser onboarding catalog contains the current executable sample revision.
 ///
 /// The logical agent is chosen deterministically from the deployment-owned execution catalog.
-/// The reserved sample identity is immutable: an existing conflicting revision fails closed
-/// instead of being reinterpreted as Steward's sample.
+/// Existing sample revisions remain immutable. Bootstrap appends the current revision exactly once
+/// and fails closed if a reserved revision does not match its system-authored contract.
 pub async fn ensure_sample_workflow<L>(
     repository: &L,
     agents: &[ExecutionBindingAdvertisement],
@@ -223,33 +241,35 @@ pub async fn ensure_sample_workflow<L>(
 where
     L: WorkflowRepository,
 {
-    if let Some(existing) = repository
+    let existing_v2 = repository
+        .workflow_revision(SAMPLE_WORKFLOW_NAME, SAMPLE_WORKFLOW_VERSION)
+        .await?;
+    let existing_v1 = repository
         .workflow_revision(SAMPLE_WORKFLOW_NAME, 1)
-        .await?
-    {
+        .await?;
+    if let Some(existing) = existing_v2 {
+        if !existing_v1
+            .as_ref()
+            .is_some_and(is_onboarding_sample_workflow_v1)
+        {
+            return Err(StoreError::InvalidWorkflow);
+        }
         return sample_workflow_record(existing, agents);
     }
-    if agents.is_empty() {
+
+    ensure_sample_workflow_v1(repository, agents, existing_v1).await?;
+    let Some(agent) = sample_agent(agents) else {
         return Ok(None);
-    }
-    let agent = agents
-        .iter()
-        .map(|agent| agent.agent_ref.as_str())
-        .min()
-        .ok_or(StoreError::InvalidWorkflow)?;
-    let digest = workflow_content_digest(agent, SAMPLE_WORKFLOW_PROMPT);
-    let publication = WorkflowPublication {
-        name: SAMPLE_WORKFLOW_NAME,
-        display_name: SAMPLE_WORKFLOW_DISPLAY_NAME,
-        agent,
-        prompt: SAMPLE_WORKFLOW_PROMPT,
-        content_digest: &digest,
-        published_by: SAMPLE_WORKFLOW_ACTOR,
     };
-    match repository.publish_initial_workflow(publication).await {
+    let digest = workflow_content_digest(agent, SAMPLE_WORKFLOW_PROMPT);
+    let publication = sample_workflow_publication(agent, SAMPLE_WORKFLOW_PROMPT, &digest);
+    match repository
+        .publish_exact_workflow_revision(publication, SAMPLE_WORKFLOW_VERSION)
+        .await
+    {
         Ok(record) => sample_workflow_record(record, agents),
         Err(StoreError::WorkflowAlreadyExists) => repository
-            .workflow_revision(SAMPLE_WORKFLOW_NAME, 1)
+            .workflow_revision(SAMPLE_WORKFLOW_NAME, SAMPLE_WORKFLOW_VERSION)
             .await?
             .ok_or(StoreError::WorkflowNotFound)
             .and_then(|record| sample_workflow_record(record, agents)),
@@ -257,12 +277,74 @@ where
     }
 }
 
+async fn ensure_sample_workflow_v1<L>(
+    repository: &L,
+    agents: &[ExecutionBindingAdvertisement],
+    existing: Option<WorkflowRevisionRecord>,
+) -> Result<(), StoreError>
+where
+    L: WorkflowRepository,
+{
+    if let Some(existing) = existing {
+        return is_onboarding_sample_workflow_v1(&existing)
+            .then_some(())
+            .ok_or(StoreError::InvalidWorkflow);
+    }
+    let Some(agent) = sample_agent(agents) else {
+        return Ok(());
+    };
+    let digest = workflow_content_digest(agent, SAMPLE_WORKFLOW_V1_PROMPT);
+    let publication = sample_workflow_publication(agent, SAMPLE_WORKFLOW_V1_PROMPT, &digest);
+    match repository.publish_initial_workflow(publication).await {
+        Ok(record) if is_onboarding_sample_workflow_v1(&record) => Ok(()),
+        Ok(_) => Err(StoreError::InvalidWorkflow),
+        Err(StoreError::WorkflowAlreadyExists) => repository
+            .workflow_revision(SAMPLE_WORKFLOW_NAME, 1)
+            .await?
+            .filter(is_onboarding_sample_workflow_v1)
+            .map(|_| ())
+            .ok_or(StoreError::InvalidWorkflow),
+        Err(error) => Err(error),
+    }
+}
+
+fn sample_agent(agents: &[ExecutionBindingAdvertisement]) -> Option<&str> {
+    agents.iter().map(|agent| agent.agent_ref.as_str()).min()
+}
+
+fn sample_workflow_publication<'a>(
+    agent: &'a str,
+    prompt: &'a str,
+    digest: &'a str,
+) -> WorkflowPublication<'a> {
+    WorkflowPublication {
+        name: SAMPLE_WORKFLOW_NAME,
+        display_name: SAMPLE_WORKFLOW_DISPLAY_NAME,
+        agent,
+        prompt,
+        content_digest: digest,
+        published_by: SAMPLE_WORKFLOW_ACTOR,
+    }
+}
+
+fn is_onboarding_sample_workflow_v1(record: &WorkflowRevisionRecord) -> bool {
+    is_sample_workflow_revision(record, 1, SAMPLE_WORKFLOW_V1_PROMPT)
+}
+
 pub(crate) fn is_onboarding_sample_workflow(record: &WorkflowRevisionRecord) -> bool {
+    is_sample_workflow_revision(record, SAMPLE_WORKFLOW_VERSION, SAMPLE_WORKFLOW_PROMPT)
+}
+
+fn is_sample_workflow_revision(
+    record: &WorkflowRevisionRecord,
+    version: i64,
+    prompt: &str,
+) -> bool {
     record.name == SAMPLE_WORKFLOW_NAME
-        && record.version == 1
+        && record.version == version
         && record.display_name == SAMPLE_WORKFLOW_DISPLAY_NAME
-        && record.prompt == SAMPLE_WORKFLOW_PROMPT
-        && record.content_digest == workflow_content_digest(&record.agent, SAMPLE_WORKFLOW_PROMPT)
+        && record.prompt == prompt
+        && record.content_digest == workflow_content_digest(&record.agent, prompt)
         && record.published_by == SAMPLE_WORKFLOW_ACTOR
 }
 
@@ -524,9 +606,10 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        PublishWorkflowError, PublishWorkflowRequest, WorkflowReference, WorkflowReferenceError,
-        WorkflowRepository, ensure_sample_workflow, is_onboarding_sample_workflow,
-        protected_admin_router_with_agents,
+        PublishWorkflowError, PublishWorkflowRequest, SAMPLE_WORKFLOW_ACTOR,
+        SAMPLE_WORKFLOW_DISPLAY_NAME, SAMPLE_WORKFLOW_NAME, SAMPLE_WORKFLOW_V1_PROMPT,
+        WorkflowReference, WorkflowReferenceError, WorkflowRepository, ensure_sample_workflow,
+        is_onboarding_sample_workflow, protected_admin_router_with_agents, workflow_content_digest,
     };
     use crate::BoxFuture;
     use crate::ExecutionBindingAdvertisement;
@@ -738,6 +821,44 @@ mod tests {
         ) -> BoxFuture<'a, Result<WorkflowRevisionRecord, StoreError>> {
             self.publish(publication, true)
         }
+
+        fn publish_exact_workflow_revision<'a>(
+            &'a self,
+            publication: WorkflowPublication<'a>,
+            version: i64,
+        ) -> BoxFuture<'a, Result<WorkflowRevisionRecord, StoreError>> {
+            Box::pin(async move {
+                let mut records = self
+                    .records
+                    .lock()
+                    .map_err(|_| StoreError::Database("lock Workflow records".to_owned()))?;
+                let current = records
+                    .iter()
+                    .filter(|record| record.name == publication.name)
+                    .map(|record| record.version)
+                    .max()
+                    .unwrap_or(0);
+                if current + 1 != version {
+                    return Err(if current >= version {
+                        StoreError::WorkflowAlreadyExists
+                    } else {
+                        StoreError::WorkflowNotFound
+                    });
+                }
+                let record = WorkflowRevisionRecord {
+                    name: publication.name.to_owned(),
+                    version,
+                    display_name: publication.display_name.to_owned(),
+                    agent: publication.agent.to_owned(),
+                    prompt: publication.prompt.to_owned(),
+                    content_digest: publication.content_digest.to_owned(),
+                    published_by: publication.published_by.to_owned(),
+                    published_at: "2026-08-24T00:00:00.000000Z".to_owned(),
+                };
+                records.push(record.clone());
+                Ok(record)
+            })
+        }
     }
 
     impl FakeWorkflowRepository {
@@ -798,15 +919,19 @@ mod tests {
         assert_eq!(first, second);
         assert!(is_onboarding_sample_workflow(&first));
         assert_eq!(first.name, "repo-summary");
-        assert_eq!(first.version, 1);
+        assert_eq!(first.version, 2);
         assert_eq!(first.agent, TEST_AGENT);
+        assert!(
+            first.prompt.contains("out/summary.md"),
+            "the onboarding sample must produce the artifact required by the rendered workflow"
+        );
         assert_eq!(
             repository
                 .records
                 .lock()
                 .map_err(|_| "lock Workflow records".to_owned())?
                 .len(),
-            1,
+            2,
             "startup reconciliation must not append duplicate sample revisions"
         );
 
@@ -823,6 +948,70 @@ mod tests {
             ensure_sample_workflow(&repository, &[]).await,
             Ok(None),
             "removing every advertised binding must hide the immutable sample without blocking startup"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sample_workflow_v1_is_migrated_without_rewriting_it() -> Result<(), String> {
+        let old_agent = "retired-agent@1";
+        let old_prompt = SAMPLE_WORKFLOW_V1_PROMPT;
+        let original = WorkflowRevisionRecord {
+            name: SAMPLE_WORKFLOW_NAME.to_owned(),
+            version: 1,
+            display_name: SAMPLE_WORKFLOW_DISPLAY_NAME.to_owned(),
+            agent: old_agent.to_owned(),
+            prompt: old_prompt.to_owned(),
+            content_digest: workflow_content_digest(old_agent, old_prompt),
+            published_by: SAMPLE_WORKFLOW_ACTOR.to_owned(),
+            published_at: "2026-08-24T00:00:00.000000Z".to_owned(),
+        };
+        let repository = FakeWorkflowRepository {
+            records: Arc::new(Mutex::new(vec![original.clone()])),
+        };
+        let agents = vec![advertised_agent(TEST_AGENT_TWO, "Example Agent 2")];
+
+        let migrated = ensure_sample_workflow(&repository, &agents)
+            .await
+            .map_err(|error| format!("migrate sample workflow: {error}"))?
+            .ok_or_else(|| "the migrated sample should be executable".to_owned())?;
+        assert_eq!(migrated.version, 2);
+        assert_eq!(migrated.agent, TEST_AGENT_TWO);
+        assert!(migrated.prompt.contains("out/summary.md"));
+        assert_eq!(
+            repository
+                .workflow_revision(SAMPLE_WORKFLOW_NAME, 1)
+                .await
+                .map_err(|error| error.to_string())?,
+            Some(original),
+            "migration must preserve immutable revision 1"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn current_sample_does_not_mask_a_conflicting_reserved_v1() -> Result<(), String> {
+        let repository = FakeWorkflowRepository::default();
+        let agents = vec![advertised_agent(TEST_AGENT, "Example Agent")];
+        ensure_sample_workflow(&repository, &agents)
+            .await
+            .map_err(|error| format!("seed sample workflows: {error}"))?;
+        {
+            let mut records = repository
+                .records
+                .lock()
+                .map_err(|_| "lock Workflow records".to_owned())?;
+            let revision_v1 = records
+                .iter_mut()
+                .find(|record| record.version == 1)
+                .ok_or_else(|| "sample revision 1 was not seeded".to_owned())?;
+            revision_v1.prompt = "Conflicting reserved workflow.".to_owned();
+        }
+
+        assert_eq!(
+            ensure_sample_workflow(&repository, &agents).await,
+            Err(StoreError::InvalidWorkflow),
+            "a valid current revision must not hide conflicting reserved history"
         );
         Ok(())
     }
