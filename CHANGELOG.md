@@ -20,6 +20,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Preserved bounded MCP-GW HTTP status and safe reason diagnostics for failed governed
   connection operations in additive migration 0052 and returned them through the
   connection API's `upstreamStatus` and `detail` fields.
+- Distinguished an authenticated `steward-task-v2` credential that names an
+  unknown canonical user (`403 task_identity_unknown_user`) from an invalid
+  credential (`401`), and documented Identity v6 / `steward-task-v3` as the
+  recommended new-install contract while retaining v5 / v2 compatibility.
 
 ## [0.3.5] - 2026-09-30
 
