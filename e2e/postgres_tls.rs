@@ -420,12 +420,7 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
     ));
     assert!(matches!(
         store
-            .associate_federated_subject_from_connection(
-                observation(),
-                &bob,
-                "github",
-                "16106037",
-            )
+            .associate_federated_subject_from_connection(observation(), &bob, "github", "16106037",)
             .await,
         Err(StoreError::FederatedSubjectDisabled)
     ));
@@ -437,12 +432,7 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
         display_name: Some("alice@example.com"),
     };
     let connected = store
-        .associate_federated_subject_from_connection(
-            connected_account,
-            &alice,
-            "github",
-            "424242",
-        )
+        .associate_federated_subject_from_connection(connected_account, &alice, "github", "424242")
         .await?;
     assert_eq!(connected.state, FederatedSubjectState::Associated);
     assert_eq!(connected.canonical_user_id.as_ref(), Some(&alice));
@@ -466,7 +456,10 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
         .ok_or_else(|| io::Error::other("connection verification audit is missing"))?;
     assert_eq!(verification.actor, "connection-verification");
     assert_eq!(verification.connection_provider.as_deref(), Some("github"));
-    assert_eq!(verification.connection_account_id.as_deref(), Some("424242"));
+    assert_eq!(
+        verification.connection_account_id.as_deref(),
+        Some("424242")
+    );
     assert!(matches!(
         store
             .associate_federated_subject_from_connection(
