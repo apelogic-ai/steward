@@ -16,7 +16,7 @@ import {
   type ToolGrant,
 } from "@/api-client";
 import { DataTable, FormSection, GrantChipList, SectionCard, TagSelect, grantKindForAction } from "@/components/hs";
-import { ToolPicker, toolKey } from "@/components/tool-picker";
+import { ToolPicker, dedupeToolGrants, toolKey } from "@/components/tool-picker";
 import { EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -604,6 +604,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
     resource: tool.resource,
     action: tool.action,
   })));
+  const [previousTools, setPreviousTools] = useState<Array<ToolGrant>>(() => dedupeToolGrants(template.spec.tools));
   const [monthlyLimit, setMonthlyLimit] = useState(template.spec.budget.monthlyLimit);
   const [singleRunLimit, setSingleRunLimit] = useState(template.spec.budget.singleRunLimit ?? "");
   const [runtimeMinutesLimit, setRuntimeMinutesLimit] = useState(template.spec.runtimeMinutesLimit ?? "");
@@ -726,6 +727,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
     });
     if (result.data && result.response?.status === 201) {
       setCurrentRevision(result.data.envelope.revision);
+      if (!create && !saveAsNew) setPreviousTools(dedupeToolGrants(result.data.envelope.spec.tools));
       setStatus("saved");
       if (create || saveAsNew) router.push(`/admin/envelopes/templates/${encodeURIComponent(templateId)}`);
       return;
@@ -812,7 +814,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
 
       <FormSection description="Only models supported by the inference gateway can be selected." title="Models"><fieldset><legend className="sr-only">Models</legend><TagSelect addPlaceholder="Add…" emptyPlaceholder="Search models…" inputDisabled={modelCatalog.length === 0} label="Models" onChange={(keys) => { setModels(keys.flatMap((key) => { const model = [...modelCatalog, ...missingModels].find((candidate) => modelKey(candidate) === key); return model ? [model] : []; })); clearFieldError("models"); }} options={modelOptions} value={models.map(modelKey)} /><FieldError message={fieldErrors.models} />{missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}</fieldset></FormSection>
 
-      <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Groups appear only when supplied as authoritative catalog metadata.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} previousTools={template.spec.tools} tools={tools} /><FieldError message={fieldErrors.tools} /></fieldset></FormSection>
+      <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Groups appear only when supplied as authoritative catalog metadata.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} previousTools={previousTools} tools={tools} /><FieldError message={fieldErrors.tools} /></fieldset></FormSection>
 
       <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
         <div className="space-y-4">

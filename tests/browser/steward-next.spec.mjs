@@ -2209,6 +2209,40 @@ test("administrator selects every grouped read tool as exact authority tuples", 
   }
 });
 
+test("successive template saves diff tools against the accepted prior revision", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    adminTemplateTools: [],
+    capabilityCatalogTools: groupedGithubTools,
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/developer`);
+    const tools = administrator.page.getByRole("group", { name: "Tools" });
+    const changes = tools.getByRole("region", { name: "Tool changes in next revision" });
+    const issuesRead = tools.getByRole("checkbox", { name: "github:issues_get:read" });
+    const repositoryRead = tools.getByRole("checkbox", { name: "github:repository_get:read" }).first();
+
+    await issuesRead.check();
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.filter((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer").length).toBe(1);
+    await expect(changes.getByText("No tool authority changes.", { exact: true })).toBeVisible();
+
+    await issuesRead.uncheck();
+    await repositoryRead.check();
+    await expect(changes.getByText("Added (1)", { exact: true })).toBeVisible();
+    await expect(changes.getByText("Removed (1)", { exact: true })).toBeVisible();
+
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.filter((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer").length).toBe(2);
+    const revisions = administrator.mutations
+      .filter((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")
+      .map((mutation) => mutation.body.envelope.revision);
+    expect(revisions).toEqual([adminEnvelope.revision + 1, adminEnvelope.revision + 2]);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
 test("administrator confirms write and destructive tools one at a time", async ({ browser }) => {
   const administrator = await guardedPage(browser, {
     adminTemplateTools: [],

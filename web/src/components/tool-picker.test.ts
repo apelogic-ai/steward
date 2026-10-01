@@ -15,13 +15,14 @@ describe("tool picker authority helpers", () => {
   test("uses only authoritative multi-membership toolsets and one deterministic fallback", () => {
     expect(groupCapabilityTools(tools).map((group) => ({
       authoritative: group.authoritative,
+      kind: group.kind,
       name: group.name,
       resources: group.tools.map((tool) => tool.resource),
     }))).toEqual([
-      { authoritative: true, name: "issues", resources: ["issues_get", "issues_update"] },
-      { authoritative: true, name: "repositories", resources: ["repository_get"] },
-      { authoritative: true, name: "search", resources: ["repository_get"] },
-      { authoritative: false, name: "Ungrouped", resources: ["repository_delete"] },
+      { authoritative: true, kind: "toolset", name: "issues", resources: ["issues_get", "issues_update"] },
+      { authoritative: true, kind: "toolset", name: "repositories", resources: ["repository_get"] },
+      { authoritative: true, kind: "toolset", name: "search", resources: ["repository_get"] },
+      { authoritative: false, kind: "fallback", name: "Ungrouped", resources: ["repository_delete"] },
     ]);
 
     expect(groupCapabilityTools(tools.map((tool) => ({
@@ -31,6 +32,23 @@ describe("tool picker authority helpers", () => {
       accessClass: tool.accessClass,
     }))))
       .toMatchObject([{ authoritative: false, name: "All tools" }]);
+  });
+
+  test("keeps an authoritative Ungrouped toolset distinct from the ungrouped fallback", () => {
+    const mixed: Array<CapabilityTool> = [
+      { provider: "github", resource: "authoritative", action: "read", accessClass: "read", toolsets: ["Ungrouped"] },
+      { provider: "github", resource: "legacy", action: "read", accessClass: "read" },
+    ];
+
+    expect(groupCapabilityTools(mixed).map((group) => ({
+      authoritative: group.authoritative,
+      kind: group.kind,
+      name: group.name,
+      resources: group.tools.map((tool) => tool.resource),
+    }))).toEqual([
+      { authoritative: true, kind: "toolset", name: "Ungrouped", resources: ["authoritative"] },
+      { authoritative: false, kind: "fallback", name: "No authoritative toolset", resources: ["legacy"] },
+    ]);
   });
 
   test("bulk selection adds only read tools and deduplicates exact authority tuples", () => {

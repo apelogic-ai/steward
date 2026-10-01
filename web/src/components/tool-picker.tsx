@@ -8,6 +8,8 @@ type ToolAccessClass = CapabilityTool["accessClass"];
 
 export type ToolGroup = {
   authoritative: boolean;
+  id: string;
+  kind: "fallback" | "toolset";
   name: string;
   tools: Array<CapabilityTool>;
 };
@@ -29,6 +31,15 @@ export function dedupeToolGrants(tools: ReadonlyArray<ToolGrant>): Array<ToolGra
   return [...byKey.values()].sort(compareTools);
 }
 
+function fallbackGroupName(authoritativeNames: ReadonlySet<string>): string {
+  if (!authoritativeNames.has("Ungrouped")) return "Ungrouped";
+  const base = "No authoritative toolset";
+  if (!authoritativeNames.has(base)) return base;
+  let suffix = 2;
+  while (authoritativeNames.has(`${base} (${suffix})`)) suffix += 1;
+  return `${base} (${suffix})`;
+}
+
 export function groupCapabilityTools(tools: ReadonlyArray<CapabilityTool>): Array<ToolGroup> {
   const sorted = [...tools].sort(compareTools);
   const groups = new Map<string, Array<CapabilityTool>>();
@@ -41,11 +52,23 @@ export function groupCapabilityTools(tools: ReadonlyArray<CapabilityTool>): Arra
     }
     for (const name of names) groups.set(name, [...(groups.get(name) ?? []), tool]);
   }
-  if (groups.size === 0) return [{ authoritative: false, name: "All tools", tools: sorted }];
-  const result = [...groups.entries()]
+  if (groups.size === 0) return [{ authoritative: false, id: "fallback:all", kind: "fallback", name: "All tools", tools: sorted }];
+  const result: Array<ToolGroup> = [...groups.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([name, groupTools]) => ({ authoritative: true, name, tools: groupTools }));
-  if (ungrouped.length > 0) result.push({ authoritative: false, name: "Ungrouped", tools: ungrouped });
+    .map(([name, groupTools]) => ({
+      authoritative: true,
+      id: JSON.stringify(["toolset", name]),
+      kind: "toolset" as const,
+      name,
+      tools: groupTools,
+    }));
+  if (ungrouped.length > 0) result.push({
+    authoritative: false,
+    id: "fallback:ungrouped",
+    kind: "fallback",
+    name: fallbackGroupName(new Set(groups.keys())),
+    tools: ungrouped,
+  });
   return result;
 }
 
@@ -125,7 +148,7 @@ export function ToolPicker({ catalog, missingTools, onChange, previousTools, too
       </label>
       <div className="space-y-4">
         {visibleGroups.map((group) => (
-          <section className="rounded-control border" key={group.name}>
+          <section className="rounded-control border" key={group.id}>
             <header className="flex flex-wrap items-center justify-between gap-2 border-b bg-subtle px-3 py-2">
               <h3 className="font-semibold">{group.name}</h3>
               {group.authoritative ? <div className="flex gap-2">
@@ -136,7 +159,7 @@ export function ToolPicker({ catalog, missingTools, onChange, previousTools, too
             <div className="divide-y divide-line-soft">
               {group.tools.map((tool) => {
                 const key = toolKey(tool);
-                return <label className="flex min-h-11 cursor-pointer items-center gap-3 px-3 py-2" key={`${group.name}:${key}`}>
+                return <label className="flex min-h-11 cursor-pointer items-center gap-3 px-3 py-2" key={`${group.id}:${key}`}>
                   <input checked={selected.has(key)} onChange={() => toggle(tool)} type="checkbox" />
                   <span className="min-w-0 flex-1 break-all font-mono text-sm">{toolLabel(tool)}</span>
                   <span className={`rounded-full px-2 py-0.5 text-xs font-semibold ${accessBadgeClass(tool.accessClass)}`}>{tool.accessClass}</span>
