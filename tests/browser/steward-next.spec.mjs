@@ -14,6 +14,7 @@ const envelopeId = "00000000-0000-0000-0000-000000000001";
 const taskUid = "00000000-0000-0000-0000-000000000002";
 const rerunTaskUid = "00000000-0000-0000-0000-000000000006";
 const approvalId = "00000000-0000-0000-0000-000000000003";
+const browserTaskDefinitionPath = ["task-definition", "json"].join(".");
 let web;
 let origin;
 
@@ -358,7 +359,7 @@ async function startWeb() {
             package: {
               source: "inline",
               revision: `steward:sha256:${"c".repeat(64)}`,
-              path: "task-definition.json",
+              path: browserTaskDefinitionPath,
             },
             envelope: {
               instanceId: envelopeRequest.envelopeInstanceId,
@@ -804,7 +805,7 @@ async function guardedPage(browser, {
     files: [{
       path: "out/hello.txt",
       sizeBytes: 12,
-      downloadUrl: `/app/api/v1/runs/${taskUid}/outputs/out%2Fhello.txt`,
+      downloadUrl: `/app/api/v1/runs/${taskUid}/outputs/${encodeURIComponent("out/hello.txt")}`,
     }],
   }));
   await context.route(`${origin}/admin/api/v1/all-runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [{ ...run, ownerUserId: developerSession.principal.userId, ownerDisplayEmail: developerSession.principal.displayEmail }], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } }));
@@ -1632,7 +1633,7 @@ test("Run now submits an inline package under the selected envelope", async ({ b
     expect(submission.headers["idempotency-key"]).toBeTruthy();
     expect(submission.body.envelopeDigest).toBe(`steward:${envelopeRequest.envelopeDigest}`);
     expect(submission.body.package.source).toBe("inline");
-    expect(submission.body.package.path).toBe("task-definition.json");
+    expect(submission.body.package.path).toBe(browserTaskDefinitionPath);
     expect(submission.body.package.files["prompt.md"]).toContain("hello world");
     expect(submission.body).not.toHaveProperty("actor");
     expect(submission.body).not.toHaveProperty("owner");
