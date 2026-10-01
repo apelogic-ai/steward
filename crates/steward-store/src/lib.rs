@@ -577,10 +577,32 @@ impl PgStore {
         self.publish_workflow(publication, true).await
     }
 
+    /// Append one exact Workflow revision if its immediate predecessor is current.
+    ///
+    /// System-owned catalog migrations use this boundary so concurrent apiserver startups cannot
+    /// accidentally append two revisions while converging on one reserved revision.
+    pub async fn publish_exact_workflow_revision(
+        &self,
+        publication: WorkflowPublication<'_>,
+        version: i64,
+    ) -> Result<WorkflowRevisionRecord, StoreError> {
+        self.publish_workflow_version(publication, false, Some(version))
+            .await
+    }
+
     async fn publish_workflow(
         &self,
         publication: WorkflowPublication<'_>,
         next: bool,
+    ) -> Result<WorkflowRevisionRecord, StoreError> {
+        self.publish_workflow_version(publication, next, None).await
+    }
+
+    async fn publish_workflow_version(
+        &self,
+        publication: WorkflowPublication<'_>,
+        next: bool,
+        exact_version: Option<i64>,
     ) -> Result<WorkflowRevisionRecord, StoreError> {
         if !valid_workflow_publication(&publication) {
             return Err(StoreError::InvalidWorkflow);
@@ -598,11 +620,30 @@ impl PgStore {
         .fetch_one(&mut *transaction)
         .await
         .map_err(database_error)?;
-        let version = match (next, current) {
-            (false, None) => 1,
-            (false, Some(_)) => return Err(StoreError::WorkflowAlreadyExists),
-            (true, None) => return Err(StoreError::WorkflowNotFound),
-            (true, Some(version)) => version.checked_add(1).ok_or(StoreError::InvalidWorkflow)?,
+        let version = match exact_version {
+            Some(version) if version > 0 => {
+                let expected = current
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or(StoreError::InvalidWorkflow)?;
+                if expected != version {
+                    return Err(if current.is_some_and(|current| current >= version) {
+                        StoreError::WorkflowAlreadyExists
+                    } else {
+                        StoreError::WorkflowNotFound
+                    });
+                }
+                version
+            }
+            Some(_) => return Err(StoreError::InvalidWorkflow),
+            None => match (next, current) {
+                (false, None) => 1,
+                (false, Some(_)) => return Err(StoreError::WorkflowAlreadyExists),
+                (true, None) => return Err(StoreError::WorkflowNotFound),
+                (true, Some(version)) => {
+                    version.checked_add(1).ok_or(StoreError::InvalidWorkflow)?
+                }
+            },
         };
         let row = sqlx::query(
             "INSERT INTO workflow_revisions \
