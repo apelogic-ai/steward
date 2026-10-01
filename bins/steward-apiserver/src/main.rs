@@ -169,6 +169,9 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let task_execution_bindings_json = configured_execution_bindings_json()?;
     let source_repository_bindings_json = configured_source_repository_bindings_json()?;
     let github_source = configured_github_source_adapter()?;
+    let task_auth_discovery = configured_task_identity
+        .discovery
+        .map(|config| config.with_direct_packages_supported(github_source.is_some()));
     let task_execution_bindings_active = execution_bindings_active().map_err(io::Error::other)?;
     let mut task_api_config =
         TaskApiConfig::new(task_mcp_gateway_endpoint).map_err(io::Error::other)?;
@@ -221,9 +224,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         decisions.clone(),
     )
     .merge(operator_admin::router(store.clone(), authenticator))
-    .merge(task_auth_discovery_router(
-        configured_task_identity.discovery,
-    ))
+    .merge(task_auth_discovery_router(task_auth_discovery))
     .merge(task_router(
         store.clone(),
         task_identities,

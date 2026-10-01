@@ -288,6 +288,17 @@ when it changes. Repository names remain audit metadata and cannot substitute
 for these IDs. The deployment adapter resolves and maintains the approved
 GitHub API CIDRs; the portable chart opens HTTPS egress only to those entries.
 
+An in-repository Task package therefore requires all of the following before
+submission: `githubSource.enabled=true`, a read-only Contents GitHub App
+installed on the invoking repository, the referenced Secret, and nonempty
+`networkPolicy.githubApiCidrs` when NetworkPolicy is enabled. A package in the
+invoking repository needs no cross-repository binding. A package in another
+repository additionally needs its exact caller/source ID pair in
+`githubSource.bindings`. When protected-resource discovery is configured, it
+advertises the resulting capability as `steward_direct_packages_supported`;
+when the value is false, a direct submission returns
+`task.direct_package_source_disabled` without reserving a Task.
+
 ## Governed provider connections
 
 `connectionsBridge` is disabled by default. Enabling it requires browser

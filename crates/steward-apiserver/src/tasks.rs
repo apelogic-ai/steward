@@ -51,7 +51,8 @@ use crate::WorkflowReference;
 use crate::execution_bindings::ExecutionBindingCatalog;
 use crate::task_auth::{FEDERATED_TASK_TOKEN_CONTRACT, LEGACY_TASK_TOKEN_CONTRACT};
 use crate::{
-    AdmissionLedger, ApiError, BoxFuture, KubernetesTokenReviewAudience,
+    AdmissionLedger, ApiError, BoxFuture, DIRECT_PACKAGE_SOURCE_DISABLED_CODE,
+    DIRECT_PACKAGE_SOURCE_DISABLED_REASON, KubernetesTokenReviewAudience,
     authenticated_token_review_user, spec_digest, token_review_request,
 };
 
@@ -92,6 +93,7 @@ struct SourceRepositoryIdentity {
 }
 
 type SourceRepositoryBindingKey = (String, String, String, String);
+type TaskSubmissionFailureReporter = Arc<dyn Fn(&str) + Send + Sync>;
 
 fn versioned_workflow_reference(
     workflow: &str,
@@ -173,6 +175,7 @@ pub struct TaskApiConfig {
     orchestration_mode: TaskOrchestrationMode,
     direct_git_resolver: Option<Arc<dyn DirectGitResolver>>,
     source_repository_bindings: BTreeSet<SourceRepositoryBindingKey>,
+    failure_reporter: TaskSubmissionFailureReporter,
 }
 
 impl Default for TaskApiConfig {
@@ -185,6 +188,7 @@ impl Default for TaskApiConfig {
             orchestration_mode: TaskOrchestrationMode::Staged,
             direct_git_resolver: None,
             source_repository_bindings: BTreeSet::new(),
+            failure_reporter: Arc::new(|line| eprintln!("{line}")),
         }
     }
 }
@@ -258,6 +262,18 @@ impl TaskApiConfig {
     {
         self.direct_git_resolver = Some(Arc::new(resolver));
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_failure_reporter(mut self, reporter: TaskSubmissionFailureReporter) -> Self {
+        self.failure_reporter = reporter;
+        self
+    }
+
+    fn report_direct_package_source_disabled(&self) {
+        (self.failure_reporter)(&format!(
+            "task submission rejected code={DIRECT_PACKAGE_SOURCE_DISABLED_CODE} failureReason={DIRECT_PACKAGE_SOURCE_DISABLED_REASON}"
+        ));
     }
 
     pub fn with_source_repository_bindings_json(
@@ -1485,6 +1501,8 @@ pub enum TaskAdmissionDelta {
 #[serde(rename_all = "camelCase")]
 pub struct TaskErrorResponse {
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -1785,6 +1803,10 @@ where
         request: &DirectTaskSubmission,
     ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
         request.validate().map_err(ApiError::Admission)?;
+        if self.config.direct_git_resolver.is_none() {
+            self.config.report_direct_package_source_disabled();
+            return Err(ApiError::DirectPackageSourceDisabled);
+        }
         let existing = self
             .ledger
             .task_by_idempotency(
