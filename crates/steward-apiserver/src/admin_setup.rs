@@ -789,6 +789,23 @@ mod tests {
         assert_eq!(status.checks[5].status, AdminSetupCheckStatus::Unknown);
         assert!(status.checks[5].detail.contains("no GitHub-ratified"));
 
+        let successful_versioned_workflow = build_status(
+            &config,
+            SetupFacts {
+                active_other_members: 1,
+                member_ready_templates: 1,
+                connection_start_duration_ms: Some(1_000),
+                latest_github_submission_error_category: None,
+                unassociated_github_actors: 0,
+                direct_packages_used: false,
+                has_successful_github_submission: true,
+            },
+        );
+        assert_eq!(
+            successful_versioned_workflow.checks[5].status,
+            AdminSetupCheckStatus::Ready
+        );
+
         let direct_packages = build_status(
             &config,
             SetupFacts {

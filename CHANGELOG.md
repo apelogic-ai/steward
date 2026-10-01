@@ -21,9 +21,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   checks for orchestration bindings, administrator-scoped GitHub Connect,
   capability-catalog coverage, member-ready templates, active members, and
   optional GitHub Actions automation. Automation readiness uses only durable
-  GitHub-ratified Task provenance, and `githubSource` is required only after
-  direct-package use. The guide refreshes after each read settles without an
-  apiserver restart and can be hidden or restored per browser.
+  GitHub-ratified Task provenance persisted for both versioned workflows and
+  direct packages, and `githubSource` is required only after direct-package use.
+  The guide refreshes after each read settles without an apiserver restart and
+  can be hidden or restored per browser. Migration 0056 backfills direct-package
+  provenance; historical versioned Workflow rows remain unknown because their
+  discarded identity evidence cannot be reconstructed safely.
 - Added opt-in MCP-GW connection-status v2 consumption and default-on GitHub
   Connect association for `steward-task-v3`, matching only the immutable numeric
   GitHub account ID and recording connection-verification evidence in additive

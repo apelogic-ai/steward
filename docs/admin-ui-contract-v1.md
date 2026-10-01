@@ -166,11 +166,14 @@ submission. The check links to installation guidance and retains only the
 latest bounded error from an owner-scoped Task with durable GitHub-ratified
 source provenance. GitHub Actions automation is ready only after at least one
 such Task has durably succeeded; unrelated Tasks are not evidence. Versioned
-workflow-only installations do not require the direct-package `githubSource`
-adapter. When no ratified Task exists and no bounded ratified failure is
-recorded, the status is `unknown`: authentication or policy failures before
-Task reservation leave no AgentRun record and therefore cannot truthfully be
-reported as ready.
+workflow reservations persist the authenticated provenance independently of
+direct-package binding evidence, so versioned-workflow-only installations can
+become ready without the direct-package `githubSource` adapter. Historical
+versioned Tasks without that evidence remain unknown rather than being inferred
+from submitter names. When no ratified Task exists and no bounded ratified
+failure is recorded, the status is `unknown`: authentication or policy failures
+before Task reservation leave no AgentRun record and therefore cannot truthfully
+be reported as ready.
 
 `GET /app/api/v1/connections` returns connected providers and the available
 provider catalog. GitHub is enabled; unavailable providers remain explicit and
