@@ -942,6 +942,8 @@ mod tests {
                     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         .to_owned(),
                 reviewed_release: release,
+                workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
+                task_identity_discovery_enabled: false,
             },
         )
         .map_err(|error| format!("versioned workflow failed to render: {error}"))?;
