@@ -1,6 +1,6 @@
 # Steward GitHub Actions generator contract
 
-Status: current Steward v0.3.3 renderer and browser integration
+Status: unreleased contract targeting the Steward v0.3.6 renderer and browser integration
 
 The generator turns one authoritative Steward envelope selection and one bounded task template
 into workflow YAML that a developer may inspect, copy, commit, and dispatch. It never selects a
@@ -42,19 +42,21 @@ Steward source does not select a steward-run release. Release/integration
 packaging verifies steward-run's signed release handoff, records its exact
 coordinates in the installation BOM, and supplies that object through
 `config.apiserver.stewardRunRelease`. The object contains OSS release-manifest
-schema 3, semantic version, reusable-workflow repository and commit, action commit, and
-governed job-container digest. The generator requires structurally immutable
-coordinates and steward-run v0.7.0 or later.
+schema 3, semantic version, reusable-workflow repository and commit, and action
+commit. The versioned generator requires structurally immutable coordinates and
+steward-run v0.7.0 or later. The deprecated `governedJobContainerImage` field
+remains accepted, but the versioned generator does not emit or consume it.
 
 The committed golden workflow uses reserved example coordinates. It tests
 deterministic rendering and is not an installation BOM or a deployable pin.
 
 The reusable workflow, not the caller, pins the remote action and owns the six-operation Task
 lifecycle and unconditional finalization. The generated caller retains only `contents: read` and
-`id-token: write` on the governed job. Seed and verification jobs have only `contents: read`, run
-inside the same immutable container on the configured ARC runner, and use full-SHA artifact action
-references. There is no checkout, PAT, GitHub App token, deploy key, long-lived bearer token, or
-caller-selected job container.
+`id-token: write` on the governed job. The versioned caller's preparation and verification jobs
+have only `contents: read`, run directly on the configured runner, and use full-SHA artifact action
+references. There is no PAT, GitHub App token, deploy key, long-lived bearer token, or
+caller-selected job container. The lower-level v1 smoke renderer still requires the optional
+governed job image because its seed and verification jobs explicitly emit that container.
 
 Repository administrators provide these non-secret Actions variables:
 

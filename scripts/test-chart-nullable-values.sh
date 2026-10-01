@@ -40,6 +40,7 @@ browser_values=(
 )
 valid_custom_ceiling='{"revision":7,"spec":{"budget":{"currency":"USD","monthlyLimit":"25.00","singleRunLimit":"5.00"},"llms":[{"model":"gpt-5.4","provider":"openai"}],"runner":{"compute":"4","memory":"8Gi","platforms":["linux"],"storage":"20Gi"},"runtimeMinutesLimit":"45","tools":[{"action":"read","provider":"github","resource":"actions_get"}],"ttl":"4h"}}'
 valid_steward_run_release='{"actionCommit":"4444444444444444444444444444444444444444","governedJobContainerImage":"registry.example.test/steward-run@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","manifestSchemaVersion":3,"version":"0.7.0","workflowCommit":"3333333333333333333333333333333333333333","workflowRepository":"example-org/steward-run"}'
+valid_steward_run_release_without_image='{"actionCommit":"4444444444444444444444444444444444444444","manifestSchemaVersion":3,"version":"0.7.0","workflowCommit":"3333333333333333333333333333333333333333","workflowRepository":"example-org/steward-run"}'
 
 render_chart() {
   local chart_path="$1"
@@ -118,6 +119,12 @@ fi
 render_chart "${chart}" "${browser_values[@]}" \
   --set-json "config.apiserver.stewardRunRelease=${valid_steward_run_release}" > "${rendered}"
 assert_exact_json_environment STEWARD_RUN_RELEASE_JSON "${valid_steward_run_release}" "${rendered}"
+
+# The active versioned workflow generator does not use a governed job container image.
+render_chart "${chart}" "${browser_values[@]}" \
+  --set-json "config.apiserver.stewardRunRelease=${valid_steward_run_release_without_image}" > "${rendered}"
+assert_exact_json_environment \
+  STEWARD_RUN_RELEASE_JSON "${valid_steward_run_release_without_image}" "${rendered}"
 
 if render_chart "${chart}" \
   --set-json 'config.apiserver.stewardRunRelease={"manifestSchemaVersion":3}' \

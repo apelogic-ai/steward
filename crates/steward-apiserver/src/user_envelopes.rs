@@ -1256,10 +1256,10 @@ mod tests {
                 workflow_repository: "example-org/steward-run".to_owned(),
                 workflow_commit: "3333333333333333333333333333333333333333".to_owned(),
                 action_commit: "4444444444444444444444444444444444444444".to_owned(),
-                governed_job_container_image: format!(
+                governed_job_container_image: Some(format!(
                     "registry.example.test/steward-run@sha256:{}",
                     "a".repeat(64)
-                ),
+                )),
             })
         }
 

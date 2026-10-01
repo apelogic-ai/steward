@@ -624,8 +624,7 @@
                 "version",
                 "workflowRepository",
                 "workflowCommit",
-                "actionCommit",
-                "governedJobContainerImage"
+                "actionCommit"
               ],
               "properties": {
                 "manifestSchemaVersion": {"const": 3},

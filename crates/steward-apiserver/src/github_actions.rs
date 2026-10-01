@@ -29,7 +29,8 @@ pub struct StewardRunRelease {
     pub workflow_repository: String,
     pub workflow_commit: String,
     pub action_commit: String,
-    pub governed_job_container_image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governed_job_container_image: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -253,6 +254,10 @@ pub fn render_github_actions_workflow(
 ) -> Result<GeneratedGithubActionsWorkflow, GithubActionsRenderError> {
     validate_request(request, context)?;
     let release = &request.release;
+    let governed_job_container_image = release
+        .governed_job_container_image
+        .as_deref()
+        .ok_or(GithubActionsRenderError::UnreviewedRelease)?;
     let template = &request.task_template;
     let envelope = &request.envelope;
     let yaml = [
@@ -275,7 +280,7 @@ pub fn render_github_actions_workflow(
         format!("# steward-run-action-commit: {}", release.action_commit),
         format!(
             "# governed-job-container: {}",
-            release.governed_job_container_image
+            governed_job_container_image
         ),
         String::new(),
         "name: Steward governed GitHub file read".to_owned(),
@@ -291,7 +296,7 @@ pub fn render_github_actions_workflow(
         "    runs-on: ${{ vars.STEWARD_RUNNER_LABEL }}".to_owned(),
         "    timeout-minutes: 5".to_owned(),
         "    container:".to_owned(),
-        format!("      image: {}", release.governed_job_container_image),
+        format!("      image: {governed_job_container_image}"),
         "    permissions:".to_owned(),
         "      contents: read".to_owned(),
         "    steps:".to_owned(),
@@ -350,7 +355,7 @@ pub fn render_github_actions_workflow(
         "    runs-on: ${{ vars.STEWARD_RUNNER_LABEL }}".to_owned(),
         "    timeout-minutes: 5".to_owned(),
         "    container:".to_owned(),
-        format!("      image: {}", release.governed_job_container_image),
+        format!("      image: {governed_job_container_image}"),
         "    permissions:".to_owned(),
         "      contents: read".to_owned(),
         "    steps:".to_owned(),
@@ -434,6 +439,7 @@ fn validate_request(
     }
     validate_envelope(&context.current_envelope)?;
     validate_release(&context.reviewed_release)?;
+    validate_legacy_job_container(&context.reviewed_release)?;
     if request.envelope != context.current_envelope {
         return Err(GithubActionsRenderError::StaleEnvelope);
     }
@@ -497,7 +503,19 @@ fn validate_release(release: &StewardRunRelease) -> Result<(), GithubActionsRend
         || !valid_repository(&release.workflow_repository)
         || !valid_full_sha(&release.workflow_commit)
         || !valid_full_sha(&release.action_commit)
-        || !valid_immutable_image(&release.governed_job_container_image)
+    {
+        return Err(GithubActionsRenderError::UnreviewedRelease);
+    }
+    Ok(())
+}
+
+fn validate_legacy_job_container(
+    release: &StewardRunRelease,
+) -> Result<(), GithubActionsRenderError> {
+    if !release
+        .governed_job_container_image
+        .as_deref()
+        .is_some_and(valid_immutable_image)
     {
         return Err(GithubActionsRenderError::UnreviewedRelease);
     }
@@ -716,7 +734,7 @@ mod tests {
             workflow_repository: "example-org/steward-run".to_owned(),
             workflow_commit: WORKFLOW_COMMIT.to_owned(),
             action_commit: ACTION_COMMIT.to_owned(),
-            governed_job_container_image: JOB_CONTAINER.to_owned(),
+            governed_job_container_image: Some(JOB_CONTAINER.to_owned()),
         }
     }
 
@@ -727,7 +745,7 @@ mod tests {
             workflow_repository: "example-org/steward-run".to_owned(),
             workflow_commit: VERSIONED_WORKFLOW_COMMIT.to_owned(),
             action_commit: VERSIONED_ACTION_COMMIT.to_owned(),
-            governed_job_container_image: JOB_CONTAINER.to_owned(),
+            governed_job_container_image: Some(JOB_CONTAINER.to_owned()),
         }
     }
 
@@ -750,6 +768,41 @@ mod tests {
             Err("steward-run 0.7.0 or later is required for envelopeDigest".to_owned())
         );
         Ok(())
+    }
+
+    #[test]
+    fn installation_bom_release_allows_omitting_the_unused_governed_job_image() -> Result<(), String>
+    {
+        let release = format!(
+            r#"{{"manifestSchemaVersion":3,"version":"0.7.0","workflowRepository":"example-org/steward-run","workflowCommit":"{VERSIONED_WORKFLOW_COMMIT}","actionCommit":"{VERSIONED_ACTION_COMMIT}"}}"#
+        );
+        let release = steward_run_release_from_installation_bom(&release)?;
+        render_versioned_github_actions_workflow(
+            "repository-review@1",
+            &VersionedGithubActionsWorkflowContext {
+                envelope: envelope(),
+                workflow_name: "repository-review".to_owned(),
+                workflow_version: 1,
+                workflow_digest:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_owned(),
+                reviewed_release: release,
+            },
+        )
+        .map_err(|error| format!("versioned workflow failed to render: {error}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_renderer_still_requires_its_emitted_governed_job_image() {
+        let mut request = request();
+        request.release.governed_job_container_image = None;
+        let mut context = context();
+        context.reviewed_release.governed_job_container_image = None;
+        assert_eq!(
+            render_github_actions_workflow(&request, &context),
+            Err(GithubActionsRenderError::UnreviewedRelease)
+        );
     }
 
     fn request() -> GithubActionsRenderRequest {
@@ -837,9 +890,22 @@ mod tests {
 
         let mut different_container = request();
         different_container.release.governed_job_container_image =
-            "example.invalid/steward-run:latest".to_owned();
+            Some("example.invalid/steward-run:latest".to_owned());
         assert_eq!(
             render_github_actions_workflow(&different_container, &context()),
+            Err(GithubActionsRenderError::UnreviewedRelease)
+        );
+
+        let mut mutable_container_request = request();
+        mutable_container_request
+            .release
+            .governed_job_container_image = Some("example.invalid/steward-run:latest".to_owned());
+        let mut mutable_container_context = context();
+        mutable_container_context
+            .reviewed_release
+            .governed_job_container_image = Some("example.invalid/steward-run:latest".to_owned());
+        assert_eq!(
+            render_github_actions_workflow(&mutable_container_request, &mutable_container_context),
             Err(GithubActionsRenderError::UnreviewedRelease)
         );
     }

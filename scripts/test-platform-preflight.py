@@ -260,6 +260,29 @@ class PlatformPreflightTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("stewardRunRelease.manifestSchemaVersion must equal 3", result.stderr)
 
+    def test_accepts_steward_run_release_without_unused_governed_job_image(self) -> None:
+        self.assertNotIn("governedJobContainerImage", self.input["stewardRunRelease"])
+        result = self.run_validate(self.input)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_legacy_governed_job_image_when_present(self) -> None:
+        self.input["stewardRunRelease"]["governedJobContainerImage"] = (
+            "registry.example.test/steward-run@sha256:" + "a" * 64
+        )
+        result = self.run_validate(self.input)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_mutable_legacy_governed_job_image_when_present(self) -> None:
+        self.input["stewardRunRelease"]["governedJobContainerImage"] = (
+            "registry.example.test/steward-run:latest"
+        )
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "stewardRunRelease.governedJobContainerImage must be an immutable sha256 image",
+            result.stderr,
+        )
+
     def test_rejects_steward_run_repository_components_rejected_by_runtime(self) -> None:
         for repository in ("./steward-run", "example-org/.."):
             with self.subTest(repository=repository):

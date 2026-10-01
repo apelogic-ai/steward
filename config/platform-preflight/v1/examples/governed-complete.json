@@ -44,7 +44,7 @@
   "capabilityCatalog": {"schemaVersion": "steward.capability-catalog/v2", "models": [{"provider": "litellm", "model": "gpt-5.4"}], "tools": [{"provider": "github", "resource": "actions_get", "action": "read", "accessClass": "read"}], "catalogs": [{"provider": "github", "catalogId": "github-tools", "version": "1.6.0", "available": true}]},
   "networkPolicy": {"kubeApiCidrs": ["192.0.2.10/32"], "postgresCidrs": ["192.0.2.20/32"]},
   "browserAuth": {"clientId": "example.apps.example.com", "workspaceDomain": "example.com", "organizationId": "org_example", "clientSecretName": "steward-browser-auth", "clientSecretKey": "client-secret", "egressCidrs": ["192.0.2.0/24"]},
-  "stewardRunRelease": {"manifestSchemaVersion": 3, "version": "0.7.0", "workflowRepository": "example-org/steward-run", "workflowCommit": "1111111111111111111111111111111111111111", "actionCommit": "2222222222222222222222222222222222222222", "governedJobContainerImage": "registry.example.test/team-a/steward-run@sha256:7777777777777777777777777777777777777777777777777777777777777777"},
+  "stewardRunRelease": {"manifestSchemaVersion": 3, "version": "0.7.0", "workflowRepository": "example-org/steward-run", "workflowCommit": "1111111111111111111111111111111111111111", "actionCommit": "2222222222222222222222222222222222222222"},
   "apiTlsSecretName": "steward-apiserver-tls",
   "webhookTlsSecretName": "steward-webhook-tls"
 }

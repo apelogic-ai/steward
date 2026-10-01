@@ -94,11 +94,13 @@ exact:
 | `workflowRepository` | `workflowRepository` |
 | `workflowCommit` | `workflowCommit` |
 | `actionCommit` | `actionCommit` |
-| `image` | `governedJobContainerImage` |
 
 For the v0.7.0 handoff, `schemaVersion` is the JSON number `3`. This normalized
 projection renames fields but must not select different coordinates from the
-signed BOM.
+signed BOM. The active versioned workflow does not run caller jobs in a
+steward-run image, so the image coordinate is not part of this projection.
+Existing values may retain `governedJobContainerImage` for compatibility with
+the lower-level v1 smoke renderer.
 
 ## Stable runtime contracts
 
