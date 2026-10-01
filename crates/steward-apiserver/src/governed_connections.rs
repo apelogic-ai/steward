@@ -827,6 +827,7 @@ where
                 .await?;
             Ok(ReservedConnectionStart {
                 operation_id: record.operation_id,
+                poll_deadline_at: record.response_deadline_at,
             })
         })
     }

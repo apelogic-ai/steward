@@ -1167,6 +1167,10 @@ export type StableProviderId = string;
 export type StartConnectionAcceptedResponse = {
     apiVersion: string;
     operationId: string;
+    /**
+     * Server-owned deadline after which the browser must stop polling.
+     */
+    pollDeadlineAt: string;
     provider: string;
 };
 

@@ -134,14 +134,15 @@ remains the authority for exact deltas and Envelope revisions.
 provider catalog. GitHub is enabled; unavailable providers remain explicit and
 disabled. Provider `start` and `disconnect` mutations are browser-session and
 CSRF scoped. A successful `POST /app/api/v1/connections/{provider}/start`
-returns HTTP 202 with an opaque operation identifier and no provider URL. The
-browser polls
+returns HTTP 202 with an opaque operation identifier, the server-owned
+`pollDeadlineAt`, and no provider URL. The browser polls
 `GET /app/api/v1/connections/{provider}/operations/{operation_id}`: pending
 operations return HTTP 202, while a completed operation returns HTTP 200 with
 either the one-time authorization URL or a bounded terminal failure. Operation
 reads are exact-owner scoped and use HTTP 404 for absent, foreign, or
 provider-mismatched identifiers. The browser aborts the poll when its view is
-replaced or unmounted and never persists the authorization URL. The onboarding
+replaced, unmounted, or reaches the advertised deadline; a deadline leaves an
+actionable retry state. It never persists the authorization URL. The onboarding
 aggregate composes connection, Envelope, workflow,
 and run evidence; dismissal and the explicit "I added the workflow"
 acknowledgement are server-side preferences. When browser surfaces are enabled

@@ -27,6 +27,13 @@ describe("governed provider connection controls", () => {
     expect(source).toContain("signal: controller.signal");
   });
 
+  test("bounds a perpetually pending operation by the server deadline", () => {
+    expect(source).toContain("result.data.pollDeadlineAt");
+    expect(source).toContain("MAX_CONNECTION_POLL_MS");
+    expect(source).toContain('setAction("poll-expired")');
+    expect(source).toContain("Authorization did not become ready in time. Retry the connection");
+  });
+
   test("shows the bounded terminal connection failure category", () => {
     expect(source).toContain("GitHub authorization failed");
     expect(source).toContain("startFailure.error");

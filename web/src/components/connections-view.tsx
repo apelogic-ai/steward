@@ -18,6 +18,8 @@ import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspac
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
+const MAX_CONNECTION_POLL_MS = 60_000;
+
 export function ConnectionsView() {
   const [generation, setGeneration] = useState(0);
   const load = useCallback(() => {
@@ -46,7 +48,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
   const session = useSession();
   const startController = useRef<AbortController | null>(null);
   const [disconnectOpen, setDisconnectOpen] = useState(false);
-  const [action, setAction] = useState<"idle" | "working" | ConnectionMutationState>("idle");
+  const [action, setAction] = useState<"idle" | "working" | "poll-expired" | ConnectionMutationState>("idle");
   const [startFailure, setStartFailure] = useState<ConnectionOperationErrorResponse | null>(null);
   const status = connection?.status;
   const health = status ? connectionHealth(status) : undefined;
@@ -63,13 +65,29 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
     setAction("working");
     setStartFailure(null);
     const provider = connection?.provider ?? "github";
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       const result = await startProviderConnection({ body: {}, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { provider }, signal: controller.signal });
-      if (result.response?.status !== 202 || !result.data?.operationId) {
+      if (result.response?.status !== 202 || !result.data?.operationId || !result.data.pollDeadlineAt) {
         setStartFailure(connectionOperationError(result.error));
         setAction(classifyConnectionMutationFailure(result.response?.status, result.error));
         return;
       }
+      const pollDeadline = boundedConnectionPollDeadline(result.data.pollDeadlineAt);
+      if (pollDeadline === null) {
+        setAction("error");
+        return;
+      }
+      const expirePoll = () => {
+        if (startController.current !== controller || controller.signal.aborted) return;
+        setAction("poll-expired");
+        controller.abort();
+      };
+      if (pollDeadline <= Date.now()) {
+        expirePoll();
+        return;
+      }
+      deadlineTimer = setTimeout(expirePoll, pollDeadline - Date.now());
       while (!controller.signal.aborted) {
         const operation = await getProviderConnectionStartOperation({ cache: "no-store", credentials: "same-origin", path: { provider, operation_id: result.data.operationId }, signal: controller.signal });
         if (operation.data?.state === "succeeded" && operation.data.authorizationUrl) {
@@ -96,6 +114,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
     } catch {
       if (!controller.signal.aborted) setAction("error");
     } finally {
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
       if (startController.current === controller) startController.current = null;
     }
   }
@@ -128,10 +147,16 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
         <dl className="grid gap-3 text-sm sm:grid-cols-2"><div><dt className="text-xs font-semibold text-muted-ink">Active credential expires</dt><dd className="mt-1">{status?.activeCredentialExpiresAt ?? "Not reported"}</dd></div><div><dt className="text-xs font-semibold text-muted-ink">Renewal credential expires</dt><dd className="mt-1">{status?.renewalCredentialExpiresAt ?? "Not reported"}</dd></div></dl>
         {!status ? <p className="text-sm text-muted-ink">Connection metadata is not currently available. Authorization can still be started safely.</p> : null}
         {status?.phase === "connected" ? reauthorizationRecommended ? <button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">Re-authorize GitHub</button> : null : <button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">{!status ? "Authorize / re-authorize GitHub" : status.phase === "reauth_required" || status.phase === "unavailable" ? "Re-authorize GitHub" : "Connect GitHub"}</button>}
-        {action !== "idle" && action !== "working" ? <p className="text-sm text-err" role="alert">{action !== "orchestration-not-active" && startFailure ? `GitHub authorization failed (${startFailure.error})${startFailure.detail ? `: ${startFailure.detail}` : "."}` : { "orchestration-not-active": "Connections are disabled until task orchestration is active (stage 2).", "oauth-pending": "Finish or wait for the pending GitHub authorization before disconnecting.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "Rust rejected the connection action.", forbidden: "The Rust authorization boundary rejected the connection action.", unavailable: "The authoritative connection service is unavailable.", error: "The server-owned connection action could not be completed." }[action]}</p> : null}
+        {action !== "idle" && action !== "working" ? <p className="text-sm text-err" role="alert">{action !== "orchestration-not-active" && startFailure ? `GitHub authorization failed (${startFailure.error})${startFailure.detail ? `: ${startFailure.detail}` : "."}` : { "orchestration-not-active": "Connections are disabled until task orchestration is active (stage 2).", "oauth-pending": "Finish or wait for the pending GitHub authorization before disconnecting.", "poll-expired": "Authorization did not become ready in time. Retry the connection; if it continues, contact an administrator.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "Rust rejected the connection action.", forbidden: "The Rust authorization boundary rejected the connection action.", unavailable: "The authoritative connection service is unavailable.", error: "The server-owned connection action could not be completed." }[action]}</p> : null}
       </div>
     </SectionCard>
   );
+}
+
+function boundedConnectionPollDeadline(value: string): number | null {
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.min(parsed, Date.now() + MAX_CONNECTION_POLL_MS);
 }
 
 function waitForConnectionPoll(signal: AbortSignal): Promise<boolean> {

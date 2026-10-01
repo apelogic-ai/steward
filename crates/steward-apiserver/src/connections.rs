@@ -132,6 +132,8 @@ pub(crate) struct StartConnectionAcceptedResponse {
     provider: &'static str,
     #[schema(value_type = String, format = "uuid")]
     operation_id: Uuid,
+    /// Server-owned deadline after which the browser must stop polling.
+    poll_deadline_at: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -207,6 +209,7 @@ pub struct StartedConnection {
 
 pub struct ReservedConnectionStart {
     pub operation_id: Uuid,
+    pub poll_deadline_at: String,
 }
 
 pub enum ConnectionStartOperation {
@@ -408,6 +411,7 @@ where
                 api_version: CONNECTIONS_API_VERSION,
                 provider: "github",
                 operation_id: reserved.operation_id,
+                poll_deadline_at: reserved.poll_deadline_at,
             }),
         )
             .into_response(),
@@ -921,6 +925,7 @@ mod tests {
                 ));
                 Ok(ReservedConnectionStart {
                     operation_id: Uuid::from_u128(1),
+                    poll_deadline_at: "2026-09-01T12:00:30Z".to_owned(),
                 })
             })
         }
@@ -1141,6 +1146,7 @@ mod tests {
         assert_eq!(value["apiVersion"], CONNECTIONS_API_VERSION);
         assert_eq!(value["provider"], "github");
         assert_eq!(value["operationId"], Uuid::from_u128(1).to_string());
+        assert_eq!(value["pollDeadlineAt"], "2026-09-01T12:00:30Z");
         assert!(value.get("authorizationUrl").is_none());
         let serialized = String::from_utf8_lossy(&body).to_lowercase();
         for forbidden in ["alice@example.com", "usr_", "session-a", "token", "secret"] {

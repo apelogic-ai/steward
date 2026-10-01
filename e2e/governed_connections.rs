@@ -245,6 +245,13 @@ impl Harness {
         self.start_reconciler();
     }
 
+    async fn stop_reconciler(&mut self) {
+        if let Some(reconciler) = self.reconciler.take() {
+            reconciler.abort();
+            let _ = reconciler.await;
+        }
+    }
+
     fn broker_for_mode(
         &self,
         artifact_trust_mode: &str,
@@ -1041,23 +1048,22 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     );
 
     let start_count = harness.operation_count(&alice_id, "start").await?;
+    harness.stop_reconciler().await;
     let reserved = connection_result(broker.start(&alice).await)?;
     let start_operation = harness
         .latest_operation(&alice_id, "start", start_count)
         .await?;
     assert_eq!(reserved.operation_id, start_operation);
-    let operation_state: String = sqlx::query_scalar(
-        "SELECT operation_state FROM connection_operations WHERE operation_id = $1",
-    )
-    .bind(start_operation)
-    .fetch_one(&harness.database)
-    .await?;
     assert!(
-        matches!(operation_state.as_str(), "queued" | "provisioning" | "running"),
-        "start must return before the governed bridge completes; observed {operation_state}"
+        matches!(
+            connection_result(broker.start_operation(&alice, start_operation).await)?,
+            Some(ConnectionStartOperation::Pending)
+        ),
+        "reservation must return while the deliberately stopped reconciler cannot complete it"
     );
     let (bridge_workspace, bridge_sandbox, bridge_uid) =
         harness.capture_bridge_refs(start_operation).await?;
+    harness.start_reconciler();
     let started = connection_result(wait_start_operation(&broker, &alice, start_operation).await)?;
     harness
         .wait_operation_finalized(start_operation, Duration::from_secs(90))

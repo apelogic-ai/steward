@@ -180,14 +180,15 @@ currently supported, tested controller line for this chart. The chart does not
 install Gateway API CRDs or a controller.
 
 Connection start is asynchronous: its POST returns HTTP 202 with an operation
-identifier, and the browser polls an owner-scoped resource until authorization
-can continue. It therefore does not require a long-lived edge request while
-the governed runtime starts. Other synchronous connection mutations may still
-spend up to 40 seconds in Steward after runtime provisioning begins, so the
-public edge must allow at least 60 seconds for those requests (60–90 seconds is
-the recommended operator range). Configure that timeout on the platform-owned
-Gateway policy because the portable Steward chart does not own the
-controller-specific policy.
+identifier and server-owned polling deadline. The browser polls an owner-scoped
+resource until authorization can continue, then stops with a retry action if
+the deadline passes. It therefore does not require a long-lived edge request
+while the governed runtime starts. Other synchronous connection mutations may
+still spend up to 40 seconds in Steward after runtime provisioning begins, so
+the public edge must allow at least 60 seconds for those requests (60–90
+seconds is the recommended operator range). Configure that timeout on the
+platform-owned Gateway policy because the portable Steward chart does not own
+the controller-specific policy.
 
 Publish the CA ConfigMap through the platform's public trust-distribution
 controller (for example, a trust-manager `Bundle` whose ConfigMap target is in
