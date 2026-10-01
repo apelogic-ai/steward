@@ -552,6 +552,18 @@ async function stopWeb(instance) {
 }
 
 async function guardedPage(browser, {
+  adminSetupStatus = {
+    apiVersion: "steward.admin-setup/v1",
+    checks: [
+      { id: "orchestration", title: "Orchestration", status: "attention", detail: "Task orchestration is staged.", fixHref: "https://github.com/apelogic-ai/steward/blob/main/docs/installation/execution-bindings.md", optional: false },
+      { id: "githubConnect", title: "GitHub Connect", status: "attention", detail: "No successful GitHub Connect operation has been recorded for this administrator.", fixHref: "/connections", optional: false },
+      { id: "capabilityCatalog", title: "Capability catalog", status: "unknown", detail: "No tools are published and catalog provenance is not reported by capability-catalog v2.", fixHref: "https://github.com/apelogic-ai/steward/issues/234", optional: false },
+      { id: "templates", title: "Member-ready template", status: "attention", detail: "No template grants member roles, models, and tools together.", fixHref: "/admin/envelopes/templates", optional: false },
+      { id: "members", title: "Members", status: "attention", detail: "No active member besides this administrator is registered.", fixHref: "https://github.com/apelogic-ai/steward/issues/231", optional: false },
+      { id: "githubActions", title: "GitHub Actions automation", status: "not_configured", detail: "Task identity discovery is not configured.", fixHref: "https://github.com/apelogic-ai/steward/blob/main/docs/installation/federated-task-identity-upgrade.md", optional: true },
+      { id: "runNow", title: "Run now", status: "not_configured", detail: "Run now is tracked separately.", fixHref: "https://github.com/apelogic-ai/steward/issues/227", optional: true },
+    ],
+  },
   adminTemplateAutoProvisionThreshold = null,
   adminTemplateModels = adminEnvelope.spec.llms,
   adminTemplateTools = adminEnvelope.spec.tools,
@@ -588,6 +600,8 @@ async function guardedPage(browser, {
   const context = await browser.newContext({ colorScheme, viewport });
   const executionLogRequests = [];
   const mutations = [];
+  const setupStatusRequests = [];
+  let currentAdminSetupStatus = adminSetupStatus;
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
   web.useConnectionStartFixture({
@@ -597,8 +611,20 @@ async function guardedPage(browser, {
   });
   web.useRerunFixtures(rerunResponses);
   await context.addInitScript(() => {
+    const BrowserAbortController = AbortController;
+    Object.defineProperty(window, "__stewardAbortCount", { configurable: true, value: 0, writable: true });
+    Object.defineProperty(window, "AbortController", {
+      configurable: true,
+      value: class extends BrowserAbortController {
+        abort(reason) {
+          window.__stewardAbortCount += 1;
+          return super.abort(reason);
+        }
+      },
+      writable: true,
+    });
     const allowedPreference = (key) => typeof key === "string"
-      && key.startsWith("steward.ui.envelope-accordion.");
+      && (key.startsWith("steward.ui.envelope-accordion.") || key === "steward.ui.admin-setup-dismissed");
     for (const method of ["getItem", "removeItem", "setItem"]) {
       const original = Storage.prototype[method];
       Object.defineProperty(Storage.prototype, method, {
@@ -626,6 +652,16 @@ async function guardedPage(browser, {
       contentType: "application/json",
       body: JSON.stringify(session),
     });
+  });
+  await context.route(`${origin}/admin/api/v1/setup-status`, async (route) => {
+    setupStatusRequests.push(route.request());
+    try {
+      if (currentAdminSetupStatus.delayMs) await new Promise((resolve) => setTimeout(resolve, currentAdminSetupStatus.delayMs));
+      if (currentAdminSetupStatus.httpStatus) return route.fulfill({ status: currentAdminSetupStatus.httpStatus, body: "" });
+      return json(route, currentAdminSetupStatus.body ?? currentAdminSetupStatus);
+    } catch {
+      return undefined;
+    }
   });
   await context.route(`${origin}/admin/auth/login*`, (route) => route.fulfill({
     status: 200,
@@ -898,7 +934,17 @@ async function guardedPage(browser, {
   page.on("request", (request) => {
     if (new URL(request.url()).origin !== origin) crossOriginRequests.push(request.url());
   });
-  return { context, page, consoleErrors, crossOriginRequests, executionLogRequests, httpErrors, mutations };
+  return {
+    context,
+    page,
+    consoleErrors,
+    crossOriginRequests,
+    executionLogRequests,
+    httpErrors,
+    mutations,
+    setupStatusRequests,
+    useAdminSetupStatus: (status) => { currentAdminSetupStatus = status; },
+  };
 }
 
 async function closeGuardedPage(session) {
@@ -997,6 +1043,59 @@ test("the shell carries the HyperShell visual system", async ({ browser }) => {
     await expect(session.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Runs", exact: true })).toHaveCSS("color", "rgb(162, 168, 171)");
   } finally {
     await closeGuardedPage(session);
+  }
+});
+
+test("administrators get live prerequisite reasons and can restore the hidden setup guide", async ({ browser }) => {
+  const administrator = await guardedPage(browser, { expectedHttpStatuses: [503], session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/get-started`);
+    await expect(administrator.page.getByRole("heading", { name: "Get started" })).toBeVisible();
+    await expect(administrator.page.getByText("Task orchestration is staged.")).toBeVisible();
+    await expect(administrator.page.getByText("No successful GitHub Connect operation has been recorded for this administrator.")).toBeVisible();
+    await expect(administrator.page.getByText("catalog provenance is not reported", { exact: false })).toBeVisible();
+
+    administrator.useAdminSetupStatus({
+      apiVersion: "steward.admin-setup/v1",
+      checks: [{ id: "orchestration", title: "Orchestration", status: "ready", detail: "Orchestration and one resolvable execution binding are active.", fixHref: "https://github.com/apelogic-ai/steward/blob/main/docs/installation/execution-bindings.md", optional: false }],
+    });
+    await administrator.page.getByRole("button", { name: "Refresh status" }).click();
+    await expect(administrator.page.getByText("Orchestration and one resolvable execution binding are active.")).toBeVisible();
+
+    administrator.useAdminSetupStatus({ httpStatus: 503 });
+    await administrator.page.getByRole("button", { name: "Refresh status" }).click();
+    await expect(administrator.page.getByRole("heading", { name: "Setup status is unavailable" })).toBeVisible();
+    await expect(administrator.page.getByText("No prerequisite has been inferred. Retry when the authoritative service is available.", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByText("Orchestration and one resolvable execution binding are active.")).toHaveCount(0);
+
+    const requestsBeforeSlowRefresh = administrator.setupStatusRequests.length;
+    administrator.useAdminSetupStatus({ delayMs: 16_000, body: {
+      apiVersion: "steward.admin-setup/v1",
+      checks: [{ id: "orchestration", title: "Orchestration", status: "ready", detail: "A slow authoritative refresh settled successfully.", fixHref: "https://github.com/apelogic-ai/steward/blob/main/docs/installation/execution-bindings.md", optional: false }],
+    } });
+    await administrator.page.getByRole("button", { name: "Refresh status" }).click();
+    await expect(administrator.page.getByText("A slow authoritative refresh settled successfully.")).toBeVisible({ timeout: 17_500 });
+    expect(administrator.setupStatusRequests).toHaveLength(requestsBeforeSlowRefresh + 1);
+
+    const abortsBeforeDismissal = await administrator.page.evaluate(() => window.__stewardAbortCount);
+    const requestsBeforeDismissal = administrator.setupStatusRequests.length;
+    administrator.useAdminSetupStatus({ delayMs: 3_000, body: { apiVersion: "steward.admin-setup/v1", checks: [] } });
+    await administrator.page.getByRole("button", { name: "Refresh status" }).click();
+    await expect.poll(() => administrator.setupStatusRequests.length).toBe(requestsBeforeDismissal + 1);
+    await administrator.page.getByRole("button", { name: "Hide this guide" }).click();
+    await expect(administrator.page.getByText("The administrator setup guide is hidden in this browser.")).toBeVisible();
+    await expect.poll(() => administrator.page.evaluate(() => window.__stewardAbortCount)).toBeGreaterThan(abortsBeforeDismissal);
+    await expect(administrator.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Get started" })).toHaveCount(0);
+    const hiddenRequestCount = administrator.setupStatusRequests.length;
+    await administrator.page.waitForTimeout(15_500);
+    expect(administrator.setupStatusRequests).toHaveLength(hiddenRequestCount);
+
+    await administrator.page.goto(`${origin}/admin/settings`);
+    await administrator.page.getByRole("button", { name: "Reopen Get started" }).click();
+    await expect(administrator.page.getByRole("button", { name: "Guide is visible" })).toBeVisible();
+    await expect(administrator.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Get started" })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
   }
 });
 

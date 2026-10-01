@@ -10,7 +10,10 @@ use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec,
     add_budget_amount, envelope_is_within, evaluate, validate_envelope,
 };
-use steward_types::direct_package::{DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES};
+use steward_types::direct_package::{
+    DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES, SOURCE_PROVENANCE_CONTRACT_VERSION,
+    SourceProvenance,
+};
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
     OrganizationIdentity, OrganizationIdentityMigration, TaskExecutionBinding,
@@ -40,6 +43,15 @@ impl TaskOrchestrationMode {
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
+}
+
+/// Bounded setup facts from Tasks whose persisted source-authority evidence was ratified as
+/// GitHub provenance during admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GithubAutomationSetupEvidence {
+    pub direct_packages_used: bool,
+    pub latest_owned_failure_reason: Option<String>,
+    pub has_successful_owned_submission: bool,
 }
 
 /// One immutable, administrator-published Workflow revision.
@@ -501,6 +513,17 @@ mod migration_tests {
             "migration 53 must remain embedded and describe its additive connection-verification evidence"
         );
     }
+
+    #[test]
+    fn task_source_provenance_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 56 && migration.description.contains("task source provenance")
+            }),
+            "migration 56 must remain embedded and preserve authenticated Task source evidence"
+        );
+    }
 }
 
 impl PgStore {
@@ -791,6 +814,22 @@ impl PgStore {
         .into_iter()
         .map(canonical_user_record)
         .collect()
+    }
+
+    /// Count active canonical users other than the authenticated administrator.
+    pub async fn active_other_canonical_user_count(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+    ) -> Result<i64, StoreError> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM canonical_users \
+             WHERE state = 'active' AND user_id <> $1 \
+               AND organization_id = (SELECT organization_id FROM canonical_users WHERE user_id = $1)",
+        )
+        .bind(canonical_user_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)
     }
 
     pub async fn canonical_user(
@@ -1598,6 +1637,24 @@ impl PgStore {
         .await
         .map_err(database_error)?;
         rows.into_iter().map(federated_subject_record).collect()
+    }
+
+    /// Count enabled, observed external identities that still lack canonical association.
+    pub async fn unassociated_federated_subject_count(
+        &self,
+        issuer: &str,
+    ) -> Result<i64, StoreError> {
+        if issuer.trim().is_empty() {
+            return Err(StoreError::InvalidFederatedSubject);
+        }
+        sqlx::query_scalar(
+            "SELECT count(*) FROM federated_subjects \
+             WHERE issuer = $1 AND state = 'observed' AND canonical_user_id IS NULL",
+        )
+        .bind(issuer)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)
     }
 
     pub async fn federated_subject_audit(
@@ -2957,6 +3014,46 @@ impl PgStore {
         })
     }
 
+    /// Return bounded GitHub Actions setup evidence without treating unrelated Tasks as proof.
+    pub async fn github_automation_setup_evidence(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+    ) -> Result<GithubAutomationSetupEvidence, StoreError> {
+        let row = sqlx::query(
+            "WITH github_runs AS ( \
+                 SELECT owner_user_id, phase, failure_reason, created_at, task_uid \
+                 FROM task_submissions \
+                 WHERE source_provenance ->> 'contractVersion' = $2 \
+                   AND source_provenance ->> 'provider' = 'github' \
+             ) \
+             SELECT EXISTS(SELECT 1 FROM task_submissions \
+                           WHERE direct_task_evidence IS NOT NULL) AS direct_packages_used, \
+                    EXISTS(SELECT 1 FROM github_runs \
+                           WHERE owner_user_id = $1 AND phase = 'succeeded') \
+                        AS has_successful_owned_submission, \
+                    (SELECT failure_reason FROM github_runs \
+                     WHERE owner_user_id = $1 \
+                     ORDER BY created_at DESC, task_uid DESC LIMIT 1) \
+                        AS latest_owned_failure_reason",
+        )
+        .bind(canonical_user_id.as_str())
+        .bind(SOURCE_PROVENANCE_CONTRACT_VERSION)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(GithubAutomationSetupEvidence {
+            direct_packages_used: row
+                .try_get("direct_packages_used")
+                .map_err(database_error)?,
+            latest_owned_failure_reason: row
+                .try_get("latest_owned_failure_reason")
+                .map_err(database_error)?,
+            has_successful_owned_submission: row
+                .try_get("has_successful_owned_submission")
+                .map_err(database_error)?,
+        })
+    }
+
     /// Count phases for the current run filters while deliberately excluding the phase filter
     /// and pagination cursor, so the browser can render stable facet chips.
     pub async fn agent_run_phase_facets(
@@ -4282,6 +4379,25 @@ impl PgStore {
         .collect()
     }
 
+    /// Count latest template revisions that grant a role and nonempty model and tool sets.
+    pub async fn member_ready_envelope_template_count(&self) -> Result<i64, StoreError> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM ( \
+                 SELECT DISTINCT ON (template_id) member_roles, spec \
+                 FROM envelope_template_revisions \
+                 ORDER BY template_id, revision DESC \
+             ) latest \
+             WHERE cardinality(member_roles) > 0 \
+               AND jsonb_typeof(spec -> 'llms') = 'array' \
+               AND jsonb_array_length(spec -> 'llms') > 0 \
+               AND jsonb_typeof(spec -> 'tools') = 'array' \
+               AND jsonb_array_length(spec -> 'tools') > 0",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
     /// List current templates visible to any of the principal's active member roles.
     pub async fn available_envelope_templates(
         &self,
@@ -5567,14 +5683,14 @@ impl PgStore {
               user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
               authority_kind, user_envelope_snapshot, \
               coding_agent_runtime, runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, \
-              runtime_spec, agent_command, execution_binding, direct_task_evidence, \
+              runtime_spec, agent_command, execution_binding, source_provenance, direct_task_evidence, \
               envelope_revision, orchestration_version, \
               orchestration_operation_id, \
               candidate_digest, service_envelope_digest, original_admission_decision, \
               original_admission_deltas) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, $13, $14, \
-                     'user-envelope', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, \
-                     NULL, 3, $26, $27, NULL, $28, $29) \
+                     'user-envelope', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, \
+                     NULL, 3, $27, $28, NULL, $29, $30) \
              ON CONFLICT DO NOTHING",
         )
         .bind(task_uid)
@@ -5601,6 +5717,7 @@ impl PgStore {
         .bind(Json(request.runtime_spec))
         .bind(Json(request.agent_command))
         .bind(request.execution_binding.map(Json))
+        .bind(request.source_provenance.map(Json))
         .bind(request.direct_task_evidence.map(Json))
         .bind(operation_id)
         .bind(request.candidate_digest)
@@ -8160,6 +8277,28 @@ impl PgStore {
             .transpose()
     }
 
+    /// Duration of the administrator's latest successful GitHub Connect start.
+    ///
+    /// This deliberately returns only a bounded timing fact. OAuth continuation material and
+    /// connection-operation output remain confined to the Connections BFF.
+    pub async fn latest_successful_connection_start_duration_ms(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+    ) -> Result<Option<i64>, StoreError> {
+        sqlx::query_scalar(
+            "SELECT round(extract(epoch FROM (flow_created_at - created_at)) * 1000)::bigint \
+             FROM connection_operations \
+             WHERE canonical_user_id = $1 AND provider = 'github' \
+               AND operation_kind = 'start' AND operation_state = 'succeeded' \
+               AND flow_created_at IS NOT NULL \
+             ORDER BY created_at DESC, operation_id DESC LIMIT 1",
+        )
+        .bind(canonical_user_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
     /// Internal controller lookup. Dedicated connection operations are never exposed through
     /// generic task or run read models, but the controller must recover their immutable binding
     /// snapshot before it provisions or executes the referenced task.
@@ -8981,6 +9120,8 @@ pub struct TaskReservationRequest<'a> {
     pub runtime_spec: &'a AgentRuntimeSpec,
     pub agent_command: &'a [String],
     pub execution_binding: Option<&'a TaskExecutionBinding>,
+    /// Immutable source provenance ratified by authenticated task identity resolution.
+    pub source_provenance: Option<&'a SourceProvenance>,
     /// Immutable direct-package source and authority evidence. Legacy and catalog Tasks omit it.
     pub direct_task_evidence: Option<&'a DirectTaskBindingEvidence>,
     /// Exact approved User Envelope used for admission. Internal operations omit it and carry
@@ -9321,6 +9462,7 @@ fn task_reservation_matches(
         && record.runtime_spec == *request.runtime_spec
         && record.agent_command == request.agent_command
         && record.execution_binding.as_ref() == request.execution_binding
+        && record.source_provenance.as_ref() == request.source_provenance
         && record.direct_task_evidence.as_ref() == request.direct_task_evidence
         && record.authority_kind.as_deref() == Some("user-envelope")
         && record.user_envelope_snapshot.as_ref() == request.user_envelope_snapshot
@@ -9633,6 +9775,17 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
                 && workflow_pins[0] == envelope_pins[0]
         }
     };
+    let source_provenance_valid = match request.source_provenance {
+        Some(provenance) => {
+            provenance.validate().is_ok()
+                && if let Some(evidence) = request.direct_task_evidence {
+                    evidence.source_provenance == *provenance
+                } else {
+                    workflow_pins.iter().all(|present| *present)
+                }
+        }
+        None => request.direct_task_evidence.is_none(),
+    };
     if request
         .execution_binding
         .is_some_and(|binding| binding.validate().is_err())
@@ -9654,6 +9807,7 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
                 }
             })
         || !direct_evidence_valid
+        || !source_provenance_valid
         || request.workflow_version.is_some_and(|version| version <= 0)
         || request
             .user_envelope_revision
@@ -9671,6 +9825,7 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
 #[cfg(test)]
 mod task_execution_binding_tests {
     use steward_admission::{AdmissionDecision, Envelope, EnvelopeSpec};
+    use steward_types::direct_package::SourceProvenance;
     use steward_types::{
         AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email, Principal,
         ResidentExecutionBinding, RunnerRequirements, RuntimeId, RuntimeOwnership,
@@ -9681,7 +9836,8 @@ mod task_execution_binding_tests {
     use super::{StoreError, TaskReservationRequest, validate_task_version_pins};
 
     #[test]
-    fn resident_reservation_uid_must_match_its_lease_binding() -> Result<(), String> {
+    fn reservation_pins_reject_mismatched_runtime_and_unversioned_source_provenance()
+    -> Result<(), String> {
         let owner = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
         let binding = TaskExecutionBinding::Resident(ResidentExecutionBinding {
             schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
@@ -9733,7 +9889,7 @@ mod task_execution_binding_tests {
         let admission = AdmissionDecision::Admit;
         let task_uid = Uuid::new_v4();
         let operation_id = Uuid::new_v4();
-        let request = TaskReservationRequest {
+        let mut request = TaskReservationRequest {
             task_uid,
             operation_id,
             idempotency_key: "resident-mismatch",
@@ -9757,6 +9913,7 @@ mod task_execution_binding_tests {
             runtime_spec: &spec,
             agent_command: &command,
             execution_binding: Some(&binding),
+            source_provenance: None,
             direct_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &digest,
@@ -9769,6 +9926,41 @@ mod task_execution_binding_tests {
             validate_task_version_pins(&request),
             Err(StoreError::InvalidTaskIdentityBinding),
             "a resident Task row must not disagree with its immutable lease UID"
+        );
+        request.runtime_uid = Some("runtime-uid-a");
+        assert_eq!(validate_task_version_pins(&request), Ok(()));
+
+        let provenance = serde_json::from_value::<SourceProvenance>(serde_json::json!({
+            "contractVersion": "steward.source-provenance/v1",
+            "provider": "github",
+            "repository": {"id": "123456", "ownerId": "7890", "name": "example-org/repository"},
+            "triggeredSha": format!("git:sha1:{}", "a".repeat(40)),
+            "run": {"id": "900001", "attempt": 1},
+            "event": "workflow_dispatch",
+            "ref": "refs/heads/main",
+            "actorId": "16106037",
+            "actor": "alice",
+            "callerWorkflow": {"ref": "example-org/repository/.github/workflows/run.yml@refs/heads/main", "sha": format!("git:sha1:{}", "b".repeat(40))},
+            "reusableWorkflow": {"ref": "example-org/automation/.github/workflows/steward.yml@refs/tags/v1", "sha": format!("git:sha1:{}", "c".repeat(40))}
+        }))
+        .map_err(|error| error.to_string())?;
+        request.source_provenance = Some(&provenance);
+        assert_eq!(
+            validate_task_version_pins(&request),
+            Err(StoreError::InvalidTaskIdentityBinding),
+            "ratified source evidence must not be attached to an unrelated unversioned Task"
+        );
+
+        request.workflow_name = Some("repository-review");
+        request.workflow_version = Some(1);
+        request.workflow_digest = Some("sha256:workflow");
+        request.user_envelope_instance_id = Some("envelope-instance-1");
+        request.user_envelope_revision = Some(1);
+        request.user_envelope_digest = Some("sha256:envelope");
+        assert_eq!(
+            validate_task_version_pins(&request),
+            Ok(()),
+            "a versioned Task may persist authenticated source provenance"
         );
         Ok(())
     }
@@ -10233,6 +10425,7 @@ pub struct TaskRecord {
     pub runtime_spec: AgentRuntimeSpec,
     pub agent_command: Vec<String>,
     pub execution_binding: Option<TaskExecutionBinding>,
+    pub source_provenance: Option<SourceProvenance>,
     pub direct_task_evidence: Option<DirectTaskBindingEvidence>,
     pub envelope_revision: Option<i64>,
     pub orchestration_version: i16,
@@ -11342,6 +11535,10 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
             .try_get::<Option<Json<TaskExecutionBinding>>, _>("execution_binding")
             .map_err(database_error)?
             .map(|binding| binding.0),
+        source_provenance: row
+            .try_get::<Option<Json<SourceProvenance>>, _>("source_provenance")
+            .map_err(database_error)?
+            .map(|provenance| provenance.0),
         direct_task_evidence: row
             .try_get::<Option<Json<DirectTaskBindingEvidence>>, _>("direct_task_evidence")
             .map_err(database_error)?

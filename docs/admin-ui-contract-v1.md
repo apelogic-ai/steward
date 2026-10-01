@@ -3,6 +3,7 @@
 Status: active browser and API boundary.
 
 Applies to Steward 0.3.6.
+Sections that describe unreleased behavior say so explicitly.
 
 ## Presentation ownership
 
@@ -129,6 +130,50 @@ models are omitted rather than rendered as guessed disabled options. Admission
 remains the authority for exact deltas and Envelope revisions.
 
 ### Connections and onboarding
+
+The administrator setup guide described below is unreleased.
+
+The administrator workspace exposes `/admin/get-started`. Its source of truth
+is the administrator-only, read-only `GET /admin/api/v1/setup-status` route.
+The response derives current checks from deployment configuration and live
+Steward records: active orchestration and resolvable execution bindings, the
+signed-in administrator's latest successful GitHub Connect start and duration,
+published capability count, member-ready templates, other active canonical
+users, configured task-identity discovery, whether direct-package use makes
+`githubSource` required, unassociated actors from the configured GitHub
+task-identity issuer, and bounded owner-scoped evidence from Tasks carrying
+durable GitHub-ratified source provenance. It never returns provider tokens,
+OAuth continuations, raw task failure text, or credentials.
+
+The UI refreshes the endpoint 15 seconds after the preceding request settles
+and on explicit request, so a slow authoritative read is not repeatedly
+aborted by overlapping polls. Each refresh enters an explicit loading state; a
+failed refresh discards prior cards and renders unavailable rather than
+retaining a stale ready result. Polling stops and its active request is aborted
+when the guide is hidden or unmounted. Hiding the administrator guide is
+deliberately a presentation-only preference stored under the exact
+browser-local key `steward.ui.admin-setup-dismissed`; it changes no server state
+or authority and can be restored from administrator settings. This differs from
+user onboarding, whose progress and dismissal are durable server preferences.
+
+Capability-catalog v2 reports published tools but has no expected-tool count or
+authoritative gateway-publication provenance. Until that metadata exists, the
+setup endpoint reports this check as `unknown` rather than inferring provenance
+from names or counts. Likewise, Steward can report that task-identity discovery
+is configured and whether recent identities are associated, but it cannot prove
+an installation-specific repository policy without a concrete repository
+submission. The check links to installation guidance and retains only the
+latest bounded error from an owner-scoped Task with durable GitHub-ratified
+source provenance. GitHub Actions automation is ready only after at least one
+such Task has durably succeeded; unrelated Tasks are not evidence. Versioned
+workflow reservations persist the authenticated provenance independently of
+direct-package binding evidence, so versioned-workflow-only installations can
+become ready without the direct-package `githubSource` adapter. Historical
+versioned Tasks without that evidence remain unknown rather than being inferred
+from submitter names. When no ratified Task exists and no bounded ratified
+failure is recorded, the status is `unknown`: authentication or policy failures
+before Task reservation leave no AgentRun record and therefore cannot truthfully
+be reported as ready.
 
 `GET /app/api/v1/connections` returns connected providers and the available
 provider catalog. GitHub is enabled; unavailable providers remain explicit and

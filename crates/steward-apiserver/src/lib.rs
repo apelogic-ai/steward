@@ -1,5 +1,6 @@
 //! REST admission path and authenticated administrator surface.
 
+pub mod admin_setup;
 pub mod agent_runs_ui;
 pub mod browser_admin;
 pub mod browser_auth;
@@ -344,6 +345,7 @@ pub struct GrantRevocationRequest {
         task_outputs_contract,
         task_delete_contract,
         browser_auth::session,
+        admin_setup::get_setup_status,
         user_envelopes::list_templates,
         user_envelopes::list_requests,
         user_envelopes::get_request,
@@ -425,6 +427,10 @@ pub struct GrantRevocationRequest {
         browser_auth::BrowserRole,
         browser_auth::SessionPrincipalResponse,
         browser_auth::SessionResponse,
+        admin_setup::AdminSetupCheck,
+        admin_setup::AdminSetupCheckId,
+        admin_setup::AdminSetupCheckStatus,
+        admin_setup::AdminSetupStatusResponse,
         browser_admin::BrowserFederatedSubjectView,
         browser_admin::BrowserFederatedSubjectAuditView,
         browser_admin::BrowserFederatedSubjectResponse,
@@ -2061,7 +2067,7 @@ fn agent_run_view(record: AgentRunRecord) -> AgentRunView {
     }
 }
 
-fn bounded_task_error_category(reason: Option<&str>) -> Option<&'static str> {
+pub(crate) fn bounded_task_error_category(reason: Option<&str>) -> Option<&'static str> {
     reason.map(|reason| {
         if reason.starts_with("task output archive exceeds") {
             "output-limit"
@@ -3439,7 +3445,7 @@ mod tests {
         WorkflowRevisionRecord,
     };
     use steward_types::direct_package::{
-        ExactGitCommit, RepositoryUrl, SourceProvenance, StableProviderId,
+        ExactGitCommit, RepositoryUrl, SourceProvenance, SourceProvider, StableProviderId,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
@@ -8116,6 +8122,7 @@ mod tests {
                     runtime_spec: request.runtime_spec.clone(),
                     agent_command: request.agent_command.to_vec(),
                     execution_binding: request.execution_binding.cloned(),
+                    source_provenance: request.source_provenance.cloned(),
                     direct_task_evidence: request.direct_task_evidence.cloned(),
                     envelope_revision: None,
                     orchestration_version: 3,
@@ -10922,14 +10929,20 @@ mod tests {
             .await
             .map_err(|error| format!("submit direct package: {error}"))?;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let tasks = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake task ledger lock was poisoned")?;
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
         assert_eq!(
-            ledger
-                .tasks
-                .lock()
-                .map_err(|_| "fake task ledger lock was poisoned")?
-                .len(),
-            1
+            task.source_provenance.as_ref(),
+            task.direct_task_evidence
+                .as_ref()
+                .map(|evidence| &evidence.source_provenance),
+            "direct-package readiness provenance must remain identical to its binding evidence"
         );
+        drop(tasks);
         Ok(())
     }
 
@@ -11650,6 +11663,15 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let task = &rows[0];
         assert_eq!(task.workflow, "repository-review@1");
+        let provenance = task.source_provenance.as_ref().ok_or_else(|| {
+            "versioned GitHub submission did not persist identity-ratified provenance".to_owned()
+        })?;
+        assert_eq!(
+            provenance.provider,
+            SourceProvider::Github,
+            "only the authenticated GitHub source identity may establish this evidence"
+        );
+        assert_eq!(provenance.run.id.as_str(), "900001");
         assert_eq!(task.workflow_name.as_deref(), Some("repository-review"));
         assert_eq!(task.workflow_version, Some(1));
         assert_eq!(
@@ -12051,6 +12073,7 @@ mod tests {
                 runtime_spec: &spec,
                 agent_command: &["agent-v1".to_owned()],
                 execution_binding: None,
+                source_provenance: None,
                 direct_task_evidence: None,
                 user_envelope_snapshot: Some(&user_envelope),
                 candidate_digest: &intent_digest,

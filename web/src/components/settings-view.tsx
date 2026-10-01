@@ -6,6 +6,7 @@ import { updateBrowserPreferences } from "@/api-client";
 import { SectionCard, StatusPill, ThemeControl } from "@/components/hs";
 import { EmptyState, PageHeader } from "@/components/workspace-ui";
 import { useSession } from "@/session/session-context";
+import { setAdminSetupDismissed } from "@/data/admin-setup-preference";
 
 export function SettingsView({ admin = false }: Readonly<{ admin?: boolean }>) {
   const session = useSession();
@@ -28,7 +29,7 @@ export function SettingsView({ admin = false }: Readonly<{ admin?: boolean }>) {
             setGuideState("done");
             window.dispatchEvent(new CustomEvent("hypershell:preferences-updated", { detail: { onboardingDismissed: false } }));
           } else setGuideState("error");
-        }} type="button">{guideState === "done" ? "Guide is visible" : "Reopen Get started"}</button> : null}</div>{guideState === "error" ? <p className="mt-3 text-sm text-err" role="alert">The onboarding preference could not be updated.</p> : null}</SectionCard>
+        }} type="button">{guideState === "done" ? "Guide is visible" : "Reopen Get started"}</button> : <button className="rounded-control border px-3 py-2 text-sm font-semibold" onClick={() => { setAdminSetupDismissed(false); setGuideState("done"); }} type="button">{guideState === "done" ? "Guide is visible" : "Reopen Get started"}</button>}</div>{guideState === "error" ? <p className="mt-3 text-sm text-err" role="alert">The onboarding preference could not be updated.</p> : null}</SectionCard>
         <p className="text-[13px] leading-5 text-muted-ink">Authentication, role resolution and CSRF proof are handled by the server. This page stores no identity data in the browser.</p>
       </> : <EmptyState title="Session unavailable"><p>The authoritative session is not available.</p></EmptyState>}
     </section>

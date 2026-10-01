@@ -136,3 +136,10 @@ New `connection_verified` audit events carry only provider `github` and the
 bounded positive numeric account ID. Login, display name, and email are not
 association evidence. The migration is additive and must remain in place if
 automatic association is later disabled or v3 is rolled back.
+
+Migration 0056 adds immutable, nullable Task source provenance populated only
+from authenticated task-identity evidence. Existing direct-package Tasks are
+deterministically backfilled from their immutable binding evidence; versioned
+Tasks begin recording the same GitHub-ratified provenance on new reservations.
+Other historical and Kubernetes-authenticated Tasks remain `NULL` and cannot be
+used as GitHub Actions readiness evidence.
