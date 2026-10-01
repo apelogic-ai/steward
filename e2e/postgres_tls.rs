@@ -75,7 +75,7 @@ impl ProviderConnectionBroker<String> for NoopConnectionMutations {
     fn disconnect<'a>(
         &'a self,
         _session: &'a ConnectionSession<String>,
-    ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
+    ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
         Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
     }
 }
