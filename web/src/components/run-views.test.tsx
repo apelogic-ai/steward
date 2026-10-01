@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BrowserRunView } from "@/api-client";
 
-import { pollRerun, RunCards } from "./run-views";
+import { pollRerun, rerunFailureMessage, RunCards } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -74,6 +74,20 @@ describe("GitHub reruns", () => {
     );
 
     expect(outcome).toEqual({ failure: "conflict" });
+  });
+
+  test("preserves the staged-orchestration diagnostic", async () => {
+    const outcome = await pollRerun(
+      async () => ({
+        error: { error: "connections.orchestration_not_active" },
+        response: { ok: false, status: 503 },
+      }),
+      async () => { throw new Error("must not wait"); },
+    );
+
+    expect(outcome).toEqual({ failure: "orchestration-not-active" });
+    expect(rerunFailureMessage("orchestration-not-active"))
+      .toBe("Re-run is disabled until task orchestration is active (stage 2).");
   });
 
   test("bounds server-controlled retry delays and times out as unavailable", async () => {

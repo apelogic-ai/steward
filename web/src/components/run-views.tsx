@@ -18,6 +18,7 @@ import {
 } from "@/api-client";
 import { DataTable, FilterChips } from "@/components/hs";
 import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
+import { classifyConnectionMutationFailure, type ConnectionMutationState } from "@/components/connection-mutation-state";
 import { ExecutionLogPanel } from "@/components/run-log-view";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import type { ExecutionLogStream } from "@/data/execution-log";
@@ -83,10 +84,17 @@ function isTerminalPhase(phase: string): boolean {
 
 type RerunAttempt = {
   data?: { retryAfterMs?: number; taskUid?: string };
+  error?: unknown;
   response?: { ok: boolean; status: number };
 };
 
-type RerunOutcome = { taskUid: string } | { failure: MutationFailureState };
+type RerunOutcome = { taskUid: string } | { failure: ConnectionMutationState };
+
+export function rerunFailureMessage(state: ConnectionMutationState): string {
+  return state === "orchestration-not-active"
+    ? "Re-run is disabled until task orchestration is active (stage 2)."
+    : `The run could not be re-run (${state}).`;
+}
 
 function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -101,7 +109,7 @@ export async function pollRerun(
     const result = await attempt();
     if (result.response?.ok && result.data?.taskUid) return { taskUid: result.data.taskUid };
     if (result.response?.status !== 202) {
-      return { failure: classifyMutationFailure(result.response?.status) };
+      return { failure: classifyConnectionMutationFailure(result.response?.status, result.error) };
     }
     if (index + 1 < maxAttempts) {
       const retryAfterMs = Math.min(Math.max(result.data?.retryAfterMs ?? 1_000, 250), 5_000);
@@ -197,7 +205,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
   const session = useSession();
   const [cancelState, setCancelState] = useState<"idle" | "working" | "cancelled" | MutationFailureState>("idle");
   const [cancelOpen, setCancelOpen] = useState(false);
-  const [rerunState, setRerunState] = useState<"idle" | "working" | MutationFailureState>("idle");
+  const [rerunState, setRerunState] = useState<"idle" | "working" | ConnectionMutationState>("idle");
   const [selectedStageId, setSelectedStageId] = useState<string | null>(null);
   const loadRun = useCallback(() => admin
     ? allRun({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } })
@@ -244,7 +252,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 else setRerunState(outcome.failure);
               }} type="button">{rerunState === "working" ? "Starting…" : "Re-run"}</button>{!isTerminalPhase(run.phase) ? <details className="relative"><summary aria-label="More run actions" className="grid min-h-10 min-w-10 cursor-pointer list-none place-items-center rounded-control border bg-panel px-3 text-lg font-semibold">···</summary><div className="absolute right-0 z-10 mt-1 min-w-40 rounded-control border bg-panel p-1 shadow-lg"><button className="w-full rounded-control px-3 py-2 text-left text-sm font-semibold text-err hover:bg-err-soft" disabled={cancelState === "working" || cancelState === "cancelled"} onClick={() => setCancelOpen(true)} type="button">{cancelState === "working" ? "Cancelling…" : cancelState === "cancelled" ? "Cancellation requested" : "Cancel run"}</button></div></details> : null}</div> : null}
             </header>
-            {rerunState !== "idle" && rerunState !== "working" ? <p className="text-sm text-err" role="alert">The run could not be re-run ({rerunState}).</p> : null}
+            {rerunState !== "idle" && rerunState !== "working" ? <p className="text-sm text-err" role="alert">{rerunFailureMessage(rerunState)}</p> : null}
             {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="text-sm text-err" role="alert">The run could not be cancelled ({cancelState}).</p> : null}
             <ConfirmationDialog cancelLabel="Keep running" confirmLabel="Cancel run" description="The agent will stop and its runtime credentials will be revoked. This cannot be undone." onConfirm={() => void cancelRun()} onOpenChange={setCancelOpen} open={cancelOpen} pending={cancelState === "working"} title="Cancel this run?" />
             <div className="grid min-h-[540px] overflow-hidden rounded-panel border bg-panel lg:grid-cols-[260px_minmax(0,1fr)]">

@@ -1056,6 +1056,10 @@ export type RenderGithubActionsWorkflowBody = {
 
 export type RepositoryUrl = string;
 
+export type RerunErrorResponse = {
+    error: string;
+};
+
 export type RerunPendingResponse = {
     apiVersion: string;
     retryAfterMs: number;
@@ -3485,10 +3489,12 @@ export type RerunMyRunErrors = {
      */
     409: unknown;
     /**
-     * Run submission is unavailable
+     * Run submission is unavailable; connections.orchestration_not_active identifies staged task orchestration
      */
-    503: unknown;
+    503: RerunErrorResponse;
 };
+
+export type RerunMyRunError = RerunMyRunErrors[keyof RerunMyRunErrors];
 
 export type RerunMyRunResponses = {
     /**
