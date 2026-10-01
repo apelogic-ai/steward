@@ -552,6 +552,18 @@ async function stopWeb(instance) {
 }
 
 async function guardedPage(browser, {
+  adminSetupStatus = {
+    apiVersion: "steward.admin-setup/v1",
+    checks: [
+      { id: "orchestration", title: "Orchestration", status: "attention", detail: "Task orchestration is staged.", fixHref: "https://github.com/apelogic-ai/steward/blob/main/docs/installation/execution-bindings.md", optional: false },
+      { id: "githubConnect", title: "GitHub Connect", status: "attention", detail: "No successful GitHub Connect operation has been recorded for this administrator.", fixHref: "/connections", optional: false },
+      { id: "capabilityCatalog", title: "Capability catalog", status: "unknown", detail: "No tools are published and catalog provenance is not reported by capability-catalog v2.", fixHref: "https://github.com/apelogic-ai/steward/issues/234", optional: false },
+      { id: "templates", title: "Member-ready template", status: "attention", detail: "No template grants member roles, models, and tools together.", fixHref: "/admin/envelopes/templates", optional: false },
+      { id: "members", title: "Members", status: "attention", detail: "No active member besides this administrator is registered.", fixHref: "https://github.com/apelogic-ai/steward/issues/231", optional: false },
+      { id: "githubActions", title: "GitHub Actions automation", status: "not_configured", detail: "Task identity discovery is not configured.", fixHref: "https://github.com/apelogic-ai/steward/blob/main/docs/installation/federated-task-identity-upgrade.md", optional: true },
+      { id: "runNow", title: "Run now", status: "not_configured", detail: "Run now is tracked separately.", fixHref: "https://github.com/apelogic-ai/steward/issues/227", optional: true },
+    ],
+  },
   adminTemplateAutoProvisionThreshold = null,
   adminTemplateModels = adminEnvelope.spec.llms,
   adminTemplateTools = adminEnvelope.spec.tools,
@@ -588,6 +600,7 @@ async function guardedPage(browser, {
   const context = await browser.newContext({ colorScheme, viewport });
   const executionLogRequests = [];
   const mutations = [];
+  let currentAdminSetupStatus = adminSetupStatus;
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
   web.useConnectionStartFixture({
@@ -598,7 +611,7 @@ async function guardedPage(browser, {
   web.useRerunFixtures(rerunResponses);
   await context.addInitScript(() => {
     const allowedPreference = (key) => typeof key === "string"
-      && key.startsWith("steward.ui.envelope-accordion.");
+      && (key.startsWith("steward.ui.envelope-accordion.") || key === "steward.ui.admin-setup-dismissed");
     for (const method of ["getItem", "removeItem", "setItem"]) {
       const original = Storage.prototype[method];
       Object.defineProperty(Storage.prototype, method, {
@@ -627,6 +640,7 @@ async function guardedPage(browser, {
       body: JSON.stringify(session),
     });
   });
+  await context.route(`${origin}/admin/api/v1/setup-status`, (route) => json(route, currentAdminSetupStatus));
   await context.route(`${origin}/admin/auth/login*`, (route) => route.fulfill({
     status: 200,
     contentType: "text/html",
@@ -898,7 +912,16 @@ async function guardedPage(browser, {
   page.on("request", (request) => {
     if (new URL(request.url()).origin !== origin) crossOriginRequests.push(request.url());
   });
-  return { context, page, consoleErrors, crossOriginRequests, executionLogRequests, httpErrors, mutations };
+  return {
+    context,
+    page,
+    consoleErrors,
+    crossOriginRequests,
+    executionLogRequests,
+    httpErrors,
+    mutations,
+    useAdminSetupStatus: (status) => { currentAdminSetupStatus = status; },
+  };
 }
 
 async function closeGuardedPage(session) {
@@ -997,6 +1020,35 @@ test("the shell carries the HyperShell visual system", async ({ browser }) => {
     await expect(session.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Runs", exact: true })).toHaveCSS("color", "rgb(162, 168, 171)");
   } finally {
     await closeGuardedPage(session);
+  }
+});
+
+test("administrators get live prerequisite reasons and can restore the hidden setup guide", async ({ browser }) => {
+  const administrator = await guardedPage(browser, { session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/get-started`);
+    await expect(administrator.page.getByRole("heading", { name: "Get started" })).toBeVisible();
+    await expect(administrator.page.getByText("Task orchestration is staged.")).toBeVisible();
+    await expect(administrator.page.getByText("No successful GitHub Connect operation has been recorded for this administrator.")).toBeVisible();
+    await expect(administrator.page.getByText("catalog provenance is not reported", { exact: false })).toBeVisible();
+
+    administrator.useAdminSetupStatus({
+      apiVersion: "steward.admin-setup/v1",
+      checks: [{ id: "orchestration", title: "Orchestration", status: "ready", detail: "Orchestration and one resolvable execution binding are active.", fixHref: "https://github.com/apelogic-ai/steward/blob/main/docs/installation/execution-bindings.md", optional: false }],
+    });
+    await administrator.page.getByRole("button", { name: "Refresh status" }).click();
+    await expect(administrator.page.getByText("Orchestration and one resolvable execution binding are active.")).toBeVisible();
+
+    await administrator.page.getByRole("button", { name: "Hide this guide" }).click();
+    await expect(administrator.page.getByText("The administrator setup guide is hidden in this browser.")).toBeVisible();
+    await expect(administrator.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Get started" })).toHaveCount(0);
+
+    await administrator.page.goto(`${origin}/admin/settings`);
+    await administrator.page.getByRole("button", { name: "Reopen Get started" }).click();
+    await expect(administrator.page.getByRole("button", { name: "Guide is visible" })).toBeVisible();
+    await expect(administrator.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Get started" })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
   }
 });
 

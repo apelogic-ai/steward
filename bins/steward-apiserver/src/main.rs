@@ -152,6 +152,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let connection_auto_association_issuer = configured_task_identity
         .connection_auto_association_issuer
         .clone();
+    let task_identity_issuer = configured_task_identity.task_identity_issuer.clone();
     let task_identity_discovery_enabled = configured_task_identity.discovery.is_some();
     let task_identities = configured_task_identity.resolver;
     let authenticator = IdentityOrKubernetesTokenAuthenticator::new(
@@ -169,6 +170,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let task_execution_bindings_json = configured_execution_bindings_json()?;
     let source_repository_bindings_json = configured_source_repository_bindings_json()?;
     let github_source = configured_github_source_adapter()?;
+    let github_source_enabled = github_source.is_some();
     let task_auth_discovery = configured_task_identity
         .discovery
         .map(|config| config.with_direct_packages_supported(github_source.is_some()));
@@ -212,9 +214,14 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         runtimes.clone(),
         decisions.clone(),
         workflow_agents,
-        task_orchestration_mode,
-        connection_auto_association_issuer,
-        task_identity_discovery_enabled,
+        BrowserApplicationConfig {
+            task_orchestration_mode,
+            connection_auto_association_issuer,
+            task_identity_discovery_enabled,
+            task_execution_bindings_active,
+            github_source_enabled,
+            github_actor_issuer: task_identity_issuer,
+        },
     )
     .await?;
     let app = router(
@@ -544,6 +551,7 @@ struct ConfiguredTaskIdentity {
     resolver: ConfiguredTaskIdentityResolver,
     discovery: Option<TaskAuthDiscoveryConfig>,
     connection_auto_association_issuer: Option<String>,
+    task_identity_issuer: Option<String>,
 }
 
 fn connection_auto_association_issuer(
@@ -601,6 +609,7 @@ fn configured_task_identity_resolver(
             ),
             discovery: None,
             connection_auto_association_issuer: None,
+            task_identity_issuer: None,
         });
     }
     let [issuer, audience, jwks_file] = values;
@@ -638,8 +647,9 @@ fn configured_task_identity_resolver(
         connection_auto_association_issuer: connection_auto_association_issuer(
             federated_subjects_enabled,
             auto_associate_from_connections,
-            issuer,
+            issuer.clone(),
         ),
+        task_identity_issuer: Some(issuer),
     })
 }
 
@@ -692,14 +702,21 @@ fn parse_custom_envelope_safety_ceiling(
     Ok(ceiling)
 }
 
+struct BrowserApplicationConfig {
+    task_orchestration_mode: TaskOrchestrationMode,
+    connection_auto_association_issuer: Option<String>,
+    task_identity_discovery_enabled: bool,
+    task_execution_bindings_active: bool,
+    github_source_enabled: bool,
+    github_actor_issuer: Option<String>,
+}
+
 async fn browser_application_router(
     store: PgStore,
     runtimes: KubeRuntimeRepository,
     decisions: JiraAdapter,
     workflow_agents: Vec<steward_apiserver::ExecutionBindingAdvertisement>,
-    task_orchestration_mode: TaskOrchestrationMode,
-    connection_auto_association_issuer: Option<String>,
-    task_identity_discovery_enabled: bool,
+    application_config: BrowserApplicationConfig,
 ) -> Result<Option<axum::Router>, Box<dyn Error>> {
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
@@ -713,6 +730,15 @@ async fn browser_application_router(
     .ok_or_else(|| io::Error::other("browser administration requires a capability catalog"))?;
     let capability_catalog = browser_admin::CapabilityCatalog::from_json(&capability_catalog_json)
         .map_err(io::Error::other)?;
+    let admin_setup_config = steward_apiserver::admin_setup::AdminSetupConfig {
+        orchestration_active: application_config.task_orchestration_mode.is_active(),
+        execution_bindings_active: application_config.task_execution_bindings_active,
+        resolvable_execution_bindings: workflow_agents.len(),
+        task_identity_discovery_enabled: application_config.task_identity_discovery_enabled,
+        github_source_enabled: application_config.github_source_enabled,
+        github_actor_issuer: application_config.github_actor_issuer,
+        capability_catalog: capability_catalog.clone(),
+    };
     let custom_envelope_safety_ceiling = configured_bounded_json(
         "STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON",
         "STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE",
@@ -770,8 +796,8 @@ async fn browser_application_router(
     let connections = governed_connections_configuration(
         &origin,
         store.clone(),
-        task_orchestration_mode,
-        connection_auto_association_issuer,
+        application_config.task_orchestration_mode,
+        application_config.connection_auto_association_issuer,
     )?;
     if workflows::ensure_sample_workflow(&store, &workflow_agents)
         .await
@@ -790,7 +816,7 @@ async fn browser_application_router(
                 custom_envelope_safety_ceiling.clone(),
                 steward_run_release,
                 workflow_installation_mode,
-                task_identity_discovery_enabled,
+                application_config.task_identity_discovery_enabled,
             ),
             auth.clone(),
         ))
@@ -808,6 +834,11 @@ async fn browser_application_router(
         ))
         .merge(browser_admin::protected_federated_subject_router(
             store.clone(),
+            auth.clone(),
+        ))
+        .merge(steward_apiserver::admin_setup::protected_router(
+            store.clone(),
+            admin_setup_config,
             auth.clone(),
         ))
         .merge(workflows::protected_admin_router_with_agents(

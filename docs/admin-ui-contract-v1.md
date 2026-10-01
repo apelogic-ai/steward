@@ -3,6 +3,7 @@
 Status: active browser and API boundary.
 
 Applies to Steward 0.3.6.
+Sections that describe unreleased behavior say so explicitly.
 
 ## Presentation ownership
 
@@ -129,6 +130,36 @@ models are omitted rather than rendered as guessed disabled options. Admission
 remains the authority for exact deltas and Envelope revisions.
 
 ### Connections and onboarding
+
+The administrator setup guide described below is unreleased.
+
+The administrator workspace exposes `/admin/get-started`. Its source of truth
+is the administrator-only, read-only `GET /admin/api/v1/setup-status` route.
+The response derives current checks from deployment configuration and live
+Steward records: active orchestration and resolvable execution bindings, the
+signed-in administrator's latest successful GitHub Connect start and duration,
+published capability count, member-ready templates, other active canonical
+users, configured task-identity discovery and `githubSource`, unassociated
+actors from the configured GitHub task-identity issuer, and the latest owned
+submission's bounded error category. It never returns provider tokens, OAuth
+continuations, raw task failure text, or credentials.
+
+The UI refreshes the endpoint every 15 seconds and on explicit request, so an
+operator can correct a prerequisite and observe the check change without an
+apiserver restart. Hiding the administrator guide is deliberately a
+presentation-only preference stored under the exact browser-local key
+`steward.ui.admin-setup-dismissed`; it changes no server state or authority and
+can be restored from administrator settings. This differs from user onboarding,
+whose progress and dismissal are durable server preferences.
+
+Capability-catalog v2 reports published tools but has no expected-tool count or
+authoritative gateway-publication provenance. Until that metadata exists, the
+setup endpoint reports this check as `unknown` rather than inferring provenance
+from names or counts. Likewise, Steward can report that task-identity discovery
+is configured and whether recent identities are associated, but it cannot prove
+an installation-specific repository policy without a concrete repository
+submission. The check links to installation guidance and retains the latest
+bounded submission error as the operational signal.
 
 `GET /app/api/v1/connections` returns connected providers and the available
 provider catalog. GitHub is enabled; unavailable providers remain explicit and

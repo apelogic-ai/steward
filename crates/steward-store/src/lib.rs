@@ -1600,6 +1600,24 @@ impl PgStore {
         rows.into_iter().map(federated_subject_record).collect()
     }
 
+    /// Count enabled, observed external identities that still lack canonical association.
+    pub async fn unassociated_federated_subject_count(
+        &self,
+        issuer: &str,
+    ) -> Result<i64, StoreError> {
+        if issuer.trim().is_empty() {
+            return Err(StoreError::InvalidFederatedSubject);
+        }
+        sqlx::query_scalar(
+            "SELECT count(*) FROM federated_subjects \
+             WHERE issuer = $1 AND state = 'observed' AND canonical_user_id IS NULL",
+        )
+        .bind(issuer)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
     pub async fn federated_subject_audit(
         &self,
         subject_id: Uuid,
@@ -8158,6 +8176,28 @@ impl PgStore {
         .map_err(database_error)?
         .map(connection_operation_record)
             .transpose()
+    }
+
+    /// Duration of the administrator's latest successful GitHub Connect start.
+    ///
+    /// This deliberately returns only a bounded timing fact. OAuth continuation material and
+    /// connection-operation output remain confined to the Connections BFF.
+    pub async fn latest_successful_connection_start_duration_ms(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+    ) -> Result<Option<i64>, StoreError> {
+        sqlx::query_scalar(
+            "SELECT round(extract(epoch FROM (flow_created_at - created_at)) * 1000)::bigint \
+             FROM connection_operations \
+             WHERE canonical_user_id = $1 AND provider = 'github' \
+               AND operation_kind = 'start' AND operation_state = 'succeeded' \
+               AND flow_created_at IS NOT NULL \
+             ORDER BY created_at DESC, operation_id DESC LIMIT 1",
+        )
+        .bind(canonical_user_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
     }
 
     /// Internal controller lookup. Dedicated connection operations are never exposed through

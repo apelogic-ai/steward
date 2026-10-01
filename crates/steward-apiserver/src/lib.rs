@@ -1,5 +1,6 @@
 //! REST admission path and authenticated administrator surface.
 
+pub mod admin_setup;
 pub mod agent_runs_ui;
 pub mod browser_admin;
 pub mod browser_auth;
@@ -344,6 +345,7 @@ pub struct GrantRevocationRequest {
         task_outputs_contract,
         task_delete_contract,
         browser_auth::session,
+        admin_setup::get_setup_status,
         user_envelopes::list_templates,
         user_envelopes::list_requests,
         user_envelopes::get_request,
@@ -425,6 +427,10 @@ pub struct GrantRevocationRequest {
         browser_auth::BrowserRole,
         browser_auth::SessionPrincipalResponse,
         browser_auth::SessionResponse,
+        admin_setup::AdminSetupCheck,
+        admin_setup::AdminSetupCheckId,
+        admin_setup::AdminSetupCheckStatus,
+        admin_setup::AdminSetupStatusResponse,
         browser_admin::BrowserFederatedSubjectView,
         browser_admin::BrowserFederatedSubjectAuditView,
         browser_admin::BrowserFederatedSubjectResponse,
@@ -2061,7 +2067,7 @@ fn agent_run_view(record: AgentRunRecord) -> AgentRunView {
     }
 }
 
-fn bounded_task_error_category(reason: Option<&str>) -> Option<&'static str> {
+pub(crate) fn bounded_task_error_category(reason: Option<&str>) -> Option<&'static str> {
     reason.map(|reason| {
         if reason.starts_with("task output archive exceeds") {
             "output-limit"

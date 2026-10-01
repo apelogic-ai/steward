@@ -14,6 +14,7 @@ import { Breadcrumbs, type BreadcrumbItem } from "@/components/hs/breadcrumbs";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { authStartPath } from "@/session/auth-redirect";
 import { deriveOnboardingProgress, loadOnboardingEvidence } from "@/data/onboarding-progress";
+import { adminSetupDismissed, adminSetupVisibleOnServer, subscribeToAdminSetupPreference } from "@/data/admin-setup-preference";
 import { useSession, type SessionState } from "@/session/session-context";
 
 const userNavigation = [
@@ -25,6 +26,7 @@ const userNavigation = [
 ] as const;
 
 const adminNavigation = [
+  { href: "/admin/get-started", label: "Get started" },
   { href: "/admin/envelopes/templates", label: "Templates" },
   { href: "/admin/approvals", label: "Requests" },
   { href: "/admin/runs", label: "Runs" },
@@ -271,7 +273,8 @@ function ProfileMenu({ adminMode, session }: Readonly<{
   );
 }
 
-function AppSidebar({ adminMode, mobile = false, needsAction, onNavigate, onboardingCompleted, onboardingDismissed, session }: Readonly<{
+function AppSidebar({ adminGuideDismissed, adminMode, mobile = false, needsAction, onNavigate, onboardingCompleted, onboardingDismissed, session }: Readonly<{
+  adminGuideDismissed: boolean;
   adminMode: boolean;
   mobile?: boolean;
   needsAction: number | null;
@@ -282,7 +285,7 @@ function AppSidebar({ adminMode, mobile = false, needsAction, onNavigate, onboar
 }>) {
   const pathname = usePathname();
   const onboardingComplete = onboardingCompleted === 5;
-  const navigation = adminMode ? adminNavigation : userNavigation.filter((item) => !(onboardingDismissed || onboardingComplete) || item.href !== "/get-started");
+  const navigation = adminMode ? adminNavigation.filter((item) => !adminGuideDismissed || item.href !== "/admin/get-started") : userNavigation.filter((item) => !(onboardingDismissed || onboardingComplete) || item.href !== "/get-started");
   return (
     <aside className={mobile ? "flex h-full w-[216px] flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 shadow-xl" : "sticky top-0 hidden h-screen flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 md:flex"}>
       <Link aria-label="HyperShell home" className="flex items-center gap-2.5 px-2 pb-[22px] text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"} onClick={onNavigate}>
@@ -324,6 +327,7 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
   const adminMode = pathname === "/admin" || pathname.startsWith("/admin/");
   const workspaceAuthorized = session.status === "authenticated" && (!adminMode || session.value.role === "admin");
   const [needsAction, setNeedsAction] = useState<number | null>(null);
+  const adminGuideDismissed = useSyncExternalStore(subscribeToAdminSetupPreference, adminSetupDismissed, adminSetupVisibleOnServer);
   const [onboardingCompleted, setOnboardingCompleted] = useState<number | null>(null);
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -386,10 +390,10 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
     <TooltipProvider>
       <div className="min-h-screen md:grid md:grid-cols-[216px_minmax(0,1fr)]">
         <a className="sr-only focus:not-sr-only focus:fixed focus:start-4 focus:top-4 focus:z-50 focus:rounded-control focus:bg-panel focus:px-4 focus:py-3" href="#workspace">Skip to workspace</a>
-        {session.status === "authenticated" && workspaceAuthorized ? <AppSidebar adminMode={adminMode} needsAction={needsAction} onboardingCompleted={onboardingCompleted} onboardingDismissed={onboardingDismissed} session={session} /> : <div className="hidden md:block" />}
+        {session.status === "authenticated" && workspaceAuthorized ? <AppSidebar adminGuideDismissed={adminGuideDismissed} adminMode={adminMode} needsAction={needsAction} onboardingCompleted={onboardingCompleted} onboardingDismissed={onboardingDismissed} session={session} /> : <div className="hidden md:block" />}
         {session.status === "authenticated" && workspaceAuthorized ? <header className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-line bg-panel px-4 md:hidden"><Link aria-label="HyperShell home" className="flex items-center gap-2 text-ink" href={adminMode ? "/admin/envelopes/templates" : "/envelopes"}>{/* eslint-disable-next-line @next/next/no-img-element */}
         <img alt="HyperShell" className="size-7 rounded-control bg-white object-cover" height="28" src="/brand/logo" width="28" /><span className="text-base font-semibold">HyperShell</span></Link><button aria-controls="mobile-navigation" aria-expanded={mobileMenuOpen} aria-label="Open navigation" className="grid size-10 place-items-center rounded-control border bg-panel text-xl" onClick={() => setMobileMenuOpen(true)} ref={mobileMenuButtonRef} type="button">☰</button></header> : null}
-        {mobileMenuOpen && session.status === "authenticated" && workspaceAuthorized ? <div aria-label="Navigation" aria-modal="true" className="fixed inset-0 z-50 flex bg-black/30 md:hidden" id="mobile-navigation" ref={mobileNavigationRef} role="dialog"><AppSidebar adminMode={adminMode} mobile needsAction={needsAction} onNavigate={closeMobileMenu} onboardingCompleted={onboardingCompleted} onboardingDismissed={onboardingDismissed} session={session} /><button aria-label="Close navigation" className="flex-1" onClick={closeMobileMenu} type="button" /></div> : null}
+        {mobileMenuOpen && session.status === "authenticated" && workspaceAuthorized ? <div aria-label="Navigation" aria-modal="true" className="fixed inset-0 z-50 flex bg-black/30 md:hidden" id="mobile-navigation" ref={mobileNavigationRef} role="dialog"><AppSidebar adminGuideDismissed={adminGuideDismissed} adminMode={adminMode} mobile needsAction={needsAction} onNavigate={closeMobileMenu} onboardingCompleted={onboardingCompleted} onboardingDismissed={onboardingDismissed} session={session} /><button aria-label="Close navigation" className="flex-1" onClick={closeMobileMenu} type="button" /></div> : null}
         <main className="min-w-0 px-4 pt-[18px] pb-16 sm:px-7" id="workspace">
           <div className="mx-auto max-w-[1180px]">
             {session.status === "loading" ? <StatePanel title="Loading HyperShell"><p>Checking the server-owned session…</p></StatePanel> : null}

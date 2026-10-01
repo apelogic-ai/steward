@@ -73,6 +73,24 @@ export type AdminRequestsSummaryResponse = {
     requested: number;
 };
 
+export type AdminSetupCheck = {
+    detail: string;
+    fixHref: string;
+    id: AdminSetupCheckId;
+    optional: boolean;
+    status: AdminSetupCheckStatus;
+    title: string;
+};
+
+export type AdminSetupCheckId = 'orchestration' | 'githubConnect' | 'capabilityCatalog' | 'templates' | 'members' | 'githubActions' | 'runNow';
+
+export type AdminSetupCheckStatus = 'ready' | 'attention' | 'unknown' | 'not_configured';
+
+export type AdminSetupStatusResponse = {
+    apiVersion: string;
+    checks: Array<AdminSetupCheck>;
+};
+
 export type AgentRunAvailability = 'available' | 'partial' | 'unavailable';
 
 export type AgentRunDataStatus = {
@@ -2678,6 +2696,34 @@ export type SessionResponses = {
 };
 
 export type SessionResponse2 = SessionResponses[keyof SessionResponses];
+
+export type GetAdminSetupStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/setup-status';
+};
+
+export type GetAdminSetupStatusErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Authoritative setup state is unavailable
+     */
+    503: unknown;
+};
+
+export type GetAdminSetupStatusResponses = {
+    200: AdminSetupStatusResponse;
+};
+
+export type GetAdminSetupStatusResponse = GetAdminSetupStatusResponses[keyof GetAdminSetupStatusResponses];
 
 export type ListAdminWorkflowsData = {
     body?: never;
