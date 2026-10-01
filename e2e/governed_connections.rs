@@ -829,8 +829,36 @@ where
         match broker.start_operation(session, operation_id).await? {
             Some(ConnectionStartOperation::Pending) => {}
             Some(ConnectionStartOperation::Succeeded(started)) => return Ok(started),
+            Some(ConnectionStartOperation::Disconnected) => {
+                return Err(ConnectionBrokerError::Unavailable);
+            }
             Some(ConnectionStartOperation::Failed(error)) => return Err(error),
             None => return Err(ConnectionBrokerError::Unavailable),
+        }
+        if Instant::now() >= deadline {
+            return Err(ConnectionBrokerError::Unavailable);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_disconnect_operation<B>(
+    broker: &GovernedConnectionsBroker<B>,
+    session: &ConnectionSession<B>,
+    operation_id: Uuid,
+) -> Result<(), ConnectionBrokerError>
+where
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match broker.start_operation(session, operation_id).await? {
+            Some(ConnectionStartOperation::Pending) => {}
+            Some(ConnectionStartOperation::Disconnected) => return Ok(()),
+            Some(ConnectionStartOperation::Failed(error)) => return Err(error),
+            Some(ConnectionStartOperation::Succeeded(_)) | None => {
+                return Err(ConnectionBrokerError::Unavailable);
+            }
         }
         if Instant::now() >= deadline {
             return Err(ConnectionBrokerError::Unavailable);
@@ -1135,10 +1163,12 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     .await?;
     assert_eq!(steward_lifetime, 630.0);
 
-    assert_eq!(
-        broker.disconnect(&alice).await,
-        Err(ConnectionBrokerError::OAuthFlowPending),
-        "disconnect must perform an uncached governed status and retain a genuinely pending flow"
+    assert!(
+        matches!(
+            broker.disconnect(&alice).await,
+            Err(ConnectionBrokerError::OAuthFlowPending)
+        ),
+        "disconnect must reject a genuinely pending OAuth flow"
     );
     let pending_url_present: bool = sqlx::query_scalar(
         "SELECT authorization_url IS NOT NULL FROM connection_operations WHERE operation_id = $1",
@@ -1280,7 +1310,8 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         "the same browser idempotency identity must reuse one governed mutation"
     );
 
-    connection_result(broker.disconnect(&alice).await)?;
+    let disconnect = connection_result(broker.disconnect(&alice).await)?;
+    connection_result(wait_disconnect_operation(&broker, &alice, disconnect.operation_id).await)?;
     let enforcement = harness.wait_tool_contains(
         ALICE_NAMESPACE,
         ALICE_RUNTIME,

@@ -136,17 +136,26 @@ disabled. Provider `start` and `disconnect` mutations are browser-session and
 CSRF scoped. A successful `POST /app/api/v1/connections/{provider}/start`
 returns HTTP 202 with an opaque operation identifier, the server-owned
 `pollDeadlineAt`, and no provider URL. The browser polls
+`POST /app/api/v1/connections/{provider}/disconnect` likewise returns HTTP 202
+with an operation identifier and polling deadline. The browser polls
 `GET /app/api/v1/connections/{provider}/operations/{operation_id}`: pending
 operations return HTTP 202, while a completed operation returns HTTP 200 with
-either the one-time authorization URL or a bounded terminal failure. Operation
-reads are exact-owner scoped and use HTTP 404 for absent, foreign, or
-provider-mismatched identifiers. An active operation advertises its bounded
-runtime-response deadline; a reused, succeeded operation whose OAuth flow is
-still pending advertises the later flow expiry so a retry can retrieve the
-still-valid URL. The browser aborts the poll when its view is
-replaced, unmounted, or reaches the advertised deadline; a deadline leaves an
-actionable retry state. It never persists the authorization URL. The onboarding
-aggregate composes connection, Envelope, workflow,
+the one-time authorization URL, successful disconnect, or a bounded terminal
+failure. Operation reads are exact-owner scoped and use HTTP 404 for absent,
+foreign, provider-mismatched, or unsupported operation identifiers. An active
+operation advertises its bounded runtime-response deadline; a reused,
+succeeded start whose OAuth flow is still pending advertises the later flow
+expiry so a retry can retrieve the still-valid URL. The browser aborts the poll
+when its view is replaced or unmounted. It observes a short, locally bounded
+grace after the advertised execution deadline so Steward can publish the
+durable deadline result, and always permits an immediate read of a reused
+terminal operation. An unobserved deadline leaves an actionable retry state. It
+never persists the authorization URL. The Connections UI renders distinct
+recovery guidance for runtime authentication, token grant, provider-response,
+gateway transport/status/body/unavailable, runtime creation, runtime start, and
+deadline failures. These bounded categories come from the durable operation
+record; arbitrary runtime diagnostics remain out of the browser response. The
+onboarding aggregate composes connection, Envelope, workflow,
 and run evidence; dismissal and the explicit "I added the workflow"
 acknowledgement are server-side preferences. When browser surfaces are enabled
 and at least one execution binding is advertised, Steward publishes the

@@ -12,10 +12,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Started GitHub connection authorization asynchronously: the browser mutation
   now returns an owner-scoped operation identifier and polling deadline with
   HTTP 202, and the UI polls that operation until the one-time authorization
-  URL or a bounded terminal failure is available. A perpetually pending poll
-  stops at the advertised deadline and leaves an actionable retry state. A
-  retry that reuses a completed start remains pollable until its pending OAuth
-  flow expires rather than inheriting the elapsed runtime-response deadline.
+  URL or a bounded terminal failure is available. A short observation grace
+  lets the UI read Steward's durable deadline result, while a reused terminal
+  operation always receives an immediate observation window. A retry that
+  reuses a completed start remains pollable until its pending OAuth flow expires
+  rather than inheriting the elapsed runtime-response deadline.
 - Added opt-in MCP-GW connection-status v2 consumption and default-on GitHub
   Connect association for `steward-task-v3`, matching only the immutable numeric
   GitHub account ID and recording connection-verification evidence in additive
@@ -28,6 +29,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   service outage. Governed connection mutations now return
   `connections.orchestration_not_active`, the browser explains that activation
   is required, and startup logs the staged bridge state once.
+- Failed governed connection starts promptly when their exact runtime reports a
+  terminal start failure, and preserved distinct runtime-authentication,
+  token-grant, provider-response, gateway, runtime-create, runtime-start, and
+  deadline categories through audit records, API problem bodies, and actionable
+  browser messages. Disconnect now follows the same asynchronous owner-scoped
+  operation polling contract as connection start, avoiding edge request
+  timeouts while preserving the durable terminal result.
 - Published the immutable `repo-summary@2` onboarding Workflow with an explicit
   `out/summary.md` result and migrated existing revision-1 installations without
   rewriting their history. The Workflow authoring UI now states that governed

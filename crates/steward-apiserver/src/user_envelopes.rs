@@ -2176,7 +2176,7 @@ mod tests {
         fn disconnect<'a>(
             &'a self,
             _session: &'a ConnectionSession<()>,
-        ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
+        ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
             Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
         }
     }

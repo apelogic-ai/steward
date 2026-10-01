@@ -783,8 +783,18 @@ where
                     }),
                 )
                     .into_response(),
-                ConnectionBrokerError::ProxyPolicyDenied
+                ConnectionBrokerError::RuntimeAuthenticationFailed
+                | ConnectionBrokerError::ProxyPolicyDenied
                 | ConnectionBrokerError::ProviderAuthorizationFailed
+                | ConnectionBrokerError::TokenGrantFailed
+                | ConnectionBrokerError::ProviderResponseInvalid
+                | ConnectionBrokerError::GatewayTransportFailed
+                | ConnectionBrokerError::GatewayStatusInvalid
+                | ConnectionBrokerError::GatewayBodyUnavailable
+                | ConnectionBrokerError::GatewayUnavailable
+                | ConnectionBrokerError::RuntimeCreateFailed
+                | ConnectionBrokerError::RuntimeStartFailed
+                | ConnectionBrokerError::DeadlineExceeded
                 | ConnectionBrokerError::GatewayHttp { .. }
                 | ConnectionBrokerError::Unavailable => {
                     browser_runs_error(StatusCode::SERVICE_UNAVAILABLE)

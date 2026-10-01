@@ -545,7 +545,7 @@ where
     fn disconnect<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
-    ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
+    ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
         self.mutations.disconnect(session)
     }
 }
@@ -867,7 +867,12 @@ where
             else {
                 return Ok(None);
             };
-            if record.provider != "github" || record.operation_kind != StoredOperationKind::Start {
+            if record.provider != "github"
+                || !matches!(
+                    record.operation_kind,
+                    StoredOperationKind::Start | StoredOperationKind::Disconnect
+                )
+            {
                 return Ok(None);
             }
             let operation = match record.operation_state {
@@ -880,28 +885,49 @@ where
                         record.failure_detail.as_ref(),
                     ))
                 }
-                ConnectionOperationState::Succeeded => {
-                    if record.oauth_phase != ConnectionOAuthPhase::Pending {
-                        ConnectionStartOperation::Failed(ConnectionBrokerError::Unavailable)
-                    } else {
-                        match (record.authorization_url, record.flow_expires_at) {
-                            (Some(value), Some(expires_at)) => match AuthorizationUrl::new(value) {
-                                Ok(authorization_url) => {
-                                    ConnectionStartOperation::Succeeded(StartedConnection {
-                                        authorization_url,
-                                        expires_at,
-                                    })
+                ConnectionOperationState::Succeeded => match record.operation_kind {
+                    StoredOperationKind::Start => {
+                        if record.oauth_phase != ConnectionOAuthPhase::Pending {
+                            ConnectionStartOperation::Failed(ConnectionBrokerError::Unavailable)
+                        } else {
+                            match (record.authorization_url, record.flow_expires_at) {
+                                (Some(value), Some(expires_at)) => {
+                                    match AuthorizationUrl::new(value) {
+                                        Ok(authorization_url) => {
+                                            ConnectionStartOperation::Succeeded(StartedConnection {
+                                                authorization_url,
+                                                expires_at,
+                                            })
+                                        }
+                                        Err(_) => ConnectionStartOperation::Failed(
+                                            ConnectionBrokerError::Unavailable,
+                                        ),
+                                    }
                                 }
-                                Err(_) => ConnectionStartOperation::Failed(
+                                _ => ConnectionStartOperation::Failed(
                                     ConnectionBrokerError::Unavailable,
                                 ),
-                            },
-                            _ => {
-                                ConnectionStartOperation::Failed(ConnectionBrokerError::Unavailable)
                             }
                         }
                     }
-                }
+                    StoredOperationKind::Disconnect => {
+                        if record
+                            .result
+                            .as_ref()
+                            .and_then(Value::as_object)
+                            .and_then(|object| object.get("disconnected"))
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                        {
+                            ConnectionStartOperation::Disconnected
+                        } else {
+                            ConnectionStartOperation::Failed(ConnectionBrokerError::Unavailable)
+                        }
+                    }
+                    StoredOperationKind::Status | StoredOperationKind::Rerun => {
+                        ConnectionStartOperation::Failed(ConnectionBrokerError::Unavailable)
+                    }
+                },
             };
             Ok(Some(operation))
         })
@@ -910,9 +936,9 @@ where
     fn disconnect<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
-    ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
+    ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
         Box::pin(async move {
-            let reserve = self
+            let record = self
                 .reserve(
                     &session.subject.canonical_user_id,
                     &session.subject.display_email,
@@ -921,43 +947,11 @@ where
                     None,
                     None,
                 )
-                .await;
-            let record = match reserve {
-                Err(ConnectionBrokerError::OAuthFlowPending) => {
-                    let status = self.status_operation(session, false).await?;
-                    if status.phase != ConnectionPhase::Connected {
-                        return Err(ConnectionBrokerError::OAuthFlowPending);
-                    }
-                    self.reserve(
-                        &session.subject.canonical_user_id,
-                        &session.subject.display_email,
-                        ConnectionOperationKind::Disconnect,
-                        true,
-                        None,
-                        None,
-                    )
-                    .await?
-                }
-                other => other?,
-            };
-            let completed = if record.operation_state == ConnectionOperationState::Succeeded {
-                record
-            } else {
-                self.wait(&session.subject.canonical_user_id, record.operation_id)
-                    .await?
-            };
-            let disconnected = completed
-                .result
-                .as_ref()
-                .and_then(Value::as_object)
-                .and_then(|object| object.get("disconnected"))
-                .and_then(Value::as_bool)
-                == Some(true);
-            if disconnected {
-                Ok(())
-            } else {
-                Err(ConnectionBrokerError::Unavailable)
-            }
+                .await?;
+            Ok(ReservedConnectionStart {
+                operation_id: record.operation_id,
+                poll_deadline_at: record.response_deadline_at,
+            })
         })
     }
 }
@@ -1130,6 +1124,14 @@ impl ConnectionOperationReconciler {
                 }
                 continue;
             }
+            if matches!(
+                operation.task_phase,
+                steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled
+            ) {
+                self.fail_operation(operation.operation_id, &task_failure)
+                    .await?;
+                continue;
+            }
             if self
                 .store
                 .connection_operation_deadline_elapsed(operation.operation_id)
@@ -1190,10 +1192,7 @@ impl ConnectionOperationReconciler {
                         }
                     }
                 }
-                steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled => {
-                    self.fail_operation(operation.operation_id, &task_failure)
-                        .await?;
-                }
+                steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled => {}
                 steward_types::TaskPhase::Submitted
                 | steward_types::TaskPhase::Parked
                 | steward_types::TaskPhase::Queued
@@ -1241,9 +1240,19 @@ fn connection_operation_failure(
     execution_stderr: Option<&[u8]>,
 ) -> ConnectionOperationFailure {
     let category = match failure_reason {
+        Some("bridge-runtime-authentication") => "bridge-runtime-authentication",
         Some("bridge-proxy-policy") => "bridge-proxy-policy",
         Some("bridge-runtime-authorization") => "bridge-runtime-authorization",
+        Some("bridge-token-grant") => "bridge-token-grant",
+        Some("bridge-response-contract") => "bridge-response-contract",
+        Some("bridge-gateway-transport") => "bridge-gateway-transport",
+        Some("bridge-gateway-status") => "bridge-gateway-status",
+        Some("bridge-gateway-body") => "bridge-gateway-body",
+        Some("bridge-gateway-unavailable") => "bridge-gateway-unavailable",
         Some("bridge-gateway-http") => "bridge-gateway-http",
+        Some("runtime_create_admission_rejected") => "runtime_create_admission_rejected",
+        Some("runtime_start_failed") => "runtime_start_failed",
+        Some("deadline_exceeded") => "deadline_exceeded",
         _ => "bridge_failed",
     };
     let detail = (category == "bridge-gateway-http")
@@ -1278,8 +1287,19 @@ fn connection_broker_error(
     failure_detail: Option<&Value>,
 ) -> ConnectionBrokerError {
     match failure_category {
+        Some("bridge-runtime-authentication") => ConnectionBrokerError::RuntimeAuthenticationFailed,
         Some("bridge-proxy-policy") => ConnectionBrokerError::ProxyPolicyDenied,
         Some("bridge-runtime-authorization") => ConnectionBrokerError::ProviderAuthorizationFailed,
+        Some("bridge-token-grant") => ConnectionBrokerError::TokenGrantFailed,
+        Some("bridge-response-contract") => ConnectionBrokerError::ProviderResponseInvalid,
+        Some("bridge-gateway-transport") => ConnectionBrokerError::GatewayTransportFailed,
+        Some("bridge-gateway-status") => ConnectionBrokerError::GatewayStatusInvalid,
+        Some("bridge-gateway-body") => ConnectionBrokerError::GatewayBodyUnavailable,
+        Some("bridge-gateway-unavailable") => ConnectionBrokerError::GatewayUnavailable,
+        Some("invalid_bridge_result") => ConnectionBrokerError::ProviderResponseInvalid,
+        Some("runtime_create_admission_rejected") => ConnectionBrokerError::RuntimeCreateFailed,
+        Some("runtime_start_failed") => ConnectionBrokerError::RuntimeStartFailed,
+        Some("deadline_exceeded") => ConnectionBrokerError::DeadlineExceeded,
         Some("bridge-gateway-http") => failure_detail
             .and_then(GithubBridgeFailureDiagnostic::from_value)
             .map_or(ConnectionBrokerError::Unavailable, |detail| {
@@ -1362,6 +1382,80 @@ mod finalized_connection_operation_tests {
                 broker_error
             );
         }
+        for (task_reason, operation_category, broker_error) in [
+            (
+                "bridge-runtime-authentication",
+                "bridge-runtime-authentication",
+                crate::connections::ConnectionBrokerError::RuntimeAuthenticationFailed,
+            ),
+            (
+                "bridge-token-grant",
+                "bridge-token-grant",
+                crate::connections::ConnectionBrokerError::TokenGrantFailed,
+            ),
+            (
+                "runtime_create_admission_rejected",
+                "runtime_create_admission_rejected",
+                crate::connections::ConnectionBrokerError::RuntimeCreateFailed,
+            ),
+            (
+                "runtime_start_failed",
+                "runtime_start_failed",
+                crate::connections::ConnectionBrokerError::RuntimeStartFailed,
+            ),
+            (
+                "deadline_exceeded",
+                "deadline_exceeded",
+                crate::connections::ConnectionBrokerError::DeadlineExceeded,
+            ),
+        ] {
+            assert_eq!(
+                connection_operation_failure(Some(task_reason), None).category,
+                operation_category
+            );
+            assert_eq!(
+                connection_broker_error(Some(operation_category), None),
+                broker_error
+            );
+        }
+    }
+
+    #[test]
+    fn every_safe_gateway_failure_keeps_its_actionable_category() {
+        for (category, broker_error) in [
+            (
+                "bridge-response-contract",
+                crate::connections::ConnectionBrokerError::ProviderResponseInvalid,
+            ),
+            (
+                "bridge-gateway-transport",
+                crate::connections::ConnectionBrokerError::GatewayTransportFailed,
+            ),
+            (
+                "bridge-gateway-status",
+                crate::connections::ConnectionBrokerError::GatewayStatusInvalid,
+            ),
+            (
+                "bridge-gateway-body",
+                crate::connections::ConnectionBrokerError::GatewayBodyUnavailable,
+            ),
+            (
+                "bridge-gateway-unavailable",
+                crate::connections::ConnectionBrokerError::GatewayUnavailable,
+            ),
+        ] {
+            assert_eq!(
+                connection_operation_failure(Some(category), None).category,
+                category,
+                "safe bridge failure categories must not collapse to bridge_failed"
+            );
+            assert_eq!(connection_broker_error(Some(category), None), broker_error);
+        }
+        assert_eq!(
+            connection_broker_error(Some("invalid_bridge_result"), None),
+            crate::connections::ConnectionBrokerError::ProviderResponseInvalid,
+            "an invalid successful bridge result must remain distinct at the API boundary"
+        );
     }
 
     #[test]
@@ -1807,7 +1901,7 @@ mod tests {
         fn disconnect<'a>(
             &'a self,
             _session: &'a ConnectionSession<String>,
-        ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
+        ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
             Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
         }
     }
