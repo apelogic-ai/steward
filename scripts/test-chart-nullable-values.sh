@@ -68,10 +68,22 @@ assert_exact_json_environment() {
   fi
 }
 
+assert_exact_string_environment() {
+  local environment_name="$1"
+  local expected_value="$2"
+  local manifest="$3"
+  local expected_line="            - { name: ${environment_name}, value: \"${expected_value}\" }"
+  if ! grep -Fxq "${expected_line}" "${manifest}"; then
+    echo "${environment_name} did not contain the exact configured value" >&2
+    exit 1
+  fi
+}
+
 # The published null defaults must coalesce and render with browser administration disabled.
 render_chart "${chart}" > "${rendered}"
 assert_environment_absent STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON "${rendered}"
 assert_environment_absent STEWARD_RUN_RELEASE_JSON "${rendered}"
+assert_exact_string_environment STEWARD_RUN_WORKFLOW_INSTALLATION_MODE remote "${rendered}"
 
 # The same disabled configuration must work if a downstream chart omits both optional defaults.
 cp -R "${chart}" "${omitted_chart}"
@@ -82,6 +94,7 @@ awk '
 render_chart "${omitted_chart}" > "${rendered}"
 assert_environment_absent STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON "${rendered}"
 assert_environment_absent STEWARD_RUN_RELEASE_JSON "${rendered}"
+assert_exact_string_environment STEWARD_RUN_WORKFLOW_INSTALLATION_MODE remote "${rendered}"
 
 # An explicit null ceiling preserves the fail-closed runtime default and projects no environment.
 render_chart "${chart}" \
@@ -118,6 +131,18 @@ fi
 render_chart "${chart}" "${browser_values[@]}" \
   --set-json "config.apiserver.stewardRunRelease=${valid_steward_run_release}" > "${rendered}"
 assert_exact_json_environment STEWARD_RUN_RELEASE_JSON "${valid_steward_run_release}" "${rendered}"
+
+render_chart "${chart}" "${browser_values[@]}" \
+  --set-json "config.apiserver.stewardRunRelease=${valid_steward_run_release}" \
+  --set-string config.apiserver.stewardRunWorkflowInstallationMode=vendored > "${rendered}"
+assert_exact_string_environment STEWARD_RUN_WORKFLOW_INSTALLATION_MODE vendored "${rendered}"
+
+if render_chart "${chart}" \
+  --set-string config.apiserver.stewardRunWorkflowInstallationMode=mutable >/dev/null 2>&1
+then
+  echo 'chart accepted an unsupported steward-run workflow installation mode' >&2
+  exit 1
+fi
 
 if render_chart "${chart}" \
   --set-json 'config.apiserver.stewardRunRelease={"manifestSchemaVersion":3}' \
