@@ -227,6 +227,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         &maximum_direct_source_provenance,
     )
     .await?;
+    verify_source_provenance_byte_limits(&store).await?;
     assert_connection_association_upgrade_result(&store).await?;
     assert_template_catalog_upgrade_result(&store).await?;
     verify_federated_subject_lifecycle(&store).await?;
@@ -440,6 +441,113 @@ async fn assert_maximum_source_provenance_upgrade_result(
         migrated, *expected,
         "migration 0056 must backfill every source-provenance value accepted by the frozen contract"
     );
+    Ok(())
+}
+
+async fn verify_source_provenance_byte_limits(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let exact = serde_json::json!({
+        "contractVersion": "steward.source-provenance/v1",
+        "provider": "github",
+        "repository": {
+            "id": "123456",
+            "ownerId": "7890",
+            "name": "é".repeat(256),
+        },
+        "triggeredSha": format!("git:sha1:{}", "a".repeat(40)),
+        "run": {
+            "id": "900001",
+            "attempt": 1,
+        },
+        "event": "é".repeat(256),
+        "ref": "é".repeat(1024),
+        "actorId": "24680",
+        "actor": "é".repeat(256),
+        "callerWorkflow": {
+            "ref": "é".repeat(1024),
+            "sha": format!("git:sha1:{}", "b".repeat(40)),
+        },
+        "reusableWorkflow": {
+            "ref": "é".repeat(1024),
+            "sha": format!("git:sha1:{}", "c".repeat(40)),
+        },
+    });
+    let frozen_provenance: SourceProvenance = serde_json::from_value(exact.clone())?;
+    frozen_provenance.validate().map_err(io::Error::other)?;
+
+    let mut connection = store.pool().acquire().await?;
+    sqlx::query(
+        "CREATE TEMP TABLE source_provenance_byte_limit_probe \
+         (LIKE task_submissions INCLUDING CONSTRAINTS)",
+    )
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(
+        "DO $probe$ \
+         DECLARE column_name text; \
+         BEGIN \
+           FOR column_name IN \
+             SELECT attribute.attname \
+             FROM pg_attribute attribute \
+             WHERE attribute.attrelid = \
+                     'pg_temp.source_provenance_byte_limit_probe'::regclass \
+               AND attribute.attnum > 0 \
+               AND NOT attribute.attisdropped \
+               AND attribute.attname <> 'source_provenance' \
+           LOOP \
+             EXECUTE format( \
+               'ALTER TABLE pg_temp.source_provenance_byte_limit_probe DROP COLUMN %I CASCADE', \
+               column_name \
+             ); \
+           END LOOP; \
+         END \
+         $probe$",
+    )
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query(
+        "INSERT INTO source_provenance_byte_limit_probe (source_provenance) VALUES ($1)",
+    )
+    .bind(&exact)
+    .execute(&mut *connection)
+    .await?;
+
+    for (field, pointer, value) in [
+        ("repository.name", "/repository/name", "é".repeat(257)),
+        ("event", "/event", "é".repeat(257)),
+        ("ref", "/ref", "é".repeat(1025)),
+        ("actor", "/actor", "é".repeat(257)),
+        (
+            "callerWorkflow.ref",
+            "/callerWorkflow/ref",
+            "é".repeat(1025),
+        ),
+        (
+            "reusableWorkflow.ref",
+            "/reusableWorkflow/ref",
+            "é".repeat(1025),
+        ),
+    ] {
+        let mut too_many_bytes = exact.clone();
+        *too_many_bytes
+            .pointer_mut(pointer)
+            .ok_or_else(|| io::Error::other(format!("missing provenance field {field}")))? =
+            serde_json::json!(value);
+        assert!(
+            serde_json::from_value::<SourceProvenance>(too_many_bytes.clone()).is_err(),
+            "the frozen Rust contract must reject {field} above its UTF-8 byte limit"
+        );
+        assert!(
+            sqlx::query(
+                "INSERT INTO source_provenance_byte_limit_probe (source_provenance) VALUES ($1)",
+            )
+            .bind(&too_many_bytes)
+            .execute(&mut *connection)
+            .await
+            .is_err(),
+            "migration 0056 must reject {field} above its UTF-8 byte limit"
+        );
+    }
+
     Ok(())
 }
 

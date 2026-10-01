@@ -18,20 +18,20 @@ ALTER TABLE task_submissions
             AND jsonb_typeof(source_provenance -> 'repository') = 'object'
             AND source_provenance #>> '{repository,id}' ~ '^[0-9]{1,20}$'
             AND source_provenance #>> '{repository,ownerId}' ~ '^[0-9]{1,20}$'
-            AND length(source_provenance #>> '{repository,name}') BETWEEN 1 AND 512
+            AND octet_length(source_provenance #>> '{repository,name}') BETWEEN 1 AND 512
             AND source_provenance ->> 'triggeredSha' ~ '^git:sha1:[0-9a-f]{40}$'
             AND jsonb_typeof(source_provenance -> 'run') = 'object'
             AND source_provenance #>> '{run,id}' ~ '^[0-9]{1,20}$'
             AND source_provenance #>> '{run,attempt}' ~ '^[1-9][0-9]*$'
-            AND length(source_provenance ->> 'event') BETWEEN 1 AND 512
-            AND length(source_provenance ->> 'ref') BETWEEN 1 AND 2048
+            AND octet_length(source_provenance ->> 'event') BETWEEN 1 AND 512
+            AND octet_length(source_provenance ->> 'ref') BETWEEN 1 AND 2048
             AND source_provenance ->> 'actorId' ~ '^[0-9]{1,20}$'
-            AND length(source_provenance ->> 'actor') BETWEEN 1 AND 512
+            AND octet_length(source_provenance ->> 'actor') BETWEEN 1 AND 512
             AND jsonb_typeof(source_provenance -> 'callerWorkflow') = 'object'
-            AND length(source_provenance #>> '{callerWorkflow,ref}') BETWEEN 1 AND 2048
+            AND octet_length(source_provenance #>> '{callerWorkflow,ref}') BETWEEN 1 AND 2048
             AND source_provenance #>> '{callerWorkflow,sha}' ~ '^git:sha1:[0-9a-f]{40}$'
             AND jsonb_typeof(source_provenance -> 'reusableWorkflow') = 'object'
-            AND length(source_provenance #>> '{reusableWorkflow,ref}') BETWEEN 1 AND 2048
+            AND octet_length(source_provenance #>> '{reusableWorkflow,ref}') BETWEEN 1 AND 2048
             AND source_provenance #>> '{reusableWorkflow,sha}' ~ '^git:sha1:[0-9a-f]{40}$'
         ) IS TRUE)
     ),
