@@ -2,6 +2,20 @@ import { describe, expect, test } from "bun:test";
 
 import { initialEnvelopeTemplate, templateMemberRoles, validateTemplateFields } from "./admin-template-view";
 
+function authoredEnvelope() {
+  return {
+    revision: 1,
+    spec: {
+      budget: { currency: "USD", monthlyLimit: "10.00", singleRunLimit: "1.00" },
+      llms: [{ provider: "provider-a", model: "model-a" }],
+      tools: [],
+      runtimeMinutesLimit: "60",
+      ttl: "15m",
+      runner: { platforms: ["linux" as const], memory: "2Gi", compute: "1", storage: "10Gi" },
+    },
+  };
+}
+
 describe("first envelope template", () => {
   test("starts as an editable, least-authority version-one template", () => {
     expect(initialEnvelopeTemplate).toEqual({
@@ -29,6 +43,7 @@ describe("first envelope template", () => {
       allowedTools: new Set([JSON.stringify(["github", "repository", "read"])]),
       autoApproveToCeiling: false,
       displayName: "",
+      envelope: authoredEnvelope(),
       memberRoles: [],
       models: [],
       monthlyLimit: "",
@@ -56,6 +71,7 @@ describe("first envelope template", () => {
       allowedTools: new Set(),
       autoApproveToCeiling: true,
       displayName: "Engineering",
+      envelope: authoredEnvelope(),
       memberRoles: ["engineering:member"],
       models: [{ provider: "provider-a", model: "model-a" }],
       monthlyLimit: "01.1234567",
@@ -64,5 +80,59 @@ describe("first envelope template", () => {
       thresholdJson: "",
       tools: [],
     })).toEqual({});
+  });
+
+  test("rejects valid JSON when the threshold is invalid or wider than its ceiling", () => {
+    const ceiling = authoredEnvelope();
+    const threshold = authoredEnvelope();
+    threshold.revision = 2;
+    threshold.spec.budget.monthlyLimit = "11.00";
+    threshold.spec.ttl = "not-a-duration";
+    threshold.spec.runner.memory = "2GB";
+
+    expect(validateTemplateFields({
+      allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
+      allowedTools: new Set(),
+      autoApproveToCeiling: false,
+      displayName: "Engineering",
+      envelope: ceiling,
+      memberRoles: ["engineer"],
+      models: ceiling.spec.llms,
+      monthlyLimit: "10.00",
+      singleRunLimit: "1.00",
+      templateId: "engineer",
+      thresholdJson: JSON.stringify(threshold),
+      tools: [],
+    })).toEqual({ threshold: "Enter a valid envelope within this template ceiling." });
+  });
+
+  test("reports invalid lifetime and runner quantities before submission", () => {
+    const envelope = authoredEnvelope();
+    envelope.spec.ttl = "";
+    envelope.spec.runtimeMinutesLimit = "many";
+    envelope.spec.runner.memory = "2GB";
+    envelope.spec.runner.compute = "0";
+    envelope.spec.runner.storage = "lots";
+
+    expect(validateTemplateFields({
+      allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
+      allowedTools: new Set(),
+      autoApproveToCeiling: true,
+      displayName: "Engineering",
+      envelope,
+      memberRoles: ["engineer"],
+      models: envelope.spec.llms,
+      monthlyLimit: "10.00",
+      singleRunLimit: "1.00",
+      templateId: "engineer",
+      thresholdJson: "",
+      tools: [],
+    })).toEqual({
+      ttl: "Enter a TTL.",
+      runtimeMinutes: "Enter a non-negative decimal.",
+      memory: "Use a positive binary quantity, such as 2Gi or 512Mi.",
+      compute: "Use positive cores or millicores, such as 1 or 500m.",
+      storage: "Use a positive binary quantity, such as 2Gi or 512Mi.",
+    });
   });
 });

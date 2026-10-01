@@ -23,7 +23,7 @@ import { useSession } from "@/session/session-context";
 
 type TemplateMutationState = "idle" | "saving" | "saved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
 
-type TemplateField = "templateId" | "displayName" | "memberRoles" | "monthlyLimit" | "singleRunLimit" | "models" | "tools" | "threshold";
+type TemplateField = "templateId" | "displayName" | "memberRoles" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "memory" | "compute" | "storage" | "models" | "tools" | "threshold";
 
 export type TemplateFieldErrors = Partial<Record<TemplateField, string>>;
 
@@ -75,6 +75,98 @@ function validDecimal(value: string): boolean {
   return /^[0-9]+(?:\.[0-9]*)?$/.test(value);
 }
 
+function decimalParts(value: string): { fractional: string; integer: string } | null {
+  if (!validDecimal(value)) return null;
+  const [integer = "", fractional = ""] = value.split(".");
+  return {
+    integer: integer.replace(/^0+/, ""),
+    fractional: fractional.replace(/0+$/, ""),
+  };
+}
+
+function compareDecimals(left: string, right: string): number | null {
+  const leftParts = decimalParts(left);
+  const rightParts = decimalParts(right);
+  if (!leftParts || !rightParts) return null;
+  if (leftParts.integer.length !== rightParts.integer.length) return leftParts.integer.length - rightParts.integer.length;
+  const integerComparison = leftParts.integer < rightParts.integer ? -1 : leftParts.integer > rightParts.integer ? 1 : 0;
+  if (integerComparison !== 0) return integerComparison;
+  const width = Math.max(leftParts.fractional.length, rightParts.fractional.length);
+  const leftFractional = leftParts.fractional.padEnd(width, "0");
+  const rightFractional = rightParts.fractional.padEnd(width, "0");
+  return leftFractional < rightFractional ? -1 : leftFractional > rightFractional ? 1 : 0;
+}
+
+function durationSeconds(value: string): bigint | null {
+  const match = /^([0-9]+)(s|m|h|d)$/.exec(value);
+  if (!match) return null;
+  const multiplier = { s: 1n, m: 60n, h: 3600n, d: 86400n }[match[2] as "s" | "m" | "h" | "d"];
+  const seconds = BigInt(match[1]) * multiplier;
+  return seconds <= 18446744073709551615n ? seconds : null;
+}
+
+function runnerQuantity(value: string, resource: "compute" | "memory" | "storage"): bigint | null {
+  let quantity: bigint;
+  if (resource === "compute") {
+    const match = /^([0-9]+)(m)?$/.exec(value);
+    if (!match) return null;
+    quantity = BigInt(match[1]) * (match[2] ? 1n : 1000n);
+  } else {
+    const match = /^([0-9]+)(Ki|Mi|Gi|Ti)$/.exec(value);
+    if (!match) return null;
+    const power = { Ki: 1n, Mi: 2n, Gi: 3n, Ti: 4n }[match[2] as "Ki" | "Mi" | "Gi" | "Ti"];
+    quantity = BigInt(match[1]) * (1024n ** power);
+  }
+  return quantity > 0n && quantity <= 340282366920938463463374607431768211455n ? quantity : null;
+}
+
+function validEnvelopeSemantics(envelope: BrowserEnvelope): boolean {
+  const { budget, runner, runtimeMinutesLimit, ttl } = envelope.spec;
+  const platforms = runner?.platforms ?? [];
+  return envelope.revision > 0
+    && validDecimal(budget.monthlyLimit)
+    && (budget.singleRunLimit === undefined || budget.singleRunLimit === null || validDecimal(budget.singleRunLimit))
+    && /^[A-Z]{3}$/.test(budget.currency)
+    && (runtimeMinutesLimit === undefined || runtimeMinutesLimit === null || validDecimal(runtimeMinutesLimit))
+    && durationSeconds(ttl) !== null
+    && new Set(platforms).size === platforms.length
+    && (runner?.memory == null || runnerQuantity(runner.memory, "memory") !== null)
+    && (runner?.compute == null || runnerQuantity(runner.compute, "compute") !== null)
+    && (runner?.storage == null || runnerQuantity(runner.storage, "storage") !== null);
+}
+
+function envelopeIsWithin(candidate: BrowserEnvelope, ceiling: BrowserEnvelope): boolean {
+  if (!validEnvelopeSemantics(candidate) || !validEnvelopeSemantics(ceiling)) return false;
+  if (candidate.revision !== ceiling.revision || candidate.spec.budget.currency !== ceiling.spec.budget.currency) return false;
+  if ((compareDecimals(candidate.spec.budget.monthlyLimit, ceiling.spec.budget.monthlyLimit) ?? 1) > 0) return false;
+  if (ceiling.spec.budget.singleRunLimit !== undefined && ceiling.spec.budget.singleRunLimit !== null) {
+    if (candidate.spec.budget.singleRunLimit === undefined || candidate.spec.budget.singleRunLimit === null) return false;
+    if ((compareDecimals(candidate.spec.budget.singleRunLimit, ceiling.spec.budget.singleRunLimit) ?? 1) > 0) return false;
+  }
+  if (ceiling.spec.runtimeMinutesLimit !== undefined && ceiling.spec.runtimeMinutesLimit !== null) {
+    if (candidate.spec.runtimeMinutesLimit === undefined || candidate.spec.runtimeMinutesLimit === null) return false;
+    if ((compareDecimals(candidate.spec.runtimeMinutesLimit, ceiling.spec.runtimeMinutesLimit) ?? 1) > 0) return false;
+  }
+  const candidateTtl = durationSeconds(candidate.spec.ttl);
+  const ceilingTtl = durationSeconds(ceiling.spec.ttl);
+  if (candidateTtl === null || ceilingTtl === null || candidateTtl > ceilingTtl) return false;
+  if (candidate.spec.llms.some((model) => !ceiling.spec.llms.some((allowed) => modelKey(model) === modelKey(allowed)))) return false;
+  if (candidate.spec.tools.some((tool) => !ceiling.spec.tools.some((allowed) => toolKey(tool) === toolKey(allowed)))) return false;
+  const candidateRunner = candidate.spec.runner;
+  const ceilingRunner = ceiling.spec.runner;
+  if ((candidateRunner?.platforms ?? []).some((platform) => !(ceilingRunner?.platforms ?? []).includes(platform))) return false;
+  for (const resource of ["memory", "compute", "storage"] as const) {
+    const requested = candidateRunner?.[resource];
+    if (requested == null) continue;
+    const allowed = ceilingRunner?.[resource];
+    if (allowed == null) return false;
+    const requestedQuantity = runnerQuantity(requested, resource);
+    const allowedQuantity = runnerQuantity(allowed, resource);
+    if (requestedQuantity === null || allowedQuantity === null || requestedQuantity > allowedQuantity) return false;
+  }
+  return true;
+}
+
 function isBrowserEnvelope(value: unknown): value is BrowserEnvelope {
   if (!isRecord(value)) return false;
   const envelope = value;
@@ -119,6 +211,7 @@ export function validateTemplateFields({
   allowedTools,
   autoApproveToCeiling,
   displayName: templateDisplayName,
+  envelope,
   memberRoles,
   models,
   monthlyLimit,
@@ -131,6 +224,7 @@ export function validateTemplateFields({
   allowedTools: ReadonlySet<string>;
   autoApproveToCeiling: boolean;
   displayName: string;
+  envelope: BrowserEnvelope;
   memberRoles: Array<string>;
   models: Array<ModelRef>;
   monthlyLimit: string;
@@ -149,12 +243,22 @@ export function validateTemplateFields({
   else if (!validDecimal(singleRunLimit.trim())) errors.singleRunLimit = decimalMessage;
   if (!monthlyLimit.trim()) errors.monthlyLimit = "Enter a monthly budget.";
   else if (!validDecimal(monthlyLimit.trim())) errors.monthlyLimit = decimalMessage;
+  if (!envelope.spec.ttl) errors.ttl = "Enter a TTL.";
+  else if (durationSeconds(envelope.spec.ttl) === null) errors.ttl = "Use a duration such as 15m, 2h, or 1d.";
+  if (envelope.spec.runtimeMinutesLimit && !validDecimal(envelope.spec.runtimeMinutesLimit)) errors.runtimeMinutes = decimalMessage;
+  for (const resource of ["memory", "compute", "storage"] as const) {
+    const value = envelope.spec.runner?.[resource];
+    if (value && runnerQuantity(value, resource) === null) errors[resource] = resource === "compute"
+      ? "Use positive cores or millicores, such as 1 or 500m."
+      : "Use a positive binary quantity, such as 2Gi or 512Mi.";
+  }
   if (models.length === 0) errors.models = "Select at least one model.";
   else if (models.some((model) => !allowedModels.has(modelKey(model)))) errors.models = "Remove or replace every model not listed in the capability catalog.";
   if (tools.some((tool) => !allowedTools.has(toolKey(tool)))) errors.tools = "Remove or replace every tool not listed in the capability catalog.";
   if (!autoApproveToCeiling) {
     try {
-      if (!isBrowserEnvelope(JSON.parse(thresholdJson) as unknown)) errors.threshold = "Enter a complete valid envelope as JSON.";
+      const threshold = JSON.parse(thresholdJson) as unknown;
+      if (!isBrowserEnvelope(threshold) || !envelopeIsWithin(threshold, envelope)) errors.threshold = "Enter a valid envelope within this template ceiling.";
     } catch {
       errors.threshold = "Enter a complete valid envelope as JSON.";
     }
@@ -558,25 +662,6 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
     const templateId = create || saveAsNew ? newTemplateId : memberRole;
     const platforms = fields.getAll("platforms").filter((value): value is RunnerPlatform =>
       value === "linux" || value === "mac" || value === "windows");
-    const errors = validateTemplateFields({
-      allowedModels,
-      allowedTools,
-      autoApproveToCeiling,
-      displayName: name,
-      memberRoles: selectedRoles,
-      models,
-      monthlyLimit,
-      singleRunLimit,
-      templateId,
-      thresholdJson,
-      tools,
-    });
-    setFieldErrors(errors);
-    setRejectionCode(null);
-    if (Object.keys(errors).length > 0) {
-      setStatus("idle");
-      return;
-    }
     const memory = String(fields.get("memory") ?? "").trim();
     const compute = String(fields.get("compute") ?? "").trim();
     const storage = String(fields.get("storage") ?? "").trim();
@@ -601,14 +686,39 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
       },
     };
     let nextAutoProvisionThreshold: BrowserEnvelope | null = null;
+    let thresholdJsonForValidation = thresholdJson;
     if (!autoApproveToCeiling) {
       try {
         const parsed: unknown = JSON.parse(thresholdJson);
-        if (!isBrowserEnvelope(parsed)) return;
-        nextAutoProvisionThreshold = parsed;
+        if (isBrowserEnvelope(parsed)) {
+          nextAutoProvisionThreshold = !create && parsed.revision === currentRevision
+            ? { ...parsed, revision: envelope.revision }
+            : parsed;
+          thresholdJsonForValidation = JSON.stringify(nextAutoProvisionThreshold);
+        }
       } catch {
-        return;
+        // The field validator below owns the inline malformed-JSON diagnostic.
       }
+    }
+    const errors = validateTemplateFields({
+      allowedModels,
+      allowedTools,
+      autoApproveToCeiling,
+      displayName: name,
+      envelope,
+      memberRoles: selectedRoles,
+      models,
+      monthlyLimit,
+      singleRunLimit,
+      templateId,
+      thresholdJson: thresholdJsonForValidation,
+      tools,
+    });
+    setFieldErrors(errors);
+    setRejectionCode(null);
+    if (Object.keys(errors).length > 0) {
+      setStatus("idle");
+      return;
     }
     setStatus("saving");
     const result = await putAdminEnvelopeTemplate({
@@ -649,8 +759,8 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
           <div className="grid gap-4 sm:grid-cols-4">
             <label className="grid gap-2 text-sm font-semibold">Per run (USD)<input aria-invalid={Boolean(fieldErrors.singleRunLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setSingleRunLimit(event.target.value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label>
             <label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input aria-invalid={Boolean(fieldErrors.monthlyLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setMonthlyLimit(event.target.value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label>
-            <label className="grid gap-2 text-sm font-semibold">TTL<input className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" required /></label>
-            <label className="grid gap-2 text-sm font-semibold">Runtime minutes<input className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => setRuntimeMinutesLimit(event.target.value)} placeholder="60" value={runtimeMinutesLimit} /></label>
+            <label className="grid gap-2 text-sm font-semibold">TTL<input aria-invalid={Boolean(fieldErrors.ttl)} className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" onChange={() => clearFieldError("ttl")} required /><FieldError message={fieldErrors.ttl} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Runtime minutes<input aria-invalid={Boolean(fieldErrors.runtimeMinutes)} className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => { setRuntimeMinutesLimit(event.target.value); clearFieldError("runtimeMinutes"); }} placeholder="60" value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label>
           </div>
         </FormSection>
         <FormSection description="Only models supported by the inference gateway can be selected." title="Models">
@@ -698,7 +808,7 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
           <div className="space-y-4"><label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => { setAutoApproveToCeiling(event.target.checked); clearFieldError("threshold"); }} type="checkbox" />Auto-approve every request within the ceiling</label>{!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea aria-invalid={Boolean(fieldErrors.threshold)} className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setThresholdJson(event.target.value); clearFieldError("threshold"); }} spellCheck={false} value={thresholdJson} /><FieldError message={fieldErrors.threshold} /></label> : null}</div>
         </FormSection>
         <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner">
-          <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" placeholder="2Gi" /></label><label className="grid gap-2 text-sm font-semibold">Compute<input className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" placeholder="1000m" /></label><label className="grid gap-2 text-sm font-semibold">Storage<input className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" placeholder="10Gi" /></label></div></fieldset>
+          <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset>
         </FormSection>
         {status !== "idle" && status !== "saving" ? <p className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status, rejectionCode)}</p> : null}
         <footer className="sticky bottom-0 flex flex-wrap items-center justify-between gap-4 border-t bg-subtle px-6 py-4"><p className="text-sm text-muted-ink">{models.length} model{models.length === 1 ? "" : "s"} · {tools.length} tool{tools.length === 1 ? "" : "s"} · {singleRunLimit || "—"} USD per run</p><div className="flex gap-3"><Link className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold" href="/admin/envelopes/templates">Cancel</Link><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="create">{status === "saving" ? "Saving…" : "Create template"}</button></div></footer>
@@ -718,7 +828,7 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
       </FormSection>
 
       <FormSection description="Inference spend limits in USD and how long an envelope stays valid." title="Budget and lifetime">
-        <div className="grid gap-4 sm:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Per run (USD)<input aria-invalid={Boolean(fieldErrors.singleRunLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setSingleRunLimit(event.target.value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label><label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input aria-invalid={Boolean(fieldErrors.monthlyLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setMonthlyLimit(event.target.value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label><label className="grid gap-2 text-sm font-semibold">TTL<input className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" required /></label><label className="grid gap-2 text-sm font-semibold">Runtime minutes<input className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => setRuntimeMinutesLimit(event.target.value)} placeholder="60" value={runtimeMinutesLimit} /></label></div>
+        <div className="grid gap-4 sm:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Per run (USD)<input aria-invalid={Boolean(fieldErrors.singleRunLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setSingleRunLimit(event.target.value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label><label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input aria-invalid={Boolean(fieldErrors.monthlyLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setMonthlyLimit(event.target.value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label><label className="grid gap-2 text-sm font-semibold">TTL<input aria-invalid={Boolean(fieldErrors.ttl)} className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" onChange={() => clearFieldError("ttl")} required /><FieldError message={fieldErrors.ttl} /></label><label className="grid gap-2 text-sm font-semibold">Runtime minutes<input aria-invalid={Boolean(fieldErrors.runtimeMinutes)} className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => { setRuntimeMinutesLimit(event.target.value); clearFieldError("runtimeMinutes"); }} placeholder="60" value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label></div>
       </FormSection>
 
       <FormSection description="Only models supported by the inference gateway can be selected." title="Models"><fieldset><legend className="sr-only">Models</legend><TagSelect addPlaceholder="Add…" emptyPlaceholder="Search models…" inputDisabled={modelCatalog.length === 0} label="Models" onChange={(keys) => { setModels(keys.flatMap((key) => { const model = [...modelCatalog, ...missingModels].find((candidate) => modelKey(candidate) === key); return model ? [model] : []; })); clearFieldError("models"); }} options={modelOptions} value={models.map(modelKey)} /><FieldError message={fieldErrors.models} />{missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}</fieldset></FormSection>
@@ -732,7 +842,7 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
         </div>
       </FormSection>
 
-      <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" placeholder="2Gi" /></label><label className="grid gap-2 text-sm font-semibold">Compute<input className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" placeholder="1000m" /></label><label className="grid gap-2 text-sm font-semibold">Storage<input className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" placeholder="10Gi" /></label></div></fieldset></FormSection>
+      <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
 
       {status !== "idle" && status !== "saving" ? (
         <p className={status === "saved" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status, rejectionCode)}</p>

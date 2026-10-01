@@ -1756,6 +1756,7 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await templateId.fill("not valid");
     await administrator.page.getByRole("textbox", { name: "Per run (USD)" }).fill("not-a-decimal");
     await administrator.page.getByRole("textbox", { name: "Monthly (USD)" }).fill("");
+    await administrator.page.getByRole("textbox", { name: "TTL" }).fill("");
     await administrator.page.getByRole("button", { name: "Remove provider-a/model-a" }).click();
     await administrator.page.getByRole("button", { name: "Create template" }).click();
 
@@ -1764,6 +1765,7 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await expect(administrator.page.getByText("Add at least one eligible member role.")).toBeVisible();
     await expect(administrator.page.getByText("Enter a non-negative decimal.")).toBeVisible();
     await expect(administrator.page.getByText("Enter a monthly budget.")).toBeVisible();
+    await expect(administrator.page.getByText("Enter a TTL.")).toBeVisible();
     await expect(administrator.page.getByText("Select at least one model.")).toBeVisible();
     await expect(administrator.page.getByText(/The server rejected the template/)).toHaveCount(0);
     expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
@@ -1774,6 +1776,7 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await roles.press("Enter");
     await administrator.page.getByRole("textbox", { name: "Per run (USD)" }).fill("1.00");
     await administrator.page.getByRole("textbox", { name: "Monthly (USD)" }).fill("10.00");
+    await administrator.page.getByRole("textbox", { name: "TTL" }).fill("15m");
     const models = administrator.page.getByRole("combobox", { name: "Models" });
     await models.fill("provider-a/model-a");
     await models.press("Enter");
@@ -1782,6 +1785,21 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await administrator.page.getByRole("textbox", { name: "Auto-approve up to (complete envelope JSON)" }).fill("not-json");
     await administrator.page.getByRole("button", { name: "Create template" }).click();
     await expect(administrator.page.getByText("Enter a complete valid envelope as JSON.")).toBeVisible();
+    expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
+
+    await administrator.page.getByRole("textbox", { name: "Auto-approve up to (complete envelope JSON)" }).fill(JSON.stringify({
+      revision: 2,
+      spec: {
+        budget: { currency: "USD", monthlyLimit: "11.00", singleRunLimit: "1.00" },
+        llms: [{ provider: "provider-a", model: "model-a" }],
+        tools: [],
+        runtimeMinutesLimit: "60",
+        ttl: "15m",
+        runner: { platforms: ["linux"] },
+      },
+    }));
+    await administrator.page.getByRole("button", { name: "Create template" }).click();
+    await expect(administrator.page.getByText("Enter a valid envelope within this template ceiling.")).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
 
     await autoApprove.check();
@@ -1819,7 +1837,7 @@ test("administrator preserves a narrower auto-provision threshold when revising 
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     const mutation = administrator.mutations.find((item) => item.path === "/admin/api/v1/envelope-templates/analyst");
     expectMutationProof(mutation);
-    expect(mutation.body.autoProvisionThreshold).toEqual(threshold);
+    expect(mutation.body.autoProvisionThreshold).toEqual({ ...threshold, revision: adminEnvelope.revision + 1 });
   } finally {
     await closeGuardedPage(administrator);
   }
