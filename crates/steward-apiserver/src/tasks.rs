@@ -11,7 +11,7 @@ use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use jsonwebtoken::jwk::{Jwk, JwkSet, KeyAlgorithm, PublicKeyUse};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 #[cfg(test)]
@@ -25,8 +25,8 @@ use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec, evaluate_with_grants,
 };
 use steward_ports::{
-    GitFile, GitFileRequest, GitHostingPlane, GitRepositoryIdentity, MAX_TASK_INPUT_ARCHIVE_BYTES,
-    TaskExecutionAdapter, TaskExecutionPlanRequest,
+    GitFile, GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRevisionRequest,
+    MAX_TASK_INPUT_ARCHIVE_BYTES, TaskExecutionAdapter, TaskExecutionPlanRequest,
 };
 use steward_store::{
     EnvelopeRequestRecord, FederatedSubjectObservation, FederatedSubjectRecord, PgStore,
@@ -34,12 +34,13 @@ use steward_store::{
     TaskRuntimeOperationRecord, TaskRuntimeOwnership, WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
-    BoundedText, ClosureEntry, ClosureEntryKind, ContentDigest, DirectAdmissionDelta,
-    DirectRequirements, DirectRuntimeOwnership, DirectTaskBindingEvidence, DirectTaskDefinition,
-    DirectTaskPhase, DirectTaskStatusResponse, DirectTaskSubmission, EnvelopeDigest,
-    EnvelopeEvidence, InstructionSkill, InvocationManifest, PACKAGE_CLOSURE_CONTRACT_VERSION,
-    PackageClosure, PackageCommit, RelativePath, RepositoryUrl, ResolvedSource, SourceProvenance,
-    StableProviderId, TASK_BINDING_EVIDENCE_SCHEMA, TriggerRepository, canonical_json_bytes,
+    BoundedText, BrowserTaskEvidence, BrowserTaskSubmission, ClosureEntry, ClosureEntryKind,
+    ContentDigest, DirectAdmissionDelta, DirectRequirements, DirectRuntimeOwnership,
+    DirectTaskBindingEvidence, DirectTaskDefinition, DirectTaskPhase, DirectTaskStatusResponse,
+    DirectTaskSubmission, EnvelopeDigest, EnvelopeEvidence, InstructionSkill, InvocationManifest,
+    PACKAGE_CLOSURE_CONTRACT_VERSION, PackageClosure, PackageCommit, RelativePath, RepositoryUrl,
+    ResolvedSource, SourceProvenance, StableProviderId, TASK_BINDING_EVIDENCE_SCHEMA, TaskOrigin,
+    TriggerRepository, canonical_json_bytes,
 };
 use steward_types::{
     AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, Email,
@@ -48,6 +49,9 @@ use steward_types::{
 use uuid::Uuid;
 
 use crate::WorkflowReference;
+use crate::browser_auth::{
+    BrowserAuthService, BrowserMutationProof, BrowserSessionContext, protect_browser_routes,
+};
 use crate::execution_bindings::ExecutionBindingCatalog;
 use crate::task_auth::{FEDERATED_TASK_TOKEN_CONTRACT, LEGACY_TASK_TOKEN_CONTRACT};
 use crate::{
@@ -135,6 +139,15 @@ struct DirectTaskPreAdmission {
     execution_binding: TaskExecutionBinding,
 }
 
+struct BrowserTaskPreAdmission {
+    definition: DirectTaskDefinition,
+    evidence: BrowserTaskEvidence,
+    envelope: EnvelopeRequestRecord,
+    spec: AgentRuntimeSpec,
+    command: Vec<String>,
+    execution_binding: TaskExecutionBinding,
+}
+
 trait DirectGitResolver: Send + Sync {
     fn resolve_repository<'a>(
         &'a self,
@@ -145,6 +158,14 @@ trait DirectGitResolver: Send + Sync {
         &'a self,
         request: &'a GitFileRequest,
     ) -> BoxFuture<'a, Result<GitFile, steward_ports::PortError>>;
+
+    fn resolve_revision<'a>(
+        &'a self,
+        request: &'a GitRevisionRequest,
+    ) -> BoxFuture<
+        'a,
+        Result<steward_types::direct_package::ExactGitCommit, steward_ports::PortError>,
+    >;
 }
 
 impl<G> DirectGitResolver for G
@@ -163,6 +184,16 @@ where
         request: &'a GitFileRequest,
     ) -> BoxFuture<'a, Result<GitFile, steward_ports::PortError>> {
         Box::pin(GitHostingPlane::read_file(self, request))
+    }
+
+    fn resolve_revision<'a>(
+        &'a self,
+        request: &'a GitRevisionRequest,
+    ) -> BoxFuture<
+        'a,
+        Result<steward_types::direct_package::ExactGitCommit, steward_ports::PortError>,
+    > {
+        Box::pin(GitHostingPlane::resolve_revision(self, request))
     }
 }
 
@@ -1270,6 +1301,14 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    fn envelope_template_allows_inline_browser_tasks<'a>(
+        &'a self,
+        _template_id: &'a str,
+        _revision: i64,
+    ) -> BoxFuture<'a, Result<Option<bool>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn task_by_idempotency<'a>(
         &'a self,
         submitter_service: &'a str,
@@ -1348,6 +1387,17 @@ impl TaskSubmissionLedger for PgStore {
         Box::pin(
             async move { PgStore::active_provisioned_user_envelopes(self, owner_user_id).await },
         )
+    }
+
+    fn envelope_template_allows_inline_browser_tasks<'a>(
+        &'a self,
+        template_id: &'a str,
+        revision: i64,
+    ) -> BoxFuture<'a, Result<Option<bool>, StoreError>> {
+        Box::pin(async move {
+            PgStore::envelope_template_allows_inline_browser_tasks(self, template_id, revision)
+                .await
+        })
     }
 
     fn task_by_idempotency<'a>(
@@ -1547,6 +1597,114 @@ struct TaskApiState<L, I> {
 struct TaskApplicationService<L> {
     ledger: L,
     config: TaskApiConfig,
+}
+
+#[derive(Clone)]
+pub(crate) struct BrowserTaskState<L> {
+    application: TaskApplicationService<L>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserRunSubmissionResponse {
+    #[schema(value_type = String, format = "uuid")]
+    pub task_uid: Uuid,
+    pub phase: TaskPhase,
+    pub origin: TaskOrigin,
+    pub package: BrowserResolvedPackage,
+    pub envelope: BrowserResolvedEnvelope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserResolvedPackage {
+    pub source: String,
+    pub revision: String,
+    pub path: RelativePath,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserResolvedEnvelope {
+    pub instance_id: String,
+    pub revision: i64,
+    pub digest: String,
+}
+
+pub fn browser_task_router<L>(
+    ledger: L,
+    config: TaskApiConfig,
+    browser_auth: BrowserAuthService,
+) -> Router
+where
+    L: AdmissionLedger + TaskSubmissionLedger,
+{
+    let routes = Router::new()
+        .route("/app/api/v1/runs", post(submit_browser_run::<L>))
+        .layer(DefaultBodyLimit::max(
+            steward_types::direct_package::MAX_INLINE_PACKAGE_BYTES
+                + steward_types::direct_package::MAX_BROWSER_INPUT_BYTES
+                + 16 * 1024,
+        ))
+        .with_state(BrowserTaskState {
+            application: TaskApplicationService { ledger, config },
+        });
+    protect_browser_routes(routes, browser_auth)
+}
+
+#[utoipa::path(
+    post,
+    path = "/app/api/v1/runs",
+    request_body = BrowserTaskSubmission,
+    params(
+        ("Idempotency-Key" = String, Header),
+        ("X-Steward-CSRF" = String, Header)
+    ),
+    responses(
+        (status = 202, body = BrowserRunSubmissionResponse),
+        (status = 400, description = "Browser package request is invalid"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 409, description = "Envelope or idempotency selection is ambiguous"),
+        (status = 422, description = "Package authority exceeds the selected Envelope"),
+        (status = 503, description = "Task submission is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn submit_browser_run<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    mutation: Option<Extension<BrowserMutationProof>>,
+    State(state): State<BrowserTaskState<L>>,
+    headers: HeaderMap,
+    Json(request): Json<BrowserTaskSubmission>,
+) -> Response
+where
+    L: AdmissionLedger + TaskSubmissionLedger,
+{
+    let (Some(Extension(session)), Some(Extension(_))) = (session, mutation) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(idempotency_key) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 255)
+    else {
+        return ApiError::Admission("Idempotency-Key is required".to_owned()).into_response();
+    };
+    let identity = TaskIdentity {
+        service: "steward-browser".to_owned(),
+        acting_user: Some(session.principal.display_email.clone()),
+        owner: session.principal.display_email,
+        canonical_user_id: session.principal.canonical_user_id,
+        source_provenance: None,
+    };
+    match state
+        .application
+        .submit_browser(idempotency_key, identity, &request)
+        .await
+    {
+        Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 pub fn task_router<L, I>(ledger: L, identities: I, config: TaskApiConfig) -> Router
@@ -1809,6 +1967,219 @@ impl<L> TaskApplicationService<L>
 where
     L: AdmissionLedger + TaskSubmissionLedger,
 {
+    async fn submit_browser(
+        &self,
+        idempotency_key: &str,
+        identity: TaskIdentity,
+        request: &BrowserTaskSubmission,
+    ) -> Result<BrowserRunSubmissionResponse, ApiError> {
+        request.validate().map_err(ApiError::Admission)?;
+        if !self.config.orchestration_mode.is_active() {
+            return Err(ApiError::TaskRuntimeContractUnavailable(
+                "Task submission is disabled during the staged orchestration rollout".to_owned(),
+            ));
+        }
+        let (mut record, evidence) = if request.package.source.starts_with("steward:registry/") {
+            self.submit_browser_registry(idempotency_key, identity.clone(), request)
+                .await?
+        } else {
+            self.submit_browser_package(idempotency_key, identity.clone(), request)
+                .await?
+        };
+        let input_archive = browser_inputs_archive(&request.inputs)?;
+        if record.browser_task_evidence.as_ref() != Some(&evidence) {
+            return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+        }
+        match record.input_archive.as_deref() {
+            Some(existing) if existing != input_archive => {
+                return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+            }
+            Some(_) => {}
+            None => {
+                record = self
+                    .ledger
+                    .put_task_inputs(
+                        record.task_uid,
+                        &identity.service,
+                        identity.canonical_user_id.as_str(),
+                        &input_archive,
+                    )
+                    .await
+                    .map_err(ApiError::Store)?;
+            }
+        }
+        if !record.execute_requested {
+            record = self
+                .ledger
+                .request_task_execution(
+                    record.task_uid,
+                    &identity.service,
+                    identity.canonical_user_id.as_str(),
+                )
+                .await
+                .map_err(ApiError::Store)?;
+        }
+        browser_submission_response(record)
+    }
+
+    async fn submit_browser_registry(
+        &self,
+        idempotency_key: &str,
+        identity: TaskIdentity,
+        request: &BrowserTaskSubmission,
+    ) -> Result<(TaskRecord, BrowserTaskEvidence), ApiError> {
+        let name = request
+            .package
+            .source
+            .strip_prefix("steward:registry/")
+            .ok_or_else(|| ApiError::Admission("registry package source is invalid".to_owned()))?;
+        let version = request
+            .package
+            .revision
+            .as_deref()
+            .and_then(|value| value.strip_prefix("steward:version:"))
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                ApiError::Admission("registry package revision is invalid".to_owned())
+            })?;
+        let workflow = self
+            .ledger
+            .workflow_revision(name, version)
+            .await
+            .map_err(ApiError::Store)?
+            .ok_or(ApiError::TaskWorkflowNotFound)?;
+        let closure_digest = ContentDigest::parse(format!("steward:{}", workflow.content_digest))
+            .map_err(ApiError::Admission)?;
+        let evidence = BrowserTaskEvidence {
+            source: request.package.source.clone(),
+            revision: request.package.revision.clone().ok_or_else(|| {
+                ApiError::Admission("registry package revision is required".to_owned())
+            })?,
+            path: request.package.path.clone(),
+            closure: None,
+            closure_digest,
+            inline_files: None,
+        };
+        evidence.validate().map_err(ApiError::Admission)?;
+        let task_request = TaskSubmissionRequest {
+            workflow: format!("{name}@{version}"),
+            envelope_digest: request.envelope_digest.clone(),
+            coding_agent_runtime: None,
+            agent_runtime_uid: None,
+        };
+        let reference = WorkflowReference {
+            name: name.to_owned(),
+            version,
+        };
+        submit_versioned_task(
+            self,
+            idempotency_key,
+            identity.clone(),
+            reference,
+            &task_request,
+            Some(&evidence),
+        )
+        .await?;
+        let record = self
+            .ledger
+            .task_by_idempotency(
+                &identity.service,
+                identity.canonical_user_id.as_str(),
+                idempotency_key,
+            )
+            .await
+            .map_err(ApiError::Store)?
+            .ok_or(ApiError::Store(StoreError::TaskNotFound))?;
+        Ok((record, evidence))
+    }
+
+    async fn submit_browser_package(
+        &self,
+        idempotency_key: &str,
+        identity: TaskIdentity,
+        request: &BrowserTaskSubmission,
+    ) -> Result<(TaskRecord, BrowserTaskEvidence), ApiError> {
+        let resolved =
+            resolve_browser_package_pre_admission(&self.ledger, &self.config, &identity, request)
+                .await?;
+        let approved = resolved
+            .envelope
+            .approved_envelope
+            .as_ref()
+            .ok_or(ApiError::MissingEnvelope)?;
+        let envelope_instance_id = resolved
+            .envelope
+            .envelope_instance_id
+            .as_deref()
+            .ok_or(ApiError::MissingEnvelope)?;
+        let envelope_digest = resolved
+            .envelope
+            .envelope_digest
+            .as_deref()
+            .ok_or(ApiError::MissingEnvelope)?;
+        let decision = AdmissionDecision::Admit;
+        let task_uid = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        let runtime_name = stable_task_runtime_name(operation_id);
+        let orchestration = task_orchestration_reservation(
+            task_uid,
+            operation_id,
+            VERSIONED_WORKFLOW_NAMESPACE,
+            &runtime_name,
+            &resolved.spec,
+            approved,
+            Some(&resolved.execution_binding),
+        )?;
+        let workflow = format!(
+            "direct:{}@{}",
+            resolved.definition.name.as_str(),
+            resolved.definition.version
+        );
+        let reservation = self
+            .ledger
+            .reserve_task(TaskReservationRequest {
+                task_uid,
+                operation_id,
+                idempotency_key,
+                submitter_service: &identity.service,
+                acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
+                acting_user_id: identity
+                    .acting_user
+                    .as_ref()
+                    .map(|_| identity.canonical_user_id.as_str()),
+                owner: &identity.owner.0,
+                owner_user_id: identity.canonical_user_id.as_str(),
+                workflow: &workflow,
+                workflow_name: None,
+                workflow_version: None,
+                workflow_digest: None,
+                user_envelope_instance_id: Some(envelope_instance_id),
+                user_envelope_revision: Some(approved.revision),
+                user_envelope_digest: Some(envelope_digest),
+                coding_agent_runtime: resolved.definition.runtime.agent_ref.as_str(),
+                runtime_uid: None,
+                runtime_namespace: VERSIONED_WORKFLOW_NAMESPACE,
+                runtime_name: &runtime_name,
+                runtime_ownership: RuntimeOwnership::Provisioned,
+                runtime_spec: &resolved.spec,
+                agent_command: &resolved.command,
+                execution_binding: Some(&resolved.execution_binding),
+                source_provenance: None,
+                direct_task_evidence: None,
+                task_origin: TaskOrigin::Browser,
+                browser_task_evidence: Some(&resolved.evidence),
+                user_envelope_snapshot: Some(approved),
+                candidate_digest: &orchestration.candidate_digest,
+                admission_decision: &decision,
+                inert_manifest_digest: &orchestration.inert_manifest_digest,
+                active_manifest_digest: &orchestration.active_manifest_digest,
+            })
+            .await
+            .map_err(ApiError::Store)?;
+        Ok((reservation.record, resolved.evidence))
+    }
+
     async fn submit_direct(
         &self,
         idempotency_key: &str,
@@ -1925,6 +2296,8 @@ where
                 execution_binding: Some(&execution_binding),
                 source_provenance: Some(&evidence.source_provenance),
                 direct_task_evidence: Some(&evidence),
+                task_origin: TaskOrigin::GithubActions,
+                browser_task_evidence: None,
                 user_envelope_snapshot: Some(approved),
                 candidate_digest: &orchestration.candidate_digest,
                 admission_decision: &decision,
@@ -1993,8 +2366,15 @@ where
             ));
         }
         if let Some(reference) = reference {
-            return submit_versioned_task(self, idempotency_key, identity, reference, request)
-                .await;
+            return submit_versioned_task(
+                self,
+                idempotency_key,
+                identity,
+                reference,
+                request,
+                None,
+            )
+            .await;
         }
         Err(ApiError::Admission(
             "governed Tasks require a provisioned User Envelope and a supported direct-package or versioned workflow contract"
@@ -2069,6 +2449,393 @@ where
             task_response(&self.ledger, record, deltas).await
         }
     }
+}
+
+async fn resolve_browser_package_pre_admission<L>(
+    ledger: &L,
+    config: &TaskApiConfig,
+    identity: &TaskIdentity,
+    request: &BrowserTaskSubmission,
+) -> Result<BrowserTaskPreAdmission, ApiError>
+where
+    L: TaskSubmissionLedger,
+{
+    let (definition, prompt, closure, closure_digest, revision, inline_files) =
+        if request.package.source == "inline" {
+            let files =
+                request.package.files.as_ref().ok_or_else(|| {
+                    ApiError::Admission("inline packages require files".to_owned())
+                })?;
+            let definition_bytes = files
+                .get(request.package.path.as_str())
+                .ok_or_else(|| {
+                    ApiError::Admission("inline package entry point is missing".to_owned())
+                })?
+                .as_bytes();
+            let definition = serde_json::from_slice::<DirectTaskDefinition>(definition_bytes)
+                .map_err(|_| ApiError::Admission("direct TaskDefinition is invalid".to_owned()))?;
+            definition.validate().map_err(ApiError::Admission)?;
+            let (prompt, closure, closure_digest) = resolve_inline_package_closure(
+                &request.package.path,
+                &definition,
+                definition_bytes,
+                files,
+            )?;
+            if let Some(expected) = request.package.revision.as_deref()
+                && expected != closure_digest.as_str()
+            {
+                return Err(ApiError::Admission(
+                    "inline package revision does not match its computed digest".to_owned(),
+                ));
+            }
+            (
+                definition,
+                prompt,
+                closure,
+                closure_digest.clone(),
+                closure_digest.as_str().to_owned(),
+                Some(files.clone()),
+            )
+        } else {
+            let git = config.direct_git_resolver.as_ref().ok_or_else(|| {
+                ApiError::TaskRuntimeContractUnavailable(
+                    "direct package Git source resolver is unavailable".to_owned(),
+                )
+            })?;
+            let repository = RepositoryUrl::parse(request.package.source.clone())
+                .map_err(ApiError::Admission)?;
+            let repository = git
+                .resolve_repository(&repository)
+                .await
+                .map_err(source_port_error)?;
+            let requested_revision = request.package.revision.as_deref().ok_or_else(|| {
+                ApiError::Admission("repository package revision is required".to_owned())
+            })?;
+            let commit = if requested_revision.starts_with("git:sha1:") {
+                steward_types::direct_package::ExactGitCommit::parse(requested_revision.to_owned())
+                    .map_err(ApiError::Admission)?
+            } else {
+                git.resolve_revision(&GitRevisionRequest {
+                    repository: repository.clone(),
+                    reference: requested_revision.to_owned(),
+                })
+                .await
+                .map_err(source_port_error)?
+            };
+            let definition_request = GitFileRequest {
+                repository: repository.clone(),
+                commit: commit.clone(),
+                path: request.package.path.clone(),
+                max_bytes: steward_types::direct_package::MAX_PACKAGE_FILE_BYTES,
+            };
+            let definition_file = git
+                .read_file(&definition_request)
+                .await
+                .map_err(source_port_error)?;
+            let definition_bytes = verified_git_file(definition_file, &definition_request)?;
+            let definition = serde_json::from_slice::<DirectTaskDefinition>(&definition_bytes)
+                .map_err(|_| ApiError::Admission("direct TaskDefinition is invalid".to_owned()))?;
+            definition.validate().map_err(ApiError::Admission)?;
+            let (prompt, closure, closure_digest) = resolve_package_closure(
+                git.as_ref(),
+                &repository,
+                &commit,
+                &request.package.path,
+                &definition,
+                &definition_bytes,
+            )
+            .await?;
+            (
+                definition,
+                prompt,
+                closure,
+                closure_digest,
+                commit.as_str().to_owned(),
+                None,
+            )
+        };
+
+    let envelope = resolve_direct_user_envelope(
+        ledger,
+        &identity.canonical_user_id,
+        request.envelope_digest.as_ref(),
+    )
+    .await?;
+    if request.package.source == "inline"
+        && let (Some(template_id), Some(template_revision)) =
+            (envelope.template_id.as_deref(), envelope.template_revision)
+    {
+        match ledger
+            .envelope_template_allows_inline_browser_tasks(template_id, template_revision)
+            .await
+            .map_err(ApiError::Store)?
+        {
+            Some(true) => {}
+            Some(false) => {
+                return Err(ApiError::Admission(
+                    "inline browser Tasks are disabled for the selected Envelope template"
+                        .to_owned(),
+                ));
+            }
+            None => {
+                return Err(ApiError::Admission(
+                    "the selected Envelope template revision is unavailable".to_owned(),
+                ));
+            }
+        }
+    }
+    let approved = envelope
+        .approved_envelope
+        .as_ref()
+        .ok_or(ApiError::MissingEnvelope)?;
+    let mut effective_requirements = match &definition.requires {
+        Some(requirements) => requirements.clone(),
+        None => direct_requirements_from_envelope(&approved.spec)?,
+    };
+    let selected_model = match definition.runtime.model.as_ref() {
+        Some(model) => model.clone(),
+        None => match effective_requirements.authority.llms.as_slice() {
+            [model] => model.clone(),
+            _ => {
+                return Err(ApiError::Admission(
+                    "direct TaskDefinition must select a runtime model when multiple models are available"
+                        .to_owned(),
+                ));
+            }
+        },
+    };
+    if definition.requires.is_none()
+        && !approved.spec.llms.iter().any(|model| {
+            model.provider == selected_model.provider.as_str()
+                && model.model == selected_model.model.as_str()
+        })
+    {
+        return Err(ApiError::Admission(
+            "selected model is not allowed by the selected Envelope".to_owned(),
+        ));
+    }
+    let requested_spec = direct_runtime_spec(identity, &definition, &effective_requirements)?;
+    if !matches!(
+        evaluate_with_grants(&requested_spec, approved, &[])
+            .map_err(|error| ApiError::Admission(format!("{error:?}")))?,
+        AdmissionDecision::Admit
+    ) {
+        return Err(ApiError::Admission(
+            "browser package requirements exceed the selected Envelope".to_owned(),
+        ));
+    }
+    effective_requirements.authority.llms = vec![selected_model.clone()];
+    let spec = direct_runtime_spec(identity, &definition, &effective_requirements)?;
+    let model = ModelRef {
+        provider: selected_model.provider.as_str().to_owned(),
+        model: selected_model.model.as_str().to_owned(),
+    };
+    let (command, execution_binding) =
+        resolve_direct_execution_plan(config, &definition, &prompt, &spec, &model)?;
+    let evidence = BrowserTaskEvidence {
+        source: request.package.source.clone(),
+        revision,
+        path: request.package.path.clone(),
+        closure: Some(closure),
+        closure_digest,
+        inline_files,
+    };
+    evidence.validate().map_err(ApiError::Admission)?;
+    Ok(BrowserTaskPreAdmission {
+        definition,
+        evidence,
+        envelope,
+        spec,
+        command,
+        execution_binding,
+    })
+}
+
+fn resolve_inline_package_closure(
+    entry_point: &RelativePath,
+    definition: &DirectTaskDefinition,
+    definition_bytes: &[u8],
+    files: &BTreeMap<String, String>,
+) -> Result<(String, PackageClosure, ContentDigest), ApiError> {
+    if definition_bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return Err(ApiError::Admission(
+            "direct TaskDefinition must not contain a UTF-8 BOM".to_owned(),
+        ));
+    }
+    let package_root = containing_directory(entry_point.as_str());
+    let mut entries = BTreeMap::<String, ClosureEntry>::new();
+    let canonical_definition = canonical_json_bytes(definition).map_err(ApiError::Admission)?;
+    insert_closure_entry(
+        &mut entries,
+        ClosureEntryKind::TaskDefinition,
+        entry_point.clone(),
+        &canonical_definition,
+    )?;
+    let prompt_path = resolve_package_relative_path(
+        package_root,
+        containing_directory(entry_point.as_str()),
+        &definition.prompt,
+    )?;
+    let prompt_bytes = inline_file(files, &prompt_path)?;
+    insert_closure_entry(
+        &mut entries,
+        ClosureEntryKind::Prompt,
+        prompt_path,
+        prompt_bytes,
+    )?;
+    let mut rendered_prompt = std::str::from_utf8(prompt_bytes)
+        .map_err(|_| ApiError::Admission("direct package prompt must be UTF-8".to_owned()))?
+        .to_owned();
+    for skill_reference in &definition.skills {
+        let skill_path = resolve_package_relative_path(
+            package_root,
+            containing_directory(entry_point.as_str()),
+            skill_reference,
+        )?;
+        let skill_bytes = inline_file(files, &skill_path)?;
+        let skill = serde_json::from_slice::<InstructionSkill>(skill_bytes)
+            .map_err(|_| ApiError::Admission("instruction skill is invalid".to_owned()))?;
+        skill.validate().map_err(ApiError::Admission)?;
+        let canonical_skill = canonical_json_bytes(&skill).map_err(ApiError::Admission)?;
+        insert_closure_entry(
+            &mut entries,
+            ClosureEntryKind::InstructionSkill,
+            skill_path.clone(),
+            &canonical_skill,
+        )?;
+        let skill_root = containing_directory(skill_path.as_str());
+        let instructions_path =
+            resolve_package_relative_path(package_root, skill_root, &skill.instructions)?;
+        let instructions = inline_file(files, &instructions_path)?;
+        insert_closure_entry(
+            &mut entries,
+            ClosureEntryKind::Instructions,
+            instructions_path,
+            instructions,
+        )?;
+        let instructions = std::str::from_utf8(instructions).map_err(|_| {
+            ApiError::Admission("instruction skill instructions must be UTF-8".to_owned())
+        })?;
+        rendered_prompt.push_str("\n\n## Instruction skill: ");
+        rendered_prompt.push_str(skill.name.as_str());
+        rendered_prompt.push_str("\n\n");
+        rendered_prompt.push_str(skill.description.as_str());
+        rendered_prompt.push_str("\n\n");
+        rendered_prompt.push_str(instructions);
+        for asset in &skill.assets {
+            let asset_path = resolve_package_relative_path(package_root, skill_root, asset)?;
+            let asset_bytes = inline_file(files, &asset_path)?;
+            insert_closure_entry(
+                &mut entries,
+                ClosureEntryKind::Asset,
+                asset_path,
+                asset_bytes,
+            )?;
+        }
+    }
+    if entries.len() != files.len() {
+        return Err(ApiError::Admission(
+            "inline package contains unreferenced files".to_owned(),
+        ));
+    }
+    let closure = PackageClosure {
+        contract_version: PACKAGE_CLOSURE_CONTRACT_VERSION.to_owned(),
+        entry_point: entry_point.clone(),
+        entries: entries.into_values().collect(),
+    };
+    closure.validate().map_err(ApiError::Admission)?;
+    let digest = Sha256::digest(canonical_json_bytes(&closure).map_err(ApiError::Admission)?);
+    let digest =
+        ContentDigest::parse(format!("steward:sha256:{digest:x}")).map_err(ApiError::Admission)?;
+    Ok((rendered_prompt, closure, digest))
+}
+
+fn inline_file<'a>(
+    files: &'a BTreeMap<String, String>,
+    path: &RelativePath,
+) -> Result<&'a [u8], ApiError> {
+    files
+        .get(path.as_str())
+        .map(String::as_bytes)
+        .ok_or_else(|| ApiError::Admission(format!("package file {} is missing", path.as_str())))
+}
+
+fn browser_inputs_archive(inputs: &serde_json::Value) -> Result<Vec<u8>, ApiError> {
+    let bytes = canonical_json_bytes(inputs).map_err(ApiError::Admission)?;
+    let mut archive = vec![0_u8; 512];
+    let name = b"in/inputs.json";
+    archive[..name.len()].copy_from_slice(name);
+    write_tar_octal(&mut archive[100..108], 0o644)?;
+    write_tar_octal(&mut archive[108..116], 0)?;
+    write_tar_octal(&mut archive[116..124], 0)?;
+    write_tar_octal(&mut archive[124..136], bytes.len() as u64)?;
+    write_tar_octal(&mut archive[136..148], 0)?;
+    archive[148..156].fill(b' ');
+    archive[156] = b'0';
+    archive[257..263].copy_from_slice(b"ustar\0");
+    archive[263..265].copy_from_slice(b"00");
+    let checksum: u64 = archive.iter().map(|byte| u64::from(*byte)).sum();
+    write_tar_checksum(&mut archive[148..156], checksum)?;
+    archive.extend_from_slice(&bytes);
+    let padding = (512 - bytes.len() % 512) % 512;
+    archive.resize(archive.len() + padding + 1024, 0);
+    Ok(archive)
+}
+
+fn write_tar_octal(field: &mut [u8], value: u64) -> Result<(), ApiError> {
+    let width = field.len().saturating_sub(1);
+    let encoded = format!("{value:0width$o}");
+    if encoded.len() != width {
+        return Err(ApiError::Admission(
+            "Task inputs cannot be archived".to_owned(),
+        ));
+    }
+    field[..width].copy_from_slice(encoded.as_bytes());
+    field[width] = 0;
+    Ok(())
+}
+
+fn write_tar_checksum(field: &mut [u8], value: u64) -> Result<(), ApiError> {
+    let encoded = format!("{value:06o}\0 ");
+    if encoded.len() != field.len() {
+        return Err(ApiError::Admission(
+            "Task inputs cannot be archived".to_owned(),
+        ));
+    }
+    field.copy_from_slice(encoded.as_bytes());
+    Ok(())
+}
+
+fn browser_submission_response(
+    record: TaskRecord,
+) -> Result<BrowserRunSubmissionResponse, ApiError> {
+    let evidence = record
+        .browser_task_evidence
+        .ok_or(ApiError::Store(StoreError::InvalidTaskTransition))?;
+    let instance_id = record
+        .user_envelope_instance_id
+        .ok_or(ApiError::MissingEnvelope)?;
+    let revision = record
+        .user_envelope_revision
+        .ok_or(ApiError::MissingEnvelope)?;
+    let digest = record
+        .user_envelope_digest
+        .ok_or(ApiError::MissingEnvelope)?;
+    Ok(BrowserRunSubmissionResponse {
+        task_uid: record.task_uid,
+        phase: record.phase,
+        origin: TaskOrigin::Browser,
+        package: BrowserResolvedPackage {
+            source: evidence.source,
+            revision: evidence.revision,
+            path: evidence.path,
+        },
+        envelope: BrowserResolvedEnvelope {
+            instance_id,
+            revision,
+            digest: format!("steward:{digest}"),
+        },
+    })
 }
 
 async fn resolve_direct_task_pre_admission<L>(
@@ -2741,6 +3508,7 @@ async fn submit_versioned_task<L>(
     identity: TaskIdentity,
     reference: WorkflowReference,
     request: &TaskSubmissionRequest,
+    browser_task_evidence: Option<&BrowserTaskEvidence>,
 ) -> Result<(StatusCode, TaskStatusResponse), ApiError>
 where
     L: AdmissionLedger + TaskSubmissionLedger,
@@ -2833,6 +3601,12 @@ where
             execution_binding: Some(&plan.execution_binding),
             source_provenance: identity.source_provenance.as_ref(),
             direct_task_evidence: None,
+            task_origin: if browser_task_evidence.is_some() {
+                TaskOrigin::Browser
+            } else {
+                TaskOrigin::GithubActions
+            },
+            browser_task_evidence,
             user_envelope_snapshot: Some(user_envelope),
             candidate_digest: &orchestration.candidate_digest,
             admission_decision: &decision,

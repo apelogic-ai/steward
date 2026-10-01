@@ -29,8 +29,9 @@ use steward_apiserver::{
     IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository, KubernetesTokenAuthenticator,
     KubernetesTokenReviewAudience, MAX_EXECUTION_BINDING_CATALOG_BYTES,
     MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, StewardRunWorkflowInstallationMode, TaskApiConfig,
-    agent_runs_ui, browser_admin, browser_auth, connections, google_oidc, governed_connections,
-    operator_admin, router, stable_runtime_bridge, task_router, user_envelopes, workflows,
+    agent_runs_ui, browser_admin, browser_auth, browser_task_router, connections, google_oidc,
+    governed_connections, operator_admin, router, stable_runtime_bridge, task_router,
+    user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
@@ -207,6 +208,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         Some(adapter) => task_api_config.with_git_hosting_plane(adapter),
         None => task_api_config,
     };
+    let task_api_config = task_api_config.with_task_orchestration_mode(task_orchestration_mode);
     let workflow_agents = task_api_config.execution_binding_advertisements();
     let runtimes = KubeRuntimeRepository::new(client);
     let browser = browser_application_router(
@@ -214,6 +216,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         runtimes.clone(),
         decisions.clone(),
         workflow_agents,
+        task_api_config.clone(),
         BrowserApplicationConfig {
             task_orchestration_mode,
             connection_auto_association_issuer,
@@ -232,11 +235,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     )
     .merge(operator_admin::router(store.clone(), authenticator))
     .merge(task_auth_discovery_router(task_auth_discovery))
-    .merge(task_router(
-        store.clone(),
-        task_identities,
-        task_api_config.with_task_orchestration_mode(task_orchestration_mode),
-    ));
+    .merge(task_router(store.clone(), task_identities, task_api_config));
     let app = match browser {
         Some(browser) => app.merge(browser),
         None => app,
@@ -716,6 +715,7 @@ async fn browser_application_router(
     runtimes: KubeRuntimeRepository,
     decisions: JiraAdapter,
     workflow_agents: Vec<steward_apiserver::ExecutionBindingAdvertisement>,
+    task_api_config: TaskApiConfig,
     application_config: BrowserApplicationConfig,
 ) -> Result<Option<axum::Router>, Box<dyn Error>> {
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
@@ -845,6 +845,11 @@ async fn browser_application_router(
             store.clone(),
             auth.clone(),
             workflow_agents,
+        ))
+        .merge(browser_task_router(
+            store.clone(),
+            task_api_config,
+            auth.clone(),
         ));
     let app = match connections {
         Some(broker) => app
@@ -1497,6 +1502,7 @@ async fn ensure_default_llm_template(store: &PgStore) -> Result<(), Box<dyn Erro
             member_roles: &document.member_roles,
             ceiling: &ceiling,
             auto_provision_threshold: Some(&ceiling),
+            allow_inline_browser_tasks: true,
             authored_by: "system:install",
         })
         .await?;
@@ -1543,6 +1549,7 @@ async fn templates_command(arguments: Vec<String>) -> Result<(), Box<dyn Error>>
                 member_roles: document.member_roles,
                 ceiling: document.ceiling,
                 auto_provision_threshold: document.auto_provision_threshold,
+                allow_inline_browser_tasks: true,
             }),
         )
         .await?;

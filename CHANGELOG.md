@@ -9,6 +9,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Added browser **Run now** for inline v2 packages, exact Git package locators,
+  and published Workflow aliases. Browser Tasks use the authenticated canonical
+  user and selected User Envelope, record immutable source and authority evidence,
+  accept bounded JSON inputs, enforce four active browser Tasks per canonical user,
+  and expose owner-scoped `out/` downloads. Additive
+  migration 0057 records Task origin and the per-template inline-authoring switch.
 - Started GitHub connection authorization asynchronously: the browser mutation
   now returns an owner-scoped operation identifier and polling deadline with
   HTTP 202, and the UI polls that operation until the one-time authorization

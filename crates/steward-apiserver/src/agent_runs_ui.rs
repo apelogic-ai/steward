@@ -5,6 +5,7 @@
 //! All Runs route requires a browser-admin session; the existing bearer administrator API remains
 //! independent at `/admin/api/v1/runs`.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -18,6 +19,7 @@ use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunPage, AgentRunQuery, AgentRunRecord,
     AgentRunTimelineEvent, AgentRunTimelineKind, StoreError, TaskReservationRequest,
 };
+use steward_types::direct_package::TaskOrigin;
 use steward_types::{CanonicalUserId, RuntimeOwnership, TaskPhase};
 use uuid::Uuid;
 
@@ -121,6 +123,8 @@ const fn default_limit() -> u16 {
 pub(crate) struct BrowserRunView {
     #[schema(value_type = String, format = "uuid")]
     task_uid: Uuid,
+    origin: TaskOrigin,
+    package: Option<BrowserRunPackageView>,
     workflow: String,
     workflow_name: Option<String>,
     workflow_version: Option<i64>,
@@ -140,6 +144,14 @@ pub(crate) struct BrowserRunView {
     error_category: Option<String>,
     trigger: Option<BrowserRunTrigger>,
     stages: Vec<BrowserRunStage>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserRunPackageView {
+    source: String,
+    revision: String,
+    path: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -386,6 +398,22 @@ pub(crate) struct BrowserExecutionLogResponse {
     complete: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserRunOutputFile {
+    path: String,
+    size_bytes: usize,
+    download_url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserRunOutputsResponse {
+    #[schema(value_type = String, format = "uuid")]
+    task_uid: Uuid,
+    files: Vec<BrowserRunOutputFile>,
+}
+
 const MAX_BROWSER_LOG_CHUNK_BYTES: usize = 64 * 1024;
 
 fn my_runs_router<L>(ledger: L, github_rerunner: Arc<dyn BrowserGithubRerunner>) -> Router
@@ -408,10 +436,228 @@ where
             "/app/api/v1/runs/{task_uid}/logs/{stream}",
             get(my_run_execution_log::<L>),
         )
+        .route(
+            "/app/api/v1/runs/{task_uid}/outputs",
+            get(my_run_outputs::<L>),
+        )
+        .route(
+            "/app/api/v1/runs/{task_uid}/outputs/{*path}",
+            get(download_my_run_output::<L>),
+        )
         .with_state(BrowserRunsState {
             ledger,
             github_rerunner,
         })
+}
+
+#[utoipa::path(
+    get,
+    path = "/app/api/v1/runs/{task_uid}/outputs",
+    params(("task_uid" = String, Path, format = "uuid")),
+    responses(
+        (status = 200, body = BrowserRunOutputsResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Completed run output is unavailable"),
+        (status = 503, description = "Run output is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn my_run_outputs<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    State(state): State<BrowserRunsState<L>>,
+    Path(task_uid): Path<Uuid>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let archive = match state
+        .ledger
+        .agent_run_output_archive(task_uid, session.principal.canonical_user_id.as_str())
+        .await
+    {
+        Ok(Some(archive)) => archive,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let entries = match output_archive_entries(&archive) {
+        Ok(entries) => entries,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    Json(BrowserRunOutputsResponse {
+        task_uid,
+        files: entries
+            .into_iter()
+            .map(|entry| BrowserRunOutputFile {
+                download_url: format!(
+                    "/app/api/v1/runs/{task_uid}/outputs/{}",
+                    encode_output_path(&entry.path)
+                ),
+                path: entry.path,
+                size_bytes: entry.size,
+            })
+            .collect(),
+    })
+    .into_response()
+}
+
+#[utoipa::path(
+    get,
+    path = "/app/api/v1/runs/{task_uid}/outputs/{path}",
+    params(
+        ("task_uid" = String, Path, format = "uuid"),
+        ("path" = String, Path)
+    ),
+    responses(
+        (status = 200, description = "Opaque run output file", content_type = "application/octet-stream"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Run output file is unavailable"),
+        (status = 503, description = "Run output is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn download_my_run_output<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    State(state): State<BrowserRunsState<L>>,
+    Path((task_uid, path)): Path<(Uuid, String)>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let archive = match state
+        .ledger
+        .agent_run_output_archive(task_uid, session.principal.canonical_user_id.as_str())
+        .await
+    {
+        Ok(Some(archive)) => archive,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Ok(entries) = output_archive_entries(&archive) else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(entry) = entries.into_iter().find(|entry| entry.path == path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(content_type) = HeaderValue::from_str("application/octet-stream") else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let filename = entry.path.rsplit('/').next().unwrap_or("output");
+    let Ok(disposition) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, content_type);
+    headers.insert(header::CONTENT_DISPOSITION, disposition);
+    (
+        headers,
+        archive[entry.offset..entry.offset + entry.size].to_vec(),
+    )
+        .into_response()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OutputArchiveEntry {
+    path: String,
+    offset: usize,
+    size: usize,
+}
+
+fn output_archive_entries(archive: &[u8]) -> Result<Vec<OutputArchiveEntry>, ()> {
+    let mut offset = 0_usize;
+    let mut entries = Vec::new();
+    let mut seen = BTreeSet::new();
+    while offset
+        .checked_add(512)
+        .filter(|end| *end <= archive.len())
+        .is_some()
+    {
+        let header = &archive[offset..offset + 512];
+        if header.iter().all(|byte| *byte == 0) {
+            return Ok(entries);
+        }
+        let path = tar_path(header)?;
+        let size = tar_octal(&header[124..136])?;
+        let data_offset = offset.checked_add(512).ok_or(())?;
+        let data_end = data_offset
+            .checked_add(size)
+            .filter(|end| *end <= archive.len())
+            .ok_or(())?;
+        let kind = header[156];
+        if kind == 0 || kind == b'0' {
+            let relative = path.strip_prefix("out/").ok_or(())?;
+            let relative = steward_types::direct_package::RelativePath::parse(relative.to_owned())
+                .map_err(|_| ())?;
+            if !seen.insert(relative.as_str().to_owned()) {
+                return Err(());
+            }
+            entries.push(OutputArchiveEntry {
+                path: relative.as_str().to_owned(),
+                offset: data_offset,
+                size,
+            });
+        } else if !matches!(kind, b'5' | b'x' | b'g') {
+            return Err(());
+        }
+        let padded = size.checked_add(511).ok_or(())? / 512 * 512;
+        offset = data_offset
+            .checked_add(padded)
+            .filter(|next| *next >= data_end)
+            .ok_or(())?;
+    }
+    Err(())
+}
+
+fn tar_path(header: &[u8]) -> Result<String, ()> {
+    fn field(bytes: &[u8]) -> Result<&str, ()> {
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        std::str::from_utf8(&bytes[..end]).map_err(|_| ())
+    }
+    let name = field(&header[..100])?;
+    let prefix = field(&header[345..500])?;
+    if name.is_empty() {
+        return Err(());
+    }
+    Ok(if prefix.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{prefix}/{name}")
+    })
+}
+
+fn tar_octal(bytes: &[u8]) -> Result<usize, ()> {
+    let text = std::str::from_utf8(bytes).map_err(|_| ())?;
+    let text = text.trim_matches(['\0', ' ']);
+    if text.is_empty() {
+        return Ok(0);
+    }
+    usize::from_str_radix(text, 8).map_err(|_| ())
+}
+
+fn encode_output_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            let mut encoded = String::new();
+            for byte in segment.bytes() {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                    encoded.push(char::from(byte));
+                } else {
+                    encoded.push_str(&format!("%{byte:02X}"));
+                }
+            }
+            encoded
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn all_runs_router<L>(ledger: L, github_rerunner: Arc<dyn BrowserGithubRerunner>) -> Router
@@ -903,6 +1149,8 @@ where
             execution_binding: source.execution_binding.as_ref(),
             source_provenance: None,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
             user_envelope_snapshot: Some(envelope),
             candidate_digest: &orchestration.candidate_digest,
             admission_decision: &decision,
@@ -1265,8 +1513,35 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         record.finalize_requested,
         record.finalized,
     );
+    let package = record
+        .browser_task_evidence
+        .as_ref()
+        .map(|evidence| BrowserRunPackageView {
+            source: evidence.source.clone(),
+            revision: evidence.revision.clone(),
+            path: evidence.path.as_str().to_owned(),
+        })
+        .or_else(|| {
+            record
+                .direct_task_evidence
+                .as_ref()
+                .map(|evidence| BrowserRunPackageView {
+                    source: evidence.package.repository.as_str().to_owned(),
+                    revision: evidence.package.commit.as_str().to_owned(),
+                    path: evidence.package.path.as_str().to_owned(),
+                })
+        })
+        .or_else(|| {
+            Some(BrowserRunPackageView {
+                source: format!("steward:registry/{}", record.workflow_name.as_deref()?),
+                revision: format!("steward:version:{}", record.workflow_version?),
+                path: "task-definition.json".to_owned(),
+            })
+        });
     BrowserRunView {
         task_uid: record.task_uid,
+        origin: record.task_origin,
+        package,
         workflow: record.workflow,
         workflow_name: record.workflow_name,
         workflow_version: record.workflow_version,
@@ -1474,6 +1749,7 @@ mod tests {
         records: Arc<Mutex<Vec<AgentRunRecord>>>,
         queries: Arc<Mutex<Vec<AgentRunQuery>>>,
         logs: FakeExecutionLogs,
+        outputs: Arc<Mutex<HashMap<Uuid, Vec<u8>>>>,
         rerun_sources: Arc<Mutex<HashMap<Uuid, TaskRecord>>>,
         github_matches: Arc<Mutex<VecDeque<Option<TaskRecord>>>>,
         github_queries: Arc<Mutex<Vec<GithubRerunQuery>>>,
@@ -1710,6 +1986,34 @@ mod tests {
                     }))
             })
         }
+
+        fn agent_run_output_archive<'a>(
+            &'a self,
+            task_uid: Uuid,
+            owner_user_id: &'a str,
+        ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
+            Box::pin(async move {
+                let visible = self
+                    .records
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?
+                    .iter()
+                    .any(|record| {
+                        record.task_uid == task_uid
+                            && record.phase == TaskPhase::Succeeded
+                            && record.owner_user_id.as_deref() == Some(owner_user_id)
+                    });
+                if !visible {
+                    return Ok(None);
+                }
+                Ok(self
+                    .outputs
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?
+                    .get(&task_uid)
+                    .cloned())
+            })
+        }
     }
 
     fn run(task_uid: Uuid, owner_user_id: &str) -> AgentRunRecord {
@@ -1769,6 +2073,8 @@ mod tests {
             }),
             history_partial: false,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
         }
     }
 
@@ -1821,6 +2127,8 @@ mod tests {
             execution_binding: None,
             source_provenance: None,
             direct_task_evidence: Some(evidence),
+            task_origin: steward_types::direct_package::TaskOrigin::GithubActions,
+            browser_task_evidence: None,
             envelope_revision: view.envelope_revision,
             orchestration_version: 3,
             orchestration_operation_id: Some(Uuid::new_v4()),
@@ -2330,6 +2638,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_outputs_are_listed_downloadable_and_owner_scoped() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let other_owner = "usr_abcdefabcdefabcdefabcdefabcdefab";
+        let own_task = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let other_task = Uuid::parse_str("22222222-2222-4222-8222-222222222222")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .extend([run(own_task, owner), run(other_task, other_owner)]);
+        ledger.outputs.lock().map_err(|_| "lock outputs")?.extend([
+            (own_task, output_tar("out/report.txt", b"complete\n")),
+            (other_task, output_tar("out/secret.txt", b"hidden\n")),
+        ]);
+
+        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let app = protected_router(ledger.clone(), service);
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{own_task}/outputs"))
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build output list request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute output list request: {error}"))?;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = to_bytes(listed.into_body(), 4096)
+            .await
+            .map_err(|error| format!("read output list: {error}"))?;
+        let listed: serde_json::Value = serde_json::from_slice(&listed)
+            .map_err(|error| format!("decode output list: {error}"))?;
+        assert_eq!(listed["files"][0]["path"], "report.txt");
+        assert_eq!(listed["files"][0]["sizeBytes"], 9);
+
+        let downloaded = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{own_task}/outputs/report.txt"))
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build output download request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute output download request: {error}"))?;
+        assert_eq!(downloaded.status(), StatusCode::OK);
+        assert_eq!(
+            downloaded.headers().get(header::CONTENT_DISPOSITION),
+            Some(&header::HeaderValue::from_static(
+                "attachment; filename=\"report.txt\""
+            ))
+        );
+        let downloaded = to_bytes(downloaded.into_body(), 4096)
+            .await
+            .map_err(|error| format!("read output download: {error}"))?;
+        assert_eq!(downloaded.as_ref(), b"complete\n");
+
+        let hidden = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{other_task}/outputs/secret.txt"))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build hidden output request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute hidden output request: {error}"))?;
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn github_rerun_dispatches_once_then_returns_the_correlated_higher_attempt()
     -> Result<(), String> {
         let owner = "usr_0123456789abcdef0123456789abcdef";
@@ -2540,5 +2926,41 @@ mod tests {
         assert_eq!(body["content"], "agent failed\n");
         assert_eq!(body["complete"], true);
         Ok(())
+    }
+
+    fn output_tar(path: &str, content: &[u8]) -> Vec<u8> {
+        let mut archive = vec![0_u8; 512];
+        archive[..path.len()].copy_from_slice(path.as_bytes());
+        archive[100..108].copy_from_slice(b"0000644\0");
+        archive[108..116].copy_from_slice(b"0000000\0");
+        archive[116..124].copy_from_slice(b"0000000\0");
+        let size = format!("{:011o}\0", content.len());
+        archive[124..136].copy_from_slice(size.as_bytes());
+        archive[136..148].copy_from_slice(b"00000000000\0");
+        archive[148..156].fill(b' ');
+        archive[156] = b'0';
+        archive[257..263].copy_from_slice(b"ustar\0");
+        archive[263..265].copy_from_slice(b"00");
+        let checksum: u64 = archive.iter().map(|byte| u64::from(*byte)).sum();
+        archive[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        archive.extend_from_slice(content);
+        archive.resize(512 + content.len().div_ceil(512) * 512, 0);
+        archive.resize(archive.len() + 1024, 0);
+        archive
+    }
+
+    #[test]
+    fn output_archive_exposes_only_bounded_files_below_out() {
+        let archive = output_tar("out/result.txt", b"hello\n");
+        assert_eq!(
+            output_archive_entries(&archive),
+            Ok(vec![OutputArchiveEntry {
+                path: "result.txt".to_owned(),
+                offset: 512,
+                size: 6,
+            }])
+        );
+        assert!(output_archive_entries(&output_tar("secret.txt", b"no")).is_err());
+        assert!(output_archive_entries(&output_tar("out/../secret.txt", b"no")).is_err());
     }
 }

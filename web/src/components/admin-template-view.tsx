@@ -29,6 +29,7 @@ export type TemplateFieldErrors = Partial<Record<TemplateField, string>>;
 
 type AdminTemplateListItem = {
   autoProvisionThreshold?: BrowserEnvelope | null;
+  allowInlineBrowserTasks: boolean;
   id: string;
   displayName: string;
   memberRoles: Array<string>;
@@ -285,8 +286,9 @@ function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): 
     && Array.isArray(value.memberRoles)
     && value.memberRoles.every((role) => typeof role === "string")
     && isAutoProvisionThreshold(value.autoProvisionThreshold)
+    && (value.allowInlineBrowserTasks === undefined || typeof value.allowInlineBrowserTasks === "boolean")
     && isBrowserEnvelope(value.envelope)) {
-    return value as BrowserEnvelopeTemplateResponse;
+    return { ...value, allowInlineBrowserTasks: value.allowInlineBrowserTasks !== false } as BrowserEnvelopeTemplateResponse;
   }
   // Accept the pre-catalog response during a rolling deployment.
   if (value.apiVersion === "steward.browser-admin/v1"
@@ -300,6 +302,7 @@ function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): 
       memberRoles: [templateId],
       envelope: value.envelope,
       autoProvisionThreshold: null,
+      allowInlineBrowserTasks: true,
     };
   }
   if (value.apiVersion !== "steward.admin/v1" || !isRecord(value.template)) return null;
@@ -321,6 +324,7 @@ function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): 
       : [templateId],
     envelope: template.envelope,
     autoProvisionThreshold: isAutoProvisionThreshold(template.autoProvisionThreshold) ? template.autoProvisionThreshold : null,
+    allowInlineBrowserTasks: template.allowInlineBrowserTasks !== false,
   };
 }
 
@@ -332,9 +336,9 @@ function normalizeTemplateList(value: unknown): AdminTemplateListResponse | null
     if (typeof item.id === "string" && typeof item.displayName === "string"
       && Array.isArray(item.memberRoles) && item.memberRoles.every((role) => typeof role === "string")) {
       if (!isAutoProvisionThreshold(item.autoProvisionThreshold)) return null;
-      templates.push({ id: item.id, displayName: item.displayName, memberRoles: item.memberRoles, envelope: item.envelope, autoProvisionThreshold: item.autoProvisionThreshold });
+      templates.push({ id: item.id, displayName: item.displayName, memberRoles: item.memberRoles, envelope: item.envelope, autoProvisionThreshold: item.autoProvisionThreshold, allowInlineBrowserTasks: item.allowInlineBrowserTasks !== false });
     } else if (typeof item.memberRole === "string") {
-      templates.push({ id: item.memberRole, displayName: displayName(item.memberRole), memberRoles: [item.memberRole], envelope: item.envelope, autoProvisionThreshold: null });
+      templates.push({ id: item.memberRole, displayName: displayName(item.memberRole), memberRoles: [item.memberRole], envelope: item.envelope, autoProvisionThreshold: null, allowInlineBrowserTasks: true });
     } else return null;
   }
   return { apiVersion: "steward.browser-admin/v1", templates };
@@ -530,7 +534,7 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
         description="Inspect the current immutable revision and author a successor."
         title="Envelope template"
       />
-      <ResourceBoundary state={acceptedState}>{({ autoProvisionThreshold, displayName: templateDisplayName, envelope, memberRoles }) => (
+      <ResourceBoundary state={acceptedState}>{({ allowInlineBrowserTasks, autoProvisionThreshold, displayName: templateDisplayName, envelope, memberRoles }) => (
         <ResourceBoundary state={acceptedCapabilitiesState}>{(capabilities) => (
           <TemplateEditor
             capabilities={capabilities}
@@ -541,6 +545,7 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
             templateDisplayName={templateDisplayName}
             template={envelope}
             autoProvisionThreshold={autoProvisionThreshold}
+            allowInlineBrowserTasks={allowInlineBrowserTasks}
           />
         )}</ResourceBoundary>
       )}</ResourceBoundary>
@@ -585,13 +590,14 @@ function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
           templateDisplayName=""
           template={initialTemplateForCatalog(capabilities)}
           autoProvisionThreshold={null}
+          allowInlineBrowserTasks
         />
       )}</ResourceBoundary>
     </section>
   );
 }
 
-function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, csrf, memberRole, memberRoles, templateDisplayName, template }: Readonly<{ autoProvisionThreshold?: BrowserEnvelope | null; capabilities: CapabilityCatalog; create?: boolean; csrf: string; memberRole: string; memberRoles: Array<string>; templateDisplayName: string; template: BrowserEnvelope }>) {
+function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTasks, autoProvisionThreshold, capabilities, create = false, csrf, memberRole, memberRoles, templateDisplayName, template }: Readonly<{ allowInlineBrowserTasks: boolean; autoProvisionThreshold?: BrowserEnvelope | null; capabilities: CapabilityCatalog; create?: boolean; csrf: string; memberRole: string; memberRoles: Array<string>; templateDisplayName: string; template: BrowserEnvelope }>) {
   const router = useRouter();
   const modelCatalog = capabilities.models;
   const allowedModels = new Set(modelCatalog.map(modelKey));
@@ -616,6 +622,7 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
   const [templateIdDraft, setTemplateIdDraft] = useState("");
   const [autoApproveToCeiling, setAutoApproveToCeiling] = useState(autoProvisionThreshold === null || autoProvisionThreshold === undefined);
   const [thresholdJson, setThresholdJson] = useState(JSON.stringify(autoProvisionThreshold ?? template, null, 2));
+  const [allowInlineBrowserTasks, setAllowInlineBrowserTasks] = useState(initialAllowInlineBrowserTasks);
   const parsedRoles = [...new Set(roles.split(",").map((role) => role.trim()).filter(Boolean))].sort();
   const selectedRoles = templateMemberRoles(templateIdDraft, parsedRoles, rolesEdited);
   const missingModels = models.filter((model) => !allowedModels.has(modelKey(model)));
@@ -729,6 +736,7 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
         memberRoles: selectedRoles,
         envelope,
         autoProvisionThreshold: nextAutoProvisionThreshold,
+        allowInlineBrowserTasks,
       },
       cache: "no-store",
       credentials: "same-origin",
@@ -809,6 +817,9 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
         <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
           <div className="space-y-4"><label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => { setAutoApproveToCeiling(event.target.checked); clearFieldError("threshold"); }} type="checkbox" />Auto-approve every request within the ceiling</label>{!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea aria-invalid={Boolean(fieldErrors.threshold)} className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setThresholdJson(event.target.value); clearFieldError("threshold"); }} spellCheck={false} value={thresholdJson} /><FieldError message={fieldErrors.threshold} /></label> : null}</div>
         </FormSection>
+        <FormSection description="Repository packages remain available when inline authoring is disabled." title="Browser execution">
+          <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={allowInlineBrowserTasks} onChange={(event) => setAllowInlineBrowserTasks(event.target.checked)} type="checkbox" />Allow inline browser-authored packages</label>
+        </FormSection>
         <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner">
           <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset>
         </FormSection>
@@ -827,6 +838,9 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
 
       <FormSection description="The member roles allowed to request this template." title="Template identity and eligibility">
         <div className="grid gap-4 sm:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Display name<input aria-invalid={Boolean(fieldErrors.displayName)} className={fieldClass} name="displayName" onChange={(event) => { setName(event.target.value); clearFieldError("displayName"); }} required value={name} /><FieldError message={fieldErrors.displayName} /></label><label className="grid gap-2 text-sm font-semibold">Eligible member roles<TagSelect addPlaceholder="Add another role…" allowCreate emptyPlaceholder="Add member role…" label="Eligible member roles" onChange={updateRoles} options={roleOptions} value={selectedRoles} /><FieldError message={fieldErrors.memberRoles} /></label></div>
+      </FormSection>
+      <FormSection description="Repository packages remain available when inline authoring is disabled." title="Browser execution">
+        <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={allowInlineBrowserTasks} onChange={(event) => setAllowInlineBrowserTasks(event.target.checked)} type="checkbox" />Allow inline browser-authored packages</label>
       </FormSection>
 
       <FormSection description="Inference spend limits in USD and how long an envelope stays valid." title="Budget and lifetime">

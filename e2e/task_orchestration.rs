@@ -43,10 +43,12 @@ use steward_ports::{
 };
 use steward_store::{
     AgentRunLogStream, EnvelopeRequestReservationRequest, EnvelopeRequestStatus,
-    EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, PgStore, StoreError,
-    TaskActivationObservation, TaskExecutionObservation, TaskExecutionTransition,
-    TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest, WorkflowPublication,
+    EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, MAX_ACTIVE_BROWSER_TASKS_PER_USER,
+    PgStore, StoreError, TaskActivationObservation, TaskExecutionObservation,
+    TaskExecutionTransition, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
+    WorkflowPublication,
 };
+use steward_types::direct_package::{BrowserTaskEvidence, TaskOrigin};
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
     CanonicalAuthorityBinding, DisposableExecutionBinding, Duration, Email,
@@ -202,6 +204,7 @@ async fn concurrent_provisioning_enforces_active_digest_uniqueness_transactional
                 member_roles: std::slice::from_ref(template_id),
                 ceiling: &envelope,
                 auto_provision_threshold: Some(&envelope),
+                allow_inline_browser_tasks: true,
                 authored_by: "test-bootstrap",
             })
             .await?;
@@ -359,6 +362,7 @@ async fn operator_rbac_and_provisioning_preserve_distinct_active_authority()
                 member_roles: std::slice::from_ref(&role),
                 ceiling,
                 auto_provision_threshold: Some(ceiling),
+                allow_inline_browser_tasks: true,
                 authored_by: "test-bootstrap",
             })
             .await?;
@@ -516,6 +520,7 @@ async fn operator_rbac_and_provisioning_preserve_distinct_active_authority()
             member_roles: std::slice::from_ref(&role),
             ceiling: &envelope_a2,
             auto_provision_threshold: Some(&envelope_a2),
+            allow_inline_browser_tasks: true,
             authored_by: OPERATOR_USERNAME,
         })
         .await?;
@@ -661,6 +666,244 @@ fn disposable_execution_binding() -> Result<TaskExecutionBinding, io::Error> {
     binding.binding_digest = digest;
     binding.validate().map_err(io::Error::other)?;
     Ok(TaskExecutionBinding::Disposable(binding))
+}
+
+async fn reserve_browser_concurrency_fixture(
+    store: &PgStore,
+    idempotency_key: &str,
+    service: &str,
+    identity: &steward_types::CanonicalPrincipal,
+    envelope_instance_id: &str,
+    envelope_digest: &str,
+    envelope: &Envelope,
+    spec: &AgentRuntimeSpec,
+    execution_binding: &TaskExecutionBinding,
+    evidence: &BrowserTaskEvidence,
+) -> Result<bool, StoreError> {
+    let task_uid = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let runtime_name = format!("task-{}", operation_id.simple());
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let command = ["example-agent".to_owned(), "run".to_owned()];
+    let decision = AdmissionDecision::Admit;
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid,
+            operation_id,
+            idempotency_key,
+            submitter_service: service,
+            acting_user: Some(identity.display_email.as_str()),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: identity.display_email.as_str(),
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "browser-limit@1",
+            workflow_name: Some("browser-limit"),
+            workflow_version: Some(1),
+            workflow_digest: Some(&digest),
+            user_envelope_instance_id: Some(envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: spec,
+            agent_command: &command,
+            execution_binding: Some(execution_binding),
+            source_provenance: None,
+            direct_task_evidence: None,
+            task_origin: TaskOrigin::Browser,
+            browser_task_evidence: Some(evidence),
+            user_envelope_snapshot: Some(envelope),
+            candidate_digest: &digest,
+            admission_decision: &decision,
+            inert_manifest_digest: &digest,
+            active_manifest_digest: &digest,
+        })
+        .await
+        .map(|reservation| reservation.inserted)
+}
+
+#[tokio::test]
+async fn browser_task_concurrency_is_bounded_without_breaking_exact_retries()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let store = PgStore::new(
+        PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await?,
+    );
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("browser-limit-{suffix}"),
+                "example.com",
+                &format!("alice-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let envelope = Envelope {
+        revision: 1,
+        spec: EnvelopeSpec {
+            llms: Vec::new(),
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "1.00".to_owned(),
+                single_run_limit: Some("0.10".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            runtime_minutes_limit: Some("10".to_owned()),
+            ttl: Duration("15m".to_owned()),
+            runner: RunnerRequirements::default(),
+        },
+    };
+    let template_id = format!("browser-limit-{suffix}");
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &template_id,
+            display_name: "Browser limit",
+            member_roles: std::slice::from_ref(&template_id),
+            ceiling: &envelope,
+            auto_provision_threshold: Some(&envelope),
+            allow_inline_browser_tasks: true,
+            authored_by: "test-bootstrap",
+        })
+        .await?;
+    let request = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &identity.user_id,
+            template_id: Some(&template_id),
+            template_revision: Some(1),
+            requested_envelope: &envelope,
+            idempotency_key: &format!("browser-limit-envelope-{suffix}"),
+            actor: "test-bootstrap",
+        })
+        .await?
+        .record;
+    let envelope_instance_id = format!("env_{}", request.id.simple());
+    let envelope_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&envelope)?)
+    );
+    store
+        .append_envelope_request_status(
+            request.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: Some(Uuid::new_v4()),
+                envelope_instance_id: Some(&envelope_instance_id),
+                envelope_digest: Some(&envelope_digest),
+                reason: None,
+                rationale: Some("bounded browser-task fixture"),
+                evidence_url: None,
+                expires_at: None,
+                approved_envelope: Some(&envelope),
+                actor: "test-bootstrap",
+            },
+        )
+        .await?;
+    let workflow_digest = format!("sha256:{}", "a".repeat(64));
+    store
+        .publish_initial_workflow(WorkflowPublication {
+            name: "browser-limit",
+            display_name: "Browser limit",
+            agent: "example-agent@1",
+            prompt: "Exercise the browser-origin concurrency boundary.",
+            content_digest: &workflow_digest,
+            published_by: "test-bootstrap",
+        })
+        .await?;
+    let spec = AgentRuntimeSpec {
+        principal: Principal::User {
+            acting_user: identity.display_email.clone(),
+        },
+        owner: identity.display_email.clone(),
+        canonical_authority: Some(CanonicalAuthorityBinding::new(
+            identity.user_id.clone(),
+            Some(identity.user_id.clone()),
+        )?),
+        agent_type: AgentType {
+            name: "example-agent@1".to_owned(),
+        },
+        llms: Vec::new(),
+        tools: Vec::new(),
+        budget: envelope.spec.budget.clone(),
+        ttl: envelope.spec.ttl.clone(),
+        runner: envelope.spec.runner.clone(),
+        bindings: None,
+    };
+    let execution_binding = disposable_execution_binding()?;
+    let evidence: BrowserTaskEvidence = serde_json::from_value(json!({
+        "source": "steward:registry/browser-limit",
+        "revision": "steward:version:1",
+        "path": "task-definition.json",
+        "closureDigest": format!("steward:sha256:{}", "b".repeat(64))
+    }))?;
+    let service = format!("browser-limit-{suffix}");
+    let first_idempotency_key = format!("browser-limit-task-{suffix}-0");
+    for index in 0..MAX_ACTIVE_BROWSER_TASKS_PER_USER {
+        let idempotency_key = format!("browser-limit-task-{suffix}-{index}");
+        assert!(
+            reserve_browser_concurrency_fixture(
+                &store,
+                &idempotency_key,
+                &service,
+                &identity,
+                &envelope_instance_id,
+                &envelope_digest,
+                &envelope,
+                &spec,
+                &execution_binding,
+                &evidence,
+            )
+            .await?
+        );
+    }
+    assert!(
+        !reserve_browser_concurrency_fixture(
+            &store,
+            &first_idempotency_key,
+            &service,
+            &identity,
+            &envelope_instance_id,
+            &envelope_digest,
+            &envelope,
+            &spec,
+            &execution_binding,
+            &evidence,
+        )
+        .await?,
+        "an exact retry remains recoverable at the concurrency limit"
+    );
+    let rejected = reserve_browser_concurrency_fixture(
+        &store,
+        &format!("browser-limit-task-{suffix}-overflow"),
+        &service,
+        &identity,
+        &envelope_instance_id,
+        &envelope_digest,
+        &envelope,
+        &spec,
+        &execution_binding,
+        &evidence,
+    )
+    .await;
+    assert_eq!(rejected, Err(StoreError::BrowserTaskConcurrencyLimit));
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -1289,6 +1532,7 @@ async fn multiple_named_envelope_templates_coexist_for_one_role_and_pin_requests
                 member_roles: std::slice::from_ref(&role),
                 ceiling: &envelope,
                 auto_provision_threshold: Some(&envelope),
+                allow_inline_browser_tasks: true,
                 authored_by: "test-bootstrap",
             })
             .await?;
@@ -1423,6 +1667,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             member_roles: std::slice::from_ref(&template_id),
             ceiling: &envelope,
             auto_provision_threshold: Some(&envelope),
+            allow_inline_browser_tasks: true,
             authored_by: "test-bootstrap",
         })
         .await?;
@@ -1544,6 +1789,8 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             execution_binding: Some(&execution_binding),
             source_provenance: None,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &candidate_digest,
             admission_decision: &admission_decision,
@@ -1879,6 +2126,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             member_roles: std::slice::from_ref(&member_role),
             ceiling: &envelope,
             auto_provision_threshold: Some(&envelope),
+            allow_inline_browser_tasks: true,
             authored_by: "admin@example.com",
         })
         .await?;
@@ -2020,6 +2268,8 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             execution_binding: Some(&execution_binding),
             source_provenance: None,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &candidate_digest,
             admission_decision: &admission_decision,
@@ -2470,6 +2720,8 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             execution_binding: Some(&execution_binding),
             source_provenance: None,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &cleanup_candidate_digest,
             admission_decision: &admission_decision,
@@ -2575,6 +2827,8 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             execution_binding: Some(&execution_binding),
             source_provenance: None,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &successful_candidate_digest,
             admission_decision: &admission_decision,
@@ -2756,6 +3010,8 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             execution_binding: Some(&execution_binding),
             source_provenance: None,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &expired_candidate_digest,
             admission_decision: &admission_decision,
@@ -2952,6 +3208,8 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             execution_binding: Some(&execution_binding),
             source_provenance: None,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &cancelled_candidate_digest,
             admission_decision: &admission_decision,
@@ -3125,6 +3383,8 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             execution_binding: Some(&execution_binding),
             source_provenance: None,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &rejected_candidate_digest,
             admission_decision: &admission_decision,

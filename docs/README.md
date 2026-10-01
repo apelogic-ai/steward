@@ -53,6 +53,7 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`admin-agent-runs-api-v1.md`](admin-agent-runs-api-v1.md) | **Current implementation** | Read-only administrator Agent Runs API. |
 | [`admin-ui-contract-v1.md`](admin-ui-contract-v1.md) | **Current implementation** | Browser presentation and API boundary. |
 | [`browser-session-contract-v1.md`](browser-session-contract-v1.md) | **Current implementation, with stated activation dependency** | Browser authentication and session boundary. |
+| [`browser-run-now.md`](browser-run-now.md) | **Current implementation** | Browser-authored inline, Git, and published Workflow Tasks, immutable provenance, admission, and outputs. |
 | [`canonical-user-identity-v1.md`](canonical-user-identity-v1.md) | **Current implementation** | Canonical person identity and ownership keys. |
 | [`operator-envelope-administration.md`](operator-envelope-administration.md) | **Current release contract** | Steward v0.3.3 catalog authority, custom requests, multiple active Envelopes, digest selection, operator RBAC CLI, default smoke template, and migration 0051. |
 | [`github-actions-generator.md`](github-actions-generator.md) | **Current implementation, renderer scope** | Bounded GitHub Actions YAML generation. |

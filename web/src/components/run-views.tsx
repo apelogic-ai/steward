@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useState } from "react";
 
@@ -8,11 +9,13 @@ import {
   allRunTimeline,
   cancelMyRun,
   myRun,
+  myRunOutputs,
   myRunTimeline,
   rerunMyRun,
   type AllRunsResponse,
   type BrowserRunResponse,
   type BrowserRunTimelineResponse,
+  type BrowserRunOutputsResponse,
   type BrowserRunView,
   type MyRunsResponse,
 } from "@/api-client";
@@ -149,12 +152,20 @@ function RunStepRow({ admin, step, taskUid }: Readonly<{
   );
 }
 
+function RunOutputs({ taskUid }: Readonly<{ taskUid: string }>) {
+  const load = useCallback(() => myRunOutputs({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } }), [taskUid]);
+  const state = useApiResource<BrowserRunOutputsResponse>(load);
+  return <ResourceBoundary state={state}>{({ files }) => files.length ? <div className="mt-5 rounded-card border p-4"><h3 className="text-sm font-semibold">Outputs</h3><ul className="mt-3 space-y-2">{files.map((file) => <li className="flex items-center justify-between gap-4 text-sm" key={file.path}><a className="font-mono font-semibold text-brand" href={file.downloadUrl}>{file.path}</a><span className="text-muted-ink">{file.sizeBytes} bytes</span></li>)}</ul></div> : <p className="mt-5 text-sm text-muted-ink">This run produced no output files.</p>}</ResourceBoundary>;
+}
+
 export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; runs: Array<BrowserRunView> }>) {
   if (runs.length === 0) return <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">No runs yet.</p>;
   const newestRuns = [...runs].sort((left, right) => runUpdatedAt(right) - runUpdatedAt(left));
   const columns = [
     { key: "workflow", label: "Workflow", className: "font-semibold", render: (run: BrowserRunView) => <span><span className="block truncate">{run.workflow}</span><span className="mt-0.5 block truncate font-mono text-xs font-normal text-muted-ink">{run.taskUid}</span></span> },
     ...(admin ? [{ key: "owner", label: "Owner", render: (run: BrowserRunView) => <span className="block truncate text-muted-ink">{"ownerDisplayEmail" in run ? String(run.ownerDisplayEmail ?? "Not reported") : "Not reported"}</span> }] : []),
+    { key: "source", label: "Origin / package", render: (run: BrowserRunView) => <span><span className="block">{run.origin}</span><span className="mt-0.5 block max-w-64 truncate font-mono text-xs text-muted-ink">{run.package ? `${run.package.source} @ ${run.package.revision}` : "No package pin"}</span></span> },
+    { key: "envelope", label: "Envelope", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => run.userEnvelopeRevision ? `rev ${run.userEnvelopeRevision}` : "—" },
     { key: "status", label: "Status", render: (run: BrowserRunView) => <StatusBadge value={run.phase} /> },
     { key: "runtime", label: "Runtime", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => <span className={run.runtimeUid ? "text-ink" : "text-faint-ink"}>{runtimeLabel(run.runtimeUid)}</span> },
     { key: "spend", label: "Spend", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "—" },
@@ -163,8 +174,8 @@ export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; ru
   return <DataTable
     ariaLabel={admin ? "All runs" : "Runs"}
     columns={columns}
-    gridTemplateColumns={admin ? "minmax(180px,1.5fr) minmax(180px,1fr) 120px 100px 100px 170px" : "minmax(220px,1.5fr) 120px 110px 100px 180px"}
-    minWidth={admin ? "980px" : "780px"}
+    gridTemplateColumns={admin ? "minmax(180px,1.2fr) minmax(160px,1fr) minmax(220px,1.4fr) 90px 110px 110px 90px 150px" : "minmax(190px,1.2fr) minmax(220px,1.4fr) 90px 110px 110px 90px 150px"}
+    minWidth={admin ? "1280px" : "1100px"}
     rowHref={(run) => `${admin ? "/admin/runs" : "/runs"}/${run.taskUid}`}
     rowKey={(run) => run.taskUid}
     rows={newestRuns}
@@ -180,6 +191,7 @@ export function RunsView({ admin = false }: Readonly<{ admin?: boolean }>) {
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader
+        actions={!admin ? <Link className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href="/runs/new">Run now</Link> : null}
         description={admin ? "Every governed run across all users." : "Agent runs executed under your envelopes."}
         title={admin ? "All runs" : "Runs"}
       />
@@ -242,6 +254,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 <div className="flex flex-wrap items-center gap-3"><h1 className="text-[28px] font-semibold tracking-tight" id="page-title">{pinnedWorkflow}</h1><StatusBadge value={run.phase} /></div>
                 <p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p>
                 {run.trigger ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.trigger.actor}</strong> via {run.trigger.event} · <a href={run.trigger.runUrl} rel="noreferrer" target="_blank">{run.trigger.repository}@{run.trigger.ref} ({run.trigger.sha.slice(0, 7)})</a> · {durationLabel(run.createdAt, run.updatedAt)}</div> : <div className="mt-2 text-sm text-muted-ink">Started {dateTime(run.createdAt)} · {durationLabel(run.createdAt, run.updatedAt)}</div>}
+                <div className="mt-1 text-sm text-muted-ink">Origin: {run.origin}{run.package ? ` · Package: ${run.package.source} @ ${run.package.revision} · ${run.package.path}` : ""}</div>
               </div>
               {!admin ? <div className="flex flex-wrap gap-2"><button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={rerunState === "working"} onClick={async () => {
                 if (session.status !== "authenticated") return;
@@ -273,6 +286,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                   <div className="flex items-center justify-between gap-4"><h2 className="text-lg font-semibold" id="selected-stage">{selectedStage?.displayName ?? "Run stages"}</h2>{selectedStage ? <StatusBadge value={selectedStage.state} /> : null}</div>
                   <p className="mt-5 rounded-control border border-warn/30 bg-warn-soft px-4 py-3 text-sm text-warn"><strong className="block font-semibold text-warn" id="sensitivity-notice">Sensitivity notice</strong>Execution logs may reproduce arbitrary user, tool, or agent output.</p>
                   {selectedStage?.steps.length ? <ol className="mt-5 divide-y divide-line-soft rounded-card border">{selectedStage.steps.map((step) => <RunStepRow admin={admin} key={step.id} step={step} taskUid={taskUid} />)}</ol> : <div className="mt-5"><EmptyState title="No steps reported" /></div>}
+                  {!admin && run.phase === "succeeded" ? <RunOutputs taskUid={taskUid} /> : null}
                 </section>
               </main>
             </div>

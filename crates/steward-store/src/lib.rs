@@ -11,14 +11,16 @@ use steward_admission::{
     add_budget_amount, envelope_is_within, evaluate, validate_envelope,
 };
 use steward_types::direct_package::{
-    DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES, SOURCE_PROVENANCE_CONTRACT_VERSION,
-    SourceProvenance,
+    BrowserTaskEvidence, DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES,
+    SOURCE_PROVENANCE_CONTRACT_VERSION, SourceProvenance, TaskOrigin,
 };
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
     OrganizationIdentity, OrganizationIdentityMigration, TaskExecutionBinding,
 };
 use uuid::Uuid;
+
+pub const MAX_ACTIVE_BROWSER_TASKS_PER_USER: i64 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskOrchestrationMode {
@@ -85,6 +87,7 @@ pub struct EnvelopeTemplateRevisionRecord {
     pub member_roles: Vec<String>,
     pub ceiling: Envelope,
     pub auto_provision_threshold: Option<Envelope>,
+    pub allow_inline_browser_tasks: bool,
 }
 
 /// Immutable template revision supplied to the persistence boundary.
@@ -94,6 +97,7 @@ pub struct EnvelopeTemplatePublication<'a> {
     pub member_roles: &'a [String],
     pub ceiling: &'a Envelope,
     pub auto_provision_threshold: Option<&'a Envelope>,
+    pub allow_inline_browser_tasks: bool,
     pub authored_by: &'a str,
 }
 
@@ -415,6 +419,7 @@ mod browser_rbac_tests {
             member_roles: &roles,
             ceiling: &ceiling,
             auto_provision_threshold: Some(&threshold),
+            allow_inline_browser_tasks: true,
             authored_by: "alice",
         };
 
@@ -522,6 +527,17 @@ mod migration_tests {
                 migration.version == 56 && migration.description.contains("task source provenance")
             }),
             "migration 56 must remain embedded and preserve authenticated Task source evidence"
+        );
+    }
+
+    #[test]
+    fn browser_task_provenance_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 57 && migration.description.contains("browser task provenance")
+            }),
+            "migration 57 must preserve immutable browser Task package evidence"
         );
     }
 }
@@ -3120,6 +3136,26 @@ impl PgStore {
             .transpose()
     }
 
+    /// Return a completed run's opaque output archive only to its exact browser owner.
+    pub async fn agent_run_output_archive(
+        &self,
+        task_uid: Uuid,
+        owner_user_id: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        sqlx::query_scalar(
+            "SELECT output_archive FROM task_submissions \
+             WHERE task_uid = $1 AND owner_user_id = $2 AND phase = 'succeeded' \
+               AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
+                   WHERE operations.task_uid = task_submissions.task_uid)",
+        )
+        .bind(task_uid)
+        .bind(owner_user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+        .map(Option::flatten)
+    }
+
     /// Request cancellation for one browser-owned run without accepting a caller-selected
     /// submitter identity. The existing Task finalization transition remains authoritative.
     pub async fn cancel_agent_run(
@@ -4303,8 +4339,8 @@ impl PgStore {
         sqlx::query(
             "INSERT INTO envelope_template_revisions \
              (template_id, revision, display_name, member_roles, spec, \
-              auto_provision_threshold, authored_by) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+              auto_provision_threshold, allow_inline_browser_tasks, authored_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(publication.template_id)
         .bind(publication.ceiling.revision)
@@ -4312,6 +4348,7 @@ impl PgStore {
         .bind(publication.member_roles)
         .bind(Json(&publication.ceiling.spec))
         .bind(publication.auto_provision_threshold.map(Json))
+        .bind(publication.allow_inline_browser_tasks)
         .bind(publication.authored_by)
         .execute(&mut *transaction)
         .await
@@ -4326,7 +4363,7 @@ impl PgStore {
     ) -> Result<Option<EnvelopeTemplateRevisionRecord>, StoreError> {
         sqlx::query(
             "SELECT template_id, revision, display_name, member_roles, spec, \
-                    auto_provision_threshold \
+                    auto_provision_threshold, allow_inline_browser_tasks \
              FROM envelope_template_revisions \
              WHERE template_id = $1 \
              ORDER BY revision DESC \
@@ -4348,7 +4385,7 @@ impl PgStore {
     ) -> Result<Option<EnvelopeTemplateRevisionRecord>, StoreError> {
         sqlx::query(
             "SELECT template_id, revision, display_name, member_roles, spec, \
-                    auto_provision_threshold \
+                    auto_provision_threshold, allow_inline_browser_tasks \
              FROM envelope_template_revisions \
              WHERE template_id = $1 AND revision = $2",
         )
@@ -4367,7 +4404,7 @@ impl PgStore {
     ) -> Result<Vec<EnvelopeTemplateRevisionRecord>, StoreError> {
         sqlx::query(
             "SELECT DISTINCT ON (template_id) template_id, revision, display_name, member_roles, \
-                    spec, auto_provision_threshold \
+                    spec, auto_provision_threshold, allow_inline_browser_tasks \
              FROM envelope_template_revisions \
              ORDER BY template_id, revision DESC",
         )
@@ -4408,10 +4445,10 @@ impl PgStore {
         }
         sqlx::query(
             "SELECT template_id, revision, display_name, member_roles, spec, \
-                    auto_provision_threshold \
+                    auto_provision_threshold, allow_inline_browser_tasks \
              FROM ( \
                  SELECT DISTINCT ON (template_id) template_id, revision, display_name, \
-                        member_roles, spec, auto_provision_threshold \
+                        member_roles, spec, auto_provision_threshold, allow_inline_browser_tasks \
                  FROM envelope_template_revisions \
                  ORDER BY template_id, revision DESC \
              ) latest \
@@ -5673,6 +5710,24 @@ impl PgStore {
                 operation,
             });
         }
+        if request.task_origin == TaskOrigin::Browser {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 227))")
+                .bind(request.owner_user_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+            let active_browser_tasks = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM task_submissions \
+                 WHERE owner_user_id = $1 AND task_origin = 'browser' AND NOT finalized",
+            )
+            .bind(request.owner_user_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if active_browser_tasks >= MAX_ACTIVE_BROWSER_TASKS_PER_USER {
+                return Err(StoreError::BrowserTaskConcurrencyLimit);
+            }
+        }
         let task_uid = request.task_uid;
         let operation_id = request.operation_id;
         let inserted = sqlx::query(
@@ -5684,13 +5739,13 @@ impl PgStore {
               authority_kind, user_envelope_snapshot, \
               coding_agent_runtime, runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, \
               runtime_spec, agent_command, execution_binding, source_provenance, direct_task_evidence, \
-              envelope_revision, orchestration_version, \
+              task_origin, browser_task_evidence, envelope_revision, orchestration_version, \
               orchestration_operation_id, \
               candidate_digest, service_envelope_digest, original_admission_decision, \
               original_admission_deltas) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, $13, $14, \
                      'user-envelope', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, \
-                     NULL, 3, $27, $28, NULL, $29, $30) \
+                     $27, $28, NULL, 3, $29, $30, NULL, $31, $32) \
              ON CONFLICT DO NOTHING",
         )
         .bind(task_uid)
@@ -5719,6 +5774,8 @@ impl PgStore {
         .bind(request.execution_binding.map(Json))
         .bind(request.source_provenance.map(Json))
         .bind(request.direct_task_evidence.map(Json))
+        .bind(request.task_origin.as_str())
+        .bind(request.browser_task_evidence.map(Json))
         .bind(operation_id)
         .bind(request.candidate_digest)
         .bind(admission_text)
@@ -5807,6 +5864,22 @@ impl PgStore {
             .map_err(database_error)?
             .map(task_runtime_operation_record)
             .transpose()
+    }
+
+    pub async fn envelope_template_allows_inline_browser_tasks(
+        &self,
+        template_id: &str,
+        revision: i64,
+    ) -> Result<Option<bool>, StoreError> {
+        sqlx::query_scalar(
+            "SELECT allow_inline_browser_tasks FROM envelope_template_revisions \
+             WHERE template_id = $1 AND revision = $2",
+        )
+        .bind(template_id)
+        .bind(revision)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
     }
 
     /// Internal validating-webhook lookup for one exact Task runtime transition.
@@ -8154,11 +8227,12 @@ impl PgStore {
               runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
               agent_command, input_archive, execute_requested, authority_kind, \
               internal_authority_id, internal_authority_version, internal_authority_digest, \
+              task_origin, \
               orchestration_version, orchestration_operation_id, candidate_digest, service_envelope_digest, \
               original_admission_decision, original_admission_deltas) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, \
                      'provisioned', 'queued', $12, $13, $14, true, 'internal', $15, $16, $17, \
-                     3, $1, $18, NULL, 'admit', '[]'::jsonb)",
+                     'connections', 3, $1, $18, NULL, 'admit', '[]'::jsonb)",
         )
         .bind(request.operation_id)
         .bind(task.idempotency_key)
@@ -9124,6 +9198,10 @@ pub struct TaskReservationRequest<'a> {
     pub source_provenance: Option<&'a SourceProvenance>,
     /// Immutable direct-package source and authority evidence. Legacy and catalog Tasks omit it.
     pub direct_task_evidence: Option<&'a DirectTaskBindingEvidence>,
+    /// Server-derived authoring origin. Public request bodies never supply this value.
+    pub task_origin: TaskOrigin,
+    /// Browser-authored immutable package evidence. Other Task origins omit it.
+    pub browser_task_evidence: Option<&'a BrowserTaskEvidence>,
     /// Exact approved User Envelope used for admission. Internal operations omit it and carry
     /// their code-owned authority on `ConnectionOperationReservationRequest` instead.
     pub user_envelope_snapshot: Option<&'a Envelope>,
@@ -9196,6 +9274,8 @@ pub struct AgentRunRecord {
     pub spend: Option<AgentRunSpend>,
     pub history_partial: bool,
     pub direct_task_evidence: Option<DirectTaskBindingEvidence>,
+    pub task_origin: TaskOrigin,
+    pub browser_task_evidence: Option<BrowserTaskEvidence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9464,6 +9544,8 @@ fn task_reservation_matches(
         && record.execution_binding.as_ref() == request.execution_binding
         && record.source_provenance.as_ref() == request.source_provenance
         && record.direct_task_evidence.as_ref() == request.direct_task_evidence
+        && record.task_origin == request.task_origin
+        && record.browser_task_evidence.as_ref() == request.browser_task_evidence
         && record.authority_kind.as_deref() == Some("user-envelope")
         && record.user_envelope_snapshot.as_ref() == request.user_envelope_snapshot
         && record.envelope_revision.is_none()
@@ -9758,8 +9840,10 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
     let complete = |pins: [bool; 3]| {
         pins.iter().all(|present| *present) || pins.iter().all(|present| !*present)
     };
-    let direct_evidence_valid = match request.direct_task_evidence {
-        Some(evidence) => {
+    let package_evidence_valid = match (request.direct_task_evidence, request.browser_task_evidence)
+    {
+        (Some(_), Some(_)) => false,
+        (Some(evidence), None) => {
             evidence.validate().is_ok()
                 && evidence.task_uid.as_str() == request.task_uid.to_string()
                 && workflow_pins.iter().all(|present| !*present)
@@ -9769,7 +9853,17 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
                 && evidence.envelope.digest.as_str().strip_prefix("steward:")
                     == request.user_envelope_digest
         }
-        None => {
+        (None, Some(evidence)) => {
+            evidence.validate().is_ok()
+                && envelope_pins.iter().all(|present| *present)
+                && request.runtime_ownership == steward_types::RuntimeOwnership::Provisioned
+                && if evidence.source.starts_with("steward:registry/") {
+                    workflow_pins.iter().all(|present| *present)
+                } else {
+                    workflow_pins.iter().all(|present| !*present)
+                }
+        }
+        (None, None) => {
             complete(workflow_pins)
                 && complete(envelope_pins)
                 && workflow_pins[0] == envelope_pins[0]
@@ -9785,6 +9879,15 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
                 }
         }
         None => request.direct_task_evidence.is_none(),
+    };
+    let origin_valid = match request.task_origin {
+        TaskOrigin::Browser => request.browser_task_evidence.is_some(),
+        TaskOrigin::GithubActions => {
+            request.browser_task_evidence.is_none() && request.source_provenance.is_some()
+        }
+        TaskOrigin::Connections | TaskOrigin::Unknown => {
+            request.browser_task_evidence.is_none() && request.source_provenance.is_none()
+        }
     };
     if request
         .execution_binding
@@ -9806,7 +9909,9 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
                         || request.runtime_uid != Some(resident.runtime_uid.0.as_str())
                 }
             })
-        || !direct_evidence_valid
+        || !package_evidence_valid
+        || !origin_valid
+        || (request.browser_task_evidence.is_some() && request.source_provenance.is_some())
         || !source_provenance_valid
         || request.workflow_version.is_some_and(|version| version <= 0)
         || request
@@ -9915,6 +10020,8 @@ mod task_execution_binding_tests {
             execution_binding: Some(&binding),
             source_provenance: None,
             direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &digest,
             admission_decision: &admission,
@@ -9945,6 +10052,7 @@ mod task_execution_binding_tests {
         }))
         .map_err(|error| error.to_string())?;
         request.source_provenance = Some(&provenance);
+        request.task_origin = steward_types::direct_package::TaskOrigin::GithubActions;
         assert_eq!(
             validate_task_version_pins(&request),
             Err(StoreError::InvalidTaskIdentityBinding),
@@ -10427,6 +10535,8 @@ pub struct TaskRecord {
     pub execution_binding: Option<TaskExecutionBinding>,
     pub source_provenance: Option<SourceProvenance>,
     pub direct_task_evidence: Option<DirectTaskBindingEvidence>,
+    pub task_origin: TaskOrigin,
+    pub browser_task_evidence: Option<BrowserTaskEvidence>,
     pub envelope_revision: Option<i64>,
     pub orchestration_version: i16,
     pub orchestration_operation_id: Option<Uuid>,
@@ -10846,6 +10956,7 @@ pub enum StoreError {
     EnvelopeTemplateNotFound,
     TaskNotFound,
     TaskIdempotencyConflict,
+    BrowserTaskConcurrencyLimit,
     InvalidTaskIdentityBinding,
     InvalidTaskTransition,
     ConnectionOperationNotFound,
@@ -10974,6 +11085,9 @@ impl fmt::Display for StoreError {
                     formatter,
                     "idempotency key is already bound to another task request"
                 )
+            }
+            Self::BrowserTaskConcurrencyLimit => {
+                write!(formatter, "too many active browser-authored tasks")
             }
             Self::InvalidTaskIdentityBinding => {
                 write!(formatter, "task canonical identity binding is invalid")
@@ -11541,6 +11655,15 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
             .map(|provenance| provenance.0),
         direct_task_evidence: row
             .try_get::<Option<Json<DirectTaskBindingEvidence>>, _>("direct_task_evidence")
+            .map_err(database_error)?
+            .map(|evidence| evidence.0),
+        task_origin: TaskOrigin::parse(
+            &row.try_get::<String, _>("task_origin")
+                .map_err(database_error)?,
+        )
+        .map_err(|_| StoreError::InvalidTaskTransition)?,
+        browser_task_evidence: row
+            .try_get::<Option<Json<BrowserTaskEvidence>>, _>("browser_task_evidence")
             .map_err(database_error)?
             .map(|evidence| evidence.0),
         envelope_revision: row.try_get("envelope_revision").map_err(database_error)?,
@@ -12371,7 +12494,8 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
             tasks.coding_agent_runtime, COALESCE(orchestration.runtime_uid, tasks.runtime_uid) AS runtime_uid, \
             tasks.runtime_ownership, tasks.phase, tasks.runtime_spec, \
             tasks.envelope_revision, tasks.finalize_requested, tasks.finalized, \
-            tasks.failure_reason, tasks.direct_task_evidence, \
+            tasks.failure_reason, tasks.direct_task_evidence, tasks.task_origin, \
+            tasks.browser_task_evidence, \
             to_char(tasks.created_at AT TIME ZONE 'UTC', \
                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
             to_char(tasks.updated_at AT TIME ZONE 'UTC', \
@@ -12501,6 +12625,15 @@ fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreE
         history_partial: row.try_get("history_partial").map_err(database_error)?,
         direct_task_evidence: row
             .try_get::<Option<Json<DirectTaskBindingEvidence>>, _>("direct_task_evidence")
+            .map_err(database_error)?
+            .map(|value| value.0),
+        task_origin: TaskOrigin::parse(
+            &row.try_get::<String, _>("task_origin")
+                .map_err(database_error)?,
+        )
+        .map_err(|_| StoreError::InvalidTaskTransition)?,
+        browser_task_evidence: row
+            .try_get::<Option<Json<BrowserTaskEvidence>>, _>("browser_task_evidence")
             .map_err(database_error)?
             .map(|value| value.0),
     })
@@ -12654,6 +12787,9 @@ fn envelope_template_revision_record(
             .try_get::<Option<Json<Envelope>>, _>("auto_provision_threshold")
             .map_err(database_error)?
             .map(|value| value.0),
+        allow_inline_browser_tasks: row
+            .try_get("allow_inline_browser_tasks")
+            .map_err(database_error)?,
     })
 }
 

@@ -4,7 +4,7 @@
 //! source references and authority selection explicit while leaving source retrieval,
 //! authorization, and Envelope lookup to their owning services.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,6 +23,8 @@ pub const MAX_EXECUTION_TRANSCRIPT_BYTES: u64 = 2 * MAX_EXECUTION_STREAM_BYTES;
 pub const MAX_PACKAGE_FILES: usize = 128;
 pub const MAX_PACKAGE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_PACKAGE_CLOSURE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_INLINE_PACKAGE_BYTES: usize = 64 * 1024;
+pub const MAX_BROWSER_INPUT_BYTES: usize = 16 * 1024;
 
 macro_rules! validated_string {
     ($name:ident, $validator:ident) => {
@@ -301,6 +303,206 @@ pub struct DirectTaskSubmission {
     /// The invocation manifest field remains accepted during the compatibility window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope_digest: Option<EnvelopeDigest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserTaskSubmission {
+    pub package: BrowserPackageLocator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_digest: Option<EnvelopeDigest>,
+    #[serde(default)]
+    pub inputs: serde_json::Value,
+}
+
+impl BrowserTaskSubmission {
+    pub fn validate(&self) -> Result<(), String> {
+        self.package.validate()?;
+        if !self.inputs.is_object() {
+            return Err("browser Task inputs must be a JSON object".to_owned());
+        }
+        let encoded = canonical_json_bytes(&self.inputs)?;
+        if encoded.len() > MAX_BROWSER_INPUT_BYTES {
+            return Err("browser Task inputs exceed the size limit".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserPackageLocator {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub path: RelativePath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub files: Option<BTreeMap<String, String>>,
+}
+
+impl BrowserPackageLocator {
+    pub fn validate(&self) -> Result<(), String> {
+        match self.source.as_str() {
+            "inline" => {
+                let files = self
+                    .files
+                    .as_ref()
+                    .ok_or_else(|| "inline packages require files".to_owned())?;
+                if files.is_empty() || files.len() > MAX_PACKAGE_FILES {
+                    return Err(
+                        "inline package file count is outside the allowed bounds".to_owned()
+                    );
+                }
+                let mut total = 0_usize;
+                for (path, bytes) in files {
+                    RelativePath::parse(path.clone())?;
+                    total = total
+                        .checked_add(bytes.len())
+                        .ok_or_else(|| "inline package size overflow".to_owned())?;
+                    if bytes.len() as u64 > MAX_PACKAGE_FILE_BYTES {
+                        return Err(format!("inline package file {path} exceeds the size limit"));
+                    }
+                }
+                if total > MAX_INLINE_PACKAGE_BYTES {
+                    return Err("inline package exceeds the size limit".to_owned());
+                }
+                if !files.contains_key(self.path.as_str()) {
+                    return Err("inline package does not contain its entry point".to_owned());
+                }
+                if let Some(revision) = &self.revision {
+                    ContentDigest::parse(revision.clone())?;
+                }
+            }
+            source if source.starts_with("https://") => {
+                RepositoryUrl::parse(source.to_owned())?;
+                if self.files.is_some() {
+                    return Err("repository packages must not include inline files".to_owned());
+                }
+                let revision = self
+                    .revision
+                    .as_deref()
+                    .ok_or_else(|| "repository packages require a revision".to_owned())?;
+                if !valid_exact_git_commit(revision) && !valid_git_ref(revision) {
+                    return Err("repository package revision is invalid".to_owned());
+                }
+            }
+            source if source.starts_with("steward:registry/") => {
+                let name = source
+                    .strip_prefix("steward:registry/")
+                    .ok_or_else(|| "registry package source is invalid".to_owned())?;
+                Slug::parse(name.to_owned())?;
+                if self.files.is_some() || self.path.as_str() != "task-definition.json" {
+                    return Err(
+                        "registry packages use task-definition.json and no inline files".to_owned(),
+                    );
+                }
+                let version = self
+                    .revision
+                    .as_deref()
+                    .and_then(|value| value.strip_prefix("steward:version:"))
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| "registry package revision is invalid".to_owned())?;
+                let _ = version;
+            }
+            _ => return Err("browser package source is invalid".to_owned()),
+        }
+        Ok(())
+    }
+}
+
+fn valid_git_ref(value: &str) -> bool {
+    let Some(reference) = value.strip_prefix("git:ref:") else {
+        return false;
+    };
+    !reference.is_empty()
+        && reference.len() <= 512
+        && reference.trim() == reference
+        && !reference.starts_with('-')
+        && !reference.ends_with('/')
+        && !["..", "@{", "\\", " "]
+            .iter()
+            .any(|forbidden| reference.contains(forbidden))
+        && !reference.chars().any(char::is_control)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskOrigin {
+    Browser,
+    GithubActions,
+    Connections,
+    Unknown,
+}
+
+impl TaskOrigin {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Browser => "browser",
+            Self::GithubActions => "github-actions",
+            Self::Connections => "connections",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "browser" => Ok(Self::Browser),
+            "github-actions" => Ok(Self::GithubActions),
+            "connections" => Ok(Self::Connections),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err("Task origin is invalid".to_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserTaskEvidence {
+    pub source: String,
+    pub revision: String,
+    pub path: RelativePath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure: Option<PackageClosure>,
+    pub closure_digest: ContentDigest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub inline_files: Option<BTreeMap<String, String>>,
+}
+
+impl BrowserTaskEvidence {
+    pub fn validate(&self) -> Result<(), String> {
+        let locator = BrowserPackageLocator {
+            source: self.source.clone(),
+            revision: Some(self.revision.clone()),
+            path: self.path.clone(),
+            files: self.inline_files.clone(),
+        };
+        locator.validate()?;
+        if self.source == "inline" && self.revision != self.closure_digest.as_str() {
+            return Err("inline package revision differs from its closure digest".to_owned());
+        }
+        if self.source.starts_with("steward:registry/") {
+            if self.closure.is_some() || self.inline_files.is_some() {
+                return Err("legacy registry evidence must not claim a v2 closure".to_owned());
+            }
+            return Ok(());
+        }
+        let closure = self
+            .closure
+            .as_ref()
+            .ok_or_else(|| "browser package closure is missing".to_owned())?;
+        closure.validate()?;
+        if closure.entry_point != self.path {
+            return Err("browser package path differs from its closure entry point".to_owned());
+        }
+        let digest = Sha256::digest(canonical_json_bytes(closure)?);
+        if self.closure_digest.as_str() != format!("steward:sha256:{digest:x}") {
+            return Err("browser package closure digest is invalid".to_owned());
+        }
+        Ok(())
+    }
 }
 
 impl DirectTaskSubmission {
@@ -1002,4 +1204,54 @@ pub fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, String> 
         .map_err(|error| format!("contract value cannot be canonicalized: {error}"))?;
     serde_json::to_vec(&value)
         .map_err(|error| format!("canonical contract value cannot be encoded: {error}"))
+}
+
+#[cfg(test)]
+mod browser_submission_tests {
+    use super::{BrowserTaskSubmission, MAX_BROWSER_INPUT_BYTES};
+
+    #[test]
+    fn inline_package_requires_its_entry_point_and_object_inputs() -> Result<(), String> {
+        let valid: BrowserTaskSubmission = serde_json::from_value(serde_json::json!({
+            "package": {
+                "source": "inline",
+                "path": "task-definition.json",
+                "files": { "task-definition.json": "{}" }
+            },
+            "inputs": {}
+        }))
+        .map_err(|error| error.to_string())?;
+        valid.validate()?;
+
+        let mut missing = valid.clone();
+        missing.package.path = super::RelativePath::parse("missing.json")?;
+        assert!(missing.validate().is_err());
+        let mut scalar = valid;
+        scalar.inputs = serde_json::json!("not an object");
+        assert!(scalar.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn repository_refs_are_allowed_but_unsafe_or_unpinned_inputs_are_rejected() -> Result<(), String>
+    {
+        let branch: BrowserTaskSubmission = serde_json::from_value(serde_json::json!({
+            "package": {
+                "source": "https://github.com/example-org/agentic-ops.git",
+                "revision": "git:ref:main",
+                "path": "catalog/hello/task-definition.json"
+            },
+            "inputs": {}
+        }))
+        .map_err(|error| error.to_string())?;
+        branch.validate()?;
+
+        let mut unsafe_ref = branch.clone();
+        unsafe_ref.package.revision = Some("git:ref:refs/heads/../secret".to_owned());
+        assert!(unsafe_ref.validate().is_err());
+        let mut oversized = branch;
+        oversized.inputs = serde_json::json!({ "value": "x".repeat(MAX_BROWSER_INPUT_BYTES) });
+        assert!(oversized.validate().is_err());
+        Ok(())
+    }
 }
