@@ -32,9 +32,11 @@ that handoff.
 8. Browser administration now requires
    `config.apiserver.stewardRunRelease`, populated from the verified installation
    BOM with `manifestSchemaVersion`, `version`, `workflowRepository`,
-   `workflowCommit`, `actionCommit`, and `governedJobContainerImage`. Install
-   `steward-run` v0.7.0 or later; apiserver startup fails closed on a missing,
-   malformed, mutable, or older handoff.
+   `workflowCommit`, and `actionCommit`. Install `steward-run` v0.7.0 or later;
+   apiserver startup fails closed on a missing, malformed, mutable, or older
+   handoff. `governedJobContainerImage` was required by the original v0.3.0
+   chart and remains accepted, but current versioned workflow generation does
+   not use it.
 9. Before upgrading to 0.3.2 or later with Gateway API enabled, configure the
    complete seven-entry `web.httpRoute.apiPaths` list from the chart README;
    incomplete route sets are rejected instead of silently reaching the web frontend.

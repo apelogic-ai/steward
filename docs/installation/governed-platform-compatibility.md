@@ -34,6 +34,11 @@ For v0.3.5 it declares:
 - the exact-operation and base-URL semantics for the Codex and Claude inference
   adapters.
 
+The declared Identity v5 / `steward-task-v2` pair remains supported and is not
+deprecated. New installations should choose Identity policy v6 with
+`steward-task-v3` so first-run subject enrollment and connection-verified
+association have explicit outcomes.
+
 Download and verify it from the Steward release:
 
 ```sh
@@ -94,11 +99,13 @@ exact:
 | `workflowRepository` | `workflowRepository` |
 | `workflowCommit` | `workflowCommit` |
 | `actionCommit` | `actionCommit` |
-| `image` | `governedJobContainerImage` |
 
 For the v0.7.0 handoff, `schemaVersion` is the JSON number `3`. This normalized
 projection renames fields but must not select different coordinates from the
-signed BOM.
+signed BOM. The active versioned workflow does not run caller jobs in a
+steward-run image, so the image coordinate is not part of this projection.
+Existing values may retain `governedJobContainerImage` for compatibility with
+the lower-level v1 smoke renderer.
 
 ## Stable runtime contracts
 

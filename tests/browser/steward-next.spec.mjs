@@ -333,7 +333,7 @@ async function startWeb() {
         }
         if (failureStatus) {
           response.writeHead(failureStatus, { "content-type": "application/json", "cache-control": "no-store" });
-          response.end("{}");
+          response.end(JSON.stringify(typeof failure === "object" && failure !== null ? (failure.body ?? {}) : {}));
           return;
         }
         if (requestUrl.pathname.endsWith("/rerun")) {
@@ -1724,6 +1724,113 @@ test("administrator templates and approvals use typed browser authority", async 
   }
 });
 
+test("new template defaults eligibility to its typed ID and identifies invalid fields", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    expectedHttpStatuses: [422],
+    mutationFailures: {
+      "/admin/api/v1/envelope-templates/operator": { status: 422, body: { code: "template_invalid" } },
+    },
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/new`);
+
+    const templateId = administrator.page.getByRole("textbox", { name: "Template ID" });
+    await templateId.fill("engineer");
+    await expect(administrator.page.getByRole("button", { name: "Remove engineer" })).toBeVisible();
+
+    await templateId.fill("analyst");
+    await expect(administrator.page.getByRole("button", { name: "Remove analyst" })).toBeVisible();
+    await expect(administrator.page.getByRole("button", { name: "Remove engineer" })).toHaveCount(0);
+
+    const roles = administrator.page.getByRole("combobox", { name: "Eligible member roles" });
+    await roles.fill("reviewer");
+    await roles.press("Enter");
+    await templateId.fill("operator");
+    await expect(administrator.page.getByRole("button", { name: "Remove analyst" })).toBeVisible();
+    await expect(administrator.page.getByRole("button", { name: "Remove reviewer" })).toBeVisible();
+    await expect(administrator.page.getByRole("button", { name: "Remove operator" })).toHaveCount(0);
+
+    await administrator.page.getByRole("button", { name: "Remove analyst" }).click();
+    await administrator.page.getByRole("button", { name: "Remove reviewer" }).click();
+    await templateId.fill("not valid");
+    await administrator.page.getByRole("textbox", { name: "Per run (USD)" }).fill("not-a-decimal");
+    await administrator.page.getByRole("textbox", { name: "Monthly (USD)" }).fill("");
+    await administrator.page.getByRole("textbox", { name: "TTL" }).fill("");
+    await administrator.page.getByRole("button", { name: "Remove provider-a/model-a" }).click();
+    await administrator.page.getByRole("button", { name: "Create template" }).click();
+
+    await expect(administrator.page.getByText("Use 1–128 letters, numbers, periods, underscores, hyphens, or colons; start with a letter or number.")).toBeVisible();
+    await expect(administrator.page.getByText("Enter a display name.")).toBeVisible();
+    await expect(administrator.page.getByText("Add at least one eligible member role.")).toBeVisible();
+    await expect(administrator.page.getByText("Enter a non-negative decimal.")).toBeVisible();
+    await expect(administrator.page.getByText("Enter a monthly budget.")).toBeVisible();
+    await expect(administrator.page.getByText("Enter a TTL.")).toBeVisible();
+    await expect(administrator.page.getByText("Select at least one model.")).toBeVisible();
+    await expect(administrator.page.getByText(/The server rejected the template/)).toHaveCount(0);
+    expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
+
+    await templateId.fill("operator");
+    await administrator.page.getByRole("textbox", { name: "Display name" }).fill("Operator");
+    await roles.fill("operator");
+    await roles.press("Enter");
+    await administrator.page.getByRole("textbox", { name: "Per run (USD)" }).fill("1.00");
+    await administrator.page.getByRole("textbox", { name: "Monthly (USD)" }).fill("10.00");
+    await administrator.page.getByRole("textbox", { name: "TTL" }).fill("15m");
+    const models = administrator.page.getByRole("combobox", { name: "Models" });
+    await models.fill("provider-a/model-a");
+    await models.press("Enter");
+    const autoApprove = administrator.page.getByRole("checkbox", { name: "Auto-approve every request within the ceiling" });
+    await autoApprove.uncheck();
+    await administrator.page.getByRole("textbox", { name: "Auto-approve up to (complete envelope JSON)" }).fill("not-json");
+    await administrator.page.getByRole("button", { name: "Create template" }).click();
+    await expect(administrator.page.getByText("Enter a complete valid envelope as JSON.")).toBeVisible();
+    expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
+
+    await administrator.page.getByRole("textbox", { name: "Auto-approve up to (complete envelope JSON)" }).fill(JSON.stringify({
+      revision: 2,
+      spec: {
+        budget: { currency: "USD", monthlyLimit: "11.00", singleRunLimit: "1.00" },
+        llms: [{ provider: "provider-a", model: "model-a" }],
+        tools: [],
+        runtimeMinutesLimit: "60",
+        ttl: "15m",
+        runner: { platforms: ["linux"] },
+      },
+    }));
+    await administrator.page.getByRole("button", { name: "Create template" }).click();
+    await expect(administrator.page.getByText("Enter a valid envelope within this template ceiling.")).toBeVisible();
+    expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
+
+    await autoApprove.check();
+    await administrator.page.getByRole("button", { name: "Create template" }).click();
+
+    await expect(administrator.page.getByText("The server rejected the template, so no authority was changed. Error code: template_invalid.")).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("new template reports display-name and member-role limits before submission", async ({ browser }) => {
+  const administrator = await guardedPage(browser, { session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/new`);
+    await administrator.page.getByRole("textbox", { name: "Template ID" }).fill("engineer");
+    await administrator.page.getByRole("textbox", { name: "Display name" }).fill("x".repeat(129));
+    const roles = administrator.page.getByRole("combobox", { name: "Eligible member roles" });
+    for (let index = 0; index < 64; index += 1) {
+      await roles.fill(`role-${index}`);
+      await roles.press("Enter");
+    }
+    await administrator.page.getByRole("button", { name: "Create template" }).click();
+    await expect(administrator.page.getByText("Use at most 128 characters.")).toBeVisible();
+    await expect(administrator.page.getByText("Use at most 64 eligible member roles.")).toBeVisible();
+    expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
 test("administrator preserves a narrower auto-provision threshold when revising a template", async ({ browser }) => {
   const threshold = {
     ...adminEnvelope,
@@ -1750,7 +1857,7 @@ test("administrator preserves a narrower auto-provision threshold when revising 
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     const mutation = administrator.mutations.find((item) => item.path === "/admin/api/v1/envelope-templates/analyst");
     expectMutationProof(mutation);
-    expect(mutation.body.autoProvisionThreshold).toEqual(threshold);
+    expect(mutation.body.autoProvisionThreshold).toEqual({ ...threshold, revision: adminEnvelope.revision + 1 });
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1812,7 +1919,7 @@ test("administrator can replace a template tool absent from the capability catal
     const tools = administrator.page.getByRole("group", { name: "Tools" });
     await expect(tools.getByText("Not listed in the deployment capability catalog")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
-    await expect(administrator.page.getByRole("alert").filter({ hasText: "no authority was changed" })).toBeVisible();
+    await expect(tools.getByText("Remove or replace every tool not listed in the capability catalog.")).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
 
     const tool = tools.getByRole("combobox", { name: "Tools" });
@@ -1858,7 +1965,7 @@ test("administrator template authoring rejects models absent from the capability
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
-    await expect(administrator.page.getByText("The template ID or envelope fields are invalid, so no authority was changed.", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByText("Remove or replace every model not listed in the capability catalog.", { exact: true })).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
   } finally {
     await closeGuardedPage(administrator);
@@ -1877,7 +1984,7 @@ test("administrator can replace a template model absent from the capability cata
     await expect(models.getByText("openai/gpt-5.4", { exact: true })).toBeVisible();
     await expect(models.getByText("Not listed in the deployment capability catalog")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
-    await expect(administrator.page.getByText("The template ID or envelope fields are invalid, so no authority was changed.", { exact: true })).toBeVisible();
+    await expect(models.getByText("Remove or replace every model not listed in the capability catalog.", { exact: true })).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
 
     await models.getByRole("button", { name: "Remove openai/gpt-5.4" }).click();
