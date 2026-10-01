@@ -543,6 +543,14 @@ struct ConfiguredTaskIdentity {
     connection_auto_association_issuer: Option<String>,
 }
 
+fn connection_auto_association_issuer(
+    federated_subjects_enabled: bool,
+    auto_associate_from_connections: bool,
+    issuer: String,
+) -> Option<String> {
+    (federated_subjects_enabled && auto_associate_from_connections).then_some(issuer)
+}
+
 fn configured_task_identity_resolver(
     client: kube::Client,
     kubernetes_audience: KubernetesTokenReviewAudience,
@@ -624,9 +632,11 @@ fn configured_task_identity_resolver(
     Ok(ConfiguredTaskIdentity {
         resolver,
         discovery,
-        connection_auto_association_issuer: (federated_subjects_enabled
-            && auto_associate_from_connections)
-            .then_some(issuer),
+        connection_auto_association_issuer: connection_auto_association_issuer(
+            federated_subjects_enabled,
+            auto_associate_from_connections,
+            issuer,
+        ),
     })
 }
 
@@ -1751,15 +1761,33 @@ mod tests {
         CodexTaskExecutionAdapter, KubernetesTokenReviewAudience, OPERATOR_EXIT_CONFLICT,
         OPERATOR_EXIT_FORBIDDEN, OPERATOR_EXIT_NOT_FOUND, OPERATOR_EXIT_UNAVAILABLE,
         OPERATOR_EXIT_USAGE, OperatorCommandError, TaskApiConfig, TlsListener,
-        bootstrap_rbac_arguments, decode_tls_material, format_effective_access_human,
-        github_source_adapter_from_values, install_rustls_crypto_provider,
-        kubernetes_token_review_audience, operator_exit_code, parse_custom_envelope_safety_ceiling,
-        parse_execution_bindings_mode, parse_template_document,
-        stable_bridge_configuration_from_values, validate_execution_bindings,
-        with_claude_code_execution_adapter,
+        bootstrap_rbac_arguments, connection_auto_association_issuer, decode_tls_material,
+        format_effective_access_human, github_source_adapter_from_values,
+        install_rustls_crypto_provider, kubernetes_token_review_audience, operator_exit_code,
+        parse_custom_envelope_safety_ceiling, parse_execution_bindings_mode,
+        parse_template_document, stable_bridge_configuration_from_values,
+        validate_execution_bindings, with_claude_code_execution_adapter,
     };
 
     static NEXT_PREFLIGHT_CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn connection_auto_association_requires_both_feature_switches() {
+        let issuer = "https://identity.example.test".to_owned();
+
+        assert_eq!(
+            connection_auto_association_issuer(true, true, issuer.clone()),
+            Some(issuer.clone())
+        );
+        assert_eq!(
+            connection_auto_association_issuer(true, false, issuer.clone()),
+            None
+        );
+        assert_eq!(
+            connection_auto_association_issuer(false, true, issuer),
+            None
+        );
+    }
 
     struct OwnedTestDirectory(std::path::PathBuf);
 

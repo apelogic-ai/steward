@@ -3699,8 +3699,12 @@ mod identity_task_authentication_tests {
     use rand_core::OsRng;
     use serde::Serialize;
     use std::sync::Arc;
-    use steward_store::{FederatedSubjectObservation, FederatedSubjectRecord, StoreError};
+    use steward_store::{
+        FederatedSubjectAssociationMethod, FederatedSubjectObservation, FederatedSubjectRecord,
+        FederatedSubjectState, StoreError,
+    };
     use steward_types::{CanonicalPrincipal, CanonicalUserId, Email, OrganizationId};
+    use uuid::Uuid;
 
     const ISSUER: &str = "https://identity.localhost:18444";
     const AUDIENCE: &str = "steward-task-api";
@@ -3751,6 +3755,69 @@ mod identity_task_authentication_tests {
     struct V2SeedFailureStore {
         principal: CanonicalPrincipal,
         seed_failure: SeedFailure,
+    }
+
+    struct PreassociatedFederatedStore {
+        principal: CanonicalPrincipal,
+    }
+
+    impl PreassociatedFederatedStore {
+        fn record(&self) -> FederatedSubjectRecord {
+            FederatedSubjectRecord {
+                subject_id: Uuid::nil(),
+                issuer: ISSUER.to_owned(),
+                subject: "github-actions:actor:16106037".to_owned(),
+                state: FederatedSubjectState::Associated,
+                canonical_user_id: Some(self.principal.user_id.clone()),
+                actor_login: Some("alice".to_owned()),
+                display_name: Some("Alice".to_owned()),
+                association_method: Some(FederatedSubjectAssociationMethod::ConnectionVerification),
+                revision: 1,
+                first_seen_at: "2026-01-01T00:00:00Z".to_owned(),
+                last_seen_at: "2026-01-01T00:00:00Z".to_owned(),
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            }
+        }
+    }
+
+    impl IdentityTaskStore for PreassociatedFederatedStore {
+        fn resolve_canonical_principal<'a>(
+            &'a self,
+            _user_id: &'a CanonicalUserId,
+            _current_verified_email: &'a Email,
+        ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>> {
+            Box::pin(async move { Ok(self.principal.clone()) })
+        }
+
+        fn seed_federated_subject_association<'a>(
+            &'a self,
+            _observation: FederatedSubjectObservation<'a>,
+            _canonical_user_id: &'a CanonicalUserId,
+            _actor: &'a str,
+        ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>> {
+            Box::pin(async move { Ok(self.record()) })
+        }
+
+        fn observe_federated_subject<'a>(
+            &'a self,
+            _observation: FederatedSubjectObservation<'a>,
+        ) -> BoxFuture<'a, Result<FederatedSubjectRecord, StoreError>> {
+            Box::pin(async move { Ok(self.record()) })
+        }
+
+        fn resolve_federated_subject<'a>(
+            &'a self,
+            issuer: &'a str,
+            subject: &'a str,
+        ) -> BoxFuture<'a, Result<CanonicalPrincipal, StoreError>> {
+            Box::pin(async move {
+                if issuer == ISSUER && subject == "github-actions:actor:16106037" {
+                    Ok(self.principal.clone())
+                } else {
+                    Err(StoreError::FederatedSubjectNotFound)
+                }
+            })
+        }
     }
 
     impl IdentityTaskStore for V2SeedFailureStore {
@@ -3916,6 +3983,36 @@ mod identity_task_authentication_tests {
                 "usr_528fc0fed6cf400abb93a3f327d9a809"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v3_resolver_accepts_subject_preassociated_by_verified_connection() -> Result<(), String>
+    {
+        let (key, jwks) = key_material()?;
+        let assertion = federated_token(&key)?;
+        let principal = CanonicalPrincipal::new(
+            CanonicalUserId::parse("usr_528fc0fed6cf400abb93a3f327d9a809")?,
+            OrganizationId::parse("org_example")?,
+            Email::parse("alice@example.com")?,
+        )?;
+        let resolver = IdentityTaskIdentityResolver {
+            jwks,
+            issuer: ISSUER.to_owned(),
+            audience: AUDIENCE.to_owned(),
+            canonical_identities: Arc::new(PreassociatedFederatedStore { principal }),
+            federated_subjects_enabled: true,
+        };
+
+        let identity = resolver
+            .resolve(&assertion)
+            .await
+            .map_err(|error| format!("preassociated v3 subject was rejected: {error:?}"))?;
+        assert_eq!(identity.owner.as_str(), "alice@example.com");
+        assert_eq!(
+            identity.canonical_user_id.as_str(),
+            "usr_528fc0fed6cf400abb93a3f327d9a809"
+        );
         Ok(())
     }
 

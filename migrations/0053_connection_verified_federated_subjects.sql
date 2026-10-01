@@ -1,5 +1,6 @@
 -- Record GitHub Connect as a distinct, auditable proof for federated-subject
--- association. Existing subjects and audit rows remain unchanged.
+-- association. Existing bindings and audit rows remain unchanged; the new proof
+-- column is backfilled from the current association's audit revision.
 ALTER TABLE federated_subjects
     ADD COLUMN association_method text;
 
