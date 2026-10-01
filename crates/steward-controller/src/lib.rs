@@ -6167,11 +6167,10 @@ mod tests {
                 .map_err(|error| format!("classify failed runtime status: {error}"))?
         );
 
-        runtime
-            .status
-            .as_mut()
-            .expect("fixture status")
-            .observed_generation = 6;
+        let Some(runtime_status) = runtime.status.as_mut() else {
+            return Err("fixture status is missing".to_owned());
+        };
+        runtime_status.observed_generation = 6;
         assert!(
             !task_runtime_observation_is_failed(&runtime)
                 .map_err(|error| format!("classify stale failed runtime status: {error}"))?,

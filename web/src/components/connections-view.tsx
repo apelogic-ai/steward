@@ -190,6 +190,8 @@ function connectionOperationError(value: unknown): ConnectionOperationErrorRespo
 function connectionFailureMessage(failure: ConnectionOperationErrorResponse): string {
   const messages: Record<string, string> = {
     runtime_authentication_failed: "The governed runtime could not authenticate to GitHub. Re-authorize GitHub; if it continues, ask an administrator to verify runtime credential injection.",
+    proxy_policy_denied: "OpenShell policy denied the governed GitHub request. Ask an administrator to verify the runtime's GitHub proxy policy.",
+    provider_authorization_failed: "GitHub rejected the governed runtime's authority. Re-authorize GitHub; if it continues, ask an administrator to verify the approved GitHub scopes.",
     token_grant_failed: "The governed runtime could not receive its GitHub credential. Retry once; if it continues, ask an administrator to inspect MCP-GW token grants.",
     runtime_create_failed: "The governed connection runtime could not be created. Ask an administrator to inspect Steward runtime admission and controller events.",
     runtime_start_failed: "The governed connection runtime failed to start. Ask an administrator to inspect the AgentRuntime and OpenShell sandbox status.",

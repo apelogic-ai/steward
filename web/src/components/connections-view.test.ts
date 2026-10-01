@@ -41,6 +41,10 @@ describe("governed provider connection controls", () => {
     expect(source).toContain("failure.detail");
     expect(source).toContain("runtime_authentication_failed");
     expect(source).toContain("verify runtime credential injection");
+    expect(source).toContain("proxy_policy_denied");
+    expect(source).toContain("verify the runtime's GitHub proxy policy");
+    expect(source).toContain("provider_authorization_failed");
+    expect(source).toContain("verify the approved GitHub scopes");
     expect(source).toContain("token_grant_failed");
     expect(source).toContain("inspect MCP-GW token grants");
     expect(source).toContain("runtime_create_failed");

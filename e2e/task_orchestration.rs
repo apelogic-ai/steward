@@ -10,6 +10,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::{Method, Response, StatusCode, header};
+use axum::response::IntoResponse;
 use axum::routing::any;
 use kube::api::PostParams;
 use kube::core::Request as KubeRequest;
@@ -20,10 +21,12 @@ use sqlx::{postgres::PgPoolOptions, types::Uuid};
 use steward_admission::internal_authorities::steward_connections_v1;
 use steward_admission::{AdmissionDecision, Envelope, EnvelopeSpec};
 use steward_apiserver::connections::{
-    ConnectionSession, ConnectionSubject, ProviderConnectionBroker,
+    ConnectionBrokerError, ConnectionSession, ConnectionStartOperation, ConnectionSubject,
+    ProviderConnectionBroker,
 };
 use steward_apiserver::governed_connections::{
-    ConnectionExecutionBindings, GovernedConnectionsBroker, GovernedConnectionsConfig,
+    ConnectionExecutionBindings, ConnectionOperationReconciler, GovernedConnectionsBroker,
+    GovernedConnectionsConfig,
 };
 use steward_apiserver::{
     AuthenticatedCaller, AuthenticationError, BoxFuture, RequestAuthenticator, operator_admin,
@@ -34,9 +37,9 @@ use steward_controller::{
 };
 use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
-    InferenceRequest, PortError, ProvisionedInference, SandboxObservation, SandboxRequest,
-    SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest,
-    SandboxTaskRuntime, TaskAttemptId,
+    InferenceRequest, PortError, ProviderControlExecutionBindings, ProvisionedInference,
+    SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput,
+    SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
 use steward_store::{
     AgentRunLogStream, EnvelopeRequestReservationRequest, EnvelopeRequestStatus,
@@ -665,14 +668,25 @@ struct AmbiguousTaskRuntime {
     starts: Arc<AtomicUsize>,
     ensures: Arc<AtomicUsize>,
     deletes: Arc<AtomicUsize>,
+    fail_next_ensure: Arc<AtomicBool>,
     succeed_next_start: Arc<AtomicBool>,
     terminal_observed: Arc<AtomicBool>,
     fail_next_observation: Arc<AtomicBool>,
+    provider_control_bindings: Option<ProviderControlExecutionBindings>,
 }
 
 impl SandboxRuntime for AmbiguousTaskRuntime {
+    fn provider_control_bindings(&self) -> Option<ProviderControlExecutionBindings> {
+        self.provider_control_bindings.clone()
+    }
+
     async fn ensure(&self, request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
         self.ensures.fetch_add(1, Ordering::SeqCst);
+        if self.fail_next_ensure.swap(false, Ordering::SeqCst) {
+            return Err(PortError::Failed {
+                reason: "sandbox entered an error phase".to_owned(),
+            });
+        }
         Ok(SandboxObservation::Running {
             refs: RuntimeRefs {
                 workspace: Some(format!("workspace-{}", request.workspace_key)),
@@ -742,6 +756,10 @@ impl InferencePlane for ActiveInference {
 }
 
 impl SandboxTaskRuntime for AmbiguousTaskRuntime {
+    fn provider_control_bindings(&self) -> Option<ProviderControlExecutionBindings> {
+        self.provider_control_bindings.clone()
+    }
+
     async fn start_task(
         &self,
         _attempt_id: &TaskAttemptId,
@@ -791,6 +809,233 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
             reason: "attempt-scoped cancellation is unprovable".to_owned(),
         })
     }
+}
+
+#[tokio::test]
+async fn connections_runtime_error_fails_owner_operation_and_cleans_up()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let store = PgStore::new(
+        PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await?,
+    );
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let alice_email = Email(format!("alice-{suffix}@example.com"));
+    let alice = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("connections-alice-{suffix}"),
+                "example.com",
+                alice_email.as_str(),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let bob_email = Email(format!("bob-{suffix}@example.org"));
+    let bob = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.org",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("connections-bob-{suffix}"),
+                "example.org",
+                bob_email.as_str(),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let config = GovernedConnectionsConfig::new(
+        ConnectionExecutionBindings {
+            artifact_trust_mode: "github-attestation".to_owned(),
+            bridge_image_digest: format!("ghcr.io/example-org/bridge@sha256:{}", "a".repeat(64)),
+            mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
+            mcp_gw_version: "0.3.2".to_owned(),
+            namespace: "steward-test".to_owned(),
+            runtime_class: "sandbox-vm".to_owned(),
+        },
+        "https://steward.example.test",
+    )
+    .map_err(|error| io::Error::other(format!("internal Task config: {error:?}")))?;
+    let broker =
+        GovernedConnectionsBroker::new(store.clone(), config, TaskOrchestrationMode::Active);
+    let alice_session = ConnectionSession {
+        subject: ConnectionSubject {
+            canonical_user_id: alice.user_id.clone(),
+            display_email: alice_email.as_str().to_owned(),
+        },
+        binding: (),
+    };
+    let bob_session = ConnectionSession {
+        subject: ConnectionSubject {
+            canonical_user_id: bob.user_id,
+            display_email: bob_email.as_str().to_owned(),
+        },
+        binding: (),
+    };
+    let reserved = broker
+        .start(&alice_session)
+        .await
+        .map_err(|error| io::Error::other(format!("reserve connection start: {error:?}")))?;
+    let task_uid = reserved.operation_id;
+    let kubernetes = AmbiguousKubernetes::default();
+    let (client, _server) = kubernetes_client(kubernetes.clone()).await?;
+    let runtime = AmbiguousTaskRuntime {
+        provider_control_bindings: Some(ProviderControlExecutionBindings {
+            artifact_trust_mode: "github-attestation".to_owned(),
+            bridge_image_digest: format!("ghcr.io/example-org/bridge@sha256:{}", "a".repeat(64)),
+            mcp_gw_origin: "https://mcp-gw.example.test".to_owned(),
+            mcp_gw_version: "0.3.2".to_owned(),
+            namespace: "steward-test".to_owned(),
+            runtime_class: "sandbox-vm".to_owned(),
+        }),
+        ..AmbiguousTaskRuntime::default()
+    };
+
+    reconcile_current(&client, &runtime, &store, task_uid).await?;
+    reconcile_current(&client, &runtime, &store, task_uid).await?;
+    reconcile_current(&client, &runtime, &store, task_uid).await?;
+    reconcile_current(&client, &runtime, &store, task_uid).await?;
+    reconcile_current(&client, &runtime, &store, task_uid).await?;
+    assert_eq!(
+        operation(&store, task_uid).await?.state,
+        TaskOrchestrationState::ActivationPending
+    );
+    let active_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("active connection runtime is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        runtime.clone(),
+        ActiveInference::default(),
+        store.clone(),
+        active_runtime,
+    )
+    .await?;
+    runtime.fail_next_ensure.store(true, Ordering::SeqCst);
+    let finalized_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("finalized connection runtime is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        runtime.clone(),
+        ActiveInference::default(),
+        store.clone(),
+        finalized_runtime,
+    )
+    .await?;
+    let failed_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("failed connection runtime is absent"))?;
+    assert_eq!(
+        failed_runtime.status.as_ref().map(|status| status.phase),
+        Some(Phase::Failed)
+    );
+
+    reconcile_current(&client, &runtime, &store, task_uid).await?;
+    assert_eq!(
+        operation(&store, task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending
+    );
+    let failed_task = store
+        .task(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(failed_task.phase, TaskPhase::Failed);
+    assert_eq!(
+        failed_task.failure_reason.as_deref(),
+        Some("runtime_start_failed")
+    );
+
+    reconcile_current(&client, &runtime, &store, task_uid).await?;
+    let deleting_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("deleting connection runtime is absent"))?;
+    assert!(deleting_runtime.metadata.deletion_timestamp.is_some());
+    reconcile_agent_runtime_work_item(
+        &client,
+        runtime.clone(),
+        ActiveInference::default(),
+        store.clone(),
+        deleting_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &runtime, &store, task_uid).await?;
+    reconcile_current(&client, &runtime, &store, task_uid).await?;
+    assert_eq!(
+        operation(&store, task_uid).await?.state,
+        TaskOrchestrationState::Finalized
+    );
+    assert!(
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .is_none()
+    );
+
+    let connection_reconciler = ConnectionOperationReconciler::new(store.clone());
+    connection_reconciler.reconcile_once().await?;
+    connection_reconciler.reconcile_once().await?;
+    let owner_operation = store
+        .connection_operation(task_uid, &alice.user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("owner connection operation is absent"))?;
+    assert_eq!(owner_operation.finalization_state, "finalized");
+    assert_eq!(owner_operation.cleanup_state, "clean");
+    assert!(
+        broker
+            .start_operation(&bob_session, task_uid)
+            .await
+            .map_err(|error| io::Error::other(format!("read Bob operation: {error:?}")))?
+            .is_none(),
+        "a connection failure must remain scoped to its owner"
+    );
+    let Some(ConnectionStartOperation::Failed(error)) = broker
+        .start_operation(&alice_session, task_uid)
+        .await
+        .map_err(|error| io::Error::other(format!("read Alice operation: {error:?}")))?
+    else {
+        return Err(io::Error::other("owner did not observe a failed connection operation").into());
+    };
+    assert_eq!(error, ConnectionBrokerError::RuntimeStartFailed);
+    let response = error.into_response();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response_json(response).await?,
+        json!({
+            "apiVersion": "steward.connections/v1",
+            "error": "runtime_start_failed"
+        })
+    );
+    Ok(())
 }
 
 #[tokio::test]
