@@ -1542,6 +1542,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             runtime_spec: &spec,
             agent_command: &agent_command,
             execution_binding: Some(&execution_binding),
+            source_provenance: None,
             direct_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &candidate_digest,
@@ -2017,6 +2018,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             runtime_spec: &spec,
             agent_command: &agent_command,
             execution_binding: Some(&execution_binding),
+            source_provenance: None,
             direct_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &candidate_digest,
@@ -2466,6 +2468,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             runtime_spec: &spec,
             agent_command: &agent_command,
             execution_binding: Some(&execution_binding),
+            source_provenance: None,
             direct_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &cleanup_candidate_digest,
@@ -2570,6 +2573,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             runtime_spec: &spec,
             agent_command: &agent_command,
             execution_binding: Some(&execution_binding),
+            source_provenance: None,
             direct_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &successful_candidate_digest,
@@ -2750,6 +2754,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             runtime_spec: &spec,
             agent_command: &agent_command,
             execution_binding: Some(&execution_binding),
+            source_provenance: None,
             direct_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &expired_candidate_digest,
@@ -2945,6 +2950,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             runtime_spec: &spec,
             agent_command: &agent_command,
             execution_binding: Some(&execution_binding),
+            source_provenance: None,
             direct_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &cancelled_candidate_digest,
@@ -3117,6 +3123,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             runtime_spec: &spec,
             agent_command: &agent_command,
             execution_binding: Some(&execution_binding),
+            source_provenance: None,
             direct_task_evidence: None,
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &rejected_candidate_digest,
@@ -3250,7 +3257,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     );
 
     let mut github_candidates = Vec::new();
-    for (attempt, run_id) in [(3_u32, "900001"), (2_u32, "900001"), (4_u32, "other-run")] {
+    for (attempt, run_id) in [(3_u32, "900001"), (2_u32, "900001"), (4_u32, "900002")] {
         let candidate_task_uid = Uuid::new_v4();
         let candidate_operation_id = Uuid::new_v4();
         let candidate_runtime_name = format!("task-{}", candidate_operation_id.simple());
@@ -3386,7 +3393,7 @@ async fn insert_task_projection_fixture(
           workflow_digest, user_envelope_instance_id, user_envelope_revision, \
           user_envelope_digest, authority_kind, user_envelope_snapshot, coding_agent_runtime, \
           runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
-          agent_command, execution_binding, direct_task_evidence, envelope_revision, \
+          agent_command, execution_binding, source_provenance, direct_task_evidence, envelope_revision, \
           orchestration_version, orchestration_operation_id, candidate_digest, \
           service_envelope_digest, original_admission_decision, original_admission_deltas) \
          SELECT $1, $2, submitter_service, acting_user, acting_user_id, owner, owner_user_id, \
@@ -3397,7 +3404,10 @@ async fn insert_task_projection_fixture(
                 user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
                 authority_kind, user_envelope_snapshot, coding_agent_runtime, NULL, \
                 runtime_namespace, $3, runtime_ownership, 'submitted', runtime_spec, agent_command, \
-                execution_binding, COALESCE($6::jsonb, direct_task_evidence), envelope_revision, orchestration_version, \
+                execution_binding, \
+                CASE WHEN $6::jsonb IS NULL \
+                     THEN source_provenance ELSE $6::jsonb -> 'sourceProvenance' END, \
+                COALESCE($6::jsonb, direct_task_evidence), envelope_revision, orchestration_version, \
                 $4, candidate_digest, service_envelope_digest, original_admission_decision, \
                 original_admission_deltas \
          FROM task_submissions WHERE task_uid = $5",

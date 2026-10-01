@@ -26,6 +26,7 @@ use steward_store::{
     StoreError,
 };
 use steward_types::CanonicalUserId;
+use steward_types::direct_package::SourceProvenance;
 use tokio::net::TcpListener;
 use tokio::sync::Barrier;
 use tokio::task::JoinHandle;
@@ -210,6 +211,8 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         0,
         "migration 0040 must not synthesize federated subjects from historical identity data"
     );
+    let maximum_direct_source_provenance =
+        seed_maximum_source_provenance_upgrade_fixture(&store).await?;
     seed_connection_association_upgrade_fixture(&store).await?;
     migration_set(None)
         .run(store.pool())
@@ -219,6 +222,11 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
                 "Steward connection-verification migration must complete over the required TLS session: {error}"
             ))
         })?;
+    assert_maximum_source_provenance_upgrade_result(
+        &store,
+        &maximum_direct_source_provenance,
+    )
+    .await?;
     assert_connection_association_upgrade_result(&store).await?;
     assert_template_catalog_upgrade_result(&store).await?;
     verify_federated_subject_lifecycle(&store).await?;
@@ -325,6 +333,113 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         "new Task writers must use the User-Envelope-only orchestration contract: {new_writer_constraint}"
     );
 
+    Ok(())
+}
+
+async fn seed_maximum_source_provenance_upgrade_fixture(
+    store: &PgStore,
+) -> Result<serde_json::Value, Box<dyn Error>> {
+    let task_uid = "00000000-0000-0000-0000-000000000056";
+    let operation_id = "00000000-0000-0000-0000-000000001056";
+    let mut evidence: serde_json::Value = serde_json::from_str(include_str!(
+        "../docs/contracts/task/v2/fixtures/positive/task-binding-evidence.json"
+    ))?;
+    let maximum_provenance = serde_json::json!({
+        "contractVersion": "steward.source-provenance/v1",
+        "provider": "github",
+        "repository": {
+            "id": "123456",
+            "ownerId": "7890",
+            "name": "n".repeat(512),
+        },
+        "triggeredSha": format!("git:sha1:{}", "a".repeat(40)),
+        "run": {
+            "id": "900001",
+            "attempt": 1,
+        },
+        "event": "e".repeat(512),
+        "ref": "r".repeat(2048),
+        "actorId": "24680",
+        "actor": "a".repeat(512),
+        "callerWorkflow": {
+            "ref": "c".repeat(2048),
+            "sha": format!("git:sha1:{}", "b".repeat(40)),
+        },
+        "reusableWorkflow": {
+            "ref": "w".repeat(2048),
+            "sha": format!("git:sha1:{}", "c".repeat(40)),
+        },
+    });
+    let frozen_provenance: SourceProvenance =
+        serde_json::from_value(maximum_provenance.clone())?;
+    frozen_provenance.validate().map_err(io::Error::other)?;
+
+    evidence["taskUid"] = serde_json::json!(task_uid);
+    evidence["sourceProvenance"] = maximum_provenance.clone();
+    evidence["envelope"]["revision"] = serde_json::json!(7);
+    evidence["envelope"]["digest"] =
+        serde_json::json!(format!("steward:sha256:{}", "b".repeat(64)));
+
+    let mut transaction = store.pool().begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO task_submissions (\
+             task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
+             owner, owner_user_id, identity_binding_state, workflow, workflow_name, workflow_version, \
+             workflow_digest, user_envelope_instance_id, user_envelope_revision, \
+             user_envelope_digest, authority_kind, user_envelope_snapshot, coding_agent_runtime, \
+             runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
+             agent_command, execution_binding, direct_task_evidence, envelope_revision, \
+             orchestration_version, orchestration_operation_id, candidate_digest, \
+             service_envelope_digest, original_admission_decision, original_admission_deltas) \
+         SELECT $1::text::uuid, 'migration-0056-max-provenance', submitter_service, acting_user, \
+                acting_user_id, owner, owner_user_id, identity_binding_state, workflow, NULL, NULL, \
+                NULL, user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
+                authority_kind, user_envelope_snapshot, coding_agent_runtime, NULL, \
+                runtime_namespace, 'task-migration-0056', runtime_ownership, 'submitted', \
+                runtime_spec, agent_command, execution_binding, $3, envelope_revision, \
+                orchestration_version, $2::text::uuid, candidate_digest, service_envelope_digest, \
+                original_admission_decision, original_admission_deltas \
+         FROM task_submissions \
+         WHERE task_uid = '00000000-0000-0000-0000-000000000002'",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .bind(&evidence)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    assert_eq!(inserted, 1, "the pre-0056 direct Task fixture must exist");
+    sqlx::query(
+        "INSERT INTO task_runtime_operations (\
+             task_uid, operation_id, state, generation, runtime_ownership, runtime_namespace, \
+             runtime_name, inert_manifest_digest, active_manifest_digest) \
+         VALUES ($1::text::uuid, $2::text::uuid, 'intent_recorded', 1, 'provisioned', \
+                 'steward-workflows', 'task-migration-0056', $3, $4)",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .bind(format!("sha256:{}", "1".repeat(64)))
+    .bind(format!("sha256:{}", "2".repeat(64)))
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(maximum_provenance)
+}
+
+async fn assert_maximum_source_provenance_upgrade_result(
+    store: &PgStore,
+    expected: &serde_json::Value,
+) -> Result<(), Box<dyn Error>> {
+    let migrated = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT source_provenance FROM task_submissions \
+         WHERE task_uid = '00000000-0000-0000-0000-000000000056'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        migrated, *expected,
+        "migration 0056 must backfill every source-provenance value accepted by the frozen contract"
+    );
     Ok(())
 }
 
