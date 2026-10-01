@@ -209,7 +209,10 @@ mode the apiserver rejects new public and internal Task submissions, and the con
 the Task lifecycle owner or approval dispatcher. Roll every apiserver and controller replica with
 `staged`, verify that no legacy writer remains, and then use a separate Helm operation to set the
 shared value to `active`. Existing Task reads and exact idempotent retries remain available during
-the staged deployment.
+the staged deployment. Treat this as stage 1; `active` is stage 2. A configured Connections bridge
+may still serve its runtime-free status read in stage 1, but authorize, reauthorize, disconnect, and
+rerun mutations are deliberately refused with `connections.orchestration_not_active`. Verify that
+GitHub Connect works only after every replica is in stage 2.
 
 ## Required existing references
 

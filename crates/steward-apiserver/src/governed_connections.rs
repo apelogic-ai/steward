@@ -565,12 +565,25 @@ pub struct GovernedConnectionsBroker<B> {
     orchestration_mode: TaskOrchestrationMode,
 }
 
+const STAGED_CONNECTIONS_WARNING: &str = "connections bridge enabled but taskOrchestrationMode=staged; Connections operations are refused";
+
+fn connection_orchestration_error(mode: TaskOrchestrationMode) -> Option<ConnectionBrokerError> {
+    (!mode.is_active()).then_some(ConnectionBrokerError::OrchestrationNotActive)
+}
+
+fn connections_startup_warning(mode: TaskOrchestrationMode) -> Option<&'static str> {
+    (!mode.is_active()).then_some(STAGED_CONNECTIONS_WARNING)
+}
+
 impl<B> GovernedConnectionsBroker<B> {
     pub fn new(
         store: PgStore,
         config: GovernedConnectionsConfig,
         orchestration_mode: TaskOrchestrationMode,
     ) -> Self {
+        if let Some(warning) = connections_startup_warning(orchestration_mode) {
+            eprintln!("{warning}");
+        }
         Self {
             store,
             config,
@@ -588,8 +601,8 @@ impl<B> GovernedConnectionsBroker<B> {
         request_body: Option<Value>,
         idempotency_identity: Option<&str>,
     ) -> Result<ConnectionOperationRecord, ConnectionBrokerError> {
-        if !self.orchestration_mode.is_active() {
-            return Err(ConnectionBrokerError::Unavailable);
+        if let Some(error) = connection_orchestration_error(self.orchestration_mode) {
+            return Err(error);
         }
         let email = Email::parse(display_email.to_owned())
             .map_err(|_| ConnectionBrokerError::Unavailable)?;
@@ -1689,8 +1702,8 @@ mod tests {
         GovernedConnectionPlanError, MCP_GW_CONTRACT_VERSION, MCP_GW_OAUTH_CLOCK_SKEW_SECONDS,
         MCP_GW_OAUTH_STATE_LIFETIME_SECONDS, OPERATOR_PINNED_TRUST_MODE,
         ProviderConnectionStatusSource, SplitConnectionsBroker, bridge_result,
-        plan_connection_operation, provider_status, single_file_archive,
-        valid_operator_pinned_image,
+        connection_orchestration_error, connections_startup_warning, plan_connection_operation,
+        provider_status, single_file_archive, valid_operator_pinned_image,
     };
 
     #[derive(Clone)]
@@ -1777,6 +1790,30 @@ mod tests {
             "status must not reserve a governed connection operation, Task, or AgentRuntime"
         );
         Ok(())
+    }
+
+    #[test]
+    fn staged_orchestration_refuses_mutations_with_an_actionable_reason() {
+        assert_eq!(
+            connection_orchestration_error(steward_store::TaskOrchestrationMode::Staged),
+            Some(ConnectionBrokerError::OrchestrationNotActive)
+        );
+        assert_eq!(
+            connection_orchestration_error(steward_store::TaskOrchestrationMode::Active),
+            None
+        );
+    }
+
+    #[test]
+    fn staged_connections_have_one_bounded_startup_warning() {
+        assert_eq!(
+            connections_startup_warning(steward_store::TaskOrchestrationMode::Staged),
+            Some(super::STAGED_CONNECTIONS_WARNING)
+        );
+        assert_eq!(
+            connections_startup_warning(steward_store::TaskOrchestrationMode::Active),
+            None
+        );
     }
 
     fn bindings() -> ConnectionExecutionBindings {

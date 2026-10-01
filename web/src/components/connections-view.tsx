@@ -10,9 +10,9 @@ import {
   type ProviderConnectionView,
 } from "@/api-client";
 import { connectionHealth } from "@/components/connection-health";
+import { classifyConnectionMutationFailure, type ConnectionMutationState } from "@/components/connection-mutation-state";
 import { ConfirmationDialog, SectionCard } from "@/components/hs";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
-import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
@@ -43,7 +43,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
 }>) {
   const session = useSession();
   const [disconnectOpen, setDisconnectOpen] = useState(false);
-  const [action, setAction] = useState<"idle" | "working" | "oauth-pending" | MutationFailureState>("idle");
+  const [action, setAction] = useState<"idle" | "working" | ConnectionMutationState>("idle");
   const status = connection?.status;
   const health = status ? connectionHealth(status) : undefined;
   const reauthorizationRecommended = health === "expiring_soon" || health === "expired";
@@ -54,7 +54,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
     setAction("working");
     const result = await startProviderConnection({ body: {}, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { provider: connection?.provider ?? "github" } });
     if (result.data?.authorizationUrl && result.response?.ok) { window.location.assign(result.data.authorizationUrl); return; }
-    setAction(classifyMutationFailure(result.response?.status));
+    setAction(classifyConnectionMutationFailure(result.response?.status, result.error));
   }
 
   async function disconnect() {
@@ -62,8 +62,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
     setAction("working");
     const result = await disconnectProviderConnection({ body: { confirm: true }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { provider: connection?.provider ?? "github" } });
     if (result.response?.status === 204) { setDisconnectOpen(false); setAction("idle"); refresh(); return; }
-    if (result.response?.status === 409 && (result.error as { error?: string } | undefined)?.error === "oauth_flow_pending") { setAction("oauth-pending"); return; }
-    setAction(classifyMutationFailure(result.response?.status));
+    setAction(classifyConnectionMutationFailure(result.response?.status, result.error));
   }
 
   const footer = status?.phase === "connected" ? (
@@ -86,7 +85,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
         <dl className="grid gap-3 text-sm sm:grid-cols-2"><div><dt className="text-xs font-semibold text-muted-ink">Active credential expires</dt><dd className="mt-1">{status?.activeCredentialExpiresAt ?? "Not reported"}</dd></div><div><dt className="text-xs font-semibold text-muted-ink">Renewal credential expires</dt><dd className="mt-1">{status?.renewalCredentialExpiresAt ?? "Not reported"}</dd></div></dl>
         {!status ? <p className="text-sm text-muted-ink">Connection metadata is not currently available. Authorization can still be started safely.</p> : null}
         {status?.phase === "connected" ? reauthorizationRecommended ? <button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">Re-authorize GitHub</button> : null : <button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">{!status ? "Authorize / re-authorize GitHub" : status.phase === "reauth_required" || status.phase === "unavailable" ? "Re-authorize GitHub" : "Connect GitHub"}</button>}
-        {action !== "idle" && action !== "working" ? <p className="text-sm text-err" role="alert">{{ "oauth-pending": "Finish or wait for the pending GitHub authorization before disconnecting.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "Rust rejected the connection action.", forbidden: "The Rust authorization boundary rejected the connection action.", unavailable: "The authoritative connection service is unavailable.", error: "The server-owned connection action could not be completed." }[action]}</p> : null}
+        {action !== "idle" && action !== "working" ? <p className="text-sm text-err" role="alert">{{ "orchestration-not-active": "Connections are disabled until task orchestration is active (stage 2).", "oauth-pending": "Finish or wait for the pending GitHub authorization before disconnecting.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "Rust rejected the connection action.", forbidden: "The Rust authorization boundary rejected the connection action.", unavailable: "The authoritative connection service is unavailable.", error: "The server-owned connection action could not be completed." }[action]}</p> : null}
       </div>
     </SectionCard>
   );

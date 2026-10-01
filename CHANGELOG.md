@@ -17,6 +17,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Distinguished the deliberate staged-orchestration boundary from a Connections
+  service outage. Governed connection mutations now return
+  `connections.orchestration_not_active`, the browser explains that activation
+  is required, and startup logs the staged bridge state once.
 - Preserved bounded MCP-GW HTTP status and safe reason diagnostics for failed governed
   connection operations in additive migration 0052 and returned them through the
   connection API's `upstreamStatus` and `detail` fields.
