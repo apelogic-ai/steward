@@ -1415,7 +1415,7 @@ mod tests {
         let sample_agent = "example-agent@1.0.0";
         let sample = PublishedWorkflowOption::from(WorkflowRevisionRecord {
             name: crate::workflows::SAMPLE_WORKFLOW_NAME.to_owned(),
-            version: 1,
+            version: crate::workflows::SAMPLE_WORKFLOW_VERSION,
             display_name: crate::workflows::SAMPLE_WORKFLOW_DISPLAY_NAME.to_owned(),
             agent: sample_agent.to_owned(),
             prompt: crate::workflows::SAMPLE_WORKFLOW_PROMPT.to_owned(),
@@ -1428,7 +1428,7 @@ mod tests {
         });
         let impostor = PublishedWorkflowOption::from(WorkflowRevisionRecord {
             name: crate::workflows::SAMPLE_WORKFLOW_NAME.to_owned(),
-            version: 1,
+            version: crate::workflows::SAMPLE_WORKFLOW_VERSION,
             display_name: crate::workflows::SAMPLE_WORKFLOW_DISPLAY_NAME.to_owned(),
             agent: sample_agent.to_owned(),
             prompt: crate::workflows::SAMPLE_WORKFLOW_PROMPT.to_owned(),

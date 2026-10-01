@@ -621,7 +621,7 @@ async function guardedPage(browser, {
         displayName: "Repository summary",
         name: "repo-summary",
         sample: true,
-        version: 1,
+        version: 2,
       }] : []),
     ],
   }));
@@ -658,9 +658,9 @@ async function guardedPage(browser, {
         runs: cursor ? [{
           ...run,
           taskUid: "00000000-0000-0000-0000-000000000007",
-          workflow: "repo-summary@1",
+          workflow: "repo-summary@2",
           workflowName: "repo-summary",
-          workflowVersion: 1,
+          workflowVersion: 2,
           trigger: { provider: "github", repository: "https://github.com/example-org/sample" },
         }] : [run],
         nextCursor: cursor ? null : taskUid,

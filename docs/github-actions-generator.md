@@ -1,6 +1,6 @@
 # Steward GitHub Actions generator contract
 
-Status: current Steward v0.3.3 renderer and browser integration
+Status: current Steward v0.3.6 renderer and browser integration
 
 The generator turns one authoritative Steward envelope selection and one bounded task template
 into workflow YAML that a developer may inspect, copy, commit, and dispatch. It never selects a
@@ -30,11 +30,16 @@ references, environment expressions, secret references, and arbitrary YAML
 are not request fields.
 
 The browser route accepts a server-published versioned Workflow reference such
-as `repo-summary@1`. It resolves the Workflow and the user's provisioned
+as `repo-summary@2`. It resolves the Workflow and the user's provisioned
 Envelope on the server and emits schema
 `steward/github-actions-rendered-workflow/v2`. Both render paths forward the
 authoritative Envelope digest to steward-run as `envelope-digest`; neither path
 lets the caller supply release coordinates or authority.
+
+The reusable workflow uploads only the governed task's `out/` directory and
+treats an empty directory as an error. A published Workflow prompt must direct
+the agent to write every returned result beneath `out/`. The reserved
+`repo-summary@2` sample writes its Markdown result to `out/summary.md`.
 
 ## BOM-selected steward-run release
 

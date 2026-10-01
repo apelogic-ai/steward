@@ -13,4 +13,9 @@ describe("Workflow agent catalog", () => {
     expect(source).toContain("agent.displayName ?? agent.agentRef");
     expect(source).toContain('value={agent.agentRef}');
   });
+
+  test("tells authors where governed output must be written", () => {
+    expect(source).toContain("Write every result file under");
+    expect(source).toContain("<code>out/</code>");
+  });
 });
