@@ -29,10 +29,10 @@ describe("governed provider connection controls", () => {
 
   test("bounds a perpetually pending operation by the server deadline", () => {
     expect(source).toContain("result.data.pollDeadlineAt");
-    expect(source).toContain("MAX_CONNECTION_POLL_MS");
+    expect(source).toContain("boundedConnectionPollDeadline");
     expect(source).toContain('setAction("poll-expired")');
     expect(source).toContain("if (controller.signal.aborted) return;");
-    expect(source).toContain("Authorization did not become ready in time. Retry the connection");
+    expect(source).toContain("The connection operation did not finish in time. Retry it");
   });
 
   test("shows the bounded terminal connection failure category", () => {
@@ -44,9 +44,17 @@ describe("governed provider connection controls", () => {
     expect(source).toContain("proxy_policy_denied");
     expect(source).toContain("verify the runtime's GitHub proxy policy");
     expect(source).toContain("provider_authorization_failed");
-    expect(source).toContain("verify the approved GitHub scopes");
+    expect(source).toContain("verify the runtime authority and MCP-GW configuration");
     expect(source).toContain("token_grant_failed");
     expect(source).toContain("inspect MCP-GW token grants");
+    expect(source).toContain("provider_response_invalid");
+    expect(source).toContain("verify the MCP-GW connection contract");
+    expect(source).toContain("gateway_transport_failed");
+    expect(source).toContain("verify the gateway route and transport health");
+    expect(source).toContain("gateway_status_invalid");
+    expect(source).toContain("verify the deployed MCP-GW contract version");
+    expect(source).toContain("gateway_body_unavailable");
+    expect(source).toContain("gateway_unavailable");
     expect(source).toContain("runtime_create_failed");
     expect(source).toContain("inspect Steward runtime admission and controller events");
     expect(source).toContain("runtime_start_failed");
@@ -57,6 +65,12 @@ describe("governed provider connection controls", () => {
 
   test("clears a stale authorization failure before disconnecting", () => {
     expect(source).toMatch(/async function disconnect\(\) \{[\s\S]*?setStartFailure\(null\);[\s\S]*?setAction\("working"\);/);
+  });
+
+  test("renders the structured failure returned by disconnect", () => {
+    expect(source).toMatch(/async function disconnect\(\) \{[\s\S]*?setStartFailure\(connectionOperationError\(result\.error\)\);/);
+    expect(source).toMatch(/async function disconnect\(\) \{[\s\S]*?result\.response\?\.status !== 202[\s\S]*?getProviderConnectionStartOperation/);
+    expect(source).toMatch(/operation\.data\?\.state === "succeeded" && !operation\.data\.authorizationUrl/);
   });
 
   test("shows a reauthorization action when a reported credential deadline approaches", () => {

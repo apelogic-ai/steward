@@ -1680,9 +1680,9 @@ export type DisconnectConnectionError = DisconnectConnectionErrors[keyof Disconn
 
 export type DisconnectConnectionResponses = {
     /**
-     * Connection was disconnected
+     * Disconnect was accepted
      */
-    204: void;
+    202: StartConnectionAcceptedResponse;
 };
 
 export type DisconnectConnectionResponse = DisconnectConnectionResponses[keyof DisconnectConnectionResponses];
@@ -3081,9 +3081,9 @@ export type DisconnectProviderConnectionError = DisconnectProviderConnectionErro
 
 export type DisconnectProviderConnectionResponses = {
     /**
-     * Connection was disconnected
+     * Disconnect was accepted
      */
-    204: void;
+    202: StartConnectionAcceptedResponse;
 };
 
 export type DisconnectProviderConnectionResponse = DisconnectProviderConnectionResponses[keyof DisconnectProviderConnectionResponses];

@@ -13,12 +13,11 @@ import {
 } from "@/api-client";
 import { connectionHealth } from "@/components/connection-health";
 import { classifyConnectionMutationFailure, type ConnectionMutationState } from "@/components/connection-mutation-state";
+import { boundedConnectionPollDeadline } from "@/components/connection-poll-deadline";
 import { ConfirmationDialog, SectionCard } from "@/components/hs";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
-
-const MAX_CONNECTION_POLL_MS = 60_000;
 
 export function ConnectionsView() {
   const [generation, setGeneration] = useState(0);
@@ -122,11 +121,61 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
 
   async function disconnect() {
     if (session.status !== "authenticated") return;
+    startController.current?.abort();
+    const controller = new AbortController();
+    startController.current = controller;
     setStartFailure(null);
     setAction("working");
-    const result = await disconnectProviderConnection({ body: { confirm: true }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { provider: connection?.provider ?? "github" } });
-    if (result.response?.status === 204) { setDisconnectOpen(false); setAction("idle"); refresh(); return; }
-    setAction(classifyConnectionMutationFailure(result.response?.status, result.error));
+    const provider = connection?.provider ?? "github";
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await disconnectProviderConnection({ body: { confirm: true }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { provider }, signal: controller.signal });
+      if (result.response?.status !== 202 || !result.data?.operationId || !result.data.pollDeadlineAt) {
+        setStartFailure(connectionOperationError(result.error));
+        setAction(classifyConnectionMutationFailure(result.response?.status, result.error));
+        return;
+      }
+      const pollDeadline = boundedConnectionPollDeadline(result.data.pollDeadlineAt);
+      if (pollDeadline === null) { setAction("error"); return; }
+      const expirePoll = () => {
+        if (startController.current !== controller || controller.signal.aborted) return;
+        setAction("poll-expired");
+        controller.abort();
+      };
+      if (pollDeadline <= Date.now()) { expirePoll(); return; }
+      deadlineTimer = setTimeout(expirePoll, pollDeadline - Date.now());
+      while (!controller.signal.aborted) {
+        const operation = await getProviderConnectionStartOperation({ cache: "no-store", credentials: "same-origin", path: { provider, operation_id: result.data.operationId }, signal: controller.signal });
+        if (controller.signal.aborted) return;
+        if (operation.data?.state === "succeeded" && !operation.data.authorizationUrl) {
+          setDisconnectOpen(false);
+          setAction("idle");
+          refresh();
+          return;
+        }
+        if (operation.data?.state === "failed") {
+          setStartFailure(operation.data.error ? {
+            apiVersion: operation.data.apiVersion,
+            error: operation.data.error,
+            upstreamStatus: operation.data.upstreamStatus,
+            detail: operation.data.detail,
+          } : null);
+          setAction("error");
+          return;
+        }
+        if (operation.response?.status !== 202 || operation.data?.state !== "pending") {
+          setStartFailure(connectionOperationError(operation.error));
+          setAction(classifyConnectionMutationFailure(operation.response?.status, operation.error));
+          return;
+        }
+        if (!await waitForConnectionPoll(controller.signal)) return;
+      }
+    } catch {
+      if (!controller.signal.aborted) setAction("error");
+    } finally {
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      if (startController.current === controller) startController.current = null;
+    }
   }
 
   const footer = status?.phase === "connected" ? (
@@ -149,16 +198,10 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
         <dl className="grid gap-3 text-sm sm:grid-cols-2"><div><dt className="text-xs font-semibold text-muted-ink">Active credential expires</dt><dd className="mt-1">{status?.activeCredentialExpiresAt ?? "Not reported"}</dd></div><div><dt className="text-xs font-semibold text-muted-ink">Renewal credential expires</dt><dd className="mt-1">{status?.renewalCredentialExpiresAt ?? "Not reported"}</dd></div></dl>
         {!status ? <p className="text-sm text-muted-ink">Connection metadata is not currently available. Authorization can still be started safely.</p> : null}
         {status?.phase === "connected" ? reauthorizationRecommended ? <button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">Re-authorize GitHub</button> : null : <button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">{!status ? "Authorize / re-authorize GitHub" : status.phase === "reauth_required" || status.phase === "unavailable" ? "Re-authorize GitHub" : "Connect GitHub"}</button>}
-        {action !== "idle" && action !== "working" ? <p className="text-sm text-err" role="alert">{action !== "orchestration-not-active" && startFailure ? connectionFailureMessage(startFailure) : { "orchestration-not-active": "Connections are disabled until task orchestration is active (stage 2).", "oauth-pending": "Finish or wait for the pending GitHub authorization before disconnecting.", "poll-expired": "Authorization did not become ready in time. Retry the connection; if it continues, contact an administrator.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "Rust rejected the connection action.", forbidden: "The Rust authorization boundary rejected the connection action.", unavailable: "The authoritative connection service is unavailable.", error: "The server-owned connection action could not be completed." }[action]}</p> : null}
+        {action !== "idle" && action !== "working" ? <p className="text-sm text-err" role="alert">{action !== "orchestration-not-active" && startFailure ? connectionFailureMessage(startFailure) : { "orchestration-not-active": "Connections are disabled until task orchestration is active (stage 2).", "oauth-pending": "Finish or wait for the pending GitHub authorization before disconnecting.", "poll-expired": "The connection operation did not finish in time. Retry it; if it continues, contact an administrator.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "Rust rejected the connection action.", forbidden: "The Rust authorization boundary rejected the connection action.", unavailable: "The authoritative connection service is unavailable.", error: "The server-owned connection action could not be completed." }[action]}</p> : null}
       </div>
     </SectionCard>
   );
-}
-
-function boundedConnectionPollDeadline(value: string): number | null {
-  const parsed = Date.parse(value);
-  if (!Number.isFinite(parsed)) return null;
-  return Math.min(parsed, Date.now() + MAX_CONNECTION_POLL_MS);
 }
 
 function waitForConnectionPoll(signal: AbortSignal): Promise<boolean> {
@@ -191,8 +234,13 @@ function connectionFailureMessage(failure: ConnectionOperationErrorResponse): st
   const messages: Record<string, string> = {
     runtime_authentication_failed: "The governed runtime could not authenticate to GitHub. Re-authorize GitHub; if it continues, ask an administrator to verify runtime credential injection.",
     proxy_policy_denied: "OpenShell policy denied the governed GitHub request. Ask an administrator to verify the runtime's GitHub proxy policy.",
-    provider_authorization_failed: "GitHub rejected the governed runtime's authority. Re-authorize GitHub; if it continues, ask an administrator to verify the approved GitHub scopes.",
+    provider_authorization_failed: "MCP-GW rejected the governed runtime's authority. Ask an administrator to verify the runtime authority and MCP-GW configuration.",
     token_grant_failed: "The governed runtime could not receive its GitHub credential. Retry once; if it continues, ask an administrator to inspect MCP-GW token grants.",
+    provider_response_invalid: "The provider returned a response Steward could not validate. Ask an administrator to verify the MCP-GW connection contract.",
+    gateway_transport_failed: "The governed runtime could not reach MCP-GW. Ask an administrator to verify the gateway route and transport health.",
+    gateway_status_invalid: "MCP-GW returned an invalid status response. Ask an administrator to verify the deployed MCP-GW contract version.",
+    gateway_body_unavailable: "The governed runtime could not read MCP-GW's response body. Retry once; if it continues, ask an administrator to inspect gateway health.",
+    gateway_unavailable: "MCP-GW is unavailable. Retry once; if it continues, ask an administrator to inspect the gateway service.",
     runtime_create_failed: "The governed connection runtime could not be created. Ask an administrator to inspect Steward runtime admission and controller events.",
     runtime_start_failed: "The governed connection runtime failed to start. Ask an administrator to inspect the AgentRuntime and OpenShell sandbox status.",
     connection_deadline_exceeded: "The governed connection did not become ready before its deadline. Retry once; if it continues, ask an administrator to inspect runtime health.",

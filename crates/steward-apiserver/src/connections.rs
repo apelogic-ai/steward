@@ -215,6 +215,7 @@ pub struct ReservedConnectionStart {
 pub enum ConnectionStartOperation {
     Pending,
     Succeeded(StartedConnection),
+    Disconnected,
     Failed(ConnectionBrokerError),
 }
 
@@ -226,6 +227,11 @@ pub enum ConnectionBrokerError {
     ProxyPolicyDenied,
     ProviderAuthorizationFailed,
     TokenGrantFailed,
+    ProviderResponseInvalid,
+    GatewayTransportFailed,
+    GatewayStatusInvalid,
+    GatewayBodyUnavailable,
+    GatewayUnavailable,
     RuntimeCreateFailed,
     RuntimeStartFailed,
     DeadlineExceeded,
@@ -262,7 +268,7 @@ where
     fn disconnect<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
-    ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>>;
+    ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -559,6 +565,9 @@ fn start_operation_response(
             response.authorization_url = Some(started.authorization_url.as_str().to_owned());
             response.expires_at = Some(started.expires_at);
         }
+        ConnectionStartOperation::Disconnected => {
+            response.state = ConnectionStartOperationState::Succeeded;
+        }
         ConnectionStartOperation::Failed(error) => {
             response.state = ConnectionStartOperationState::Failed;
             let problem = connection_broker_problem(error);
@@ -576,7 +585,7 @@ fn start_operation_response(
     params(("X-Steward-CSRF" = String, Header)),
     request_body = DisconnectConnectionRequest,
     responses(
-        (status = 204, description = "Connection was disconnected"),
+        (status = 202, body = StartConnectionAcceptedResponse, description = "Disconnect was accepted"),
         (status = 400, description = "Explicit confirmation is required"),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
@@ -606,7 +615,17 @@ where
         return StatusCode::BAD_REQUEST.into_response();
     }
     match state.broker.disconnect(&session).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(reserved) => (
+            StatusCode::ACCEPTED,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(StartConnectionAcceptedResponse {
+                api_version: CONNECTIONS_API_VERSION,
+                provider: "github",
+                operation_id: reserved.operation_id,
+                poll_deadline_at: reserved.poll_deadline_at,
+            }),
+        )
+            .into_response(),
         Err(ConnectionBrokerError::OAuthFlowPending) => oauth_flow_pending_response(),
         Err(error) => connection_broker_error_response(error),
     }
@@ -619,7 +638,7 @@ where
     params(("provider" = String, Path), ("X-Steward-CSRF" = String, Header)),
     request_body = DisconnectConnectionRequest,
     responses(
-        (status = 204, description = "Connection was disconnected"),
+        (status = 202, body = StartConnectionAcceptedResponse, description = "Disconnect was accepted"),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Provider is unavailable"),
@@ -775,6 +794,11 @@ fn connection_broker_problem(error: ConnectionBrokerError) -> ConnectionOperatio
             ("provider_authorization_failed", None, None)
         }
         ConnectionBrokerError::TokenGrantFailed => ("token_grant_failed", None, None),
+        ConnectionBrokerError::ProviderResponseInvalid => ("provider_response_invalid", None, None),
+        ConnectionBrokerError::GatewayTransportFailed => ("gateway_transport_failed", None, None),
+        ConnectionBrokerError::GatewayStatusInvalid => ("gateway_status_invalid", None, None),
+        ConnectionBrokerError::GatewayBodyUnavailable => ("gateway_body_unavailable", None, None),
+        ConnectionBrokerError::GatewayUnavailable => ("gateway_unavailable", None, None),
         ConnectionBrokerError::RuntimeCreateFailed => ("runtime_create_failed", None, None),
         ConnectionBrokerError::RuntimeStartFailed => ("runtime_start_failed", None, None),
         ConnectionBrokerError::DeadlineExceeded => ("connection_deadline_exceeded", None, None),
@@ -949,6 +973,9 @@ mod tests {
         ) -> BoxFuture<'a, Result<Option<ConnectionStartOperation>, ConnectionBrokerError>>
         {
             Box::pin(async move {
+                if operation_id == Uuid::from_u128(2) {
+                    return Ok(Some(ConnectionStartOperation::Disconnected));
+                }
                 let state = self
                     .state
                     .lock()
@@ -992,7 +1019,7 @@ mod tests {
         fn disconnect<'a>(
             &'a self,
             session: &'a ConnectionSession<TestSessionBinding>,
-        ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
+        ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
             Box::pin(async move {
                 let mut state = self
                     .state
@@ -1007,7 +1034,10 @@ mod tests {
                 if state.connected_user.as_ref() == Some(&session.subject.canonical_user_id) {
                     state.connected_user = None;
                 }
-                Ok(())
+                Ok(ReservedConnectionStart {
+                    operation_id: Uuid::from_u128(2),
+                    poll_deadline_at: "2026-09-01T12:00:30Z".to_owned(),
+                })
             })
         }
     }
@@ -1352,10 +1382,38 @@ mod tests {
                 .map_err(|error| format!("request {attempt} disconnect: {error}"))?;
             assert_eq!(
                 response.status(),
-                StatusCode::NO_CONTENT,
+                StatusCode::ACCEPTED,
                 "{attempt} must converge without exposing broker material"
             );
+            let body = to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .map_err(|error| format!("read {attempt} disconnect response: {error}"))?;
+            let value: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|error| format!("parse {attempt} disconnect response: {error}"))?;
+            assert_eq!(value["operationId"], Uuid::from_u128(2).to_string());
         }
+
+        let operation = router(broker.clone())
+            .layer(axum::Extension(session()?))
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/api/v1/connections/github/operations/{}",
+                        Uuid::from_u128(2)
+                    ))
+                    .body(Body::empty())
+                    .map_err(|error| format!("build disconnect operation request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request disconnect operation: {error}"))?;
+        assert_eq!(operation.status(), StatusCode::OK);
+        let body = to_bytes(operation.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read disconnect operation: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse disconnect operation: {error}"))?;
+        assert_eq!(value["state"], "succeeded");
+        assert!(value.get("authorizationUrl").is_none());
 
         let status = router(broker)
             .layer(axum::Extension(session()?))
@@ -1489,6 +1547,26 @@ mod tests {
             (
                 ConnectionBrokerError::TokenGrantFailed,
                 "token_grant_failed",
+            ),
+            (
+                ConnectionBrokerError::ProviderResponseInvalid,
+                "provider_response_invalid",
+            ),
+            (
+                ConnectionBrokerError::GatewayTransportFailed,
+                "gateway_transport_failed",
+            ),
+            (
+                ConnectionBrokerError::GatewayStatusInvalid,
+                "gateway_status_invalid",
+            ),
+            (
+                ConnectionBrokerError::GatewayBodyUnavailable,
+                "gateway_body_unavailable",
+            ),
+            (
+                ConnectionBrokerError::GatewayUnavailable,
+                "gateway_unavailable",
             ),
             (
                 ConnectionBrokerError::RuntimeCreateFailed,

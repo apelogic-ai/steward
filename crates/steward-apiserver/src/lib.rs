@@ -4503,7 +4503,7 @@ mod tests {
             ),
             (
                 "/paths/~1app~1api~1v1~1connections~1{provider}~1disconnect/post",
-                "204",
+                "202",
             ),
             ("/paths/~1app~1api~1v1~1preferences/get", "200"),
             ("/paths/~1app~1api~1v1~1preferences/put", "200"),
@@ -4524,7 +4524,7 @@ mod tests {
             ),
             (
                 "/paths/~1admin~1api~1v1~1connections~1github~1disconnect/post",
-                "204",
+                "202",
             ),
             ("/paths/~1admin~1api~1v1~1envelope-templates/get", "200"),
             ("/paths/~1admin~1api~1v1~1capabilities/get", "200"),

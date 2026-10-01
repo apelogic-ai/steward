@@ -1705,6 +1705,18 @@ async fn reconcile_runtime_activation(
             Err(error) => return Err(TaskControllerError::Kubernetes(error)),
         };
     }
+    if !runtime_identity_matches(&observed, work) {
+        authority
+            .enter_task_cleanup(
+                work.task.task_uid,
+                work.operation.generation,
+                TaskCleanupCause::Failed("observed_runtime_identity_changed"),
+                TASK_ORCHESTRATOR_ACTOR,
+            )
+            .await
+            .map_err(TaskControllerError::Store)?;
+        return Ok(());
+    }
     let expected = orchestrated_task_runtime_manifest(work, None, true)?;
     let expected_spec_digest = spec_digest(&expected.spec).map_err(|error| {
         TaskControllerError::InvalidState(format!(
@@ -2023,7 +2035,11 @@ fn orchestrated_task_runtime_manifest(
 
 fn runtime_identity_matches(runtime: &AgentRuntime, work: &TaskOrchestrationWorkItem) -> bool {
     let annotations = runtime.annotations();
-    annotations.get(TASK_UID_ANNOTATION) == Some(&work.task.task_uid.to_string())
+    work.operation
+        .runtime_uid
+        .as_deref()
+        .is_none_or(|runtime_uid| runtime.metadata.uid.as_deref() == Some(runtime_uid))
+        && annotations.get(TASK_UID_ANNOTATION) == Some(&work.task.task_uid.to_string())
         && annotations.get(TASK_OPERATION_ANNOTATION)
             == Some(&work.operation.operation_id.to_string())
 }
@@ -7727,8 +7743,9 @@ mod webhook_tests {
         FINALIZER, SERVICE_PRINCIPAL_ANNOTATION, TASK_MANIFEST_DIGEST_ANNOTATION,
         TASK_OPERATION_ANNOTATION, TASK_RUNTIME_MODE_ANNOTATION, TASK_UID_ANNOTATION,
         TaskRuntimeReconciliationAction, WebhookEnvelopeReader, WebhookFuture, WebhookModelCatalog,
-        task_runtime_reconciliation_action, validate_admission, validate_admission_with_catalog,
-        webhook_router, webhook_router_for_controller_with_catalog,
+        runtime_identity_matches, task_runtime_reconciliation_action, validate_admission,
+        validate_admission_with_catalog, webhook_router,
+        webhook_router_for_controller_with_catalog,
     };
 
     #[derive(Clone)]
@@ -8236,6 +8253,24 @@ mod webhook_tests {
                 .map_err(|error| format!("classify activating Task runtime: {error}"))?,
             TaskRuntimeReconciliationAction::Continue,
             "the exact authorized active manifest must provision before activation is observed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_runtime_identity_rejects_a_same_name_replacement_uid() -> Result<(), String> {
+        let admission = active_task_runtime_admission()?;
+        let work = TaskOrchestrationWorkItem {
+            task: admission.task.clone(),
+            operation: admission.operation.clone(),
+        };
+        let mut runtime = super::orchestrated_task_runtime_manifest(&work, None, true)
+            .map_err(|error| format!("construct active Task runtime: {error}"))?;
+        runtime.metadata.uid = Some("replacement-runtime-uid".to_owned());
+
+        assert!(
+            !runtime_identity_matches(&runtime, &work),
+            "matching annotations must not let a same-name replacement impersonate the bound runtime UID"
         );
         Ok(())
     }

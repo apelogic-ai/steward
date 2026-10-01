@@ -179,16 +179,19 @@ reports `BackendTLSPolicy` support are required. Envoy Gateway `v1.9.1` is the
 currently supported, tested controller line for this chart. The chart does not
 install Gateway API CRDs or a controller.
 
-Connection start is asynchronous: its POST returns HTTP 202 with an operation
-identifier and server-owned polling deadline. The browser polls an owner-scoped
-resource until authorization can continue, then stops with a retry action if
-the deadline passes. It therefore does not require a long-lived edge request
-while the governed runtime starts. Other synchronous connection mutations may
-still spend up to 40 seconds in Steward after runtime provisioning begins, so
-the public edge must allow at least 60 seconds for those requests (60–90
-seconds is the recommended operator range). Configure that timeout on the
-platform-owned Gateway policy because the portable Steward chart does not own
-the controller-specific policy.
+Connection start and disconnect are asynchronous: each POST returns HTTP 202
+with an operation identifier and server-owned polling deadline. The browser
+polls an owner-scoped resource until authorization can continue or disconnect
+finishes. It uses a short, locally bounded observation grace after the execution
+deadline so the durable deadline result can be read, then stops with a retry
+action. Neither mutation requires a long-lived edge request while its governed
+runtime starts.
+Rerun may
+still spend up to 40 seconds waiting for the governed operation, so an edge
+that exposes rerun should allow at least 60 seconds (60–90 seconds is the
+recommended operator range). Configure that timeout on the platform-owned
+Gateway policy because the portable Steward chart does not own the
+controller-specific policy.
 
 Publish the CA ConfigMap through the platform's public trust-distribution
 controller (for example, a trust-manager `Bundle` whose ConfigMap target is in
@@ -390,6 +393,11 @@ bounded diagnostic.
 | `bridge-proxy-policy` | OpenShell denied the provider request before MCP-GW handled it. |
 | `bridge-runtime-authorization` | MCP-GW rejected the runtime's authority. |
 | `bridge-token-grant` | OpenShell could not exchange the placeholder for the runtime-bound GitHub credential. Retry once, then inspect MCP-GW token-grant health. |
+| `bridge-response-contract` | MCP-GW returned a response that did not satisfy Steward's pinned provider contract. |
+| `bridge-gateway-transport` | The governed runtime could not complete the transport request to MCP-GW. |
+| `bridge-gateway-status` | MCP-GW returned status metadata that could not be validated. |
+| `bridge-gateway-body` | The governed runtime could not read the bounded MCP-GW response body. |
+| `bridge-gateway-unavailable` | MCP-GW was unavailable to the governed runtime. |
 | `runtime_create_admission_rejected` | Kubernetes admission rejected creation of the governed connection runtime. Inspect Steward admission and controller events. |
 | `runtime_start_failed` | The exact governed connection runtime entered its terminal failed phase before it became ready. Inspect the AgentRuntime and OpenShell sandbox. |
 | `bridge_failed` | The bridge failed without a recognized safe diagnostic. |

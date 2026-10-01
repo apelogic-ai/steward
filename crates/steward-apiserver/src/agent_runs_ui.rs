@@ -787,6 +787,11 @@ where
                 | ConnectionBrokerError::ProxyPolicyDenied
                 | ConnectionBrokerError::ProviderAuthorizationFailed
                 | ConnectionBrokerError::TokenGrantFailed
+                | ConnectionBrokerError::ProviderResponseInvalid
+                | ConnectionBrokerError::GatewayTransportFailed
+                | ConnectionBrokerError::GatewayStatusInvalid
+                | ConnectionBrokerError::GatewayBodyUnavailable
+                | ConnectionBrokerError::GatewayUnavailable
                 | ConnectionBrokerError::RuntimeCreateFailed
                 | ConnectionBrokerError::RuntimeStartFailed
                 | ConnectionBrokerError::DeadlineExceeded
