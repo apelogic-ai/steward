@@ -222,11 +222,8 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
                 "Steward connection-verification migration must complete over the required TLS session: {error}"
             ))
         })?;
-    assert_maximum_source_provenance_upgrade_result(
-        &store,
-        &maximum_direct_source_provenance,
-    )
-    .await?;
+    assert_maximum_source_provenance_upgrade_result(&store, &maximum_direct_source_provenance)
+        .await?;
     verify_source_provenance_byte_limits(&store).await?;
     assert_connection_association_upgrade_result(&store).await?;
     assert_template_catalog_upgrade_result(&store).await?;
@@ -371,8 +368,7 @@ async fn seed_maximum_source_provenance_upgrade_fixture(
             "sha": format!("git:sha1:{}", "c".repeat(40)),
         },
     });
-    let frozen_provenance: SourceProvenance =
-        serde_json::from_value(maximum_provenance.clone())?;
+    let frozen_provenance: SourceProvenance = serde_json::from_value(maximum_provenance.clone())?;
     frozen_provenance.validate().map_err(io::Error::other)?;
 
     evidence["taskUid"] = serde_json::json!(task_uid);
@@ -504,12 +500,10 @@ async fn verify_source_provenance_byte_limits(store: &PgStore) -> Result<(), Box
     )
     .execute(&mut *connection)
     .await?;
-    sqlx::query(
-        "INSERT INTO source_provenance_byte_limit_probe (source_provenance) VALUES ($1)",
-    )
-    .bind(&exact)
-    .execute(&mut *connection)
-    .await?;
+    sqlx::query("INSERT INTO source_provenance_byte_limit_probe (source_provenance) VALUES ($1)")
+        .bind(&exact)
+        .execute(&mut *connection)
+        .await?;
 
     for (field, pointer, value) in [
         ("repository.name", "/repository/name", "é".repeat(257)),
