@@ -765,6 +765,31 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
         Err(StoreError::FederatedSubjectDisabled)
     ));
 
+    let observed_from_task = store
+        .observe_federated_subject(FederatedSubjectObservation {
+            issuer: "https://identity.example.test",
+            subject: "github-actions:actor:424241",
+            actor_login: Some("signed-login"),
+            display_name: Some("Signed Display"),
+        })
+        .await?;
+    let linked_observed = store
+        .associate_federated_subject_from_connection(
+            FederatedSubjectObservation {
+                issuer: "https://identity.example.test",
+                subject: "github-actions:actor:424241",
+                actor_login: Some("connection-login"),
+                display_name: Some("connection@example.org"),
+            },
+            &alice,
+            "github",
+            "424241",
+        )
+        .await?;
+    assert_eq!(linked_observed.last_seen_at, observed_from_task.last_seen_at);
+    assert_eq!(linked_observed.actor_login, observed_from_task.actor_login);
+    assert_eq!(linked_observed.display_name, observed_from_task.display_name);
+
     let connected_account = FederatedSubjectObservation {
         issuer: "https://identity.example.test",
         subject: "github-actions:actor:424242",
@@ -799,6 +824,28 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
     assert_eq!(
         verification.connection_account_id.as_deref(),
         Some("424242")
+    );
+    let repeated = store
+        .associate_federated_subject_from_connection(
+            FederatedSubjectObservation {
+                issuer: "https://identity.example.test",
+                subject: "github-actions:actor:424242",
+                actor_login: Some("alice-renamed"),
+                display_name: Some("changed@example.org"),
+            },
+            &alice,
+            "github",
+            "424242",
+        )
+        .await?;
+    assert_eq!(repeated.updated_at, connected.updated_at);
+    assert_eq!(repeated.last_seen_at, connected.last_seen_at);
+    assert_eq!(repeated.actor_login, connected.actor_login);
+    assert_eq!(repeated.display_name, connected.display_name);
+    assert_eq!(
+        store.federated_subject_audit(connected.subject_id).await?,
+        connected_audit,
+        "repeated status reads must not write subject or audit state"
     );
     assert!(matches!(
         store

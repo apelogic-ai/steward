@@ -1364,10 +1364,91 @@ impl PgStore {
         {
             return Err(StoreError::InvalidFederatedSubject);
         }
+        if let Some(existing) = self
+            .federated_subject_by_external_identity(observation.issuer, observation.subject)
+            .await?
+        {
+            match existing.state {
+                FederatedSubjectState::Associated
+                    if existing.canonical_user_id.as_ref() == Some(canonical_user_id) =>
+                {
+                    return Ok(existing);
+                }
+                FederatedSubjectState::Associated => {
+                    return Err(StoreError::FederatedSubjectConflict);
+                }
+                FederatedSubjectState::Disabled => {
+                    return Err(StoreError::FederatedSubjectDisabled);
+                }
+                FederatedSubjectState::Observed => {}
+            }
+        }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         ensure_active_canonical_user(&mut transaction, canonical_user_id).await?;
-        let observed =
-            Self::observe_federated_subject_in_transaction(&mut transaction, &observation).await?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+                hashtextextended($1::text || chr(31) || $2::text, 0)\
+             )",
+        )
+        .bind(observation.issuer)
+        .bind(observation.subject)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let existing = sqlx::query(
+            "SELECT subject_id, issuer, subject, state, canonical_user_id, \
+                    actor_login, display_name, association_method, revision, \
+                    to_char(first_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                    to_char(last_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                    to_char(updated_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+             FROM federated_subjects \
+             WHERE issuer = $1 AND subject = $2 FOR UPDATE",
+        )
+        .bind(observation.issuer)
+        .bind(observation.subject)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let observed = if let Some(row) = existing {
+            federated_subject_record(row)?
+        } else {
+            let subject_id = Uuid::new_v4();
+            let row = sqlx::query(
+                "INSERT INTO federated_subjects \
+                 (subject_id, issuer, subject, actor_login, display_name) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 RETURNING subject_id, issuer, subject, state, canonical_user_id, \
+                           actor_login, display_name, association_method, revision, \
+                           to_char(first_seen_at AT TIME ZONE 'UTC', \
+                                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                           to_char(last_seen_at AT TIME ZONE 'UTC', \
+                                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                           to_char(updated_at AT TIME ZONE 'UTC', \
+                                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
+            )
+            .bind(subject_id)
+            .bind(observation.issuer)
+            .bind(observation.subject)
+            .bind(observation.actor_login)
+            .bind(observation.display_name)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            sqlx::query(
+                "INSERT INTO federated_subject_audit \
+                 (event_id, subject_id, action, actor, previous_revision, revision) \
+                 VALUES ($1, $2, 'observed', 'connection-verification', 0, 1)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(subject_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            federated_subject_record(row)?
+        };
         let record = match observed.state {
             FederatedSubjectState::Observed => {
                 transition_federated_subject_association(
