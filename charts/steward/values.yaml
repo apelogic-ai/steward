@@ -119,6 +119,8 @@ taskIdentity:
   federatedSubjects:
     # Opts into steward-task-v3 subject observation. The unchanged default accepts v2 only.
     enabled: false
+    # Associate a GitHub Actions numeric actor ID after the same user verifies it through Connect.
+    autoAssociateFromConnections: true
   publicJwksConfigMap:
     name: ""
     key: ""

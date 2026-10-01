@@ -107,12 +107,26 @@ verified pair:
 (iss, github-actions:actor:<positive numeric actor ID>)
 ```
 
-The first valid submission records that subject and bounded signed display
-metadata atomically, but returns `403 task_identity_unassociated` and creates no
-Task. Login, display name, and email similarity never associate a subject. An
-administrator must associate the observation with an existing active canonical
-user, or a complete trusted v2 compatibility identity may seed that exact
-association. Disabled subjects return `403 task_identity_disabled`.
+With the default
+`taskIdentity.federatedSubjects.autoAssociateFromConnections=true`, a connected
+GitHub account reported by MCP-GW connection-status v2 pre-associates the exact
+`github-actions:actor:<numeric account ID>` subject with the signed-in canonical
+user. The first valid v3 submission can therefore proceed without an
+administrator round trip. Only `account.id` is an identity key; login, display
+name, and email are display metadata and never participate in matching. The
+association audit records method `connection-verification`, provider `github`,
+the numeric account ID, and its timestamp.
+
+If stable account metadata is unavailable, auto-association is disabled, or no
+GitHub connection was verified, the first valid submission records the subject
+and bounded signed display metadata atomically but returns
+`403 task_identity_unassociated` and creates no Task. An administrator may then
+associate the observation with an existing active canonical user, or a complete
+trusted v2 compatibility identity may seed that exact association. A verified
+connection never replaces a conflicting association and never re-enables a
+disabled subject. Disconnecting GitHub does not remove the association;
+administrators use the explicit disable operation. Disabled subjects return
+`403 task_identity_disabled`.
 
 For v3, Steward reads the current display email from its canonical-user store
 and server-authors service `steward-run`, acting user, owner, and canonical user

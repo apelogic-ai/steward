@@ -2055,6 +2055,9 @@ mod tests {
                 Ok(ProviderConnectionStatus {
                     phase,
                     account_email: None,
+                    account_id: None,
+                    account_login: None,
+                    github_actions_identity_linked: None,
                     scopes_required: vec!["repo".to_owned()],
                     scopes_granted: Vec::new(),
                     scopes_missing: vec!["repo".to_owned()],

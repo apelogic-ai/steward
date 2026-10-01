@@ -25,4 +25,10 @@ describe("governed provider connection controls", () => {
     expect(source).toContain('Authorize / re-authorize GitHub');
     expect(source).toContain('Status unavailable');
   });
+
+  test("shows the stable GitHub account identity and Actions link state", () => {
+    expect(source).toContain('GitHub ID ${status.accountId}');
+    expect(source).toContain('GitHub Actions runs as you: linked.');
+    expect(source).toContain('status?.githubActionsIdentityLinked === false');
+  });
 });

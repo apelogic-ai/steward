@@ -309,8 +309,11 @@
         "federatedSubjects": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["enabled"],
-          "properties": {"enabled": {"type": "boolean"}}
+          "required": ["enabled", "autoAssociateFromConnections"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "autoAssociateFromConnections": {"type": "boolean"}
+          }
         },
         "publicJwksConfigMap": {
           "type": "object",

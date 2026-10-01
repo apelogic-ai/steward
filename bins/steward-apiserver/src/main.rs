@@ -149,6 +149,9 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     );
     let configured_task_identity =
         configured_task_identity_resolver(client.clone(), token_review_audience, store.clone())?;
+    let connection_auto_association_issuer = configured_task_identity
+        .connection_auto_association_issuer
+        .clone();
     let task_identities = configured_task_identity.resolver;
     let authenticator = IdentityOrKubernetesTokenAuthenticator::new(
         kubernetes_authenticator,
@@ -206,6 +209,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         decisions.clone(),
         workflow_agents,
         task_orchestration_mode,
+        connection_auto_association_issuer,
     )
     .await?;
     let app = router(
@@ -536,6 +540,15 @@ fn read_execution_binding_catalog(path: &str) -> Result<String, io::Error> {
 struct ConfiguredTaskIdentity {
     resolver: ConfiguredTaskIdentityResolver,
     discovery: Option<TaskAuthDiscoveryConfig>,
+    connection_auto_association_issuer: Option<String>,
+}
+
+fn connection_auto_association_issuer(
+    federated_subjects_enabled: bool,
+    auto_associate_from_connections: bool,
+    issuer: String,
+) -> Option<String> {
+    (federated_subjects_enabled && auto_associate_from_connections).then_some(issuer)
 }
 
 fn configured_task_identity_resolver(
@@ -559,6 +572,18 @@ fn configured_task_identity_resolver(
             ));
         }
     };
+    let auto_associate_from_connections = match env::var(
+        "STEWARD_FEDERATED_TASK_IDENTITY_AUTO_ASSOCIATE_FROM_CONNECTIONS",
+    ) {
+        Ok(value) if value == "true" => true,
+        Ok(value) if value == "false" => false,
+        Err(env::VarError::NotPresent) => true,
+        _ => {
+            return Err(io::Error::other(
+                "STEWARD_FEDERATED_TASK_IDENTITY_AUTO_ASSOCIATE_FROM_CONNECTIONS must be true or false",
+            ));
+        }
+    };
     if values.iter().all(Option::is_none) {
         if resource.is_some() || federated_subjects_enabled {
             return Err(io::Error::other(
@@ -572,6 +597,7 @@ fn configured_task_identity_resolver(
                 store,
             ),
             discovery: None,
+            connection_auto_association_issuer: None,
         });
     }
     let [issuer, audience, jwks_file] = values;
@@ -596,7 +622,7 @@ fn configured_task_identity_resolver(
         None => None,
     };
     let resolver = ConfiguredTaskIdentityResolver::identity_from_jwks_file(
-        issuer,
+        issuer.clone(),
         required(audience)?,
         std::path::Path::new(&required(jwks_file)?),
         store,
@@ -606,6 +632,11 @@ fn configured_task_identity_resolver(
     Ok(ConfiguredTaskIdentity {
         resolver,
         discovery,
+        connection_auto_association_issuer: connection_auto_association_issuer(
+            federated_subjects_enabled,
+            auto_associate_from_connections,
+            issuer,
+        ),
     })
 }
 
@@ -664,6 +695,7 @@ async fn browser_application_router(
     decisions: JiraAdapter,
     workflow_agents: Vec<steward_apiserver::ExecutionBindingAdvertisement>,
     task_orchestration_mode: TaskOrchestrationMode,
+    connection_auto_association_issuer: Option<String>,
 ) -> Result<Option<axum::Router>, Box<dyn Error>> {
     let Ok(client_id) = env::var("STEWARD_GOOGLE_OIDC_CLIENT_ID") else {
         return Ok(None);
@@ -720,8 +752,12 @@ async fn browser_application_router(
         Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
     )
     .map_err(io::Error::other)?;
-    let connections =
-        governed_connections_configuration(&origin, store.clone(), task_orchestration_mode)?;
+    let connections = governed_connections_configuration(
+        &origin,
+        store.clone(),
+        task_orchestration_mode,
+        connection_auto_association_issuer,
+    )?;
     if workflows::ensure_sample_workflow(&store, &workflow_agents)
         .await
         .map_err(|error| io::Error::other(format!("sample Workflow bootstrap failed: {error}")))?
@@ -792,6 +828,7 @@ fn governed_connections_configuration(
     browser_origin: &str,
     store: PgStore,
     task_orchestration_mode: TaskOrchestrationMode,
+    connection_auto_association_issuer: Option<String>,
 ) -> Result<Option<GovernedConnectionsBroker>, io::Error> {
     let artifact_trust_mode = env::var("STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE").ok();
     let values = [
@@ -836,6 +873,7 @@ fn governed_connections_configuration(
                 "STEWARD_CONNECTIONS_CONTROL_PLANE_CREDENTIAL_FILE",
             )?),
             mint_origin: required("STEWARD_CONNECTIONS_MINT_ORIGIN")?,
+            federated_subject_issuer: connection_auto_association_issuer,
         },
         &bindings.mcp_gw_origin,
         &bindings.mcp_gw_version,
@@ -1723,15 +1761,33 @@ mod tests {
         CodexTaskExecutionAdapter, KubernetesTokenReviewAudience, OPERATOR_EXIT_CONFLICT,
         OPERATOR_EXIT_FORBIDDEN, OPERATOR_EXIT_NOT_FOUND, OPERATOR_EXIT_UNAVAILABLE,
         OPERATOR_EXIT_USAGE, OperatorCommandError, TaskApiConfig, TlsListener,
-        bootstrap_rbac_arguments, decode_tls_material, format_effective_access_human,
-        github_source_adapter_from_values, install_rustls_crypto_provider,
-        kubernetes_token_review_audience, operator_exit_code, parse_custom_envelope_safety_ceiling,
-        parse_execution_bindings_mode, parse_template_document,
-        stable_bridge_configuration_from_values, validate_execution_bindings,
-        with_claude_code_execution_adapter,
+        bootstrap_rbac_arguments, connection_auto_association_issuer, decode_tls_material,
+        format_effective_access_human, github_source_adapter_from_values,
+        install_rustls_crypto_provider, kubernetes_token_review_audience, operator_exit_code,
+        parse_custom_envelope_safety_ceiling, parse_execution_bindings_mode,
+        parse_template_document, stable_bridge_configuration_from_values,
+        validate_execution_bindings, with_claude_code_execution_adapter,
     };
 
     static NEXT_PREFLIGHT_CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn connection_auto_association_requires_both_feature_switches() {
+        let issuer = "https://identity.example.test".to_owned();
+
+        assert_eq!(
+            connection_auto_association_issuer(true, true, issuer.clone()),
+            Some(issuer.clone())
+        );
+        assert_eq!(
+            connection_auto_association_issuer(true, false, issuer.clone()),
+            None
+        );
+        assert_eq!(
+            connection_auto_association_issuer(false, true, issuer),
+            None
+        );
+    }
 
     struct OwnedTestDirectory(std::path::PathBuf);
 

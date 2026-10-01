@@ -51,15 +51,23 @@ acting-user/owner groups. The Task request body rejects `canonicalUserId`, `acti
 other unknown fields, so the caller cannot select another person.
 
 The opt-in `steward-task-v3` path uses the exact verified `(issuer, subject)` as
-an upstream identity key. First verification creates only an `observed` record;
-it does not create a canonical user, User Envelope, Task, role, or authority.
-Administrator association names one existing active canonical user and is
+an upstream identity key. With the default connection-association setting, a
+signed-in user's verified GitHub Connect status may create and associate
+`github-actions:actor:<numeric account ID>` with that same active canonical user
+before the first v3 Task submission. The association uses only the immutable
+numeric account ID and records connection-verification evidence. Actor login,
+display name, and email are metadata and are never lookup or matching keys.
+
+When connection proof is unavailable or automatic association is disabled, the
+first valid v3 submission creates only an `observed` record; it does not create
+a canonical user, User Envelope, Task, role, or authority. Administrator
+association then names one existing active canonical user and is
 revision-checked and append-only audited. Replacement and disable are equally
-explicit. Actor login, display name, and email are metadata and are never lookup
-or matching keys. Steward may best-effort seed a valid v2 token's same
-issuer/subject and already verified canonical-user binding. Seeding failure,
-conflict, or a disabled federated subject never changes otherwise-valid v2
-authentication or admission.
+explicit. A connection-verified association never replaces a conflicting
+association or re-enables a disabled subject. Steward may also best-effort seed
+a valid v2 token's same issuer/subject and already verified canonical-user
+binding. Seeding failure, conflict, or a disabled federated subject never
+changes otherwise-valid v2 authentication or admission.
 
 After association, Steward resolves the canonical user's current display email
 from the canonical store and server-authors the v3 service, acting user, owner,
@@ -108,6 +116,11 @@ Migration `0040_federated_subject_identity.sql` separately adds observed,
 associated, and disabled federated-subject state plus append-only audit. It does
 not backfill canonical users or reinterpret historical Tasks, runs, runtimes,
 Envelopes, or identity events.
+
+Migration `0053_connection_verified_federated_subjects.sql` adds the association
+method and bounded GitHub connection evidence. It classifies existing associated
+subjects from their prior audit history without changing their canonical-user
+binding, and it does not infer an association from login, display name, or email.
 
 The following integrations consume this foundation and must preserve its boundary:
 

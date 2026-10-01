@@ -90,6 +90,7 @@ pub(crate) struct BrowserFederatedSubjectView {
     canonical_user_id: Option<CanonicalUserId>,
     actor_login: Option<String>,
     display_name: Option<String>,
+    association_method: Option<String>,
     revision: i64,
     first_seen_at: String,
     last_seen_at: String,
@@ -106,6 +107,9 @@ impl From<FederatedSubjectRecord> for BrowserFederatedSubjectView {
             canonical_user_id: record.canonical_user_id,
             actor_login: record.actor_login,
             display_name: record.display_name,
+            association_method: record
+                .association_method
+                .map(|method| method.as_str().to_owned()),
             revision: record.revision,
             first_seen_at: record.first_seen_at,
             last_seen_at: record.last_seen_at,
@@ -128,6 +132,8 @@ pub(crate) struct BrowserFederatedSubjectAuditView {
     previous_revision: i64,
     revision: i64,
     reason: Option<String>,
+    connection_provider: Option<String>,
+    connection_account_id: Option<String>,
     created_at: String,
 }
 
@@ -143,6 +149,8 @@ impl From<FederatedSubjectAuditRecord> for BrowserFederatedSubjectAuditView {
             previous_revision: record.previous_revision,
             revision: record.revision,
             reason: record.reason,
+            connection_provider: record.connection_provider,
+            connection_account_id: record.connection_account_id,
             created_at: record.created_at,
         }
     }

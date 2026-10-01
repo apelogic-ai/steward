@@ -186,6 +186,7 @@ pub struct FederatedSubjectRecord {
     pub canonical_user_id: Option<CanonicalUserId>,
     pub actor_login: Option<String>,
     pub display_name: Option<String>,
+    pub association_method: Option<FederatedSubjectAssociationMethod>,
     pub revision: i64,
     pub first_seen_at: String,
     pub last_seen_at: String,
@@ -193,9 +194,36 @@ pub struct FederatedSubjectRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FederatedSubjectAssociationMethod {
+    Admin,
+    ConnectionVerification,
+    V2Claim,
+}
+
+impl FederatedSubjectAssociationMethod {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::ConnectionVerification => "connection-verification",
+            Self::V2Claim => "v2-claim",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "admin" => Ok(Self::Admin),
+            "connection-verification" => Ok(Self::ConnectionVerification),
+            "v2-claim" => Ok(Self::V2Claim),
+            _ => Err(StoreError::InvalidFederatedSubjectRecord),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FederatedSubjectAuditAction {
     Observed,
     V2Seeded,
+    ConnectionVerified,
     Associated,
     Replaced,
     Disabled,
@@ -206,6 +234,7 @@ impl FederatedSubjectAuditAction {
         match self {
             Self::Observed => "observed",
             Self::V2Seeded => "v2_seeded",
+            Self::ConnectionVerified => "connection_verified",
             Self::Associated => "associated",
             Self::Replaced => "replaced",
             Self::Disabled => "disabled",
@@ -216,6 +245,7 @@ impl FederatedSubjectAuditAction {
         match value {
             "observed" => Ok(Self::Observed),
             "v2_seeded" => Ok(Self::V2Seeded),
+            "connection_verified" => Ok(Self::ConnectionVerified),
             "associated" => Ok(Self::Associated),
             "replaced" => Ok(Self::Replaced),
             "disabled" => Ok(Self::Disabled),
@@ -235,6 +265,8 @@ pub struct FederatedSubjectAuditRecord {
     pub previous_revision: i64,
     pub revision: i64,
     pub reason: Option<String>,
+    pub connection_provider: Option<String>,
+    pub connection_account_id: Option<String>,
     pub created_at: String,
 }
 
@@ -453,6 +485,20 @@ mod migration_tests {
                 migration.version == 40 && migration.description.contains("federated subject")
             }),
             "migration 40 must remain embedded and describe its additive federated-subject boundary"
+        );
+    }
+
+    #[test]
+    fn connection_verified_subject_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 53
+                    && migration
+                        .description
+                        .contains("connection verified federated subjects")
+            }),
+            "migration 53 must remain embedded and describe its additive connection-verification evidence"
         );
     }
 }
@@ -1210,7 +1256,7 @@ impl PgStore {
                      last_seen_at = now() \
                  WHERE subject_id = $1 \
                  RETURNING subject_id, issuer, subject, state, canonical_user_id, \
-                           actor_login, display_name, revision, \
+                           actor_login, display_name, association_method, revision, \
                            to_char(first_seen_at AT TIME ZONE 'UTC', \
                                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
                            to_char(last_seen_at AT TIME ZONE 'UTC', \
@@ -1231,7 +1277,7 @@ impl PgStore {
                  (subject_id, issuer, subject, actor_login, display_name) \
                  VALUES ($1, $2, $3, $4, $5) \
                  RETURNING subject_id, issuer, subject, state, canonical_user_id, \
-                           actor_login, display_name, revision, \
+                           actor_login, display_name, association_method, revision, \
                            to_char(first_seen_at AT TIME ZONE 'UTC', \
                                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
                            to_char(last_seen_at AT TIME ZONE 'UTC', \
@@ -1285,6 +1331,134 @@ impl PgStore {
                     canonical_user_id,
                     FederatedSubjectAuditAction::V2Seeded,
                     actor,
+                    None,
+                    None,
+                )
+                .await?
+            }
+            FederatedSubjectState::Associated
+                if observed.canonical_user_id.as_ref() == Some(canonical_user_id) =>
+            {
+                observed
+            }
+            FederatedSubjectState::Associated => {
+                return Err(StoreError::FederatedSubjectConflict);
+            }
+            FederatedSubjectState::Disabled => return Err(StoreError::FederatedSubjectDisabled),
+        };
+        transaction.commit().await.map_err(database_error)?;
+        Ok(record)
+    }
+
+    pub async fn associate_federated_subject_from_connection(
+        &self,
+        observation: FederatedSubjectObservation<'_>,
+        canonical_user_id: &CanonicalUserId,
+        provider: &str,
+        account_id: &str,
+    ) -> Result<FederatedSubjectRecord, StoreError> {
+        if !valid_federated_subject_observation(&observation)
+            || provider != "github"
+            || !valid_provider_account_id(account_id)
+            || observation.subject.strip_prefix("github-actions:actor:") != Some(account_id)
+        {
+            return Err(StoreError::InvalidFederatedSubject);
+        }
+        if let Some(existing) = self
+            .federated_subject_by_external_identity(observation.issuer, observation.subject)
+            .await?
+        {
+            match existing.state {
+                FederatedSubjectState::Associated
+                    if existing.canonical_user_id.as_ref() == Some(canonical_user_id) =>
+                {
+                    return Ok(existing);
+                }
+                FederatedSubjectState::Associated => {
+                    return Err(StoreError::FederatedSubjectConflict);
+                }
+                FederatedSubjectState::Disabled => {
+                    return Err(StoreError::FederatedSubjectDisabled);
+                }
+                FederatedSubjectState::Observed => {}
+            }
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        ensure_active_canonical_user(&mut transaction, canonical_user_id).await?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+                hashtextextended($1::text || chr(31) || $2::text, 0)\
+             )",
+        )
+        .bind(observation.issuer)
+        .bind(observation.subject)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let existing = sqlx::query(
+            "SELECT subject_id, issuer, subject, state, canonical_user_id, \
+                    actor_login, display_name, association_method, revision, \
+                    to_char(first_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                    to_char(last_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                    to_char(updated_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+             FROM federated_subjects \
+             WHERE issuer = $1 AND subject = $2 FOR UPDATE",
+        )
+        .bind(observation.issuer)
+        .bind(observation.subject)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let observed = if let Some(row) = existing {
+            federated_subject_record(row)?
+        } else {
+            let subject_id = Uuid::new_v4();
+            let row = sqlx::query(
+                "INSERT INTO federated_subjects \
+                 (subject_id, issuer, subject, actor_login, display_name) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 RETURNING subject_id, issuer, subject, state, canonical_user_id, \
+                           actor_login, display_name, association_method, revision, \
+                           to_char(first_seen_at AT TIME ZONE 'UTC', \
+                                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                           to_char(last_seen_at AT TIME ZONE 'UTC', \
+                                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                           to_char(updated_at AT TIME ZONE 'UTC', \
+                                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
+            )
+            .bind(subject_id)
+            .bind(observation.issuer)
+            .bind(observation.subject)
+            .bind(observation.actor_login)
+            .bind(observation.display_name)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            sqlx::query(
+                "INSERT INTO federated_subject_audit \
+                 (event_id, subject_id, action, actor, previous_revision, revision) \
+                 VALUES ($1, $2, 'observed', 'connection-verification', 0, 1)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(subject_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            federated_subject_record(row)?
+        };
+        let record = match observed.state {
+            FederatedSubjectState::Observed => {
+                transition_federated_subject_association(
+                    &mut transaction,
+                    &observed,
+                    canonical_user_id,
+                    FederatedSubjectAuditAction::ConnectionVerified,
+                    "connection-verification",
+                    Some(provider),
+                    Some(account_id),
                 )
                 .await?
             }
@@ -1308,7 +1482,7 @@ impl PgStore {
     ) -> Result<FederatedSubjectRecord, StoreError> {
         let row = sqlx::query(
             "SELECT subject_id, issuer, subject, state, canonical_user_id, \
-                    actor_login, display_name, revision, \
+                    actor_login, display_name, association_method, revision, \
                     to_char(first_seen_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
                     to_char(last_seen_at AT TIME ZONE 'UTC', \
@@ -1340,7 +1514,7 @@ impl PgStore {
         }
         sqlx::query(
             "SELECT subject_id, issuer, subject, state, canonical_user_id, \
-                    actor_login, display_name, revision, \
+                    actor_login, display_name, association_method, revision, \
                     to_char(first_seen_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
                     to_char(last_seen_at AT TIME ZONE 'UTC', \
@@ -1367,7 +1541,7 @@ impl PgStore {
         }
         let rows = sqlx::query(
             "SELECT subject_id, issuer, subject, state, canonical_user_id, \
-                    actor_login, display_name, revision, \
+                    actor_login, display_name, association_method, revision, \
                     to_char(first_seen_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
                     to_char(last_seen_at AT TIME ZONE 'UTC', \
@@ -1402,6 +1576,7 @@ impl PgStore {
         let rows = sqlx::query(
             "SELECT event_id, subject_id, action, actor, previous_canonical_user_id, \
                     canonical_user_id, previous_revision, revision, reason, \
+                    connection_provider, connection_account_id, \
                     to_char(created_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at \
              FROM federated_subject_audit \
@@ -1474,6 +1649,8 @@ impl PgStore {
             association.canonical_user_id,
             action,
             association.actor,
+            None,
+            None,
         )
         .await?;
         transaction.commit().await.map_err(database_error)?;
@@ -1508,7 +1685,7 @@ impl PgStore {
              SET state = 'disabled', revision = $2, updated_at = now() \
              WHERE subject_id = $1 AND revision = $3 \
              RETURNING subject_id, issuer, subject, state, canonical_user_id, \
-                       actor_login, display_name, revision, \
+                       actor_login, display_name, association_method, revision, \
                        to_char(first_seen_at AT TIME ZONE 'UTC', \
                                'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
                        to_char(last_seen_at AT TIME ZONE 'UTC', \
@@ -10649,7 +10826,7 @@ async fn locked_federated_subject(
 ) -> Result<FederatedSubjectRecord, StoreError> {
     let row = sqlx::query(
         "SELECT subject_id, issuer, subject, state, canonical_user_id, \
-                actor_login, display_name, revision, \
+                actor_login, display_name, association_method, revision, \
                 to_char(first_seen_at AT TIME ZONE 'UTC', \
                         'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
                 to_char(last_seen_at AT TIME ZONE 'UTC', \
@@ -10672,17 +10849,32 @@ async fn transition_federated_subject_association(
     canonical_user_id: &CanonicalUserId,
     action: FederatedSubjectAuditAction,
     actor: &str,
+    connection_provider: Option<&str>,
+    connection_account_id: Option<&str>,
 ) -> Result<FederatedSubjectRecord, StoreError> {
+    let association_method = match action {
+        FederatedSubjectAuditAction::V2Seeded => FederatedSubjectAssociationMethod::V2Claim,
+        FederatedSubjectAuditAction::ConnectionVerified => {
+            FederatedSubjectAssociationMethod::ConnectionVerification
+        }
+        FederatedSubjectAuditAction::Associated | FederatedSubjectAuditAction::Replaced => {
+            FederatedSubjectAssociationMethod::Admin
+        }
+        FederatedSubjectAuditAction::Observed | FederatedSubjectAuditAction::Disabled => {
+            return Err(StoreError::InvalidFederatedSubject);
+        }
+    };
     let next_revision = current
         .revision
         .checked_add(1)
         .ok_or(StoreError::FederatedSubjectConflict)?;
     let row = sqlx::query(
         "UPDATE federated_subjects \
-         SET state = 'associated', canonical_user_id = $2, revision = $3, updated_at = now() \
+         SET state = 'associated', canonical_user_id = $2, revision = $3, \
+             association_method = $5, updated_at = now() \
          WHERE subject_id = $1 AND revision = $4 \
          RETURNING subject_id, issuer, subject, state, canonical_user_id, \
-                   actor_login, display_name, revision, \
+                   actor_login, display_name, association_method, revision, \
                    to_char(first_seen_at AT TIME ZONE 'UTC', \
                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
                    to_char(last_seen_at AT TIME ZONE 'UTC', \
@@ -10694,6 +10886,7 @@ async fn transition_federated_subject_association(
     .bind(canonical_user_id.as_str())
     .bind(next_revision)
     .bind(current.revision)
+    .bind(association_method.as_str())
     .fetch_optional(&mut **transaction)
     .await
     .map_err(database_error)?
@@ -10701,8 +10894,9 @@ async fn transition_federated_subject_association(
     sqlx::query(
         "INSERT INTO federated_subject_audit \
          (event_id, subject_id, action, actor, previous_canonical_user_id, \
-          canonical_user_id, previous_revision, revision) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+          canonical_user_id, previous_revision, revision, connection_provider, \
+          connection_account_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(Uuid::new_v4())
     .bind(current.subject_id)
@@ -10717,6 +10911,8 @@ async fn transition_federated_subject_association(
     .bind(canonical_user_id.as_str())
     .bind(current.revision)
     .bind(next_revision)
+    .bind(connection_provider)
+    .bind(connection_account_id)
     .execute(&mut **transaction)
     .await
     .map_err(database_error)?;
@@ -10740,6 +10936,13 @@ fn valid_federated_subject_observation(observation: &FederatedSubjectObservation
         && observation
             .display_name
             .is_none_or(|value| bounded_exact(value, 256))
+}
+
+fn valid_provider_account_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 20
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && !value.starts_with('0')
 }
 
 fn valid_federated_subject_actor(actor: &str) -> bool {
@@ -10775,8 +10978,15 @@ fn federated_subject_record(
         FederatedSubjectState::parse(&row.try_get::<String, _>("state").map_err(database_error)?)?;
     let canonical_user_id =
         optional_canonical_user_id(row.try_get("canonical_user_id").map_err(database_error)?)?;
+    let association_method = row
+        .try_get::<Option<String>, _>("association_method")
+        .map_err(database_error)?
+        .map(|value| FederatedSubjectAssociationMethod::parse(&value))
+        .transpose()?;
     if (state == FederatedSubjectState::Observed && canonical_user_id.is_some())
         || (state == FederatedSubjectState::Associated && canonical_user_id.is_none())
+        || (state == FederatedSubjectState::Observed && association_method.is_some())
+        || (state == FederatedSubjectState::Associated && association_method.is_none())
     {
         return Err(StoreError::InvalidFederatedSubjectRecord);
     }
@@ -10788,6 +10998,7 @@ fn federated_subject_record(
         canonical_user_id,
         actor_login: row.try_get("actor_login").map_err(database_error)?,
         display_name: row.try_get("display_name").map_err(database_error)?,
+        association_method,
         revision: row.try_get("revision").map_err(database_error)?,
         first_seen_at: row.try_get("first_seen_at").map_err(database_error)?,
         last_seen_at: row.try_get("last_seen_at").map_err(database_error)?,
@@ -10815,6 +11026,10 @@ fn federated_subject_audit_record(
         previous_revision: row.try_get("previous_revision").map_err(database_error)?,
         revision: row.try_get("revision").map_err(database_error)?,
         reason: row.try_get("reason").map_err(database_error)?,
+        connection_provider: row.try_get("connection_provider").map_err(database_error)?,
+        connection_account_id: row
+            .try_get("connection_account_id")
+            .map_err(database_error)?,
         created_at: row.try_get("created_at").map_err(database_error)?,
     })
 }

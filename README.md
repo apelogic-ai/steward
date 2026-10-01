@@ -16,10 +16,14 @@ available models and tools without granting authority.
 
 Task authentication keeps `steward-task-v2` as the default. Deployments may
 opt into `steward-task-v3`, where Steward observes the exact verified Identity
-issuer plus stable GitHub actor subject, and an administrator associates that
-subject with an existing canonical user. Observation alone grants no Task or
-Envelope authority. See the [Task submission API](docs/task-submission-api.md)
-and [federated identity upgrade guide](docs/installation/federated-task-identity-upgrade.md).
+issuer plus stable GitHub actor subject. By default, a signed-in user's verified
+GitHub Connect status associates that subject with the same canonical user by
+immutable numeric account ID before the first v3 Task submission. If connection
+proof is unavailable or automatic association is disabled, the first valid v3
+submission records an observation and an administrator performs the association.
+Observation or association alone grants no Task or Envelope authority. See the
+[Task submission API](docs/task-submission-api.md) and
+[federated identity upgrade guide](docs/installation/federated-task-identity-upgrade.md).
 
 Steward is available under the [MIT License](LICENSE). Checked-in upstream
 patches retain their [third-party notices](THIRD_PARTY_NOTICES.md).

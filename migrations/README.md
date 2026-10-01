@@ -126,3 +126,13 @@ Migration 0052 adds a nullable, bounded failure detail to governed connection
 operations. Only the adapter-sanitized upstream HTTP status and optional reason
 may be stored for `bridge-gateway-http` failures; raw provider responses,
 request URLs, credentials, and arbitrary stderr remain outside this projection.
+
+Migration 0053 adds the federated-subject association method and append-only
+GitHub connection-verification evidence. Existing associated subjects are
+classified from the audit event at their current revision: `v2_seeded` becomes
+`v2-claim`, while an administrator association or replacement becomes `admin`.
+Their canonical-user bindings and audit rows are unchanged.
+New `connection_verified` audit events carry only provider `github` and the
+bounded positive numeric account ID. Login, display name, and email are not
+association evidence. The migration is additive and must remain in place if
+automatic association is later disabled or v3 is rolled back.
