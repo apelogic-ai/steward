@@ -154,9 +154,11 @@ system. The default names can be overridden under `secrets`, `tls`,
 When `browserAuth.enabled=true`, set
 `config.apiserver.stewardRunRelease` from the verified installation BOM. The
 required normalized fields are `manifestSchemaVersion`, `version`,
-`workflowRepository`, `workflowCommit`, `actionCommit`, and
-`governedJobContainerImage`; Steward requires v0.7.0 or later and immutable
-commits/image digest. This value binds generated workflows to the same
+`workflowRepository`, `workflowCommit`, and `actionCommit`; Steward requires
+v0.7.0 or later and immutable commits. The deprecated
+`governedJobContainerImage` field remains accepted for older installation
+values, but the active versioned workflow generator does not use it. This value
+binds generated workflows to the same
 steward-run release selected for the installation.
 
 Set `config.apiserver.stewardRunWorkflowInstallationMode` independently from

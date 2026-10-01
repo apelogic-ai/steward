@@ -115,7 +115,7 @@
     "browserAuth": {"type": "object"},
     "stewardRunRelease": {
       "type": "object",
-      "required": ["manifestSchemaVersion", "version", "workflowRepository", "workflowCommit", "actionCommit", "governedJobContainerImage"],
+      "required": ["manifestSchemaVersion", "version", "workflowRepository", "workflowCommit", "actionCommit"],
       "additionalProperties": false,
       "properties": {
         "manifestSchemaVersion": {"const": 3},

@@ -481,7 +481,9 @@ Steward release namespace also creates `steward-workflows`.
   custom requests fail closed.
 - `config.apiserver.stewardRunRelease` is the exact verified steward-run handoff selected by the
   installation BOM: manifest schema, semantic version, reusable-workflow repository and commit,
-  action commit, and governed job-container digest. The default `null` value is valid while browser
+  and action commit. The deprecated `governedJobContainerImage` coordinate remains accepted for
+  compatibility but is not used by the active versioned workflow generator. The default `null`
+  value is valid while browser
   administration is disabled. Enabling browser administration requires a complete v0.7.0-or-later
   object and fails schema validation when the value is absent, null, or malformed. Steward validates
   and renders these deployment coordinates; its source and chart defaults do not select them.

@@ -1137,11 +1137,12 @@ def validate_steward_run_release(release: dict[str, Any]) -> None:
     for key in ("workflowCommit", "actionCommit"):
         if not re.fullmatch(r"[0-9a-f]{40}", require_string(release, key, path)):
             raise ValidationError(f"stewardRunRelease.{key} must be a full lowercase commit")
-    image = require_string(release, "governedJobContainerImage", path)
-    if not re.fullmatch(r"[^@\s:]+(?:/[^@\s:]+)+@sha256:[0-9a-f]{64}", image):
-        raise ValidationError(
-            "stewardRunRelease.governedJobContainerImage must be an immutable sha256 image"
-        )
+    if "governedJobContainerImage" in release:
+        image = require_string(release, "governedJobContainerImage", path)
+        if not re.fullmatch(r"[^@\s:]+(?:/[^@\s:]+)+@sha256:[0-9a-f]{64}", image):
+            raise ValidationError(
+                "stewardRunRelease.governedJobContainerImage must be an immutable sha256 image"
+            )
 
 
 def run_helm(chart: pathlib.Path, namespace: str, values_path: pathlib.Path) -> None:
