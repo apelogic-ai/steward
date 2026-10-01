@@ -351,6 +351,15 @@ impl TaskApiConfig {
         ))
     }
 
+    fn browser_source_repository_is_authorized(&self, source: &GitRepositoryIdentity) -> bool {
+        self.source_repository_bindings.iter().any(
+            |(_, _, source_owner_id, source_repository_id)| {
+                source_owner_id == source.repository_owner_id.as_str()
+                    && source_repository_id == source.repository_id.as_str()
+            },
+        )
+    }
+
     pub fn execution_binding_refs(&self) -> Vec<String> {
         if self.execution_bindings_active {
             self.execution_bindings
@@ -2508,6 +2517,9 @@ where
                 .resolve_repository(&repository)
                 .await
                 .map_err(source_port_error)?;
+            if !config.browser_source_repository_is_authorized(&repository) {
+                return Err(ApiError::BrowserTaskSourceUnauthorized);
+            }
             let requested_revision = request.package.revision.as_deref().ok_or_else(|| {
                 ApiError::Admission("repository package revision is required".to_owned())
             })?;

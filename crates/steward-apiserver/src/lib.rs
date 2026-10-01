@@ -901,6 +901,7 @@ pub enum ApiError {
     TaskIdentityDisabled { issuer: String, subject: String },
     TaskAuthenticationUnavailable,
     TaskSourceUnauthorized(String),
+    BrowserTaskSourceUnauthorized,
     TaskWorkflowNotFound,
     TaskNotReady,
     TaskOutputNotReady,
@@ -2485,6 +2486,16 @@ impl IntoResponse for ApiError {
                 )
                     .into_response();
             }
+            Self::BrowserTaskSourceUnauthorized => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "task.browser_source_not_allowed",
+                        "message": "The repository is not authorized as a browser Task source. Ask a Steward administrator to allow it.",
+                    })),
+                )
+                    .into_response();
+            }
             _ => {}
         }
         let status = match &self {
@@ -2498,6 +2509,7 @@ impl IntoResponse for ApiError {
                 StatusCode::FORBIDDEN
             }
             Self::TaskSourceUnauthorized(_) => StatusCode::FORBIDDEN,
+            Self::BrowserTaskSourceUnauthorized => StatusCode::FORBIDDEN,
             Self::TaskAuthenticationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::TaskWorkflowNotFound
             | Self::Store(
@@ -10866,6 +10878,77 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn browser_repository_source_requires_an_operator_authorized_stable_identity()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let git = browser_git_fixture()?;
+        let reads = git.reads.clone();
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let response = browser_task_router(
+            ledger.clone(),
+            task_api_config()?.with_git_hosting_plane(git),
+            auth,
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/runs")
+                .header(header::COOKIE, session_cookie)
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", csrf)
+                .header("idempotency-key", "browser-repository-not-allowed")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "package": {
+                            "source": "https://github.com/example-org/agentic-ops.git",
+                            "revision": "git:ref:main",
+                            "path": "task-definition.json"
+                        },
+                        "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64)),
+                        "inputs": {}
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build browser repository request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("submit browser repository request: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read browser repository response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("decode browser repository response: {error}"))?,
+            serde_json::json!({
+                "error": "task.browser_source_not_allowed",
+                "message": "The repository is not authorized as a browser Task source. Ask a Steward administrator to allow it."
+            })
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?
+                .is_empty(),
+            "an unauthorized browser source must fail before Task reservation"
+        );
+        assert!(
+            reads
+                .lock()
+                .map_err(|_| "fake Git read ledger was poisoned")?
+                .is_empty(),
+            "source authorization must happen before reading repository content"
+        );
+        Ok(())
+    }
+
     fn same_repository_direct_git_fixture() -> Result<FakeDirectGit, String> {
         let repository = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
         let identity = GitRepositoryIdentity {
@@ -11065,7 +11148,9 @@ mod tests {
         enable_inline_for_versioned_task_fixture(&repo_ledger, false)?;
         let (repo_auth, repo_cookie, repo_csrf) =
             signed_in_browser(origin, LocalFakeIdentity::User).await?;
-        let repo_config = task_api_config()?.with_git_hosting_plane(browser_git_fixture()?);
+        let repo_config = task_api_config()?
+            .with_git_hosting_plane(browser_git_fixture()?)
+            .with_source_repository_bindings_json(Some(&direct_source_bindings_json("654321")))?;
         let repo_response = browser_task_router(repo_ledger.clone(), repo_config, repo_auth)
             .oneshot(
                 Request::builder()
