@@ -140,7 +140,10 @@ returns HTTP 202 with an opaque operation identifier, the server-owned
 operations return HTTP 202, while a completed operation returns HTTP 200 with
 either the one-time authorization URL or a bounded terminal failure. Operation
 reads are exact-owner scoped and use HTTP 404 for absent, foreign, or
-provider-mismatched identifiers. The browser aborts the poll when its view is
+provider-mismatched identifiers. An active operation advertises its bounded
+runtime-response deadline; a reused, succeeded operation whose OAuth flow is
+still pending advertises the later flow expiry so a retry can retrieve the
+still-valid URL. The browser aborts the poll when its view is
 replaced, unmounted, or reaches the advertised deadline; a deadline leaves an
 actionable retry state. It never persists the authorization URL. The onboarding
 aggregate composes connection, Envelope, workflow,

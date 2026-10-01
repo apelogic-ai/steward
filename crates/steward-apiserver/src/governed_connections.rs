@@ -799,6 +799,21 @@ impl From<ConnectionOperationKind> for StoredOperationKind {
     }
 }
 
+fn start_poll_deadline<'a>(
+    operation_state: ConnectionOperationState,
+    oauth_phase: ConnectionOAuthPhase,
+    flow_expires_at: Option<&'a str>,
+    response_deadline_at: &'a str,
+) -> &'a str {
+    if operation_state == ConnectionOperationState::Succeeded
+        && oauth_phase == ConnectionOAuthPhase::Pending
+    {
+        flow_expires_at.unwrap_or(response_deadline_at)
+    } else {
+        response_deadline_at
+    }
+}
+
 impl<B> ProviderConnectionBroker<B> for GovernedConnectionsBroker<B>
 where
     B: Clone + Eq + Hash + Send + Sync + 'static,
@@ -827,7 +842,13 @@ where
                 .await?;
             Ok(ReservedConnectionStart {
                 operation_id: record.operation_id,
-                poll_deadline_at: record.response_deadline_at,
+                poll_deadline_at: start_poll_deadline(
+                    record.operation_state,
+                    record.oauth_phase,
+                    record.flow_expires_at.as_deref(),
+                    &record.response_deadline_at,
+                )
+                .to_owned(),
             })
         })
     }
@@ -1749,8 +1770,9 @@ mod tests {
         MCP_GW_OAUTH_STATE_LIFETIME_SECONDS, OPERATOR_PINNED_TRUST_MODE,
         ProviderConnectionStatusSource, SplitConnectionsBroker, bridge_result,
         connection_orchestration_error, connections_startup_warning, plan_connection_operation,
-        provider_status, single_file_archive, valid_operator_pinned_image,
+        provider_status, single_file_archive, start_poll_deadline, valid_operator_pinned_image,
     };
+    use steward_store::{ConnectionOAuthPhase, ConnectionOperationState};
 
     #[derive(Clone)]
     struct RejectingMutations {
@@ -1916,6 +1938,32 @@ mod tests {
                 "operator-pinned validation accepted {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn reused_succeeded_start_polls_until_flow_expiry_after_response_deadline() {
+        let elapsed_response_deadline = "2026-09-01T12:00:30Z";
+        let pending_flow_expiry = "2026-09-01T12:10:30Z";
+
+        assert_eq!(
+            start_poll_deadline(
+                ConnectionOperationState::Succeeded,
+                ConnectionOAuthPhase::Pending,
+                Some(pending_flow_expiry),
+                elapsed_response_deadline,
+            ),
+            pending_flow_expiry
+        );
+        assert_eq!(
+            start_poll_deadline(
+                ConnectionOperationState::Running,
+                ConnectionOAuthPhase::None,
+                None,
+                elapsed_response_deadline,
+            ),
+            elapsed_response_deadline,
+            "an active start must retain its bounded runtime response deadline"
+        );
     }
 
     #[test]

@@ -22,8 +22,8 @@ use steward_adapter_openshell::{
 };
 use steward_admission::{AdmissionDecision, Envelope, EnvelopeSpec, evaluate, validate_envelope};
 use steward_apiserver::connections::{
-    ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionSubject,
-    ConnectionStartOperation, GithubWorkflowRerunBroker, GithubWorkflowRerunRequest,
+    ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionStartOperation,
+    ConnectionSubject, GithubWorkflowRerunBroker, GithubWorkflowRerunRequest,
     ProviderConnectionBroker, StartedConnection,
 };
 use steward_apiserver::governed_connections::{
@@ -1070,9 +1070,26 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         .await?;
     harness.assert_bridge_runtime_absent(&bridge_workspace, &bridge_sandbox, &bridge_uid)?;
 
+    let elapsed = sqlx::query(
+        "UPDATE connection_operations SET response_deadline_at = now() - interval '1 second' \
+         WHERE operation_id = $1 AND oauth_phase = 'pending' AND flow_expires_at > now()",
+    )
+    .bind(start_operation)
+    .execute(&harness.database)
+    .await?;
+    assert_eq!(
+        elapsed.rows_affected(),
+        1,
+        "the retry regression requires an elapsed response deadline inside a live OAuth flow"
+    );
     let reused = connection_result(broker.start(&alice).await)?;
     assert_eq!(reused.operation_id, start_operation);
-    let reused = connection_result(wait_start_operation(&broker, &alice, reused.operation_id).await)?;
+    assert_eq!(
+        reused.poll_deadline_at, started.expires_at,
+        "a retry after the runtime response deadline must remain pollable until the reused OAuth flow expires"
+    );
+    let reused =
+        connection_result(wait_start_operation(&broker, &alice, reused.operation_id).await)?;
     assert_eq!(
         reused.authorization_url.as_str(),
         started.authorization_url.as_str(),
@@ -1163,9 +1180,8 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         .latest_operation(&alice_id, "start", reauthorization_count)
         .await?;
     assert_eq!(reauthorization.operation_id, reauthorization_operation);
-    let reauthorization = connection_result(
-        wait_start_operation(&broker, &alice, reauthorization_operation).await,
-    )?;
+    let reauthorization =
+        connection_result(wait_start_operation(&broker, &alice, reauthorization_operation).await)?;
     assert_ne!(
         reauthorization.authorization_url.as_str(),
         started.authorization_url.as_str(),
