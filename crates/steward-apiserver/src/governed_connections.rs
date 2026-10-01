@@ -471,9 +471,7 @@ impl DirectConnectionStatusReader {
         ) else {
             return None;
         };
-        let Some(subject) = github_actions_subject(account_id) else {
-            return None;
-        };
+        let subject = github_actions_subject(account_id)?;
         match self
             .store
             .associate_federated_subject_from_connection(
