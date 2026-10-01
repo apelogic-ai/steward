@@ -136,8 +136,7 @@
     "version": "0.7.0",
     "workflowRepository": "example-org/steward-run",
     "workflowCommit": "1111111111111111111111111111111111111111",
-    "actionCommit": "2222222222222222222222222222222222222222",
-    "governedJobContainerImage": "registry.example.test/team-a/steward-run@sha256:7777777777777777777777777777777777777777777777777777777777777777"
+    "actionCommit": "2222222222222222222222222222222222222222"
   },
   "apiTlsSecretName": "steward-apiserver-tls",
   "webhookTlsSecretName": "steward-webhook-tls"
