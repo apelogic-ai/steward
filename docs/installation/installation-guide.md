@@ -708,13 +708,19 @@ Do not hand off merely because `helm template` or `helm lint` passed.
    loop. Confirm the API/controller are usable with only PostgreSQL, the
    Kubernetes API, and TLS supplied. An otherwise-valid Task submission must
    fail at the staged-orchestration boundary before creating a Task or runtime;
-   it must not start a sandbox or call a model.
+   it must not start a sandbox or call a model. When the Connections bridge is
+   configured, its direct status read may remain available, but Connect and the
+   other governed connection mutations must return
+   `connections.orchestration_not_active` without creating a Task or runtime.
+   This is stage-1 acceptance; do not diagnose it as an MCP-GW, NetworkPolicy,
+   or OpenShell failure.
 5. For governed mode, first confirm OpenShell mTLS, workload exchange,
    SPIRE identity, LiteLLM, and Mint readiness. Activate execution bindings and Task
-   orchestration only in their documented staged rollout sequence. Run one
-   approved bounded Task, then verify execution, audit, and cleanup. Confirm no
-   undeclared provider profile was attached. This is functional sandbox
-   acceptance and does not establish VM isolation.
+   orchestration only in their documented staged rollout sequence. After Task
+   orchestration is active on every replica, verify GitHub Connect as a stage-2
+   acceptance check, then run one approved bounded Task and verify execution,
+   audit, and cleanup. Confirm no undeclared provider profile was attached. This
+   is functional sandbox acceptance and does not establish VM isolation.
 6. Exercise a fresh install, same-revision upgrade, a supported prior-version
    upgrade, and rollback on a disposable or otherwise explicitly authorized
    target. Verify no user data, credentials, CRDs, or external integrations

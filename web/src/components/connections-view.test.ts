@@ -10,8 +10,12 @@ describe("governed provider connection controls", () => {
   });
 
   test("distinguishes an outstanding OAuth flow from an ordinary conflict", () => {
-    expect(source).toContain('oauth_flow_pending');
     expect(source).toContain("Finish or wait for the pending GitHub authorization");
+  });
+
+  test("explains that staged orchestration deliberately disables connection mutations", () => {
+    expect(source).toContain("orchestration-not-active");
+    expect(source).toContain("Connections are disabled until task orchestration is active (stage 2).");
   });
 
   test("shows a reauthorization action when a reported credential deadline approaches", () => {

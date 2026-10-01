@@ -179,6 +179,7 @@ pub struct StartedConnection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionBrokerError {
     OAuthFlowPending,
+    OrchestrationNotActive,
     ProxyPolicyDenied,
     ProviderAuthorizationFailed,
     GatewayHttp { status: u16, reason: Option<String> },
@@ -579,6 +580,9 @@ fn connection_broker_error_response(error: ConnectionBrokerError) -> Response {
         }
         ConnectionBrokerError::GatewayHttp { status, reason } => {
             ("gateway_http_error", Some(status), reason)
+        }
+        ConnectionBrokerError::OrchestrationNotActive => {
+            ("connections.orchestration_not_active", None, None)
         }
         ConnectionBrokerError::OAuthFlowPending | ConnectionBrokerError::Unavailable => {
             ("connection_broker_unavailable", None, None)
@@ -1132,6 +1136,25 @@ mod tests {
                 })
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn staged_orchestration_has_a_distinct_bounded_problem_code() -> Result<(), String> {
+        let response =
+            connection_broker_error_response(ConnectionBrokerError::OrchestrationNotActive);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read staged-orchestration body: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("parse staged-orchestration body: {error}"))?,
+            serde_json::json!({
+                "apiVersion": CONNECTIONS_API_VERSION,
+                "error": "connections.orchestration_not_active"
+            })
+        );
         Ok(())
     }
 

@@ -224,12 +224,12 @@ to enable the browser path, have the person sign in once, record the audited
 initial RBAC grant, verify the deployment capability catalog, author versioned
 Envelope templates, and complete one User Envelope request and approval.
 
-The verified GitHub connection is also part of the default v3 sequence. The
-signed-in person connects the same GitHub account that will trigger the workflow
-and waits for connection status to report its immutable numeric account ID.
-Steward associates the corresponding `github-actions:actor:<id>` subject with
-that person's canonical user. This does not create a User Envelope or grant Task
-authority.
+The verified GitHub connection is also part of the default v3 sequence, but it
+cannot be created while `config.taskOrchestrationMode=staged`. Complete the
+browser identity, RBAC, template, and Envelope work in this step, then defer
+GitHub Connect to Step 8 after task orchestration is active on every replica.
+The runtime-free connection status read may be available during stage 1; that
+does not make authorize, reauthorize, disconnect, or rerun mutations available.
 
 For v2 enrollment and the v3 manual fallback, two identity outputs of this step
 are inputs to Step 6:
@@ -267,17 +267,16 @@ ownership and idempotency naming. Authority is the User Envelope bound to the
 canonical user, so a token whose canonical user has no active provisioned
 Envelope fails closed even though every signature check passed.
 
-Finish this step when one real assertion exchanges successfully, a replay of
+For v2, finish this step when one real assertion exchanges successfully, a replay of
 the same assertion is denied, and a wrong repository, ref, actor, and audience
 are each denied with a fresh assertion.
 
 For v3, Identity issues the stable subject
 `github-actions:actor:<numeric-actor-id>` and need not stamp email or Steward
-canonical-user groups. With the default connection-association setting, verify
-the connected numeric account ID from Step 5 matches this actor ID, the subject
-is already associated, and its audit records method `connection-verification`,
-provider `github`, and that numeric ID. The first valid v3 submission can then
-proceed without an administrator association or retry.
+canonical-user groups. Configure and validate the v3 issuer, audience, and
+claim shape in this step. With the default connection-association setting,
+defer the connection-backed association proof to Step 8; staged orchestration
+deliberately refuses the required Connect mutation.
 
 If connection proof is unavailable or
 `taskIdentity.federatedSubjects.autoAssociateFromConnections=false`, the first
@@ -314,9 +313,17 @@ and values so the provider-profile digests and reference runtime come from the
 same verified deployment lock; for Codex, use the supported
 [reference-runtime procedure](codex-reference-runtime.md). Re-run the live
 Gateway and applicable network checks against the final namespaces, then move
-the staged ownership switches. The prerequisites and their verification live in
-the [installation guide](installation-guide.md); this page adds only their
-position in the order.
+the staged ownership switches. After task orchestration is active on every
+replica, have the signed-in person connect the same GitHub account that will
+trigger the workflow. Verify that status reports its immutable numeric account
+ID, the corresponding `github-actions:actor:<id>` subject is associated with
+that person's canonical user, and the audit records method
+`connection-verification`, provider `github`, and that numeric ID. Treat
+“Connect works” as a stage-2 acceptance check and complete it before the first
+v3 Task submission. This connection does not create a User Envelope or grant
+Task authority. The prerequisites and their verification live in the
+[installation guide](installation-guide.md); this page adds only their position
+in the order.
 
 ## Step 9: accept governed execution end to end
 

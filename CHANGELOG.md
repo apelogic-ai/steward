@@ -17,6 +17,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Distinguished the deliberate staged-orchestration boundary from a Connections
+  service outage. Governed connection mutations now return
+  `connections.orchestration_not_active`, the browser explains that activation
+  is required, and startup logs the staged bridge state once.
 - Published the immutable `repo-summary@2` onboarding Workflow with an explicit
   `out/summary.md` result and migrated existing revision-1 installations without
   rewriting their history. The Workflow authoring UI now states that governed

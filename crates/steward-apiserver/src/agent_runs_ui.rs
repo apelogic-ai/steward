@@ -34,6 +34,11 @@ use crate::{AgentRunLedger, AgentRunSpendView, BoxFuture, bounded_task_error_cat
 
 pub const BROWSER_AGENT_RUNS_API_VERSION: &str = "steward.browser-runs/v1";
 
+#[derive(Serialize, utoipa::ToSchema)]
+struct RerunErrorResponse {
+    error: &'static str,
+}
+
 #[derive(Clone)]
 pub(crate) struct BrowserRunsState<L> {
     ledger: L,
@@ -696,7 +701,7 @@ where
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Run was not found in the user's scope"),
         (status = 409, description = "The original envelope is no longer active or GitHub connection authorization is pending"),
-        (status = 503, description = "Run submission is unavailable")
+        (status = 503, body = RerunErrorResponse, description = "Run submission is unavailable; connections.orchestration_not_active identifies staged task orchestration")
     ),
     security(("browserSession" = []))
 )]
@@ -771,6 +776,13 @@ where
         if let Err(error) = state.github_rerunner.rerun(&session, &dispatch).await {
             return match error {
                 ConnectionBrokerError::OAuthFlowPending => StatusCode::CONFLICT.into_response(),
+                ConnectionBrokerError::OrchestrationNotActive => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(RerunErrorResponse {
+                        error: "connections.orchestration_not_active",
+                    }),
+                )
+                    .into_response(),
                 ConnectionBrokerError::ProxyPolicyDenied
                 | ConnectionBrokerError::ProviderAuthorizationFailed
                 | ConnectionBrokerError::GatewayHttp { .. }
@@ -1838,6 +1850,19 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FailingGithubRerunner(ConnectionBrokerError);
+
+    impl GithubWorkflowRerunBroker<BrowserSessionBinding> for FailingGithubRerunner {
+        fn rerun<'a>(
+            &'a self,
+            _session: &'a ConnectionSession<BrowserSessionBinding>,
+            _request: &'a GithubWorkflowRerunRequest,
+        ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
+            Box::pin(async move { Err(self.0.clone()) })
+        }
+    }
+
     fn cookie(response: &Response, name: &str) -> Result<String, String> {
         response
             .headers()
@@ -2398,6 +2423,52 @@ mod tests {
                     1
                 ),
             ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn github_rerun_preserves_the_staged_orchestration_diagnostic() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let source_task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        ledger
+            .rerun_sources
+            .lock()
+            .map_err(|_| "lock rerun sources")?
+            .insert(source_task_uid, github_task(source_task_uid, owner, 1)?);
+        let (service, session_cookie, csrf) =
+            signed_in_cookie_and_csrf(LocalFakeIdentity::User).await?;
+        let app = protected_router_with_github_reruns(
+            ledger,
+            FailingGithubRerunner(ConnectionBrokerError::OrchestrationNotActive),
+            service,
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/app/api/v1/runs/{source_task_uid}/rerun"))
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::ORIGIN, "http://127.0.0.1:33001")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"idempotencyKey":"one-click"}"#))
+                    .map_err(|error| format!("build staged rerun request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute staged rerun: {error}"))?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read staged rerun response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("decode staged rerun response: {error}"))?,
+            serde_json::json!({ "error": "connections.orchestration_not_active" })
         );
         Ok(())
     }
