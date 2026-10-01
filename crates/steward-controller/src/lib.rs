@@ -1370,6 +1370,9 @@ fn task_runtime_observation_is_ready(runtime: &AgentRuntime) -> Result<bool, Tas
 }
 
 fn task_runtime_observation_is_failed(runtime: &AgentRuntime) -> Result<bool, TaskControllerError> {
+    if runtime.spec.agent_type.name != steward_connections_v1::AGENT_TYPE {
+        return Ok(false);
+    }
     let digest = spec_digest(&runtime.spec).map_err(|error| {
         TaskControllerError::InvalidState(format!("Task runtime spec cannot be digested: {error}"))
     })?;
@@ -2035,10 +2038,14 @@ fn orchestrated_task_runtime_manifest(
 
 fn runtime_identity_matches(runtime: &AgentRuntime, work: &TaskOrchestrationWorkItem) -> bool {
     let annotations = runtime.annotations();
-    work.operation
-        .runtime_uid
-        .as_deref()
-        .is_none_or(|runtime_uid| runtime.metadata.uid.as_deref() == Some(runtime_uid))
+    let runtime_uid_matches = work.task.runtime_spec.agent_type.name
+        != steward_connections_v1::AGENT_TYPE
+        || work
+            .operation
+            .runtime_uid
+            .as_deref()
+            .is_none_or(|runtime_uid| runtime.metadata.uid.as_deref() == Some(runtime_uid));
+    runtime_uid_matches
         && annotations.get(TASK_UID_ANNOTATION) == Some(&work.task.task_uid.to_string())
         && annotations.get(TASK_OPERATION_ANNOTATION)
             == Some(&work.operation.operation_id.to_string())
@@ -6183,6 +6190,18 @@ mod tests {
                 .map_err(|error| format!("classify failed runtime status: {error}"))?
         );
 
+        let mut ordinary_runtime = runtime.clone();
+        ordinary_runtime.spec.agent_type.name = "codex".to_owned();
+        ordinary_runtime.status = Some(
+            failed_connections_runtime_status(&ordinary_runtime)
+                .map_err(|error| format!("build ordinary failed runtime status: {error}"))?,
+        );
+        assert!(
+            !task_runtime_observation_is_failed(&ordinary_runtime)
+                .map_err(|error| format!("classify ordinary failed runtime status: {error}"))?,
+            "the fail-fast observation must remain scoped to Connections runtimes"
+        );
+
         let Some(runtime_status) = runtime.status.as_mut() else {
             return Err("fixture status is missing".to_owned());
         };
@@ -8258,9 +8277,10 @@ mod webhook_tests {
     }
 
     #[test]
-    fn task_runtime_identity_rejects_a_same_name_replacement_uid() -> Result<(), String> {
+    fn connection_task_runtime_identity_rejects_a_same_name_replacement_uid() -> Result<(), String>
+    {
         let admission = active_task_runtime_admission()?;
-        let work = TaskOrchestrationWorkItem {
+        let mut work = TaskOrchestrationWorkItem {
             task: admission.task.clone(),
             operation: admission.operation.clone(),
         };
@@ -8269,8 +8289,14 @@ mod webhook_tests {
         runtime.metadata.uid = Some("replacement-runtime-uid".to_owned());
 
         assert!(
+            runtime_identity_matches(&runtime, &work),
+            "ordinary Task runtime UID semantics must remain unchanged by the Connections fix"
+        );
+        work.task.runtime_spec.agent_type.name =
+            steward_admission::internal_authorities::steward_connections_v1::AGENT_TYPE.to_owned();
+        assert!(
             !runtime_identity_matches(&runtime, &work),
-            "matching annotations must not let a same-name replacement impersonate the bound runtime UID"
+            "matching annotations must not let a same-name replacement impersonate a bound Connections runtime UID"
         );
         Ok(())
     }
