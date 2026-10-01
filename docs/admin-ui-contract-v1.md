@@ -192,6 +192,12 @@ action. Login, display name, and email remain display metadata rather than
 association evidence. The default GitHub Connect path may create the
 connection-verified association before any v3 Task observation. It never
 replaces a conflicting association or re-enables a disabled subject.
+For such a subject, `firstSeenAt` originates from the verified Connect event and
+the initial `lastSeenAt` is equal to it; only a later signed Task observation
+advances `lastSeenAt` or its display metadata. Re-reading connection status is
+side-effect free. Disconnecting or later connecting another verified GitHub
+account does not remove an existing association; explicit administrator
+disable remains the revocation path.
 
 An administrator should first inspect the observation and intended canonical
 user, then submit `expectedRevision` and `canonicalUserId`. A `409` requires a

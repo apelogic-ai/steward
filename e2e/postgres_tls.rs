@@ -3,6 +3,7 @@ use std::env;
 use std::error::Error;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
@@ -25,6 +26,7 @@ use steward_store::{
 };
 use steward_types::CanonicalUserId;
 use tokio::net::TcpListener;
+use tokio::sync::Barrier;
 use tokio::task::JoinHandle;
 
 struct ServerGuard(JoinHandle<Result<(), io::Error>>);
@@ -905,6 +907,142 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
             .user_id,
         alice,
         "mutable login or display metadata must never move a numeric GitHub account association"
+    );
+
+    let competing_barrier = Arc::new(Barrier::new(3));
+    let alice_store = store.clone();
+    let alice_id = alice.clone();
+    let alice_barrier = Arc::clone(&competing_barrier);
+    let alice_attempt = tokio::spawn(async move {
+        alice_barrier.wait().await;
+        alice_store
+            .associate_federated_subject_from_connection(
+                FederatedSubjectObservation {
+                    issuer: "https://identity.example.test",
+                    subject: "github-actions:actor:525252",
+                    actor_login: Some("alice-race"),
+                    display_name: Some("alice@example.com"),
+                },
+                &alice_id,
+                "github",
+                "525252",
+            )
+            .await
+    });
+    let bob_store = store.clone();
+    let bob_id = bob.clone();
+    let bob_barrier = Arc::clone(&competing_barrier);
+    let bob_attempt = tokio::spawn(async move {
+        bob_barrier.wait().await;
+        bob_store
+            .associate_federated_subject_from_connection(
+                FederatedSubjectObservation {
+                    issuer: "https://identity.example.test",
+                    subject: "github-actions:actor:525252",
+                    actor_login: Some("bob-race"),
+                    display_name: Some("bob@example.org"),
+                },
+                &bob_id,
+                "github",
+                "525252",
+            )
+            .await
+    });
+    competing_barrier.wait().await;
+    let alice_result = alice_attempt.await?;
+    let bob_result = bob_attempt.await?;
+    let (winning_user, winning_login, winner) = match (&alice_result, &bob_result) {
+        (Ok(record), Err(StoreError::FederatedSubjectConflict)) => (&alice, "alice-race", record),
+        (Err(StoreError::FederatedSubjectConflict), Ok(record)) => (&bob, "bob-race", record),
+        outcomes => panic!("exactly one competing connection owner must win: {outcomes:?}"),
+    };
+    assert_eq!(winner.canonical_user_id.as_ref(), Some(winning_user));
+    assert_eq!(winner.actor_login.as_deref(), Some(winning_login));
+    let competing_audit = store.federated_subject_audit(winner.subject_id).await?;
+    assert_eq!(competing_audit.len(), 2);
+    assert_eq!(
+        competing_audit.last().map(|event| event.action),
+        Some(FederatedSubjectAuditAction::ConnectionVerified)
+    );
+
+    let disable_race_subject = store
+        .observe_federated_subject(FederatedSubjectObservation {
+            issuer: "https://identity.example.test",
+            subject: "github-actions:actor:525253",
+            actor_login: Some("signed-race"),
+            display_name: Some("Signed Race"),
+        })
+        .await?;
+    let disable_race_subject_id = disable_race_subject.subject_id;
+    let disable_race_revision = disable_race_subject.revision;
+    let disable_race_last_seen_at = disable_race_subject.last_seen_at.clone();
+    let disable_barrier = Arc::new(Barrier::new(3));
+    let associate_store = store.clone();
+    let associate_user = alice.clone();
+    let associate_barrier = Arc::clone(&disable_barrier);
+    let associate_attempt = tokio::spawn(async move {
+        associate_barrier.wait().await;
+        associate_store
+            .associate_federated_subject_from_connection(
+                FederatedSubjectObservation {
+                    issuer: "https://identity.example.test",
+                    subject: "github-actions:actor:525253",
+                    actor_login: Some("connection-race"),
+                    display_name: Some("connection@example.org"),
+                },
+                &associate_user,
+                "github",
+                "525253",
+            )
+            .await
+    });
+    let disable_store = store.clone();
+    let disable_barrier_task = Arc::clone(&disable_barrier);
+    let disable_attempt = tokio::spawn(async move {
+        disable_barrier_task.wait().await;
+        disable_store
+            .disable_federated_subject(FederatedSubjectDisable {
+                subject_id: disable_race_subject_id,
+                expected_revision: disable_race_revision,
+                actor: "usr_0123456789abcdef0123456789abcdef",
+                reason: Some("PROJ-123 concurrent revocation"),
+            })
+            .await
+    });
+    disable_barrier.wait().await;
+    let associate_result = associate_attempt.await?;
+    let disable_result = disable_attempt.await?;
+    assert!(
+        matches!(
+            (&associate_result, &disable_result),
+            (Ok(_), Err(StoreError::FederatedSubjectConflict))
+                | (Err(StoreError::FederatedSubjectDisabled), Ok(_))
+        ),
+        "association and disable race must have exactly one winner: {associate_result:?}, {disable_result:?}"
+    );
+    let disable_race_final = store
+        .federated_subject_by_external_identity(
+            "https://identity.example.test",
+            "github-actions:actor:525253",
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("disable race subject disappeared"))?;
+    assert_eq!(
+        disable_race_final.actor_login.as_deref(),
+        Some("signed-race")
+    );
+    assert_eq!(
+        disable_race_final.display_name.as_deref(),
+        Some("Signed Race")
+    );
+    assert_eq!(disable_race_final.last_seen_at, disable_race_last_seen_at);
+    assert_eq!(
+        store
+            .federated_subject_audit(disable_race_final.subject_id)
+            .await?
+            .len(),
+        2,
+        "the losing transition must not append audit state"
     );
 
     let similarity = store
