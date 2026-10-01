@@ -122,6 +122,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
 
   async function disconnect() {
     if (session.status !== "authenticated") return;
+    setStartFailure(null);
     setAction("working");
     const result = await disconnectProviderConnection({ body: { confirm: true }, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { provider: connection?.provider ?? "github" } });
     if (result.response?.status === 204) { setDisconnectOpen(false); setAction("idle"); refresh(); return; }

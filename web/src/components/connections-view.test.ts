@@ -41,6 +41,10 @@ describe("governed provider connection controls", () => {
     expect(source).toContain("startFailure.detail");
   });
 
+  test("clears a stale authorization failure before disconnecting", () => {
+    expect(source).toMatch(/async function disconnect\(\) \{[\s\S]*?setStartFailure\(null\);[\s\S]*?setAction\("working"\);/);
+  });
+
   test("shows a reauthorization action when a reported credential deadline approaches", () => {
     expect(source).toContain('connectionHealth(status)');
     expect(source).toContain('Re-authorize GitHub');
