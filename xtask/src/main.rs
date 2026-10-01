@@ -149,6 +149,10 @@ fn quality() -> TaskResult {
         ],
     )?;
     run("cargo", &["test", "--workspace"])?;
+    run(
+        "cargo",
+        &["test", "--manifest-path", "e2e/Cargo.toml", "--no-run"],
+    )?;
     // Vendor SDKs are introduced in later slices, so unused wrapper declarations
     // are expected here. `layering_test` below exercises the wrapper rule itself.
     run("cargo", &["deny", "check", "-A", "unused-wrapper"])?;
@@ -2666,13 +2670,67 @@ mod tests {
             .map_err(|error| format!("governed Connections stack is required: {error}"))?;
         let sandbox = fs::read_to_string(root().join("e2e/Dockerfile.workflow-sandbox"))
             .map_err(|error| format!("pinned workflow sandbox is required: {error}"))?;
+        let prebuilt =
+            fs::read_to_string(root().join("e2e/Dockerfile.governed-connections-prebuilt"))
+                .map_err(|error| {
+                    format!("prebuilt governed Connections images are required: {error}")
+                })?;
+        let package =
+            fs::read_to_string(root().join("scripts/package-governed-connections-artifacts.sh"))
+                .map_err(|error| {
+                    format!("governed Connections artifact packager is required: {error}")
+                })?;
+
+        let quality_job = ci
+            .split("  quality:")
+            .nth(1)
+            .and_then(|remainder| remainder.split("  conformance-pinned:").next())
+            .ok_or_else(|| "quality CI job is required".to_owned())?;
+        let governed_job = ci
+            .split("  governed-connections:")
+            .nth(1)
+            .and_then(|remainder| remainder.split("  postgres-tls:").next())
+            .ok_or_else(|| "governed Connections CI job is required".to_owned())?;
+        let browser_job = ci
+            .split("  browser-e2e:")
+            .nth(1)
+            .and_then(|remainder| remainder.split("  codex-reference-runtime:").next())
+            .ok_or_else(|| "browser E2E CI job is required".to_owned())?;
 
         for required in [
-            "governed-connections:",
+            "timeout-minutes: 40",
+            "needs: quality",
+            "runs-on: ubuntu-24.04",
+            "actions/download-artifact@",
+            "governed-connections-${{ github.sha }}",
+            "STEWARD_CONNECTIONS_PREBUILT_DIR",
             "cargo xtask e2e-governed-connections",
+            "supervisor-tools: \"true\"",
+        ] {
+            assert!(
+                governed_job.contains(required),
+                "governed Connections CI job is missing {required}"
+            );
+        }
+        for required in [
+            "scripts/package-governed-connections-artifacts.sh",
+            "actions/upload-artifact@",
+            "governed-connections-${{ github.sha }}",
+            "runs-on: ubuntu-24.04",
+        ] {
+            assert!(
+                quality_job.contains(required),
+                "quality CI job is missing {required}"
+            );
+        }
+        assert!(
+            browser_job.contains("Swatinem/rust-cache@")
+                && browser_job.contains("shared-key: steward-rust-1.95.0"),
+            "browser E2E must restore the shared Rust build cache"
+        );
+        for required in [
             "- governed-connections",
             "GOVERNED_CONNECTIONS: ${{ needs.governed-connections.result }}",
-            "supervisor-tools: \"true\"",
         ] {
             assert!(ci.contains(required), "pinned CI is missing {required}");
         }
@@ -2688,6 +2746,8 @@ mod tests {
             "scripts/build-patched-openshell-supervisor.sh",
             "STEWARD_OPENSHELL_SUPERVISOR_IMAGE",
             "STEWARD_OPENSHELL_SANDBOX_IMAGE",
+            "e2e/Dockerfile.governed-connections-prebuilt",
+            "governed-connections timing: setup-and-build-seconds=",
             "scripts/openshell-testbed.sh",
         ] {
             assert!(
@@ -2702,10 +2762,33 @@ mod tests {
             "ctr -n k8s.io images list",
             "$1 == image { print $3 }",
             "ctr -n k8s.io images tag \"${bridge_containerd_name}\" \"${bridge_digest_image}\"",
+            "STEWARD_CONNECTIONS_TEST_BINARY",
+            "governed-connections timing: actual-test-seconds=",
         ] {
             assert!(
                 inner.contains(required),
                 "inner harness is missing {required}"
+            );
+        }
+        for required in [
+            "steward-mint-bin",
+            "steward-connections-bridge",
+            "governed-connections-webhook",
+            "governed_connections",
+        ] {
+            assert!(
+                package.contains(required),
+                "artifact packager is missing {required}"
+            );
+        }
+        for required in [
+            "steward-mint-bin",
+            "steward-connections-bridge",
+            "governed-connections-webhook",
+        ] {
+            assert!(
+                prebuilt.contains(required),
+                "prebuilt image definition is missing {required}"
             );
         }
         for required in [
@@ -2730,6 +2813,21 @@ mod tests {
                 && sandbox.contains("codex-cli 0.140.0"),
             "the real-stack lane must install and verify the exact approved Workflow agent"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn quality_gate_compiles_the_e2e_workspace() -> Result<(), String> {
+        let xtask_source = fs::read_to_string(root().join("xtask/src/main.rs"))
+            .map_err(|error| format!("xtask source is required: {error}"))?;
+
+        assert!(
+            xtask_source.contains(
+                "run(\n        \"cargo\",\n        &[\"test\", \"--manifest-path\", \"e2e/Cargo.toml\", \"--no-run\"],\n    )?;"
+            ),
+            "cargo xtask quality must compile every e2e target without running it"
+        );
+
         Ok(())
     }
 

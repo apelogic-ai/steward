@@ -18,7 +18,7 @@ env:
 jobs:
   quality:
     name: quality
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Check out repository
@@ -45,6 +45,19 @@ jobs:
         env:
           STEWARD_MIGRATION_BASE: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.sha }}
         run: cargo xtask quality
+
+      - name: Build governed Connections test artifacts
+        run: scripts/package-governed-connections-artifacts.sh
+
+      - name: Retain governed Connections test artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: governed-connections-${{ github.sha }}-${{ github.run_id }}
+          path: target/governed-connections-artifacts
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
 
   conformance-pinned:
     name: conformance / pinned upstream
@@ -100,13 +113,28 @@ jobs:
 
   governed-connections:
     name: integration / governed MCP provider connections
-    runs-on: ubuntu-latest
-    timeout-minutes: 50
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Restore governed Connections test artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: governed-connections-${{ github.sha }}-${{ github.run_id }}
+          path: target/governed-connections-artifacts
+
+      - name: Prepare governed Connections test artifacts
+        run: |
+          chmod 0755 \
+            target/governed-connections-artifacts/steward-mint-bin \
+            target/governed-connections-artifacts/steward-connections-bridge \
+            target/governed-connections-artifacts/governed-connections-webhook \
+            target/governed-connections-artifacts/governed_connections
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
@@ -123,6 +151,8 @@ jobs:
           supervisor-tools: "true"
 
       - name: Verify governed provider connections against the pinned real stack
+        env:
+          STEWARD_CONNECTIONS_PREBUILT_DIR: ${{ github.workspace }}/target/governed-connections-artifacts
         run: cargo xtask e2e-governed-connections
 
   postgres-tls:
@@ -160,6 +190,11 @@ jobs:
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.95.0 --profile minimal
+
+      - name: Restore shared Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: steward-rust-1.95.0
 
       - name: Install pinned Node runtime
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
