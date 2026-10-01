@@ -23,6 +23,10 @@ import { useSession } from "@/session/session-context";
 
 type TemplateMutationState = "idle" | "saving" | "saved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
 
+type TemplateField = "templateId" | "displayName" | "memberRoles" | "monthlyLimit" | "singleRunLimit" | "models" | "tools" | "threshold";
+
+export type TemplateFieldErrors = Partial<Record<TemplateField, string>>;
+
 type AdminTemplateListItem = {
   autoProvisionThreshold?: BrowserEnvelope | null;
   id: string;
@@ -37,6 +41,9 @@ type AdminTemplateListResponse = {
 };
 
 const fieldClass = "min-h-11 min-w-0 w-full rounded-md border bg-panel px-3 font-normal";
+
+const identifierMessage = "Use 1–128 letters, numbers, periods, underscores, hyphens, or colons; start with a letter or number.";
+const decimalMessage = "Enter a non-negative decimal.";
 
 export const initialEnvelopeTemplate: BrowserEnvelope = {
   revision: 1,
@@ -56,6 +63,16 @@ export const initialEnvelopeTemplate: BrowserEnvelope = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function validTemplateIdentifier(value: string): boolean {
+  return value.length > 0
+    && value.length <= 128
+    && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value);
+}
+
+function validDecimal(value: string): boolean {
+  return /^[0-9]+(?:\.[0-9]*)?$/.test(value);
 }
 
 function isBrowserEnvelope(value: unknown): value is BrowserEnvelope {
@@ -90,6 +107,68 @@ function isBrowserEnvelope(value: unknown): value is BrowserEnvelope {
 
 function isAutoProvisionThreshold(value: unknown): value is BrowserEnvelope | null | undefined {
   return value === undefined || value === null || isBrowserEnvelope(value);
+}
+
+export function templateMemberRoles(templateId: string, memberRoles: Array<string>, rolesEdited: boolean): Array<string> {
+  const normalizedTemplateId = templateId.trim();
+  return !rolesEdited && normalizedTemplateId ? [normalizedTemplateId] : memberRoles;
+}
+
+export function validateTemplateFields({
+  allowedModels,
+  allowedTools,
+  autoApproveToCeiling,
+  displayName: templateDisplayName,
+  memberRoles,
+  models,
+  monthlyLimit,
+  singleRunLimit,
+  templateId,
+  thresholdJson,
+  tools,
+}: Readonly<{
+  allowedModels: ReadonlySet<string>;
+  allowedTools: ReadonlySet<string>;
+  autoApproveToCeiling: boolean;
+  displayName: string;
+  memberRoles: Array<string>;
+  models: Array<ModelRef>;
+  monthlyLimit: string;
+  singleRunLimit: string;
+  templateId: string;
+  thresholdJson: string;
+  tools: Array<ToolGrant>;
+}>): TemplateFieldErrors {
+  const errors: TemplateFieldErrors = {};
+  if (!templateId) errors.templateId = "Enter a template ID.";
+  else if (!validTemplateIdentifier(templateId)) errors.templateId = identifierMessage;
+  if (!templateDisplayName.trim()) errors.displayName = "Enter a display name.";
+  if (memberRoles.length === 0) errors.memberRoles = "Add at least one eligible member role.";
+  else if (memberRoles.some((role) => !validTemplateIdentifier(role))) errors.memberRoles = "Use a valid identifier for every eligible member role.";
+  if (!singleRunLimit.trim()) errors.singleRunLimit = "Enter a per-run budget.";
+  else if (!validDecimal(singleRunLimit.trim())) errors.singleRunLimit = decimalMessage;
+  if (!monthlyLimit.trim()) errors.monthlyLimit = "Enter a monthly budget.";
+  else if (!validDecimal(monthlyLimit.trim())) errors.monthlyLimit = decimalMessage;
+  if (models.length === 0) errors.models = "Select at least one model.";
+  else if (models.some((model) => !allowedModels.has(modelKey(model)))) errors.models = "Remove or replace every model not listed in the capability catalog.";
+  if (tools.some((tool) => !allowedTools.has(toolKey(tool)))) errors.tools = "Remove or replace every tool not listed in the capability catalog.";
+  if (!autoApproveToCeiling) {
+    try {
+      if (!isBrowserEnvelope(JSON.parse(thresholdJson) as unknown)) errors.threshold = "Enter a complete valid envelope as JSON.";
+    } catch {
+      errors.threshold = "Enter a complete valid envelope as JSON.";
+    }
+  }
+  return errors;
+}
+
+function serverErrorCode(error: unknown): string | null {
+  if (!isRecord(error)) return null;
+  for (const key of ["code", "error"]) {
+    const value = error[key];
+    if (typeof value === "string" && /^[a-z][a-z0-9._-]{0,63}$/i.test(value)) return value;
+  }
+  return null;
 }
 
 function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): BrowserEnvelopeTemplateResponse | null {
@@ -237,15 +316,19 @@ function toolLabel(tool: ToolGrant, choices: Array<ToolGrant>): string {
     : display;
 }
 
-function mutationMessage(status: Exclude<TemplateMutationState, "idle" | "saving">): string {
+function mutationMessage(status: Exclude<TemplateMutationState, "idle" | "saving">, rejectionCode: string | null): string {
   return {
     saved: "Template revision accepted by the Rust authority.",
     conflict: "A newer template revision already exists. Load it before authoring another revision.",
-    rejected: "The template ID or envelope fields are invalid, so no authority was changed.",
+    rejected: `The server rejected the template, so no authority was changed.${rejectionCode ? ` Error code: ${rejectionCode}.` : ""}`,
     forbidden: "The Rust authorization boundary rejected this template mutation.",
     unavailable: "The authoritative template service is unavailable.",
     error: "The template response could not be accepted.",
   }[status];
+}
+
+function FieldError({ message }: Readonly<{ message?: string }>) {
+  return message ? <p className="text-sm font-normal text-err" role="alert">{message}</p> : null;
 }
 
 export function AdminEnvelopeTemplatesView() {
@@ -409,6 +492,8 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
   const toolCatalog = capabilities.tools;
   const allowedTools = new Set(toolCatalog.map(toolKey));
   const [status, setStatus] = useState<TemplateMutationState>("idle");
+  const [rejectionCode, setRejectionCode] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<TemplateFieldErrors>({});
   const [currentRevision, setCurrentRevision] = useState(template.revision);
   const [models, setModels] = useState<Array<ModelRef>>(template.spec.llms);
   const [tools, setTools] = useState<Array<ToolGrant>>(template.spec.tools.map((tool) => ({
@@ -421,8 +506,12 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
   const [runtimeMinutesLimit, setRuntimeMinutesLimit] = useState(template.spec.runtimeMinutesLimit ?? "");
   const [name, setName] = useState(templateDisplayName);
   const [roles, setRoles] = useState(memberRoles.join(", "));
+  const [rolesEdited, setRolesEdited] = useState(!create);
+  const [templateIdDraft, setTemplateIdDraft] = useState("");
   const [autoApproveToCeiling, setAutoApproveToCeiling] = useState(autoProvisionThreshold === null || autoProvisionThreshold === undefined);
   const [thresholdJson, setThresholdJson] = useState(JSON.stringify(autoProvisionThreshold ?? template, null, 2));
+  const parsedRoles = [...new Set(roles.split(",").map((role) => role.trim()).filter(Boolean))].sort();
+  const selectedRoles = templateMemberRoles(templateIdDraft, parsedRoles, rolesEdited);
   const missingModels = models.filter((model) => !allowedModels.has(modelKey(model)));
   const missingTools = tools.filter((tool) => !allowedTools.has(toolKey(tool)));
   const modelOptions = [...modelCatalog, ...missingModels].map((model) => ({
@@ -442,6 +531,22 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
       note: catalogTool ? displayName(tool.provider) : "Not listed in the deployment capability catalog",
     };
   });
+  const roleOptions = selectedRoles.map((role) => ({ key: role, kind: "neutral" as const, label: role }));
+
+  function clearFieldError(field: TemplateField) {
+    setFieldErrors((current) => {
+      if (!current[field]) return current;
+      const next = { ...current };
+      delete next[field];
+      return next;
+    });
+  }
+
+  function updateRoles(next: Array<string>) {
+    setRolesEdited(true);
+    setRoles(next.join(", "));
+    clearFieldError("memberRoles");
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -451,18 +556,25 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
     const saveAsNew = action === "copy";
     const newTemplateId = String(fields.get("newTemplateId") ?? "").trim();
     const templateId = create || saveAsNew ? newTemplateId : memberRole;
-    const selectedRoles = [...new Set(roles.split(",").map((role) => role.trim()).filter(Boolean))].sort();
     const platforms = fields.getAll("platforms").filter((value): value is RunnerPlatform =>
       value === "linux" || value === "mac" || value === "windows");
-    if (!templateId
-      || !name.trim()
-      || selectedRoles.length === 0
-      || !monthlyLimit.trim()
-      || !singleRunLimit.trim()
-      || models.length === 0
-      || models.some((model) => !allowedModels.has(modelKey(model)))
-      || tools.some((tool) => !allowedTools.has(toolKey(tool)))) {
-      setStatus("rejected");
+    const errors = validateTemplateFields({
+      allowedModels,
+      allowedTools,
+      autoApproveToCeiling,
+      displayName: name,
+      memberRoles: selectedRoles,
+      models,
+      monthlyLimit,
+      singleRunLimit,
+      templateId,
+      thresholdJson,
+      tools,
+    });
+    setFieldErrors(errors);
+    setRejectionCode(null);
+    if (Object.keys(errors).length > 0) {
+      setStatus("idle");
       return;
     }
     const memory = String(fields.get("memory") ?? "").trim();
@@ -492,10 +604,9 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
     if (!autoApproveToCeiling) {
       try {
         const parsed: unknown = JSON.parse(thresholdJson);
-        if (!isBrowserEnvelope(parsed)) { setStatus("rejected"); return; }
+        if (!isBrowserEnvelope(parsed)) return;
         nextAutoProvisionThreshold = parsed;
       } catch {
-        setStatus("rejected");
         return;
       }
     }
@@ -518,24 +629,26 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
       if (create || saveAsNew) router.push(`/admin/envelopes/templates/${encodeURIComponent(templateId)}`);
       return;
     }
-    setStatus(classifyMutationFailure(result.response?.status));
+    const failure = classifyMutationFailure(result.response?.status);
+    setRejectionCode(failure === "rejected" ? serverErrorCode(result.error) : null);
+    setStatus(failure);
   }
 
   const runner = template.spec.runner;
   if (create) {
     return (
-      <form className="overflow-hidden rounded-card border bg-panel" onSubmit={submit}>
+      <form className="overflow-hidden rounded-card border bg-panel" noValidate onSubmit={submit}>
         <FormSection description="The template ID. Users with this role can request against it." title="Member role">
           <div className="grid gap-4 sm:grid-cols-3">
-            <label className="grid gap-2 text-sm font-semibold">Template ID<input className={`${fieldClass} font-mono`} name="newTemplateId" placeholder="developer" required /></label>
-            <label className="grid gap-2 text-sm font-semibold">Display name<input className={fieldClass} name="displayName" onChange={(event) => setName(event.target.value)} required value={name} /></label>
-            <label className="grid gap-2 text-sm font-semibold">Eligible member roles<TagSelect addPlaceholder="Add another role…" allowCreate emptyPlaceholder="Add member role…" label="Eligible member roles" onChange={(next) => setRoles(next.join(", "))} options={roles.split(",").map((role) => role.trim()).filter(Boolean).map((role) => ({ key: role, kind: "neutral", label: role }))} value={roles.split(",").map((role) => role.trim()).filter(Boolean)} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Template ID<input aria-invalid={Boolean(fieldErrors.templateId)} className={`${fieldClass} font-mono`} name="newTemplateId" onChange={(event) => { setTemplateIdDraft(event.target.value); clearFieldError("templateId"); if (!rolesEdited) clearFieldError("memberRoles"); }} placeholder="developer" required value={templateIdDraft} /><FieldError message={fieldErrors.templateId} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Display name<input aria-invalid={Boolean(fieldErrors.displayName)} className={fieldClass} name="displayName" onChange={(event) => { setName(event.target.value); clearFieldError("displayName"); }} required value={name} /><FieldError message={fieldErrors.displayName} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Eligible member roles<TagSelect addPlaceholder="Add another role…" allowCreate emptyPlaceholder="Add member role…" label="Eligible member roles" onChange={updateRoles} options={roleOptions} value={selectedRoles} /><FieldError message={fieldErrors.memberRoles} /></label>
           </div>
         </FormSection>
         <FormSection description="Inference spend limits in USD and how long an envelope stays valid." title="Budget and lifetime">
           <div className="grid gap-4 sm:grid-cols-4">
-            <label className="grid gap-2 text-sm font-semibold">Per run (USD)<input className={fieldClass} inputMode="decimal" onChange={(event) => setSingleRunLimit(event.target.value)} required value={singleRunLimit} /></label>
-            <label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input className={fieldClass} inputMode="decimal" onChange={(event) => setMonthlyLimit(event.target.value)} required value={monthlyLimit} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Per run (USD)<input aria-invalid={Boolean(fieldErrors.singleRunLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setSingleRunLimit(event.target.value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input aria-invalid={Boolean(fieldErrors.monthlyLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setMonthlyLimit(event.target.value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label>
             <label className="grid gap-2 text-sm font-semibold">TTL<input className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" required /></label>
             <label className="grid gap-2 text-sm font-semibold">Runtime minutes<input className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => setRuntimeMinutesLimit(event.target.value)} placeholder="60" value={runtimeMinutesLimit} /></label>
           </div>
@@ -546,13 +659,17 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
             emptyPlaceholder="Search models…"
             inputDisabled={modelCatalog.length === 0}
             label="Models"
-            onChange={(keys) => setModels(keys.flatMap((key) => {
-              const model = modelCatalog.find((candidate) => modelKey(candidate) === key);
-              return model ? [model] : [];
-            }))}
+            onChange={(keys) => {
+              setModels(keys.flatMap((key) => {
+                const model = modelCatalog.find((candidate) => modelKey(candidate) === key);
+                return model ? [model] : [];
+              }));
+              clearFieldError("models");
+            }}
             options={modelOptions}
             value={models.map(modelKey)}
           />
+          <FieldError message={fieldErrors.models} />
           {missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}
         </FormSection>
         <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Write and destructive tools are labelled.`} title="Tools">
@@ -562,30 +679,34 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
               emptyPlaceholder="Search GitHub tools…"
               inputDisabled={toolCatalog.length === 0}
               label="Tools"
-              onChange={(keys) => setTools(keys.flatMap((key) => {
-                const tool = toolCatalog.find((candidate) => toolKey(candidate) === key);
-                return tool ? [{ provider: tool.provider, resource: tool.resource, action: tool.action }] : [];
-              }))}
+              onChange={(keys) => {
+                setTools(keys.flatMap((key) => {
+                  const tool = toolCatalog.find((candidate) => toolKey(candidate) === key);
+                  return tool ? [{ provider: tool.provider, resource: tool.resource, action: tool.action }] : [];
+                }));
+                clearFieldError("tools");
+              }}
               options={toolOptions}
               value={tools.map(toolKey)}
             />
+            <FieldError message={fieldErrors.tools} />
             {missingTools.length ? <p className="text-sm text-warn">{missingTools.length} selected tool{missingTools.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : toolCatalog.length === 0 ? <p className="text-sm text-muted-ink">No tools are listed in the deployment capability catalog.</p> : null}
             <p className="text-xs text-muted-ink">Type to filter. ↑ ↓ to move, Enter to add, Backspace removes the last tag.</p>
           </div>
         </FormSection>
         <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
-          <div className="space-y-4"><label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => setAutoApproveToCeiling(event.target.checked)} type="checkbox" />Auto-approve every request within the ceiling</label>{!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => setThresholdJson(event.target.value)} spellCheck={false} value={thresholdJson} /></label> : null}</div>
+          <div className="space-y-4"><label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => { setAutoApproveToCeiling(event.target.checked); clearFieldError("threshold"); }} type="checkbox" />Auto-approve every request within the ceiling</label>{!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea aria-invalid={Boolean(fieldErrors.threshold)} className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setThresholdJson(event.target.value); clearFieldError("threshold"); }} spellCheck={false} value={thresholdJson} /><FieldError message={fieldErrors.threshold} /></label> : null}</div>
         </FormSection>
         <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner">
           <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" placeholder="2Gi" /></label><label className="grid gap-2 text-sm font-semibold">Compute<input className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" placeholder="1000m" /></label><label className="grid gap-2 text-sm font-semibold">Storage<input className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" placeholder="10Gi" /></label></div></fieldset>
         </FormSection>
-        {status !== "idle" && status !== "saving" ? <p className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status)}</p> : null}
+        {status !== "idle" && status !== "saving" ? <p className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status, rejectionCode)}</p> : null}
         <footer className="sticky bottom-0 flex flex-wrap items-center justify-between gap-4 border-t bg-subtle px-6 py-4"><p className="text-sm text-muted-ink">{models.length} model{models.length === 1 ? "" : "s"} · {tools.length} tool{tools.length === 1 ? "" : "s"} · {singleRunLimit || "—"} USD per run</p><div className="flex gap-3"><Link className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold" href="/admin/envelopes/templates">Cancel</Link><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="create">{status === "saving" ? "Saving…" : "Create template"}</button></div></footer>
       </form>
     );
   }
   return (
-    <form className="space-y-6" onSubmit={submit}>
+    <form className="space-y-6" noValidate onSubmit={submit}>
       <SectionCard>
       <div>
         <h2 className="text-xl font-semibold">{create ? "New template" : name}</h2>
@@ -593,34 +714,35 @@ function TemplateEditor({ autoProvisionThreshold, capabilities, create = false, 
       </div>
 
       <FormSection description="The member roles allowed to request this template." title="Template identity and eligibility">
-        <div className="grid gap-4 sm:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Display name<input className={fieldClass} name="displayName" onChange={(event) => setName(event.target.value)} required value={name} /></label><label className="grid gap-2 text-sm font-semibold">Eligible member roles<TagSelect addPlaceholder="Add another role…" allowCreate emptyPlaceholder="Add member role…" label="Eligible member roles" onChange={(next) => setRoles(next.join(", "))} options={roles.split(",").map((role) => role.trim()).filter(Boolean).map((role) => ({ key: role, kind: "neutral", label: role }))} value={roles.split(",").map((role) => role.trim()).filter(Boolean)} /></label></div>
+        <div className="grid gap-4 sm:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Display name<input aria-invalid={Boolean(fieldErrors.displayName)} className={fieldClass} name="displayName" onChange={(event) => { setName(event.target.value); clearFieldError("displayName"); }} required value={name} /><FieldError message={fieldErrors.displayName} /></label><label className="grid gap-2 text-sm font-semibold">Eligible member roles<TagSelect addPlaceholder="Add another role…" allowCreate emptyPlaceholder="Add member role…" label="Eligible member roles" onChange={updateRoles} options={roleOptions} value={selectedRoles} /><FieldError message={fieldErrors.memberRoles} /></label></div>
       </FormSection>
 
       <FormSection description="Inference spend limits in USD and how long an envelope stays valid." title="Budget and lifetime">
-        <div className="grid gap-4 sm:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Per run (USD)<input className={fieldClass} inputMode="decimal" onChange={(event) => setSingleRunLimit(event.target.value)} required value={singleRunLimit} /></label><label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input className={fieldClass} inputMode="decimal" onChange={(event) => setMonthlyLimit(event.target.value)} required value={monthlyLimit} /></label><label className="grid gap-2 text-sm font-semibold">TTL<input className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" required /></label><label className="grid gap-2 text-sm font-semibold">Runtime minutes<input className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => setRuntimeMinutesLimit(event.target.value)} placeholder="60" value={runtimeMinutesLimit} /></label></div>
+        <div className="grid gap-4 sm:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Per run (USD)<input aria-invalid={Boolean(fieldErrors.singleRunLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setSingleRunLimit(event.target.value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label><label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input aria-invalid={Boolean(fieldErrors.monthlyLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setMonthlyLimit(event.target.value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label><label className="grid gap-2 text-sm font-semibold">TTL<input className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" required /></label><label className="grid gap-2 text-sm font-semibold">Runtime minutes<input className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => setRuntimeMinutesLimit(event.target.value)} placeholder="60" value={runtimeMinutesLimit} /></label></div>
       </FormSection>
 
-      <FormSection description="Only models supported by the inference gateway can be selected." title="Models"><fieldset><legend className="sr-only">Models</legend><TagSelect addPlaceholder="Add…" emptyPlaceholder="Search models…" inputDisabled={modelCatalog.length === 0} label="Models" onChange={(keys) => setModels(keys.flatMap((key) => { const model = [...modelCatalog, ...missingModels].find((candidate) => modelKey(candidate) === key); return model ? [model] : []; }))} options={modelOptions} value={models.map(modelKey)} />{missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}</fieldset></FormSection>
+      <FormSection description="Only models supported by the inference gateway can be selected." title="Models"><fieldset><legend className="sr-only">Models</legend><TagSelect addPlaceholder="Add…" emptyPlaceholder="Search models…" inputDisabled={modelCatalog.length === 0} label="Models" onChange={(keys) => { setModels(keys.flatMap((key) => { const model = [...modelCatalog, ...missingModels].find((candidate) => modelKey(candidate) === key); return model ? [model] : []; })); clearFieldError("models"); }} options={modelOptions} value={models.map(modelKey)} /><FieldError message={fieldErrors.models} />{missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}</fieldset></FormSection>
 
-      <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Write and destructive tools are labelled.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><TagSelect addPlaceholder="Add another tool…" emptyPlaceholder="Search tools…" inputDisabled={toolCatalog.length === 0} label="Tools" onChange={(keys) => setTools(keys.flatMap((key) => { const tool = [...toolCatalog, ...missingTools].find((candidate) => toolKey(candidate) === key); return tool ? [{ provider: tool.provider, resource: tool.resource, action: tool.action }] : []; }))} options={toolOptions} value={tools.map(toolKey)} />{missingTools.length ? <p className="mt-2 text-sm text-warn">{missingTools.length} selected tool{missingTools.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : toolCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No tools are listed in the deployment capability catalog.</p> : null}<p className="mt-2 text-xs text-muted-ink">Type to filter. ↑ ↓ to move, Enter to add, Backspace removes the last tag.</p></fieldset></FormSection>
+      <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Write and destructive tools are labelled.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><TagSelect addPlaceholder="Add another tool…" emptyPlaceholder="Search tools…" inputDisabled={toolCatalog.length === 0} label="Tools" onChange={(keys) => { setTools(keys.flatMap((key) => { const tool = [...toolCatalog, ...missingTools].find((candidate) => toolKey(candidate) === key); return tool ? [{ provider: tool.provider, resource: tool.resource, action: tool.action }] : []; })); clearFieldError("tools"); }} options={toolOptions} value={tools.map(toolKey)} /><FieldError message={fieldErrors.tools} />{missingTools.length ? <p className="mt-2 text-sm text-warn">{missingTools.length} selected tool{missingTools.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : toolCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No tools are listed in the deployment capability catalog.</p> : null}<p className="mt-2 text-xs text-muted-ink">Type to filter. ↑ ↓ to move, Enter to add, Backspace removes the last tag.</p></fieldset></FormSection>
 
       <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
         <div className="space-y-4">
-          <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => setAutoApproveToCeiling(event.target.checked)} type="checkbox" />Auto-approve every request within the ceiling</label>
-          {!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => setThresholdJson(event.target.value)} spellCheck={false} value={thresholdJson} /></label> : null}
+          <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => { setAutoApproveToCeiling(event.target.checked); clearFieldError("threshold"); }} type="checkbox" />Auto-approve every request within the ceiling</label>
+          {!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea aria-invalid={Boolean(fieldErrors.threshold)} className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setThresholdJson(event.target.value); clearFieldError("threshold"); }} spellCheck={false} value={thresholdJson} /><FieldError message={fieldErrors.threshold} /></label> : null}
         </div>
       </FormSection>
 
       <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" placeholder="2Gi" /></label><label className="grid gap-2 text-sm font-semibold">Compute<input className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" placeholder="1000m" /></label><label className="grid gap-2 text-sm font-semibold">Storage<input className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" placeholder="10Gi" /></label></div></fieldset></FormSection>
 
       {status !== "idle" && status !== "saving" ? (
-        <p className={status === "saved" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status)}</p>
+        <p className={status === "saved" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status, rejectionCode)}</p>
       ) : null}
 
       <div className="flex flex-wrap items-end gap-3 border-t pt-5">
         <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value={create ? "create" : "version"}>{status === "saving" ? "Saving…" : create ? "Create template" : "Save new version"}</button>
         <label className="grid min-w-56 flex-1 gap-2 text-sm font-semibold">{create ? "Template ID" : "New template ID"}
-          <input className={fieldClass} name="newTemplateId" placeholder="developer" required={create} />
+          <input aria-invalid={Boolean(fieldErrors.templateId)} className={fieldClass} name="newTemplateId" onChange={() => clearFieldError("templateId")} placeholder="developer" required={create} />
+          <FieldError message={fieldErrors.templateId} />
         </label>
         {!create ? <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="copy">Save as new</button> : null}
       </div>
