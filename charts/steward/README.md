@@ -471,6 +471,14 @@ Steward release namespace also creates `steward-workflows`.
   administration is disabled. Enabling browser administration requires a complete v0.7.0-or-later
   object and fails schema validation when the value is absent, null, or malformed. Steward validates
   and renders these deployment coordinates; its source and chart defaults do not select them.
+- `config.apiserver.stewardRunWorkflowInstallationMode` controls only how generated callers
+  reference that verified release. `remote` is the default and renders the release handoff's exact
+  repository and workflow commit. `vendored` renders
+  `./.github/workflows/steward-task-vendored.yml`; select it only after each caller repository has
+  installed the checksum- and signature-verified steward-run v0.7.6-or-later release asset at that
+  exact path. Older release handoffs fail closed in this mode. The local mode does not add a PAT,
+  checkout token, or mutable action reference. See
+  [the installation guide](../../docs/installation/installation-guide.md#vendored-steward-run-workflow).
 - `config.apiserver.executionBindings` is the structured, deployment-owned coding-agent
   catalog. The default `bindings: []` advertises no agents and creates no fallback.
   The chart validates it, renders it into an immutable content-addressed ConfigMap,

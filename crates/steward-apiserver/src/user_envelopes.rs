@@ -29,7 +29,7 @@ use crate::browser_auth::{
 };
 use crate::{
     AgentRunAvailability, AgentRunDataStatus, BoxFuture, GithubActionsEnvelopeSelection,
-    StewardRunRelease, VersionedGithubActionsWorkflowContext,
+    StewardRunRelease, StewardRunWorkflowInstallationMode, VersionedGithubActionsWorkflowContext,
     render_versioned_github_actions_workflow,
 };
 
@@ -311,6 +311,8 @@ pub struct PgEnvelopeRequestBroker {
     capabilities: CapabilityCatalog,
     custom_envelope_safety_ceiling: Option<Envelope>,
     steward_run_release: StewardRunRelease,
+    workflow_installation_mode: StewardRunWorkflowInstallationMode,
+    task_identity_discovery_enabled: bool,
 }
 
 impl PgEnvelopeRequestBroker {
@@ -319,12 +321,16 @@ impl PgEnvelopeRequestBroker {
         capabilities: CapabilityCatalog,
         custom_envelope_safety_ceiling: Option<Envelope>,
         steward_run_release: StewardRunRelease,
+        workflow_installation_mode: StewardRunWorkflowInstallationMode,
+        task_identity_discovery_enabled: bool,
     ) -> Self {
         Self {
             store,
             capabilities,
             custom_envelope_safety_ceiling,
             steward_run_release,
+            workflow_installation_mode,
+            task_identity_discovery_enabled,
         }
     }
 
@@ -355,6 +361,14 @@ impl PgEnvelopeRequestBroker {
 impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
     fn steward_run_release(&self) -> Option<StewardRunRelease> {
         Some(self.steward_run_release.clone())
+    }
+
+    fn workflow_installation_mode(&self) -> StewardRunWorkflowInstallationMode {
+        self.workflow_installation_mode
+    }
+
+    fn task_identity_discovery_enabled(&self) -> bool {
+        self.task_identity_discovery_enabled
     }
 
     fn custom_envelope_capabilities_valid(&self, envelope: &Envelope) -> bool {
@@ -709,6 +723,14 @@ where
 {
     fn steward_run_release(&self) -> Option<StewardRunRelease> {
         None
+    }
+
+    fn workflow_installation_mode(&self) -> StewardRunWorkflowInstallationMode {
+        StewardRunWorkflowInstallationMode::Remote
+    }
+
+    fn task_identity_discovery_enabled(&self) -> bool {
+        false
     }
 
     fn custom_envelope_capabilities_valid(&self, _envelope: &Envelope) -> bool {
@@ -1170,6 +1192,8 @@ where
         workflow_version: workflow.version,
         workflow_digest: workflow.content_digest,
         reviewed_release,
+        workflow_installation_mode: state.broker.workflow_installation_mode(),
+        task_identity_discovery_enabled: state.broker.task_identity_discovery_enabled(),
     };
     match render_versioned_github_actions_workflow(&body.workflow, &context) {
         Ok(workflow) => Json(GithubActionsWorkflowResponse {
@@ -1225,7 +1249,7 @@ mod tests {
         ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionSubject,
         ProviderConnectionBroker, ProviderConnectionStatus,
     };
-    use crate::{BoxFuture, StewardRunRelease};
+    use crate::{BoxFuture, StewardRunRelease, StewardRunWorkflowInstallationMode};
     use steward_admission::{Envelope, EnvelopeSpec};
     use steward_store::{EnvelopeUsageRecord, WorkflowRevisionRecord};
     use steward_types::{CanonicalUserId, Email};
@@ -1236,6 +1260,8 @@ mod tests {
         create_owners: Arc<Mutex<Vec<CanonicalUserId>>>,
         custom_capabilities_valid: bool,
         custom_platform_safety_valid: bool,
+        workflow_installation_mode: StewardRunWorkflowInstallationMode,
+        task_identity_discovery_enabled: bool,
     }
 
     impl Default for TestBroker {
@@ -1244,6 +1270,8 @@ mod tests {
                 create_owners: Arc::new(Mutex::new(Vec::new())),
                 custom_capabilities_valid: true,
                 custom_platform_safety_valid: true,
+                workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
+                task_identity_discovery_enabled: false,
             }
         }
     }
@@ -1252,7 +1280,7 @@ mod tests {
         fn steward_run_release(&self) -> Option<StewardRunRelease> {
             Some(StewardRunRelease {
                 manifest_schema_version: 3,
-                version: "0.7.0".to_owned(),
+                version: "0.7.6".to_owned(),
                 workflow_repository: "example-org/steward-run".to_owned(),
                 workflow_commit: "3333333333333333333333333333333333333333".to_owned(),
                 action_commit: "4444444444444444444444444444444444444444".to_owned(),
@@ -1261,6 +1289,14 @@ mod tests {
                     "a".repeat(64)
                 ),
             })
+        }
+
+        fn workflow_installation_mode(&self) -> StewardRunWorkflowInstallationMode {
+            self.workflow_installation_mode
+        }
+
+        fn task_identity_discovery_enabled(&self) -> bool {
+            self.task_identity_discovery_enabled
         }
 
         fn custom_envelope_capabilities_valid(&self, _envelope: &Envelope) -> bool {
@@ -1778,6 +1814,7 @@ mod tests {
             .as_str()
             .ok_or_else(|| "render response omitted YAML".to_owned())?;
         assert!(yaml.contains("# envelope-id: env_local_test"));
+        assert!(yaml.contains("# steward-run-workflow-installation-mode: remote"));
         assert!(yaml.contains("      workflow: repository-review@1"));
         assert!(yaml.contains(
             "uses: example-org/steward-run/.github/workflows/steward-task-self-hosted.yml@3333333333333333333333333333333333333333"
@@ -1786,10 +1823,61 @@ mod tests {
             "      envelope-digest: steward:sha256:{}",
             "a".repeat(64)
         )));
+        assert!(yaml.contains("identity-exchange-url: ${{ vars.IDENTITY_EXCHANGE_URL }}"));
+        assert!(
+            yaml.contains("identity-exchange-audience: ${{ vars.IDENTITY_EXCHANGE_AUDIENCE }}")
+        );
+        assert!(
+            yaml.contains("steward-ca-certificate-file: ${{ vars.STEWARD_CA_CERTIFICATE_FILE }}")
+        );
         assert!(!yaml.contains("contents: write"));
         assert!(!yaml.contains("coding-agent-runtime"));
         assert!(!yaml.contains("TARGET_REVISION"));
         assert!(!yaml.contains("TARGET_PATH"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provisioned_envelope_renders_configured_vendored_workflow_without_legacy_identity_inputs()
+    -> Result<(), String> {
+        let app = inner_router(TestBroker {
+            workflow_installation_mode: StewardRunWorkflowInstallationMode::Vendored,
+            task_identity_discovery_enabled: true,
+            ..TestBroker::default()
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests/00000000-0000-0000-0000-000000000001/github-actions-workflow")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workflow": "repository-review@1",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build render request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("render request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read render response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse render response: {error}"))?;
+        let yaml = value["workflow"]["yaml"]
+            .as_str()
+            .ok_or_else(|| "render response omitted YAML".to_owned())?;
+
+        assert!(yaml.contains("# steward-run-workflow-installation-mode: vendored"));
+        assert!(yaml.contains("    uses: ./.github/workflows/steward-task-vendored.yml"));
+        assert!(!yaml.contains("identity-exchange-url:"));
+        assert!(!yaml.contains("identity-exchange-audience:"));
+        assert!(!yaml.contains("steward-ca-certificate-file:"));
         Ok(())
     }
 

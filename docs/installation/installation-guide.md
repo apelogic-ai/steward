@@ -159,6 +159,47 @@ required normalized fields are `manifestSchemaVersion`, `version`,
 commits/image digest. This value binds generated workflows to the same
 steward-run release selected for the installation.
 
+Set `config.apiserver.stewardRunWorkflowInstallationMode` independently from
+those signed coordinates. Its default, `remote`, renders the exact immutable
+repository and workflow commit. `vendored` renders the local path described
+below; it does not change the verified release coordinates retained in
+generated provenance.
+
+### Vendored steward-run workflow
+
+Use `vendored` only when a caller repository must consume the official local
+workflow asset from the same verified steward-run v0.7.6-or-later release named
+by the installation BOM. Steward fails startup when this mode is paired with an
+older release handoff. Follow that release's installation guide to verify its
+`oss-release-manifest.json`, `SHA256SUMS`, signature bundles, image, and chart.
+The checksum inventory must verify `steward-task-vendored.yml` before it is
+copied:
+
+```sh
+set -euo pipefail
+CALLER_REPOSITORY=/path/to/caller
+
+sha256sum -c SHA256SUMS
+mkdir -p "$CALLER_REPOSITORY/.github/workflows"
+install -m 0644 steward-task-vendored.yml \
+  "$CALLER_REPOSITORY/.github/workflows/steward-task-vendored.yml"
+```
+
+Configure Steward only after the verified file is committed at that exact
+path:
+
+```yaml
+config:
+  apiserver:
+    stewardRunWorkflowInstallationMode: vendored
+```
+
+Generated callers then use
+`./.github/workflows/steward-task-vendored.yml`. The released file contains
+the signed manifest's immutable direct action reference, so no PAT or checkout
+token is needed. Refresh and re-verify the local file whenever the installation
+BOM selects a steward-run release whose notes require a new vendored workflow.
+
 | Reference and namespace | Kubernetes type and keys | Producer and consumer | Rotation / condition |
 |---|---|---|---|
 | `secrets.database.name` (`steward-database`) in release namespace | `Opaque`; `secrets.database.key` (`url`) | Database operator creates; API and controller read. | Always. Rotate the database credential and restart both Deployments after the new Secret is present; verify connectivity and migrations. |

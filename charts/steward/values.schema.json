@@ -479,6 +479,7 @@
             "jiraAccountEmail",
             "kubernetesTokenReviewAudience",
             "capabilityCatalog",
+            "stewardRunWorkflowInstallationMode",
             "defaultLlmTemplate",
             "executionBindingsMode",
             "executionBindings",
@@ -643,6 +644,11 @@
                   "pattern": "^[^@\\s:]+(?:/[^@\\s:]+)+@sha256:[0-9a-f]{64}$"
                 }
               }
+            },
+            "stewardRunWorkflowInstallationMode": {
+              "type": "string",
+              "enum": ["remote", "vendored"],
+              "default": "remote"
             },
             "defaultLlmTemplate": {
               "type": "object",

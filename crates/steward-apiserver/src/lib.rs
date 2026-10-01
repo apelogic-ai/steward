@@ -26,10 +26,11 @@ pub use github_actions::{
     GITHUB_FILE_READ_TEMPLATE, GeneratedGithubActionsWorkflow, GithubActionsEnvelopeSelection,
     GithubActionsRenderContext, GithubActionsRenderError, GithubActionsRenderRequest,
     GithubActionsTaskTemplate, MAX_STEWARD_RUN_RELEASE_BYTES, StewardRunRelease,
-    VERSIONED_GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA, VersionedGithubActionsWorkflowContext,
-    parse_github_actions_render_request, render_github_actions_workflow,
-    render_versioned_github_actions_workflow, steward_run_release_from_installation_bom,
-    validate_generated_github_actions_yaml,
+    StewardRunWorkflowInstallationMode, VERSIONED_GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA,
+    VersionedGithubActionsWorkflowContext, parse_github_actions_render_request,
+    render_github_actions_workflow, render_versioned_github_actions_workflow,
+    steward_run_release_from_installation_bom, validate_generated_github_actions_yaml,
+    validate_steward_run_workflow_installation,
 };
 
 pub use tasks::{
