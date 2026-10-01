@@ -507,6 +507,10 @@ fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
     {
         "bridge-gateway-transport"
     } else if stderr.contains("steward-connections-bridge:")
+        && stderr.contains("mcp-gw returned http ")
+    {
+        "bridge-gateway-http"
+    } else if stderr.contains("steward-connections-bridge:")
         && stderr.contains("mcp-gw returned an unexpected status")
     {
         "bridge-gateway-status"
@@ -883,6 +887,16 @@ fn task_log_mode_for_execution(
 
 #[cfg(feature = "runtime")]
 fn task_transcript_requested(
+    execution_class: SandboxExecutionClass,
+    execution_log: ExecutionLogMode,
+) -> bool {
+    execution_class == SandboxExecutionClass::ProviderControl
+        || (execution_class == SandboxExecutionClass::Agent
+            && execution_log == ExecutionLogMode::Full)
+}
+
+#[cfg(feature = "runtime")]
+fn task_transcript_archived(
     execution_class: SandboxExecutionClass,
     execution_log: ExecutionLogMode,
 ) -> bool {
@@ -2360,6 +2374,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             &request.command,
             output_archive_command,
             task_transcript_requested(request.execution_class, request.diagnostics.execution_log),
+            task_transcript_archived(request.execution_class, request.diagnostics.execution_log),
         );
         let executed = self
             .exec_task_process(
@@ -2605,6 +2620,7 @@ fn task_attempt_execution_command(
     command: &[String],
     output_archive_command: &str,
     capture_transcript: bool,
+    archive_transcript: bool,
 ) -> String {
     let diagnostics_directory = format!("{directory}/.steward/diagnostics");
     let stdout_path = format!("{directory}/{EXECUTION_STDOUT_ARCHIVE_PATH}");
@@ -2618,31 +2634,33 @@ fn task_attempt_execution_command(
         .map(|argument| shell_quote(argument))
         .collect::<Vec<_>>()
         .join(" ");
-    let (execution, archive_transcript) = if capture_transcript {
-        (
-            format!(
-                "mkdir -p {diagnostics_directory}; \
-                 ({command}) > {stdout_path} 2> {stderr_path}; status=$?; \
-                 if ! stdout_size=$(wc -c < {stdout_path}) \
-                    || ! stderr_size=$(wc -c < {stderr_path}); then status=70; \
-                 else transcript_size=$((stdout_size + stderr_size)); \
-                   if [ \"$stdout_size\" -gt {MAX_EXECUTION_STREAM_BYTES} ] \
-                      || [ \"$stderr_size\" -gt {MAX_EXECUTION_STREAM_BYTES} ] \
-                      || [ \"$transcript_size\" -gt {MAX_EXECUTION_TRANSCRIPT_BYTES} ]; then \
-                     printf '%s\\n' 'Task execution transcript exceeded its bounded archive contract' >&2; \
-                     status=74; \
-                   else cat {stdout_path}; cat {stderr_path} >&2; fi; \
-                 fi"
-            ),
-            format!(
-                "tar -rf {directory}/output.tar -C {directory} \
-                   {EXECUTION_STDOUT_ARCHIVE_PATH} {EXECUTION_STDERR_ARCHIVE_PATH}; status=$?; \
-                 if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
-                   printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi;"
-            ),
+    let execution = if capture_transcript {
+        format!(
+            "mkdir -p {diagnostics_directory}; \
+             ({command}) > {stdout_path} 2> {stderr_path}; status=$?; \
+             if ! stdout_size=$(wc -c < {stdout_path}) \
+                || ! stderr_size=$(wc -c < {stderr_path}); then status=70; \
+             else transcript_size=$((stdout_size + stderr_size)); \
+               if [ \"$stdout_size\" -gt {MAX_EXECUTION_STREAM_BYTES} ] \
+                  || [ \"$stderr_size\" -gt {MAX_EXECUTION_STREAM_BYTES} ] \
+                  || [ \"$transcript_size\" -gt {MAX_EXECUTION_TRANSCRIPT_BYTES} ]; then \
+                 printf '%s\\n' 'Task execution transcript exceeded its bounded archive contract' >&2; \
+                 status=74; \
+               else cat {stdout_path}; cat {stderr_path} >&2; fi; \
+             fi"
         )
     } else {
-        (format!("{command}; status=$?"), String::new())
+        format!("{command}; status=$?")
+    };
+    let archive_transcript = if archive_transcript {
+        format!(
+            "tar -rf {directory}/output.tar -C {directory} \
+               {EXECUTION_STDOUT_ARCHIVE_PATH} {EXECUTION_STDERR_ARCHIVE_PATH}; status=$?; \
+             if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
+               printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi;"
+        )
+    } else {
+        String::new()
     };
     format!(
         "set +e; pid=$$; pid_start=$(awk '{{print $22}}' /proc/$$/stat) || exit 70; \
@@ -2809,8 +2827,9 @@ mod tests {
         sandbox_spec, staging_append_command, staging_archive_chunks, staging_extract_command,
         staging_prepare_command, task_agent_failure_category, task_attempt_directory,
         task_attempt_execution_command, task_attempt_observation_command,
-        task_attempt_transcript_stream_command, task_process_log_record, task_transcript_requested,
-        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
+        task_attempt_transcript_stream_command, task_process_log_record, task_transcript_archived,
+        task_transcript_requested, validate_raw_sandbox_binding,
+        validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -3179,7 +3198,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn connections_bridge_structurally_disables_full_task_output_logging() {
+    fn connections_bridge_disables_live_logging_but_retains_a_bounded_diagnostic() {
         assert_eq!(
             super::task_log_mode_for_execution(
                 OpenShellTaskLogMode::Full,
@@ -3196,9 +3215,13 @@ mod tests {
             OpenShellTaskLogMode::Full,
             "the provider-control logging override must not change long-running agent logging"
         );
-        assert!(!task_transcript_requested(
+        assert!(task_transcript_requested(
             SandboxExecutionClass::ProviderControl,
             ExecutionLogMode::Full,
+        ));
+        assert!(task_transcript_requested(
+            SandboxExecutionClass::ProviderControl,
+            ExecutionLogMode::Off,
         ));
         assert!(!task_transcript_requested(
             SandboxExecutionClass::Agent,
@@ -3446,8 +3469,13 @@ mod tests {
     #[test]
     fn task_attempt_marker_uses_a_cross_exec_liveness_lease() {
         let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
-        let execution =
-            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true", false);
+        let execution = task_attempt_execution_command(
+            directory,
+            &["/bin/true".to_owned()],
+            "true",
+            false,
+            false,
+        );
         assert!(execution.contains("pid=$$"));
         assert!(execution.contains("/proc/$$/stat"));
         assert!(execution.contains("heartbeat"));
@@ -3464,8 +3492,13 @@ mod tests {
     #[test]
     fn successful_task_execution_archives_bounded_stdout_and_stderr() {
         let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
-        let execution =
-            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true", true);
+        let execution = task_attempt_execution_command(
+            directory,
+            &["/bin/true".to_owned()],
+            "true",
+            true,
+            true,
+        );
 
         assert!(execution.contains(steward_types::direct_package::EXECUTION_STDOUT_ARCHIVE_PATH));
         assert!(execution.contains(steward_types::direct_package::EXECUTION_STDERR_ARCHIVE_PATH));
@@ -3496,10 +3529,41 @@ mod tests {
             "the bounded transcript wrapper must be valid POSIX shell"
         );
 
-        let disabled =
-            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true", false);
+        let disabled = task_attempt_execution_command(
+            directory,
+            &["/bin/true".to_owned()],
+            "true",
+            false,
+            false,
+        );
         assert!(!disabled.contains(steward_types::direct_package::EXECUTION_STDOUT_ARCHIVE_PATH));
         assert!(!disabled.contains(steward_types::direct_package::EXECUTION_STDERR_ARCHIVE_PATH));
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn provider_control_transcript_does_not_mutate_the_response_archive() {
+        let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
+        let execution = task_attempt_execution_command(
+            directory,
+            &["/bin/true".to_owned()],
+            "tar -cf - response.json",
+            task_transcript_requested(
+                SandboxExecutionClass::ProviderControl,
+                ExecutionLogMode::Off,
+            ),
+            task_transcript_archived(
+                SandboxExecutionClass::ProviderControl,
+                ExecutionLogMode::Off,
+            ),
+        );
+
+        assert!(execution.contains(steward_types::direct_package::EXECUTION_STDOUT_ARCHIVE_PATH));
+        assert!(execution.contains(steward_types::direct_package::EXECUTION_STDERR_ARCHIVE_PATH));
+        assert!(
+            !execution.contains("tar -rf"),
+            "provider-control diagnostics must remain separate from the exact bridge response archive"
+        );
     }
 
     #[cfg(feature = "runtime")]
@@ -4693,6 +4757,13 @@ mod tests {
                 b"steward-connections-bridge: bridge MCP-GW returned an unexpected status"
             ),
             "bridge-gateway-status"
+        );
+        assert_eq!(
+            task_agent_failure_category(
+                b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (OAuth redirect target is not allowed)"
+            ),
+            "bridge-gateway-http",
+            "an actionable gateway response must not be mislabeled as a proxy-policy failure"
         );
         assert_eq!(
             task_agent_failure_category(

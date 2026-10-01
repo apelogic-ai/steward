@@ -598,7 +598,9 @@ export type ClosureEntryKind = 'task_definition' | 'prompt' | 'instruction_skill
 
 export type ConnectionOperationErrorResponse = {
     apiVersion: string;
+    detail?: string | null;
     error: string;
+    upstreamStatus?: number | null;
 };
 
 export type ConnectionPhase = 'disconnected' | 'connecting' | 'connected' | 'reauth_required' | 'unavailable';

@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserved bounded MCP-GW HTTP status and safe reason diagnostics for failed governed
+  connection operations in additive migration 0052 and returned them through the
+  connection API's `upstreamStatus` and `detail` fields.
+
 ## [0.3.5] - 2026-09-30
 
 ### Security

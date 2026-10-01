@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
 use reqwest::Url;
@@ -11,7 +12,10 @@ use reqwest::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use steward_adapter_mcp_gw::{GithubStatusCredential, GithubStatusReader};
+use steward_adapter_mcp_gw::{
+    GithubBridgeFailureDiagnostic, GithubStatusCredential, GithubStatusReader,
+    github_bridge_failure_diagnostic,
+};
 use steward_admission::internal_authorities::{
     steward_connections_v1, steward_connections_v2, steward_connections_v3,
 };
@@ -641,7 +645,10 @@ impl<B> GovernedConnectionsBroker<B> {
             match record.operation_state {
                 ConnectionOperationState::Succeeded => return Ok(record),
                 ConnectionOperationState::Failed => {
-                    return Err(connection_broker_error(record.failure_category.as_deref()));
+                    return Err(connection_broker_error(
+                        record.failure_category.as_deref(),
+                        record.failure_detail.as_ref(),
+                    ));
                 }
                 ConnectionOperationState::Queued
                 | ConnectionOperationState::Provisioning
@@ -858,11 +865,23 @@ where
 #[derive(Clone)]
 pub struct ConnectionOperationReconciler {
     store: PgStore,
+    failure_reporter: Arc<dyn Fn(String) + Send + Sync>,
 }
 
 impl ConnectionOperationReconciler {
     pub fn new(store: PgStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            failure_reporter: Arc::new(|line| eprintln!("{line}")),
+        }
+    }
+
+    pub fn with_failure_reporter(
+        mut self,
+        reporter: impl Fn(String) + Send + Sync + 'static,
+    ) -> Self {
+        self.failure_reporter = Arc::new(reporter);
+        self
     }
 
     pub async fn run(self) {
@@ -874,25 +893,47 @@ impl ConnectionOperationReconciler {
         }
     }
 
+    async fn fail_operation(
+        &self,
+        operation_id: Uuid,
+        failure: &ConnectionOperationFailure,
+    ) -> Result<(), StoreError> {
+        let detail = failure
+            .detail
+            .as_ref()
+            .map(GithubBridgeFailureDiagnostic::to_value);
+        self.store
+            .fail_connection_operation(operation_id, failure.category, detail.as_ref())
+            .await?;
+        (self.failure_reporter)(connection_operation_failure_log_line(operation_id, failure));
+        Ok(())
+    }
+
     pub async fn reconcile_once(&self) -> Result<(), StoreError> {
         for operation in self
             .store
             .connection_operations_requiring_reconcile()
             .await?
         {
-            let task_failure_category = if matches!(
+            let task_failure = if matches!(
                 operation.task_phase,
                 steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled
             ) {
-                self.store
+                let failure_reason = self
+                    .store
                     .task(operation.task_uid)
                     .await?
-                    .and_then(|task| task.failure_reason)
-                    .map_or("bridge_failed", |reason| {
-                        connection_operation_failure_category(Some(reason.as_str()))
-                    })
+                    .and_then(|task| task.failure_reason);
+                let execution_stderr = self
+                    .store
+                    .connection_operation_failure_stderr(operation.task_uid)
+                    .await?;
+                connection_operation_failure(failure_reason.as_deref(), execution_stderr.as_deref())
             } else {
-                "bridge_failed"
+                ConnectionOperationFailure {
+                    category: "bridge_failed",
+                    detail: None,
+                }
             };
             if operation.oauth_phase == ConnectionOAuthPhase::Pending {
                 let _ = self
@@ -904,10 +945,17 @@ impl ConnectionOperationReconciler {
                 operation.finalized,
                 operation.operation_state,
                 operation.task_phase,
-                task_failure_category,
+                task_failure.category,
             ) {
-                self.store
-                    .fail_connection_operation(operation.operation_id, category)
+                let failure = if category == task_failure.category {
+                    task_failure.clone()
+                } else {
+                    ConnectionOperationFailure {
+                        category,
+                        detail: None,
+                    }
+                };
+                self.fail_operation(operation.operation_id, &failure)
                     .await?;
                 continue;
             }
@@ -941,9 +989,14 @@ impl ConnectionOperationReconciler {
                 .connection_operation_deadline_elapsed(operation.operation_id)
                 .await?
             {
-                self.store
-                    .fail_connection_operation(operation.operation_id, "deadline_exceeded")
-                    .await?;
+                self.fail_operation(
+                    operation.operation_id,
+                    &ConnectionOperationFailure {
+                        category: "deadline_exceeded",
+                        detail: None,
+                    },
+                )
+                .await?;
                 continue;
             }
             match operation.task_phase {
@@ -980,18 +1033,19 @@ impl ConnectionOperationReconciler {
                                 .await?;
                         }
                         Err(_) => {
-                            self.store
-                                .fail_connection_operation(
-                                    operation.operation_id,
-                                    "invalid_bridge_result",
-                                )
-                                .await?;
+                            self.fail_operation(
+                                operation.operation_id,
+                                &ConnectionOperationFailure {
+                                    category: "invalid_bridge_result",
+                                    detail: None,
+                                },
+                            )
+                            .await?;
                         }
                     }
                 }
                 steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled => {
-                    self.store
-                        .fail_connection_operation(operation.operation_id, task_failure_category)
+                    self.fail_operation(operation.operation_id, &task_failure)
                         .await?;
                 }
                 steward_types::TaskPhase::Submitted
@@ -1030,18 +1084,64 @@ fn finalized_nonterminal_failure(
     })
 }
 
-fn connection_operation_failure_category(failure_reason: Option<&str>) -> &'static str {
-    match failure_reason {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConnectionOperationFailure {
+    category: &'static str,
+    detail: Option<GithubBridgeFailureDiagnostic>,
+}
+
+fn connection_operation_failure(
+    failure_reason: Option<&str>,
+    execution_stderr: Option<&[u8]>,
+) -> ConnectionOperationFailure {
+    let category = match failure_reason {
         Some("bridge-proxy-policy") => "bridge-proxy-policy",
         Some("bridge-runtime-authorization") => "bridge-runtime-authorization",
+        Some("bridge-gateway-http") => "bridge-gateway-http",
         _ => "bridge_failed",
+    };
+    let detail = (category == "bridge-gateway-http")
+        .then(|| execution_stderr.and_then(github_bridge_failure_diagnostic))
+        .flatten();
+    ConnectionOperationFailure { category, detail }
+}
+
+fn connection_operation_failure_log_line(
+    operation_id: Uuid,
+    failure: &ConnectionOperationFailure,
+) -> String {
+    if let Some(detail) = &failure.detail {
+        let reason = detail
+            .reason
+            .as_ref()
+            .map_or_else(|| "null".to_owned(), |reason| json!(reason).to_string());
+        format!(
+            "connection operation failed: operation_id={operation_id} category={} upstream_status={} detail={reason}",
+            failure.category, detail.status
+        )
+    } else {
+        format!(
+            "connection operation failed: operation_id={operation_id} category={}",
+            failure.category
+        )
     }
 }
 
-fn connection_broker_error(failure_category: Option<&str>) -> ConnectionBrokerError {
+fn connection_broker_error(
+    failure_category: Option<&str>,
+    failure_detail: Option<&Value>,
+) -> ConnectionBrokerError {
     match failure_category {
         Some("bridge-proxy-policy") => ConnectionBrokerError::ProxyPolicyDenied,
         Some("bridge-runtime-authorization") => ConnectionBrokerError::ProviderAuthorizationFailed,
+        Some("bridge-gateway-http") => failure_detail
+            .and_then(GithubBridgeFailureDiagnostic::from_value)
+            .map_or(ConnectionBrokerError::Unavailable, |detail| {
+                ConnectionBrokerError::GatewayHttp {
+                    status: detail.status,
+                    reason: detail.reason,
+                }
+            }),
         _ => ConnectionBrokerError::Unavailable,
     }
 }
@@ -1050,10 +1150,11 @@ fn connection_broker_error(failure_category: Option<&str>) -> ConnectionBrokerEr
 mod finalized_connection_operation_tests {
     use steward_store::ConnectionOperationState;
     use steward_types::TaskPhase;
+    use uuid::Uuid;
 
     use super::{
-        connection_broker_error, connection_operation_failure_category,
-        finalized_nonterminal_failure,
+        ConnectionOperationFailure, connection_broker_error, connection_operation_failure,
+        connection_operation_failure_log_line, finalized_nonterminal_failure,
     };
 
     #[test]
@@ -1107,14 +1208,54 @@ mod finalized_connection_operation_tests {
             ),
         ] {
             assert_eq!(
-                connection_operation_failure_category(Some(task_reason)),
+                connection_operation_failure(Some(task_reason), None).category,
                 operation_category
             );
             assert_eq!(
-                connection_broker_error(Some(operation_category)),
+                connection_broker_error(Some(operation_category), None),
                 broker_error
             );
         }
+    }
+
+    #[test]
+    fn gateway_http_failure_retains_only_the_fixed_adapter_diagnostic() {
+        let failure = connection_operation_failure(
+            Some("bridge-gateway-http"),
+            Some(
+                b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (OAuth redirect target is not allowed)\n",
+            ),
+        );
+        assert_eq!(failure.category, "bridge-gateway-http");
+        let expected_detail = steward_adapter_mcp_gw::GithubBridgeFailureDiagnostic {
+            status: 400,
+            reason: Some("OAuth redirect target is not allowed".to_owned()),
+        };
+        assert_eq!(failure.detail, Some(expected_detail.clone()));
+        let operation_id = Uuid::nil();
+        assert_eq!(
+            connection_operation_failure_log_line(operation_id, &failure),
+            "connection operation failed: operation_id=00000000-0000-0000-0000-000000000000 category=bridge-gateway-http upstream_status=400 detail=\"OAuth redirect target is not allowed\""
+        );
+        assert_eq!(
+            connection_broker_error(Some(failure.category), Some(&expected_detail.to_value()),),
+            crate::connections::ConnectionBrokerError::GatewayHttp {
+                status: 400,
+                reason: Some("OAuth redirect target is not allowed".to_owned()),
+            }
+        );
+
+        assert_eq!(
+            connection_operation_failure(
+                Some("bridge-gateway-http"),
+                Some(b"Authorization: Bearer obviously-fake-secret")
+            ),
+            ConnectionOperationFailure {
+                category: "bridge-gateway-http",
+                detail: None,
+            },
+            "arbitrary stderr must never become a durable or logged failure detail"
+        );
     }
 }
 

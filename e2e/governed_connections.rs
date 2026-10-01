@@ -5,8 +5,12 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::body::to_bytes;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use kube::Client;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
@@ -99,6 +103,7 @@ struct Harness {
     context: String,
     controller: Option<JoinHandle<()>>,
     database: PgPool,
+    failure_reports: Arc<Mutex<Vec<String>>>,
     kubeconfig: PathBuf,
     mcp_forward: String,
     openshell: PathBuf,
@@ -171,6 +176,7 @@ impl Harness {
             context,
             controller: None,
             database,
+            failure_reports: Arc::new(Mutex::new(Vec::new())),
             kubeconfig: PathBuf::from(required("STEWARD_TEST_KUBECONFIG")?),
             mcp_forward: required("STEWARD_CONNECTIONS_TEST_MCP_FORWARD")?,
             openshell: PathBuf::from(required("STEWARD_OPENSHELL_CLI")?),
@@ -220,7 +226,13 @@ impl Harness {
     }
 
     fn start_reconciler(&mut self) {
-        let reconciler = ConnectionOperationReconciler::new(self.store.clone());
+        let failure_reports = self.failure_reports.clone();
+        let reconciler = ConnectionOperationReconciler::new(self.store.clone())
+            .with_failure_reporter(move |line| {
+                if let Ok(mut reports) = failure_reports.lock() {
+                    reports.push(line);
+                }
+            });
         self.reconciler = Some(tokio::spawn(reconciler.run()));
     }
 
@@ -235,6 +247,14 @@ impl Harness {
         &self,
         artifact_trust_mode: &str,
     ) -> Result<GovernedConnectionsBroker<()>, Box<dyn Error>> {
+        self.broker_for_mode_and_origin(artifact_trust_mode, "https://steward.example.test")
+    }
+
+    fn broker_for_mode_and_origin(
+        &self,
+        artifact_trust_mode: &str,
+        server_origin: &str,
+    ) -> Result<GovernedConnectionsBroker<()>, Box<dyn Error>> {
         let config = GovernedConnectionsConfig::new(
             ConnectionExecutionBindings {
                 artifact_trust_mode: artifact_trust_mode.to_owned(),
@@ -244,7 +264,7 @@ impl Harness {
                 namespace: CONNECTIONS_NAMESPACE.to_owned(),
                 runtime_class: env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME").unwrap_or_default(),
             },
-            "https://steward.example.test",
+            server_origin,
         )
         .map_err(|error| io::Error::other(format!("build governed broker: {error:?}")))?;
         Ok(GovernedConnectionsBroker::new(
@@ -921,6 +941,106 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     harness
         .wait_operation_finalized(cancelled_status, Duration::from_secs(90))
         .await?;
+
+    let rejected_start_count = harness.operation_count(&alice_id, "start").await?;
+    let rejected_broker =
+        harness.broker_for_mode_and_origin("github-attestation", "https://blocked.example.test")?;
+    let rejected_error = match rejected_broker.start(&alice).await {
+        Err(error) => error,
+        Ok(_) => {
+            return Err(io::Error::other(
+                "real MCP-GW unexpectedly accepted a disallowed OAuth redirect origin",
+            )
+            .into());
+        }
+    };
+    let rejected_operation = harness
+        .latest_operation(&alice_id, "start", rejected_start_count)
+        .await?;
+    harness
+        .wait_operation_finalized(rejected_operation, Duration::from_secs(90))
+        .await?;
+    assert_eq!(
+        rejected_error,
+        ConnectionBrokerError::GatewayHttp {
+            status: 400,
+            reason: Some("OAuth redirect target is not allowed".to_owned()),
+        },
+        "the real MCP-GW rejection must cross the complete governed bridge path"
+    );
+
+    let operation_failure = sqlx::query(
+        "SELECT operation_state, failure_category, failure_detail, task_uid \
+         FROM connection_operations WHERE operation_id = $1",
+    )
+    .bind(rejected_operation)
+    .fetch_one(&harness.database)
+    .await?;
+    assert_eq!(
+        operation_failure.try_get::<String, _>("operation_state")?,
+        "failed"
+    );
+    assert_eq!(
+        operation_failure.try_get::<Option<String>, _>("failure_category")?,
+        Some("bridge-gateway-http".to_owned())
+    );
+    assert_eq!(
+        operation_failure.try_get::<Option<Json<serde_json::Value>>, _>("failure_detail")?,
+        Some(Json(json!({
+            "upstreamStatus": 400,
+            "reason": "OAuth redirect target is not allowed"
+        })))
+    );
+    let rejected_task_uid: Uuid = operation_failure.try_get("task_uid")?;
+    let failed_attempt = sqlx::query(
+        "SELECT last_error_code, execution_stderr FROM task_execution_attempts \
+         WHERE task_uid = $1 AND state = 'failed' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(rejected_task_uid)
+    .fetch_one(&harness.database)
+    .await?;
+    assert_eq!(
+        failed_attempt.try_get::<Option<String>, _>("last_error_code")?,
+        Some("bridge-gateway-http".to_owned())
+    );
+    assert_eq!(
+        failed_attempt.try_get::<Option<Vec<u8>>, _>("execution_stderr")?,
+        Some(
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (OAuth redirect target is not allowed)\n"
+                .to_vec()
+        )
+    );
+
+    let expected_report = format!(
+        "connection operation failed: operation_id={rejected_operation} category=bridge-gateway-http upstream_status=400 detail=\"OAuth redirect target is not allowed\""
+    );
+    let reports = harness
+        .failure_reports
+        .lock()
+        .map_err(|_| io::Error::other("connection failure report collector was poisoned"))?;
+    assert_eq!(
+        reports
+            .iter()
+            .filter(|report| report.as_str() == expected_report)
+            .count(),
+        1,
+        "one sanitized operator log must be emitted for the failed operation"
+    );
+    drop(reports);
+
+    let response = rejected_error.into_response();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response_body = to_bytes(response.into_body(), 1024).await?;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response_body)?,
+        json!({
+            "apiVersion": "steward.connections/v1",
+            "error": "gateway_http_error",
+            "upstreamStatus": 400,
+            "detail": "OAuth redirect target is not allowed"
+        }),
+        "the browser-facing API must preserve only the bounded actionable diagnostic"
+    );
 
     let start_count = harness.operation_count(&alice_id, "start").await?;
     let start_broker = broker.clone();

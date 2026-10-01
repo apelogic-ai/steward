@@ -7967,6 +7967,26 @@ impl PgStore {
         .transpose()
     }
 
+    /// Return the immutable stderr captured for a failed governed connection attempt.
+    ///
+    /// Connection Tasks are excluded from generic run reads. This internal projection lets the
+    /// connection reconciler recover only the bounded terminal transcript needed by the adapter's
+    /// strict failure-diagnostic parser.
+    pub async fn connection_operation_failure_stderr(
+        &self,
+        task_uid: Uuid,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        sqlx::query_scalar(
+            "SELECT execution_stderr FROM task_execution_attempts \
+             WHERE task_uid = $1 AND state = 'failed'",
+        )
+        .bind(task_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+        .map(Option::flatten)
+    }
+
     /// Internal validating-webhook lookup for a connection runtime transition. Namespace and
     /// name come from the admission object and must resolve to exactly one live, server-authored
     /// operation. The returned orchestration projection lets admission distinguish the inert
@@ -8394,7 +8414,7 @@ impl PgStore {
                  flow_expires_at = CASE WHEN operation_kind = 'start' \
                      THEN now() + make_interval(secs => $7) ELSE flow_expires_at END, \
                  finalization_state = 'requested', cleanup_state = 'tearing_down', \
-                 failure_category = NULL, updated_at = now() \
+                 failure_category = NULL, failure_detail = NULL, updated_at = now() \
              WHERE operation_id = $1 AND operation_state NOT IN ('succeeded', 'failed')",
         )
         .bind(operation_id)
@@ -8442,14 +8462,18 @@ impl PgStore {
         &self,
         operation_id: Uuid,
         category: &str,
+        failure_detail: Option<&serde_json::Value>,
     ) -> Result<(), StoreError> {
-        if category.trim().is_empty() {
+        if category.trim().is_empty()
+            || !connection_operation_failure_detail_is_valid(category, failure_detail)
+        {
             return Err(StoreError::InvalidConnectionOperation);
         }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let operation = sqlx::query(
             "UPDATE connection_operations \
-             SET operation_state = 'failed', failure_category = $2, result = NULL, \
+             SET operation_state = 'failed', failure_category = $2, failure_detail = $3, \
+                 result = NULL, \
                  authorization_url = NULL, finalization_state = 'requested', \
                  cleanup_state = 'tearing_down', updated_at = now() \
              WHERE operation_id = $1 AND operation_state NOT IN ('succeeded', 'failed') \
@@ -8457,6 +8481,7 @@ impl PgStore {
         )
         .bind(operation_id)
         .bind(category)
+        .bind(failure_detail.cloned().map(Json))
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?
@@ -9198,15 +9223,89 @@ fn connection_runtime_class_is_valid(runtime_class: &str) -> bool {
     runtime_class.is_empty() || !runtime_class.trim().is_empty()
 }
 
+fn connection_operation_failure_detail_is_valid(
+    category: &str,
+    failure_detail: Option<&serde_json::Value>,
+) -> bool {
+    let Some(failure_detail) = failure_detail else {
+        return true;
+    };
+    if category != "bridge-gateway-http" {
+        return false;
+    }
+    let Some(object) = failure_detail.as_object() else {
+        return false;
+    };
+    if object.is_empty()
+        || object.len() > 2
+        || !object
+            .keys()
+            .all(|key| matches!(key.as_str(), "upstreamStatus" | "reason"))
+    {
+        return false;
+    }
+    let Some(status) = object
+        .get("upstreamStatus")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return false;
+    };
+    if !(100..=599).contains(&status) {
+        return false;
+    }
+    let Some(reason) = object.get("reason") else {
+        return true;
+    };
+    let Some(reason) = reason.as_str() else {
+        return false;
+    };
+    !reason.is_empty()
+        && reason.len() <= 200
+        && reason.trim() == reason
+        && !reason.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod connection_binding_validation_tests {
-    use super::connection_runtime_class_is_valid;
+    use serde_json::json;
+
+    use super::{connection_operation_failure_detail_is_valid, connection_runtime_class_is_valid};
 
     #[test]
     fn cluster_default_runtime_class_is_valid() {
         assert!(connection_runtime_class_is_valid(""));
         assert!(connection_runtime_class_is_valid("openshell-runc"));
         assert!(!connection_runtime_class_is_valid("   "));
+    }
+
+    #[test]
+    fn connection_failure_detail_is_exact_and_bounded() {
+        assert!(connection_operation_failure_detail_is_valid(
+            "bridge-gateway-http",
+            Some(&json!({
+                "upstreamStatus": 400,
+                "reason": "OAuth redirect target is not allowed"
+            }))
+        ));
+        assert!(connection_operation_failure_detail_is_valid(
+            "bridge-gateway-http",
+            Some(&json!({"upstreamStatus": 503}))
+        ));
+        assert!(!connection_operation_failure_detail_is_valid(
+            "bridge_failed",
+            Some(&json!({"upstreamStatus": 400}))
+        ));
+        assert!(!connection_operation_failure_detail_is_valid(
+            "bridge-gateway-http",
+            Some(&json!({
+                "upstreamStatus": 400,
+                "reason": "x".repeat(201)
+            }))
+        ));
+        assert!(!connection_operation_failure_detail_is_valid(
+            "bridge-gateway-http",
+            Some(&json!({"upstreamStatus": 400, "raw": "response"}))
+        ));
     }
 }
 
@@ -10026,6 +10125,8 @@ pub struct ConnectionOperationRecord {
     pub cached_status: Option<serde_json::Value>,
     pub result: Option<serde_json::Value>,
     pub failure_category: Option<String>,
+    /// Bounded adapter-sanitized upstream status/reason. Never raw provider output or stderr.
+    pub failure_detail: Option<serde_json::Value>,
     pub finalization_state: String,
     pub cleanup_state: String,
     pub cleanup_finding: Option<String>,
@@ -10870,6 +10971,10 @@ fn connection_operation_record(
             .map_err(database_error)?
             .map(|value| value.0),
         failure_category: row.try_get("failure_category").map_err(database_error)?,
+        failure_detail: row
+            .try_get::<Option<Json<serde_json::Value>>, _>("failure_detail")
+            .map_err(database_error)?
+            .map(|value| value.0),
         finalization_state: row.try_get("finalization_state").map_err(database_error)?,
         cleanup_state: row.try_get("cleanup_state").map_err(database_error)?,
         cleanup_finding: row.try_get("cleanup_finding").map_err(database_error)?,

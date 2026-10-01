@@ -2048,7 +2048,7 @@ mod tests {
             let result = self
                 .result
                 .lock()
-                .map(|result| *result)
+                .map(|result| result.clone())
                 .unwrap_or(Err(ConnectionBrokerError::Unavailable));
             Box::pin(async move {
                 let phase = result?;

@@ -17,6 +17,76 @@ const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 const PROVIDER_TRANSPORT_READY_TIMEOUT: Duration = Duration::from_secs(12);
 const PROVIDER_TRANSPORT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const DIRECT_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
+pub const MAX_GATEWAY_FAILURE_DETAIL_BYTES: usize = 200;
+const BRIDGE_GATEWAY_HTTP_PREFIX: &str = "steward-connections-bridge: bridge MCP-GW returned HTTP ";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GithubBridgeFailureDiagnostic {
+    pub status: u16,
+    pub reason: Option<String>,
+}
+
+impl GithubBridgeFailureDiagnostic {
+    pub fn to_value(&self) -> Value {
+        let mut value = Map::new();
+        value.insert("upstreamStatus".to_owned(), Value::from(self.status));
+        if let Some(reason) = &self.reason {
+            value.insert("reason".to_owned(), Value::String(reason.clone()));
+        }
+        Value::Object(value)
+    }
+
+    pub fn from_value(value: &Value) -> Option<Self> {
+        let object = value.as_object()?;
+        if !object
+            .keys()
+            .all(|key| matches!(key.as_str(), "upstreamStatus" | "reason"))
+        {
+            return None;
+        }
+        let status = u16::try_from(object.get("upstreamStatus")?.as_u64()?).ok()?;
+        if !(100..=599).contains(&status) {
+            return None;
+        }
+        let reason = match object.get("reason") {
+            None => None,
+            Some(value) => {
+                let reason = value.as_str()?;
+                let sanitized = sanitized_gateway_failure_scalar(reason)?;
+                Some((sanitized == reason).then_some(sanitized)?)
+            }
+        };
+        Some(Self { status, reason })
+    }
+}
+
+/// Parse only the fixed, sanitized failure line emitted by the Connections bridge.
+/// Arbitrary task stderr is never treated as an operator-facing gateway diagnostic.
+pub fn github_bridge_failure_diagnostic(stderr: &[u8]) -> Option<GithubBridgeFailureDiagnostic> {
+    let stderr = std::str::from_utf8(stderr)
+        .ok()?
+        .trim_end_matches(['\r', '\n']);
+    let remainder = stderr.strip_prefix(BRIDGE_GATEWAY_HTTP_PREFIX)?;
+    let status_end = remainder
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(remainder.len());
+    let status = remainder[..status_end].parse::<u16>().ok()?;
+    if !(100..=599).contains(&status) {
+        return None;
+    }
+    let suffix = &remainder[status_end..];
+    let reason = if suffix.is_empty() {
+        None
+    } else {
+        let reason = suffix.strip_prefix(" (")?.strip_suffix(')')?;
+        let sanitized = sanitized_gateway_failure_scalar(reason)?;
+        if sanitized != reason {
+            return None;
+        }
+        Some(sanitized)
+    };
+    Some(GithubBridgeFailureDiagnostic { status, reason })
+}
 const LEGACY_STATUS_PATH: &str = "/oauth/github/status";
 const LIFECYCLE_STATUS_PATH: &str = "/connections/github/status";
 const START_PATH: &str = "/oauth/github/start";
@@ -354,12 +424,7 @@ fn parse_response(
 ) -> Result<Value, PortError> {
     match operation {
         GithubBridgeOperation::Status => {
-            require_status(
-                status,
-                StatusCode::OK,
-                "read GitHub connection status",
-                body,
-            )?;
+            require_status(status, StatusCode::OK, body)?;
             let object = json_object(body, "GitHub status response")?;
             match contract {
                 GatewayContract::LegacyV032 => {
@@ -370,26 +435,21 @@ fn parse_response(
             }
         }
         GithubBridgeOperation::Start => {
-            require_status(status, StatusCode::OK, "start GitHub connection", body)?;
+            require_status(status, StatusCode::OK, body)?;
             let object = json_object(body, "GitHub start response")?;
             let authorization_url = exact_string_field(&object, "authorizationUrl")?;
             validate_authorization_url(&authorization_url)?;
             Ok(json!({"authorizationUrl": authorization_url}))
         }
         GithubBridgeOperation::Disconnect => {
-            require_status(
-                status,
-                StatusCode::NO_CONTENT,
-                "disconnect GitHub connection",
-                body,
-            )?;
+            require_status(status, StatusCode::NO_CONTENT, body)?;
             if !body.is_empty() {
                 return Err(unavailable("disconnect GitHub connection"));
             }
             Ok(json!({"disconnected": true}))
         }
         GithubBridgeOperation::Rerun => {
-            require_status(status, StatusCode::OK, "re-run GitHub workflow", body)?;
+            require_status(status, StatusCode::OK, body)?;
             let object = mcp_json_object(body, "GitHub rerun MCP response")?;
             if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
                 || object.get("id").and_then(Value::as_str) != Some(RERUN_REQUEST_ID)
@@ -416,12 +476,7 @@ fn parse_response(
     }
 }
 
-fn require_status(
-    actual: StatusCode,
-    expected: StatusCode,
-    operation: &str,
-    body: &[u8],
-) -> Result<(), PortError> {
+fn require_status(actual: StatusCode, expected: StatusCode, body: &[u8]) -> Result<(), PortError> {
     if actual == expected {
         Ok(())
     } else if actual == StatusCode::UNAUTHORIZED {
@@ -442,8 +497,99 @@ fn require_status(
             Err(failed("MCP-GW rejected runtime authorization"))
         }
     } else {
-        Err(unavailable(operation))
+        let detail = sanitized_gateway_failure_detail(body)
+            .map(|detail| format!(" ({detail})"))
+            .unwrap_or_default();
+        Err(failed(&format!(
+            "MCP-GW returned HTTP {}{detail}",
+            actual.as_u16()
+        )))
     }
+}
+
+fn sanitized_gateway_failure_detail(body: &[u8]) -> Option<String> {
+    let object = serde_json::from_slice::<Value>(body)
+        .ok()?
+        .as_object()?
+        .clone();
+    let value = object
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("code").and_then(Value::as_str))?;
+    sanitized_gateway_failure_scalar(value)
+}
+
+fn sanitized_gateway_failure_scalar(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b' ' | b'.' | b',' | b':' | b';' | b'\'' | b'(' | b')' | b'_' | b'/' | b'-'
+                )
+        })
+        || contains_sensitive_gateway_failure_material(value)
+    {
+        return None;
+    }
+    let truncated = value[..value.len().min(MAX_GATEWAY_FAILURE_DETAIL_BYTES)].trim_end();
+    (!truncated.is_empty()).then(|| truncated.to_owned())
+}
+
+fn contains_sensitive_gateway_failure_material(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if [
+        "authorization",
+        "bearer",
+        "cookie",
+        "token",
+        "secret",
+        "password",
+        "api_key",
+        "api-key",
+        "apikey",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+
+    let has_compact_high_entropy_word = value
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '_' && character != '-'
+        })
+        .any(|word| {
+            word.len() >= 20
+                && word.bytes().any(|byte| byte.is_ascii_alphabetic())
+                && word.bytes().any(|byte| byte.is_ascii_digit())
+        });
+    if has_compact_high_entropy_word {
+        return true;
+    }
+
+    value
+        .split(|character: char| {
+            character.is_whitespace() || matches!(character, '"' | '\'' | '(' | ')' | ',' | ';')
+        })
+        .any(|word| {
+            let segments = word.split('.').collect::<Vec<_>>();
+            segments.windows(3).any(|window| {
+                window.iter().all(|segment| {
+                    segment.len() >= 8
+                        && segment
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                })
+            })
+        })
 }
 
 fn validate_status_response(object: &Map<String, Value>) -> Result<(), PortError> {
@@ -806,8 +952,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        GatewayContract, GithubBridgeOperation, GithubBridgeRequest, GithubMcpGateway,
-        GithubStatusCredential, GithubStatusReader, parse_response, pre_dispatch_provider_failure,
+        GatewayContract, GithubBridgeFailureDiagnostic, GithubBridgeOperation, GithubBridgeRequest,
+        GithubMcpGateway, GithubStatusCredential, GithubStatusReader,
+        github_bridge_failure_diagnostic, parse_response, pre_dispatch_provider_failure,
     };
     use reqwest::StatusCode;
     use steward_ports::PortError;
@@ -1144,9 +1291,130 @@ mod tests {
                 b"ignored",
             ),
             Err(PortError::Failed {
-                reason: "MCP-GW unavailable while attempting to read GitHub connection status"
-                    .to_owned(),
+                reason: "MCP-GW returned HTTP 502".to_owned(),
             })
+        );
+        assert_eq!(
+            parse_response(
+                GatewayContract::LifecycleV049,
+                GithubBridgeOperation::Start,
+                StatusCode::BAD_REQUEST,
+                br#"{"error":"OAuth redirect target is not allowed"}"#,
+            ),
+            Err(PortError::Failed {
+                reason: "MCP-GW returned HTTP 400 (OAuth redirect target is not allowed)"
+                    .to_owned(),
+            }),
+            "a bounded error field must preserve the actionable gateway rejection"
+        );
+        assert_eq!(
+            parse_response(
+                GatewayContract::LifecycleV049,
+                GithubBridgeOperation::Start,
+                StatusCode::BAD_REQUEST,
+                br#"{"error":"see https://provider.example.test/callback?token=obviously-fake-secret"}"#,
+            ),
+            Err(PortError::Failed {
+                reason: "MCP-GW returned HTTP 400".to_owned(),
+            }),
+            "query-bearing URLs and token material must never enter the diagnostic"
+        );
+        let oversized = serde_json::json!({"code": "a".repeat(201)}).to_string();
+        assert_eq!(
+            parse_response(
+                GatewayContract::LifecycleV049,
+                GithubBridgeOperation::Start,
+                StatusCode::BAD_REQUEST,
+                oversized.as_bytes(),
+            ),
+            Err(PortError::Failed {
+                reason: format!("MCP-GW returned HTTP 400 ({})", "a".repeat(200)),
+            }),
+            "the diagnostic must be capped at 200 bytes"
+        );
+    }
+
+    #[test]
+    fn bridge_failure_diagnostic_accepts_only_the_fixed_sanitized_line() {
+        let diagnostic =
+            github_bridge_failure_diagnostic(
+                b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (OAuth redirect target is not allowed)\n"
+            );
+        let expected = GithubBridgeFailureDiagnostic {
+            status: 400,
+            reason: Some("OAuth redirect target is not allowed".to_owned()),
+        };
+        assert_eq!(diagnostic, Some(expected.clone()));
+        assert_eq!(
+            diagnostic
+                .as_ref()
+                .and_then(|diagnostic| GithubBridgeFailureDiagnostic::from_value(
+                    &diagnostic.to_value()
+                )),
+            Some(expected),
+            "the persisted projection must round trip only the bounded status and reason"
+        );
+        assert_eq!(
+            github_bridge_failure_diagnostic(
+                b"steward-connections-bridge: bridge MCP-GW returned HTTP 503\n"
+            ),
+            Some(GithubBridgeFailureDiagnostic {
+                status: 503,
+                reason: None,
+            })
+        );
+        for hostile in [
+            b"prefix steward-connections-bridge: bridge MCP-GW returned HTTP 400 (reason)"
+                .as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 99 (reason)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (https://provider.example.test/callback?token=obviously-fake-secret)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (authorization: Bearer obviously-fake-secret)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (aaaaaaaa.bbbbbbbb.cccccccc)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (/oauth/callback?code=abc&state=xyz)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (gh.example/cb?code=abc&state=xyz)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (code=abc)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (state=xyz)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (ghp_1234567890abcdef)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (gho_1234567890abcdef)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (token abcdefghijklmnop)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (Authorization : abc)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (Cookie: session=abc)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (set-cookie session=abc)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (alice@example.com)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (prefix.aaaaaaaa.bbbbbbbb.cccccccc)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (aaaaaaaa.bbbbbbbb.cccccccc.dddddddd.eeeeeeee)".as_slice(),
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (request Abcdefghijklmnop12345 rejected)".as_slice(),
+            "steward-connections-bridge: bridge MCP-GW returned HTTP 400 (unsafe\u{2028}detail)".as_bytes(),
+        ] {
+            assert_eq!(
+                github_bridge_failure_diagnostic(hostile),
+                None,
+                "untrusted bridge stderr must not become a persisted diagnostic"
+            );
+        }
+
+        let userinfo = format!(
+            "steward-connections-bridge: bridge MCP-GW returned HTTP 400 ({}{}{}:{}{}host.example.test/path)",
+            "https", "://", "user", "pw", "@"
+        );
+        assert_eq!(
+            github_bridge_failure_diagnostic(userinfo.as_bytes()),
+            None,
+            "URL userinfo must never become a persisted diagnostic"
+        );
+
+        let trailing = serde_json::json!({"error": format!("{} zzz", "a".repeat(199))}).to_string();
+        assert_eq!(
+            parse_response(
+                GatewayContract::LifecycleV049,
+                GithubBridgeOperation::Start,
+                StatusCode::BAD_REQUEST,
+                trailing.as_bytes(),
+            ),
+            Err(PortError::Failed {
+                reason: format!("MCP-GW returned HTTP 400 ({})", "a".repeat(199)),
+            }),
+            "truncation must not retain trailing whitespace"
         );
     }
 
