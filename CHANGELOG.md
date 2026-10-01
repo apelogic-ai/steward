@@ -9,6 +9,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Started GitHub connection authorization asynchronously: the browser mutation
+  now returns an owner-scoped operation identifier and polling deadline with
+  HTTP 202, and the UI polls that operation until the one-time authorization
+  URL or a bounded terminal failure is available. A perpetually pending poll
+  stops at the advertised deadline and leaves an actionable retry state. A
+  retry that reuses a completed start remains pollable until its pending OAuth
+  flow expires rather than inheriting the elapsed runtime-response deadline.
 - Added opt-in MCP-GW connection-status v2 consumption and default-on GitHub
   Connect association for `steward-task-v3`, matching only the immutable numeric
   GitHub account ID and recording connection-verification evidence in additive

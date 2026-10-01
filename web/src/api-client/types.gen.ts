@@ -608,6 +608,26 @@ export type ConnectionOperationErrorResponse = {
 
 export type ConnectionPhase = 'disconnected' | 'connecting' | 'connected' | 'reauth_required' | 'unavailable';
 
+export type ConnectionStartOperationResponse = {
+    apiVersion: string;
+    /**
+     * One-time HTTPS destination. It must not be persisted or logged by clients.
+     */
+    authorizationUrl?: string | null;
+    detail?: string | null;
+    error?: string | null;
+    /**
+     * Conservative expiry for MCP-GW's pinned OAuth state lifetime plus clock skew.
+     */
+    expiresAt?: string | null;
+    operationId: string;
+    provider: string;
+    state: ConnectionStartOperationState;
+    upstreamStatus?: number | null;
+};
+
+export type ConnectionStartOperationState = 'pending' | 'succeeded' | 'failed';
+
 export type ConnectionStatusResponse = {
     apiVersion: string;
     provider: string;
@@ -1144,16 +1164,13 @@ export type SourceProvider = 'github';
 
 export type StableProviderId = string;
 
-export type StartConnectionResponse = {
+export type StartConnectionAcceptedResponse = {
     apiVersion: string;
+    operationId: string;
     /**
-     * One-time HTTPS destination. It must not be persisted or logged by clients.
+     * Server-owned deadline after which the browser must stop polling.
      */
-    authorizationUrl: string;
-    /**
-     * Conservative expiry for MCP-GW's pinned OAuth state lifetime plus clock skew.
-     */
-    expiresAt: string;
+    pollDeadlineAt: string;
     provider: string;
 };
 
@@ -1670,6 +1687,39 @@ export type DisconnectConnectionResponses = {
 
 export type DisconnectConnectionResponse = DisconnectConnectionResponses[keyof DisconnectConnectionResponses];
 
+export type ConnectionStartOperationData = {
+    body?: never;
+    path: {
+        operation_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/connections/github/operations/{operation_id}';
+};
+
+export type ConnectionStartOperationErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Connection operation is unavailable
+     */
+    404: unknown;
+    /**
+     * Connection broker is unavailable
+     */
+    503: ConnectionOperationErrorResponse;
+};
+
+export type ConnectionStartOperationError = ConnectionStartOperationErrors[keyof ConnectionStartOperationErrors];
+
+export type ConnectionStartOperationResponses = {
+    200: ConnectionStartOperationResponse;
+    202: ConnectionStartOperationResponse;
+};
+
+export type ConnectionStartOperationResponse2 = ConnectionStartOperationResponses[keyof ConnectionStartOperationResponses];
+
 export type StartConnectionData = {
     body: BrowserMutationRequest;
     headers: {
@@ -1706,10 +1756,10 @@ export type StartConnectionErrors = {
 export type StartConnectionError = StartConnectionErrors[keyof StartConnectionErrors];
 
 export type StartConnectionResponses = {
-    200: StartConnectionResponse;
+    202: StartConnectionAcceptedResponse;
 };
 
-export type StartConnectionResponse2 = StartConnectionResponses[keyof StartConnectionResponses];
+export type StartConnectionResponse = StartConnectionResponses[keyof StartConnectionResponses];
 
 export type ApproveAdminEnvelopeRequestData = {
     body: ApproveEnvelopeRequestBody;
@@ -3038,6 +3088,40 @@ export type DisconnectProviderConnectionResponses = {
 
 export type DisconnectProviderConnectionResponse = DisconnectProviderConnectionResponses[keyof DisconnectProviderConnectionResponses];
 
+export type GetProviderConnectionStartOperationData = {
+    body?: never;
+    path: {
+        provider: string;
+        operation_id: string;
+    };
+    query?: never;
+    url: '/app/api/v1/connections/{provider}/operations/{operation_id}';
+};
+
+export type GetProviderConnectionStartOperationErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Provider or connection operation is unavailable
+     */
+    404: unknown;
+    /**
+     * Connection broker is unavailable
+     */
+    503: ConnectionOperationErrorResponse;
+};
+
+export type GetProviderConnectionStartOperationError = GetProviderConnectionStartOperationErrors[keyof GetProviderConnectionStartOperationErrors];
+
+export type GetProviderConnectionStartOperationResponses = {
+    200: ConnectionStartOperationResponse;
+    202: ConnectionStartOperationResponse;
+};
+
+export type GetProviderConnectionStartOperationResponse = GetProviderConnectionStartOperationResponses[keyof GetProviderConnectionStartOperationResponses];
+
 export type StartProviderConnectionData = {
     body: BrowserMutationRequest;
     headers: {
@@ -3072,7 +3156,7 @@ export type StartProviderConnectionErrors = {
 export type StartProviderConnectionError = StartProviderConnectionErrors[keyof StartProviderConnectionErrors];
 
 export type StartProviderConnectionResponses = {
-    200: StartConnectionResponse;
+    202: StartConnectionAcceptedResponse;
 };
 
 export type StartProviderConnectionResponse = StartProviderConnectionResponses[keyof StartProviderConnectionResponses];

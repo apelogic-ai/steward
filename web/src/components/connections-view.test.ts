@@ -18,6 +18,33 @@ describe("governed provider connection controls", () => {
     expect(source).toContain("Connections are disabled until task orchestration is active (stage 2).");
   });
 
+  test("polls an accepted connection start and aborts it when the view unmounts", () => {
+    expect(source).toContain("getProviderConnectionStartOperation");
+    expect(source).toContain('result.response?.status !== 202');
+    expect(source).toContain('operation.data?.state !== "pending"');
+    expect(source).toContain('operation.data?.state === "succeeded"');
+    expect(source).toContain("startController.current?.abort()");
+    expect(source).toContain("signal: controller.signal");
+  });
+
+  test("bounds a perpetually pending operation by the server deadline", () => {
+    expect(source).toContain("result.data.pollDeadlineAt");
+    expect(source).toContain("MAX_CONNECTION_POLL_MS");
+    expect(source).toContain('setAction("poll-expired")');
+    expect(source).toContain("if (controller.signal.aborted) return;");
+    expect(source).toContain("Authorization did not become ready in time. Retry the connection");
+  });
+
+  test("shows the bounded terminal connection failure category", () => {
+    expect(source).toContain("GitHub authorization failed");
+    expect(source).toContain("startFailure.error");
+    expect(source).toContain("startFailure.detail");
+  });
+
+  test("clears a stale authorization failure before disconnecting", () => {
+    expect(source).toMatch(/async function disconnect\(\) \{[\s\S]*?setStartFailure\(null\);[\s\S]*?setAction\("working"\);/);
+  });
+
   test("shows a reauthorization action when a reported credential deadline approaches", () => {
     expect(source).toContain('connectionHealth(status)');
     expect(source).toContain('Re-authorize GitHub');

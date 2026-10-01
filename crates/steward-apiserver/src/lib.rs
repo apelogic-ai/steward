@@ -366,9 +366,11 @@ pub struct GrantRevocationRequest {
         agent_runs_ui::all_run_execution_log,
         connections::connection_status,
         connections::start_connection,
+        connections::connection_start_operation,
         connections::disconnect_connection,
         connections::list_connections,
         connections::start_provider_connection,
+        connections::provider_connection_start_operation,
         connections::disconnect_provider_connection,
         preferences::get_preferences,
         preferences::update_preferences,
@@ -4493,6 +4495,10 @@ mod tests {
             ("/paths/~1app~1api~1v1~1connections/get", "200"),
             (
                 "/paths/~1app~1api~1v1~1connections~1{provider}~1start/post",
+                "202",
+            ),
+            (
+                "/paths/~1app~1api~1v1~1connections~1{provider}~1operations~1{operation_id}/get",
                 "200",
             ),
             (
@@ -4510,6 +4516,10 @@ mod tests {
             ("/paths/~1admin~1api~1v1~1connections~1github/get", "200"),
             (
                 "/paths/~1admin~1api~1v1~1connections~1github~1start/post",
+                "202",
+            ),
+            (
+                "/paths/~1admin~1api~1v1~1connections~1github~1operations~1{operation_id}/get",
                 "200",
             ),
             (

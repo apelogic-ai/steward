@@ -1,6 +1,7 @@
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::hash::Hash;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -21,8 +22,9 @@ use steward_adapter_openshell::{
 };
 use steward_admission::{AdmissionDecision, Envelope, EnvelopeSpec, evaluate, validate_envelope};
 use steward_apiserver::connections::{
-    ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionSubject,
-    GithubWorkflowRerunBroker, GithubWorkflowRerunRequest, ProviderConnectionBroker,
+    ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionStartOperation,
+    ConnectionSubject, GithubWorkflowRerunBroker, GithubWorkflowRerunRequest,
+    ProviderConnectionBroker, StartedConnection,
 };
 use steward_apiserver::governed_connections::{
     ConnectionExecutionBindings, ConnectionOperationReconciler, GovernedConnectionsBroker,
@@ -241,6 +243,13 @@ impl Harness {
             reconciler.abort();
         }
         self.start_reconciler();
+    }
+
+    async fn stop_reconciler(&mut self) {
+        if let Some(reconciler) = self.reconciler.take() {
+            reconciler.abort();
+            let _ = reconciler.await;
+        }
     }
 
     fn broker_for_mode(
@@ -587,41 +596,6 @@ impl Harness {
         }
     }
 
-    async fn latest_operation_or_broker_error<T>(
-        &self,
-        user_id: &CanonicalUserId,
-        kind: &str,
-        after_count: i64,
-        broker_task: &mut JoinHandle<Result<T, ConnectionBrokerError>>,
-    ) -> Result<(Uuid, Option<T>), Box<dyn Error>> {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let mut completed = None;
-        loop {
-            let rows = sqlx::query(
-                "SELECT operation_id FROM connection_operations \
-                 WHERE canonical_user_id = $1 AND operation_kind = $2 \
-                 ORDER BY created_at DESC",
-            )
-            .bind(user_id.as_str())
-            .bind(kind)
-            .fetch_all(&self.database)
-            .await?;
-            if i64::try_from(rows.len())? > after_count {
-                return Ok((rows[0].try_get("operation_id")?, completed));
-            }
-            if completed.is_none() && broker_task.is_finished() {
-                completed = Some(connection_result((&mut *broker_task).await?)?);
-            }
-            if Instant::now() >= deadline {
-                return Err(io::Error::other(format!(
-                    "no new {kind} connection operation was durably reserved"
-                ))
-                .into());
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
     async fn operation_count(
         &self,
         user_id: &CanonicalUserId,
@@ -842,6 +816,29 @@ fn connection_result<T>(result: Result<T, ConnectionBrokerError>) -> Result<T, i
     result.map_err(|error| io::Error::other(format!("connection operation failed: {error:?}")))
 }
 
+async fn wait_start_operation<B>(
+    broker: &GovernedConnectionsBroker<B>,
+    session: &ConnectionSession<B>,
+    operation_id: Uuid,
+) -> Result<StartedConnection, ConnectionBrokerError>
+where
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        match broker.start_operation(session, operation_id).await? {
+            Some(ConnectionStartOperation::Pending) => {}
+            Some(ConnectionStartOperation::Succeeded(started)) => return Ok(started),
+            Some(ConnectionStartOperation::Failed(error)) => return Err(error),
+            None => return Err(ConnectionBrokerError::Unavailable),
+        }
+        if Instant::now() >= deadline {
+            return Err(ConnectionBrokerError::Unavailable);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exactly()
 -> Result<(), Box<dyn Error>> {
@@ -945,7 +942,18 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     let rejected_start_count = harness.operation_count(&alice_id, "start").await?;
     let rejected_broker =
         harness.broker_for_mode_and_origin("github-attestation", "https://blocked.example.test")?;
-    let rejected_error = match rejected_broker.start(&alice).await {
+    let rejected_reserved = connection_result(rejected_broker.start(&alice).await)?;
+    let rejected_operation = harness
+        .latest_operation(&alice_id, "start", rejected_start_count)
+        .await?;
+    assert_eq!(rejected_reserved.operation_id, rejected_operation);
+    let rejected_error = match wait_start_operation(
+        &rejected_broker,
+        &alice,
+        rejected_reserved.operation_id,
+    )
+    .await
+    {
         Err(error) => error,
         Ok(_) => {
             return Err(io::Error::other(
@@ -954,9 +962,6 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
             .into());
         }
     };
-    let rejected_operation = harness
-        .latest_operation(&alice_id, "start", rejected_start_count)
-        .await?;
     harness
         .wait_operation_finalized(rejected_operation, Duration::from_secs(90))
         .await?;
@@ -1043,24 +1048,48 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     );
 
     let start_count = harness.operation_count(&alice_id, "start").await?;
-    let start_broker = broker.clone();
-    let start_session = alice.clone();
-    let mut start_task = tokio::spawn(async move { start_broker.start(&start_session).await });
-    let (start_operation, early_start) = harness
-        .latest_operation_or_broker_error(&alice_id, "start", start_count, &mut start_task)
+    harness.stop_reconciler().await;
+    let reserved = connection_result(broker.start(&alice).await)?;
+    let start_operation = harness
+        .latest_operation(&alice_id, "start", start_count)
         .await?;
+    assert_eq!(reserved.operation_id, start_operation);
+    assert!(
+        matches!(
+            connection_result(broker.start_operation(&alice, start_operation).await)?,
+            Some(ConnectionStartOperation::Pending)
+        ),
+        "reservation must return while the deliberately stopped reconciler cannot complete it"
+    );
     let (bridge_workspace, bridge_sandbox, bridge_uid) =
         harness.capture_bridge_refs(start_operation).await?;
-    let started = match early_start {
-        Some(started) => started,
-        None => connection_result(start_task.await?)?,
-    };
+    harness.start_reconciler();
+    let started = connection_result(wait_start_operation(&broker, &alice, start_operation).await)?;
     harness
         .wait_operation_finalized(start_operation, Duration::from_secs(90))
         .await?;
     harness.assert_bridge_runtime_absent(&bridge_workspace, &bridge_sandbox, &bridge_uid)?;
 
+    let elapsed = sqlx::query(
+        "UPDATE connection_operations SET response_deadline_at = now() - interval '1 second' \
+         WHERE operation_id = $1 AND oauth_phase = 'pending' AND flow_expires_at > now()",
+    )
+    .bind(start_operation)
+    .execute(&harness.database)
+    .await?;
+    assert_eq!(
+        elapsed.rows_affected(),
+        1,
+        "the retry regression requires an elapsed response deadline inside a live OAuth flow"
+    );
     let reused = connection_result(broker.start(&alice).await)?;
+    assert_eq!(reused.operation_id, start_operation);
+    assert_eq!(
+        reused.poll_deadline_at, started.expires_at,
+        "a retry after the runtime response deadline must remain pollable until the reused OAuth flow expires"
+    );
+    let reused =
+        connection_result(wait_start_operation(&broker, &alice, reused.operation_id).await)?;
     assert_eq!(
         reused.authorization_url.as_str(),
         started.authorization_url.as_str(),
@@ -1147,14 +1176,17 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
 
     let reauthorization_count = harness.operation_count(&alice_id, "start").await?;
     let reauthorization = connection_result(broker.start(&alice).await)?;
+    let reauthorization_operation = harness
+        .latest_operation(&alice_id, "start", reauthorization_count)
+        .await?;
+    assert_eq!(reauthorization.operation_id, reauthorization_operation);
+    let reauthorization =
+        connection_result(wait_start_operation(&broker, &alice, reauthorization_operation).await)?;
     assert_ne!(
         reauthorization.authorization_url.as_str(),
         started.authorization_url.as_str(),
         "MCP-GW 0.4.9 must issue a new state-bound flow when start is called while connected"
     );
-    let reauthorization_operation = harness
-        .latest_operation(&alice_id, "start", reauthorization_count)
-        .await?;
     harness
         .wait_operation_finalized(reauthorization_operation, Duration::from_secs(90))
         .await?;
