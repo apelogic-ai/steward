@@ -323,15 +323,29 @@ done
 postgres_port="$(sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' "${postgres_forward_log}" | head -1)"
 mcp_port="$(sed -nE 's/.*127\.0\.0\.1:([0-9]+).*/\1/p' "${mcp_forward_log}" | head -1)"
 
-STEWARD_OPEN_SHELL_RELEASE=v0.0.98 \
-STEWARD_OPENSHELL_CLI="${OPEN_SHELL}" \
-STEWARD_CONNECTIONS_TEST_DATABASE_URL="postgres://steward@127.0.0.1:${postgres_port}/steward" \
-STEWARD_CONNECTIONS_TEST_MCP_FORWARD="127.0.0.1:${mcp_port}" \
-STEWARD_CONNECTIONS_TEST_BRIDGE_DIGEST_IMAGE="${bridge_digest_image}" \
-STEWARD_AGENTRUNTIME_API_VERSION="agents.apelogic.ai/v1alpha1" \
-cargo test \
-  --manifest-path "${ROOT}/e2e/Cargo.toml" \
-  --test governed_connections \
-  governed_connections_share_the_runtime_credential_owner_and_cleanup_exactly \
-  -- \
-  --exact --nocapture
+export STEWARD_OPEN_SHELL_RELEASE=v0.0.98
+export STEWARD_OPENSHELL_CLI="${OPEN_SHELL}"
+export STEWARD_CONNECTIONS_TEST_DATABASE_URL="postgres://steward@127.0.0.1:${postgres_port}/steward"
+export STEWARD_CONNECTIONS_TEST_MCP_FORWARD="127.0.0.1:${mcp_port}"
+export STEWARD_CONNECTIONS_TEST_BRIDGE_DIGEST_IMAGE="${bridge_digest_image}"
+export STEWARD_AGENTRUNTIME_API_VERSION="agents.apelogic.ai/v1alpha1"
+
+test_started="${SECONDS}"
+if [[ -n "${STEWARD_CONNECTIONS_TEST_BINARY:-}" ]]; then
+  if [[ "${STEWARD_CONNECTIONS_TEST_BINARY}" != /* || ! -x "${STEWARD_CONNECTIONS_TEST_BINARY}" ]]; then
+    echo "STEWARD_CONNECTIONS_TEST_BINARY must be an absolute executable path" >&2
+    exit 2
+  fi
+  "${STEWARD_CONNECTIONS_TEST_BINARY}" \
+    governed_connections_share_the_runtime_credential_owner_and_cleanup_exactly \
+    --exact --nocapture
+else
+  cargo test \
+    --manifest-path "${ROOT}/e2e/Cargo.toml" \
+    --test governed_connections \
+    governed_connections_share_the_runtime_credential_owner_and_cleanup_exactly \
+    -- \
+    --exact --nocapture
+fi
+printf 'governed-connections timing: actual-test-seconds=%s\n' \
+  "$((SECONDS - test_started))"

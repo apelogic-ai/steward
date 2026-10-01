@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.19.0@sha256:b6afd42430b15f2d2a4c5a02b919e98a525b785b1aaff16747d2f623364e39b6
+FROM ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254 AS mint
+
+COPY steward-mint-bin /usr/local/bin/steward-mint
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/steward-mint"]
+
+FROM ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254 AS bridge
+
+RUN apt-get update \
+  && apt-get install --yes --no-install-recommends iproute2 \
+  && rm -rf /var/lib/apt/lists/* \
+  && test -x /bin/cat \
+  && test -x /bin/find \
+  && test -x /bin/id \
+  && test -x /bin/ip \
+  && test -x /bin/mkdir \
+  && test -x /bin/mktemp \
+  && test -x /bin/rm \
+  && test -x /bin/sh \
+  && test -x /bin/sleep \
+  && test -x /bin/tar \
+  && test -x /bin/touch \
+  && mkdir -p /sandbox \
+  && chown 65532:65532 /sandbox
+
+COPY steward-connections-bridge /usr/local/bin/steward-connections-bridge
+COPY LICENSE /usr/share/licenses/steward/LICENSE
+COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/steward/THIRD_PARTY_NOTICES.md
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/steward-connections-bridge"]
+
+FROM ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254 AS webhook
+
+COPY governed-connections-webhook /usr/local/bin/governed-connections-webhook
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/governed-connections-webhook"]

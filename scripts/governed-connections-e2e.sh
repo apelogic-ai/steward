@@ -14,6 +14,7 @@ for command in bash docker; do
   fi
 done
 docker info >/dev/null
+setup_started="${SECONDS}"
 
 SUPERVISOR_IMAGE="$(
   "${ROOT}/scripts/build-patched-openshell-supervisor.sh" --print-contract |
@@ -51,26 +52,68 @@ MCP_GW_RELEASE_IMAGE="ghcr.io/apelogic-ai/mcp-gw-github-wrapper@sha256:80bef7bee
 
 docker pull "${MCP_GW_RELEASE_IMAGE}"
 docker tag "${MCP_GW_RELEASE_IMAGE}" "${MCP_GW_LOCAL_IMAGE}"
-docker build \
-  --label "steward.test/run-id=${RUN_ID}" \
-  --file "${ROOT}/config/s1/steward-mint.Dockerfile" \
-  --tag "${MINT_IMAGE}" \
-  "${ROOT}"
-docker build \
-  --label "steward.test/run-id=${RUN_ID}" \
-  --file "${ROOT}/build/connections-bridge.Dockerfile" \
-  --tag "${BRIDGE_IMAGE}" \
-  "${ROOT}"
-docker build \
-  --label "steward.test/run-id=${RUN_ID}" \
-  --file "${ROOT}/e2e/Dockerfile.governed-connections-webhook" \
-  --tag "${WEBHOOK_IMAGE}" \
-  "${ROOT}"
+if [[ -n "${STEWARD_CONNECTIONS_PREBUILT_DIR:-}" ]]; then
+  if [[ "${STEWARD_CONNECTIONS_PREBUILT_DIR}" != /* ]]; then
+    echo "STEWARD_CONNECTIONS_PREBUILT_DIR must be an absolute path" >&2
+    exit 2
+  fi
+  for artifact in \
+    steward-mint-bin \
+    steward-connections-bridge \
+    governed-connections-webhook \
+    governed_connections
+  do
+    if [[ ! -x "${STEWARD_CONNECTIONS_PREBUILT_DIR}/${artifact}" ]]; then
+      echo "prebuilt governed Connections executable is missing: ${artifact}" >&2
+      exit 2
+    fi
+  done
+  for artifact in LICENSE THIRD_PARTY_NOTICES.md; do
+    if [[ ! -f "${STEWARD_CONNECTIONS_PREBUILT_DIR}/${artifact}" ]]; then
+      echo "prebuilt governed Connections artifact is missing: ${artifact}" >&2
+      exit 2
+    fi
+  done
+  for image_target in \
+    "mint:${MINT_IMAGE}" \
+    "bridge:${BRIDGE_IMAGE}" \
+    "webhook:${WEBHOOK_IMAGE}"
+  do
+    target="${image_target%%:*}"
+    image="${image_target#*:}"
+    docker build \
+      --label "steward.test/run-id=${RUN_ID}" \
+      --target "${target}" \
+      --file "${ROOT}/e2e/Dockerfile.governed-connections-prebuilt" \
+      --tag "${image}" \
+      "${STEWARD_CONNECTIONS_PREBUILT_DIR}"
+  done
+  export STEWARD_CONNECTIONS_TEST_BINARY="${STEWARD_CONNECTIONS_PREBUILT_DIR}/governed_connections"
+else
+  docker build \
+    --label "steward.test/run-id=${RUN_ID}" \
+    --file "${ROOT}/config/s1/steward-mint.Dockerfile" \
+    --tag "${MINT_IMAGE}" \
+    "${ROOT}"
+  docker build \
+    --label "steward.test/run-id=${RUN_ID}" \
+    --file "${ROOT}/build/connections-bridge.Dockerfile" \
+    --tag "${BRIDGE_IMAGE}" \
+    "${ROOT}"
+  docker build \
+    --label "steward.test/run-id=${RUN_ID}" \
+    --file "${ROOT}/e2e/Dockerfile.governed-connections-webhook" \
+    --tag "${WEBHOOK_IMAGE}" \
+    "${ROOT}"
+fi
 docker build \
   --label "steward.test/run-id=${RUN_ID}" \
   --file "${ROOT}/e2e/Dockerfile.workflow-sandbox" \
   --tag "${SANDBOX_IMAGE}" \
   "${ROOT}"
+
+printf 'governed-connections timing: setup-and-build-seconds=%s\n' \
+  "$((SECONDS - setup_started))"
 
 STEWARD_RUN_ID="${RUN_ID}" \
 STEWARD_OPEN_SHELL_RELEASE=v0.0.98 \
