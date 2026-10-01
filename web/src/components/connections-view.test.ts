@@ -31,6 +31,7 @@ describe("governed provider connection controls", () => {
     expect(source).toContain("result.data.pollDeadlineAt");
     expect(source).toContain("MAX_CONNECTION_POLL_MS");
     expect(source).toContain('setAction("poll-expired")');
+    expect(source).toContain("if (controller.signal.aborted) return;");
     expect(source).toContain("Authorization did not become ready in time. Retry the connection");
   });
 

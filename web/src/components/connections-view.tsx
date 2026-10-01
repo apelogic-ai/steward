@@ -90,6 +90,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
       deadlineTimer = setTimeout(expirePoll, pollDeadline - Date.now());
       while (!controller.signal.aborted) {
         const operation = await getProviderConnectionStartOperation({ cache: "no-store", credentials: "same-origin", path: { provider, operation_id: result.data.operationId }, signal: controller.signal });
+        if (controller.signal.aborted) return;
         if (operation.data?.state === "succeeded" && operation.data.authorizationUrl) {
           window.location.assign(operation.data.authorizationUrl);
           return;
