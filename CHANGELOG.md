@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-10-01
+
 ### Added
 
 - Added browser **Run now** for inline v2 packages, exact Git package locators,
@@ -449,7 +451,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/apelogic-ai/steward/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/apelogic-ai/steward/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/apelogic-ai/steward/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/apelogic-ai/steward/compare/v0.3.2...v0.3.3

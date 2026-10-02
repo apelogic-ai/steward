@@ -626,7 +626,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.5"
+          test "$version" = "0.3.6"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
@@ -728,7 +728,11 @@ jobs:
                 "0048_runtime_minute_authority.sql",
                 "0049_github_rerun_operations.sql",
                 "0050_browser_onboarding_workflow_acknowledgement.sql",
-                "0051_template_free_envelope_requests.sql"
+                "0051_template_free_envelope_requests.sql",
+                "0052_connection_operation_failure_detail.sql",
+                "0053_connection_verified_federated_subjects.sql",
+                "0056_task_source_provenance.sql",
+                "0057_browser_task_provenance.sql"
               ],
               serviceEnvelopeSupported: false
             }' > dist/release-handoff.json
@@ -736,15 +740,15 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.5 removes unrestricted Kubernetes user and group impersonation from AgentRuntime writes. The apiserver and controller now use their exact service-account identities while the admission webhook continues to enforce Envelope, grant, role-binding, principal-immutability, and authority checks.\n\n'
-            printf 'The release retains the v0.3.4 platform and provider-profile contracts and preserves controller authority rollback for existing noncanonical user runtimes.\n\n'
+            printf 'Steward v0.3.6 adds browser Run now for governed inline, exact Git, and published Workflow sources, with canonical-user identity, selected User Envelope authority, immutable provenance, bounded inputs and concurrency, and owner-scoped output downloads.\n\n'
+            printf 'This release also adds durable setup guidance and GitHub-ratified Task provenance, asynchronous governed Connections operations with precise failure diagnostics, and opt-in MCP-GW status v2 identity association.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'This patch adds no migration. Installations upgrading from v0.2.6 must still complete the v0.3 prerequisites before rollout.\n\n'
-            printf 'For an upgrade from v0.3.4, deploy the v0.3.5 chart and images as one release unit. No database migration or provider-profile transition is required.\n\n'
-            printf 'Rollback from v0.3.5 to v0.3.4 requires no database rollback. Restore the prior chart and component-image set as one release unit.\n\n'
+            printf 'This patch adds migrations 0052, 0053, 0056, and 0057. Installations upgrading from v0.2.6 must still complete the v0.3 prerequisites before rollout.\n\n'
+            printf 'For an upgrade from v0.3.5, deploy the v0.3.6 chart and images as one release unit and allow the additive migrations to complete before serving traffic. No provider-profile transition is required.\n\n'
+            printf 'Rollback from v0.3.6 to v0.3.5 requires restoring the pre-upgrade database together with the prior chart and component-image set because the release adds durable provenance and connection-operation state.\n\n'
             printf '## Required action\n\n'
-            printf 'Allow the apiserver and controller rollouts to converge before retrying rejected AgentRuntime writes. Operators who added separate impersonation grants for Steward service accounts may remove them after the upgrade.\n\n'
+            printf 'Before enabling browser Run now, authorize each Git source through the operator-managed source-repository binding catalog and configure the intended Envelope templates.\n\n'
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
@@ -814,7 +818,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.5.json
+          subject-path: dist/steward-product-compatibility-0.3.6.json
 
       - name: Archive product compatibility verification material
         env:
@@ -824,7 +828,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.5.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.6.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 
