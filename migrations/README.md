@@ -143,3 +143,15 @@ deterministically backfilled from their immutable binding evidence; versioned
 Tasks begin recording the same GitHub-ratified provenance on new reservations.
 Other historical and Kubernetes-authenticated Tasks remain `NULL` and cannot be
 used as GitHub Actions readiness evidence.
+
+Migration 0057 adds the immutable authoring origin and browser Task evidence.
+It classifies existing v3 Tasks as connections, GitHub Actions, or unknown from
+their existing durable records. Migration 0054 preserves the finalized-Task
+monotonicity trigger while allowing only those three new provenance fields
+during the 0056/0057 backfills; their dedicated immutability triggers protect
+the fields once they exist. Migration 0058 restores the ordinary strict
+finalized-Task comparison.
+
+The 0054/0058 compatibility pair is additive; no existing migration checksum is
+changed. A database that failed before migration 0056 can retry normally after
+the updated binary is deployed.

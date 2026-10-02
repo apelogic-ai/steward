@@ -213,6 +213,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     );
     let maximum_direct_source_provenance =
         seed_maximum_source_provenance_upgrade_fixture(&store).await?;
+    seed_finalized_task_provenance_upgrade_fixtures(&store).await?;
     seed_connection_association_upgrade_fixture(&store).await?;
     migration_set(None)
         .run(store.pool())
@@ -224,6 +225,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         })?;
     assert_maximum_source_provenance_upgrade_result(&store, &maximum_direct_source_provenance)
         .await?;
+    assert_finalized_task_provenance_upgrade_result(&store).await?;
     verify_source_provenance_byte_limits(&store).await?;
     assert_connection_association_upgrade_result(&store).await?;
     assert_template_catalog_upgrade_result(&store).await?;
@@ -385,15 +387,15 @@ async fn seed_maximum_source_provenance_upgrade_fixture(
              workflow_digest, user_envelope_instance_id, user_envelope_revision, \
              user_envelope_digest, authority_kind, user_envelope_snapshot, coding_agent_runtime, \
              runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
-             agent_command, execution_binding, direct_task_evidence, envelope_revision, \
+             finalize_requested, finalized, agent_command, execution_binding, direct_task_evidence, envelope_revision, \
              orchestration_version, orchestration_operation_id, candidate_digest, \
              service_envelope_digest, original_admission_decision, original_admission_deltas) \
          SELECT $1::text::uuid, 'migration-0056-max-provenance', submitter_service, acting_user, \
                 acting_user_id, owner, owner_user_id, identity_binding_state, workflow, NULL, NULL, \
                 NULL, user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
                 authority_kind, user_envelope_snapshot, coding_agent_runtime, NULL, \
-                runtime_namespace, 'task-migration-0056', runtime_ownership, 'submitted', \
-                runtime_spec, agent_command, execution_binding, $3, envelope_revision, \
+                runtime_namespace, 'task-migration-0056', runtime_ownership, 'succeeded', \
+                runtime_spec, true, true, agent_command, execution_binding, $3, envelope_revision, \
                 orchestration_version, $2::text::uuid, candidate_digest, service_envelope_digest, \
                 original_admission_decision, original_admission_deltas \
          FROM task_submissions \
@@ -437,6 +439,147 @@ async fn assert_maximum_source_provenance_upgrade_result(
         migrated, *expected,
         "migration 0056 must backfill every source-provenance value accepted by the frozen contract"
     );
+    Ok(())
+}
+
+async fn seed_finalized_task_provenance_upgrade_fixtures(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    sqlx::query(
+        "UPDATE task_submissions \
+         SET phase = 'failed', finalize_requested = true, finalized = true, \
+             failure_reason = 'upgrade_fixture' \
+         WHERE idempotency_key = 'user-unfinished'",
+    )
+    .execute(store.pool())
+    .await?;
+
+    let task_uid = "00000000-0000-0000-0000-000000000057";
+    let operation_id = "00000000-0000-0000-0000-000000001057";
+    let authority_digest =
+        "sha256:9a572bcefa75b6f2b5b4931d8604c1ad3f3e7560e0e0c2843646ec4f7853ef02";
+    let mut transaction = store.pool().begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO task_submissions (\
+             task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
+             owner, owner_user_id, identity_binding_state, workflow, workflow_name, workflow_version, \
+             workflow_digest, user_envelope_instance_id, user_envelope_revision, \
+             user_envelope_digest, authority_kind, user_envelope_snapshot, internal_authority_id, \
+             internal_authority_version, internal_authority_digest, coding_agent_runtime, runtime_uid, \
+             runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
+             finalize_requested, finalized, failure_reason, agent_command, execution_binding, \
+             direct_task_evidence, envelope_revision, orchestration_version, orchestration_operation_id, \
+             candidate_digest, service_envelope_digest, original_admission_decision, original_admission_deltas) \
+         SELECT $1::text::uuid, 'migration-0057-finalized-connection', 'steward-connections', \
+                acting_user, acting_user_id, owner, owner_user_id, identity_binding_state, \
+                'connections.github.status', NULL, NULL, NULL, NULL, NULL, NULL, 'internal', NULL, \
+                'steward-connections', 2, $3, coding_agent_runtime, NULL, runtime_namespace, \
+                'task-migration-0057', runtime_ownership, 'failed', runtime_spec, true, true, \
+                'upgrade_fixture', agent_command, execution_binding, NULL, envelope_revision, \
+                orchestration_version, $2::text::uuid, candidate_digest, service_envelope_digest, \
+                original_admission_decision, original_admission_deltas \
+         FROM task_submissions \
+         WHERE task_uid = '00000000-0000-0000-0000-000000000003'",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .bind(authority_digest)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    assert_eq!(inserted, 1, "the pre-0057 internal Task fixture must exist");
+
+    sqlx::query(
+        "INSERT INTO task_runtime_operations (\
+             task_uid, operation_id, state, generation, runtime_ownership, runtime_namespace, \
+             runtime_name, inert_manifest_digest, active_manifest_digest) \
+         VALUES ($1::text::uuid, $2::text::uuid, 'intent_recorded', 1, 'provisioned', \
+                 'steward-workflows', 'task-migration-0057', $3, $4)",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .bind(format!("sha256:{}", "3".repeat(64)))
+    .bind(format!("sha256:{}", "4".repeat(64)))
+    .execute(&mut *transaction)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO connection_operations (\
+             operation_id, task_uid, canonical_user_id, provider, operation_kind, \
+             submitter_service, authority_id, authority_version, authority_digest, \
+             runtime_spec_snapshot, command_snapshot, artifact_trust_mode, bridge_image_digest, \
+             mcp_gw_origin, mcp_gw_version, runtime_namespace, runtime_class, \
+             idempotency_identity, response_deadline_at) \
+         VALUES (\
+             $2::text::uuid, $1::text::uuid, 'usr_0123456789abcdef0123456789abcdef', \
+             'github', 'status', 'steward-connections', 'steward-connections', 2, $3, \
+             '{}'::jsonb, '[]'::jsonb, 'github-attestation', \
+             'ghcr.io/example-org/connections-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+             'https://gateway.example.test', '0.4.9', 'steward-workflows', '', \
+             'migration-0057-finalized-connection', now() + interval '1 minute'\
+         )",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .bind(authority_digest)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    Ok(())
+}
+
+async fn assert_finalized_task_provenance_upgrade_result(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let versioned = sqlx::query_as::<_, (Option<serde_json::Value>, String)>(
+        "SELECT source_provenance, task_origin FROM task_submissions \
+         WHERE idempotency_key = 'user-unfinished'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        versioned,
+        (None, "unknown".to_owned()),
+        "migration provenance backfills must preserve finalized versioned Workflow history"
+    );
+
+    let connection_origin = sqlx::query_scalar::<_, String>(
+        "SELECT task_origin FROM task_submissions \
+         WHERE idempotency_key = 'migration-0057-finalized-connection'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        connection_origin, "connections",
+        "migration 0057 must classify finalized governed connection Tasks"
+    );
+
+    let monotonic_trigger_enabled = sqlx::query_scalar::<_, bool>(
+        "SELECT tgenabled = 'O' FROM pg_trigger \
+         WHERE tgrelid = 'task_submissions'::regclass \
+           AND tgname = 'task_commands_are_monotonic'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert!(
+        monotonic_trigger_enabled,
+        "migration backfills must re-enable the finalized-Task monotonicity trigger"
+    );
+
+    let rejected = sqlx::query(
+        "UPDATE task_submissions SET updated_at = now() \
+         WHERE idempotency_key = 'migration-0056-max-provenance'",
+    )
+    .execute(store.pool())
+    .await;
+    assert!(
+        rejected.is_err_and(|error| error
+            .to_string()
+            .contains("durable Task commands and terminal observations are monotonic")),
+        "the re-enabled monotonicity trigger must still reject later finalized-Task mutation"
+    );
+
     Ok(())
 }
 
