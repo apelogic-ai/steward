@@ -10,7 +10,9 @@ import {
   cancelMyRun,
   myRun,
   myRunOutputs,
+  myRunPackage,
   myRunTimeline,
+  renderRepositoryBundleForEnvelope,
   rerunMyRun,
   type AllRunsResponse,
   type BrowserRunResponse,
@@ -26,7 +28,7 @@ import { ExecutionLogPanel } from "@/components/run-log-view";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import type { ExecutionLogStream } from "@/data/execution-log";
 import { useApiResource } from "@/data/use-api-resource";
-import { loadAllMyRuns, loadAllRuns } from "@/data/paginated-api";
+import { loadAllEnvelopeRequests, loadAllMyRuns, loadAllRuns } from "@/data/paginated-api";
 import { useSession } from "@/session/session-context";
 import { EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 
@@ -158,6 +160,74 @@ function RunOutputs({ taskUid }: Readonly<{ taskUid: string }>) {
   return <ResourceBoundary state={state}>{({ files }) => files.length ? <div className="mt-5 rounded-card border p-4"><h3 className="text-sm font-semibold">Outputs</h3><ul className="mt-3 space-y-2">{files.map((file) => <li className="flex items-center justify-between gap-4 text-sm" key={file.path}><a className="font-mono font-semibold text-brand" href={file.downloadUrl}>{file.path}</a><span className="text-muted-ink">{file.sizeBytes} bytes</span></li>)}</ul></div> : <p className="mt-5 text-sm text-muted-ink">This run produced no output files.</p>}</ResourceBoundary>;
 }
 
+export function exactRepositoryBundle(
+  exactPackage: Record<string, string>,
+  wrapperFiles: Record<string, string>,
+): Record<string, string> {
+  return { ...wrapperFiles, ...exactPackage };
+}
+
+function SaveInlineRunToRepository({ run }: Readonly<{ run: BrowserRunView }>) {
+  const session = useSession();
+  const [repository, setRepository] = useState("https://github.com/example-org/agentic-ops.git");
+  const [state, setState] = useState<"idle" | "working" | "copied" | "error">("idle");
+  const [failure, setFailure] = useState<string | null>(null);
+
+  async function copyBundle() {
+    if (session.status !== "authenticated" || !run.package || !run.userEnvelopeInstanceId) return;
+    setState("working");
+    setFailure(null);
+    try {
+      const requests = await loadAllEnvelopeRequests("provisioned");
+      const envelopeRequest = requests.data?.requests.find(
+        (request) => request.envelopeInstanceId === run.userEnvelopeInstanceId,
+      );
+      if (!envelopeRequest) {
+        setFailure("The Envelope used by this run is no longer provisioned, so Steward cannot render its GitHub Actions wrapper.");
+        setState("error");
+        return;
+      }
+      const [exact, wrapper] = await Promise.all([
+        myRunPackage({ cache: "no-store", credentials: "same-origin", path: { task_uid: run.taskUid } }),
+        renderRepositoryBundleForEnvelope({
+          body: {
+            repository: repository.trim(),
+            packagePath: run.package.path,
+            invocationPath: ".steward/invocations/browser-task.json",
+          },
+          credentials: "same-origin",
+          headers: { "X-Steward-CSRF": session.value.csrf },
+          path: { request_id: envelopeRequest.id },
+        }),
+      ]);
+      if (!exact.data || !exact.response?.ok || !wrapper.data || !wrapper.response?.ok) {
+        setFailure("Steward could not render the repository bundle for this exact successful run.");
+        setState("error");
+        return;
+      }
+      await navigator.clipboard.writeText(JSON.stringify(
+        exactRepositoryBundle(exact.data.files, wrapper.data.files),
+        null,
+        2,
+      ));
+      setState("copied");
+    } catch {
+      setFailure("Steward could not render the repository bundle. Retry the request; if it persists, contact an administrator.");
+      setState("error");
+    }
+  }
+
+  return (
+    <section className="mt-5 rounded-card border p-4" aria-labelledby="save-task-title">
+      <h3 className="text-sm font-semibold" id="save-task-title">Save this task to a repository</h3>
+      <p className="mt-2 text-sm text-muted-ink">Copy the exact package that succeeded, plus its GitHub Actions invocation and caller workflow. Steward never rebuilds the package from the form.</p>
+      <label className="mt-4 grid gap-2 text-sm font-semibold">Target repository<input className="min-h-11 w-full rounded-control border bg-panel px-3 font-mono font-normal" onChange={(event) => setRepository(event.target.value)} value={repository} /></label>
+      <button className="mt-4 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={state === "working" || !repository.trim()} onClick={() => void copyBundle()} type="button">{state === "working" ? "Rendering…" : state === "copied" ? "Bundle copied" : "Copy repository bundle"}</button>
+      {failure ? <p className="mt-3 text-sm text-err" role="alert">{failure}</p> : null}
+    </section>
+  );
+}
+
 export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; runs: Array<BrowserRunView> }>) {
   if (runs.length === 0) return <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">No runs yet.</p>;
   const newestRuns = [...runs].sort((left, right) => runUpdatedAt(right) - runUpdatedAt(left));
@@ -287,6 +357,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                   <p className="mt-5 rounded-control border border-warn/30 bg-warn-soft px-4 py-3 text-sm text-warn"><strong className="block font-semibold text-warn" id="sensitivity-notice">Sensitivity notice</strong>Execution logs may reproduce arbitrary user, tool, or agent output.</p>
                   {selectedStage?.steps.length ? <ol className="mt-5 divide-y divide-line-soft rounded-card border">{selectedStage.steps.map((step) => <RunStepRow admin={admin} key={step.id} step={step} taskUid={taskUid} />)}</ol> : <div className="mt-5"><EmptyState title="No steps reported" /></div>}
                   {!admin && run.phase === "succeeded" ? <RunOutputs taskUid={taskUid} /> : null}
+                  {!admin && run.phase === "succeeded" && run.origin === "browser" && run.package?.source === "inline" ? <SaveInlineRunToRepository run={run} /> : null}
                 </section>
               </main>
             </div>

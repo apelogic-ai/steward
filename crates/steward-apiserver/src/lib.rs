@@ -371,6 +371,7 @@ pub struct GrantRevocationRequest {
         agent_runs_ui::rerun_my_run,
         agent_runs_ui::my_run_timeline,
         agent_runs_ui::my_run_execution_log,
+        agent_runs_ui::my_run_package,
         agent_runs_ui::my_run_outputs,
         agent_runs_ui::download_my_run_output,
         agent_runs_ui::all_runs,
@@ -493,7 +494,8 @@ pub struct GrantRevocationRequest {
         AgentRunTimelineResponse,
         agent_runs_ui::BrowserRunOutputFile,
         agent_runs_ui::BrowserRunOutputsResponse,
-        agent_runs_ui::BrowserRunPackageView
+        agent_runs_ui::BrowserRunPackageView,
+        agent_runs_ui::BrowserRunPackageContentResponse
     )),
     modifiers(&TaskSecurity)
 )]

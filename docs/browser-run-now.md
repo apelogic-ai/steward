@@ -74,6 +74,16 @@ Both routes are scoped to the authenticated canonical owner. Failed, incomplete,
 cross-owner, malformed, and path-traversing archives are not downloadable. Execution
 stdout and stderr remain available through the existing log routes.
 
+A succeeded inline run also exposes its exact persisted package files to its owner:
+
+```text
+GET /app/api/v1/runs/{taskUid}/package
+```
+
+Failed, incomplete, non-inline, and cross-owner runs return not found. This prevents a
+failed attempt or mutable browser form state from being presented as a known-good
+repository package.
+
 ## Template control
 
 Each immutable Envelope-template revision records
@@ -82,10 +92,16 @@ authoring for a successor template revision without disabling repository package
 published Workflow aliases.
 
 The user **Run now** page offers a prefilled no-tool hello-world package, Git package
-locators, and published Workflows. **Copy repository bundle** asks the server to render
-the handoff against the selected provisioned Envelope and the deployment's reviewed
-`steward-run` release. The copied JSON file map contains the unchanged
-`task-definition.json` and `prompt.md`, a `git:trigger` invocation manifest, and a
-caller workflow with the exact reusable-workflow commit. Committing those files
+locators, and published Workflows. Inline authoring lists agents directly from the
+deployment-owned execution-binding catalog; it does not require a published Workflow.
+It selects only a coding agent whose model family is allowed by the selected Envelope
+and records that exact model in the package requirements.
+
+After an inline run succeeds, its detail page offers **Save this task to a repository**.
+**Copy repository bundle** reads the exact persisted package from the successful run,
+then asks the server to render the handoff against the same provisioned Envelope and
+the deployment's reviewed `steward-run` release. The copied JSON file map contains the
+unchanged `task-definition.json` and `prompt.md`, a `git:trigger` invocation manifest,
+and a caller workflow with the exact reusable-workflow commit. Committing those files
 preserves the package closure digest proven by the inline run; release coordinates are
 never guessed by the browser client.

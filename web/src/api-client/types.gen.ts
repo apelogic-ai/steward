@@ -505,7 +505,15 @@ export type BrowserRunOutputsResponse = {
     taskUid: string;
 };
 
+export type BrowserRunPackageContentResponse = {
+    files: {
+        [key: string]: string;
+    };
+    taskUid: string;
+};
+
 export type BrowserRunPackageView = {
+    contentDigest?: string | null;
     path: string;
     revision: string;
     source: string;
@@ -1182,6 +1190,10 @@ export type PublishedWorkflowOption = {
 };
 
 export type PublishedWorkflowsResponse = {
+    /**
+     * Exact logical agent references from the deployment-owned execution catalog.
+     */
+    agents: Array<ExecutionBindingAdvertisement>;
     apiVersion: string;
     workflows: Array<PublishedWorkflowOption>;
 };
@@ -3960,6 +3972,36 @@ export type DownloadMyRunOutputResponses = {
 };
 
 export type DownloadMyRunOutputResponse = DownloadMyRunOutputResponses[keyof DownloadMyRunOutputResponses];
+
+export type MyRunPackageData = {
+    body?: never;
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/package';
+};
+
+export type MyRunPackageErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Exact successful inline package is unavailable
+     */
+    404: unknown;
+    /**
+     * Run package is unavailable
+     */
+    503: unknown;
+};
+
+export type MyRunPackageResponses = {
+    200: BrowserRunPackageContentResponse;
+};
+
+export type MyRunPackageResponse = MyRunPackageResponses[keyof MyRunPackageResponses];
 
 export type RerunMyRunData = {
     body: RerunRequest;
