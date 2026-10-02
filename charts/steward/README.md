@@ -480,6 +480,8 @@ Steward release namespace also creates `steward-workflows`.
             resource: actions_get
             action: read
             accessClass: read
+            # Unreleased presentation metadata.
+            toolsets: [actions]
         catalogs:
           - provider: github
             catalogId: github-tools
@@ -489,6 +491,13 @@ Steward release namespace also creates `steward-workflows`.
 
   Tool access classes and provider catalog availability are display metadata. Authority,
   budget, TTL, template, and user fields are intentionally not part of this catalog.
+
+  **Unreleased:** optional `toolsets` are also presentation metadata. A tool may belong to at
+  most 16 toolsets. The template editor groups tools only when these authoritative names are
+  supplied; it does not infer groups from tool names or provider conventions. Existing v2
+  entries without `toolsets` remain valid and appear in a deterministic fallback group.
+  Steward does not generate this metadata from an MCP-GW release asset; the deployment owner
+  supplies it with the catalog.
 - `config.apiserver.customEnvelopeSafetyCeiling` is the optional deployment-owned maximum for
   template-free requests. It is a complete Envelope and its capabilities must exist in the
   catalog. Steward revalidates the current ceiling at both request creation and administrator

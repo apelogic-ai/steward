@@ -513,6 +513,7 @@ mod tests {
                     resource: format!("resource-{index}"),
                     action: "read".to_owned(),
                     access_class: crate::browser_admin::ToolAccessClass::Read,
+                    toolsets: Vec::new(),
                 })
                 .collect(),
             catalogs: Vec::new(),

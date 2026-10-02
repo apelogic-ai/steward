@@ -16,6 +16,7 @@ import {
   type ToolGrant,
 } from "@/api-client";
 import { DataTable, FormSection, GrantChipList, SectionCard, TagSelect, grantKindForAction } from "@/components/hs";
+import { ToolPicker, dedupeToolGrants, toolKey } from "@/components/tool-picker";
 import { EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -357,7 +358,8 @@ function normalizeCapabilityCatalog(value: unknown): CapabilityCatalog | null {
       && typeof tool.provider === "string"
       && typeof tool.resource === "string"
       && typeof tool.action === "string"
-      && (tool.accessClass === "read" || tool.accessClass === "write" || tool.accessClass === "destructive"));
+      && (tool.accessClass === "read" || tool.accessClass === "write" || tool.accessClass === "destructive")
+      && (tool.toolsets === undefined || (Array.isArray(tool.toolsets) && tool.toolsets.every((toolset) => typeof toolset === "string"))));
   const catalogsValid = value.catalogs.every((catalog) => isRecord(catalog)
     && typeof catalog.provider === "string"
     && typeof catalog.catalogId === "string"
@@ -413,17 +415,6 @@ function initialTemplateForCatalog(capabilities: CapabilityCatalog): BrowserEnve
 
 function toolValue(tool: ToolGrant): string {
   return `${tool.provider}:${tool.resource}:${tool.action}`;
-}
-
-function toolKey(tool: ToolGrant): string {
-  return JSON.stringify([tool.provider, tool.resource, tool.action]);
-}
-
-function toolLabel(tool: ToolGrant, choices: Array<ToolGrant>): string {
-  const display = `${tool.resource}:${tool.action}`;
-  return choices.some((other) => toolKey(other) !== toolKey(tool) && `${other.resource}:${other.action}` === display)
-    ? `Resource: ${tool.resource} · Action: ${tool.action}`
-    : display;
 }
 
 function mutationMessage(status: Exclude<TemplateMutationState, "idle" | "saving">, rejectionCode: string | null): string {
@@ -613,6 +604,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
     resource: tool.resource,
     action: tool.action,
   })));
+  const [previousTools, setPreviousTools] = useState<Array<ToolGrant>>(() => dedupeToolGrants(template.spec.tools));
   const [monthlyLimit, setMonthlyLimit] = useState(template.spec.budget.monthlyLimit);
   const [singleRunLimit, setSingleRunLimit] = useState(template.spec.budget.singleRunLimit ?? "");
   const [runtimeMinutesLimit, setRuntimeMinutesLimit] = useState(template.spec.runtimeMinutesLimit ?? "");
@@ -634,16 +626,6 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
     label: modelLabel(model, [...modelCatalog, ...missingModels]),
     note: allowedModels.has(modelKey(model)) ? undefined : "Not listed in the deployment capability catalog",
   }));
-  const toolOptions = [...toolCatalog, ...missingTools].map((tool) => {
-    const catalogTool = toolCatalog.find((candidate) => toolKey(candidate) === toolKey(tool));
-    return {
-      disabled: !catalogTool,
-      key: toolKey(tool),
-      kind: catalogTool?.accessClass ?? grantKindForAction(tool.action),
-      label: toolLabel(tool, [...toolCatalog, ...missingTools]),
-      note: catalogTool ? displayName(tool.provider) : "Not listed in the deployment capability catalog",
-    };
-  });
   const roleOptions = selectedRoles.map((role) => ({ key: role, kind: "neutral" as const, label: role }));
 
   function clearFieldError(field: TemplateField) {
@@ -745,6 +727,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
     });
     if (result.data && result.response?.status === 201) {
       setCurrentRevision(result.data.envelope.revision);
+      if (!create && !saveAsNew) setPreviousTools(dedupeToolGrants(result.data.envelope.spec.tools));
       setStatus("saved");
       if (create || saveAsNew) router.push(`/admin/envelopes/templates/${encodeURIComponent(templateId)}`);
       return;
@@ -792,27 +775,9 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
           <FieldError message={fieldErrors.models} />
           {missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}
         </FormSection>
-        <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Write and destructive tools are labelled.`} title="Tools">
-          <div className="space-y-2">
-            <TagSelect
-              addPlaceholder="Add another tool…"
-              emptyPlaceholder="Search GitHub tools…"
-              inputDisabled={toolCatalog.length === 0}
-              label="Tools"
-              onChange={(keys) => {
-                setTools(keys.flatMap((key) => {
-                  const tool = toolCatalog.find((candidate) => toolKey(candidate) === key);
-                  return tool ? [{ provider: tool.provider, resource: tool.resource, action: tool.action }] : [];
-                }));
-                clearFieldError("tools");
-              }}
-              options={toolOptions}
-              value={tools.map(toolKey)}
-            />
-            <FieldError message={fieldErrors.tools} />
-            {missingTools.length ? <p className="text-sm text-warn">{missingTools.length} selected tool{missingTools.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : toolCatalog.length === 0 ? <p className="text-sm text-muted-ink">No tools are listed in the deployment capability catalog.</p> : null}
-            <p className="text-xs text-muted-ink">Type to filter. ↑ ↓ to move, Enter to add, Backspace removes the last tag.</p>
-          </div>
+        <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Groups appear only when supplied as authoritative catalog metadata.`} title="Tools">
+          <ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} tools={tools} />
+          <FieldError message={fieldErrors.tools} />
         </FormSection>
         <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
           <div className="space-y-4"><label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => { setAutoApproveToCeiling(event.target.checked); clearFieldError("threshold"); }} type="checkbox" />Auto-approve every request within the ceiling</label>{!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea aria-invalid={Boolean(fieldErrors.threshold)} className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setThresholdJson(event.target.value); clearFieldError("threshold"); }} spellCheck={false} value={thresholdJson} /><FieldError message={fieldErrors.threshold} /></label> : null}</div>
@@ -849,7 +814,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
 
       <FormSection description="Only models supported by the inference gateway can be selected." title="Models"><fieldset><legend className="sr-only">Models</legend><TagSelect addPlaceholder="Add…" emptyPlaceholder="Search models…" inputDisabled={modelCatalog.length === 0} label="Models" onChange={(keys) => { setModels(keys.flatMap((key) => { const model = [...modelCatalog, ...missingModels].find((candidate) => modelKey(candidate) === key); return model ? [model] : []; })); clearFieldError("models"); }} options={modelOptions} value={models.map(modelKey)} /><FieldError message={fieldErrors.models} />{missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}</fieldset></FormSection>
 
-      <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Write and destructive tools are labelled.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><TagSelect addPlaceholder="Add another tool…" emptyPlaceholder="Search tools…" inputDisabled={toolCatalog.length === 0} label="Tools" onChange={(keys) => { setTools(keys.flatMap((key) => { const tool = [...toolCatalog, ...missingTools].find((candidate) => toolKey(candidate) === key); return tool ? [{ provider: tool.provider, resource: tool.resource, action: tool.action }] : []; })); clearFieldError("tools"); }} options={toolOptions} value={tools.map(toolKey)} /><FieldError message={fieldErrors.tools} />{missingTools.length ? <p className="mt-2 text-sm text-warn">{missingTools.length} selected tool{missingTools.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : toolCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No tools are listed in the deployment capability catalog.</p> : null}<p className="mt-2 text-xs text-muted-ink">Type to filter. ↑ ↓ to move, Enter to add, Backspace removes the last tag.</p></fieldset></FormSection>
+      <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Groups appear only when supplied as authoritative catalog metadata.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} previousTools={previousTools} tools={tools} /><FieldError message={fieldErrors.tools} /></fieldset></FormSection>
 
       <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
         <div className="space-y-4">

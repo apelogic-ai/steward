@@ -528,7 +528,13 @@
                       "provider": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
                       "resource": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
                       "action": {"type": "string", "minLength": 1, "maxLength": 255, "pattern": "\\S"},
-                      "accessClass": {"type": "string", "enum": ["read", "write", "destructive"]}
+                      "accessClass": {"type": "string", "enum": ["read", "write", "destructive"]},
+                      "toolsets": {
+                        "type": "array",
+                        "maxItems": 16,
+                        "uniqueItems": true,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^\\S(?:.*\\S)?$"}
+                      }
                     }
                   }
                 },

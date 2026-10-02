@@ -5697,6 +5697,7 @@ mod tests {
                     resource: tool.resource.clone(),
                     action: tool.action.clone(),
                     access_class: browser_admin::ToolAccessClass::Read,
+                    toolsets: Vec::new(),
                 }],
                 catalogs: Vec::new(),
             },
