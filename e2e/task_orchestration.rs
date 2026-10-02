@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::env;
 use std::error::Error;
@@ -48,7 +49,10 @@ use steward_store::{
     TaskExecutionTransition, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
     WorkflowPublication,
 };
-use steward_types::direct_package::{BrowserTaskEvidence, TaskOrigin};
+use steward_types::direct_package::{
+    BrowserTaskEvidence, ClosureEntry, ClosureEntryKind, ContentDigest, PackageClosure,
+    RelativePath, TaskOrigin, canonical_json_bytes,
+};
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
     CanonicalAuthorityBinding, DisposableExecutionBinding, Duration, Email,
@@ -668,6 +672,39 @@ fn disposable_execution_binding() -> Result<TaskExecutionBinding, io::Error> {
     Ok(TaskExecutionBinding::Disposable(binding))
 }
 
+fn browser_direct_package_evidence(
+    source: &str,
+    repository_revision: Option<String>,
+) -> Result<BrowserTaskEvidence, Box<dyn Error>> {
+    let path = RelativePath::parse("task-definition.json")?;
+    let closure = PackageClosure {
+        contract_version: "steward.package-closure/v1".to_owned(),
+        entry_point: path.clone(),
+        entries: vec![ClosureEntry {
+            kind: ClosureEntryKind::TaskDefinition,
+            path: path.clone(),
+            digest: ContentDigest::parse(format!("steward:sha256:{:x}", Sha256::digest(b"{}")))?,
+            size_bytes: 2,
+        }],
+    };
+    closure.validate()?;
+    let closure_digest = ContentDigest::parse(format!(
+        "steward:sha256:{:x}",
+        Sha256::digest(canonical_json_bytes(&closure)?)
+    ))?;
+    let evidence = BrowserTaskEvidence {
+        source: source.to_owned(),
+        revision: repository_revision.unwrap_or_else(|| closure_digest.as_str().to_owned()),
+        path,
+        closure: Some(closure),
+        closure_digest,
+        inline_files: (source == "inline")
+            .then(|| BTreeMap::from([("task-definition.json".to_owned(), "{}".to_owned())])),
+    };
+    evidence.validate()?;
+    Ok(evidence)
+}
+
 async fn reserve_browser_concurrency_fixture(
     store: &PgStore,
     idempotency_key: &str,
@@ -725,8 +762,65 @@ async fn reserve_browser_concurrency_fixture(
         .map(|reservation| reservation.inserted)
 }
 
+async fn reserve_browser_direct_package_fixture(
+    store: &PgStore,
+    idempotency_key: &str,
+    service: &str,
+    identity: &steward_types::CanonicalPrincipal,
+    envelope_instance_id: &str,
+    envelope_digest: &str,
+    envelope: &Envelope,
+    spec: &AgentRuntimeSpec,
+    execution_binding: &TaskExecutionBinding,
+    evidence: &BrowserTaskEvidence,
+) -> Result<bool, StoreError> {
+    let task_uid = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let runtime_name = format!("task-{}", operation_id.simple());
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let command = ["example-agent".to_owned(), "run".to_owned()];
+    let decision = AdmissionDecision::Admit;
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid,
+            operation_id,
+            idempotency_key,
+            submitter_service: service,
+            acting_user: Some(identity.display_email.as_str()),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: identity.display_email.as_str(),
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "direct:browser-package@1",
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: Some(envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: spec,
+            agent_command: &command,
+            execution_binding: Some(execution_binding),
+            source_provenance: None,
+            direct_task_evidence: None,
+            task_origin: TaskOrigin::Browser,
+            browser_task_evidence: Some(evidence),
+            user_envelope_snapshot: Some(envelope),
+            candidate_digest: &digest,
+            admission_decision: &decision,
+            inert_manifest_digest: &digest,
+            active_manifest_digest: &digest,
+        })
+        .await
+        .map(|reservation| reservation.inserted)
+}
+
 #[tokio::test]
-async fn browser_task_concurrency_is_bounded_without_breaking_exact_retries()
+async fn browser_task_rows_persist_and_concurrency_is_bounded_without_breaking_exact_retries()
 -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
     let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
@@ -854,8 +948,54 @@ async fn browser_task_concurrency_is_bounded_without_breaking_exact_retries()
         "closureDigest": format!("steward:sha256:{}", "b".repeat(64))
     }))?;
     let service = format!("browser-limit-{suffix}");
+    let inline_evidence = browser_direct_package_evidence("inline", None)?;
+    let repository_evidence = browser_direct_package_evidence(
+        "https://github.com/example-org/agentic-ops.git",
+        Some(format!("git:sha1:{}", "e".repeat(40))),
+    )?;
+    for (kind, evidence) in [
+        ("inline", &inline_evidence),
+        ("repository", &repository_evidence),
+    ] {
+        let key = format!("browser-{kind}-task-{suffix}");
+        assert!(
+            reserve_browser_direct_package_fixture(
+                &store,
+                &key,
+                &service,
+                &identity,
+                &envelope_instance_id,
+                &envelope_digest,
+                &envelope,
+                &spec,
+                &execution_binding,
+                evidence,
+            )
+            .await?,
+            "the {kind} browser package must persist through PgStore"
+        );
+        let persisted = store
+            .task_by_idempotency(&service, identity.user_id.as_str(), &key)
+            .await?
+            .ok_or("browser package Task was not persisted")?;
+        assert_eq!(persisted.task_origin, TaskOrigin::Browser);
+        assert!(persisted.direct_task_evidence.is_none());
+        assert_eq!(persisted.browser_task_evidence.as_ref(), Some(evidence));
+        assert!(persisted.workflow_name.is_none());
+        assert!(persisted.workflow_version.is_none());
+        assert!(persisted.workflow_digest.is_none());
+        assert_eq!(
+            persisted.user_envelope_instance_id.as_deref(),
+            Some(envelope_instance_id.as_str())
+        );
+        assert_eq!(persisted.user_envelope_revision, Some(envelope.revision));
+        assert_eq!(
+            persisted.user_envelope_digest.as_deref(),
+            Some(envelope_digest.as_str())
+        );
+    }
     let first_idempotency_key = format!("browser-limit-task-{suffix}-0");
-    for index in 0..MAX_ACTIVE_BROWSER_TASKS_PER_USER {
+    for index in 0..(MAX_ACTIVE_BROWSER_TASKS_PER_USER - 2) {
         let idempotency_key = format!("browser-limit-task-{suffix}-{index}");
         assert!(
             reserve_browser_concurrency_fixture(
