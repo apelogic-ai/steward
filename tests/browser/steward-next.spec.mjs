@@ -49,7 +49,10 @@ const envelope = {
   revision: 4,
   spec: {
     budget: { currency: "USD", monthlyLimit: "25.00", singleRunLimit: "5.00" },
-    llms: [{ provider: "provider-a", model: "model-a" }],
+    llms: [
+      { provider: "provider-a", model: "model-a" },
+      { provider: "openai", model: "gpt-5.4" },
+    ],
     tools: [{ provider: "github", resource: "repository", action: "get_file_contents" }],
     ttl: "4h",
     runner: { platforms: [] },
@@ -315,6 +318,7 @@ async function startWeb() {
         requestUrl.pathname === "/app/api/v1/runs"
         || requestUrl.pathname === "/app/api/v1/envelope-requests"
         || requestUrl.pathname.endsWith("/github-actions-workflow")
+        || requestUrl.pathname.endsWith("/repository-bundle")
         || requestUrl.pathname.startsWith("/admin/api/v1/envelope-templates/")
         || requestUrl.pathname === "/admin/api/v1/envelopes/provision"
         || requestUrl.pathname === "/admin/api/v1/workflows"
@@ -429,6 +433,17 @@ async function startWeb() {
         if (requestUrl.pathname.endsWith("/github-actions-workflow")) {
           response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
           response.end(JSON.stringify({ apiVersion: "steward.envelope-requests/v1", workflow: { schemaVersion: "v2", contentType: "application/yaml", suggestedPath: ".github/workflows/steward-repository-review.yml", sha256: "abc123", yaml: ["name: Steward governed run", "on:", "  workflow_dispatch:", "jobs:", "  governed:", "    with:", "      workflow: repository-review@1", ""].join("\n") } }));
+          return;
+        }
+        if (requestUrl.pathname.endsWith("/repository-bundle")) {
+          response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+          response.end(JSON.stringify({
+            apiVersion: "steward.envelope-requests/v1",
+            files: {
+              ".github/workflows/steward-browser-task.yml": "name: Steward governed run\n",
+              ".steward/invocations/browser-task.json": "{\"contractVersion\":\"steward.task/v2\"}\n",
+            },
+          }));
           return;
         }
         if (requestUrl.pathname.endsWith("/file")) {
@@ -613,6 +628,8 @@ async function guardedPage(browser, {
     stderr: { body: "agent stderr\n", status: 200 },
   },
   includeSampleWorkflow = false,
+  inlineRun = false,
+  publishedWorkflows = true,
   initialOnboardingDismissed = false,
   initialWorkflowAcknowledged = false,
   onboardingPagination = false,
@@ -640,9 +657,27 @@ async function guardedPage(browser, {
     hangPoll: connectionStartHangPoll,
   });
   web.useRerunFixtures(rerunResponses);
+  const fixtureRun = inlineRun ? {
+    ...run,
+    origin: "browser",
+    workflow: "browser-task@1",
+    workflowName: null,
+    workflowVersion: null,
+    package: {
+      source: "inline",
+      revision: `steward:sha256:${"c".repeat(64)}`,
+      path: browserTaskDefinitionPath,
+      contentDigest: `steward:sha256:${"c".repeat(64)}`,
+    },
+  } : run;
   await context.addInitScript(() => {
     const BrowserAbortController = AbortController;
     Object.defineProperty(window, "__stewardAbortCount", { configurable: true, value: 0, writable: true });
+    Object.defineProperty(window, "__stewardClipboardText", { configurable: true, value: "", writable: true });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText(value) { window.__stewardClipboardText = value; return Promise.resolve(); } },
+    });
     Object.defineProperty(window, "AbortController", {
       configurable: true,
       value: class extends BrowserAbortController {
@@ -726,7 +761,11 @@ async function guardedPage(browser, {
   }));
   await context.route(`${origin}/app/api/v1/workflows`, (route) => json(route, {
     apiVersion: "steward.workflows/v1",
-    workflows: emptyCollections ? [] : [
+    agents: emptyCollections ? [] : [
+      { agentRef: "codex@0.140.0", displayName: "Codex 0.140.0" },
+      { agentRef: "claude-code@2.1.222", displayName: "Claude Code 2.1.222" },
+    ],
+    workflows: emptyCollections || !publishedWorkflows ? [] : [
       {
         agent: workflowRevision.agent,
         displayName: workflowRevision.displayName,
@@ -762,7 +801,7 @@ async function guardedPage(browser, {
     await json(route, { apiVersion: "steward.envelope-requests/v1", requests: emptyCollections ? [] : [envelopeRequest] });
   });
   await context.route(`${origin}/app/api/v1/envelope-requests/**`, async (route) => {
-    if (route.request().url().endsWith("/github-actions-workflow")) {
+    if (route.request().url().endsWith("/github-actions-workflow") || route.request().url().endsWith("/repository-bundle")) {
       await route.continue();
       return;
     }
@@ -779,23 +818,36 @@ async function guardedPage(browser, {
         runs: cursor ? [{
           ...run,
           taskUid: "00000000-0000-0000-0000-000000000007",
-          workflow: "repo-summary@2",
-          workflowName: "repo-summary",
-          workflowVersion: 2,
+          origin: "browser",
+          workflow: "browser-task@1",
+          workflowName: null,
+          workflowVersion: null,
+          package: { source: "inline", revision: `steward:sha256:${"c".repeat(64)}`, path: browserTaskDefinitionPath, contentDigest: `steward:sha256:${"c".repeat(64)}` },
+        }] : [{
+          ...run,
+          origin: "github-actions",
+          package: { source: "https://github.com/example-org/sample.git", revision: `git:sha1:${"a".repeat(40)}`, path: browserTaskDefinitionPath, contentDigest: `steward:sha256:${"c".repeat(64)}` },
           trigger: { provider: "github", repository: "https://github.com/example-org/sample" },
-        }] : [run],
+        }],
         nextCursor: cursor ? null : taskUid,
         facets: { phase: runFacets },
       });
     }
-    return json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [run], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } });
+    return json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [fixtureRun], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } });
   });
   await context.route(`${origin}/app/api/v1/runs/**`, (route) => {
     if (route.request().url().endsWith("/rerun")) return route.continue();
     return route.request().url().endsWith("/timeline")
       ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
-      : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } });
+      : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...fixtureRun, phase: runPhase } });
   });
+  await context.route(`${origin}/app/api/v1/runs/${taskUid}/package`, (route) => json(route, {
+    taskUid,
+    files: {
+      [browserTaskDefinitionPath]: "{\"schemaVersion\":\"steward.task-definition/v2\"}\n",
+      "prompt.md": "Create the hello-world output.\n",
+    },
+  }));
   await context.route(`${origin}/app/api/v1/runs/${taskUid}/logs/*`, async (route) => {
     const stream = new URL(route.request().url()).pathname.split("/").at(-1);
     executionLogRequests.push(route.request());
@@ -816,10 +868,10 @@ async function guardedPage(browser, {
       downloadUrl: `/app/api/v1/runs/${taskUid}/outputs/${encodeURIComponent("out/hello.txt")}`,
     }],
   }));
-  await context.route(`${origin}/admin/api/v1/all-runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [{ ...run, ownerUserId: developerSession.principal.userId, ownerDisplayEmail: developerSession.principal.displayEmail }], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } }));
+  await context.route(`${origin}/admin/api/v1/all-runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [{ ...fixtureRun, ownerUserId: developerSession.principal.userId, ownerDisplayEmail: developerSession.principal.displayEmail }], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } }));
   await context.route(`${origin}/admin/api/v1/all-runs/**`, (route) => route.request().url().endsWith("/timeline")
     ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
-    : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } }));
+    : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...fixtureRun, phase: runPhase } }));
   await context.route(`${origin}/admin/api/v1/all-runs/${taskUid}/logs/*`, async (route) => {
     const stream = new URL(route.request().url()).pathname.split("/").at(-1);
     executionLogRequests.push(route.request());
@@ -1187,8 +1239,8 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
     await expect(developer.page.getByText("Sensitivity notice", { exact: true })).toBeVisible();
 
     await developer.page.goto(`${origin}/get-started`);
-    await expect(developer.page.getByText("Five steps to your first governed agent run. An envelope is the budget, models and tools an agent may use; the workflow runs your agent inside it.")).toBeVisible();
-    for (const title of ["Connect GitHub", "Get your first envelope", "Choose the sample package", "Trigger a test run", "See the result"]) {
+    await expect(developer.page.getByText("Four steps to your first governed browser run. GitHub Actions automation is available afterward, but never blocks completion.")).toBeVisible();
+    for (const title of ["Connect GitHub", "Get your first envelope", "Run hello world now", "See the result", "Automate it from GitHub Actions"]) {
       await expect(developer.page.getByRole("button", { name: new RegExp(title) })).toBeVisible();
     }
   } finally {
@@ -1582,27 +1634,16 @@ test("administrators can provision a template envelope directly to a user", asyn
   }
 });
 
-test("onboarding selects the browser sample and ignores unrelated runs", async ({ browser }) => {
+test("onboarding makes the browser run core and repository automation optional", async ({ browser }) => {
   const developer = await guardedPage(browser, { includeSampleWorkflow: true });
   try {
     await developer.page.goto(`${origin}/get-started`);
-    const workflowStep = developer.page.getByRole("listitem").filter({ hasText: "Choose the sample package" });
-    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" });
-    await expect(workflowStep.getByText("Use the published sample now; a repository is optional", { exact: true })).toBeVisible();
-    await expect(runStep.getByText("Start the sample from Steward", { exact: true })).toBeVisible();
-
-    await developer.page.getByRole("button", { name: "Use this sample" }).click();
-    await expect(workflowStep.getByText("Done", { exact: true })).toBeVisible();
-    const acknowledgement = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/preferences");
-    expect(acknowledgement, "expected the durable preference mutation").toBeTruthy();
-    expect(acknowledgement.headers["x-steward-csrf"]).toBe("test-csrf");
-    expect(acknowledgement.headers["content-type"]).toContain("application/json");
-    expect(acknowledgement.headers.origin).toBe(origin);
-    expect(acknowledgement.body).toEqual({ workflowAcknowledged: true });
-
-    await developer.page.reload();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "Choose the sample package" }).getByText("Done", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" }).getByText("Start the sample from Steward", { exact: true })).toBeVisible();
+    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Run hello world now" });
+    const automationStep = developer.page.getByRole("listitem").filter({ hasText: "Automate it from GitHub Actions" });
+    await expect(runStep.getByText(/Start directly in Steward/)).toBeVisible();
+    await expect(runStep.getByRole("link", { name: "Open Run now" })).toHaveAttribute("href", "/runs/new");
+    await expect(automationStep.getByText("Optional", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("2 of 4 done", { exact: true })).toBeVisible();
 
     await developer.page.getByRole("button", { name: "Hide Get started" }).click();
     await expect(developer.page.getByText("The onboarding guide is hidden. Your progress is preserved.")).toBeVisible();
@@ -1650,11 +1691,11 @@ test("onboarding banner is shared, dismissible, and restorable from settings", a
   }
 });
 
-test("onboarding navigation shows progress and disappears when all five steps are complete", async ({ browser }) => {
+test("onboarding navigation shows progress and disappears when all four core steps are complete", async ({ browser }) => {
   const inProgress = await guardedPage(browser, { includeSampleWorkflow: true });
   try {
     await inProgress.page.goto(`${origin}/envelopes`);
-    await expect(inProgress.page.getByRole("link", { name: /Get started/ })).toContainText("2/5");
+    await expect(inProgress.page.getByRole("link", { name: /Get started/ })).toContainText("2/4");
   } finally {
     await closeGuardedPage(inProgress);
   }
@@ -1686,19 +1727,19 @@ test("onboarding lets the user choose which first envelope template to request",
   }
 });
 
-test("onboarding cannot acknowledge an absent sample", async ({ browser }) => {
+test("onboarding does not require a published sample", async ({ browser }) => {
   const developer = await guardedPage(browser);
   try {
     await developer.page.goto(`${origin}/get-started`);
-    await expect(developer.page.getByText("The deployment has no executable onboarding sample.")).toBeVisible();
-    await expect(developer.page.getByRole("button", { name: "Use this sample" })).toBeDisabled();
+    await expect(developer.page.getByRole("link", { name: "Open Run now" })).toBeVisible();
+    await expect(developer.page.getByText("Optional", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
 });
 
 test("Run now submits an inline package under the selected envelope", async ({ browser }) => {
-  const developer = await guardedPage(browser);
+  const developer = await guardedPage(browser, { publishedWorkflows: false });
   try {
     await developer.page.goto(`${origin}/runs/new`);
     await developer.page.getByRole("button", { name: "Run now" }).click();
@@ -1711,8 +1752,38 @@ test("Run now submits an inline package under the selected envelope", async ({ b
     expect(submission.body.package.source).toBe("inline");
     expect(submission.body.package.path).toBe(browserTaskDefinitionPath);
     expect(submission.body.package.files["prompt.md"]).toContain("hello world");
+    const taskDefinition = JSON.parse(submission.body.package.files[browserTaskDefinitionPath]);
+    expect(taskDefinition.runtime).toEqual({ agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } });
+    expect(taskDefinition.requires.authority.llms).toEqual([{ provider: "openai", model: "gpt-5.4" }]);
     expect(submission.body).not.toHaveProperty("actor");
     expect(submission.body).not.toHaveProperty("owner");
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("a successful inline run exports its exact package with the repository wrapper", async ({ browser }) => {
+  const developer = await guardedPage(browser, { inlineRun: true });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByRole("heading", { name: "Save this task to a repository" })).toBeVisible();
+    await developer.page.getByLabel("Target repository").fill("https://github.com/example-org/agentic-ops.git");
+    await developer.page.getByRole("button", { name: "Copy repository bundle" }).click();
+    await expect(developer.page.getByRole("button", { name: "Bundle copied" })).toBeVisible();
+
+    const clipboard = JSON.parse(await developer.page.evaluate(() => window.__stewardClipboardText));
+    expect(clipboard[browserTaskDefinitionPath]).toBe("{\"schemaVersion\":\"steward.task-definition/v2\"}\n");
+    expect(clipboard["prompt.md"]).toBe("Create the hello-world output.\n");
+    expect(clipboard[".steward/invocations/browser-task.json"]).toContain("steward.task/v2");
+    expect(clipboard[".github/workflows/steward-browser-task.yml"]).toContain("Steward governed run");
+
+    const mutation = developer.mutations.find((entry) => entry.path.endsWith("/repository-bundle"));
+    expectMutationProof(mutation);
+    expect(mutation.body).toEqual({
+      repository: "https://github.com/example-org/agentic-ops.git",
+      packagePath: browserTaskDefinitionPath,
+      invocationPath: ".steward/invocations/browser-task.json",
+    });
   } finally {
     await closeGuardedPage(developer);
   }
@@ -1726,8 +1797,9 @@ test("onboarding follows paginated envelope and run evidence", async ({ browser 
   try {
     await developer.page.goto(`${origin}/get-started`);
     await expect(developer.page.getByRole("listitem").filter({ hasText: "Get your first envelope" }).getByText("Done", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Run hello world now" }).getByText("Done", { exact: true })).toBeVisible();
     await expect(developer.page.getByRole("listitem").filter({ hasText: "See the result" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Automate it from GitHub Actions" }).getByText("Done", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }

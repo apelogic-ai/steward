@@ -5,7 +5,7 @@
 //! All Runs route requires a browser-admin session; the existing bearer administrator API remains
 //! independent at `/admin/api/v1/runs`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -152,6 +152,15 @@ pub(crate) struct BrowserRunPackageView {
     source: String,
     revision: String,
     path: String,
+    content_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserRunPackageContentResponse {
+    #[schema(value_type = String, format = "uuid")]
+    task_uid: Uuid,
+    files: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -424,6 +433,10 @@ where
         .route("/app/api/v1/runs", get(my_runs::<L>))
         .route("/app/api/v1/runs/{task_uid}", get(my_run::<L>))
         .route(
+            "/app/api/v1/runs/{task_uid}/package",
+            get(my_run_package::<L>),
+        )
+        .route(
             "/app/api/v1/runs/{task_uid}/cancel",
             post(cancel_my_run::<L>),
         )
@@ -448,6 +461,59 @@ where
             ledger,
             github_rerunner,
         })
+}
+
+#[utoipa::path(
+    get,
+    path = "/app/api/v1/runs/{task_uid}/package",
+    params(("task_uid" = String, Path, format = "uuid")),
+    responses(
+        (status = 200, body = BrowserRunPackageContentResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Exact successful inline package is unavailable"),
+        (status = 503, description = "Run package is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn my_run_package<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    State(state): State<BrowserRunsState<L>>,
+    Path(task_uid): Path<Uuid>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match scoped_run(
+        &state.ledger,
+        task_uid,
+        Some(session.principal.canonical_user_id.as_str().to_owned()),
+    )
+    .await
+    {
+        Ok(Some(record))
+            if record.phase == TaskPhase::Succeeded
+                && record.task_origin == TaskOrigin::Browser =>
+        {
+            let Some(evidence) = record
+                .browser_task_evidence
+                .filter(|evidence| evidence.source == "inline")
+            else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            let Some(files) = evidence.inline_files else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            Json(BrowserRunPackageContentResponse { task_uid, files }).into_response()
+        }
+        Ok(Some(_) | None) => StatusCode::NOT_FOUND.into_response(),
+        Err(StoreError::InvalidRunQuery | StoreError::InvalidRunCursor) => {
+            browser_runs_error(StatusCode::BAD_REQUEST)
+        }
+        Err(_) => browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 #[utoipa::path(
@@ -1520,6 +1586,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
             source: evidence.source.clone(),
             revision: evidence.revision.clone(),
             path: evidence.path.as_str().to_owned(),
+            content_digest: Some(evidence.closure_digest.as_str().to_owned()),
         })
         .or_else(|| {
             record
@@ -1529,6 +1596,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
                     source: evidence.package.repository.as_str().to_owned(),
                     revision: evidence.package.commit.as_str().to_owned(),
                     path: evidence.package.path.as_str().to_owned(),
+                    content_digest: Some(evidence.closure_digest.as_str().to_owned()),
                 })
         })
         .or_else(|| {
@@ -1536,6 +1604,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
                 source: format!("steward:registry/{}", record.workflow_name.as_deref()?),
                 revision: format!("steward:version:{}", record.workflow_version?),
                 path: "task-definition.json".to_owned(),
+                content_digest: record.workflow_digest.clone(),
             })
         });
     BrowserRunView {
@@ -1730,6 +1799,7 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
     use steward_store::{AgentRunSpend, AgentRunTimelineEvent, TaskRecord};
+    use steward_types::direct_package::{BrowserTaskEvidence, ContentDigest, RelativePath};
     use steward_types::{
         AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal,
     };
@@ -2712,6 +2782,87 @@ mod tests {
             .await
             .map_err(|error| format!("execute hidden output request: {error}"))?;
         assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_inline_package_is_exact_and_owner_scoped() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let other_owner = "usr_abcdefabcdefabcdefabcdefabcdefab";
+        let own_task = Uuid::parse_str("33333333-3333-4333-8333-333333333333")
+            .map_err(|error| error.to_string())?;
+        let other_task = Uuid::parse_str("44444444-4444-4444-8444-444444444444")
+            .map_err(|error| error.to_string())?;
+        let failed_task = Uuid::parse_str("55555555-5555-4555-8555-555555555555")
+            .map_err(|error| error.to_string())?;
+        let digest = format!("steward:sha256:{}", "d".repeat(64));
+        let evidence = BrowserTaskEvidence {
+            source: "inline".to_owned(),
+            revision: digest.clone(),
+            path: RelativePath::parse("task-definition.json")?,
+            closure: None,
+            closure_digest: ContentDigest::parse(digest)?,
+            inline_files: Some(BTreeMap::from([
+                ("prompt.md".to_owned(), "Say hello.\n".to_owned()),
+                (
+                    "task-definition.json".to_owned(),
+                    "{\"schemaVersion\":\"steward.task-definition/v2\"}".to_owned(),
+                ),
+            ])),
+        };
+        let mut own = run(own_task, owner);
+        own.task_origin = TaskOrigin::Browser;
+        own.browser_task_evidence = Some(evidence.clone());
+        let mut other = run(other_task, other_owner);
+        other.task_origin = TaskOrigin::Browser;
+        other.browser_task_evidence = Some(evidence.clone());
+        let mut failed = run(failed_task, owner);
+        failed.phase = TaskPhase::Failed;
+        failed.task_origin = TaskOrigin::Browser;
+        failed.browser_task_evidence = Some(evidence);
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .extend([own, other, failed]);
+
+        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let app = protected_router(ledger, service);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{own_task}/package"))
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build exact package request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute exact package request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .map_err(|error| format!("read exact package response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode exact package response: {error}"))?;
+        assert_eq!(body["taskUid"], own_task.to_string());
+        assert_eq!(body["files"]["prompt.md"], "Say hello.\n");
+
+        for hidden_task in [other_task, failed_task] {
+            let hidden = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/app/api/v1/runs/{hidden_task}/package"))
+                        .header(header::COOKIE, &session_cookie)
+                        .body(Body::empty())
+                        .map_err(|error| format!("build hidden package request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("execute hidden package request: {error}"))?;
+            assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+        }
         Ok(())
     }
 

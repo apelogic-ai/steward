@@ -1,12 +1,10 @@
 import {
   getBrowserPreferences,
   listProviderConnections,
-  listPublishedWorkflows,
   type BrowserPreferencesView,
   type ConnectionsCollectionResponse,
   type EnvelopeRequestsResponse,
   type MyRunsResponse,
-  type PublishedWorkflowsResponse,
 } from "@/api-client";
 import { loadAllEnvelopeRequests, loadAllMyRuns } from "@/data/paginated-api";
 
@@ -14,51 +12,58 @@ export type OnboardingEvidence = {
   connections: ConnectionsCollectionResponse;
   envelopes: EnvelopeRequestsResponse;
   preferences: BrowserPreferencesView;
-  workflows: PublishedWorkflowsResponse;
   runs: MyRunsResponse;
 };
 
-export function matchingSampleRun(
+export function browserHelloWorldRun(
   runs: MyRunsResponse["runs"],
-  sampleWorkflow: string | null,
   provisionedEnvelopeIds: ReadonlySet<string>,
 ) {
-  if (!sampleWorkflow) return undefined;
+  return runs.find((run) => run.origin === "browser"
+    && run.package?.source === "inline"
+    && Boolean(run.userEnvelopeInstanceId)
+    && provisionedEnvelopeIds.has(String(run.userEnvelopeInstanceId)));
+}
+
+export function automatedPackageRun(
+  runs: MyRunsResponse["runs"],
+  browserRun: MyRunsResponse["runs"][number] | undefined,
+  provisionedEnvelopeIds: ReadonlySet<string>,
+) {
+  const digest = browserRun?.package?.contentDigest;
+  if (!digest) return undefined;
   return runs.find((run) => run.trigger?.provider === "github"
-    && `${run.workflowName}@${run.workflowVersion}` === sampleWorkflow
+    && run.package?.contentDigest === digest
     && Boolean(run.userEnvelopeInstanceId)
     && provisionedEnvelopeIds.has(String(run.userEnvelopeInstanceId)));
 }
 
 export function deriveOnboardingProgress(data: OnboardingEvidence) {
-  const sample = data.workflows.workflows.find((workflow) => workflow.sample);
-  const sampleWorkflow = sample ? `${sample.name}@${sample.version}` : null;
   const provisionedEnvelopeIds = new Set(data.envelopes.requests
     .filter((request) => request.status === "provisioned" && request.envelopeInstanceId)
     .map((request) => String(request.envelopeInstanceId)));
-  const sampleRun = matchingSampleRun(data.runs.runs, sampleWorkflow, provisionedEnvelopeIds);
+  const helloWorldRun = browserHelloWorldRun(data.runs.runs, provisionedEnvelopeIds);
+  const automationRun = automatedPackageRun(data.runs.runs, helloWorldRun, provisionedEnvelopeIds);
   const done = [
     data.connections.connections.some((connection) => connection.status.phase === "connected"),
     provisionedEnvelopeIds.size > 0,
-    data.preferences.workflowAcknowledged,
-    Boolean(sampleRun),
-    Boolean(sampleRun && ["succeeded", "failed", "cancelled"].includes(sampleRun.phase)),
+    Boolean(helloWorldRun),
+    helloWorldRun?.phase === "succeeded",
   ];
-  return { completed: done.filter(Boolean).length, done, provisionedEnvelopeIds, sample, sampleRun, sampleWorkflow };
+  return { completed: done.filter(Boolean).length, done, provisionedEnvelopeIds, helloWorldRun, automationRun };
 }
 
 export async function loadOnboardingEvidence() {
-  const [connections, envelopes, preferences, workflows, runs] = await Promise.all([
+  const [connections, envelopes, preferences, runs] = await Promise.all([
     listProviderConnections({ cache: "no-store", credentials: "same-origin" }),
     loadAllEnvelopeRequests("provisioned"),
     getBrowserPreferences({ cache: "no-store", credentials: "same-origin" }),
-    listPublishedWorkflows({ cache: "no-store", credentials: "same-origin" }),
     loadAllMyRuns(),
   ]);
-  const results = [connections, envelopes, preferences, workflows, runs];
+  const results = [connections, envelopes, preferences, runs];
   return {
-    data: connections.data && envelopes.data && preferences.data && workflows.data && runs.data
-      ? { connections: connections.data, envelopes: envelopes.data, preferences: preferences.data, workflows: workflows.data, runs: runs.data }
+    data: connections.data && envelopes.data && preferences.data && runs.data
+      ? { connections: connections.data, envelopes: envelopes.data, preferences: preferences.data, runs: runs.data }
       : undefined,
     response: results.find((result) => !result.response?.ok)?.response ?? connections.response,
   };

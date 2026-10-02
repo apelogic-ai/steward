@@ -34,9 +34,9 @@ use crate::browser_auth::{
 };
 use crate::{
     AgentRunAvailability, AgentRunDataStatus, BoxFuture, DirectPackageGithubActionsWorkflowContext,
-    GithubActionsEnvelopeSelection, StewardRunRelease, StewardRunWorkflowInstallationMode,
-    VersionedGithubActionsWorkflowContext, render_direct_package_github_actions_workflow,
-    render_versioned_github_actions_workflow,
+    ExecutionBindingAdvertisement, GithubActionsEnvelopeSelection, StewardRunRelease,
+    StewardRunWorkflowInstallationMode, VersionedGithubActionsWorkflowContext,
+    render_direct_package_github_actions_workflow, render_versioned_github_actions_workflow,
 };
 
 pub const ENVELOPE_REQUESTS_API_VERSION: &str = "steward.envelope-requests/v1";
@@ -303,6 +303,8 @@ impl From<WorkflowRevisionRecord> for PublishedWorkflowOption {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PublishedWorkflowsResponse {
     api_version: &'static str,
+    /// Exact logical agent references from the deployment-owned execution catalog.
+    agents: Vec<ExecutionBindingAdvertisement>,
     workflows: Vec<PublishedWorkflowOption>,
 }
 
@@ -822,9 +824,19 @@ where
 #[derive(Clone)]
 pub(crate) struct UserEnvelopeState<P> {
     broker: P,
+    agents: Vec<ExecutionBindingAdvertisement>,
 }
 
+#[cfg(test)]
 fn inner_router<P, B>(broker: P) -> Router
+where
+    P: EnvelopeRequestBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    inner_router_with_agents(broker, Vec::new())
+}
+
+fn inner_router_with_agents<P, B>(broker: P, agents: Vec<ExecutionBindingAdvertisement>) -> Router
 where
     P: EnvelopeRequestBroker<B>,
     B: Clone + Eq + Hash + Send + Sync + 'static,
@@ -851,7 +863,7 @@ where
             post(render_repository_bundle_for_envelope::<P, B>),
         )
         .route("/app/api/v1/workflows", get(list_workflows::<P, B>))
-        .with_state(UserEnvelopeState { broker })
+        .with_state(UserEnvelopeState { broker, agents })
 }
 
 #[utoipa::path(
@@ -879,6 +891,7 @@ where
     match state.broker.workflows(&session).await {
         Ok(workflows) => Json(PublishedWorkflowsResponse {
             api_version: ENVELOPE_REQUESTS_API_VERSION,
+            agents: state.agents,
             workflows: workflows.into_iter().map(Into::into).collect(),
         })
         .into_response(),
@@ -888,11 +901,16 @@ where
 
 /// Mount user envelope APIs behind the common browser-session, same-origin, CSRF and
 /// fetch-metadata boundary. User pages only learn authoritative records returned by their broker.
-pub fn protected_router<P>(broker: P, browser_auth: BrowserAuthService) -> Router
+pub fn protected_router<P>(
+    broker: P,
+    agents: Vec<ExecutionBindingAdvertisement>,
+    browser_auth: BrowserAuthService,
+) -> Router
 where
     P: EnvelopeRequestBroker<BrowserSessionBinding>,
 {
-    let routes = inner_router(broker).route_layer(middleware::from_fn(adapt_browser_context));
+    let routes = inner_router_with_agents(broker, agents)
+        .route_layer(middleware::from_fn(adapt_browser_context));
     protect_browser_routes(routes, browser_auth)
 }
 
@@ -1374,14 +1392,17 @@ mod tests {
         AvailableEnvelopeTemplate, EnvelopeRequestBroker, EnvelopeRequestBrokerError,
         EnvelopeRequestStatus, PublishedWorkflowOption, UserEnvelopeMutationProof,
         UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest,
-        envelope_usage_view, inner_router,
+        envelope_usage_view, inner_router, inner_router_with_agents,
     };
     use crate::connections::{
         ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionStartOperation,
         ConnectionSubject, ProviderConnectionBroker, ProviderConnectionStatus,
         ReservedConnectionStart,
     };
-    use crate::{BoxFuture, StewardRunRelease, StewardRunWorkflowInstallationMode};
+    use crate::{
+        BoxFuture, ExecutionBindingAdvertisement, StewardRunRelease,
+        StewardRunWorkflowInstallationMode,
+    };
     use steward_admission::{Envelope, EnvelopeSpec};
     use steward_store::{EnvelopeUsageRecord, WorkflowRevisionRecord};
     use steward_types::{CanonicalUserId, Email};
@@ -1612,6 +1633,36 @@ mod tests {
             .map_err(|error| format!("serialize impostor Workflow option: {error}"))?;
         assert_eq!(sample["sample"], true);
         assert_eq!(impostor["sample"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn published_workflow_catalog_advertises_deployment_execution_bindings()
+    -> Result<(), String> {
+        let response = inner_router_with_agents(
+            TestBroker::default(),
+            vec![ExecutionBindingAdvertisement {
+                agent_ref: "codex@0.140.0".to_owned(),
+                display_name: Some("Codex 0.140.0".to_owned()),
+            }],
+        )
+        .layer(axum::Extension(session()?))
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/workflows")
+                .body(Body::empty())
+                .map_err(|error| format!("build workflow catalog request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("request workflow catalog: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read workflow catalog response: {error}"))?;
+        let response: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse workflow catalog response: {error}"))?;
+        assert_eq!(response["agents"][0]["agentRef"], "codex@0.140.0");
+        assert_eq!(response["agents"][0]["displayName"], "Codex 0.140.0");
         Ok(())
     }
 
