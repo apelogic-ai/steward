@@ -431,6 +431,28 @@ export type BrowserFederatedSubjectView = {
     updatedAt: string;
 };
 
+export type BrowserMemberAssignmentAction = 'grant' | 'revoke';
+
+export type BrowserMemberAssignmentKind = 'administrator' | 'member_role';
+
+export type BrowserMemberResponse = {
+    apiVersion: string;
+    member: BrowserMemberView;
+};
+
+export type BrowserMemberView = {
+    administrator: boolean;
+    displayEmail: string;
+    memberRoles: Array<string>;
+    state: string;
+    userId: string;
+};
+
+export type BrowserMembersResponse = {
+    apiVersion: string;
+    members: Array<BrowserMemberView>;
+};
+
 export type BrowserMutationRequest = {
     [key: string]: never;
 };
@@ -678,6 +700,12 @@ export type CapabilityTool = {
     toolsets?: Array<string>;
 };
 
+export type ChangeBrowserMemberRoleBody = {
+    action: BrowserMemberAssignmentAction;
+    kind: BrowserMemberAssignmentKind;
+    memberRole?: string | null;
+};
+
 export type ClosureEntry = {
     digest: ContentDigest;
     kind: ClosureEntryKind;
@@ -729,6 +757,10 @@ export type ConnectionsCollectionResponse = {
 };
 
 export type ContentDigest = string;
+
+export type CreateBrowserMemberBody = {
+    email: string;
+};
 
 export type CreateEnvelopeRequestBody = {
     idempotencyKey: string;
@@ -2525,6 +2557,114 @@ export type ReplaceAdminFederatedSubjectAssociationResponses = {
 };
 
 export type ReplaceAdminFederatedSubjectAssociationResponse = ReplaceAdminFederatedSubjectAssociationResponses[keyof ReplaceAdminFederatedSubjectAssociationResponses];
+
+export type ListAdminMembersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/members';
+};
+
+export type ListAdminMembersErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Member records are unavailable
+     */
+    503: unknown;
+};
+
+export type ListAdminMembersResponses = {
+    200: BrowserMembersResponse;
+};
+
+export type ListAdminMembersResponse = ListAdminMembersResponses[keyof ListAdminMembersResponses];
+
+export type CreateAdminMemberData = {
+    body: CreateBrowserMemberBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/members';
+};
+
+export type CreateAdminMemberErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Member email is invalid
+     */
+    422: unknown;
+    /**
+     * Member records are unavailable
+     */
+    503: unknown;
+};
+
+export type CreateAdminMemberResponses = {
+    200: BrowserMemberResponse;
+};
+
+export type CreateAdminMemberResponse = CreateAdminMemberResponses[keyof CreateAdminMemberResponses];
+
+export type ChangeAdminMemberRoleData = {
+    body: ChangeBrowserMemberRoleBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        user_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/members/{user_id}/roles';
+};
+
+export type ChangeAdminMemberRoleErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Member was not found
+     */
+    404: unknown;
+    /**
+     * The last active administrator cannot be revoked
+     */
+    409: unknown;
+    /**
+     * Role change is invalid
+     */
+    422: unknown;
+    /**
+     * Member records are unavailable
+     */
+    503: unknown;
+};
+
+export type ChangeAdminMemberRoleResponses = {
+    200: BrowserMemberResponse;
+};
+
+export type ChangeAdminMemberRoleResponse = ChangeAdminMemberRoleResponses[keyof ChangeAdminMemberRoleResponses];
 
 export type ListAdminRequestsData = {
     body?: never;

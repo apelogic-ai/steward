@@ -802,6 +802,36 @@ impl PgStore {
             transaction.commit().await.map_err(database_error)?;
             return Ok(());
         }
+        if assignment_kind == "administrator"
+            && matches!(change.action, BrowserRbacAssignmentAction::Revoke)
+            && current.as_deref() == Some(BrowserRbacAssignmentAction::Grant.as_str())
+            && user_state == "active"
+        {
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock(hashtextextended('browser-rbac-administrators', 0))",
+            )
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            let remaining_administrators = sqlx::query_scalar::<_, i64>(
+                "WITH latest AS ( \
+                     SELECT DISTINCT ON (user_id) user_id, action \
+                     FROM browser_rbac_assignment_events \
+                     WHERE assignment_kind = 'administrator' \
+                     ORDER BY user_id, at DESC, id DESC \
+                 ) \
+                 SELECT count(*) \
+                 FROM latest \
+                 JOIN canonical_users ON canonical_users.user_id = latest.user_id \
+                 WHERE latest.action = 'grant' AND canonical_users.state = 'active'",
+            )
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if remaining_administrators <= 1 {
+                return Err(StoreError::LastBrowserAdministrator);
+            }
+        }
         sqlx::query(
             "INSERT INTO browser_rbac_assignment_events \
              (id, user_id, assignment_kind, member_role, action, actor) \
@@ -824,6 +854,24 @@ impl PgStore {
             "SELECT user_id, organization_id, display_email, state \
              FROM canonical_users ORDER BY user_id",
         )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(canonical_user_record)
+        .collect()
+    }
+
+    /// List only the canonical users belonging to one organization.
+    pub async fn canonical_users_in_organization(
+        &self,
+        organization_id: &OrganizationId,
+    ) -> Result<Vec<CanonicalUserRecord>, StoreError> {
+        sqlx::query(
+            "SELECT user_id, organization_id, display_email, state \
+             FROM canonical_users WHERE organization_id = $1 ORDER BY user_id",
+        )
+        .bind(organization_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(database_error)?
@@ -11060,6 +11108,7 @@ pub enum StoreError {
     InvalidBrowserRbacActor,
     InvalidBrowserRbacAssignment,
     InvalidBrowserRbacRecord,
+    LastBrowserAdministrator,
     InvalidBrowserPreferences,
     ApprovalNotFound,
     ApprovalNotPending,
@@ -11155,6 +11204,12 @@ impl fmt::Display for StoreError {
             }
             Self::InvalidBrowserRbacRecord => {
                 write!(formatter, "browser RBAC record is invalid")
+            }
+            Self::LastBrowserAdministrator => {
+                write!(
+                    formatter,
+                    "the last active browser administrator cannot be revoked"
+                )
             }
             Self::InvalidBrowserPreferences => {
                 write!(formatter, "browser preferences are invalid")

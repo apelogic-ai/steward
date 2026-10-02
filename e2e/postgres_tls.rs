@@ -26,10 +26,10 @@ use steward_store::{
     FederatedSubjectDisable, FederatedSubjectObservation, FederatedSubjectState, PgStore,
     StoreError,
 };
+use steward_types::direct_package::SourceProvenance;
 use steward_types::{
     CanonicalUserId, Email, GOOGLE_ORGANIZATION_ISSUER, OrganizationId, OrganizationIdentityPolicy,
 };
-use steward_types::direct_package::SourceProvenance;
 use tokio::net::TcpListener;
 use tokio::sync::Barrier;
 use tokio::task::JoinHandle;
@@ -344,7 +344,11 @@ async fn verify_pending_member_identity_state(store: &PgStore) -> Result<(), Box
     let organization_id = OrganizationId::parse("org_example")?;
     let email = Email::parse("pending.member@example.com")?;
     let pending = store
-        .preprovision_canonical_user(&organization_id, &email, "usr_0123456789abcdef0123456789abcdef")
+        .preprovision_canonical_user(
+            &organization_id,
+            &email,
+            "usr_0123456789abcdef0123456789abcdef",
+        )
         .await?;
     assert_eq!(pending.state, "pending");
     let assignment = BrowserRbacAssignment::MemberRole("engineer".to_owned());
@@ -368,17 +372,46 @@ async fn verify_pending_member_identity_state(store: &PgStore) -> Result<(), Box
         email.as_str(),
         true,
     )?;
-    let activated = store.register_canonical_identity(&identity, "browser-oidc").await?;
+    let activated = store
+        .register_canonical_identity(&identity, "browser-oidc")
+        .await?;
     assert_eq!(activated.user_id, pending.user_id);
     assert_eq!(
-        store.browser_rbac_assignments(&activated.user_id).await?.member_roles,
+        store
+            .browser_rbac_assignments(&activated.user_id)
+            .await?
+            .member_roles,
         ["engineer"],
         "the verified sign-in must activate the exact pending member without losing its audited role"
     );
     assert_eq!(
-        store.canonical_user(&activated.user_id).await?.expect("activated user").state,
+        store
+            .canonical_user(&activated.user_id)
+            .await?
+            .expect("activated user")
+            .state,
         "active"
     );
+    let administrator = BrowserRbacAssignment::Administrator;
+    store
+        .append_browser_rbac_assignment(BrowserRbacAssignmentChange {
+            user_id: &activated.user_id,
+            assignment: &administrator,
+            action: BrowserRbacAssignmentAction::Grant,
+            actor: "usr_0123456789abcdef0123456789abcdef",
+        })
+        .await?;
+    assert!(matches!(
+        store
+            .append_browser_rbac_assignment(BrowserRbacAssignmentChange {
+                user_id: &activated.user_id,
+                assignment: &administrator,
+                action: BrowserRbacAssignmentAction::Revoke,
+                actor: "usr_0123456789abcdef0123456789abcdef",
+            })
+            .await,
+        Err(StoreError::LastBrowserAdministrator)
+    ));
     Ok(())
 }
 

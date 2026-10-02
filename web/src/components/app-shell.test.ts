@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { breadcrumbsForPath, hasDualRole, isActive, workspaceLandingPath } from "./app-shell";
+import { breadcrumbsForPath, hasDualRole, isAccessPending, isActive, workspaceLandingPath } from "./app-shell";
 
 describe("primary navigation", () => {
   test("selects Envelopes for list, new, detail, and nested run routes", () => {
@@ -39,6 +39,22 @@ describe("workspace mode availability", () => {
   test("lands administrators on template authoring and members on envelopes", () => {
     expect(workspaceLandingPath("admin")).toBe("/admin/envelopes/templates");
     expect(workspaceLandingPath("user")).toBe("/envelopes");
+  });
+
+  test("holds a signed-in person without roles at access pending", () => {
+    const session = {
+      status: "authenticated" as const,
+      value: {
+        apiVersion: "steward.browser-session/v1",
+        csrf: "test-csrf",
+        principal: { displayEmail: "alice@example.com", displayName: "Alice Example", userId: "usr_abcdef0123456789abcdef0123456789" },
+        role: "user" as const,
+        memberRoles: [],
+        surfaces: [],
+      },
+    };
+    expect(isAccessPending(session, false)).toBe(true);
+    expect(isAccessPending(session, true)).toBe(false);
   });
 });
 

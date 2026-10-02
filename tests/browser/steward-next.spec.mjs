@@ -234,6 +234,7 @@ const presentationRoutes = [
   { path: `/runs/${taskUid}`, heading: "repository-review@1", activeNavigation: "Runs" },
   { path: "/connections", heading: "Connections", activeNavigation: "Connections" },
   { path: "/settings", heading: "Settings", activeNavigation: "Settings" },
+  { path: "/admin/members", heading: "Members", activeNavigation: "Members" },
   { path: "/admin/envelopes/templates", heading: "Envelope templates", activeNavigation: "Templates" },
   { path: "/admin/envelopes/provision", heading: "Provision envelope", activeNavigation: "Provision" },
   { path: "/admin/envelopes/templates/analyst", heading: "Envelope template", activeNavigation: "Templates" },
@@ -853,6 +854,29 @@ async function guardedPage(browser, {
       { id: "developer", displayName: "Developer", memberRoles: ["developer"], envelope, autoProvisionThreshold: null },
     ],
   }));
+  await context.route(`${origin}/admin/api/v1/members*`, async (route) => {
+    const member = {
+      userId: developerSession.principal.userId,
+      displayEmail: developerSession.principal.displayEmail,
+      state: "active",
+      administrator: true,
+      memberRoles: ["analyst"],
+    };
+    if (route.request().method() === "GET") {
+      await json(route, { apiVersion: "steward.browser-members/v1", members: [member] });
+      return;
+    }
+    mutations.push({
+      path: new URL(route.request().url()).pathname,
+      headers: route.request().headers(),
+      body: route.request().postDataJSON(),
+    });
+    await json(route, { apiVersion: "steward.browser-members/v1", member });
+  });
+  await context.route(`${origin}/admin/api/v1/federated-subjects`, (route) => json(route, {
+    apiVersion: "steward.browser-admin/v1",
+    federatedSubjects: [],
+  }));
   await context.route(`${origin}/admin/api/v1/capabilities`, (route) => capabilityCatalogStatus === 200
     ? json(route, {
       schemaVersion: "steward.capability-catalog/v2",
@@ -1205,6 +1229,21 @@ test("a user session cannot enter the administrator workspace", async ({ browser
     await expect(developer.page.getByRole("heading", { name: "All runs", exact: true })).toHaveCount(0);
   } finally {
     await closeGuardedPage(developer);
+  }
+});
+
+test("an unroled signed-in person sees access pending instead of a workspace", async ({ browser }) => {
+  const unroled = await guardedPage(browser, {
+    session: { ...developerSession, memberRoles: [] },
+  });
+  try {
+    await unroled.page.goto(`${origin}/envelopes`);
+    await expect(unroled.page.getByRole("heading", { name: "Access pending", exact: true })).toBeVisible();
+    await expect(unroled.page.getByText(developerSession.principal.displayEmail, { exact: true })).toBeVisible();
+    await expect(unroled.page.getByRole("button", { name: "Copy user ID" })).toBeVisible();
+    await expect(unroled.page.getByRole("navigation", { name: "Primary navigation" })).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(unroled);
   }
 });
 
