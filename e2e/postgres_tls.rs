@@ -21,11 +21,14 @@ use steward_apiserver::governed_connections::{
     DirectConnectionStatusConfig, DirectConnectionStatusReader, SplitConnectionsBroker,
 };
 use steward_store::{
+    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
     FederatedSubjectAssociation, FederatedSubjectAssociationMethod, FederatedSubjectAuditAction,
     FederatedSubjectDisable, FederatedSubjectObservation, FederatedSubjectState, PgStore,
     StoreError,
 };
-use steward_types::CanonicalUserId;
+use steward_types::{
+    CanonicalUserId, Email, GOOGLE_ORGANIZATION_ISSUER, OrganizationId, OrganizationIdentityPolicy,
+};
 use steward_types::direct_package::SourceProvenance;
 use tokio::net::TcpListener;
 use tokio::sync::Barrier;
@@ -231,6 +234,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     assert_template_catalog_upgrade_result(&store).await?;
     verify_federated_subject_lifecycle(&store).await?;
     verify_direct_connection_auto_association(&store).await?;
+    verify_pending_member_identity_state(&store).await?;
 
     let tls_active =
         sqlx::query_scalar::<_, bool>("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
@@ -333,6 +337,48 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         "new Task writers must use the User-Envelope-only orchestration contract: {new_writer_constraint}"
     );
 
+    Ok(())
+}
+
+async fn verify_pending_member_identity_state(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let organization_id = OrganizationId::parse("org_example")?;
+    let email = Email::parse("pending.member@example.com")?;
+    let pending = store
+        .preprovision_canonical_user(&organization_id, &email, "usr_0123456789abcdef0123456789abcdef")
+        .await?;
+    assert_eq!(pending.state, "pending");
+    let assignment = BrowserRbacAssignment::MemberRole("engineer".to_owned());
+    store
+        .append_browser_rbac_assignment(BrowserRbacAssignmentChange {
+            user_id: &pending.user_id,
+            assignment: &assignment,
+            action: BrowserRbacAssignmentAction::Grant,
+            actor: "usr_0123456789abcdef0123456789abcdef",
+        })
+        .await?;
+    let identity = OrganizationIdentityPolicy::new(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "example.com",
+        organization_id.clone(),
+    )?
+    .validate(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "pending-member-subject",
+        "example.com",
+        email.as_str(),
+        true,
+    )?;
+    let activated = store.register_canonical_identity(&identity, "browser-oidc").await?;
+    assert_eq!(activated.user_id, pending.user_id);
+    assert_eq!(
+        store.browser_rbac_assignments(&activated.user_id).await?.member_roles,
+        ["engineer"],
+        "the verified sign-in must activate the exact pending member without losing its audited role"
+    );
+    assert_eq!(
+        store.canonical_user(&activated.user_id).await?.expect("activated user").state,
+        "active"
+    );
     Ok(())
 }
 

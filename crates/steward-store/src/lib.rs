@@ -832,6 +832,75 @@ impl PgStore {
         .collect()
     }
 
+    /// Reserve one verified organization email for browser-member onboarding.
+    ///
+    /// A pending record has no external identity and cannot act as a principal. The browser OIDC
+    /// registration path is the only operation that can activate it, after it verifies the exact
+    /// organization email.
+    pub async fn preprovision_canonical_user(
+        &self,
+        organization_id: &OrganizationId,
+        email: &Email,
+        actor: &str,
+    ) -> Result<CanonicalUserRecord, StoreError> {
+        if actor.trim().is_empty() {
+            return Err(StoreError::CanonicalIdentityInvalidActor);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+                hashtextextended($1::text || chr(31) || lower($2::text), 0)\
+             )",
+        )
+        .bind(organization_id.as_str())
+        .bind(email.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if let Some(row) = sqlx::query(
+            "SELECT user_id, organization_id, display_email, state \
+             FROM canonical_users \
+             WHERE organization_id = $1 AND lower(display_email) = lower($2) FOR UPDATE",
+        )
+        .bind(organization_id.as_str())
+        .bind(email.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        {
+            transaction.commit().await.map_err(database_error)?;
+            return canonical_user_record(row);
+        }
+
+        let user_id = CanonicalUserId::parse(format!("usr_{}", Uuid::new_v4().simple()))
+            .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)?;
+        let row = sqlx::query(
+            "INSERT INTO canonical_users (user_id, organization_id, display_email, state) \
+             VALUES ($1, $2, $3, 'pending') \
+             RETURNING user_id, organization_id, display_email, state",
+        )
+        .bind(user_id.as_str())
+        .bind(organization_id.as_str())
+        .bind(email.as_str())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(canonical_identity_database_error)?;
+        sqlx::query(
+            "INSERT INTO canonical_identity_audit \
+             (id, user_id, action, actor, new_display_email) \
+             VALUES ($1, $2, 'preprovisioned', $3, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id.as_str())
+        .bind(actor)
+        .bind(email.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        canonical_user_record(row)
+    }
+
     /// Count active canonical users other than the authenticated administrator.
     pub async fn active_other_canonical_user_count(
         &self,
@@ -1075,17 +1144,68 @@ impl PgStore {
                 identity.verified_email(),
             );
         }
-        let email_owner = sqlx::query_scalar::<_, String>(
-            "SELECT user_id FROM canonical_users \
-             WHERE organization_id = $1 AND lower(display_email) = lower($2)",
+        let email_owner = sqlx::query(
+            "SELECT user_id, state FROM canonical_users \
+             WHERE organization_id = $1 AND lower(display_email) = lower($2) FOR UPDATE",
         )
         .bind(identity.organization_id().as_str())
         .bind(identity.verified_email().as_str())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
-        if email_owner.is_some() {
-            return Err(StoreError::CanonicalIdentityAmbiguousEmail);
+        if let Some(email_owner) = email_owner {
+            let user_id = email_owner
+                .try_get::<String, _>("user_id")
+                .map_err(database_error)
+                .and_then(|value| {
+                    CanonicalUserId::parse(value)
+                        .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
+                })?;
+            let state: String = email_owner.try_get("state").map_err(database_error)?;
+            if state != "pending" {
+                return Err(StoreError::CanonicalIdentityAmbiguousEmail);
+            }
+            sqlx::query(
+                "UPDATE canonical_users SET state = 'active', updated_at = now() \
+                 WHERE user_id = $1 AND state = 'pending'",
+            )
+            .bind(user_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(canonical_identity_database_error)?;
+            sqlx::query(
+                "INSERT INTO canonical_identity_subjects \
+                 (issuer, subject, organization_claim, organization_id, user_id, verified_email) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(identity.issuer())
+            .bind(identity.subject())
+            .bind(identity.organization_claim())
+            .bind(identity.organization_id().as_str())
+            .bind(user_id.as_str())
+            .bind(identity.verified_email().as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(canonical_identity_database_error)?;
+            sqlx::query(
+                "INSERT INTO canonical_identity_audit \
+                 (id, user_id, action, actor, new_display_email) \
+                 VALUES ($1, $2, 'activated', $3, $4)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(user_id.as_str())
+            .bind(actor)
+            .bind(identity.verified_email().as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            transaction.commit().await.map_err(database_error)?;
+            return CanonicalPrincipal::new(
+                user_id,
+                identity.organization_id().clone(),
+                identity.verified_email().clone(),
+            )
+            .map_err(|_| StoreError::CanonicalIdentityInvalidRecord);
         }
 
         let user_id = CanonicalUserId::parse(format!("usr_{}", Uuid::new_v4().simple()))
