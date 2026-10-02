@@ -52,7 +52,6 @@ export function OnboardingView() {
   const state = useApiResource<OnboardingData>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Five steps to your first governed agent run. An envelope is the budget, models and tools an agent may use; the workflow runs your agent inside it." title="Get started" />
       <ResourceBoundary state={state}>{(data) => <OnboardingChecklist data={data} />}</ResourceBoundary>
     </section>
   );
@@ -85,8 +84,25 @@ function OnboardingChecklist({ data }: Readonly<{ data: OnboardingData }>) {
     return accepted;
   }
 
+  function hideGuide() {
+    setDismissal("done");
+    window.dispatchEvent(new CustomEvent("hypershell:preferences-updated", { detail: { onboardingDismissed: true } }));
+    void updatePreferences({ onboardingDismissed: true }).then((accepted) => {
+      if (!accepted) {
+        window.dispatchEvent(new CustomEvent("hypershell:preferences-updated", { detail: { onboardingDismissed: false } }));
+        setDismissal("error");
+      }
+    });
+  }
+
+  const header = <PageHeader
+    actions={<button aria-label="Hide Get started" className="grid size-10 place-items-center rounded-control border text-lg text-muted-ink hover:bg-line-soft hover:text-ink" disabled={dismissal === "working" || dismissal === "done"} onClick={hideGuide} type="button"><span aria-hidden="true">×</span></button>}
+    description="Five steps to your first governed agent run. An envelope is the budget, models and tools an agent may use; the workflow runs your agent inside it."
+    title="Get started"
+  />;
+
   if ((data.preferences.onboardingDismissed && dismissal !== "shown") || dismissal === "done") {
-    return <div className="rounded-card border bg-panel p-5"><p className="text-sm text-muted-ink">The onboarding guide is hidden. Your progress is preserved.</p><button className="mt-4 rounded-control border px-4 py-2 text-sm font-semibold" onClick={async () => { setDismissal("working"); setDismissal(await updatePreferences({ onboardingDismissed: false }) ? "shown" : "error"); }} type="button">Show guide again</button></div>;
+    return <>{header}<div className="rounded-card border bg-panel p-5"><p className="text-sm text-muted-ink">The onboarding guide is hidden. Your progress is preserved.</p><button className="mt-4 rounded-control border px-4 py-2 text-sm font-semibold" onClick={async () => { setDismissal("working"); setDismissal(await updatePreferences({ onboardingDismissed: false }) ? "shown" : "error"); }} type="button">Show guide again</button></div></>;
   }
 
   const stepRows = [
@@ -117,9 +133,8 @@ function OnboardingChecklist({ data }: Readonly<{ data: OnboardingData }>) {
     },
   ];
 
-  return <div className="overflow-hidden rounded-card border bg-panel">
+  return <>{header}<div className="overflow-hidden rounded-card border bg-panel">
     <div className="flex items-center gap-4 px-5 py-4"><strong className="whitespace-nowrap text-sm">{completed} of 5 done</strong><div aria-label={`${completed} of 5 onboarding steps complete`} className="h-1.5 flex-1 overflow-hidden rounded-full bg-line-soft" role="progressbar"><div className="h-full rounded-full bg-brand transition-[width] duration-300" style={{ width: `${completed * 20}%` }} /></div></div>
     <ol>{stepRows.map((step, index) => <li className="border-t border-line-soft" key={step.title}><button aria-expanded={openStep === index} className="grid w-full grid-cols-[28px_minmax(0,1fr)_auto_14px] items-center gap-3.5 px-5 py-4 text-left hover:bg-subtle" onClick={() => setOpenStep(openStep === index ? -1 : index)} type="button"><span aria-hidden="true" className={`grid size-7 place-items-center rounded-full text-[13px] font-bold ${done[index] ? "bg-ok text-panel" : index === current ? "bg-brand text-on-brand" : "shadow-[inset_0_0_0_1.5px_var(--color-field)] text-muted-ink"}`}>{done[index] ? "✓" : index + 1}</span><span><strong className={`block text-[15px] ${done[index] ? "text-muted-ink" : ""}`}>{step.title}</strong><span className="mt-0.5 block text-[13px] text-muted-ink">{step.status}</span></span>{done[index] ? <span className="rounded-full bg-ok-soft px-2.5 py-1 text-xs font-semibold text-ok">Done</span> : <span />}<span aria-hidden="true" className={`transition-transform ${openStep === index ? "rotate-90" : ""}`}>›</span></button>{openStep === index ? <div className="space-y-3 pb-5 pl-[62px] pr-5">{step.body}</div> : null}</li>)}</ol>
-    <div className="border-t border-line-soft px-5 py-4"><button className="text-sm text-muted-ink hover:text-ink" disabled={dismissal === "working"} onClick={async () => { setDismissal("working"); setDismissal(await updatePreferences({ onboardingDismissed: true }) ? "done" : "error"); }} type="button">Hide this guide · you can reopen it from Settings.</button></div>
-  </div>;
+  </div>{dismissal === "error" ? <p className="text-sm text-err" role="alert">The onboarding preference could not be updated.</p> : null}</>;
 }

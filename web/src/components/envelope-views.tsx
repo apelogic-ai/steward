@@ -21,7 +21,6 @@ import { RunCards } from "@/components/run-views";
 import { CodeBlock, DataTable, FilterTabs, GrantChipList, Meter, SectionCard, StatStrip, TagSelect, grantKindForAction } from "@/components/hs";
 import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
-import { deriveOnboardingProgress, loadOnboardingEvidence } from "@/data/onboarding-progress";
 import { loadAllEnvelopeRequests } from "@/data/paginated-api";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
@@ -50,12 +49,11 @@ export function EnvelopesView() {
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader actions={<PrimaryLink href="/envelopes/new">Request envelope</PrimaryLink>} description="Budget, models and tools your agents are allowed to use." title="Envelopes" />
       <ResourceBoundary state={state}>{({ requests, templates }) => {
-        const onboarding = <EnvelopesOnboardingBanner />;
-        if (requests.length === 0) return <div className="space-y-5">{onboarding}<p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">No envelopes yet.</p></div>;
+        if (requests.length === 0) return <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">No envelopes yet.</p>;
         const count = (value: string) => requests.filter((request) => value === "pending" ? request.status !== "provisioned" && request.status !== "rejected" : request.status === value).length;
         const filtered = status === "all" ? requests : requests.filter((request) => status === "pending" ? request.status !== "provisioned" && request.status !== "rejected" : request.status === status);
         const names = new Map(templates.map((template) => [template.id, template.displayName]));
-        return <div className="space-y-5">{onboarding}
+        return <div className="space-y-5">
           <FilterTabs active={status} items={[
             { count: requests.length, label: "All", value: "all" },
             { count: count("provisioned"), label: "Provisioned", value: "provisioned" },
@@ -67,17 +65,6 @@ export function EnvelopesView() {
       }}</ResourceBoundary>
     </section>
   );
-}
-
-function EnvelopesOnboardingBanner() {
-  const load = useCallback(() => loadOnboardingEvidence(), []);
-  const state = useApiResource(load);
-  if (state.status !== "ready" || state.value.preferences.onboardingDismissed) return null;
-  const data = state.value;
-  const { completed: complete, done } = deriveOnboardingProgress(data);
-  if (complete === done.length) return null;
-  const titles = ["Connect GitHub", "Get your first envelope", "Choose the sample package", "Trigger a test run", "See the result"];
-  return <div className="flex flex-wrap items-center gap-4 rounded-card bg-brand-soft px-[18px] py-3.5"><div className="min-w-48 flex-1"><p className="text-sm font-semibold">Get started</p><p className="mt-0.5 text-[13px] text-muted-ink">{complete} of 5 done · next: {titles[done.findIndex((value) => !value)]}</p><div aria-label={`${complete} of 5 onboarding steps complete`} aria-valuemax={5} aria-valuemin={0} aria-valuenow={complete} className="mt-2 h-[5px] overflow-hidden rounded-full bg-line-soft" role="progressbar"><div className="h-full rounded-full bg-brand" style={{ width: `${complete * 20}%` }} /></div></div><Link className="inline-flex h-[34px] items-center rounded-control bg-brand px-3.5 text-[13px] font-semibold text-on-brand hover:bg-brand-hover" href="/get-started">Continue</Link></div>;
 }
 
 function EnvelopeTable({ names, requests }: Readonly<{ names: ReadonlyMap<string, string>; requests: Array<UserEnvelopeRequest> }>) {

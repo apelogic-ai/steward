@@ -1565,7 +1565,7 @@ test("onboarding selects the browser sample and ignores unrelated runs", async (
     await expect(developer.page.getByRole("listitem").filter({ hasText: "Choose the sample package" }).getByText("Done", { exact: true })).toBeVisible();
     await expect(developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" }).getByText("Start the sample from Steward", { exact: true })).toBeVisible();
 
-    await developer.page.getByRole("button", { name: /Hide this guide/ }).click();
+    await developer.page.getByRole("button", { name: "Hide Get started" }).click();
     await expect(developer.page.getByText("The onboarding guide is hidden. Your progress is preserved.")).toBeVisible();
     await expect(developer.page.getByRole("link", { name: "Get started" })).toHaveCount(0);
     const dismissal = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
@@ -1574,6 +1574,36 @@ test("onboarding selects the browser sample and ignores unrelated runs", async (
     await developer.page.getByRole("button", { name: "Show guide again" }).click();
     await expect(developer.page.getByRole("heading", { name: "Get started" })).toBeVisible();
     await expect(developer.page.getByRole("link", { name: "Get started" })).toBeVisible();
+    const restored = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
+    expect(restored.body).toEqual({ onboardingDismissed: false });
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("onboarding banner is shared, dismissible, and restorable from settings", async ({ browser }) => {
+  const developer = await guardedPage(browser, { includeSampleWorkflow: true });
+  try {
+    for (const path of ["/envelopes", "/runs", "/connections", "/settings"]) {
+      await developer.page.goto(`${origin}${path}`);
+      await expect(developer.page.getByRole("region", { name: "Get started" })).toBeVisible();
+      await expect(developer.page.getByRole("button", { name: "Hide Get started" })).toBeVisible();
+    }
+
+    await developer.page.goto(`${origin}/envelopes`);
+    await developer.page.getByRole("button", { name: "Hide Get started" }).click();
+    await expect(developer.page.getByRole("region", { name: "Get started" })).toHaveCount(0);
+    await expect(developer.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Get started" })).toHaveCount(0);
+    const dismissal = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
+    expect(dismissal.body).toEqual({ onboardingDismissed: true });
+
+    await developer.page.reload();
+    await expect(developer.page.getByRole("region", { name: "Get started" })).toHaveCount(0);
+
+    await developer.page.goto(`${origin}/settings`);
+    await developer.page.getByRole("button", { name: "Reopen Get started" }).click();
+    await expect(developer.page.getByRole("region", { name: "Get started" })).toBeVisible();
+    await expect(developer.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Get started" })).toBeVisible();
     const restored = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
     expect(restored.body).toEqual({ onboardingDismissed: false });
   } finally {
