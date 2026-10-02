@@ -26,6 +26,15 @@ type RunNowData = {
 type SourceKind = "inline" | "repository" | "registry";
 
 const fieldClass = "min-h-11 w-full rounded-control border bg-panel px-3 font-normal";
+const genericRunNowFailure = "The run request was rejected. Check the package locator, inputs, and Envelope authority.";
+
+export function runNowFailureMessage(error: unknown): string {
+  if (!error || typeof error !== "object") return genericRunNowFailure;
+  const value = error as Record<string, unknown>;
+  if (typeof value.message === "string" && value.message.trim()) return value.message;
+  if (typeof value.error === "string" && value.error.trim()) return `Run request failed (${value.error}).`;
+  return genericRunNowFailure;
+}
 
 function inlineFiles(agentRef: string, prompt: string): Record<string, string> {
   return {
@@ -91,6 +100,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
   const [workflowRef, setWorkflowRef] = useState(defaultWorkflow ? `${defaultWorkflow.name}@${defaultWorkflow.version}` : "");
   const [inputs, setInputs] = useState("{}");
   const [status, setStatus] = useState<"idle" | "submitting" | "copying" | "error">("idle");
+  const [failure, setFailure] = useState<string | null>(null);
   const selectedEnvelope = active.find((request) => request.id === envelopeId);
   const selectedTemplate = data.templates.templates.find((template) => template.id === selectedEnvelope?.templateId && template.revision === selectedEnvelope?.templateRevision);
   const inlineAllowed = selectedTemplate?.allowInlineBrowserTasks !== false;
@@ -103,12 +113,14 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
     try {
       parsedInputs = JSON.parse(inputs);
     } catch {
+      setFailure("Inputs must be valid JSON.");
       setStatus("error");
       return;
     }
     let packageLocator: BrowserPackageLocator;
     if (sourceKind === "inline") {
       if (!inlineAllowed) {
+        setFailure("Inline packages are disabled by the selected Envelope template.");
         setStatus("error");
         return;
       }
@@ -122,6 +134,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
     const envelopeDigest = selectedEnvelope.envelopeDigest.startsWith("steward:")
       ? selectedEnvelope.envelopeDigest
       : `steward:${selectedEnvelope.envelopeDigest}`;
+    setFailure(null);
     setStatus("submitting");
     const result = await submitBrowserRun({
       body: { package: packageLocator, envelopeDigest, inputs: parsedInputs },
@@ -129,12 +142,17 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
       credentials: "same-origin",
       headers: { "Idempotency-Key": crypto.randomUUID(), "X-Steward-CSRF": session.value.csrf },
     });
-    if (result.data && result.response?.ok) onCreated(result.data.taskUid);
-    else setStatus("error");
+    if (result.data && result.response?.ok) {
+      onCreated(result.data.taskUid);
+      return;
+    }
+    setFailure(runNowFailureMessage(result.error));
+    setStatus("error");
   }
 
   async function copyPackage() {
     if (session.status !== "authenticated" || !selectedEnvelope) return;
+    setFailure(null);
     setStatus("copying");
     try {
       const result = await renderRepositoryBundleForEnvelope({
@@ -148,12 +166,14 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
         path: { request_id: selectedEnvelope.id },
       });
       if (!result.data || !result.response?.ok) {
+        setFailure("The repository bundle could not be rendered. Check the repository locator and Envelope authority.");
         setStatus("error");
         return;
       }
       await navigator.clipboard.writeText(JSON.stringify({ ...files, ...result.data.files }, null, 2));
       setStatus("idle");
     } catch {
+      setFailure("The repository bundle could not be rendered. Retry the request; if it persists, contact a Steward administrator.");
       setStatus("error");
     }
   }
@@ -168,7 +188,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
     {sourceKind === "repository" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Repository<input className={`${fieldClass} font-mono`} onChange={(event) => setRepository(event.target.value)} value={repository} /></label><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Revision<input className={`${fieldClass} font-mono`} onChange={(event) => setRevision(event.target.value)} value={revision} /></label><label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} value={path} /></label></div><p className="text-xs text-muted-ink">Branch and tag refs are resolved server-side and recorded as an exact commit before execution.</p></div> : null}
     {sourceKind === "registry" ? <label className="grid gap-2 text-sm font-semibold">Published workflow<select className={fieldClass} onChange={(event) => setWorkflowRef(event.target.value)} value={workflowRef}>{data.workflows.workflows.map((workflow) => <option key={`${workflow.name}@${workflow.version}`} value={`${workflow.name}@${workflow.version}`}>{workflow.displayName} · {workflow.name}@{workflow.version}</option>)}</select></label> : null}
     <label className="grid gap-2 text-sm font-semibold">Inputs (JSON object)<textarea className="min-h-28 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setInputs(event.target.value)} spellCheck={false} value={inputs} /></label>
-    {status === "error" ? <p className="text-sm text-err" role="alert">The run request was rejected. Check the package locator, inputs, and Envelope authority.</p> : null}
+    {status === "error" ? <p className="text-sm text-err" role="alert">{failure ?? genericRunNowFailure}</p> : null}
     <div className="flex justify-end"><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "submitting" || (sourceKind === "inline" && !inlineAllowed)} type="submit">{status === "submitting" ? "Starting…" : "Run now"}</button></div>
   </form>;
 }

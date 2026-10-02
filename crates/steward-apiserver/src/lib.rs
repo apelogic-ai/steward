@@ -905,6 +905,7 @@ pub enum ApiError {
     TaskWorkflowNotFound,
     TaskNotReady,
     TaskOutputNotReady,
+    TaskPersistenceFailed,
     DirectPackageSourceDisabled,
     TaskRuntimeContractUnavailable(String),
 }
@@ -2486,6 +2487,16 @@ impl IntoResponse for ApiError {
                 )
                     .into_response();
             }
+            Self::TaskPersistenceFailed => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "task.persistence_failed",
+                        "message": "Steward could not record this run. Retry the request; if it persists, contact a Steward administrator.",
+                    })),
+                )
+                    .into_response();
+            }
             Self::BrowserTaskSourceUnauthorized => {
                 return (
                     StatusCode::FORBIDDEN,
@@ -2528,6 +2539,7 @@ impl IntoResponse for ApiError {
             ) => StatusCode::FORBIDDEN,
             Self::TaskNotReady
             | Self::DirectPackageSourceDisabled
+            | Self::TaskPersistenceFailed
             | Self::TaskRuntimeContractUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::TaskOutputNotReady => StatusCode::CONFLICT,
             Self::Store(StoreError::BrowserTaskConcurrencyLimit) => StatusCode::TOO_MANY_REQUESTS,
@@ -3466,7 +3478,7 @@ fn spec_digest(spec: &AgentRuntimeSpec) -> Result<String, ApiError> {
 mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, Response as HttpResponse, StatusCode, header};
-    use axum::response::Response;
+    use axum::response::{IntoResponse, Response};
     use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
     use kube::client::Body as KubeBody;
     use kube::{Client, ResourceExt};
@@ -8680,6 +8692,26 @@ mod tests {
         Ok(ledger)
     }
 
+    fn versioned_task_ledger_with_runtime_minutes() -> Result<FakeLedger, String> {
+        let ledger = versioned_task_ledger()?;
+        let mut envelopes = ledger
+            .user_envelopes
+            .lock()
+            .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+        let envelope = envelopes
+            .first_mut()
+            .ok_or_else(|| "fixture requires a User Envelope".to_owned())?;
+        envelope.requested_envelope.spec.runtime_minutes_limit = Some("60".to_owned());
+        envelope
+            .approved_envelope
+            .as_mut()
+            .ok_or_else(|| "fixture requires approved authority".to_owned())?
+            .spec
+            .runtime_minutes_limit = Some("60".to_owned());
+        drop(envelopes);
+        Ok(ledger)
+    }
+
     #[derive(Clone, Default)]
     struct FlakyDecisionChannel {
         attempts: Arc<Mutex<usize>>,
@@ -10788,6 +10820,24 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn task_persistence_failure_is_bounded_for_browser_clients() -> Result<(), String> {
+        let response = ApiError::TaskPersistenceFailed.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read persistence failure response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("parse persistence failure response: {error}"))?,
+            serde_json::json!({
+                "error": "task.persistence_failed",
+                "message": "Steward could not record this run. Retry the request; if it persists, contact a Steward administrator.",
+            })
+        );
+        Ok(())
+    }
+
     fn direct_test_app(ledger: FakeLedger, git: FakeDirectGit) -> Result<axum::Router, String> {
         Ok(task_router(
             ledger,
@@ -10996,7 +11046,7 @@ mod tests {
     #[tokio::test]
     async fn browser_inline_task_is_resolved_admitted_and_reserved_with_immutable_evidence()
     -> Result<(), String> {
-        let ledger = versioned_task_ledger()?;
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
         enable_inline_for_versioned_task_fixture(&ledger, true)?;
         let origin = "http://127.0.0.1:33001";
         let (auth, session_cookie, csrf) =
@@ -11113,7 +11163,7 @@ mod tests {
     #[tokio::test]
     async fn inline_repository_and_github_actions_packages_share_a_digest_while_the_template_switch_only_blocks_inline()
     -> Result<(), String> {
-        let inline_ledger = versioned_task_ledger()?;
+        let inline_ledger = versioned_task_ledger_with_runtime_minutes()?;
         enable_inline_for_versioned_task_fixture(&inline_ledger, true)?;
         let origin = "http://127.0.0.1:33001";
         let (auth, session_cookie, csrf) =
@@ -11144,7 +11194,7 @@ mod tests {
             .map(|evidence| evidence.closure_digest.clone())
             .ok_or_else(|| "inline Task omitted closure evidence".to_owned())?;
 
-        let repo_ledger = versioned_task_ledger()?;
+        let repo_ledger = versioned_task_ledger_with_runtime_minutes()?;
         enable_inline_for_versioned_task_fixture(&repo_ledger, false)?;
         let (repo_auth, repo_cookie, repo_csrf) =
             signed_in_browser(origin, LocalFakeIdentity::User).await?;
@@ -11195,7 +11245,7 @@ mod tests {
             );
         }
 
-        let github_actions_ledger = versioned_task_ledger()?;
+        let github_actions_ledger = versioned_task_ledger_with_runtime_minutes()?;
         let github_actions_response = direct_test_app(
             github_actions_ledger.clone(),
             same_repository_direct_git_fixture()?,

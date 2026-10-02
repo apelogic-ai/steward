@@ -155,3 +155,8 @@ finalized-Task comparison.
 The 0054/0058 compatibility pair is additive; no existing migration checksum is
 changed. A database that failed before migration 0056 can retry normally after
 the updated binary is deployed.
+
+Migration 0059 preserves the two existing Task pin shapes and adds the distinct
+browser direct-package shape: immutable browser evidence, no legacy Workflow
+pin, and a complete approved User Envelope pin set. Published browser Workflows
+continue to use the existing complete Workflow-and-Envelope pin shape.

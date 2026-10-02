@@ -307,6 +307,12 @@ impl TaskApiConfig {
         ));
     }
 
+    fn report_browser_task_persistence_failure(&self, error: &StoreError) {
+        (self.failure_reporter)(&format!(
+            "browser task submission failed code=task.persistence_failed reason={error:?}"
+        ));
+    }
+
     pub fn with_source_repository_bindings_json(
         mut self,
         value: Option<&str>,
@@ -1990,10 +1996,12 @@ where
         }
         let (mut record, evidence) = if request.package.source.starts_with("steward:registry/") {
             self.submit_browser_registry(idempotency_key, identity.clone(), request)
-                .await?
+                .await
+                .map_err(|error| self.browser_task_persistence_error(error))?
         } else {
             self.submit_browser_package(idempotency_key, identity.clone(), request)
-                .await?
+                .await
+                .map_err(|error| self.browser_task_persistence_error(error))?
         };
         let input_archive = browser_inputs_archive(&request.inputs)?;
         if record.browser_task_evidence.as_ref() != Some(&evidence) {
@@ -2014,7 +2022,7 @@ where
                         &input_archive,
                     )
                     .await
-                    .map_err(ApiError::Store)?;
+                    .map_err(|error| self.browser_task_store_error(error))?;
             }
         }
         if !record.execute_requested {
@@ -2026,9 +2034,10 @@ where
                     identity.canonical_user_id.as_str(),
                 )
                 .await
-                .map_err(ApiError::Store)?;
+                .map_err(|error| self.browser_task_store_error(error))?;
         }
         browser_submission_response(record)
+            .map_err(|error| self.browser_task_persistence_error(error))
     }
 
     async fn submit_browser_registry(
@@ -2089,7 +2098,8 @@ where
             &task_request,
             Some(&evidence),
         )
-        .await?;
+        .await
+        .map_err(|error| self.browser_task_persistence_error(error))?;
         let record = self
             .ledger
             .task_by_idempotency(
@@ -2185,8 +2195,26 @@ where
                 active_manifest_digest: &orchestration.active_manifest_digest,
             })
             .await
-            .map_err(ApiError::Store)?;
+            .map_err(|error| self.browser_task_store_error(error))?;
         Ok((reservation.record, resolved.evidence))
+    }
+
+    fn browser_task_store_error(&self, error: StoreError) -> ApiError {
+        if matches!(error, StoreError::Database(_)) {
+            self.config.report_browser_task_persistence_failure(&error);
+            ApiError::TaskPersistenceFailed
+        } else {
+            ApiError::Store(error)
+        }
+    }
+
+    fn browser_task_persistence_error(&self, error: ApiError) -> ApiError {
+        match error {
+            ApiError::Store(error @ StoreError::Database(_)) => {
+                self.browser_task_store_error(error)
+            }
+            error => error,
+        }
     }
 
     async fn submit_direct(
@@ -3454,6 +3482,10 @@ fn verified_git_file(file: GitFile, request: &GitFileRequest) -> Result<Vec<u8>,
 fn direct_requirements_from_envelope(spec: &EnvelopeSpec) -> Result<DirectRequirements, ApiError> {
     let mut authority = serde_json::to_value(spec)
         .map_err(|error| ApiError::Admission(format!("Envelope cannot be projected: {error}")))?;
+    authority
+        .as_object_mut()
+        .ok_or_else(|| ApiError::Admission("Envelope authority is invalid".to_owned()))?
+        .remove("runtimeMinutesLimit");
     let budget = authority
         .get_mut("budget")
         .and_then(serde_json::Value::as_object_mut)
