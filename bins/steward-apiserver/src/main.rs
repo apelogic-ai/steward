@@ -836,6 +836,10 @@ async fn browser_application_router(
             store.clone(),
             auth.clone(),
         ))
+        .merge(steward_apiserver::browser_members::protected_router(
+            store.clone(),
+            auth.clone(),
+        ))
         .merge(steward_apiserver::admin_setup::protected_router(
             store.clone(),
             admin_setup_config,

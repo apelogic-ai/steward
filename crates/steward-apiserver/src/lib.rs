@@ -4,6 +4,7 @@ pub mod admin_setup;
 pub mod agent_runs_ui;
 pub mod browser_admin;
 pub mod browser_auth;
+pub mod browser_members;
 mod browser_security;
 pub mod connections;
 mod execution_bindings;
@@ -407,6 +408,9 @@ pub struct GrantRevocationRequest {
         browser_admin::associate_federated_subject,
         browser_admin::replace_federated_subject,
         browser_admin::disable_federated_subject,
+        browser_members::list_members,
+        browser_members::create_member,
+        browser_members::change_member_role,
         browser_admin::top_up_escalation,
         browser_admin::deny_escalation,
         operator_admin::users,
@@ -455,6 +459,13 @@ pub struct GrantRevocationRequest {
         browser_admin::BrowserFederatedSubjectAuditResponse,
         browser_admin::AssociateFederatedSubjectBody,
         browser_admin::DisableFederatedSubjectBody,
+        browser_members::BrowserMemberView,
+        browser_members::BrowserMembersResponse,
+        browser_members::BrowserMemberResponse,
+        browser_members::CreateBrowserMemberBody,
+        browser_members::BrowserMemberAssignmentKind,
+        browser_members::BrowserMemberAssignmentAction,
+        browser_members::ChangeBrowserMemberRoleBody,
         browser_admin::ProvisionEnvelopeBody,
         browser_admin::AdminRequestStateFilter,
         operator_admin::OperatorUserView,
@@ -2568,6 +2579,7 @@ impl IntoResponse for ApiError {
                 | StoreError::CanonicalIdentityStale
                 | StoreError::CanonicalIdentityAmbiguousEmail
                 | StoreError::CanonicalIdentityConflict
+                | StoreError::LastBrowserAdministrator
                 | StoreError::FederatedSubjectConflict
                 | StoreError::ConnectionOperationConflict
                 | StoreError::ConnectionOAuthFlowPending
