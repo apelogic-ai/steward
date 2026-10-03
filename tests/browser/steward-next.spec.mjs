@@ -2066,12 +2066,16 @@ test("Run now submits an inline package under the selected envelope", async ({ b
   }
 });
 
-test("a successful inline run exports its exact package with the repository wrapper", async ({ browser }) => {
-  const developer = await guardedPage(browser, { inlineRun: true });
+test("a successful inline run exports the exact package later admitted from GitHub Actions", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    includeSampleWorkflow: true,
+    inlineRun: true,
+    onboardingPagination: true,
+  });
   try {
     await developer.page.goto(`${origin}/runs/${taskUid}`);
     await expect(developer.page.getByRole("heading", { name: "Save this task to a repository" })).toBeVisible();
-    await developer.page.getByLabel("Target repository").fill("https://github.com/example-org/agentic-ops.git");
+    await developer.page.getByLabel("Target repository").fill("https://github.com/example-org/sample.git");
     await developer.page.getByRole("button", { name: "Copy repository bundle" }).click();
     await expect(developer.page.getByRole("button", { name: "Bundle copied" })).toBeVisible();
 
@@ -2084,10 +2088,27 @@ test("a successful inline run exports its exact package with the repository wrap
     const mutation = developer.mutations.find((entry) => entry.path.endsWith("/repository-bundle"));
     expectMutationProof(mutation);
     expect(mutation.body).toEqual({
-      repository: "https://github.com/example-org/agentic-ops.git",
+      repository: "https://github.com/example-org/sample.git",
       packagePath: browserTaskDefinitionPath,
       invocationPath: ".steward/invocations/browser-task.json",
     });
+
+    const runs = await developer.page.evaluate(async () => {
+      const firstResponse = await fetch("/app/api/v1/runs", { credentials: "same-origin" });
+      const first = await firstResponse.json();
+      const secondResponse = await fetch(`/app/api/v1/runs?cursor=${encodeURIComponent(first.nextCursor)}`, { credentials: "same-origin" });
+      const second = await secondResponse.json();
+      return [...first.runs, ...second.runs];
+    });
+    const browserRun = runs.find((entry) => entry.origin === "browser" && entry.package?.source === "inline");
+    const githubRun = runs.find((entry) => entry.trigger?.provider === "github");
+    expect(browserRun?.package?.contentDigest).toBeTruthy();
+    expect(githubRun?.package?.source).toBe(mutation.body.repository);
+    expect(githubRun?.package?.path).toBe(mutation.body.packagePath);
+    expect(githubRun?.package?.contentDigest).toBe(browserRun.package.contentDigest);
+
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Automate it from GitHub Actions" }).getByText("Done", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
