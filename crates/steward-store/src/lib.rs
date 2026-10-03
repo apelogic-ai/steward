@@ -171,6 +171,33 @@ pub struct BrowserRbacAssignmentChange<'a> {
     pub actor: &'a str,
 }
 
+pub struct BrowserMemberInvitation<'a> {
+    pub organization_id: &'a OrganizationId,
+    pub email: &'a Email,
+    pub actor: &'a str,
+    pub administrator: bool,
+    pub member_roles: &'a [String],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowserMemberInvitationOutcome {
+    Invited(CanonicalUserRecord),
+    AlreadyMember(CanonicalUserRecord),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserMemberStateAction {
+    Disable,
+    Enable,
+    RevokeInvitation,
+}
+
+pub struct BrowserMemberStateChange<'a> {
+    pub user_id: &'a CanonicalUserId,
+    pub action: BrowserMemberStateAction,
+    pub actor: &'a CanonicalUserId,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FederatedSubjectState {
     Observed,
@@ -790,6 +817,26 @@ impl PgStore {
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
+        let administrator_organization = if assignment_kind == "administrator"
+            && matches!(change.action, BrowserRbacAssignmentAction::Revoke)
+        {
+            let organization_id = sqlx::query_scalar::<_, String>(
+                "SELECT organization_id FROM canonical_users WHERE user_id = $1",
+            )
+            .bind(change.user_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?
+            .ok_or(StoreError::CanonicalIdentityNotFound)?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!("browser-rbac-administrators:{organization_id}"))
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+            Some(organization_id)
+        } else {
+            None
+        };
         let user_state =
             sqlx::query_scalar::<_, String>("SELECT state FROM canonical_users WHERE user_id = $1")
                 .bind(change.user_id.as_str())
@@ -797,7 +844,7 @@ impl PgStore {
                 .await
                 .map_err(database_error)?
                 .ok_or(StoreError::CanonicalIdentityNotFound)?;
-        if user_state == "disabled" {
+        if matches!(user_state.as_str(), "disabled" | "revoked") {
             return Err(StoreError::CanonicalIdentityInactive);
         }
         let current = sqlx::query_scalar::<_, String>(
@@ -821,12 +868,9 @@ impl PgStore {
             && current.as_deref() == Some(BrowserRbacAssignmentAction::Grant.as_str())
             && user_state == "active"
         {
-            sqlx::query(
-                "SELECT pg_advisory_xact_lock(hashtextextended('browser-rbac-administrators', 0))",
-            )
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
+            let organization_id = administrator_organization
+                .as_deref()
+                .ok_or(StoreError::CanonicalIdentityInvalidRecord)?;
             let remaining_administrators = sqlx::query_scalar::<_, i64>(
                 "WITH latest AS ( \
                      SELECT DISTINCT ON (user_id) user_id, action \
@@ -837,8 +881,10 @@ impl PgStore {
                  SELECT count(*) \
                  FROM latest \
                  JOIN canonical_users ON canonical_users.user_id = latest.user_id \
-                 WHERE latest.action = 'grant' AND canonical_users.state = 'active'",
+                 WHERE latest.action = 'grant' AND canonical_users.state = 'active' \
+                   AND canonical_users.organization_id = $1",
             )
+            .bind(organization_id)
             .fetch_one(&mut *transaction)
             .await
             .map_err(database_error)?;
@@ -864,30 +910,14 @@ impl PgStore {
     }
 
     pub async fn canonical_users(&self) -> Result<Vec<CanonicalUserRecord>, StoreError> {
-        sqlx::query(
-            "SELECT canonical_users.user_id, canonical_users.organization_id, \
-                    canonical_users.display_email, canonical_users.display_name, \
-                    canonical_users.state, \
-                    to_char(canonical_users.created_at AT TIME ZONE 'UTC', \
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
-                    to_char(canonical_users.last_sign_in_at AT TIME ZONE 'UTC', \
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_sign_in_at, \
-                    ( \
-                        SELECT COALESCE(inviter.display_email, audit.actor) \
-                        FROM canonical_identity_audit audit \
-                        LEFT JOIN canonical_users inviter ON inviter.user_id = audit.actor \
-                        WHERE audit.user_id = canonical_users.user_id \
-                          AND audit.action = 'preprovisioned' \
-                        ORDER BY audit.created_at, audit.id LIMIT 1 \
-                    ) AS invited_by \
-             FROM canonical_users ORDER BY canonical_users.user_id",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(database_error)?
-        .into_iter()
-        .map(canonical_user_record)
-        .collect()
+        let query = canonical_user_query(" ORDER BY canonical_users.user_id");
+        sqlx::query(&query)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(canonical_user_record)
+            .collect()
     }
 
     /// List only the canonical users belonging to one organization.
@@ -895,33 +925,19 @@ impl PgStore {
         &self,
         organization_id: &OrganizationId,
     ) -> Result<Vec<CanonicalUserRecord>, StoreError> {
-        sqlx::query(
-            "SELECT canonical_users.user_id, canonical_users.organization_id, \
-                    canonical_users.display_email, canonical_users.display_name, \
-                    canonical_users.state, \
-                    to_char(canonical_users.created_at AT TIME ZONE 'UTC', \
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
-                    to_char(canonical_users.last_sign_in_at AT TIME ZONE 'UTC', \
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_sign_in_at, \
-                    ( \
-                        SELECT COALESCE(inviter.display_email, audit.actor) \
-                        FROM canonical_identity_audit audit \
-                        LEFT JOIN canonical_users inviter ON inviter.user_id = audit.actor \
-                        WHERE audit.user_id = canonical_users.user_id \
-                          AND audit.action = 'preprovisioned' \
-                        ORDER BY audit.created_at, audit.id LIMIT 1 \
-                    ) AS invited_by \
-             FROM canonical_users \
-             WHERE canonical_users.organization_id = $1 \
-             ORDER BY canonical_users.user_id",
-        )
-        .bind(organization_id.as_str())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(database_error)?
-        .into_iter()
-        .map(canonical_user_record)
-        .collect()
+        let query = canonical_user_query(
+            " WHERE canonical_users.organization_id = $1 \
+               AND canonical_users.state <> 'revoked' \
+              ORDER BY canonical_users.user_id",
+        );
+        sqlx::query(&query)
+            .bind(organization_id.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(canonical_user_record)
+            .collect()
     }
 
     /// Reserve one verified organization email for browser-member onboarding.
@@ -949,31 +965,17 @@ impl PgStore {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        if let Some(row) = sqlx::query(
-            "SELECT canonical_users.user_id, canonical_users.organization_id, \
-                    canonical_users.display_email, canonical_users.display_name, \
-                    canonical_users.state, \
-                    to_char(canonical_users.created_at AT TIME ZONE 'UTC', \
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
-                    to_char(canonical_users.last_sign_in_at AT TIME ZONE 'UTC', \
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_sign_in_at, \
-                    ( \
-                        SELECT COALESCE(inviter.display_email, audit.actor) \
-                        FROM canonical_identity_audit audit \
-                        LEFT JOIN canonical_users inviter ON inviter.user_id = audit.actor \
-                        WHERE audit.user_id = canonical_users.user_id \
-                          AND audit.action = 'preprovisioned' \
-                        ORDER BY audit.created_at, audit.id LIMIT 1 \
-                    ) AS invited_by \
-             FROM canonical_users \
-             WHERE canonical_users.organization_id = $1 \
-               AND lower(canonical_users.display_email) = lower($2) FOR UPDATE",
-        )
-        .bind(organization_id.as_str())
-        .bind(email.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(database_error)?
+        let existing_query = canonical_user_query(
+            " WHERE canonical_users.organization_id = $1 \
+               AND lower(canonical_users.display_email) = lower($2) \
+               AND canonical_users.state <> 'revoked' FOR UPDATE",
+        );
+        if let Some(row) = sqlx::query(&existing_query)
+            .bind(organization_id.as_str())
+            .bind(email.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?
         {
             transaction.commit().await.map_err(database_error)?;
             return canonical_user_record(row);
@@ -1025,34 +1027,232 @@ impl PgStore {
         .map_err(database_error)
     }
 
+    /// Create one pending member and its initial Steward-local authority atomically.
+    ///
+    /// A live member with the same organization email is returned unchanged. A revoked
+    /// invitation is historical and does not prevent a fresh pending membership.
+    pub async fn invite_browser_member(
+        &self,
+        invitation: BrowserMemberInvitation<'_>,
+    ) -> Result<BrowserMemberInvitationOutcome, StoreError> {
+        if invitation.actor.trim().is_empty() {
+            return Err(StoreError::CanonicalIdentityInvalidActor);
+        }
+        if invitation
+            .member_roles
+            .iter()
+            .any(|role| !is_valid_member_role(role))
+        {
+            return Err(StoreError::InvalidBrowserRbacAssignment);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+                hashtextextended($1::text || chr(31) || lower($2::text), 0)\
+             )",
+        )
+        .bind(invitation.organization_id.as_str())
+        .bind(invitation.email.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+
+        if let Some(user_id) = sqlx::query_scalar::<_, String>(
+            "SELECT user_id FROM canonical_users \
+             WHERE organization_id = $1 AND lower(display_email) = lower($2) \
+               AND state <> 'revoked' FOR UPDATE",
+        )
+        .bind(invitation.organization_id.as_str())
+        .bind(invitation.email.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        {
+            transaction.commit().await.map_err(database_error)?;
+            let user_id = CanonicalUserId::parse(user_id)
+                .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)?;
+            let user = self
+                .canonical_user(&user_id)
+                .await?
+                .ok_or(StoreError::CanonicalIdentityNotFound)?;
+            return Ok(BrowserMemberInvitationOutcome::AlreadyMember(user));
+        }
+
+        let user_id = CanonicalUserId::parse(format!("usr_{}", Uuid::new_v4().simple()))
+            .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)?;
+        sqlx::query(
+            "INSERT INTO canonical_users (user_id, organization_id, display_email, state) \
+             VALUES ($1, $2, $3, 'pending')",
+        )
+        .bind(user_id.as_str())
+        .bind(invitation.organization_id.as_str())
+        .bind(invitation.email.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(canonical_identity_database_error)?;
+        sqlx::query(
+            "INSERT INTO canonical_identity_audit \
+             (id, user_id, action, actor, new_display_email) \
+             VALUES ($1, $2, 'preprovisioned', $3, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id.as_str())
+        .bind(invitation.actor)
+        .bind(invitation.email.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+
+        let mut assignments = Vec::with_capacity(invitation.member_roles.len() + 1);
+        if invitation.administrator {
+            assignments.push(("administrator", None));
+        }
+        for role in invitation.member_roles {
+            assignments.push(("member_role", Some(role.as_str())));
+        }
+        for (assignment_kind, member_role) in assignments {
+            sqlx::query(
+                "INSERT INTO browser_rbac_assignment_events \
+                 (id, user_id, assignment_kind, member_role, action, actor) \
+                 VALUES ($1, $2, $3, $4, 'grant', $5)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(user_id.as_str())
+            .bind(assignment_kind)
+            .bind(member_role)
+            .bind(invitation.actor)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+        transaction.commit().await.map_err(database_error)?;
+        let user = self
+            .canonical_user(&user_id)
+            .await?
+            .ok_or(StoreError::CanonicalIdentityNotFound)?;
+        Ok(BrowserMemberInvitationOutcome::Invited(user))
+    }
+
+    /// Apply an administrator-owned member-state transition and append its audit event.
+    pub async fn change_browser_member_state(
+        &self,
+        change: BrowserMemberStateChange<'_>,
+    ) -> Result<CanonicalUserRecord, StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let organization_id = sqlx::query_scalar::<_, String>(
+            "SELECT organization_id FROM canonical_users WHERE user_id = $1",
+        )
+        .bind(change.user_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::CanonicalIdentityNotFound)?;
+        if matches!(change.action, BrowserMemberStateAction::Disable) {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!("browser-rbac-administrators:{organization_id}"))
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+        }
+        let row = sqlx::query(
+            "SELECT state, organization_id FROM canonical_users WHERE user_id = $1 FOR UPDATE",
+        )
+        .bind(change.user_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::CanonicalIdentityNotFound)?;
+        let current_state: String = row.try_get("state").map_err(database_error)?;
+        let locked_organization_id: String =
+            row.try_get("organization_id").map_err(database_error)?;
+        if locked_organization_id != organization_id {
+            return Err(StoreError::CanonicalIdentityTransitionConflict);
+        }
+        let (expected_state, next_state, audit_action) = match change.action {
+            BrowserMemberStateAction::Disable => ("active", "disabled", "disabled"),
+            BrowserMemberStateAction::Enable => ("disabled", "active", "enabled"),
+            BrowserMemberStateAction::RevokeInvitation => {
+                ("pending", "revoked", "invitation_revoked")
+            }
+        };
+        if current_state != expected_state {
+            return Err(StoreError::CanonicalIdentityTransitionConflict);
+        }
+        if matches!(change.action, BrowserMemberStateAction::Disable)
+            && change.user_id == change.actor
+        {
+            return Err(StoreError::SelfBrowserMemberMutation);
+        }
+        if matches!(change.action, BrowserMemberStateAction::Disable) {
+            let is_administrator = sqlx::query_scalar::<_, bool>(
+                "SELECT COALESCE(( \
+                    SELECT action = 'grant' FROM browser_rbac_assignment_events \
+                    WHERE user_id = $1 AND assignment_kind = 'administrator' \
+                    ORDER BY at DESC, id DESC LIMIT 1 \
+                 ), false)",
+            )
+            .bind(change.user_id.as_str())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if is_administrator {
+                let active_administrators = sqlx::query_scalar::<_, i64>(
+                    "WITH latest AS ( \
+                         SELECT DISTINCT ON (events.user_id) events.user_id, events.action \
+                         FROM browser_rbac_assignment_events events \
+                         JOIN canonical_users users ON users.user_id = events.user_id \
+                         WHERE events.assignment_kind = 'administrator' \
+                           AND users.organization_id = $1 \
+                         ORDER BY events.user_id, events.at DESC, events.id DESC \
+                     ) \
+                     SELECT count(*) FROM latest \
+                     JOIN canonical_users users ON users.user_id = latest.user_id \
+                     WHERE latest.action = 'grant' AND users.state = 'active'",
+                )
+                .bind(&organization_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+                if active_administrators <= 1 {
+                    return Err(StoreError::LastBrowserAdministrator);
+                }
+            }
+        }
+        sqlx::query("UPDATE canonical_users SET state = $2, updated_at = now() WHERE user_id = $1")
+            .bind(change.user_id.as_str())
+            .bind(next_state)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        sqlx::query(
+            "INSERT INTO canonical_identity_audit (id, user_id, action, actor) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(change.user_id.as_str())
+        .bind(audit_action)
+        .bind(change.actor.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        self.canonical_user(change.user_id)
+            .await?
+            .ok_or(StoreError::CanonicalIdentityNotFound)
+    }
+
     pub async fn canonical_user(
         &self,
         user_id: &CanonicalUserId,
     ) -> Result<Option<CanonicalUserRecord>, StoreError> {
-        sqlx::query(
-            "SELECT canonical_users.user_id, canonical_users.organization_id, \
-                    canonical_users.display_email, canonical_users.display_name, \
-                    canonical_users.state, \
-                    to_char(canonical_users.created_at AT TIME ZONE 'UTC', \
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
-                    to_char(canonical_users.last_sign_in_at AT TIME ZONE 'UTC', \
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_sign_in_at, \
-                    ( \
-                        SELECT COALESCE(inviter.display_email, audit.actor) \
-                        FROM canonical_identity_audit audit \
-                        LEFT JOIN canonical_users inviter ON inviter.user_id = audit.actor \
-                        WHERE audit.user_id = canonical_users.user_id \
-                          AND audit.action = 'preprovisioned' \
-                        ORDER BY audit.created_at, audit.id LIMIT 1 \
-                    ) AS invited_by \
-             FROM canonical_users WHERE canonical_users.user_id = $1",
-        )
-        .bind(user_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(database_error)?
-        .map(canonical_user_record)
-        .transpose()
+        let query = canonical_user_query(" WHERE canonical_users.user_id = $1");
+        sqlx::query(&query)
+            .bind(user_id.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+            .map(canonical_user_record)
+            .transpose()
     }
 
     /// Record metadata from a successfully verified browser sign-in.
@@ -1294,7 +1494,8 @@ impl PgStore {
         }
         let email_owner = sqlx::query(
             "SELECT user_id, state FROM canonical_users \
-             WHERE organization_id = $1 AND lower(display_email) = lower($2) FOR UPDATE",
+             WHERE organization_id = $1 AND lower(display_email) = lower($2) \
+               AND state <> 'revoked' FOR UPDATE",
         )
         .bind(identity.organization_id().as_str())
         .bind(identity.verified_email().as_str())
@@ -11280,6 +11481,7 @@ pub enum StoreError {
     CanonicalIdentityStale,
     CanonicalIdentityAmbiguousEmail,
     CanonicalIdentityConflict,
+    CanonicalIdentityTransitionConflict,
     CanonicalIdentityInvalidActor,
     CanonicalIdentityInvalidRecord,
     FederatedSubjectNotFound,
@@ -11292,6 +11494,7 @@ pub enum StoreError {
     InvalidBrowserRbacAssignment,
     InvalidBrowserRbacRecord,
     LastBrowserAdministrator,
+    SelfBrowserMemberMutation,
     InvalidBrowserPreferences,
     ApprovalNotFound,
     ApprovalNotPending,
@@ -11355,6 +11558,9 @@ impl fmt::Display for StoreError {
                     "canonical identity mapping conflicts with an existing mapping"
                 )
             }
+            Self::CanonicalIdentityTransitionConflict => {
+                write!(formatter, "canonical identity state transition conflicts")
+            }
             Self::CanonicalIdentityInvalidActor => {
                 write!(
                     formatter,
@@ -11392,6 +11598,12 @@ impl fmt::Display for StoreError {
                 write!(
                     formatter,
                     "the last active browser administrator cannot be revoked"
+                )
+            }
+            Self::SelfBrowserMemberMutation => {
+                write!(
+                    formatter,
+                    "an administrator cannot disable their own membership"
                 )
             }
             Self::InvalidBrowserPreferences => {
@@ -12845,6 +13057,26 @@ fn envelope_instance_grant_record(
         rationale: row.try_get("rationale").map_err(database_error)?,
         granted_by: row.try_get("granted_by").map_err(database_error)?,
     })
+}
+
+const CANONICAL_USER_SELECT: &str = "SELECT canonical_users.user_id, canonical_users.organization_id, \
+            canonical_users.display_email, canonical_users.display_name, canonical_users.state, \
+            to_char(canonical_users.created_at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+            to_char(canonical_users.last_sign_in_at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_sign_in_at, \
+            ( \
+                SELECT COALESCE(inviter.display_email, audit.actor) \
+                FROM canonical_identity_audit audit \
+                LEFT JOIN canonical_users inviter ON inviter.user_id = audit.actor \
+                WHERE audit.user_id = canonical_users.user_id \
+                  AND audit.action = 'preprovisioned' \
+                ORDER BY audit.created_at, audit.id LIMIT 1 \
+            ) AS invited_by \
+     FROM canonical_users";
+
+fn canonical_user_query(suffix: &str) -> String {
+    format!("{CANONICAL_USER_SELECT}{suffix}")
 }
 
 const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, tasks.acting_user, tasks.owner, tasks.owner_user_id, \

@@ -167,3 +167,9 @@ identity audit. Migration 0061 adds optional OIDC display metadata and the last
 successful browser sign-in timestamp without rewriting historical members. It
 also records an administrator unlink as a new append-only federated-subject
 audit action while returning the current subject to the observed pool.
+
+Migration 0062 adds the administrator-managed member lifecycle. Disabled members
+remain canonical identities and may be re-enabled; revoked invitations remain
+immutable history but no longer reserve the organization email, so a later invite
+creates a new pending member. Every transition remains append-only in the canonical
+identity audit.

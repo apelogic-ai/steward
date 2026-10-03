@@ -412,6 +412,7 @@ pub struct GrantRevocationRequest {
         browser_members::list_members,
         browser_members::get_member,
         browser_members::create_member,
+        browser_members::change_member_state,
         browser_members::change_member_role,
         browser_members::unlink_member_identity,
         browser_admin::top_up_escalation,
@@ -469,6 +470,11 @@ pub struct GrantRevocationRequest {
         browser_members::BrowserMemberResponse,
         browser_members::BrowserMemberDetailResponse,
         browser_members::CreateBrowserMemberBody,
+        browser_members::BrowserMemberInvitationStatus,
+        browser_members::BrowserMemberInvitationResult,
+        browser_members::BrowserMemberInvitationsResponse,
+        browser_members::BrowserMemberStateRequestAction,
+        browser_members::ChangeBrowserMemberStateBody,
         browser_members::BrowserMemberAssignmentKind,
         browser_members::BrowserMemberAssignmentAction,
         browser_members::ChangeBrowserMemberRoleBody,
@@ -2587,7 +2593,9 @@ impl IntoResponse for ApiError {
                 | StoreError::CanonicalIdentityStale
                 | StoreError::CanonicalIdentityAmbiguousEmail
                 | StoreError::CanonicalIdentityConflict
+                | StoreError::CanonicalIdentityTransitionConflict
                 | StoreError::LastBrowserAdministrator
+                | StoreError::SelfBrowserMemberMutation
                 | StoreError::FederatedSubjectConflict
                 | StoreError::ConnectionOperationConflict
                 | StoreError::ConnectionOAuthFlowPending
