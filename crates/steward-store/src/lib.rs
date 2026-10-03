@@ -117,7 +117,11 @@ pub struct CanonicalUserRecord {
     pub user_id: CanonicalUserId,
     pub organization_id: OrganizationId,
     pub display_email: Email,
+    pub display_name: Option<String>,
     pub state: String,
+    pub created_at: String,
+    pub last_sign_in_at: Option<String>,
+    pub invited_by: Option<String>,
 }
 
 impl BrowserRbacAssignments {
@@ -242,6 +246,7 @@ pub enum FederatedSubjectAuditAction {
     ConnectionVerified,
     Associated,
     Replaced,
+    Unassociated,
     Disabled,
 }
 
@@ -253,6 +258,7 @@ impl FederatedSubjectAuditAction {
             Self::ConnectionVerified => "connection_verified",
             Self::Associated => "associated",
             Self::Replaced => "replaced",
+            Self::Unassociated => "unassociated",
             Self::Disabled => "disabled",
         }
     }
@@ -264,6 +270,7 @@ impl FederatedSubjectAuditAction {
             "connection_verified" => Ok(Self::ConnectionVerified),
             "associated" => Ok(Self::Associated),
             "replaced" => Ok(Self::Replaced),
+            "unassociated" => Ok(Self::Unassociated),
             "disabled" => Ok(Self::Disabled),
             _ => Err(StoreError::InvalidFederatedSubjectRecord),
         }
@@ -305,6 +312,13 @@ pub struct FederatedSubjectDisable<'a> {
     pub expected_revision: i64,
     pub actor: &'a str,
     pub reason: Option<&'a str>,
+}
+
+pub struct FederatedSubjectUnlink<'a> {
+    pub subject_id: Uuid,
+    pub expected_revision: i64,
+    pub canonical_user_id: &'a CanonicalUserId,
+    pub actor: &'a str,
 }
 
 fn is_valid_member_role(member_role: &str) -> bool {
@@ -851,8 +865,22 @@ impl PgStore {
 
     pub async fn canonical_users(&self) -> Result<Vec<CanonicalUserRecord>, StoreError> {
         sqlx::query(
-            "SELECT user_id, organization_id, display_email, state \
-             FROM canonical_users ORDER BY user_id",
+            "SELECT canonical_users.user_id, canonical_users.organization_id, \
+                    canonical_users.display_email, canonical_users.display_name, \
+                    canonical_users.state, \
+                    to_char(canonical_users.created_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+                    to_char(canonical_users.last_sign_in_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_sign_in_at, \
+                    ( \
+                        SELECT COALESCE(inviter.display_email, audit.actor) \
+                        FROM canonical_identity_audit audit \
+                        LEFT JOIN canonical_users inviter ON inviter.user_id = audit.actor \
+                        WHERE audit.user_id = canonical_users.user_id \
+                          AND audit.action = 'preprovisioned' \
+                        ORDER BY audit.created_at, audit.id LIMIT 1 \
+                    ) AS invited_by \
+             FROM canonical_users ORDER BY canonical_users.user_id",
         )
         .fetch_all(&self.pool)
         .await
@@ -868,8 +896,24 @@ impl PgStore {
         organization_id: &OrganizationId,
     ) -> Result<Vec<CanonicalUserRecord>, StoreError> {
         sqlx::query(
-            "SELECT user_id, organization_id, display_email, state \
-             FROM canonical_users WHERE organization_id = $1 ORDER BY user_id",
+            "SELECT canonical_users.user_id, canonical_users.organization_id, \
+                    canonical_users.display_email, canonical_users.display_name, \
+                    canonical_users.state, \
+                    to_char(canonical_users.created_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+                    to_char(canonical_users.last_sign_in_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_sign_in_at, \
+                    ( \
+                        SELECT COALESCE(inviter.display_email, audit.actor) \
+                        FROM canonical_identity_audit audit \
+                        LEFT JOIN canonical_users inviter ON inviter.user_id = audit.actor \
+                        WHERE audit.user_id = canonical_users.user_id \
+                          AND audit.action = 'preprovisioned' \
+                        ORDER BY audit.created_at, audit.id LIMIT 1 \
+                    ) AS invited_by \
+             FROM canonical_users \
+             WHERE canonical_users.organization_id = $1 \
+             ORDER BY canonical_users.user_id",
         )
         .bind(organization_id.as_str())
         .fetch_all(&self.pool)
@@ -906,9 +950,24 @@ impl PgStore {
         .await
         .map_err(database_error)?;
         if let Some(row) = sqlx::query(
-            "SELECT user_id, organization_id, display_email, state \
+            "SELECT canonical_users.user_id, canonical_users.organization_id, \
+                    canonical_users.display_email, canonical_users.display_name, \
+                    canonical_users.state, \
+                    to_char(canonical_users.created_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+                    to_char(canonical_users.last_sign_in_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_sign_in_at, \
+                    ( \
+                        SELECT COALESCE(inviter.display_email, audit.actor) \
+                        FROM canonical_identity_audit audit \
+                        LEFT JOIN canonical_users inviter ON inviter.user_id = audit.actor \
+                        WHERE audit.user_id = canonical_users.user_id \
+                          AND audit.action = 'preprovisioned' \
+                        ORDER BY audit.created_at, audit.id LIMIT 1 \
+                    ) AS invited_by \
              FROM canonical_users \
-             WHERE organization_id = $1 AND lower(display_email) = lower($2) FOR UPDATE",
+             WHERE canonical_users.organization_id = $1 \
+               AND lower(canonical_users.display_email) = lower($2) FOR UPDATE",
         )
         .bind(organization_id.as_str())
         .bind(email.as_str())
@@ -922,15 +981,14 @@ impl PgStore {
 
         let user_id = CanonicalUserId::parse(format!("usr_{}", Uuid::new_v4().simple()))
             .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)?;
-        let row = sqlx::query(
+        sqlx::query(
             "INSERT INTO canonical_users (user_id, organization_id, display_email, state) \
-             VALUES ($1, $2, $3, 'pending') \
-             RETURNING user_id, organization_id, display_email, state",
+             VALUES ($1, $2, $3, 'pending')",
         )
         .bind(user_id.as_str())
         .bind(organization_id.as_str())
         .bind(email.as_str())
-        .fetch_one(&mut *transaction)
+        .execute(&mut *transaction)
         .await
         .map_err(canonical_identity_database_error)?;
         sqlx::query(
@@ -946,7 +1004,9 @@ impl PgStore {
         .await
         .map_err(database_error)?;
         transaction.commit().await.map_err(database_error)?;
-        canonical_user_record(row)
+        self.canonical_user(&user_id)
+            .await?
+            .ok_or(StoreError::CanonicalIdentityNotFound)
     }
 
     /// Count active canonical users other than the authenticated administrator.
@@ -970,8 +1030,22 @@ impl PgStore {
         user_id: &CanonicalUserId,
     ) -> Result<Option<CanonicalUserRecord>, StoreError> {
         sqlx::query(
-            "SELECT user_id, organization_id, display_email, state \
-             FROM canonical_users WHERE user_id = $1",
+            "SELECT canonical_users.user_id, canonical_users.organization_id, \
+                    canonical_users.display_email, canonical_users.display_name, \
+                    canonical_users.state, \
+                    to_char(canonical_users.created_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+                    to_char(canonical_users.last_sign_in_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_sign_in_at, \
+                    ( \
+                        SELECT COALESCE(inviter.display_email, audit.actor) \
+                        FROM canonical_identity_audit audit \
+                        LEFT JOIN canonical_users inviter ON inviter.user_id = audit.actor \
+                        WHERE audit.user_id = canonical_users.user_id \
+                          AND audit.action = 'preprovisioned' \
+                        ORDER BY audit.created_at, audit.id LIMIT 1 \
+                    ) AS invited_by \
+             FROM canonical_users WHERE canonical_users.user_id = $1",
         )
         .bind(user_id.as_str())
         .fetch_optional(&self.pool)
@@ -979,6 +1053,32 @@ impl PgStore {
         .map_err(database_error)?
         .map(canonical_user_record)
         .transpose()
+    }
+
+    /// Record metadata from a successfully verified browser sign-in.
+    pub async fn record_browser_sign_in(
+        &self,
+        user_id: &CanonicalUserId,
+        display_name: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let display_name = display_name.filter(|value| {
+            !value.is_empty() && value.trim() == *value && value.chars().count() <= 256
+        });
+        let updated = sqlx::query(
+            "UPDATE canonical_users \
+             SET display_name = COALESCE($2, display_name), \
+                 last_sign_in_at = now(), updated_at = now() \
+             WHERE user_id = $1 AND state = 'active'",
+        )
+        .bind(user_id.as_str())
+        .bind(display_name)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if updated.rows_affected() == 0 {
+            return Err(StoreError::CanonicalIdentityInactive);
+        }
+        Ok(())
     }
 
     pub async fn browser_member_roles(&self) -> Result<Vec<String>, StoreError> {
@@ -1823,6 +1923,30 @@ impl PgStore {
         rows.into_iter().map(federated_subject_record).collect()
     }
 
+    pub async fn federated_subjects_for_canonical_user(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+    ) -> Result<Vec<FederatedSubjectRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT subject_id, issuer, subject, state, canonical_user_id, \
+                    actor_login, display_name, association_method, revision, \
+                    to_char(first_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                    to_char(last_seen_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                    to_char(updated_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+             FROM federated_subjects \
+             WHERE canonical_user_id = $1 AND state = 'associated' \
+             ORDER BY issuer, subject, subject_id",
+        )
+        .bind(canonical_user_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter().map(federated_subject_record).collect()
+    }
+
     /// Count enabled, observed external identities that still lack canonical association.
     pub async fn unassociated_federated_subject_count(
         &self,
@@ -1937,6 +2061,65 @@ impl PgStore {
         .await?;
         transaction.commit().await.map_err(database_error)?;
         Ok(record)
+    }
+
+    pub async fn unlink_federated_subject(
+        &self,
+        change: FederatedSubjectUnlink<'_>,
+    ) -> Result<FederatedSubjectRecord, StoreError> {
+        if change.expected_revision <= 0 || !valid_federated_subject_actor(change.actor) {
+            return Err(StoreError::InvalidFederatedSubject);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let current = locked_federated_subject(&mut transaction, change.subject_id).await?;
+        if current.revision != change.expected_revision
+            || current.state != FederatedSubjectState::Associated
+            || current.canonical_user_id.as_ref() != Some(change.canonical_user_id)
+        {
+            return Err(StoreError::FederatedSubjectConflict);
+        }
+        let next_revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::FederatedSubjectConflict)?;
+        let row = sqlx::query(
+            "UPDATE federated_subjects \
+             SET state = 'observed', canonical_user_id = NULL, \
+                 association_method = NULL, revision = $2, updated_at = now() \
+             WHERE subject_id = $1 AND revision = $3 \
+             RETURNING subject_id, issuer, subject, state, canonical_user_id, \
+                       actor_login, display_name, association_method, revision, \
+                       to_char(first_seen_at AT TIME ZONE 'UTC', \
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS first_seen_at, \
+                       to_char(last_seen_at AT TIME ZONE 'UTC', \
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_seen_at, \
+                       to_char(updated_at AT TIME ZONE 'UTC', \
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at",
+        )
+        .bind(current.subject_id)
+        .bind(next_revision)
+        .bind(current.revision)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(StoreError::FederatedSubjectConflict)?;
+        sqlx::query(
+            "INSERT INTO federated_subject_audit \
+             (event_id, subject_id, action, actor, previous_canonical_user_id, \
+              canonical_user_id, previous_revision, revision) \
+             VALUES ($1, $2, 'unassociated', $3, $4, NULL, $5, $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(current.subject_id)
+        .bind(change.actor)
+        .bind(change.canonical_user_id.as_str())
+        .bind(current.revision)
+        .bind(next_revision)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        federated_subject_record(row)
     }
 
     pub async fn disable_federated_subject(
@@ -11383,7 +11566,9 @@ async fn transition_federated_subject_association(
         FederatedSubjectAuditAction::Associated | FederatedSubjectAuditAction::Replaced => {
             FederatedSubjectAssociationMethod::Admin
         }
-        FederatedSubjectAuditAction::Observed | FederatedSubjectAuditAction::Disabled => {
+        FederatedSubjectAuditAction::Observed
+        | FederatedSubjectAuditAction::Unassociated
+        | FederatedSubjectAuditAction::Disabled => {
             return Err(StoreError::InvalidFederatedSubject);
         }
     };
@@ -12942,7 +13127,11 @@ fn canonical_user_record(row: sqlx::postgres::PgRow) -> Result<CanonicalUserReco
             .and_then(|value| {
                 Email::parse(value).map_err(|_| StoreError::CanonicalIdentityInvalidRecord)
             })?,
+        display_name: row.try_get("display_name").map_err(database_error)?,
         state: row.try_get("state").map_err(database_error)?,
+        created_at: row.try_get("created_at").map_err(database_error)?,
+        last_sign_in_at: row.try_get("last_sign_in_at").map_err(database_error)?,
+        invited_by: row.try_get("invited_by").map_err(database_error)?,
     })
 }
 

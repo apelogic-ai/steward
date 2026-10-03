@@ -160,3 +160,10 @@ Migration 0059 preserves the two existing Task pin shapes and adds the distinct
 browser direct-package shape: immutable browser evidence, no legacy Workflow
 pin, and a complete approved User Envelope pin set. Published browser Workflows
 continue to use the existing complete Workflow-and-Envelope pin shape.
+
+Migration 0060 allows administrators to reserve a pending canonical member by
+verified organization email and records the inviter in the existing append-only
+identity audit. Migration 0061 adds optional OIDC display metadata and the last
+successful browser sign-in timestamp without rewriting historical members. It
+also records an administrator unlink as a new append-only federated-subject
+audit action while returning the current subject to the observed pool.

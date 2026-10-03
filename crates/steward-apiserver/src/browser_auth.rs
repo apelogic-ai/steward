@@ -268,6 +268,14 @@ pub trait BrowserIdentityResolver: Send + Sync + 'static {
         &'a self,
         identity: &'a OrganizationIdentity,
     ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>>;
+
+    fn record_successful_sign_in<'a>(
+        &'a self,
+        _user_id: &'a CanonicalUserId,
+        _display_name: Option<&'a str>,
+    ) -> BrowserFuture<'a, Result<(), BrowserAuthFailure>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[derive(Clone)]
@@ -302,6 +310,19 @@ impl BrowserIdentityResolver for PgBrowserIdentityResolver {
                 .await
                 .map_err(map_store_error)?;
             Ok(browser_principal_from_assignments(principal, assignments))
+        })
+    }
+
+    fn record_successful_sign_in<'a>(
+        &'a self,
+        user_id: &'a CanonicalUserId,
+        display_name: Option<&'a str>,
+    ) -> BrowserFuture<'a, Result<(), BrowserAuthFailure>> {
+        Box::pin(async move {
+            self.store
+                .record_browser_sign_in(user_id, display_name)
+                .await
+                .map_err(map_store_error)
         })
     }
 }
@@ -757,8 +778,9 @@ async fn callback(
         Ok(principal) => principal,
         Err(_) => return rejected_callback(&service.config),
     };
-    if let Some(display_name) = claims.display_name {
-        principal.display_name = display_name;
+    let verified_display_name = claims.display_name;
+    if let Some(display_name) = verified_display_name.as_ref() {
+        principal.display_name.clone_from(display_name);
     }
     if let Some(previous) = cookie_value(&headers, service.config.session_cookie)
         && service.registry.revoke(&previous).is_err()
@@ -769,6 +791,18 @@ async fn callback(
         Ok(session) => session,
         Err(_) => return rejected_callback(&service.config),
     };
+    if service
+        .identities
+        .record_successful_sign_in(
+            &session.principal.canonical_user_id,
+            verified_display_name.as_deref(),
+        )
+        .await
+        .is_err()
+    {
+        let _ = service.registry.revoke(&session.token);
+        return rejected_callback(&service.config);
+    }
     let mut response = response_with_cookie(
         StatusCode::SEE_OTHER,
         Some(&flow.return_to),
