@@ -209,10 +209,14 @@ impl Harness {
     }
 
     fn restart_controller(&mut self) {
+        self.stop_controller();
+        self.start_controller();
+    }
+
+    fn stop_controller(&mut self) {
         if let Some(controller) = self.controller.take() {
             controller.abort();
         }
-        self.start_controller();
     }
 
     async fn switch_artifact_trust_mode(
@@ -276,11 +280,17 @@ impl Harness {
             server_origin,
         )
         .map_err(|error| io::Error::other(format!("build governed broker: {error:?}")))?;
+        let failure_reports = self.failure_reports.clone();
         Ok(GovernedConnectionsBroker::new(
             self.store.clone(),
             config,
             steward_store::TaskOrchestrationMode::Active,
-        ))
+        )
+        .with_failure_reporter(move |line| {
+            if let Ok(mut reports) = failure_reports.lock() {
+                reports.push(line);
+            }
+        }))
     }
 
     fn broker(&self) -> Result<GovernedConnectionsBroker<()>, Box<dyn Error>> {
@@ -967,10 +977,55 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         .wait_operation_finalized(cancelled_status, Duration::from_secs(90))
         .await?;
 
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    harness.stop_controller();
+    let preempted_status_count = harness.operation_count(&alice_id, "status").await?;
+    let preempted_status_broker = broker.clone();
+    let preempted_status_session = alice.clone();
+    let preempted_status_task = tokio::spawn(async move {
+        preempted_status_broker
+            .status(&preempted_status_session)
+            .await
+    });
+    let preempted_status = harness
+        .latest_operation(&alice_id, "status", preempted_status_count)
+        .await?;
     let rejected_start_count = harness.operation_count(&alice_id, "start").await?;
     let rejected_broker =
         harness.broker_for_mode_and_origin("github-attestation", "https://blocked.example.test")?;
     let rejected_reserved = connection_result(rejected_broker.start(&alice).await)?;
+    assert_eq!(
+        preempted_status_task.await?,
+        Err(ConnectionBrokerError::Unavailable),
+        "a mutating operation must terminalize the queued status operation"
+    );
+    let preempted_failure: (String, Option<String>) = sqlx::query_as(
+        "SELECT operation_state, failure_category FROM connection_operations \
+         WHERE operation_id = $1",
+    )
+    .bind(preempted_status)
+    .fetch_one(&harness.database)
+    .await?;
+    assert_eq!(
+        preempted_failure,
+        (
+            "failed".to_owned(),
+            Some("superseded_by_mutation".to_owned())
+        )
+    );
+    let expected_preempted_report = format!(
+        "connection operation failed: operation_id={preempted_status} category=superseded_by_mutation"
+    );
+    assert!(
+        harness
+            .failure_reports
+            .lock()
+            .map_err(|_| io::Error::other("connection failure report collector was poisoned"))?
+            .iter()
+            .any(|report| report == &expected_preempted_report),
+        "store-owned preemption must use the connection failure reporter"
+    );
+    harness.start_controller();
     let rejected_operation = harness
         .latest_operation(&alice_id, "start", rejected_start_count)
         .await?;
@@ -997,6 +1052,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         rejected_error,
         ConnectionBrokerError::GatewayHttp {
             status: 400,
+            code: Some("oauth_redirect_target_not_allowed".to_owned()),
             reason: Some("OAuth redirect target is not allowed".to_owned()),
         },
         "the real MCP-GW rejection must cross the complete governed bridge path"
@@ -1021,6 +1077,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         operation_failure.try_get::<Option<Json<serde_json::Value>>, _>("failure_detail")?,
         Some(Json(json!({
             "upstreamStatus": 400,
+            "code": "oauth_redirect_target_not_allowed",
             "reason": "OAuth redirect target is not allowed"
         })))
     );
@@ -1039,13 +1096,13 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     assert_eq!(
         failed_attempt.try_get::<Option<Vec<u8>>, _>("execution_stderr")?,
         Some(
-            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (OAuth redirect target is not allowed)\n"
+            b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 [code=oauth_redirect_target_not_allowed] (OAuth redirect target is not allowed)\n"
                 .to_vec()
         )
     );
 
     let expected_report = format!(
-        "connection operation failed: operation_id={rejected_operation} category=bridge-gateway-http upstream_status=400 detail=\"OAuth redirect target is not allowed\""
+        "connection operation failed: operation_id={rejected_operation} category=bridge-gateway-http upstream_status=400 code=\"oauth_redirect_target_not_allowed\" detail=\"OAuth redirect target is not allowed\""
     );
     let reports = harness
         .failure_reports
@@ -1069,6 +1126,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         json!({
             "apiVersion": "steward.connections/v1",
             "error": "gateway_http_error",
+            "code": "oauth_redirect_target_not_allowed",
             "upstreamStatus": 400,
             "detail": "OAuth redirect target is not allowed"
         }),
@@ -1426,6 +1484,65 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     .await?;
     assert_eq!(operator_binding.0, "operator-pinned");
     assert_eq!(operator_binding.1, harness.bridge_image);
+
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    harness.stop_controller();
+    let drifted_status_count = harness.operation_count(&alice_id, "status").await?;
+    let drifted_status_broker = broker.clone();
+    let drifted_status_session = alice.clone();
+    let drifted_status_task =
+        tokio::spawn(async move { drifted_status_broker.status(&drifted_status_session).await });
+    let drifted_status = harness
+        .latest_operation(&alice_id, "status", drifted_status_count)
+        .await?;
+    let replacement_status_count = harness.operation_count(&alice_id, "status").await?;
+    let replacement_status_broker = operator_broker.clone();
+    let replacement_status_session = alice.clone();
+    let replacement_status_task = tokio::spawn(async move {
+        replacement_status_broker
+            .status(&replacement_status_session)
+            .await
+    });
+    let replacement_status = harness
+        .latest_operation(&alice_id, "status", replacement_status_count)
+        .await?;
+    assert_ne!(replacement_status, drifted_status);
+    assert_eq!(
+        drifted_status_task.await?,
+        Err(ConnectionBrokerError::Unavailable),
+        "a changed execution binding must terminalize the queued operation"
+    );
+    let drifted_failure: (String, Option<String>) = sqlx::query_as(
+        "SELECT operation_state, failure_category FROM connection_operations \
+         WHERE operation_id = $1",
+    )
+    .bind(drifted_status)
+    .fetch_one(&harness.database)
+    .await?;
+    assert_eq!(
+        drifted_failure,
+        ("failed".to_owned(), Some("binding_mismatch".to_owned()))
+    );
+    let expected_drift_report = format!(
+        "connection operation failed: operation_id={drifted_status} category=binding_mismatch"
+    );
+    assert!(
+        harness
+            .failure_reports
+            .lock()
+            .map_err(|_| io::Error::other("connection failure report collector was poisoned"))?
+            .iter()
+            .any(|report| report == &expected_drift_report),
+        "store-owned binding drift must use the connection failure reporter"
+    );
+    harness.start_controller();
+    assert_eq!(
+        connection_result(replacement_status_task.await?)?.phase,
+        ConnectionPhase::Disconnected
+    );
+    harness
+        .wait_operation_finalized(replacement_status, Duration::from_secs(90))
+        .await?;
     harness.wait_runtime_phase(
         ALICE_NAMESPACE,
         ALICE_RUNTIME,

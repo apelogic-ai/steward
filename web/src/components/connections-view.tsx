@@ -98,6 +98,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
           setStartFailure(operation.data.error ? {
             apiVersion: operation.data.apiVersion,
             error: operation.data.error,
+            code: operation.data.code,
             upstreamStatus: operation.data.upstreamStatus,
             detail: operation.data.detail,
           } : null);
@@ -157,6 +158,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
           setStartFailure(operation.data.error ? {
             apiVersion: operation.data.apiVersion,
             error: operation.data.error,
+            code: operation.data.code,
             upstreamStatus: operation.data.upstreamStatus,
             detail: operation.data.detail,
           } : null);
@@ -225,12 +227,16 @@ function connectionOperationError(value: unknown): ConnectionOperationErrorRespo
   return {
     apiVersion: candidate.apiVersion,
     error: candidate.error,
+    code: typeof candidate.code === "string" ? candidate.code : undefined,
     upstreamStatus: typeof candidate.upstreamStatus === "number" ? candidate.upstreamStatus : undefined,
     detail: typeof candidate.detail === "string" ? candidate.detail : undefined,
   };
 }
 
 function connectionFailureMessage(failure: ConnectionOperationErrorResponse): string {
+  if (failure.code === "oauth_redirect_target_not_allowed") {
+    return "MCP-GW rejected Steward's OAuth return origin. Add Steward's exact public origin to MCP-GW githubWrapper.oauth.redirectAfterAllowedOrigins.";
+  }
   const messages: Record<string, string> = {
     runtime_authentication_failed: "The governed runtime could not authenticate to GitHub. Re-authorize GitHub; if it continues, ask an administrator to verify runtime credential injection.",
     proxy_policy_denied: "OpenShell policy denied the governed GitHub request. Ask an administrator to verify the runtime's GitHub proxy policy.",
@@ -238,7 +244,7 @@ function connectionFailureMessage(failure: ConnectionOperationErrorResponse): st
     token_grant_failed: "The governed runtime could not receive its GitHub credential. Retry once; if it continues, ask an administrator to inspect MCP-GW token grants.",
     provider_response_invalid: "The provider returned a response Steward could not validate. Ask an administrator to verify the MCP-GW connection contract.",
     gateway_transport_failed: "The governed runtime could not reach MCP-GW. Ask an administrator to verify the gateway route and transport health.",
-    gateway_status_invalid: "MCP-GW returned an invalid status response. Ask an administrator to verify the deployed MCP-GW contract version.",
+    gateway_status_invalid: "An older connection bridge reported an unexpected successful MCP-GW response. Ask an administrator to verify the deployed Steward and MCP-GW versions.",
     gateway_body_unavailable: "The governed runtime could not read MCP-GW's response body. Retry once; if it continues, ask an administrator to inspect gateway health.",
     gateway_unavailable: "MCP-GW is unavailable. Retry once; if it continues, ask an administrator to inspect the gateway service.",
     runtime_create_failed: "The governed connection runtime could not be created. Ask an administrator to inspect Steward runtime admission and controller events.",

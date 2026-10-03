@@ -770,6 +770,7 @@ export type ClosureEntryKind = 'task_definition' | 'prompt' | 'instruction_skill
 
 export type ConnectionOperationErrorResponse = {
     apiVersion: string;
+    code?: string | null;
     detail?: string | null;
     error: string;
     upstreamStatus?: number | null;
@@ -783,6 +784,7 @@ export type ConnectionStartOperationResponse = {
      * One-time HTTPS destination. It must not be persisted or logged by clients.
      */
     authorizationUrl?: string | null;
+    code?: string | null;
     detail?: string | null;
     error?: string | null;
     /**

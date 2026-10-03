@@ -52,7 +52,7 @@ describe("governed provider connection controls", () => {
     expect(source).toContain("gateway_transport_failed");
     expect(source).toContain("verify the gateway route and transport health");
     expect(source).toContain("gateway_status_invalid");
-    expect(source).toContain("verify the deployed MCP-GW contract version");
+    expect(source).toContain("verify the deployed Steward and MCP-GW versions");
     expect(source).toContain("gateway_body_unavailable");
     expect(source).toContain("gateway_unavailable");
     expect(source).toContain("runtime_create_failed");
@@ -61,6 +61,9 @@ describe("governed provider connection controls", () => {
     expect(source).toContain("inspect the AgentRuntime and OpenShell sandbox status");
     expect(source).toContain("connection_deadline_exceeded");
     expect(source).toContain("inspect runtime health");
+    expect(source).toContain("oauth_redirect_target_not_allowed");
+    expect(source).toContain("githubWrapper.oauth.redirectAfterAllowedOrigins");
+    expect(source).toContain("code: operation.data.code");
   });
 
   test("clears a stale authorization failure before disconnecting", () => {

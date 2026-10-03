@@ -2741,7 +2741,7 @@ mod tests {
         );
         for required in [
             "STEWARD_OPEN_SHELL_RELEASE=v0.0.98",
-            "sha256:80bef7bee93482c8091335ae27c3c3e968e5c78c2bb4a40b401e6af36f70f993",
+            "sha256:9f1d76b7418caca120ab1651eb5335269127b1b3bccf4abaad79132d7a64cfe4",
             "e2e/Dockerfile.workflow-sandbox",
             "scripts/build-patched-openshell-supervisor.sh",
             "STEWARD_OPENSHELL_SUPERVISOR_IMAGE",

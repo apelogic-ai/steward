@@ -173,3 +173,8 @@ remain canonical identities and may be re-enabled; revoked invitations remain
 immutable history but no longer reserve the organization email, so a later invite
 creates a new pending member. Every transition remains append-only in the canonical
 identity audit.
+
+Migration 0063 extends the bounded governed-connection failure detail with MCP-GW's
+optional machine-readable error code. Existing status-and-reason rows remain valid
+and unchanged. New codes are limited to 100 lowercase ASCII letters, digits,
+underscores, or hyphens; raw provider responses remain forbidden.

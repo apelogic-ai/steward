@@ -376,11 +376,12 @@ administrators revoke it explicitly by disabling the federated subject.
 
 ### Troubleshooting a failed Connect operation
 
-The Connect API returns a bounded problem body. `gateway_http_error` includes
-the upstream HTTP status and, only when MCP-GW supplied a safe JSON `error` or
-`code` string, a sanitized detail of at most 200 bytes. Steward never copies a
-token, an unselected response field, or a URL containing a query string into
-that response. The same evidence is retained in
+The Connect API returns a bounded error body. `gateway_http_error` includes
+the upstream HTTP status, a safe MCP-GW JSON `code` of at most 100 bytes, and a
+sanitized human `error` detail of at most 200 bytes when those fields are
+present. Steward does not assume the upstream body is an RFC 9457 problem
+document. It never copies a token, an unselected response field, or a URL
+containing a query string into that response. The same evidence is retained in
 `connection_operations.failure_category` and
 `connection_operations.failure_detail`; the corresponding failed
 `task_execution_attempts.execution_stderr` contains the bridge's fixed,
@@ -388,14 +389,14 @@ bounded diagnostic.
 
 | Failure category | Meaning |
 | --- | --- |
-| `bridge-gateway-http` | MCP-GW returned an unexpected non-2xx HTTP status. Read `failure_detail` for the status and optional sanitized reason. |
+| `bridge-gateway-http` | MCP-GW returned a status other than the operation's exact success status (200 for status/start/rerun; 204 for disconnect), after the dedicated 401/403 and token-grant classifications. Read `failure_detail` for the status, stable code, and optional sanitized reason. |
 | `bridge-runtime-authentication` | MCP-GW rejected the runtime credential. Re-authorize the connection, then verify runtime credential injection if it continues. |
 | `bridge-proxy-policy` | OpenShell denied the provider request before MCP-GW handled it. |
 | `bridge-runtime-authorization` | MCP-GW rejected the runtime's authority. |
 | `bridge-token-grant` | OpenShell could not exchange the placeholder for the runtime-bound GitHub credential. Retry once, then inspect MCP-GW token-grant health. |
 | `bridge-response-contract` | MCP-GW returned a response that did not satisfy Steward's pinned provider contract. |
 | `bridge-gateway-transport` | The governed runtime could not complete the transport request to MCP-GW. |
-| `bridge-gateway-status` | MCP-GW returned status metadata that could not be validated. |
+| `bridge-gateway-status` | Historical category from older bridges for an unexpected successful disconnect response. New invalid response bodies use `bridge-response-contract`. |
 | `bridge-gateway-body` | The governed runtime could not read the bounded MCP-GW response body. |
 | `bridge-gateway-unavailable` | MCP-GW was unavailable to the governed runtime. |
 | `runtime_create_admission_rejected` | Kubernetes admission rejected creation of the governed connection runtime. Inspect Steward admission and controller events. |

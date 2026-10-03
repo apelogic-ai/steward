@@ -1125,6 +1125,10 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
                 .fail_connection_operation(connection.operation_id, "binding_mismatch", None)
                 .await
                 .map_err(TaskControllerError::Store)?;
+            eprintln!(
+                "{}",
+                connection_operation_failure_log_line(connection.operation_id, "binding_mismatch")
+            );
             authority
                 .enter_task_cleanup(
                     task.task_uid,
@@ -1239,6 +1243,13 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
             reason: task_failure_reason(&error),
         });
     persist_execution_observation(authority, &attempt, attempt.generation, observation).await
+}
+
+fn connection_operation_failure_log_line(
+    operation_id: impl std::fmt::Display,
+    category: &str,
+) -> String {
+    format!("connection operation failed: operation_id={operation_id} category={category}")
 }
 
 async fn reconcile_shared_runtime_observation(
@@ -5276,9 +5287,9 @@ mod tests {
         ReconcileIntent, RuntimeCreateErrorClass, SERVICE_PRINCIPAL_ANNOTATION, TaskRuntimeAction,
         TaskRuntimeBinding, TaskRuntimeBindingStore, authority_action,
         authority_application_action, classify_runtime_create_status, cleanup_runtime,
-        connection_operation_authority_action, create_task_runtime_inner,
-        exhausted_spend_to_preserve, failed_runtime_status, inference_action,
-        provider_control_bindings_match, reconcile_once, replace_as_controller,
+        connection_operation_authority_action, connection_operation_failure_log_line,
+        create_task_runtime_inner, exhausted_spend_to_preserve, failed_runtime_status,
+        inference_action, provider_control_bindings_match, reconcile_once, replace_as_controller,
         runtime_authority_action, runtime_start_failed, runtime_ttl_action,
         runtime_with_spend_top_up, sandbox_execution_class, sandbox_task_diagnostics,
         server_task_runtime_manifest, status_merge_patch, suspend_runtime,
@@ -5766,6 +5777,17 @@ mod tests {
                 "a retry must not reinterpret any persisted connection-operation binding"
             );
         }
+    }
+
+    #[test]
+    fn provider_control_binding_mismatch_uses_the_connection_failure_log_contract() {
+        assert_eq!(
+            connection_operation_failure_log_line(
+                "00000000-0000-0000-0000-000000000000",
+                "binding_mismatch",
+            ),
+            "connection operation failed: operation_id=00000000-0000-0000-0000-000000000000 category=binding_mismatch"
+        );
     }
 
     #[test]
