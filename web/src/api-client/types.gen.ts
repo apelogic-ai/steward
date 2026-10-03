@@ -435,6 +435,27 @@ export type BrowserMemberAssignmentAction = 'grant' | 'revoke';
 
 export type BrowserMemberAssignmentKind = 'administrator' | 'member_role';
 
+export type BrowserMemberDetailResponse = {
+    apiVersion: string;
+    member: BrowserMemberDetailView;
+};
+
+export type BrowserMemberDetailView = BrowserMemberView & {
+    identities: Array<BrowserMemberIdentityView>;
+};
+
+export type BrowserMemberIdentityView = {
+    associationMethod: string;
+    displayName?: string | null;
+    issuer: string;
+    linkedAt: string;
+    linkedBy: string;
+    revision: number;
+    state: string;
+    subject: string;
+    subjectId: string;
+};
+
 export type BrowserMemberResponse = {
     apiVersion: string;
     member: BrowserMemberView;
@@ -442,7 +463,12 @@ export type BrowserMemberResponse = {
 
 export type BrowserMemberView = {
     administrator: boolean;
+    createdAt: string;
     displayEmail: string;
+    displayName?: string | null;
+    identityCount: number;
+    invitedBy?: string | null;
+    lastSignInAt?: string | null;
     memberRoles: Array<string>;
     state: string;
     userId: string;
@@ -1402,6 +1428,10 @@ export type TriggerRepository = {
 export type UnknownTaskIdentityErrorResponse = {
     error: string;
     message: string;
+};
+
+export type UnlinkBrowserMemberIdentityBody = {
+    expectedRevision: number;
 };
 
 export type UpdateBrowserPreferences = {
@@ -2632,6 +2662,89 @@ export type CreateAdminMemberResponses = {
 };
 
 export type CreateAdminMemberResponse = CreateAdminMemberResponses[keyof CreateAdminMemberResponses];
+
+export type GetAdminMemberData = {
+    body?: never;
+    path: {
+        user_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/members/{user_id}';
+};
+
+export type GetAdminMemberErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Member was not found
+     */
+    404: unknown;
+    /**
+     * Member records are unavailable
+     */
+    503: unknown;
+};
+
+export type GetAdminMemberResponses = {
+    200: BrowserMemberDetailResponse;
+};
+
+export type GetAdminMemberResponse = GetAdminMemberResponses[keyof GetAdminMemberResponses];
+
+export type UnlinkAdminMemberIdentityData = {
+    body: UnlinkBrowserMemberIdentityBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        user_id: string;
+        subject_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/members/{user_id}/identities/{subject_id}/unlink';
+};
+
+export type UnlinkAdminMemberIdentityErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Member identity was not found
+     */
+    404: unknown;
+    /**
+     * Identity state or revision conflicts
+     */
+    409: unknown;
+    /**
+     * Unlink request is invalid
+     */
+    422: unknown;
+    /**
+     * Member identity is unavailable
+     */
+    503: unknown;
+};
+
+export type UnlinkAdminMemberIdentityResponses = {
+    /**
+     * Identity was returned to the unassociated pool
+     */
+    204: void;
+};
+
+export type UnlinkAdminMemberIdentityResponse = UnlinkAdminMemberIdentityResponses[keyof UnlinkAdminMemberIdentityResponses];
 
 export type ChangeAdminMemberRoleData = {
     body: ChangeBrowserMemberRoleBody;

@@ -23,8 +23,8 @@ use steward_apiserver::governed_connections::{
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
     FederatedSubjectAssociation, FederatedSubjectAssociationMethod, FederatedSubjectAuditAction,
-    FederatedSubjectDisable, FederatedSubjectObservation, FederatedSubjectState, PgStore,
-    StoreError,
+    FederatedSubjectDisable, FederatedSubjectObservation, FederatedSubjectState,
+    FederatedSubjectUnlink, PgStore, StoreError,
 };
 use steward_types::direct_package::SourceProvenance;
 use steward_types::{
@@ -218,6 +218,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         seed_maximum_source_provenance_upgrade_fixture(&store).await?;
     seed_finalized_task_provenance_upgrade_fixtures(&store).await?;
     seed_connection_association_upgrade_fixture(&store).await?;
+    seed_browser_member_details_upgrade_fixture(&store).await?;
     migration_set(None)
         .run(store.pool())
         .await
@@ -232,6 +233,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     verify_source_provenance_byte_limits(&store).await?;
     assert_connection_association_upgrade_result(&store).await?;
     assert_template_catalog_upgrade_result(&store).await?;
+    assert_browser_member_details_upgrade_result(&store).await?;
     verify_federated_subject_lifecycle(&store).await?;
     verify_direct_connection_auto_association(&store).await?;
     verify_pending_member_identity_state(&store).await?;
@@ -351,6 +353,13 @@ async fn verify_pending_member_identity_state(store: &PgStore) -> Result<(), Box
         )
         .await?;
     assert_eq!(pending.state, "pending");
+    assert_eq!(
+        pending.invited_by.as_deref(),
+        Some("alice@example.com"),
+        "member detail must resolve the invitation actor to the current administrator email"
+    );
+    assert!(pending.display_name.is_none());
+    assert!(pending.last_sign_in_at.is_none());
     let assignment = BrowserRbacAssignment::MemberRole("engineer".to_owned());
     store
         .append_browser_rbac_assignment(BrowserRbacAssignmentChange {
@@ -375,6 +384,9 @@ async fn verify_pending_member_identity_state(store: &PgStore) -> Result<(), Box
     let activated = store
         .register_canonical_identity(&identity, "browser-oidc")
         .await?;
+    store
+        .record_browser_sign_in(&activated.user_id, Some("Pending Member"))
+        .await?;
     assert_eq!(activated.user_id, pending.user_id);
     assert_eq!(
         store
@@ -384,13 +396,20 @@ async fn verify_pending_member_identity_state(store: &PgStore) -> Result<(), Box
         ["engineer"],
         "the verified sign-in must activate the exact pending member without losing its audited role"
     );
+    let active_member = store
+        .canonical_user(&activated.user_id)
+        .await?
+        .expect("activated user");
+    assert_eq!(active_member.state, "active");
     assert_eq!(
-        store
-            .canonical_user(&activated.user_id)
-            .await?
-            .expect("activated user")
-            .state,
-        "active"
+        active_member.display_name.as_deref(),
+        Some("Pending Member")
+    );
+    assert!(active_member.last_sign_in_at.is_some());
+    assert_eq!(
+        active_member.invited_by.as_deref(),
+        Some("alice@example.com"),
+        "activation must not erase who invited the member"
     );
     let administrator = BrowserRbacAssignment::Administrator;
     store
@@ -412,6 +431,46 @@ async fn verify_pending_member_identity_state(store: &PgStore) -> Result<(), Box
             .await,
         Err(StoreError::LastBrowserAdministrator)
     ));
+    Ok(())
+}
+
+async fn seed_browser_member_details_upgrade_fixture(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    sqlx::query(
+        "INSERT INTO canonical_users (user_id, organization_id, display_email) \
+         VALUES ('usr_33333333333333333333333333333333', 'org_example', \
+                 'historical.member@example.com')",
+    )
+    .execute(store.pool())
+    .await?;
+    Ok(())
+}
+
+async fn assert_browser_member_details_upgrade_result(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let user_id = CanonicalUserId::parse("usr_33333333333333333333333333333333")?;
+    let historical = store.canonical_user(&user_id).await?.ok_or_else(|| {
+        io::Error::other("historical browser member disappeared during migration")
+    })?;
+    assert!(historical.display_name.is_none());
+    assert!(historical.last_sign_in_at.is_none());
+    assert!(historical.invited_by.is_none());
+    assert!(
+        !historical.created_at.is_empty(),
+        "historical members must receive the existing creation timestamp without rewriting it"
+    );
+
+    store
+        .record_browser_sign_in(&user_id, Some("Historical Member"))
+        .await?;
+    let signed_in = store
+        .canonical_user(&user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("signed-in browser member disappeared"))?;
+    assert_eq!(signed_in.display_name.as_deref(), Some("Historical Member"));
+    assert!(signed_in.last_sign_in_at.is_some());
     Ok(())
 }
 
@@ -1492,6 +1551,87 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
         2,
         "the losing transition must not append audit state"
     );
+
+    let unlink_candidate = store
+        .observe_federated_subject(FederatedSubjectObservation {
+            issuer: "https://identity.example.test",
+            subject: "github-actions:actor:8675309",
+            actor_login: Some("alice-unlink"),
+            display_name: Some("Alice Unlink"),
+        })
+        .await?;
+    let linked = store
+        .associate_federated_subject(FederatedSubjectAssociation {
+            subject_id: unlink_candidate.subject_id,
+            expected_revision: unlink_candidate.revision,
+            canonical_user_id: &alice,
+            actor: bob.as_str(),
+        })
+        .await?;
+    assert!(
+        store
+            .federated_subjects_for_canonical_user(&alice)
+            .await?
+            .iter()
+            .any(|subject| subject.subject_id == linked.subject_id)
+    );
+    let unlinked = store
+        .unlink_federated_subject(FederatedSubjectUnlink {
+            subject_id: linked.subject_id,
+            expected_revision: linked.revision,
+            canonical_user_id: &alice,
+            actor: bob.as_str(),
+        })
+        .await?;
+    assert_eq!(unlinked.state, FederatedSubjectState::Observed);
+    assert!(unlinked.canonical_user_id.is_none());
+    assert!(unlinked.association_method.is_none());
+    assert!(
+        !store
+            .federated_subjects_for_canonical_user(&alice)
+            .await?
+            .iter()
+            .any(|subject| subject.subject_id == linked.subject_id)
+    );
+    assert!(matches!(
+        store
+            .resolve_federated_subject(&unlinked.issuer, &unlinked.subject)
+            .await,
+        Err(StoreError::FederatedSubjectUnassociated)
+    ));
+    assert_eq!(
+        store
+            .federated_subject_audit(unlinked.subject_id)
+            .await?
+            .iter()
+            .map(|event| event.action)
+            .collect::<Vec<_>>(),
+        [
+            FederatedSubjectAuditAction::Observed,
+            FederatedSubjectAuditAction::Associated,
+            FederatedSubjectAuditAction::Unassociated,
+        ]
+    );
+    assert!(matches!(
+        store
+            .unlink_federated_subject(FederatedSubjectUnlink {
+                subject_id: linked.subject_id,
+                expected_revision: linked.revision,
+                canonical_user_id: &alice,
+                actor: bob.as_str(),
+            })
+            .await,
+        Err(StoreError::FederatedSubjectConflict)
+    ));
+    let relinked = store
+        .associate_federated_subject(FederatedSubjectAssociation {
+            subject_id: unlinked.subject_id,
+            expected_revision: unlinked.revision,
+            canonical_user_id: &alice,
+            actor: bob.as_str(),
+        })
+        .await?;
+    assert_eq!(relinked.state, FederatedSubjectState::Associated);
 
     let similarity = store
         .observe_federated_subject(FederatedSubjectObservation {

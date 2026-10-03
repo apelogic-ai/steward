@@ -37,6 +37,90 @@ const administratorSession = {
   memberRoles: ["analyst"],
 };
 
+const memberFixtures = [
+  {
+    userId: administratorSession.principal.userId,
+    displayEmail: administratorSession.principal.displayEmail,
+    displayName: administratorSession.principal.displayName,
+    state: "active",
+    administrator: true,
+    memberRoles: ["analyst"],
+    createdAt: "2026-08-01T12:00:00Z",
+    lastSignInAt: "2026-08-24T17:00:00Z",
+    invitedBy: null,
+    identityCount: 0,
+  },
+  {
+    userId: "usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    displayEmail: "bob@example.org",
+    displayName: "Bob Example",
+    state: "active",
+    administrator: false,
+    memberRoles: ["developer", "retired-role"],
+    createdAt: "2026-08-02T12:00:00Z",
+    lastSignInAt: "2026-08-23T17:00:00Z",
+    invitedBy: null,
+    identityCount: 1,
+  },
+  {
+    userId: "usr_cccccccccccccccccccccccccccccccc",
+    displayEmail: "carol@example.com",
+    displayName: null,
+    state: "pending",
+    administrator: false,
+    memberRoles: [],
+    createdAt: "2026-08-24T12:00:00Z",
+    lastSignInAt: null,
+    invitedBy: administratorSession.principal.displayEmail,
+    identityCount: 0,
+  },
+  {
+    userId: "usr_dddddddddddddddddddddddddddddddd",
+    displayEmail: "dave@example.org",
+    displayName: "Dave Example",
+    state: "disabled",
+    administrator: false,
+    memberRoles: [],
+    createdAt: "2026-08-03T12:00:00Z",
+    lastSignInAt: "2026-08-10T17:00:00Z",
+    invitedBy: null,
+    identityCount: 0,
+  },
+];
+
+const federatedSubjectFixtures = [
+  {
+    subjectId: "00000000-0000-0000-0000-000000000264",
+    issuer: "https://identity.example.test",
+    subject: "github-actions:actor:24680",
+    state: "associated",
+    canonicalUserId: "usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    actorLogin: "bob-gh",
+    displayName: "Bob Example",
+    associationMethod: "admin",
+    revision: 2,
+    firstSeenAt: "2026-08-20T12:00:00Z",
+    lastSeenAt: "2026-08-23T12:00:00Z",
+    updatedAt: "2026-08-20T12:05:00Z",
+    linkedAt: "2026-08-20T12:05:00Z",
+    linkedBy: administratorSession.principal.displayEmail,
+  },
+  {
+    subjectId: "00000000-0000-0000-0000-000000000265",
+    issuer: "https://identity.example.test",
+    subject: "github-actions:actor:13579",
+    state: "observed",
+    canonicalUserId: null,
+    actorLogin: "carol-gh",
+    displayName: "Carol Example",
+    associationMethod: null,
+    revision: 1,
+    firstSeenAt: "2026-08-24T12:00:00Z",
+    lastSeenAt: "2026-08-24T12:00:00Z",
+    updatedAt: "2026-08-24T12:00:00Z",
+  },
+];
+
 const previousSessionContract = {
   ...developerSession,
   principal: {
@@ -238,6 +322,7 @@ const presentationRoutes = [
   { path: "/connections", heading: "Connections", activeNavigation: "Connections" },
   { path: "/settings", heading: "Settings", activeNavigation: "Settings" },
   { path: "/admin/members", heading: "Members", activeNavigation: "Members" },
+  { path: "/admin/members/usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", heading: "Bob Example", activeNavigation: "Members" },
   { path: "/admin/envelopes/templates", heading: "Envelope templates", activeNavigation: "Templates" },
   { path: "/admin/envelopes/provision", heading: "Provision envelope", activeNavigation: "Provision" },
   { path: "/admin/envelopes/templates/analyst", heading: "Envelope template", activeNavigation: "Templates" },
@@ -648,6 +733,8 @@ async function guardedPage(browser, {
   const executionLogRequests = [];
   const mutations = [];
   const setupStatusRequests = [];
+  const members = structuredClone(memberFixtures);
+  const federatedSubjects = structuredClone(federatedSubjectFixtures);
   let currentAdminSetupStatus = adminSetupStatus;
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
@@ -906,29 +993,98 @@ async function guardedPage(browser, {
       { id: "developer", displayName: "Developer", memberRoles: ["developer"], envelope, autoProvisionThreshold: null },
     ],
   }));
-  await context.route(`${origin}/admin/api/v1/members*`, async (route) => {
-    const member = {
-      userId: developerSession.principal.userId,
-      displayEmail: developerSession.principal.displayEmail,
-      state: "active",
-      administrator: true,
-      memberRoles: ["analyst"],
-    };
-    if (route.request().method() === "GET") {
-      await json(route, { apiVersion: "steward.browser-members/v1", members: [member] });
+  await context.route(`${origin}/admin/api/v1/members**`, async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    const parts = pathname.split("/").filter(Boolean);
+    if (request.method() === "GET" && pathname === "/admin/api/v1/members") {
+      await json(route, { apiVersion: "steward.browser-members/v1", members: emptyCollections ? [] : members });
+      return;
+    }
+    const userId = decodeURIComponent(parts[4] ?? "");
+    const member = members.find((candidate) => candidate.userId === userId);
+    if (!member) {
+      await json(route, { error: "member was not found" }, 404);
+      return;
+    }
+    if (request.method() === "GET") {
+      const identities = federatedSubjects
+        .filter((subject) => subject.state === "associated" && subject.canonicalUserId === member.userId)
+        .map((subject) => ({
+          associationMethod: subject.associationMethod,
+          displayName: subject.displayName,
+          issuer: subject.issuer,
+          linkedAt: subject.linkedAt ?? subject.updatedAt,
+          linkedBy: subject.linkedBy ?? "system",
+          revision: subject.revision,
+          state: subject.state,
+          subject: subject.subject,
+          subjectId: subject.subjectId,
+        }));
+      await json(route, { apiVersion: "steward.browser-members/v1", member: { ...member, identities } });
       return;
     }
     mutations.push({
-      path: new URL(route.request().url()).pathname,
-      headers: route.request().headers(),
-      body: route.request().postDataJSON(),
+      path: pathname,
+      headers: await request.allHeaders(),
+      body: request.postDataJSON(),
     });
+    if (pathname.endsWith("/roles")) {
+      const body = request.postDataJSON();
+      if (body.kind === "administrator") member.administrator = body.action === "grant";
+      else if (body.action === "grant" && !member.memberRoles.includes(body.memberRole)) member.memberRoles.push(body.memberRole);
+      else if (body.action === "revoke") member.memberRoles = member.memberRoles.filter((role) => role !== body.memberRole);
+      await json(route, { apiVersion: "steward.browser-members/v1", member });
+      return;
+    }
+    if (pathname.endsWith("/unlink")) {
+      const subjectId = parts[6];
+      const subject = federatedSubjects.find((candidate) => candidate.subjectId === subjectId && candidate.canonicalUserId === member.userId);
+      if (!subject) {
+        await json(route, { error: "member identity was not found" }, 404);
+        return;
+      }
+      subject.state = "observed";
+      subject.canonicalUserId = null;
+      subject.associationMethod = null;
+      subject.revision += 1;
+      delete subject.linkedAt;
+      delete subject.linkedBy;
+      member.identityCount -= 1;
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
     await json(route, { apiVersion: "steward.browser-members/v1", member });
   });
-  await context.route(`${origin}/admin/api/v1/federated-subjects`, (route) => json(route, {
-    apiVersion: "steward.browser-admin/v1",
-    federatedSubjects: [],
-  }));
+  await context.route(`${origin}/admin/api/v1/federated-subjects**`, async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (request.method() === "GET") {
+      await json(route, { apiVersion: "steward.browser-admin/v1", federatedSubjects });
+      return;
+    }
+    mutations.push({ path: pathname, headers: await request.allHeaders(), body: request.postDataJSON() });
+    if (pathname.endsWith("/associate")) {
+      const subjectId = pathname.split("/").at(-2);
+      const subject = federatedSubjects.find((candidate) => candidate.subjectId === subjectId);
+      const body = request.postDataJSON();
+      const member = members.find((candidate) => candidate.userId === body.canonicalUserId);
+      if (!subject || !member) {
+        await json(route, { error: "association target was not found" }, 404);
+        return;
+      }
+      subject.state = "associated";
+      subject.canonicalUserId = member.userId;
+      subject.associationMethod = "admin";
+      subject.revision += 1;
+      subject.linkedAt = "2026-08-24T18:00:00Z";
+      subject.linkedBy = administratorSession.principal.displayEmail;
+      member.identityCount += 1;
+      await json(route, { apiVersion: "steward.browser-admin/v1", federatedSubject: subject });
+      return;
+    }
+    await json(route, { error: "unsupported mutation" }, 422);
+  });
   await context.route(`${origin}/admin/api/v1/capabilities`, (route) => capabilityCatalogStatus === 200
     ? json(route, {
       schemaVersion: "steward.capability-catalog/v2",
@@ -1255,6 +1411,75 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
     await administrator.page.getByRole("link", { name: /Developer/ }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/approvals/${unifiedEnvelopeRequest.id}`);
     await expect(administrator.page.getByRole("heading", { name: /Developer · above ceiling/i })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrators filter members and manage one member through the detail boundary", async ({ browser }) => {
+  const administrator = await guardedPage(browser, { session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/members`);
+    await expect(administrator.page.getByText("People who can sign in to this organization, their access, and the member roles that decide which templates they can request.")).toBeVisible();
+    await expect(administrator.page.getByRole("tab", { name: /All\s+4/ })).toBeVisible();
+    await expect(administrator.page.getByRole("tab", { name: /Active\s+2/ })).toBeVisible();
+    await expect(administrator.page.getByRole("tab", { name: /Invited\s+1/ })).toBeVisible();
+    await expect(administrator.page.getByRole("tab", { name: /Disabled\s+1/ })).toBeVisible();
+
+    await administrator.page.getByRole("searchbox", { name: "Search members" }).fill("bob");
+    await expect(administrator.page.getByRole("link", { name: "Open bob@example.org" })).toBeVisible();
+    await expect(administrator.page.getByRole("link", { name: "Open alice@example.com" })).toHaveCount(0);
+    await administrator.page.getByRole("searchbox", { name: "Search members" }).fill("");
+    await administrator.page.getByRole("tab", { name: /Invited\s+1/ }).click();
+    await expect(administrator.page.getByRole("link", { name: "Open carol@example.com" })).toBeVisible();
+    await expect(administrator.page.getByRole("link", { name: "Open bob@example.org" })).toHaveCount(0);
+
+    await administrator.page.getByRole("tab", { name: /All\s+4/ }).click();
+    await administrator.page.getByRole("link", { name: "Open bob@example.org" }).click();
+    await expect(administrator.page).toHaveURL(`${origin}/admin/members/usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`);
+    await expect(administrator.page.getByRole("heading", { name: "Bob Example" })).toBeVisible();
+    await expect(administrator.page.getByText("retired-role", { exact: true }).first()).toBeVisible();
+    await expect(administrator.page.getByText(/No template currently publishes this role/)).toBeVisible();
+
+    const administratorSwitch = administrator.page.getByRole("switch", { name: "Administrator access off" });
+    await administratorSwitch.click();
+    await expect(administrator.page.getByRole("alertdialog").getByRole("heading", { name: "Grant administrator access?" })).toBeVisible();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Grant administrator" }).click();
+    await expect(administrator.page.getByRole("switch", { name: "Administrator access on" })).toHaveAttribute("aria-checked", "true");
+
+    const roles = administrator.page.getByRole("combobox", { name: "Member roles" });
+    await roles.fill("analyst");
+    await roles.press("Enter");
+    await expect(administrator.page.getByText("analyst", { exact: true })).toBeVisible();
+
+    await administrator.page.getByRole("button", { name: "Unlink" }).click();
+    await expect(administrator.page.getByRole("alertdialog").getByRole("heading", { name: "Unlink this identity?" })).toBeVisible();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Unlink identity" }).click();
+    await expect(administrator.page.getByText("No linked identities.")).toBeVisible();
+
+    await administrator.page.getByRole("button", { name: "Link identity" }).click();
+    await administrator.page.getByRole("combobox", { name: "Observed identity" }).selectOption("00000000-0000-0000-0000-000000000265");
+    await administrator.page.getByRole("button", { name: "Link", exact: true }).click();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Link identity" }).click();
+    await expect(administrator.page.getByText("github-actions:actor:13579", { exact: true })).toBeVisible();
+
+    const roleMutation = administrator.mutations.find((mutation) => mutation.path.endsWith("/roles") && mutation.body.kind === "member_role");
+    expect(roleMutation.headers["x-steward-csrf"]).toBe("test-csrf");
+    expect(roleMutation.headers["content-type"]).toContain("application/json");
+    expect(roleMutation.headers.origin).toBe(origin);
+    expect(roleMutation.body).toEqual({ action: "grant", kind: "member_role", memberRole: "analyst" });
+    for (const identityMutation of [
+      administrator.mutations.find((mutation) => mutation.path.endsWith("/identities/00000000-0000-0000-0000-000000000264/unlink")),
+      administrator.mutations.find((mutation) => mutation.path.endsWith("/00000000-0000-0000-0000-000000000265/associate")),
+    ]) {
+      expect(identityMutation.headers["x-steward-csrf"]).toBe("test-csrf");
+      expect(identityMutation.headers["content-type"]).toContain("application/json");
+      expect(identityMutation.headers.origin).toBe(origin);
+    }
+
+    await administrator.page.goto(`${origin}/admin/members/${administratorSession.principal.userId}`);
+    await expect(administrator.page.getByRole("switch", { name: "Administrator access on" })).toBeDisabled();
+    await expect(administrator.page.getByText("You can't remove your own administrator access.")).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }

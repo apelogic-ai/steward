@@ -10,6 +10,7 @@ export function ConfirmationDialog({
   onOpenChange,
   open,
   pending = false,
+  tone = "danger",
   title,
 }: Readonly<{
   cancelLabel?: string;
@@ -19,6 +20,7 @@ export function ConfirmationDialog({
   onOpenChange: (open: boolean) => void;
   open: boolean;
   pending?: boolean;
+  tone?: "danger" | "primary";
   title: string;
 }>) {
   const titleId = useId();
@@ -78,7 +80,7 @@ export function ConfirmationDialog({
         <p className="mt-2 text-sm leading-6 text-muted-ink" id={descriptionId}>{description}</p>
         <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
           <button className="h-10 rounded-control border px-4 text-sm font-semibold" disabled={pending} onClick={() => onOpenChange(false)} ref={cancelRef} type="button">{cancelLabel}</button>
-          <button className="h-10 rounded-control bg-err px-4 text-sm font-semibold text-white disabled:opacity-50" disabled={pending} onClick={onConfirm} type="button">{confirmLabel}</button>
+          <button className={`h-10 rounded-control px-4 text-sm font-semibold text-white disabled:opacity-50 ${tone === "danger" ? "bg-err" : "bg-brand"}`} disabled={pending} onClick={onConfirm} type="button">{confirmLabel}</button>
         </div>
       </div>
     </div>
