@@ -105,3 +105,20 @@ unchanged `task-definition.json` and `prompt.md`, a `git:trigger` invocation man
 and a caller workflow with the exact reusable-workflow commit. Committing those files
 preserves the package closure digest proven by the inline run; release coordinates are
 never guessed by the browser client.
+
+## First-run prerequisite failures
+
+The 0.3.6 first-run path fails before creating a Task or runtime when a required
+deployment or identity prerequisite is absent. Use the following exact signals; do
+not diagnose these cases as generic database, Kubernetes, or credential failures.
+
+| Broken prerequisite | Authoritative signal | Operator action |
+|---|---|---|
+| Task orchestration is `staged` | **Admin → Get started** reports `Task orchestration is staged.` A run submission returns HTTP 503 with `TaskRuntimeContractUnavailable("Task submission is disabled during the staged orchestration rollout")`. | Complete the documented staged rollout and activate Task orchestration. |
+| `githubSource` is disabled | Direct-package submission returns HTTP 503 with `error: task.direct_package_source_disabled` and `failureReason: Direct package source resolution is disabled on this Steward deployment; enable githubSource to accept in-repository Task packages.` | Configure and enable the exact Git source adapter before retrying. Browser-inline packages remain available. |
+| No published template grants a member role | **Admin → Get started** reports `No template grants member roles, models, and tools together.` The affected member sees no eligible template to request. | Publish a successor template revision with at least one eligible member role and the intended model and tool authority. |
+| The GitHub Actions actor is unassociated and connection-based auto-association is unavailable or disabled | The first valid v3 submission returns HTTP 403 with `error: task_identity_unassociated`, the verified `issuer` and `subject`, and `message: The authenticated federated subject is not associated with a Steward user. Ask a Steward administrator to associate it.` | Associate the observed subject with the existing Steward member, or enable connection-based auto-association and verify the member's GitHub connection. |
+
+All four failures are fail-closed. The staged and disabled-source checks run before
+Task reservation; the unassociated subject receives no Task authority; and a
+role-less template is not offered to a member.
