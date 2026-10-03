@@ -80,17 +80,6 @@ fn gateway_failure(error: &PortError) -> String {
         PortError::Failed { reason } if reason.starts_with("MCP-GW returned HTTP ") => {
             format!("bridge {reason}")
         }
-        PortError::Failed { reason }
-            if matches!(
-                reason.as_str(),
-                "MCP-GW unavailable while attempting to read GitHub connection status"
-                    | "MCP-GW unavailable while attempting to start GitHub connection"
-                    | "MCP-GW unavailable while attempting to disconnect GitHub connection"
-                    | "MCP-GW unavailable while attempting to re-run GitHub workflow"
-            ) =>
-        {
-            "bridge MCP-GW returned an unexpected status".to_owned()
-        }
         PortError::Rejected { .. } => {
             "bridge MCP-GW response violated its bounded contract".to_owned()
         }
@@ -453,13 +442,13 @@ mod tests {
                 reason: "MCP-GW unavailable while attempting to read GitHub connection status"
                     .to_owned(),
             }),
-            "bridge MCP-GW returned an unexpected status"
+            "bridge MCP-GW is unavailable"
         );
         assert_eq!(
             gateway_failure(&PortError::Failed {
                 reason: "MCP-GW unavailable while attempting to re-run GitHub workflow".to_owned(),
             }),
-            "bridge MCP-GW returned an unexpected status"
+            "bridge MCP-GW is unavailable"
         );
         assert_eq!(
             gateway_failure(&PortError::Failed {

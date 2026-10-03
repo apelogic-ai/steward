@@ -8482,7 +8482,7 @@ impl PgStore {
             .await
             .map_err(database_error)?;
 
-        sqlx::query(
+        let mut failed_operations = sqlx::query_scalar::<_, Uuid>(
             "WITH drifted AS ( \
                UPDATE connection_operations \
                SET operation_state = 'failed', failure_category = 'binding_mismatch', \
@@ -8495,13 +8495,14 @@ impl PgStore {
                  AND NOT (artifact_trust_mode = $2 AND bridge_image_digest = $3 \
                    AND mcp_gw_origin = $4 AND mcp_gw_version = $5 \
                    AND runtime_namespace = $6 AND runtime_class = $7) \
-               RETURNING task_uid \
+               RETURNING operation_id, task_uid \
              ) \
-             UPDATE task_submissions \
+             UPDATE task_submissions tasks \
              SET phase = CASE WHEN phase IN ('succeeded', 'failed') THEN phase ELSE 'failed' END, \
                  output_archive = NULL, finalize_requested = true, \
                  failure_reason = 'binding_mismatch', updated_at = now() \
-             WHERE task_uid IN (SELECT task_uid FROM drifted)",
+             FROM drifted WHERE tasks.task_uid = drifted.task_uid \
+             RETURNING drifted.operation_id",
         )
         .bind(request.task.owner_user_id)
         .bind(&request.bindings.artifact_trust_mode)
@@ -8510,9 +8511,15 @@ impl PgStore {
         .bind(&request.bindings.mcp_gw_version)
         .bind(&request.bindings.namespace)
         .bind(&request.bindings.runtime_class)
-        .execute(&mut *transaction)
+        .fetch_all(&mut *transaction)
         .await
-        .map_err(database_error)?;
+        .map_err(database_error)?
+        .into_iter()
+        .map(|operation_id| ConnectionOperationFailureNotice {
+            operation_id,
+            category: "binding_mismatch",
+        })
+        .collect::<Vec<_>>();
 
         sqlx::query(
             "UPDATE connection_operations \
@@ -8728,6 +8735,7 @@ impl PgStore {
                 return Ok(ConnectionOperationReservation {
                     inserted: false,
                     record,
+                    failed_operations,
                 });
             }
         }
@@ -8736,7 +8744,7 @@ impl PgStore {
             return Err(StoreError::ConnectionOperationConflict);
         }
         if request.operation_kind != ConnectionOperationKind::Status {
-            sqlx::query(
+            let preempted = sqlx::query_scalar::<_, Uuid>(
                 "WITH preempted AS ( \
                    UPDATE connection_operations \
                    SET operation_state = 'failed', failure_category = 'superseded_by_mutation', \
@@ -8747,19 +8755,26 @@ impl PgStore {
                      AND operation_kind = 'status' \
                      AND operation_state IN ('queued', 'provisioning', 'running') \
                      AND finalization_state = 'not_requested' \
-                   RETURNING task_uid \
+                   RETURNING operation_id, task_uid \
                  ) \
                  UPDATE task_submissions tasks \
                  SET phase = CASE WHEN tasks.phase IN ('succeeded', 'failed') \
                          THEN tasks.phase ELSE 'failed' END, \
                      output_archive = NULL, finalize_requested = true, \
                      failure_reason = 'superseded_by_mutation', updated_at = now() \
-                 FROM preempted WHERE tasks.task_uid = preempted.task_uid",
+                 FROM preempted WHERE tasks.task_uid = preempted.task_uid \
+                 RETURNING preempted.operation_id",
             )
             .bind(request.task.owner_user_id)
-            .execute(&mut *transaction)
+            .fetch_all(&mut *transaction)
             .await
             .map_err(database_error)?;
+            failed_operations.extend(preempted.into_iter().map(|operation_id| {
+                ConnectionOperationFailureNotice {
+                    operation_id,
+                    category: "superseded_by_mutation",
+                }
+            }));
             sqlx::query(
                 "UPDATE connection_operations \
                  SET cache_expires_at = NULL, result_expires_at = NULL, updated_at = now() \
@@ -8876,6 +8891,7 @@ impl PgStore {
         Ok(ConnectionOperationReservation {
             inserted: true,
             record,
+            failed_operations,
         })
     }
 
@@ -10231,10 +10247,10 @@ fn connection_operation_failure_detail_is_valid(
         return false;
     };
     if object.is_empty()
-        || object.len() > 2
+        || object.len() > 3
         || !object
             .keys()
-            .all(|key| matches!(key.as_str(), "upstreamStatus" | "reason"))
+            .all(|key| matches!(key.as_str(), "upstreamStatus" | "code" | "reason"))
     {
         return false;
     }
@@ -10247,16 +10263,26 @@ fn connection_operation_failure_detail_is_valid(
     if !(100..=599).contains(&status) {
         return false;
     }
-    let Some(reason) = object.get("reason") else {
-        return true;
-    };
-    let Some(reason) = reason.as_str() else {
-        return false;
-    };
-    !reason.is_empty()
-        && reason.len() <= 200
-        && reason.trim() == reason
-        && !reason.chars().any(char::is_control)
+    let code_is_valid = object.get("code").is_none_or(|code| {
+        code.as_str().is_some_and(|code| {
+            !code.is_empty()
+                && code.len() <= 100
+                && code.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'-')
+                })
+        })
+    });
+    let reason_is_valid = object.get("reason").is_none_or(|reason| {
+        reason.as_str().is_some_and(|reason| {
+            !reason.is_empty()
+                && reason.len() <= 200
+                && reason.trim() == reason
+                && !reason.chars().any(char::is_control)
+        })
+    });
+    code_is_valid && reason_is_valid
 }
 
 #[cfg(test)]
@@ -10278,6 +10304,7 @@ mod connection_binding_validation_tests {
             "bridge-gateway-http",
             Some(&json!({
                 "upstreamStatus": 400,
+                "code": "oauth_redirect_target_not_allowed",
                 "reason": "OAuth redirect target is not allowed"
             }))
         ));
@@ -10299,6 +10326,10 @@ mod connection_binding_validation_tests {
         assert!(!connection_operation_failure_detail_is_valid(
             "bridge-gateway-http",
             Some(&json!({"upstreamStatus": 400, "raw": "response"}))
+        ));
+        assert!(!connection_operation_failure_detail_is_valid(
+            "bridge-gateway-http",
+            Some(&json!({"upstreamStatus": 400, "code": "unsafe code"}))
         ));
     }
 }
@@ -11198,7 +11229,7 @@ pub struct ConnectionOperationRecord {
     pub cached_status: Option<serde_json::Value>,
     pub result: Option<serde_json::Value>,
     pub failure_category: Option<String>,
-    /// Bounded adapter-sanitized upstream status/reason. Never raw provider output or stderr.
+    /// Bounded adapter-sanitized upstream status/code/reason. Never raw provider output or stderr.
     pub failure_detail: Option<serde_json::Value>,
     pub finalization_state: String,
     pub cleanup_state: String,
@@ -11215,6 +11246,13 @@ pub struct ConnectionOperationRecord {
 pub struct ConnectionOperationReservation {
     pub inserted: bool,
     pub record: ConnectionOperationRecord,
+    pub failed_operations: Vec<ConnectionOperationFailureNotice>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectionOperationFailureNotice {
+    pub operation_id: Uuid,
+    pub category: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -220,14 +220,24 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     seed_finalized_task_provenance_upgrade_fixtures(&store).await?;
     seed_connection_association_upgrade_fixture(&store).await?;
     seed_browser_member_details_upgrade_fixture(&store).await?;
+    migration_set(Some(62))
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward pre-0063 migrations must complete over the required TLS session: {error}"
+            ))
+        })?;
+    seed_connection_failure_detail_upgrade_fixture(&store).await?;
     migration_set(None)
         .run(store.pool())
         .await
         .map_err(|error| {
             io::Error::other(format!(
-                "Steward connection-verification migration must complete over the required TLS session: {error}"
+                "Steward connection failure-detail code migration must complete over the required TLS session: {error}"
             ))
         })?;
+    assert_connection_failure_detail_upgrade_result(&store).await?;
     assert_maximum_source_provenance_upgrade_result(&store, &maximum_direct_source_provenance)
         .await?;
     assert_finalized_task_provenance_upgrade_result(&store).await?;
@@ -868,6 +878,95 @@ async fn assert_finalized_task_provenance_upgrade_result(
         "the re-enabled monotonicity trigger must still reject later finalized-Task mutation"
     );
 
+    Ok(())
+}
+
+async fn seed_connection_failure_detail_upgrade_fixture(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let updated = sqlx::query(
+        "UPDATE connection_operations \
+         SET operation_state = 'failed', failure_category = 'bridge-gateway-http', \
+             failure_detail = $2 \
+         WHERE operation_id = $1::text::uuid",
+    )
+    .bind("00000000-0000-0000-0000-000000001057")
+    .bind(serde_json::json!({
+        "upstreamStatus": 400,
+        "reason": "OAuth redirect target is not allowed"
+    }))
+    .execute(store.pool())
+    .await?
+    .rows_affected();
+    assert_eq!(
+        updated, 1,
+        "the pre-0063 connection operation fixture must exist"
+    );
+    Ok(())
+}
+
+async fn assert_connection_failure_detail_upgrade_result(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let operation_id = "00000000-0000-0000-0000-000000001057";
+    let historical = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT failure_detail FROM connection_operations WHERE operation_id = $1::text::uuid",
+    )
+    .bind(operation_id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        historical,
+        serde_json::json!({
+            "upstreamStatus": 400,
+            "reason": "OAuth redirect target is not allowed"
+        }),
+        "migration 0063 must preserve historical failure detail without inventing a code"
+    );
+
+    let with_code = serde_json::json!({
+        "upstreamStatus": 400,
+        "code": "oauth_redirect_target_not_allowed",
+        "reason": "OAuth redirect target is not allowed"
+    });
+    sqlx::query(
+        "UPDATE connection_operations SET failure_detail = $2 \
+         WHERE operation_id = $1::text::uuid",
+    )
+    .bind(operation_id)
+    .bind(&with_code)
+    .execute(store.pool())
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT failure_detail FROM connection_operations \
+             WHERE operation_id = $1::text::uuid",
+        )
+        .bind(operation_id)
+        .fetch_one(store.pool())
+        .await?,
+        with_code,
+        "migration 0063 must admit the bounded MCP-GW code"
+    );
+
+    for invalid in [
+        serde_json::json!({"upstreamStatus": 400, "code": "unsafe code"}),
+        serde_json::json!({"upstreamStatus": 400, "code": "x".repeat(101)}),
+        serde_json::json!({"upstreamStatus": 400, "code": "safe", "raw": "response"}),
+    ] {
+        assert!(
+            sqlx::query(
+                "UPDATE connection_operations SET failure_detail = $2 \
+                 WHERE operation_id = $1::text::uuid",
+            )
+            .bind(operation_id)
+            .bind(invalid)
+            .execute(store.pool())
+            .await
+            .is_err(),
+            "migration 0063 must reject unbounded or non-schema failure detail"
+        );
+    }
     Ok(())
 }
 

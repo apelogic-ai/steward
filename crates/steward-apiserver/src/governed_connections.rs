@@ -571,6 +571,7 @@ pub struct GovernedConnectionsBroker<B> {
     config: GovernedConnectionsConfig,
     binding: PhantomData<fn() -> B>,
     orchestration_mode: TaskOrchestrationMode,
+    failure_reporter: Arc<dyn Fn(String) + Send + Sync>,
 }
 
 const STAGED_CONNECTIONS_WARNING: &str = "connections bridge enabled but taskOrchestrationMode=staged; Connections operations are refused";
@@ -597,7 +598,16 @@ impl<B> GovernedConnectionsBroker<B> {
             config,
             binding: PhantomData,
             orchestration_mode,
+            failure_reporter: Arc::new(|line| eprintln!("{line}")),
         }
+    }
+
+    pub fn with_failure_reporter(
+        mut self,
+        reporter: impl Fn(String) + Send + Sync + 'static,
+    ) -> Self {
+        self.failure_reporter = Arc::new(reporter);
+        self
     }
 
     async fn reserve(
@@ -701,7 +711,8 @@ impl<B> GovernedConnectionsBroker<B> {
             inert_manifest_digest: &orchestration.inert_manifest_digest,
             active_manifest_digest: &orchestration.active_manifest_digest,
         };
-        self.store
+        let reservation = self
+            .store
             .reserve_connection_operation(&ConnectionOperationReservationRequest {
                 operation_id,
                 operation_kind: operation.into(),
@@ -716,8 +727,14 @@ impl<B> GovernedConnectionsBroker<B> {
                 task,
             })
             .await
-            .map(|reservation| reservation.record)
-            .map_err(store_broker_error)
+            .map_err(store_broker_error)?;
+        for failure in reservation.failed_operations {
+            (self.failure_reporter)(connection_operation_category_log_line(
+                failure.operation_id,
+                failure.category,
+            ));
+        }
+        Ok(reservation.record)
     }
 
     async fn wait(
@@ -1269,13 +1286,17 @@ fn connection_operation_failure_log_line(
     failure: &ConnectionOperationFailure,
 ) -> String {
     if let Some(detail) = &failure.detail {
+        let code = detail
+            .code
+            .as_ref()
+            .map_or_else(|| "null".to_owned(), |code| json!(code).to_string());
         let reason = detail
             .reason
             .as_ref()
             .map_or_else(|| "null".to_owned(), |reason| json!(reason).to_string());
         format!(
-            "connection operation failed: operation_id={operation_id} category={} upstream_status={} detail={reason}",
-            failure.category, detail.status
+            "connection operation failed: operation_id={operation_id} category={} upstream_status={} code={code} detail={reason}",
+            failure.category, detail.status,
         )
     } else {
         format!(
@@ -1283,6 +1304,10 @@ fn connection_operation_failure_log_line(
             failure.category
         )
     }
+}
+
+fn connection_operation_category_log_line(operation_id: Uuid, category: &str) -> String {
+    format!("connection operation failed: operation_id={operation_id} category={category}")
 }
 
 fn connection_broker_error(
@@ -1308,6 +1333,7 @@ fn connection_broker_error(
             .map_or(ConnectionBrokerError::Unavailable, |detail| {
                 ConnectionBrokerError::GatewayHttp {
                     status: detail.status,
+                    code: detail.code,
                     reason: detail.reason,
                 }
             }),
@@ -1322,7 +1348,8 @@ mod finalized_connection_operation_tests {
     use uuid::Uuid;
 
     use super::{
-        ConnectionOperationFailure, connection_broker_error, connection_operation_failure,
+        ConnectionOperationFailure, connection_broker_error,
+        connection_operation_category_log_line, connection_operation_failure,
         connection_operation_failure_log_line, finalized_nonterminal_failure,
     };
 
@@ -1354,6 +1381,14 @@ mod finalized_connection_operation_tests {
                 "bridge_failed",
             ),
             None
+        );
+    }
+
+    #[test]
+    fn store_owned_failures_use_the_connection_failure_log_contract() {
+        assert_eq!(
+            connection_operation_category_log_line(Uuid::nil(), "superseded_by_mutation"),
+            "connection operation failed: operation_id=00000000-0000-0000-0000-000000000000 category=superseded_by_mutation"
         );
     }
 
@@ -1466,24 +1501,26 @@ mod finalized_connection_operation_tests {
         let failure = connection_operation_failure(
             Some("bridge-gateway-http"),
             Some(
-                b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 (OAuth redirect target is not allowed)\n",
+                b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 [code=oauth_redirect_target_not_allowed] (OAuth redirect target is not allowed)\n",
             ),
         );
         assert_eq!(failure.category, "bridge-gateway-http");
         let expected_detail = steward_adapter_mcp_gw::GithubBridgeFailureDiagnostic {
             status: 400,
+            code: Some("oauth_redirect_target_not_allowed".to_owned()),
             reason: Some("OAuth redirect target is not allowed".to_owned()),
         };
         assert_eq!(failure.detail, Some(expected_detail.clone()));
         let operation_id = Uuid::nil();
         assert_eq!(
             connection_operation_failure_log_line(operation_id, &failure),
-            "connection operation failed: operation_id=00000000-0000-0000-0000-000000000000 category=bridge-gateway-http upstream_status=400 detail=\"OAuth redirect target is not allowed\""
+            "connection operation failed: operation_id=00000000-0000-0000-0000-000000000000 category=bridge-gateway-http upstream_status=400 code=\"oauth_redirect_target_not_allowed\" detail=\"OAuth redirect target is not allowed\""
         );
         assert_eq!(
             connection_broker_error(Some(failure.category), Some(&expected_detail.to_value()),),
             crate::connections::ConnectionBrokerError::GatewayHttp {
                 status: 400,
+                code: Some("oauth_redirect_target_not_allowed".to_owned()),
                 reason: Some("OAuth redirect target is not allowed".to_owned()),
             }
         );

@@ -24,6 +24,9 @@ Bun.serve({
         Response.json([{ email: fixtureEmail, primary: true, verified: true }]),
       );
     }
+    if (request.method === "GET" && url.pathname === "/github/user") {
+      return withProviderToken(request, () => Response.json({ id: 12345, login: "alice" }));
+    }
     if (request.method === "DELETE" && url.pathname === "/github/revoke") {
       const body = (await request.json()) as { access_token?: string };
       return body.access_token === providerToken
