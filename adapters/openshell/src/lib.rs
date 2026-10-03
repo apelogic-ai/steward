@@ -2207,9 +2207,7 @@ impl SandboxRuntime for OpenShellRuntime {
         let refs = runtime_refs(&projection);
         match snapshot.phase {
             SandboxPhase::Ready => Ok(SandboxObservation::Running { refs }),
-            SandboxPhase::Error => Err(PortError::Failed {
-                reason: "sandbox entered an error phase".to_owned(),
-            }),
+            SandboxPhase::Error => Err(PortError::SandboxFailed),
             _ => Ok(SandboxObservation::Provisioning { refs }),
         }
     }

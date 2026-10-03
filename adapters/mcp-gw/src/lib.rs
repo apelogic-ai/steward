@@ -491,7 +491,7 @@ fn require_status(actual: StatusCode, expected: StatusCode, body: &[u8]) -> Resu
     } else if actual == StatusCode::UNAUTHORIZED {
         Err(failed("MCP-GW rejected runtime authentication"))
     } else if token_grant_failure(actual, body) {
-        Err(failed("MCP-GW token grant failed"))
+        Err(PortError::CredentialGrantFailed)
     } else if actual == StatusCode::FORBIDDEN {
         let proxy_denial = serde_json::from_slice::<Value>(body)
             .ok()
@@ -1422,9 +1422,7 @@ mod tests {
                 StatusCode::BAD_GATEWAY,
                 br#"{"error":"token_grant_failed","detail":"dynamic token grant failed"}"#,
             ),
-            Err(PortError::Failed {
-                reason: "MCP-GW token grant failed".to_owned(),
-            })
+            Err(PortError::CredentialGrantFailed)
         );
         assert_eq!(
             parse_response(

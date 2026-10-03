@@ -45,6 +45,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Fail every governed Task promptly when its exact current runtime reports a
+  terminal start failure, and refused to adopt a same-name runtime whose UID
+  differs from the Task's durable binding.
 - Distinguished the deliberate staged-orchestration boundary from a Connections
   service outage. Governed connection mutations now return
   `connections.orchestration_not_active`, the browser explains that activation

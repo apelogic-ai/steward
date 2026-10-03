@@ -136,6 +136,7 @@ struct AmbiguousKubernetes {
     fail_first_create_response: Arc<AtomicBool>,
     reject_create_with_unprocessable_entity: Arc<AtomicBool>,
     delete_preconditions: Arc<Mutex<Vec<String>>>,
+    replace_uid_after_update: Arc<AtomicBool>,
     replace_name_after_delete: Arc<AtomicBool>,
     admission: Arc<Mutex<Option<WebhookAdmissionHarness>>>,
     credential_secret: Arc<Mutex<Option<serde_json::Value>>>,
@@ -1066,9 +1067,7 @@ impl SandboxRuntime for AmbiguousTaskRuntime {
     async fn ensure(&self, request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
         self.ensures.fetch_add(1, Ordering::SeqCst);
         if self.fail_next_ensure.swap(false, Ordering::SeqCst) {
-            return Err(PortError::Failed {
-                reason: "sandbox entered an error phase".to_owned(),
-            });
+            return Err(PortError::SandboxFailed);
         }
         Ok(SandboxObservation::Running {
             refs: RuntimeRefs {
@@ -2915,6 +2914,229 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .finalized
     );
 
+    let replacement_task_uid = Uuid::new_v4();
+    let replacement_operation_id = Uuid::new_v4();
+    let replacement_runtime_name = format!("task-{}", replacement_operation_id.simple());
+    let replacement_inert_digest = manifest_digest_with_binding(
+        replacement_task_uid,
+        replacement_operation_id,
+        &replacement_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let replacement_active_digest = manifest_digest_with_binding(
+        replacement_task_uid,
+        replacement_operation_id,
+        &replacement_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    insert_task_projection_fixture(
+        &pool,
+        TaskProjectionFixture {
+            source_task_uid: task_uid,
+            task_uid: replacement_task_uid,
+            operation_id: replacement_operation_id,
+            idempotency_key: &format!("runtime-replacement-{suffix}"),
+            task_runtime_name: &replacement_runtime_name,
+            operation_runtime_name: &replacement_runtime_name,
+            inert_manifest_digest: &replacement_inert_digest,
+            active_manifest_digest: &replacement_active_digest,
+            direct_task_evidence: None,
+        },
+    )
+    .await?;
+    store
+        .put_task_inputs(
+            replacement_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"replacement task input",
+        )
+        .await?;
+    store
+        .request_task_execution(replacement_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-original".to_owned());
+    for _ in 0..8 {
+        let current = operation(&store, replacement_task_uid).await?;
+        if current.state == TaskOrchestrationState::ActivationPending
+            && current.activation_effect_authorized_at.is_some()
+        {
+            break;
+        }
+        reconcile_current(&client, &task_runtime, &store, replacement_task_uid).await?;
+    }
+    kubernetes
+        .replace_uid_after_update
+        .store(true, Ordering::SeqCst);
+    reconcile_current(&client, &task_runtime, &store, replacement_task_uid).await?;
+    assert_eq!(
+        operation(&store, replacement_task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending,
+        "a same-name runtime replacement must never satisfy activation"
+    );
+    assert_eq!(
+        store
+            .task(replacement_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .failure_reason
+            .as_deref(),
+        Some("observed_runtime_identity_changed")
+    );
+    for _ in 0..3 {
+        if store
+            .task(replacement_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .finalized
+        {
+            break;
+        }
+        reconcile_current(&client, &task_runtime, &store, replacement_task_uid).await?;
+    }
+    assert!(
+        store
+            .task(replacement_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .finalized
+    );
+    assert_eq!(
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .as_ref()
+            .and_then(|runtime| runtime.metadata.uid.as_deref()),
+        Some("runtime-uid-replacement"),
+        "cleanup must leave the unbound replacement runtime untouched"
+    );
+
+    *kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))? = None;
+    let failed_start_task_uid = Uuid::new_v4();
+    let failed_start_operation_id = Uuid::new_v4();
+    let failed_start_runtime_name = format!("task-{}", failed_start_operation_id.simple());
+    let failed_start_inert_digest = manifest_digest_with_binding(
+        failed_start_task_uid,
+        failed_start_operation_id,
+        &failed_start_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let failed_start_active_digest = manifest_digest_with_binding(
+        failed_start_task_uid,
+        failed_start_operation_id,
+        &failed_start_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    insert_task_projection_fixture(
+        &pool,
+        TaskProjectionFixture {
+            source_task_uid: task_uid,
+            task_uid: failed_start_task_uid,
+            operation_id: failed_start_operation_id,
+            idempotency_key: &format!("failed-runtime-start-{suffix}"),
+            task_runtime_name: &failed_start_runtime_name,
+            operation_runtime_name: &failed_start_runtime_name,
+            inert_manifest_digest: &failed_start_inert_digest,
+            active_manifest_digest: &failed_start_active_digest,
+            direct_task_evidence: None,
+        },
+    )
+    .await?;
+    store
+        .put_task_inputs(
+            failed_start_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"failed runtime start input",
+        )
+        .await?;
+    store
+        .request_task_execution(failed_start_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-failed-start".to_owned());
+    for _ in 0..8 {
+        let current = operation(&store, failed_start_task_uid).await?;
+        if current.state == TaskOrchestrationState::ActivationPending
+            && current.activation_effect_authorized_at.is_some()
+        {
+            break;
+        }
+        reconcile_current(&client, &task_runtime, &store, failed_start_task_uid).await?;
+    }
+    reconcile_current(&client, &task_runtime, &store, failed_start_task_uid).await?;
+    {
+        let mut runtime = kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?;
+        let runtime = runtime
+            .as_mut()
+            .ok_or_else(|| io::Error::other("failed-start runtime fixture is absent"))?;
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Failed,
+            observed_generation: runtime.metadata.generation.unwrap_or_default(),
+            spec_digest: runtime_spec_digest(&runtime.spec)?,
+            refs: RuntimeRefs::default(),
+            conditions: Vec::new(),
+            spend: None,
+        });
+    }
+    reconcile_current(&client, &task_runtime, &store, failed_start_task_uid).await?;
+    assert_eq!(
+        operation(&store, failed_start_task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending
+    );
+    assert_eq!(
+        store
+            .task(failed_start_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .failure_reason
+            .as_deref(),
+        Some("runtime_start_failed")
+    );
+    for _ in 0..4 {
+        if store
+            .task(failed_start_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .finalized
+        {
+            break;
+        }
+        reconcile_current(&client, &task_runtime, &store, failed_start_task_uid).await?;
+    }
+    let failed_start_task = store
+        .task(failed_start_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert!(failed_start_task.finalized);
+    assert_eq!(failed_start_task.phase, TaskPhase::Failed);
+    assert_eq!(
+        failed_start_task.failure_reason.as_deref(),
+        Some("runtime_start_failed")
+    );
+
     let successful_task_uid = Uuid::new_v4();
     let successful_operation_id = Uuid::new_v4();
     let successful_runtime_name = format!("task-{}", successful_operation_id.simple());
@@ -4163,6 +4385,11 @@ async fn kubernetes_request(
                 desired.metadata.generation = Some(2);
                 desired.status = current.status;
                 *stored = Some(desired.clone());
+                if state.replace_uid_after_update.swap(false, Ordering::SeqCst) {
+                    let replacement = stored.as_mut().unwrap_or_else(|| unreachable!());
+                    replacement.metadata.uid = Some("runtime-uid-replacement".to_owned());
+                    replacement.metadata.resource_version = Some("3".to_owned());
+                }
                 json_response(StatusCode::OK, serde_json::to_value(&desired))
             }
         }

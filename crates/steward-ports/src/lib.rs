@@ -101,6 +101,8 @@ pub enum PortError {
     Unsupported { operation: &'static str },
     Rejected { reason: String },
     Failed { reason: String },
+    SandboxFailed,
+    CredentialGrantFailed,
 }
 
 /// An untrusted workload assertion. Deliberately implements neither `Debug` nor `Display`.

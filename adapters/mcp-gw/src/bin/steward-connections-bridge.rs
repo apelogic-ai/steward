@@ -58,9 +58,7 @@ fn gateway_failure(error: &PortError) -> String {
         PortError::Failed { reason } if reason == "MCP-GW rejected runtime authentication" => {
             "bridge MCP-GW rejected runtime authentication".to_owned()
         }
-        PortError::Failed { reason } if reason == "MCP-GW token grant failed" => {
-            "bridge MCP-GW token grant failed".to_owned()
-        }
+        PortError::CredentialGrantFailed => "bridge MCP-GW token grant failed".to_owned(),
         PortError::Failed { reason } if reason == "MCP-GW rejected runtime authorization" => {
             "bridge MCP-GW rejected runtime authorization".to_owned()
         }
@@ -476,9 +474,7 @@ mod tests {
             "bridge OpenShell proxy denied provider request"
         );
         assert_eq!(
-            gateway_failure(&PortError::Failed {
-                reason: "MCP-GW token grant failed".to_owned(),
-            }),
+            gateway_failure(&PortError::CredentialGrantFailed),
             "bridge MCP-GW token grant failed"
         );
         assert_eq!(
