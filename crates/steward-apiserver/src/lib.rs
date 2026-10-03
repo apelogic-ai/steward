@@ -3537,8 +3537,8 @@ mod tests {
         WorkflowRevisionRecord,
     };
     use steward_types::direct_package::{
-        ExactGitCommit, RepositoryUrl, SourceProvenance, SourceProvider, StableProviderId,
-        TaskOrigin,
+        ClosureEntryKind, ExactGitCommit, RepositoryUrl, SourceProvenance, SourceProvider,
+        StableProviderId, TaskOrigin,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
@@ -10906,6 +10906,7 @@ mod tests {
                     "version": 1,
                     "runtime": { "agentRef": TEST_VERSIONED_AGENT },
                     "prompt": "prompt.md",
+                    "skills": ["skills/review/skill.json"],
                     "outputs": [{ "path": "out", "kind": "directory", "required": true }]
                 })
                 .to_string(),
@@ -10913,6 +10914,20 @@ mod tests {
             (
                 "prompt.md".to_owned(),
                 "Write hello to out/hello.txt.".to_owned(),
+            ),
+            (
+                "skills/review/skill.json".to_owned(),
+                serde_json::json!({
+                    "schemaVersion": "steward.instruction-skill/v1",
+                    "name": "review",
+                    "description": "Apply the repository review instructions.",
+                    "instructions": "instructions.md"
+                })
+                .to_string(),
+            ),
+            (
+                "skills/review/instructions.md".to_owned(),
+                "Report only facts supported by the repository.".to_owned(),
             ),
         ])
     }
@@ -11214,14 +11229,33 @@ mod tests {
             .await
             .map_err(|error| format!("submit inline request: {error}"))?;
         assert_eq!(inline_response.status(), StatusCode::ACCEPTED);
-        let inline_digest = inline_ledger
+        let inline_evidence = inline_ledger
             .tasks
             .lock()
             .map_err(|_| "fake inline Task ledger lock was poisoned")?
             .first()
             .and_then(|task| task.browser_task_evidence.as_ref())
-            .map(|evidence| evidence.closure_digest.clone())
+            .cloned()
             .ok_or_else(|| "inline Task omitted closure evidence".to_owned())?;
+        let inline_digest = inline_evidence.closure_digest.clone();
+        let inline_closure = inline_evidence
+            .closure
+            .as_ref()
+            .ok_or_else(|| "inline Task omitted its persisted closure".to_owned())?;
+        assert!(
+            inline_closure
+                .entries
+                .iter()
+                .any(|entry| entry.kind == ClosureEntryKind::InstructionSkill),
+            "the digest-equivalence proof must include an instruction skill"
+        );
+        assert!(
+            inline_closure
+                .entries
+                .iter()
+                .any(|entry| entry.kind == ClosureEntryKind::Instructions),
+            "the digest-equivalence proof must include instruction content"
+        );
 
         let repo_ledger = versioned_task_ledger_with_runtime_minutes()?;
         enable_inline_for_versioned_task_fixture(&repo_ledger, false)?;
