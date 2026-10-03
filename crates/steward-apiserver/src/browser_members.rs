@@ -7,10 +7,11 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_store::{
-    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
-    BrowserRbacAssignments, CanonicalUserRecord, FederatedSubjectAssociationMethod,
-    FederatedSubjectAuditAction, FederatedSubjectRecord, FederatedSubjectUnlink, PgStore,
-    StoreError,
+    BrowserMemberInvitation, BrowserMemberInvitationOutcome, BrowserMemberStateAction,
+    BrowserMemberStateChange, BrowserRbacAssignment, BrowserRbacAssignmentAction,
+    BrowserRbacAssignmentChange, BrowserRbacAssignments, CanonicalUserRecord,
+    FederatedSubjectAssociationMethod, FederatedSubjectAuditAction, FederatedSubjectRecord,
+    FederatedSubjectUnlink, PgStore, StoreError,
 };
 use steward_types::{CanonicalUserId, Email, OrganizationId};
 use uuid::Uuid;
@@ -88,7 +89,49 @@ pub struct BrowserMemberDetailResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateBrowserMemberBody {
+    pub emails: Vec<String>,
+    #[serde(default)]
+    pub administrator: bool,
+    #[serde(default)]
+    pub member_roles: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserMemberInvitationStatus {
+    Invited,
+    AlreadyMember,
+    Invalid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserMemberInvitationResult {
     pub email: String,
+    pub status: BrowserMemberInvitationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member: Option<BrowserMemberView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserMemberInvitationsResponse {
+    pub api_version: &'static str,
+    pub results: Vec<BrowserMemberInvitationResult>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserMemberStateRequestAction {
+    Disable,
+    Enable,
+    RevokeInvitation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChangeBrowserMemberStateBody {
+    pub action: BrowserMemberStateRequestAction,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
@@ -136,6 +179,10 @@ pub fn protected_router(store: PgStore, auth: BrowserAuthService) -> Router {
             .route(
                 "/admin/api/v1/members/{user_id}/roles",
                 post(change_member_role),
+            )
+            .route(
+                "/admin/api/v1/members/{user_id}/state",
+                post(change_member_state),
             )
             .route("/admin/api/v1/members/{user_id}", get(get_member))
             .route(
@@ -277,7 +324,7 @@ pub(crate) async fn get_member(
     params(("X-Steward-CSRF" = String, Header)),
     request_body = CreateBrowserMemberBody,
     responses(
-        (status = 200, body = BrowserMemberResponse),
+        (status = 200, body = BrowserMemberInvitationsResponse),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
         (status = 422, description = "Member email is invalid"),
@@ -291,10 +338,12 @@ pub(crate) async fn create_member(
     State(state): State<BrowserMembersState>,
     Json(body): Json<CreateBrowserMemberBody>,
 ) -> Response {
-    let email = match Email::parse(body.email) {
-        Ok(email) => email,
-        Err(_) => return error(StatusCode::UNPROCESSABLE_ENTITY, "member email is invalid"),
-    };
+    if body.emails.is_empty() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "at least one member email is required",
+        );
+    }
     let organization = match state
         .store
         .canonical_user(&authority.principal().canonical_user_id)
@@ -309,25 +358,143 @@ pub(crate) async fn create_member(
         }
         Err(error_value) => return store_error(error_value),
     };
+    let mut results = Vec::with_capacity(body.emails.len());
+    for raw_email in body.emails {
+        let email = match Email::parse(raw_email.clone()) {
+            Ok(email) => email,
+            Err(_) => {
+                results.push(BrowserMemberInvitationResult {
+                    email: raw_email,
+                    status: BrowserMemberInvitationStatus::Invalid,
+                    member: None,
+                });
+                continue;
+            }
+        };
+        let outcome = match state
+            .store
+            .invite_browser_member(BrowserMemberInvitation {
+                organization_id: &organization,
+                email: &email,
+                actor: authority.principal().canonical_user_id.as_str(),
+                administrator: body.administrator,
+                member_roles: &body.member_roles,
+            })
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error_value) => return store_error(error_value),
+        };
+        let (status, user) = match outcome {
+            BrowserMemberInvitationOutcome::Invited(user) => {
+                (BrowserMemberInvitationStatus::Invited, user)
+            }
+            BrowserMemberInvitationOutcome::AlreadyMember(user) => {
+                (BrowserMemberInvitationStatus::AlreadyMember, user)
+            }
+        };
+        let assignments = match state.store.browser_rbac_assignments(&user.user_id).await {
+            Ok(assignments) => assignments,
+            Err(error_value) => return store_error(error_value),
+        };
+        let identity_count = match state
+            .store
+            .federated_subjects_for_canonical_user(&user.user_id)
+            .await
+        {
+            Ok(identities) => identities.len(),
+            Err(error_value) => return store_error(error_value),
+        };
+        results.push(BrowserMemberInvitationResult {
+            email: email.as_str().to_owned(),
+            status,
+            member: Some(member_view(user, assignments, identity_count)),
+        });
+    }
+    Json(BrowserMemberInvitationsResponse {
+        api_version: BROWSER_MEMBERS_API_VERSION,
+        results,
+    })
+    .into_response()
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "changeAdminMemberState",
+    path = "/admin/api/v1/members/{user_id}/state",
+    params(("user_id" = String, Path), ("X-Steward-CSRF" = String, Header)),
+    request_body = ChangeBrowserMemberStateBody,
+    responses(
+        (status = 200, body = BrowserMemberResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
+        (status = 404, description = "Member was not found"),
+        (status = 409, description = "The member state changed, or self/last-administrator protection applied"),
+        (status = 422, description = "State change is invalid"),
+        (status = 503, description = "Member records are unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn change_member_state(
+    Extension(authority): Extension<BrowserAdminAuthority>,
+    Extension(_proof): Extension<BrowserMutationProof>,
+    State(state): State<BrowserMembersState>,
+    Path(user_id): Path<String>,
+    Json(body): Json<ChangeBrowserMemberStateBody>,
+) -> Response {
+    let user_id = match CanonicalUserId::parse(user_id) {
+        Ok(user_id) => user_id,
+        Err(_) => return error(StatusCode::NOT_FOUND, "member was not found"),
+    };
+    let organization = match administrator_organization(&state.store, &authority).await {
+        Ok(organization) => organization,
+        Err(response) => return response,
+    };
+    match state.store.canonical_user(&user_id).await {
+        Ok(Some(user)) if user.organization_id == organization => {}
+        Ok(Some(_)) | Ok(None) => return error(StatusCode::NOT_FOUND, "member was not found"),
+        Err(error_value) => return store_error(error_value),
+    }
+    let action = match body.action {
+        BrowserMemberStateRequestAction::Disable => BrowserMemberStateAction::Disable,
+        BrowserMemberStateRequestAction::Enable => BrowserMemberStateAction::Enable,
+        BrowserMemberStateRequestAction::RevokeInvitation => {
+            BrowserMemberStateAction::RevokeInvitation
+        }
+    };
     let user = match state
         .store
-        .preprovision_canonical_user(
-            &organization,
-            &email,
-            authority.principal().canonical_user_id.as_str(),
-        )
+        .change_browser_member_state(BrowserMemberStateChange {
+            user_id: &user_id,
+            action,
+            actor: &authority.principal().canonical_user_id,
+        })
         .await
     {
         Ok(user) => user,
         Err(error_value) => return store_error(error_value),
     };
-    let assignments = match state.store.browser_rbac_assignments(&user.user_id).await {
+    if state.auth.revoke_canonical_user_sessions(&user_id).is_err() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "member state changed but session revocation is unavailable",
+        );
+    }
+    let assignments = match state.store.browser_rbac_assignments(&user_id).await {
         Ok(assignments) => assignments,
+        Err(error_value) => return store_error(error_value),
+    };
+    let identity_count = match state
+        .store
+        .federated_subjects_for_canonical_user(&user_id)
+        .await
+    {
+        Ok(identities) => identities.len(),
         Err(error_value) => return store_error(error_value),
     };
     Json(BrowserMemberResponse {
         api_version: BROWSER_MEMBERS_API_VERSION,
-        member: member_view(user, assignments, 0),
+        member: member_view(user, assignments, identity_count),
     })
     .into_response()
 }
@@ -620,6 +787,12 @@ fn store_error(error_value: StoreError) -> Response {
             StatusCode::CONFLICT,
             "the last active administrator cannot be revoked",
         ),
+        StoreError::CanonicalIdentityTransitionConflict | StoreError::SelfBrowserMemberMutation => {
+            (
+                StatusCode::CONFLICT,
+                "member state changed or the requested transition is protected",
+            )
+        }
         StoreError::Database(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "member records are unavailable",

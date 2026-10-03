@@ -1001,6 +1001,31 @@ async function guardedPage(browser, {
       await json(route, { apiVersion: "steward.browser-members/v1", members: emptyCollections ? [] : members });
       return;
     }
+    if (request.method() === "POST" && pathname === "/admin/api/v1/members") {
+      const body = request.postDataJSON();
+      mutations.push({ path: pathname, headers: await request.allHeaders(), body });
+      const results = body.emails.map((email, index) => {
+        if (!email.includes(String.fromCharCode(64))) return { email, status: "invalid" };
+        const existing = members.find((candidate) => candidate.displayEmail.toLowerCase() === email.toLowerCase());
+        if (existing) return { email, status: "already_member", member: existing };
+        const member = {
+          userId: `usr_${String(index + 1).repeat(32)}`,
+          displayEmail: email,
+          displayName: null,
+          state: "pending",
+          administrator: body.administrator,
+          memberRoles: body.memberRoles,
+          createdAt: "2026-08-24T19:00:00Z",
+          lastSignInAt: null,
+          invitedBy: administratorSession.principal.displayEmail,
+          identityCount: 0,
+        };
+        members.push(member);
+        return { email, status: "invited", member };
+      });
+      await json(route, { apiVersion: "steward.browser-members/v1", results });
+      return;
+    }
     const userId = decodeURIComponent(parts[4] ?? "");
     const member = members.find((candidate) => candidate.userId === userId);
     if (!member) {
@@ -1034,6 +1059,12 @@ async function guardedPage(browser, {
       if (body.kind === "administrator") member.administrator = body.action === "grant";
       else if (body.action === "grant" && !member.memberRoles.includes(body.memberRole)) member.memberRoles.push(body.memberRole);
       else if (body.action === "revoke") member.memberRoles = member.memberRoles.filter((role) => role !== body.memberRole);
+      await json(route, { apiVersion: "steward.browser-members/v1", member });
+      return;
+    }
+    if (pathname.endsWith("/state")) {
+      const body = request.postDataJSON();
+      member.state = body.action === "disable" ? "disabled" : body.action === "enable" ? "active" : "revoked";
       await json(route, { apiVersion: "steward.browser-members/v1", member });
       return;
     }
@@ -1080,6 +1111,18 @@ async function guardedPage(browser, {
       subject.linkedAt = "2026-08-24T18:00:00Z";
       subject.linkedBy = administratorSession.principal.displayEmail;
       member.identityCount += 1;
+      await json(route, { apiVersion: "steward.browser-admin/v1", federatedSubject: subject });
+      return;
+    }
+    if (pathname.endsWith("/disable")) {
+      const subjectId = pathname.split("/").at(-2);
+      const subject = federatedSubjects.find((candidate) => candidate.subjectId === subjectId);
+      if (!subject) {
+        await json(route, { error: "identity was not found" }, 404);
+        return;
+      }
+      subject.state = "disabled";
+      subject.revision += 1;
       await json(route, { apiVersion: "steward.browser-admin/v1", federatedSubject: subject });
       return;
     }
@@ -1480,6 +1523,42 @@ test("administrators filter members and manage one member through the detail bou
     await administrator.page.goto(`${origin}/admin/members/${administratorSession.principal.userId}`);
     await expect(administrator.page.getByRole("switch", { name: "Administrator access on" })).toBeDisabled();
     await expect(administrator.page.getByText("You can't remove your own administrator access.")).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrators invite members and govern the member lifecycle", async ({ browser }) => {
+  const administrator = await guardedPage(browser, { session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/members`);
+    await administrator.page.getByRole("button", { name: "Invite people" }).click();
+    await administrator.page.getByRole("textbox", { name: "Email addresses" }).fill("erin@example.com, invalid");
+    await administrator.page.getByRole("combobox", { name: "Access" }).selectOption("administrator");
+    const roles = administrator.page.getByRole("combobox", { name: "Member roles" });
+    await roles.fill("developer");
+    await roles.press("Enter");
+    await administrator.page.getByRole("button", { name: "Send invites" }).click();
+    await expect(administrator.page.getByText("invalid · invalid")).toBeVisible();
+    const invite = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/members");
+    expect(invite.body).toEqual({ administrator: true, emails: ["erin@example.com", "invalid"], memberRoles: ["developer"] });
+
+    await administrator.page.goto(`${origin}/admin/members/usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`);
+    await administrator.page.getByRole("button", { name: "Disable member" }).click();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Disable member" }).click();
+    await expect(administrator.page.getByText("Disabled", { exact: true })).toBeVisible();
+    await administrator.page.getByRole("button", { name: "Enable member" }).click();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Enable member" }).click();
+    await expect(administrator.page.getByText("Active", { exact: true })).toBeVisible();
+
+    await administrator.page.getByRole("button", { name: "Disable identity" }).click();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Disable identity" }).click();
+    await expect(administrator.page.getByText("No linked identities.")).toBeVisible();
+
+    await administrator.page.goto(`${origin}/admin/members/usr_cccccccccccccccccccccccccccccccc`);
+    await administrator.page.getByRole("button", { name: "Revoke invitation" }).click();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Revoke invitation" }).click();
+    await expect(administrator.page.getByText("Revoked", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }

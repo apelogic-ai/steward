@@ -456,10 +456,25 @@ export type BrowserMemberIdentityView = {
     subjectId: string;
 };
 
+export type BrowserMemberInvitationResult = {
+    email: string;
+    member?: null | BrowserMemberView;
+    status: BrowserMemberInvitationStatus;
+};
+
+export type BrowserMemberInvitationStatus = 'invited' | 'already_member' | 'invalid';
+
+export type BrowserMemberInvitationsResponse = {
+    apiVersion: string;
+    results: Array<BrowserMemberInvitationResult>;
+};
+
 export type BrowserMemberResponse = {
     apiVersion: string;
     member: BrowserMemberView;
 };
+
+export type BrowserMemberStateRequestAction = 'disable' | 'enable' | 'revoke_invitation';
 
 export type BrowserMemberView = {
     administrator: boolean;
@@ -740,6 +755,10 @@ export type ChangeBrowserMemberRoleBody = {
     memberRole?: string | null;
 };
 
+export type ChangeBrowserMemberStateBody = {
+    action: BrowserMemberStateRequestAction;
+};
+
 export type ClosureEntry = {
     digest: ContentDigest;
     kind: ClosureEntryKind;
@@ -793,7 +812,9 @@ export type ConnectionsCollectionResponse = {
 export type ContentDigest = string;
 
 export type CreateBrowserMemberBody = {
-    email: string;
+    administrator?: boolean;
+    emails: Array<string>;
+    memberRoles?: Array<string>;
 };
 
 export type CreateEnvelopeRequestBody = {
@@ -2658,7 +2679,7 @@ export type CreateAdminMemberErrors = {
 };
 
 export type CreateAdminMemberResponses = {
-    200: BrowserMemberResponse;
+    200: BrowserMemberInvitationsResponse;
 };
 
 export type CreateAdminMemberResponse = CreateAdminMemberResponses[keyof CreateAdminMemberResponses];
@@ -2790,6 +2811,51 @@ export type ChangeAdminMemberRoleResponses = {
 };
 
 export type ChangeAdminMemberRoleResponse = ChangeAdminMemberRoleResponses[keyof ChangeAdminMemberRoleResponses];
+
+export type ChangeAdminMemberStateData = {
+    body: ChangeBrowserMemberStateBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        user_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/members/{user_id}/state';
+};
+
+export type ChangeAdminMemberStateErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Member was not found
+     */
+    404: unknown;
+    /**
+     * The member state changed, or self/last-administrator protection applied
+     */
+    409: unknown;
+    /**
+     * State change is invalid
+     */
+    422: unknown;
+    /**
+     * Member records are unavailable
+     */
+    503: unknown;
+};
+
+export type ChangeAdminMemberStateResponses = {
+    200: BrowserMemberResponse;
+};
+
+export type ChangeAdminMemberStateResponse = ChangeAdminMemberStateResponses[keyof ChangeAdminMemberStateResponses];
 
 export type ListAdminRequestsData = {
     body?: never;

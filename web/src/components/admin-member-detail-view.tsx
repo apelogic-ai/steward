@@ -6,6 +6,8 @@ import { useCallback, useMemo, useState } from "react";
 import {
   associateAdminFederatedSubject,
   changeAdminMemberRole,
+  changeAdminMemberState,
+  disableAdminFederatedSubject,
   getAdminMember,
   listAdminEnvelopeTemplates,
   listAdminFederatedSubjects,
@@ -28,7 +30,9 @@ type MemberDetailData = {
 
 type Confirmation =
   | { kind: "administrator"; action: BrowserMemberAssignmentAction }
+  | { kind: "state"; action: "disable" | "enable" | "revoke_invitation" }
   | { kind: "unlink"; subjectId: string; revision: number; label: string }
+  | { kind: "disable_identity"; subjectId: string; revision: number; label: string }
   | { kind: "link"; subject: BrowserFederatedSubjectView }
   | null;
 
@@ -151,6 +155,21 @@ function MemberDetail({ csrf, currentUserId, data, onChanged }: Readonly<{
         onChanged();
         return;
       }
+    } else if (confirmation.kind === "state") {
+      const result = await changeAdminMemberState({
+        body: { action: confirmation.action },
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "X-Steward-CSRF": csrf },
+        path: { user_id: member.userId },
+      });
+      response = result.response;
+      if (result.data && response?.ok) {
+        setConfirmation(null);
+        setBusy(false);
+        onChanged();
+        return;
+      }
     } else if (confirmation.kind === "unlink") {
       const result = await unlinkAdminMemberIdentity({
         body: { expectedRevision: confirmation.revision },
@@ -161,6 +180,21 @@ function MemberDetail({ csrf, currentUserId, data, onChanged }: Readonly<{
       });
       response = result.response;
       if (response?.ok) {
+        setConfirmation(null);
+        setBusy(false);
+        onChanged();
+        return;
+      }
+    } else if (confirmation.kind === "disable_identity") {
+      const result = await disableAdminFederatedSubject({
+        body: { expectedRevision: confirmation.revision, reason: "disabled from member administration" },
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "X-Steward-CSRF": csrf },
+        path: { subject_id: confirmation.subjectId },
+      });
+      response = result.response;
+      if (result.data && response?.ok) {
         setConfirmation(null);
         setBusy(false);
         onChanged();
@@ -194,15 +228,27 @@ function MemberDetail({ csrf, currentUserId, data, onChanged }: Readonly<{
   const dialog = confirmation ? {
     confirmLabel: confirmation.kind === "administrator"
       ? grantAdmin ? "Grant administrator" : "Remove administrator"
-      : confirmation.kind === "unlink" ? "Unlink identity" : "Link identity",
+      : confirmation.kind === "state"
+        ? confirmation.action === "enable" ? "Enable member" : confirmation.action === "disable" ? "Disable member" : "Revoke invitation"
+        : confirmation.kind === "unlink" ? "Unlink identity" : confirmation.kind === "disable_identity" ? "Disable identity" : "Link identity",
     description: confirmation.kind === "administrator"
       ? `${grantAdmin ? "Grant" : "Remove"} organization administrator access for ${member.displayEmail}?`
+      : confirmation.kind === "state"
+        ? confirmation.action === "enable"
+          ? `Restore sign-in access for ${member.displayEmail}?`
+          : confirmation.action === "disable"
+            ? `Disable ${member.displayEmail} and revoke every active browser session?`
+            : `Revoke the pending invitation for ${member.displayEmail}? A later invitation will create a new pending membership.`
       : confirmation.kind === "unlink"
         ? `Unlink ${confirmation.label} from ${member.displayEmail}? The observed identity will remain available for a verified reassociation.`
+        : confirmation.kind === "disable_identity"
+          ? `Permanently disable ${confirmation.label}? It cannot authenticate or be reassociated until an administrator explicitly restores it.`
         : `Link ${confirmation.subject.subject} to ${member.displayEmail}? Do this only after verifying the identity owner.`,
     title: confirmation.kind === "administrator"
       ? `${grantAdmin ? "Grant" : "Remove"} administrator access?`
-      : confirmation.kind === "unlink" ? "Unlink this identity?" : "Link this identity?",
+      : confirmation.kind === "state"
+        ? confirmation.action === "enable" ? "Enable this member?" : confirmation.action === "disable" ? "Disable this member?" : "Revoke this invitation?"
+        : confirmation.kind === "unlink" ? "Unlink this identity?" : confirmation.kind === "disable_identity" ? "Disable this identity?" : "Link this identity?",
     tone: confirmation.kind === "link" || grantAdmin ? "primary" as const : "danger" as const,
   } : null;
 
@@ -215,6 +261,11 @@ function MemberDetail({ csrf, currentUserId, data, onChanged }: Readonly<{
           <div className="flex flex-wrap items-center gap-2.5"><h1 className="text-[28px] font-semibold leading-[34px] tracking-[-0.02em]" id="page-title">{displayName(member)}</h1><MemberStatus state={member.state} /></div>
           <p className="text-sm text-muted-ink">{member.displayEmail} · {member.state === "pending" ? `Invited ${relativeDate(member.createdAt)}${member.invitedBy ? ` by ${member.invitedBy}` : ""}` : `Member since ${relativeDate(member.createdAt)}`}</p>
           <div className="font-mono text-[13px] text-faint-ink">{member.userId}</div>
+        </div>
+        <div className="ml-auto">
+          {member.state === "active" ? <button className="h-9 rounded-control border border-err px-3 text-sm font-semibold text-err disabled:cursor-not-allowed disabled:opacity-40" disabled={busy || self} onClick={() => setConfirmation({ kind: "state", action: "disable" })} title={self ? "You can't disable your own membership." : undefined} type="button">Disable member</button> : null}
+          {member.state === "disabled" ? <button className="h-9 rounded-control border px-3 text-sm font-semibold" disabled={busy} onClick={() => setConfirmation({ kind: "state", action: "enable" })} type="button">Enable member</button> : null}
+          {member.state === "pending" ? <button className="h-9 rounded-control border border-err px-3 text-sm font-semibold text-err" disabled={busy} onClick={() => setConfirmation({ kind: "state", action: "revoke_invitation" })} type="button">Revoke invitation</button> : null}
         </div>
       </header>
 
@@ -248,7 +299,7 @@ function MemberDetail({ csrf, currentUserId, data, onChanged }: Readonly<{
           <div className="space-y-2.5">
             {member.identities.map((identity) => <div className="flex items-center gap-3 rounded-[10px] border px-3.5 py-3" key={identity.subjectId}>
               <div className="min-w-0 flex-1 space-y-0.5"><p className="truncate font-mono text-[15px] font-semibold">{identity.subject}</p><p className="truncate font-mono text-[13px] text-muted-ink">{identity.issuer}</p><p className="text-xs text-faint-ink">Linked {relativeDate(identity.linkedAt)} by {identity.linkedBy}</p></div>
-              <button className="h-9 shrink-0 rounded-control border border-err px-3 text-[13px] font-semibold text-err disabled:opacity-50" disabled={busy} onClick={() => setConfirmation({ kind: "unlink", label: identity.subject, revision: identity.revision, subjectId: identity.subjectId })} type="button">Unlink</button>
+              <div className="flex shrink-0 gap-2"><button className="h-9 rounded-control border px-3 text-[13px] font-semibold disabled:opacity-50" disabled={busy} onClick={() => setConfirmation({ kind: "unlink", label: identity.subject, revision: identity.revision, subjectId: identity.subjectId })} type="button">Unlink</button><button className="h-9 rounded-control border border-err px-3 text-[13px] font-semibold text-err disabled:opacity-50" disabled={busy} onClick={() => setConfirmation({ kind: "disable_identity", label: identity.subject, revision: identity.revision, subjectId: identity.subjectId })} type="button">Disable identity</button></div>
             </div>)}
             {member.identities.length === 0 ? <p className="text-sm text-muted-ink">No linked identities.</p> : null}
             {showIdentityPicker ? <div className="flex flex-wrap gap-2 rounded-[10px] bg-subtle p-3">

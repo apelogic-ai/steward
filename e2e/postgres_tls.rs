@@ -21,10 +21,11 @@ use steward_apiserver::governed_connections::{
     DirectConnectionStatusConfig, DirectConnectionStatusReader, SplitConnectionsBroker,
 };
 use steward_store::{
-    BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
-    FederatedSubjectAssociation, FederatedSubjectAssociationMethod, FederatedSubjectAuditAction,
-    FederatedSubjectDisable, FederatedSubjectObservation, FederatedSubjectState,
-    FederatedSubjectUnlink, PgStore, StoreError,
+    BrowserMemberInvitation, BrowserMemberInvitationOutcome, BrowserMemberStateAction,
+    BrowserMemberStateChange, BrowserRbacAssignment, BrowserRbacAssignmentAction,
+    BrowserRbacAssignmentChange, FederatedSubjectAssociation, FederatedSubjectAssociationMethod,
+    FederatedSubjectAuditAction, FederatedSubjectDisable, FederatedSubjectObservation,
+    FederatedSubjectState, FederatedSubjectUnlink, PgStore, StoreError,
 };
 use steward_types::direct_package::SourceProvenance;
 use steward_types::{
@@ -237,6 +238,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     verify_federated_subject_lifecycle(&store).await?;
     verify_direct_connection_auto_association(&store).await?;
     verify_pending_member_identity_state(&store).await?;
+    verify_browser_member_invitation_lifecycle(&store).await?;
 
     let tls_active =
         sqlx::query_scalar::<_, bool>("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
@@ -431,6 +433,154 @@ async fn verify_pending_member_identity_state(store: &PgStore) -> Result<(), Box
             .await,
         Err(StoreError::LastBrowserAdministrator)
     ));
+    Ok(())
+}
+
+async fn verify_browser_member_invitation_lifecycle(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let organization_id = OrganizationId::parse("org_team-a")?;
+    let email = Email::parse("alice@example.org")?;
+    let roles = vec!["engineer".to_owned()];
+    let outcome = store
+        .invite_browser_member(BrowserMemberInvitation {
+            organization_id: &organization_id,
+            email: &email,
+            actor: "usr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            administrator: true,
+            member_roles: &roles,
+        })
+        .await?;
+    let pending = match outcome {
+        BrowserMemberInvitationOutcome::Invited(user) => user,
+        BrowserMemberInvitationOutcome::AlreadyMember(_) => {
+            return Err(io::Error::other("fresh member was not invited").into());
+        }
+    };
+    let assignments = store.browser_rbac_assignments(&pending.user_id).await?;
+    assert!(assignments.is_admin);
+    assert_eq!(assignments.member_roles, roles);
+    assert!(matches!(
+        store
+            .invite_browser_member(BrowserMemberInvitation {
+                organization_id: &organization_id,
+                email: &email,
+                actor: "usr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                administrator: false,
+                member_roles: &[],
+            })
+            .await?,
+        BrowserMemberInvitationOutcome::AlreadyMember(_)
+    ));
+
+    let identity = OrganizationIdentityPolicy::new(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "example.org",
+        organization_id.clone(),
+    )?
+    .validate(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "member-lifecycle-subject",
+        "example.org",
+        email.as_str(),
+        true,
+    )?;
+    let active = store
+        .register_canonical_identity(&identity, "browser-oidc")
+        .await?;
+    assert_eq!(active.user_id, pending.user_id);
+    assert!(matches!(
+        store
+            .change_browser_member_state(BrowserMemberStateChange {
+                user_id: &active.user_id,
+                action: BrowserMemberStateAction::Disable,
+                actor: &active.user_id,
+            })
+            .await,
+        Err(StoreError::SelfBrowserMemberMutation)
+    ));
+    let other_actor = CanonicalUserId::parse("usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")?;
+    assert!(matches!(
+        store
+            .change_browser_member_state(BrowserMemberStateChange {
+                user_id: &active.user_id,
+                action: BrowserMemberStateAction::Disable,
+                actor: &other_actor,
+            })
+            .await,
+        Err(StoreError::LastBrowserAdministrator)
+    ));
+
+    let invite_email = Email::parse("bob@example.org")?;
+    let first_invitation = match store
+        .invite_browser_member(BrowserMemberInvitation {
+            organization_id: &organization_id,
+            email: &invite_email,
+            actor: active.user_id.as_str(),
+            administrator: false,
+            member_roles: &[],
+        })
+        .await?
+    {
+        BrowserMemberInvitationOutcome::Invited(user) => user,
+        BrowserMemberInvitationOutcome::AlreadyMember(_) => {
+            return Err(io::Error::other("fresh pending invitation already existed").into());
+        }
+    };
+    let revoked = store
+        .change_browser_member_state(BrowserMemberStateChange {
+            user_id: &first_invitation.user_id,
+            action: BrowserMemberStateAction::RevokeInvitation,
+            actor: &active.user_id,
+        })
+        .await?;
+    assert_eq!(revoked.state, "revoked");
+    let reinvited = match store
+        .invite_browser_member(BrowserMemberInvitation {
+            organization_id: &organization_id,
+            email: &invite_email,
+            actor: active.user_id.as_str(),
+            administrator: false,
+            member_roles: &[],
+        })
+        .await?
+    {
+        BrowserMemberInvitationOutcome::Invited(user) => user,
+        BrowserMemberInvitationOutcome::AlreadyMember(_) => {
+            return Err(io::Error::other("revoked invitation blocked reinvitation").into());
+        }
+    };
+    assert_ne!(reinvited.user_id, first_invitation.user_id);
+
+    let second_identity = OrganizationIdentityPolicy::new(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "example.org",
+        organization_id,
+    )?
+    .validate(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "reinvited-member-subject",
+        "example.org",
+        invite_email.as_str(),
+        true,
+    )?;
+    let second_active = store
+        .register_canonical_identity(&second_identity, "browser-oidc")
+        .await?;
+    let disabled = store
+        .change_browser_member_state(BrowserMemberStateChange {
+            user_id: &second_active.user_id,
+            action: BrowserMemberStateAction::Disable,
+            actor: &active.user_id,
+        })
+        .await?;
+    assert_eq!(disabled.state, "disabled");
+    let enabled = store
+        .change_browser_member_state(BrowserMemberStateChange {
+            user_id: &second_active.user_id,
+            action: BrowserMemberStateAction::Enable,
+            actor: &active.user_id,
+        })
+        .await?;
+    assert_eq!(enabled.state, "active");
     Ok(())
 }
 

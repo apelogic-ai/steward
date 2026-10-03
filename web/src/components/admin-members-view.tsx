@@ -3,17 +3,28 @@
 import Link from "next/link";
 import { useCallback, useMemo, useState } from "react";
 
-import { listAdminMembers, type BrowserMemberView } from "@/api-client";
+import { createAdminMember, listAdminEnvelopeTemplates, listAdminMembers, type BrowserMemberInvitationResult, type BrowserMemberView } from "@/api-client";
+import { TagSelect, type TagSelectOption } from "@/components/hs";
 import { EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
 type MemberFilter = "all" | "active" | "pending" | "disabled";
 
-async function loadMembers(): Promise<{ data?: Array<BrowserMemberView>; response?: Response }> {
-  const result = await listAdminMembers({ cache: "no-store", credentials: "same-origin" });
-  if (!result.data || !result.response?.ok) return { response: result.response };
-  return { data: result.data.members, response: result.response };
+type MembersData = { members: Array<BrowserMemberView>; roleOptions: Array<string> };
+
+async function loadMembers(refresh: number): Promise<{ data?: MembersData; response?: Response }> {
+  void refresh;
+  const [members, templates] = await Promise.all([
+    listAdminMembers({ cache: "no-store", credentials: "same-origin" }),
+    listAdminEnvelopeTemplates({ cache: "no-store", credentials: "same-origin" }),
+  ]);
+  if (!members.data || !members.response?.ok) return { response: members.response };
+  if (!templates.data || !templates.response?.ok) return { response: templates.response };
+  return { data: {
+    members: members.data.members,
+    roleOptions: [...new Set(templates.data.templates.flatMap((template) => template.memberRoles))].sort(),
+  }, response: members.response };
 }
 
 function displayName(member: BrowserMemberView): string {
@@ -44,7 +55,9 @@ function relativeDate(value: string | null | undefined): string {
 
 export function AdminMembersView() {
   const session = useSession();
-  const load = useCallback(() => loadMembers(), []);
+  const [refresh, setRefresh] = useState(0);
+  const [inviting, setInviting] = useState(false);
+  const load = useCallback(() => loadMembers(refresh), [refresh]);
   const state = useApiResource(load);
 
   if (session.status !== "authenticated") {
@@ -53,12 +66,55 @@ export function AdminMembersView() {
   return (
     <section aria-labelledby="page-title" className="space-y-5">
       <PageHeader
+        actions={<button className="h-10 rounded-control bg-brand px-4 text-sm font-semibold text-on-brand" onClick={() => setInviting(true)} type="button">Invite people</button>}
         description="People who can sign in to this organization, their access, and the member roles that decide which templates they can request."
         title="Members"
       />
-      <ResourceBoundary state={state}>{(members) => <MembersTable members={members} />}</ResourceBoundary>
+      <ResourceBoundary state={state}>{(data) => <>
+        {inviting ? <InvitePanel csrf={session.value.csrf} onCancel={() => setInviting(false)} onInvited={() => { setInviting(false); setRefresh((value) => value + 1); }} roleOptions={data.roleOptions} /> : null}
+        <MembersTable members={data.members} />
+      </>}</ResourceBoundary>
     </section>
   );
+}
+
+function InvitePanel({ csrf, onCancel, onInvited, roleOptions }: Readonly<{ csrf: string; onCancel: () => void; onInvited: () => void; roleOptions: Array<string> }>) {
+  const [emails, setEmails] = useState("");
+  const [administrator, setAdministrator] = useState(false);
+  const [memberRoles, setMemberRoles] = useState<Array<string>>([]);
+  const [pending, setPending] = useState(false);
+  const [results, setResults] = useState<Array<BrowserMemberInvitationResult>>([]);
+  const [message, setMessage] = useState<string | null>(null);
+  const options = roleOptions.map<TagSelectOption>((role) => ({ key: role, kind: "neutral", label: role }));
+
+  async function submit() {
+    const parsed = emails.split(",").map((email) => email.trim()).filter(Boolean);
+    setPending(true);
+    setMessage(null);
+    const result = await createAdminMember({
+      body: { administrator, emails: parsed, memberRoles },
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "X-Steward-CSRF": csrf },
+    });
+    setPending(false);
+    if (!result.data || !result.response?.ok) {
+      setMessage("Invitations could not be recorded.");
+      return;
+    }
+    setResults(result.data.results);
+    if (result.data.results.every((entry) => entry.status !== "invalid")) onInvited();
+  }
+
+  return <div className="space-y-4 rounded-panel border bg-panel p-5">
+    <div><h2 className="text-lg font-semibold">Invite people</h2><p className="mt-1 text-sm text-muted-ink">Reserve members by their verified organization email.</p></div>
+    <label className="block space-y-1.5 text-sm font-semibold">Email addresses<textarea aria-label="Email addresses" className="min-h-24 w-full rounded-control border bg-panel px-3 py-2 font-normal" onChange={(event) => setEmails(event.target.value)} placeholder="alice@example.com, bob@example.org" value={emails} /></label>
+    <label className="block space-y-1.5 text-sm font-semibold">Access<select aria-label="Access" className="block h-10 w-full rounded-control border bg-panel px-3 font-normal" onChange={(event) => setAdministrator(event.target.value === "administrator")} value={administrator ? "administrator" : "member"}><option value="member">Member</option><option value="administrator">Administrator</option></select></label>
+    <div className="space-y-1.5"><TagSelect addPlaceholder="Add a role…" emptyPlaceholder="Search roles…" label="Member roles" onChange={setMemberRoles} options={options} value={memberRoles} /><p className="text-xs text-muted-ink">Without a role, the member can sign in but can&apos;t request an envelope.</p></div>
+    {results.length > 0 ? <ul className="space-y-1 text-sm">{results.map((entry) => <li key={entry.email}><span className="font-mono">{entry.email}</span> · {entry.status.replaceAll("_", " ")}</li>)}</ul> : null}
+    {message ? <p className="text-sm text-err" role="alert">{message}</p> : null}
+    <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4"><p className="text-xs text-muted-ink">Invitees become active after their first verified organization sign-in.</p><div className="flex gap-2"><button className="h-9 rounded-control border px-3 text-sm font-semibold" disabled={pending} onClick={onCancel} type="button">Cancel</button><button className="h-9 rounded-control bg-brand px-3 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={pending || emails.trim().length === 0} onClick={() => void submit()} type="button">{pending ? "Sending…" : "Send invites"}</button></div></div>
+  </div>;
 }
 
 function MembersTable({ members }: Readonly<{ members: Array<BrowserMemberView> }>) {
