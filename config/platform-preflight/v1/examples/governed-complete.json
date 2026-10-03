@@ -1,6 +1,7 @@
 {
   "schemaVersion": "steward.platform-input/v1",
   "namespaces": {"steward": "steward-system", "runtime": "steward-system", "providers": "steward-system", "gateway": "gateway-system", "arc": "arc-system", "databaseTls": "steward-system", "mcpGateway": "steward-system", "litellm": "steward-system", "identityExchange": "steward-system", "openshell": "steward-system", "dns": "kube-system"},
+  "spire": {"className": "spire-spire"},
   "deploymentLock": {
     "schemaVersion": "steward.deployment-lock/v1",
     "release": {"version": "0.2.2", "commit": "1111111111111111111111111111111111111111"},

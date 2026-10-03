@@ -547,6 +547,8 @@ class PlatformPreflightTests(unittest.TestCase):
                 "steward.connections.github/v2",
             )
             self.assertEqual(values["connectionsBridge"]["mcpGatewayVersion"], "")
+            self.assertEqual(values["spire"]["className"], "spire-spire")
+            self.assertEqual(values["spire"]["sandboxRegistration"], {"enabled": True})
 
             flux = (output / "flux-values-configmap.yaml").read_text(encoding="utf-8")
             flux_lines = flux.splitlines()
@@ -590,6 +592,16 @@ class PlatformPreflightTests(unittest.TestCase):
             self.assertIn("cidr: 192.0.2.20/32", rendered.stdout)
             self.assertIn("kind: BackendTLSPolicy", rendered.stdout)
             self.assertIn('name: "steward-apiserver-ca"', rendered.stdout)
+            self.assertEqual(rendered.stdout.count("kind: ClusterSPIFFEID"), 2)
+            self.assertIn("name: steward-openshell-sandboxes", rendered.stdout)
+            self.assertIn("className: spire-spire", rendered.stdout)
+            self.assertIn("openshell.io/sandbox-id", rendered.stdout)
+
+    def test_rejects_missing_spire_controller_class(self) -> None:
+        del self.input["spire"]["className"]
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("spire.className is required", result.stderr)
 
     def test_rejects_incomplete_gateway_tls_or_unknown_connection_contract(self) -> None:
         del self.input["gateway"]["backendTls"]

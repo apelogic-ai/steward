@@ -277,9 +277,16 @@ networkPolicy:
     identityExchange: 8443
     mcpGateway: 8080
 spire:
+  # Exact class watched by the installed SPIRE controller manager. Governed
+  # execution fails closed until the platform supplies this value.
+  className: ""
   csiDriver: csi.spiffe.io
   socketPath: /run/spire/sockets
   identityPath: /steward/mint
+  # The chart owns the stock OpenShell v0.0.98 sandbox identity registration.
+  # Disable only when the platform deliberately owns an equivalent resource.
+  sandboxRegistration:
+    enabled: true
 services:
   clusterDomain: cluster.local
   apiserverPort: 443

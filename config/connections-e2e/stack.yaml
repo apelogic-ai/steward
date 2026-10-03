@@ -117,6 +117,7 @@ metadata:
   name: steward-connections-e2e-mint
   labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
 spec:
+  className: spire-spire
   spiffeIDTemplate: spiffe://openshell.local/steward/mint
   namespaceSelector:
     matchLabels:

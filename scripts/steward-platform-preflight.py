@@ -338,6 +338,7 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
         {
             "schemaVersion",
             "namespaces",
+            "spire",
             "deploymentLock",
             "database",
             "gateway",
@@ -368,6 +369,12 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
     for key in OPTIONAL_NAMESPACES:
         if key in namespaces:
             validate_name(require_string(namespaces, key, "namespaces"), f"namespaces.{key}")
+
+    spire = require_object(data, "spire", "input")
+    require_exact_keys(spire, {"className"}, "spire")
+    if "className" not in spire:
+        raise ValidationError("spire.className is required")
+    validate_name(require_string(spire, "className", "spire"), "spire.className")
 
     lock = require_object(data, "deploymentLock", "input")
     require_exact_keys(
@@ -756,6 +763,10 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
         "runtimeNamespaces": sorted(
             {data["namespaces"]["runtime"], "steward-workflows"}
         ),
+        "spire": {
+            "className": data["spire"]["className"],
+            "sandboxRegistration": {"enabled": True},
+        },
         "connectionsBridge": {
             "enabled": True,
             "artifactTrust": {"mode": "operator-pinned"},

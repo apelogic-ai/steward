@@ -16,18 +16,6 @@ done
 docker info >/dev/null
 setup_started="${SECONDS}"
 
-SUPERVISOR_IMAGE="$(
-  "${ROOT}/scripts/build-patched-openshell-supervisor.sh" --print-contract |
-    sed -n 's/^image=//p'
-)"
-if [[ -z "${SUPERVISOR_IMAGE}" ]]; then
-  echo "patched OpenShell supervisor contract omitted its image" >&2
-  exit 1
-fi
-if ! "${ROOT}/scripts/build-patched-openshell-supervisor.sh" --image-is-current; then
-  "${ROOT}/scripts/build-patched-openshell-supervisor.sh"
-fi
-
 MCP_GW_LOCAL_IMAGE="steward/mcp-gw-github-wrapper:${RUN_ID}"
 MINT_IMAGE="steward/mint:${RUN_ID}"
 BRIDGE_IMAGE="steward/connections-bridge:${RUN_ID}"
@@ -121,7 +109,6 @@ STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE="${MCP_GW_LOCAL_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_MINT_IMAGE="${MINT_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE="${BRIDGE_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE="${WEBHOOK_IMAGE}" \
-STEWARD_OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
 STEWARD_OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE}" \
 bash "${ROOT}/scripts/openshell-testbed.sh" \
   bash "${ROOT}/scripts/governed-connections-inside.sh"

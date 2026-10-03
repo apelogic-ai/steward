@@ -45,6 +45,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Bound the governed Mint and stock OpenShell v0.0.98 sandbox SPIFFE
+  registrations to the operator-selected SPIRE controller class, generated the
+  sandbox registration from the chart, and changed the required governed
+  Connections lane to use the published OpenShell supervisor in the supported
+  sidecar topology instead of a local patch.
 - Fail every governed Task promptly when its exact current runtime reports a
   terminal start failure, and refused to adopt a same-name runtime whose UID
   differs from the Task's durable binding.
