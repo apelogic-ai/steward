@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.3.5`. The release workflow pulls the published OCI
+Release contract: chart `0.3.6`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -695,7 +695,7 @@ Do not hand off merely because `helm template` or `helm lint` passed.
    --context "$CLUSTER_CONTEXT" -n steward rollout status deployment/steward-apiserver`
    and the same command for `deployment/steward-controller` complete.
    The database operator confirms the embedded migration table is at the
-   migration packaged in the exact release (currently `0051`) using an
+   migration packaged in the exact release (currently `0063`) using an
    approved database session that does not expose the URI or row contents.
 2. The `agentruntimes.agents.apelogic.ai` CRD is Established, and the
    `steward-agentruntime` validating webhook has `failurePolicy: Fail`, the

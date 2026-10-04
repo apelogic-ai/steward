@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-10-04
+
 ### Added
 
 - Added browser **Run now** for inline v2 packages, exact Git package locators,
@@ -42,6 +44,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   GitHub account ID and recording connection-verification evidence in additive
   migration 0053. Deployments can retain manual association with
   `taskIdentity.federatedSubjects.autoAssociateFromConnections=false`.
+- Added explicit remote and vendored installation modes for generated
+  `steward-run` callers. Vendored mode requires a verified steward-run v0.7.6 or
+  later workflow asset at the fixed repository-local path, while task-auth
+  discovery removes obsolete identity-exchange and CA inputs from generated
+  callers.
+- Added browser-first member administration: administrators can invite verified
+  organization email addresses before first sign-in, assign member roles and
+  administrator access, inspect member and identity details, unlink or disable
+  federated identities, disable and re-enable members, revoke pending
+  invitations, and preserve last-administrator protection. Unassigned users see
+  an explicit access-pending page. Additive migrations 0060-0062 preserve the
+  member, display, sign-in, invitation, and lifecycle audit state.
+- Made the four-step browser hello-world journey the primary user onboarding
+  path, with GitHub Actions as an optional fifth step. The dismissible Get
+  started banner is shared across user pages and can be restored from Settings.
+- Added live Run detail updates over owner-scoped SSE with bounded polling
+  fallback, replay of browser-origin runs through normal admission, job and log
+  deep links, explicit empty/unavailable log states, and opt-in full execution
+  log capture.
 
 ### Fixed
 
@@ -78,6 +99,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   unknown canonical user (`403 task_identity_unknown_user`) from an invalid
   credential (`401`), and documented Identity v6 / `steward-task-v3` as the
   recommended new-install contract while retaining v5 / v2 compatibility.
+- Returned specific, actionable failures when exact Git source resolution is
+  disabled, when task orchestration remains staged, and when a template omits
+  complete role, model, tool, budget, TTL, or runner authority instead of
+  collapsing those cases into generic dependency or form errors.
+- Preserved finalized-Task monotonicity while migrations 0056 and 0057 backfill
+  provenance: additive migration 0054 opens only the three required fields and
+  migration 0058 restores the strict trigger. Migration 0059 admits the distinct
+  browser direct-package pin shape without weakening existing Workflow pins.
+- Persisted the exact successful inline package used by browser Run now, admitted
+  packages under runtime-minute ceilings, surfaced bounded persistence failures,
+  and proved that the repository handoff and subsequent GitHub Actions run retain
+  the browser run's exact package content digest.
+- Prevented browser repository submissions from revealing whether an unlisted or
+  inaccessible private repository exists; both cases return the same authorization
+  response before Task reservation.
+- Preserved MCP-GW's bounded machine-readable failure code alongside safe status
+  and reason diagnostics in additive migration 0063, and hardened provider-control
+  transcript handling without storing raw gateway responses.
 
 ### Upgrade notes
 
@@ -476,7 +515,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/apelogic-ai/steward/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/apelogic-ai/steward/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/apelogic-ai/steward/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/apelogic-ai/steward/compare/v0.3.2...v0.3.3

@@ -1125,7 +1125,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.3.5" => Ok(true),
+            "0.3.6" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -4062,7 +4062,7 @@ mod tests {
             manifest
                 .pointer("/stewardVersion")
                 .and_then(serde_json::Value::as_str),
-            Some("0.3.5")
+            Some("0.3.6")
         );
         assert_eq!(
             manifest
@@ -4075,6 +4075,14 @@ mod tests {
                 .pointer("/clientCapabilities/envelopeDigestSelector/stewardRunMinimumVersion",)
                 .and_then(serde_json::Value::as_str),
             Some("0.7.0")
+        );
+        assert_eq!(
+            manifest
+                .pointer(
+                    "/clientCapabilities/vendoredWorkflowInstallation/stewardRunMinimumVersion",
+                )
+                .and_then(serde_json::Value::as_str),
+            Some("0.7.6")
         );
         assert_eq!(
             manifest
