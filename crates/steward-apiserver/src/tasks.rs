@@ -2675,7 +2675,7 @@ where
             let repository = git
                 .resolve_repository(&repository)
                 .await
-                .map_err(source_port_error)?;
+                .map_err(|_| ApiError::BrowserTaskSourceUnauthorized)?;
             if !config.browser_source_repository_is_authorized(&repository) {
                 return Err(ApiError::BrowserTaskSourceUnauthorized);
             }

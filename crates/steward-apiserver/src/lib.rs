@@ -11046,6 +11046,70 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn browser_repository_source_does_not_reveal_resolution_failure() -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let git = browser_git_fixture()?;
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let response = browser_task_router(
+            ledger.clone(),
+            task_api_config()?.with_git_hosting_plane(git),
+            auth,
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/runs")
+                .header(header::COOKIE, session_cookie)
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", csrf)
+                .header("idempotency-key", "browser-repository-unresolvable")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "package": {
+                            "source": "https://github.com/example-org/missing.git",
+                            "revision": "git:ref:main",
+                            "path": "task-definition.json"
+                        },
+                        "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64)),
+                        "inputs": {}
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build unresolved browser repository request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("submit unresolved browser repository request: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read unresolved browser repository response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).map_err(|error| format!(
+                "decode unresolved browser repository response: {error}"
+            ))?,
+            serde_json::json!({
+                "error": "task.browser_source_not_allowed",
+                "message": "The repository is not authorized as a browser Task source. Ask a Steward administrator to allow it."
+            }),
+            "an unresolvable repository must be indistinguishable from an unlisted repository"
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?
+                .is_empty(),
+            "an unresolvable browser source must fail before Task reservation"
+        );
+        Ok(())
+    }
+
     fn same_repository_direct_git_fixture() -> Result<FakeDirectGit, String> {
         let repository = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
         let identity = GitRepositoryIdentity {
