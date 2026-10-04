@@ -529,6 +529,13 @@ export type BrowserResolvedPackage = {
 
 export type BrowserRole = 'user' | 'admin';
 
+export type BrowserRunEventSnapshot = {
+    apiVersion: string;
+    eventId: number;
+    run: BrowserRunView;
+    timeline: BrowserRunTimelineResponse;
+};
+
 export type BrowserRunExitCategory = 'succeeded' | 'failed' | 'cancelled';
 
 export type BrowserRunFacets = {
@@ -653,12 +660,15 @@ export type BrowserRunView = {
     codingAgentRuntime: string;
     createdAt: string;
     errorCategory?: string | null;
+    executionLog: ExecutionLogMode;
     finalizationRequested: boolean;
     finalized: boolean;
     observedSpend?: null | AgentRunSpendView;
     origin: TaskOrigin;
     package?: null | BrowserRunPackageView;
     phase: TaskPhase;
+    rerunSupported: boolean;
+    rerunUnavailableReason?: string | null;
     runtimeOwnership: RuntimeOwnership;
     runtimeUid?: string | null;
     stages: Array<BrowserRunStage>;
@@ -677,6 +687,7 @@ export type BrowserRunView = {
 export type BrowserTaskEvidence = {
     closure?: null | PackageClosure;
     closureDigest: ContentDigest;
+    diagnostics?: DiagnosticsRequest;
     inlineFiles?: {
         [key: string]: unknown;
     } | null;
@@ -686,6 +697,7 @@ export type BrowserTaskEvidence = {
 };
 
 export type BrowserTaskSubmission = {
+    diagnostics?: DiagnosticsRequest;
     envelopeDigest?: null | EnvelopeDigest;
     inputs?: unknown;
     package: BrowserPackageLocator;
@@ -4051,6 +4063,39 @@ export type CancelMyRunResponses = {
 
 export type CancelMyRunResponse = CancelMyRunResponses[keyof CancelMyRunResponses];
 
+export type MyRunEventsData = {
+    body?: never;
+    headers?: {
+        'Last-Event-ID'?: number | null;
+    };
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/events';
+};
+
+export type MyRunEventsErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Run was not found in the user's scope
+     */
+    404: unknown;
+    /**
+     * Run history is unavailable
+     */
+    503: unknown;
+};
+
+export type MyRunEventsResponses = {
+    200: string;
+};
+
+export type MyRunEventsResponse = MyRunEventsResponses[keyof MyRunEventsResponses];
+
 export type MyRunExecutionLogData = {
     body?: never;
     path: {
@@ -4217,6 +4262,10 @@ export type RerunMyRunErrors = {
      * The original envelope is no longer active or GitHub connection authorization is pending
      */
     409: unknown;
+    /**
+     * The persisted browser package no longer fits the current Envelope
+     */
+    422: unknown;
     /**
      * Run submission is unavailable; connections.orchestration_not_active identifies staged task orchestration
      */

@@ -29,9 +29,9 @@ use steward_apiserver::{
     IdentityOrKubernetesTokenAuthenticator, KubeRuntimeRepository, KubernetesTokenAuthenticator,
     KubernetesTokenReviewAudience, MAX_EXECUTION_BINDING_CATALOG_BYTES,
     MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, StewardRunWorkflowInstallationMode, TaskApiConfig,
-    agent_runs_ui, browser_admin, browser_auth, browser_task_router, connections, google_oidc,
-    governed_connections, operator_admin, router, stable_runtime_bridge, task_router,
-    user_envelopes, workflows,
+    agent_runs_ui, browser_admin, browser_auth, browser_task_rerunner, browser_task_router,
+    connections, google_oidc, governed_connections, operator_admin, router, stable_runtime_bridge,
+    task_router, user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
@@ -808,6 +808,7 @@ async fn browser_application_router(
             "warning: onboarding sample Workflow is unavailable because no configured execution binding advertises its immutable agent"
         );
     }
+    let browser_task_rerunner = browser_task_rerunner(store.clone(), task_api_config.clone());
     let app = browser_auth::browser_auth_router(auth.clone())
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(
@@ -858,13 +859,18 @@ async fn browser_application_router(
         ));
     let app = match connections {
         Some(broker) => app
-            .merge(agent_runs_ui::protected_router_with_github_reruns(
+            .merge(agent_runs_ui::protected_router_with_rerunners(
                 store.clone(),
                 broker.clone(),
+                browser_task_rerunner,
                 auth.clone(),
             ))
             .merge(connections::protected_router(broker, auth.clone())),
-        None => app.merge(agent_runs_ui::protected_router(store.clone(), auth.clone())),
+        None => app.merge(agent_runs_ui::protected_router_with_task_reruns(
+            store.clone(),
+            browser_task_rerunner,
+            auth.clone(),
+        )),
     };
     let app = match stable_bridge_configuration()? {
         Some((service, verifier)) => app.merge(stable_runtime_bridge::protected_router(

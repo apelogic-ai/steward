@@ -701,6 +701,7 @@ fn browser_direct_package_evidence(
         closure_digest,
         inline_files: (source == "inline")
             .then(|| BTreeMap::from([("task-definition.json".to_owned(), "{}".to_owned())])),
+        diagnostics: Default::default(),
     };
     evidence.validate()?;
     Ok(evidence)

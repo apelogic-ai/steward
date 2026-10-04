@@ -166,6 +166,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
   const defaultWorkflow = data.workflows.workflows.find((workflow) => `${workflow.name}@${workflow.version}` === initialWorkflow) ?? data.workflows.workflows[0];
   const [workflowRef, setWorkflowRef] = useState(defaultWorkflow ? `${defaultWorkflow.name}@${defaultWorkflow.version}` : "");
   const [inputs, setInputs] = useState("{}");
+  const [captureExecutionLog, setCaptureExecutionLog] = useState(false);
   const [status, setStatus] = useState<"idle" | "submitting" | "error">("idle");
   const [failure, setFailure] = useState<string | null>(null);
   const selectedEnvelope = active.find((request) => request.id === envelopeId);
@@ -222,7 +223,12 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
     setFailure(null);
     setStatus("submitting");
     const result = await submitBrowserRun({
-      body: { package: packageLocator, envelopeDigest, inputs: parsedInputs },
+      body: {
+        package: packageLocator,
+        envelopeDigest,
+        inputs: parsedInputs,
+        diagnostics: { executionLog: captureExecutionLog ? "full" : "off" },
+      },
       cache: "no-store",
       credentials: "same-origin",
       headers: { "Idempotency-Key": crypto.randomUUID(), "X-Steward-CSRF": session.value.csrf },
@@ -245,6 +251,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
     {sourceKind === "repository" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Repository<input className={`${fieldClass} font-mono`} onChange={(event) => setRepository(event.target.value)} value={repository} /></label><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Ref or immutable commit<input className={`${fieldClass} font-mono`} onChange={(event) => setRevision(event.target.value)} value={revision} /></label><label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} value={path} /></label></div><p className="text-xs text-muted-ink">The repository must be in the operator&apos;s allowed source list. Steward resolves a ref to an exact commit and validates the package&apos;s declared requirements before execution.</p></div> : null}
     {sourceKind === "registry" ? <label className="grid gap-2 text-sm font-semibold">Published workflow<select className={fieldClass} onChange={(event) => setWorkflowRef(event.target.value)} value={workflowRef}>{data.workflows.workflows.map((workflow) => <option key={`${workflow.name}@${workflow.version}`} value={`${workflow.name}@${workflow.version}`}>{workflow.displayName} · {workflow.name}@{workflow.version}</option>)}</select></label> : null}
     <label className="grid gap-2 text-sm font-semibold">Inputs (JSON object)<span className="text-xs font-normal text-muted-ink">Optional JSON (up to 16 KiB), available to the agent as <code>in/inputs.json</code>. Reference it in your prompt; it cannot change the agent, model, tools, or Envelope. Example: <code>{'{"release":"v1.2.3"}'}</code>.</span><textarea className="min-h-28 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setInputs(event.target.value)} spellCheck={false} value={inputs} /></label>
+    <label className="flex items-start gap-3 rounded-control border border-warn/30 bg-warn-soft p-4 text-sm"><input checked={captureExecutionLog} className="mt-1 size-4" onChange={(event) => setCaptureExecutionLog(event.target.checked)} type="checkbox" /><span><strong className="block font-semibold text-warn">Capture execution log</strong><span className="mt-1 block text-muted-ink">Retain stdout and stderr for this run. Execution logs may reproduce arbitrary user, tool, or agent output.</span></span></label>
     {status === "error" ? <p className="text-sm text-err" role="alert">{failure ?? genericRunNowFailure}</p> : null}
     <div className="flex justify-end"><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "submitting" || (sourceKind === "inline" && (!inlineAllowed || !selectedModel))} type="submit">{status === "submitting" ? "Starting…" : "Run now"}</button></div>
   </form>;

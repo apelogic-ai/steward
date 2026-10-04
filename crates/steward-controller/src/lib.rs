@@ -2340,7 +2340,11 @@ fn sandbox_task_request(
     refs: RuntimeRefs,
 ) -> SandboxTaskRequest {
     let execution_class = sandbox_execution_class(&task.runtime_spec);
-    let diagnostics = sandbox_task_diagnostics(execution_class, task.direct_task_evidence.as_ref());
+    let diagnostics = sandbox_task_diagnostics(
+        execution_class,
+        task.direct_task_evidence.as_ref(),
+        task.browser_task_evidence.as_ref(),
+    );
     SandboxTaskRequest {
         runtime: RuntimeId(runtime_uid),
         refs,
@@ -2359,10 +2363,12 @@ fn sandbox_task_request(
 fn sandbox_task_diagnostics(
     execution_class: SandboxExecutionClass,
     evidence: Option<&steward_types::direct_package::DirectTaskBindingEvidence>,
+    browser_evidence: Option<&steward_types::direct_package::BrowserTaskEvidence>,
 ) -> steward_types::direct_package::DiagnosticsRequest {
     if execution_class == SandboxExecutionClass::Agent {
         evidence
             .map(|evidence| evidence.diagnostics)
+            .or_else(|| browser_evidence.map(|evidence| evidence.diagnostics))
             .unwrap_or_default()
     } else {
         steward_types::direct_package::DiagnosticsRequest::default()
@@ -5272,7 +5278,9 @@ mod tests {
         ConnectionOperationRecord, ConnectionOperationState, GrantReversion, StoreError,
         TaskRecord,
     };
-    use steward_types::direct_package::{DirectTaskBindingEvidence, ExecutionLogMode};
+    use steward_types::direct_package::{
+        BrowserTaskEvidence, DirectTaskBindingEvidence, ExecutionLogMode,
+    };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
         CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, ModelRef,
@@ -5827,24 +5835,43 @@ mod tests {
     }
 
     #[test]
-    fn task_diagnostics_come_only_from_direct_evidence_and_never_provider_control()
+    fn task_diagnostics_come_from_persisted_evidence_and_never_provider_control()
     -> Result<(), String> {
         let evidence: DirectTaskBindingEvidence = serde_json::from_str(include_str!(
             "../../../docs/contracts/task/v2/fixtures/positive/task-binding-evidence.json"
         ))
         .map_err(|error| format!("parse direct evidence fixture: {error}"))?;
         assert_eq!(
-            sandbox_task_diagnostics(SandboxExecutionClass::Agent, Some(&evidence)).execution_log,
+            sandbox_task_diagnostics(SandboxExecutionClass::Agent, Some(&evidence), None)
+                .execution_log,
             ExecutionLogMode::Full
         );
         assert_eq!(
-            sandbox_task_diagnostics(SandboxExecutionClass::Agent, None).execution_log,
+            sandbox_task_diagnostics(SandboxExecutionClass::Agent, None, None).execution_log,
             ExecutionLogMode::Off,
             "legacy Tasks must not opt into caller-visible transcripts"
         );
+        let browser_evidence: BrowserTaskEvidence = serde_json::from_value(serde_json::json!({
+            "source": "inline",
+            "revision": "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "path": "task-definition.json",
+            "closureDigest": "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "diagnostics": { "executionLog": "full" }
+        }))
+        .map_err(|error| format!("parse browser evidence fixture: {error}"))?;
         assert_eq!(
-            sandbox_task_diagnostics(SandboxExecutionClass::ProviderControl, Some(&evidence))
+            sandbox_task_diagnostics(SandboxExecutionClass::Agent, None, Some(&browser_evidence),)
                 .execution_log,
+            ExecutionLogMode::Full,
+            "browser Tasks must honor their persisted diagnostics snapshot"
+        );
+        assert_eq!(
+            sandbox_task_diagnostics(
+                SandboxExecutionClass::ProviderControl,
+                Some(&evidence),
+                Some(&browser_evidence),
+            )
+            .execution_log,
             ExecutionLogMode::Off,
             "provider-control must remain forced off even with malformed direct evidence"
         );
