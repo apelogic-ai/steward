@@ -9,10 +9,12 @@ function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
     codingAgentRuntime: "codex@0.140.0",
     createdAt: "2026-10-02T00:00:00Z",
+    executionLog: "off",
     finalizationRequested: false,
     finalized: true,
     origin: "browser",
     phase: "succeeded",
+    rerunSupported: true,
     runtimeOwnership: "provisioned",
     stages: [],
     taskUid: "task-1",

@@ -38,11 +38,12 @@ pub use github_actions::{
 
 pub use tasks::{
     BrowserResolvedEnvelope, BrowserResolvedPackage, BrowserRunSubmissionResponse,
-    ConfiguredTaskIdentityResolver, FederatedTaskIdentityErrorResponse,
-    KubernetesTaskIdentityResolver, MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, TaskAdmissionDelta,
-    TaskApiConfig, TaskArchive, TaskAuthenticationError, TaskCreateRequest, TaskErrorResponse,
-    TaskIdentity, TaskIdentityErrorResponse, TaskIdentityResolver, TaskStatusResponse,
-    TaskSubmissionLedger, TaskSubmissionRequest, UnknownTaskIdentityErrorResponse,
+    BrowserTaskRerunError, BrowserTaskRerunner, ConfiguredTaskIdentityResolver,
+    FederatedTaskIdentityErrorResponse, KubernetesTaskIdentityResolver,
+    MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, TaskAdmissionDelta, TaskApiConfig, TaskArchive,
+    TaskAuthenticationError, TaskCreateRequest, TaskErrorResponse, TaskIdentity,
+    TaskIdentityErrorResponse, TaskIdentityResolver, TaskStatusResponse, TaskSubmissionLedger,
+    TaskSubmissionRequest, UnknownTaskIdentityErrorResponse, browser_task_rerunner,
     browser_task_router, task_router,
 };
 pub use workflows::{WorkflowReference, WorkflowReferenceError};
@@ -367,6 +368,7 @@ pub struct GrantRevocationRequest {
         tasks::submit_browser_run,
         agent_runs_ui::my_runs,
         agent_runs_ui::my_run,
+        agent_runs_ui::my_run_events,
         agent_runs_ui::cancel_my_run,
         agent_runs_ui::rerun_my_run,
         agent_runs_ui::my_run_timeline,
@@ -449,6 +451,7 @@ pub struct GrantRevocationRequest {
         BrowserRunSubmissionResponse,
         BrowserResolvedPackage,
         BrowserResolvedEnvelope,
+        agent_runs_ui::BrowserRunEventSnapshot,
         browser_auth::BrowserRole,
         browser_auth::SessionPrincipalResponse,
         browser_auth::SessionResponse,

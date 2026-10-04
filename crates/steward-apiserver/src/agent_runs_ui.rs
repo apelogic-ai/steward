@@ -7,19 +7,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
-use steward_admission::AdmissionDecision;
 use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunPage, AgentRunQuery, AgentRunRecord,
-    AgentRunTimelineEvent, AgentRunTimelineKind, StoreError, TaskReservationRequest,
+    AgentRunTimelineEvent, AgentRunTimelineKind, StoreError, TaskRecord,
 };
-use steward_types::direct_package::TaskOrigin;
+use steward_types::direct_package::{ExecutionLogMode, TaskOrigin};
 use steward_types::{CanonicalUserId, RuntimeOwnership, TaskPhase};
 use uuid::Uuid;
 
@@ -31,7 +31,7 @@ use crate::connections::{
     ConnectionBrokerError, ConnectionSession, ConnectionSubject, GithubWorkflowRerunBroker,
     GithubWorkflowRerunRequest,
 };
-use crate::tasks::{stable_task_runtime_name, task_orchestration_reservation};
+use crate::tasks::{BrowserTaskRerunError, BrowserTaskRerunner};
 use crate::{AgentRunLedger, AgentRunSpendView, BoxFuture, bounded_task_error_category};
 
 pub const BROWSER_AGENT_RUNS_API_VERSION: &str = "steward.browser-runs/v1";
@@ -45,6 +45,7 @@ struct RerunErrorResponse {
 pub(crate) struct BrowserRunsState<L> {
     ledger: L,
     github_rerunner: Arc<dyn BrowserGithubRerunner>,
+    browser_task_rerunner: Arc<dyn BrowserTaskRerunner>,
 }
 
 trait BrowserGithubRerunner: Send + Sync {
@@ -87,6 +88,20 @@ impl BrowserGithubRerunner for DisabledGithubRerunner {
         _request: &'a GithubWorkflowRerunRequest,
     ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
         Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DisabledBrowserTaskRerunner;
+
+impl BrowserTaskRerunner for DisabledBrowserTaskRerunner {
+    fn rerun<'a>(
+        &'a self,
+        _session: &'a BrowserSessionContext,
+        _source: &'a TaskRecord,
+        _idempotency_key: &'a str,
+    ) -> BoxFuture<'a, Result<Uuid, BrowserTaskRerunError>> {
+        Box::pin(async { Err(BrowserTaskRerunError::Unavailable) })
     }
 }
 
@@ -143,6 +158,9 @@ pub(crate) struct BrowserRunView {
     observed_spend: Option<AgentRunSpendView>,
     error_category: Option<String>,
     trigger: Option<BrowserRunTrigger>,
+    execution_log: ExecutionLogMode,
+    rerun_supported: bool,
+    rerun_unavailable_reason: Option<&'static str>,
     stages: Vec<BrowserRunStage>,
 }
 
@@ -391,6 +409,15 @@ pub(crate) struct BrowserRunTimelineResponse {
     events: Vec<BrowserRunTimelineEvent>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserRunEventSnapshot {
+    api_version: &'static str,
+    event_id: u64,
+    run: BrowserRunView,
+    timeline: BrowserRunTimelineResponse,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct BrowserExecutionLogQuery {
@@ -425,13 +452,21 @@ pub(crate) struct BrowserRunOutputsResponse {
 
 const MAX_BROWSER_LOG_CHUNK_BYTES: usize = 64 * 1024;
 
-fn my_runs_router<L>(ledger: L, github_rerunner: Arc<dyn BrowserGithubRerunner>) -> Router
+fn my_runs_router<L>(
+    ledger: L,
+    github_rerunner: Arc<dyn BrowserGithubRerunner>,
+    browser_task_rerunner: Arc<dyn BrowserTaskRerunner>,
+) -> Router
 where
     L: AgentRunLedger,
 {
     Router::new()
         .route("/app/api/v1/runs", get(my_runs::<L>))
         .route("/app/api/v1/runs/{task_uid}", get(my_run::<L>))
+        .route(
+            "/app/api/v1/runs/{task_uid}/events",
+            get(my_run_events::<L>),
+        )
         .route(
             "/app/api/v1/runs/{task_uid}/package",
             get(my_run_package::<L>),
@@ -460,6 +495,7 @@ where
         .with_state(BrowserRunsState {
             ledger,
             github_rerunner,
+            browser_task_rerunner,
         })
 }
 
@@ -744,6 +780,7 @@ where
         .with_state(BrowserRunsState {
             ledger,
             github_rerunner,
+            browser_task_rerunner: Arc::new(DisabledBrowserTaskRerunner),
         })
 }
 
@@ -758,8 +795,13 @@ where
     L: AgentRunLedger,
 {
     let github_rerunner: Arc<dyn BrowserGithubRerunner> = Arc::new(DisabledGithubRerunner);
+    let browser_task_rerunner: Arc<dyn BrowserTaskRerunner> = Arc::new(DisabledBrowserTaskRerunner);
     protect_browser_routes(
-        my_runs_router(ledger.clone(), github_rerunner.clone()),
+        my_runs_router(
+            ledger.clone(),
+            github_rerunner.clone(),
+            browser_task_rerunner,
+        ),
         browser_auth.clone(),
     )
     .merge(protect_browser_admin_routes(
@@ -778,8 +820,61 @@ where
     P: GithubWorkflowRerunBroker<BrowserSessionBinding>,
 {
     let github_rerunner: Arc<dyn BrowserGithubRerunner> = Arc::new(github_rerunner);
+    let browser_task_rerunner: Arc<dyn BrowserTaskRerunner> = Arc::new(DisabledBrowserTaskRerunner);
     protect_browser_routes(
-        my_runs_router(ledger.clone(), github_rerunner.clone()),
+        my_runs_router(
+            ledger.clone(),
+            github_rerunner.clone(),
+            browser_task_rerunner,
+        ),
+        browser_auth.clone(),
+    )
+    .merge(protect_browser_admin_routes(
+        all_runs_router(ledger, github_rerunner),
+        browser_auth,
+    ))
+}
+
+pub fn protected_router_with_rerunners<L, P>(
+    ledger: L,
+    github_rerunner: P,
+    browser_task_rerunner: Arc<dyn BrowserTaskRerunner>,
+    browser_auth: BrowserAuthService,
+) -> Router
+where
+    L: AgentRunLedger,
+    P: GithubWorkflowRerunBroker<BrowserSessionBinding>,
+{
+    let github_rerunner: Arc<dyn BrowserGithubRerunner> = Arc::new(github_rerunner);
+    protect_browser_routes(
+        my_runs_router(
+            ledger.clone(),
+            github_rerunner.clone(),
+            browser_task_rerunner,
+        ),
+        browser_auth.clone(),
+    )
+    .merge(protect_browser_admin_routes(
+        all_runs_router(ledger, github_rerunner),
+        browser_auth,
+    ))
+}
+
+pub fn protected_router_with_task_reruns<L>(
+    ledger: L,
+    browser_task_rerunner: Arc<dyn BrowserTaskRerunner>,
+    browser_auth: BrowserAuthService,
+) -> Router
+where
+    L: AgentRunLedger,
+{
+    let github_rerunner: Arc<dyn BrowserGithubRerunner> = Arc::new(DisabledGithubRerunner);
+    protect_browser_routes(
+        my_runs_router(
+            ledger.clone(),
+            github_rerunner.clone(),
+            browser_task_rerunner,
+        ),
         browser_auth.clone(),
     )
     .merge(protect_browser_admin_routes(
@@ -953,6 +1048,96 @@ where
 }
 
 #[utoipa::path(
+    get,
+    operation_id = "myRunEvents",
+    path = "/app/api/v1/runs/{task_uid}/events",
+    params(
+        ("task_uid" = String, Path, format = "uuid"),
+        ("Last-Event-ID" = Option<u64>, Header)
+    ),
+    responses(
+        (status = 200, body = String, content_type = "text/event-stream"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Run was not found in the user's scope"),
+        (status = 503, description = "Run history is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn my_run_events<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    State(state): State<BrowserRunsState<L>>,
+    Path(task_uid): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let owner_user_id = Some(session.principal.canonical_user_id.as_str().to_owned());
+    let record = match scoped_run(&state.ledger, task_uid, owner_user_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let timeline = match state.ledger.agent_run_timeline(task_uid).await {
+        Ok(Some(events)) => match events
+            .into_iter()
+            .rev()
+            .map(browser_timeline_event)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(events) => BrowserRunTimelineResponse {
+                api_version: BROWSER_AGENT_RUNS_API_VERSION,
+                task_uid,
+                events,
+            },
+            Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+        },
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+        .min(u128::from(u64::MAX)) as u64;
+    let event_id = now.max(last_event_id.saturating_add(1));
+    let snapshot = BrowserRunEventSnapshot {
+        api_version: BROWSER_AGENT_RUNS_API_VERSION,
+        event_id,
+        run: browser_run_view(record),
+        timeline,
+    };
+    let data = match serde_json::to_string(&snapshot) {
+        Ok(data) => data,
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let body =
+        format!("retry: 2000\nid: {event_id}\nevent: snapshot\ndata: {data}\n\n: heartbeat\n\n");
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response
+}
+
+#[utoipa::path(
     post,
     operation_id = "cancelMyRun",
     path = "/app/api/v1/runs/{task_uid}/cancel",
@@ -1013,6 +1198,7 @@ where
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Run was not found in the user's scope"),
         (status = 409, description = "The original envelope is no longer active or GitHub connection authorization is pending"),
+        (status = 422, description = "The persisted browser package no longer fits the current Envelope"),
         (status = 503, body = RerunErrorResponse, description = "Run submission is unavailable; connections.orchestration_not_active identifies staged task orchestration")
     ),
     security(("browserSession" = []))
@@ -1139,113 +1325,25 @@ where
         };
     }
     match state
-        .ledger
-        .rerun_by_idempotency(&source.submitter_service, owner_user_id, &idempotency_key)
+        .browser_task_rerunner
+        .rerun(&session, &source, &idempotency_key)
         .await
     {
-        Ok(Some(existing)) => {
-            return (
-                StatusCode::OK,
-                Json(RerunResponse {
-                    api_version: BROWSER_AGENT_RUNS_API_VERSION,
-                    task_uid: existing.task_uid,
-                }),
-            )
-                .into_response();
+        Ok(task_uid) => (
+            StatusCode::CREATED,
+            Json(RerunResponse {
+                api_version: BROWSER_AGENT_RUNS_API_VERSION,
+                task_uid,
+            }),
+        )
+            .into_response(),
+        Err(BrowserTaskRerunError::Unsupported) => StatusCode::CONFLICT.into_response(),
+        Err(BrowserTaskRerunError::EnvelopeUnavailable) => StatusCode::CONFLICT.into_response(),
+        Err(BrowserTaskRerunError::Rejected) => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        Err(BrowserTaskRerunError::Unavailable) => {
+            browser_runs_error(StatusCode::SERVICE_UNAVAILABLE)
         }
-        Ok(None) => {}
-        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
     }
-    let Some(envelope) = source.user_envelope_snapshot.as_ref() else {
-        return StatusCode::CONFLICT.into_response();
-    };
-    let Some(envelope_instance_id) = source.user_envelope_instance_id.as_deref() else {
-        return StatusCode::CONFLICT.into_response();
-    };
-    let Some(envelope_revision) = source.user_envelope_revision else {
-        return StatusCode::CONFLICT.into_response();
-    };
-    let Some(envelope_digest) = source.user_envelope_digest.as_deref() else {
-        return StatusCode::CONFLICT.into_response();
-    };
-    let task_uid = Uuid::new_v4();
-    let operation_id = Uuid::new_v4();
-    let runtime_name = stable_task_runtime_name(operation_id);
-    let orchestration = match task_orchestration_reservation(
-        task_uid,
-        operation_id,
-        &source.runtime_namespace,
-        &runtime_name,
-        &source.runtime_spec,
-        envelope,
-        source.execution_binding.as_ref(),
-    ) {
-        Ok(orchestration) => orchestration,
-        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
-    };
-    let expected_runtime_uid = (source.runtime_ownership == RuntimeOwnership::Adopted)
-        .then_some(source.runtime_uid.as_deref())
-        .flatten();
-    let decision = AdmissionDecision::Admit;
-    let reservation = state
-        .ledger
-        .reserve_rerun(TaskReservationRequest {
-            task_uid,
-            operation_id,
-            idempotency_key: &idempotency_key,
-            submitter_service: &source.submitter_service,
-            acting_user: source.acting_user.as_deref(),
-            acting_user_id: source.acting_user_id.as_deref(),
-            owner: &source.owner,
-            owner_user_id,
-            workflow: &source.workflow,
-            workflow_name: source.workflow_name.as_deref(),
-            workflow_version: source.workflow_version,
-            workflow_digest: source.workflow_digest.as_deref(),
-            user_envelope_instance_id: Some(envelope_instance_id),
-            user_envelope_revision: Some(envelope_revision),
-            user_envelope_digest: Some(envelope_digest),
-            coding_agent_runtime: &source.coding_agent_runtime,
-            runtime_uid: expected_runtime_uid,
-            runtime_namespace: &source.runtime_namespace,
-            runtime_name: &runtime_name,
-            runtime_ownership: source.runtime_ownership,
-            runtime_spec: &source.runtime_spec,
-            agent_command: &source.agent_command,
-            execution_binding: source.execution_binding.as_ref(),
-            source_provenance: None,
-            direct_task_evidence: None,
-            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
-            browser_task_evidence: None,
-            user_envelope_snapshot: Some(envelope),
-            candidate_digest: &orchestration.candidate_digest,
-            admission_decision: &decision,
-            inert_manifest_digest: &orchestration.inert_manifest_digest,
-            active_manifest_digest: &orchestration.active_manifest_digest,
-        })
-        .await;
-    let reservation = match reservation {
-        Ok(reservation) => reservation,
-        Err(StoreError::StaleEnvelope) => return StatusCode::CONFLICT.into_response(),
-        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
-    };
-    if reservation.inserted
-        && state
-            .ledger
-            .activate_rerun(source_task_uid, reservation.record.task_uid)
-            .await
-            .is_err()
-    {
-        return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    (
-        StatusCode::CREATED,
-        Json(RerunResponse {
-            api_version: BROWSER_AGENT_RUNS_API_VERSION,
-            task_uid: reservation.record.task_uid,
-        }),
-    )
-        .into_response()
 }
 
 #[utoipa::path(
@@ -1573,12 +1671,26 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         .direct_task_evidence
         .as_ref()
         .map(|evidence| browser_run_trigger(&evidence.source_provenance));
+    let execution_log = record
+        .direct_task_evidence
+        .as_ref()
+        .map(|evidence| evidence.diagnostics.execution_log)
+        .or_else(|| {
+            record
+                .browser_task_evidence
+                .as_ref()
+                .map(|evidence| evidence.diagnostics.execution_log)
+        })
+        .unwrap_or(ExecutionLogMode::Off);
     let stages = browser_run_stages(
         record.phase,
         record.runtime_uid.is_some(),
         record.finalize_requested,
         record.finalized,
+        execution_log == ExecutionLogMode::Full,
     );
+    let rerun_supported = record.direct_task_evidence.is_some()
+        || (record.task_origin == TaskOrigin::Browser && record.browser_task_evidence.is_some());
     let package = record
         .browser_task_evidence
         .as_ref()
@@ -1634,6 +1746,10 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         error_category: bounded_task_error_category(record.failure_reason.as_deref())
             .map(str::to_owned),
         trigger,
+        execution_log,
+        rerun_supported,
+        rerun_unavailable_reason: (!rerun_supported)
+            .then_some("This run does not have a replayable package source."),
         stages,
     }
 }
@@ -1667,6 +1783,7 @@ fn browser_run_stages(
     runtime_bound: bool,
     finalization_requested: bool,
     finalized: bool,
+    execution_log_captured: bool,
 ) -> Vec<BrowserRunStage> {
     let terminal = matches!(
         phase,
@@ -1723,7 +1840,11 @@ fn browser_run_stages(
                 id: "execution",
                 display_name: "Agent execution",
                 state: execution_state,
-                log_streams: vec!["stdout", "stderr"],
+                log_streams: if execution_log_captured {
+                    vec!["stdout", "stderr"]
+                } else {
+                    Vec::new()
+                },
             }],
         },
         BrowserRunStage {
@@ -2253,6 +2374,29 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FakeBrowserTaskRerunner {
+        rerun_task_uid: Uuid,
+        requests: Arc<Mutex<Vec<(Uuid, String)>>>,
+    }
+
+    impl BrowserTaskRerunner for FakeBrowserTaskRerunner {
+        fn rerun<'a>(
+            &'a self,
+            _session: &'a BrowserSessionContext,
+            source: &'a TaskRecord,
+            idempotency_key: &'a str,
+        ) -> BoxFuture<'a, Result<Uuid, BrowserTaskRerunError>> {
+            Box::pin(async move {
+                self.requests
+                    .lock()
+                    .map_err(|_| BrowserTaskRerunError::Unavailable)?
+                    .push((source.task_uid, idempotency_key.to_owned()));
+                Ok(self.rerun_task_uid)
+            })
+        }
+    }
+
     fn cookie(response: &Response, name: &str) -> Result<String, String> {
         response
             .headers()
@@ -2421,6 +2565,61 @@ mod tests {
                 .as_deref(),
             Some(owner)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_events_are_owner_scoped_and_resume_after_last_event_id() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let other_owner = "usr_abcdefabcdefabcdefabcdefabcdefab";
+        let own_task = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let other_task = Uuid::parse_str("22222222-2222-4222-8222-222222222222")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .extend([run(own_task, owner), run(other_task, other_owner)]);
+        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let app = protected_router(ledger, service);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{own_task}/events"))
+                    .header(header::COOKIE, &session_cookie)
+                    .header("last-event-id", (u64::MAX - 1).to_string())
+                    .body(Body::empty())
+                    .map_err(|error| format!("build run event request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute run event request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("text/event-stream"))
+        );
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read run event response: {error}"))?;
+        let body = std::str::from_utf8(&body)
+            .map_err(|error| format!("run event response was not UTF-8: {error}"))?;
+        assert!(body.contains(&format!("id: {}", u64::MAX)));
+        assert!(body.contains(&format!("\"taskUid\":\"{own_task}\"")));
+
+        let hidden = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{other_task}/events"))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build hidden run event request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute hidden run event request: {error}"))?;
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
         Ok(())
     }
 
@@ -2809,6 +3008,7 @@ mod tests {
                     "{\"schemaVersion\":\"steward.task-definition/v2\"}".to_owned(),
                 ),
             ])),
+            diagnostics: Default::default(),
         };
         let mut own = run(own_task, owner);
         own.task_origin = TaskOrigin::Browser;
@@ -2863,6 +3063,76 @@ mod tests {
                 .map_err(|error| format!("execute hidden package request: {error}"))?;
             assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_origin_rerun_uses_the_browser_submission_boundary() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let source_task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let rerun_task_uid = Uuid::parse_str("22222222-2222-4222-8222-222222222222")
+            .map_err(|error| error.to_string())?;
+        let mut source = github_task(source_task_uid, owner, 1)?;
+        source.direct_task_evidence = None;
+        source.task_origin = TaskOrigin::Browser;
+        source.browser_task_evidence = Some(BrowserTaskEvidence {
+            source: "inline".to_owned(),
+            revision: format!("steward:sha256:{}", "d".repeat(64)),
+            path: RelativePath::parse("task-definition.json")?,
+            closure: None,
+            closure_digest: ContentDigest::parse(format!("steward:sha256:{}", "d".repeat(64)))?,
+            inline_files: Some(BTreeMap::from([(
+                "task-definition.json".to_owned(),
+                "{}".to_owned(),
+            )])),
+            diagnostics: Default::default(),
+        });
+        let ledger = FakeLedger::default();
+        ledger
+            .rerun_sources
+            .lock()
+            .map_err(|_| "lock rerun sources")?
+            .insert(source_task_uid, source);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let rerunner: Arc<dyn BrowserTaskRerunner> = Arc::new(FakeBrowserTaskRerunner {
+            rerun_task_uid,
+            requests: requests.clone(),
+        });
+        let (service, session_cookie, csrf) =
+            signed_in_cookie_and_csrf(LocalFakeIdentity::User).await?;
+        let response = protected_router_with_task_reruns(ledger, rerunner, service)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/app/api/v1/runs/{source_task_uid}/rerun"))
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::ORIGIN, "http://127.0.0.1:33001")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"idempotencyKey":"one-click"}"#))
+                    .map_err(|error| format!("build browser rerun request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute browser rerun request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .map_err(|error| format!("read browser rerun response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode browser rerun response: {error}"))?;
+        assert_eq!(body["taskUid"], rerun_task_uid.to_string());
+        assert_eq!(
+            requests
+                .lock()
+                .map_err(|_| "lock browser rerun requests")?
+                .as_slice(),
+            &[(
+                source_task_uid,
+                format!("browser-rerun:{source_task_uid}:one-click")
+            )]
+        );
         Ok(())
     }
 

@@ -1619,6 +1619,37 @@ pub(crate) struct BrowserTaskState<L> {
     application: TaskApplicationService<L>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserTaskRerunError {
+    Unsupported,
+    EnvelopeUnavailable,
+    Rejected,
+    Unavailable,
+}
+
+pub trait BrowserTaskRerunner: Send + Sync {
+    fn rerun<'a>(
+        &'a self,
+        session: &'a BrowserSessionContext,
+        source: &'a TaskRecord,
+        idempotency_key: &'a str,
+    ) -> BoxFuture<'a, Result<Uuid, BrowserTaskRerunError>>;
+}
+
+#[derive(Clone)]
+struct TaskApplicationBrowserRerunner<L> {
+    application: TaskApplicationService<L>,
+}
+
+pub fn browser_task_rerunner<L>(ledger: L, config: TaskApiConfig) -> Arc<dyn BrowserTaskRerunner>
+where
+    L: AdmissionLedger + TaskSubmissionLedger,
+{
+    Arc::new(TaskApplicationBrowserRerunner {
+        application: TaskApplicationService { ledger, config },
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserRunSubmissionResponse {
@@ -2078,6 +2109,7 @@ where
             closure: None,
             closure_digest,
             inline_files: None,
+            diagnostics: request.diagnostics,
         };
         evidence.validate().map_err(ApiError::Admission)?;
         let task_request = TaskSubmissionRequest {
@@ -2488,6 +2520,105 @@ where
     }
 }
 
+impl<L> BrowserTaskRerunner for TaskApplicationBrowserRerunner<L>
+where
+    L: AdmissionLedger + TaskSubmissionLedger,
+{
+    fn rerun<'a>(
+        &'a self,
+        session: &'a BrowserSessionContext,
+        source: &'a TaskRecord,
+        idempotency_key: &'a str,
+    ) -> BoxFuture<'a, Result<Uuid, BrowserTaskRerunError>> {
+        Box::pin(async move {
+            if source.task_origin != TaskOrigin::Browser {
+                return Err(BrowserTaskRerunError::Unsupported);
+            }
+            let evidence = source
+                .browser_task_evidence
+                .as_ref()
+                .ok_or(BrowserTaskRerunError::Unsupported)?;
+            let input_archive = source
+                .input_archive
+                .as_deref()
+                .ok_or(BrowserTaskRerunError::Unsupported)?;
+            let inputs = browser_inputs_from_archive(input_archive)
+                .map_err(|_| BrowserTaskRerunError::Unsupported)?;
+            let envelope_instance_id = source
+                .user_envelope_instance_id
+                .as_deref()
+                .ok_or(BrowserTaskRerunError::EnvelopeUnavailable)?;
+            let active = self
+                .application
+                .ledger
+                .active_provisioned_user_envelopes(&session.principal.canonical_user_id)
+                .await
+                .map_err(|_| BrowserTaskRerunError::Unavailable)?;
+            let mut matching = active.into_iter().filter(|record| {
+                record.envelope_instance_id.as_deref() == Some(envelope_instance_id)
+            });
+            let current = matching
+                .next()
+                .ok_or(BrowserTaskRerunError::EnvelopeUnavailable)?;
+            if matching.next().is_some() {
+                return Err(BrowserTaskRerunError::EnvelopeUnavailable);
+            }
+            let digest = current
+                .envelope_digest
+                .ok_or(BrowserTaskRerunError::EnvelopeUnavailable)?;
+            let envelope_digest = EnvelopeDigest::parse(if digest.starts_with("steward:") {
+                digest
+            } else {
+                format!("steward:{digest}")
+            })
+            .map_err(|_| BrowserTaskRerunError::EnvelopeUnavailable)?;
+            let request = browser_rerun_submission(evidence, inputs, envelope_digest);
+            let identity = TaskIdentity {
+                service: "steward-browser".to_owned(),
+                acting_user: Some(session.principal.display_email.clone()),
+                owner: session.principal.display_email.clone(),
+                canonical_user_id: session.principal.canonical_user_id.clone(),
+                source_provenance: None,
+            };
+            self.application
+                .submit_browser(idempotency_key, identity, &request)
+                .await
+                .map(|response| response.task_uid)
+                .map_err(|error| match error {
+                    ApiError::MissingEnvelope
+                    | ApiError::Conflict(_)
+                    | ApiError::Store(StoreError::StaleEnvelope) => {
+                        BrowserTaskRerunError::EnvelopeUnavailable
+                    }
+                    ApiError::Admission(_)
+                    | ApiError::BrowserTaskSourceUnauthorized
+                    | ApiError::TaskSourceUnauthorized(_)
+                    | ApiError::TaskWorkflowNotFound
+                    | ApiError::DirectPackageSourceDisabled => BrowserTaskRerunError::Rejected,
+                    _ => BrowserTaskRerunError::Unavailable,
+                })
+        })
+    }
+}
+
+fn browser_rerun_submission(
+    evidence: &BrowserTaskEvidence,
+    inputs: serde_json::Value,
+    envelope_digest: EnvelopeDigest,
+) -> BrowserTaskSubmission {
+    BrowserTaskSubmission {
+        package: steward_types::direct_package::BrowserPackageLocator {
+            source: evidence.source.clone(),
+            revision: Some(evidence.revision.clone()),
+            path: evidence.path.clone(),
+            files: evidence.inline_files.clone(),
+        },
+        envelope_digest: Some(envelope_digest),
+        inputs,
+        diagnostics: evidence.diagnostics,
+    }
+}
+
 async fn resolve_browser_package_pre_admission<L>(
     ledger: &L,
     config: &TaskApiConfig,
@@ -2679,6 +2810,7 @@ where
         closure: Some(closure),
         closure_digest,
         inline_files,
+        diagnostics: request.diagnostics,
     };
     evidence.validate().map_err(ApiError::Admission)?;
     Ok(BrowserTaskPreAdmission {
@@ -2820,6 +2952,38 @@ fn browser_inputs_archive(inputs: &serde_json::Value) -> Result<Vec<u8>, ApiErro
     let padding = (512 - bytes.len() % 512) % 512;
     archive.resize(archive.len() + padding + 1024, 0);
     Ok(archive)
+}
+
+fn browser_inputs_from_archive(archive: &[u8]) -> Result<serde_json::Value, ApiError> {
+    let header = archive
+        .get(..512)
+        .ok_or_else(|| ApiError::Admission("browser Task input archive is invalid".to_owned()))?;
+    let name_end = header[..100]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(100);
+    if &header[..name_end] != b"in/inputs.json" {
+        return Err(ApiError::Admission(
+            "browser Task input archive entry is invalid".to_owned(),
+        ));
+    }
+    let size = std::str::from_utf8(&header[124..136])
+        .ok()
+        .map(|value| value.trim_matches(['\0', ' ']))
+        .filter(|value| !value.is_empty())
+        .and_then(|value| usize::from_str_radix(value, 8).ok())
+        .ok_or_else(|| ApiError::Admission("browser Task input size is invalid".to_owned()))?;
+    let bytes = archive
+        .get(512..512_usize.saturating_add(size))
+        .ok_or_else(|| ApiError::Admission("browser Task input archive is truncated".to_owned()))?;
+    let inputs: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| ApiError::Admission("browser Task inputs are invalid".to_owned()))?;
+    if !inputs.is_object() {
+        return Err(ApiError::Admission(
+            "browser Task inputs must be a JSON object".to_owned(),
+        ));
+    }
+    Ok(inputs)
 }
 
 fn write_tar_octal(field: &mut [u8], value: u64) -> Result<(), ApiError> {
@@ -3944,7 +4108,8 @@ mod workflow_request_tests {
     use std::sync::Arc;
 
     use super::{
-        TaskApiConfig, TaskCreateRequest, TaskSubmissionRequest, resolve_versioned_task_plan,
+        TaskApiConfig, TaskCreateRequest, TaskSubmissionRequest, browser_inputs_archive,
+        browser_inputs_from_archive, browser_rerun_submission, resolve_versioned_task_plan,
         stable_task_runtime_name, task_orchestration_reservation, versioned_workflow_reference,
     };
     use crate::{ApiError, TaskIdentity};
@@ -3959,6 +4124,55 @@ mod workflow_request_tests {
     use uuid::Uuid;
 
     struct ExampleExecutionAdapter;
+
+    #[test]
+    fn browser_inputs_round_trip_through_the_persisted_archive() -> Result<(), String> {
+        let inputs = serde_json::json!({
+            "release": "v1.2.3",
+            "nested": { "enabled": true },
+        });
+        let archive = browser_inputs_archive(&inputs).map_err(|error| error.to_string())?;
+        assert_eq!(
+            browser_inputs_from_archive(&archive).map_err(|error| error.to_string())?,
+            inputs
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn browser_rerun_preserves_the_exact_package_inputs_and_diagnostics() -> Result<(), String> {
+        let evidence = serde_json::from_value(serde_json::json!({
+            "source": "inline",
+            "revision": "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "path": "task-definition.json",
+            "closureDigest": "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "inlineFiles": {
+                "task-definition.json": "{}",
+                "prompt.md": "Inspect the repository."
+            },
+            "diagnostics": { "executionLog": "full" }
+        }))
+        .map_err(|error| error.to_string())?;
+        let inputs = serde_json::json!({ "repository": "example-org/repository" });
+        let current_digest = steward_types::direct_package::EnvelopeDigest::parse(format!(
+            "steward:sha256:{}",
+            "b".repeat(64)
+        ))?;
+
+        let request = browser_rerun_submission(&evidence, inputs.clone(), current_digest.clone());
+
+        assert_eq!(request.package.source, evidence.source);
+        assert_eq!(
+            request.package.revision.as_deref(),
+            Some(evidence.revision.as_str())
+        );
+        assert_eq!(request.package.path, evidence.path);
+        assert_eq!(request.package.files, evidence.inline_files);
+        assert_eq!(request.inputs, inputs);
+        assert_eq!(request.diagnostics, evidence.diagnostics);
+        assert_eq!(request.envelope_digest, Some(current_digest));
+        Ok(())
+    }
 
     impl TaskExecutionAdapter for ExampleExecutionAdapter {
         fn contract(&self) -> &'static str {

@@ -3,16 +3,18 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BrowserRunView } from "@/api-client";
 
-import { exactRepositoryBundle, pollRerun, rerunFailureMessage, RunCards } from "./run-views";
+import { exactRepositoryBundle, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
     codingAgentRuntime: "codex@0.140.0",
     createdAt: "2026-08-25T20:00:00Z",
+    executionLog: "off",
     finalizationRequested: false,
     finalized: true,
     origin: "unknown",
     phase: "succeeded",
+    rerunSupported: false,
     runtimeOwnership: "provisioned",
     stages: [],
     taskUid: "task-default",
@@ -21,6 +23,16 @@ function run(overrides: Partial<BrowserRunView>): BrowserRunView {
     ...overrides,
   };
 }
+
+test("run event snapshots retain their monotonic resume identifier", () => {
+  const snapshot = parseRunEventSnapshot(`retry: 2000\nid: 42\nevent: snapshot\ndata: ${JSON.stringify({
+    eventId: 42,
+    run: run({ taskUid: "task-live", phase: "running" }),
+    timeline: { apiVersion: "steward.browser-runs/v1", taskUid: "task-live", events: [] },
+  })}\n\n`);
+  expect(snapshot?.eventId).toBe(42);
+  expect(snapshot?.run.phase).toBe("running");
+});
 
 describe("run table", () => {
   test("renders newest-first in an internally scrollable table with conventional outcome colors", () => {

@@ -231,6 +231,9 @@ const run = {
   updatedAt: "2026-08-24T17:03:00Z",
   observedSpend: { observedAmount: "1.25", currency: "USD", exhausted: false },
   errorCategory: null,
+  executionLog: "full",
+  rerunSupported: true,
+  rerunUnavailableReason: null,
   stages: [
     { id: "admission", displayName: "Admission", state: "succeeded", steps: [] },
     { id: "provision_runtime", displayName: "Provision runtime", state: "succeeded", steps: [] },
@@ -927,6 +930,24 @@ async function guardedPage(browser, {
     return route.request().url().endsWith("/timeline")
       ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
       : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...fixtureRun, phase: runPhase } });
+  });
+  await context.route(`${origin}/app/api/v1/runs/${taskUid}/events`, (route) => {
+    const snapshot = {
+      apiVersion: "steward.browser-runs/v1",
+      eventId: 1,
+      run: { ...fixtureRun, phase: runPhase },
+      timeline: {
+        apiVersion: "steward.browser-runs/v1",
+        taskUid,
+        events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }],
+      },
+    };
+    return route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: `retry: 2000\nid: 1\nevent: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n: heartbeat\n\n`,
+      headers: { "cache-control": "no-cache, no-transform", "x-accel-buffering": "no" },
+    });
   });
   await context.route(`${origin}/app/api/v1/runs/${taskUid}/package`, (route) => json(route, {
     taskUid,
@@ -1774,9 +1795,9 @@ test("empty entity collections show contextual product copy", async ({ browser }
       ["/envelopes", "No envelopes yet."],
       [`/envelopes/${envelopeId}/runs`, "No runs yet."],
       ["/runs", "No runs yet."],
-      [`/runs/${taskUid}`, "No steps reported"],
+      [`/runs/${taskUid}`, "The Task was admitted under the selected Envelope."],
       ["/admin/runs", "No runs yet."],
-      [`/admin/runs/${taskUid}`, "No steps reported"],
+      [`/admin/runs/${taskUid}`, "The Task was admitted under the selected Envelope."],
       ["/admin/envelopes/templates", "No templates yet."],
       ["/admin/envelopes/provision", "No templates"],
       ["/admin/workflows", "No workflows yet"],
@@ -2046,6 +2067,7 @@ test("Run now submits an inline package under the selected envelope", async ({ b
   const developer = await guardedPage(browser, { publishedWorkflows: false });
   try {
     await developer.page.goto(`${origin}/runs/new`);
+    await developer.page.getByRole("checkbox", { name: /Capture execution log/ }).check();
     await developer.page.getByRole("button", { name: "Run now" }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
 
@@ -2056,6 +2078,7 @@ test("Run now submits an inline package under the selected envelope", async ({ b
     expect(submission.body.package.source).toBe("inline");
     expect(submission.body.package.path).toBe(browserTaskDefinitionPath);
     expect(submission.body.package.files["prompt.md"]).toContain("hello world");
+    expect(submission.body.diagnostics).toEqual({ executionLog: "full" });
     const taskDefinition = JSON.parse(submission.body.package.files[browserTaskDefinitionPath]);
     expect(taskDefinition.runtime).toEqual({ agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } });
     expect(taskDefinition.requires.authority.llms).toEqual([{ provider: "openai", model: "gpt-5.4" }]);
@@ -2190,6 +2213,143 @@ test("GitHub re-run polls with one idempotency key until the new Task is correla
   }
 });
 
+test("browser-origin re-run uses the browser admission boundary", async ({ browser }) => {
+  const developer = await guardedPage(browser, { inlineRun: true });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await developer.page.getByRole("button", { name: "Re-run" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${rerunTaskUid}`);
+
+    const rerun = developer.mutations.find((mutation) => mutation.path.endsWith("/rerun"));
+    expectMutationProof(rerun);
+    expect(rerun.body.idempotencyKey).toBeTruthy();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("run detail follows SSE snapshots from submitted to terminal without reload", async ({ browser }) => {
+  const developer = await guardedPage(browser, { runPhase: "submitted" });
+  let eventRequest = 0;
+  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}/events`, async (route) => {
+    eventRequest += 1;
+    if (eventRequest === 1) await new Promise((resolve) => setTimeout(resolve, 200));
+    const terminal = eventRequest > 1;
+    const phase = terminal ? "succeeded" : "running";
+    const snapshot = {
+      apiVersion: "steward.browser-runs/v1",
+      eventId: eventRequest,
+      run: {
+        ...run,
+        phase,
+        runtimeUid: "runtime-live-1",
+        stages: run.stages.map((stage) => ({
+          ...stage,
+          state: stage.id === "agent_execution" ? phase : "succeeded",
+        })),
+      },
+      timeline: {
+        apiVersion: "steward.browser-runs/v1",
+        taskUid,
+        events: [
+          { kind: "phase", phase, at: terminal ? "2026-08-24T17:03:00Z" : "2026-08-24T17:02:15Z" },
+          { kind: "runtimeBound", runtimeUid: "runtime-live-1", at: "2026-08-24T17:02:10Z" },
+        ],
+      },
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: `retry: 2000\nid: ${eventRequest}\nevent: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`,
+    });
+  });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByText("submitted", { exact: true }).first()).toBeVisible();
+    await expect(developer.page.locator("article > header").getByText("running", { exact: true })).toBeVisible();
+    await expect(developer.page.locator("article > header").getByText("succeeded", { exact: true })).toBeVisible({ timeout: 5_000 });
+    await expect(developer.page.getByText("runtime-live-1", { exact: true })).toBeVisible();
+    expect(eventRequest).toBeGreaterThanOrEqual(2);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("run detail falls back to bounded polling when SSE is unavailable", async ({ browser }) => {
+  const developer = await guardedPage(browser, { runPhase: "submitted" });
+  let runRequest = 0;
+  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}/events`, (route) => route.fulfill({
+    status: 200,
+    contentType: "text/event-stream",
+    body: ": no snapshot available\n\n",
+  }));
+  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}`, (route) => {
+    runRequest += 1;
+    const phase = runRequest > 1 ? "succeeded" : "submitted";
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ apiVersion: "steward.browser-runs/v1", run: { ...run, phase } }),
+    });
+  });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByText("submitted", { exact: true }).first()).toBeVisible();
+    await expect.poll(() => runRequest, { timeout: 5_000 }).toBeGreaterThanOrEqual(2);
+    await expect(developer.page.locator("article > header").getByText("succeeded", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("job and log stream deep links survive reload and browser history", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}?job=agent_execution&stream=stderr`);
+    await expect(developer.page.getByRole("heading", { name: "Agent execution" })).toBeVisible();
+    await expect(developer.page.getByRole("tab", { name: "stderr" })).toHaveAttribute("aria-selected", "true");
+    await developer.page.reload();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}?job=agent_execution&stream=stderr`);
+    await expect(developer.page.getByRole("tab", { name: "stderr" })).toHaveAttribute("aria-selected", "true");
+
+    await developer.page.getByRole("button", { name: "Admission" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}?job=admission`);
+    await developer.page.goBack();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}?job=agent_execution&stream=stderr`);
+    await expect(developer.page.getByRole("tab", { name: "stderr" })).toHaveAttribute("aria-selected", "true");
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("logging-off runs explain that no transcript was captured", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  const loggingOffRun = {
+    ...run,
+    executionLog: "off",
+    stages: run.stages.map((stage) => stage.id === "agent_execution"
+      ? { ...stage, steps: [{ ...stage.steps[0], logStreams: [] }] }
+      : stage),
+  };
+  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}/events`, (route) => route.fulfill({
+    status: 200,
+    contentType: "text/event-stream",
+    body: ": no snapshot available\n\n",
+  }));
+  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}`, (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ apiVersion: "steward.browser-runs/v1", run: loggingOffRun }),
+  }));
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}?job=agent_execution`);
+    await expect(developer.page.getByText("No execution log was captured for this run.", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("region", { name: "Execution log" })).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("failed run phases expose stdout and stderr as escaped sensitive output", async ({ browser }) => {
   const developer = await guardedPage(browser, {
     executionLogs: {
@@ -2215,9 +2375,7 @@ test("failed run phases expose stdout and stderr as escaped sensitive output", a
     await expect(developer.page.locator("#executed")).toHaveCount(0);
 
     await developer.page.getByRole("link", { name: "Back to run" }).click();
-    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
-    await developer.page.getByRole("button", { name: /Agent execution/ }).click();
-    await developer.page.getByText("Execution", { exact: true }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}?job=agent_execution&stream=stdout`);
     await developer.page.getByRole("tab", { name: "stderr" }).click();
     const stderrLink = developer.page.getByRole("link", { name: "Open full page" });
     await expect(stderrLink).toHaveAttribute("href", `/runs/${taskUid}/logs/stderr`);
@@ -2258,7 +2416,7 @@ test("administrator run logs use the administrator boundary and report unavailab
     await administrator.page.getByRole("tab", { name: "stderr" }).click();
     await administrator.page.getByRole("link", { name: "Open full page" }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/runs/${taskUid}/logs/stderr`);
-    await expect(administrator.page.getByRole("status")).toHaveText("stderr log is unavailable for this run.");
+    await expect(administrator.page.getByRole("status")).toContainText("No execution log was captured for this run.");
     const requestedPaths = administrator.executionLogRequests.map((request) => new URL(request.url()).pathname);
     expect(requestedPaths).toContain(`/admin/api/v1/all-runs/${taskUid}/logs/stderr`);
     expect(requestedPaths.every((path) => path.startsWith(`/admin/api/v1/all-runs/${taskUid}/logs/`))).toBe(true);
