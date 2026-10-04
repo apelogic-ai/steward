@@ -1114,11 +1114,18 @@
     "spire": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["csiDriver", "socketPath", "identityPath"],
+      "required": ["className", "csiDriver", "socketPath", "identityPath", "sandboxRegistration"],
       "properties": {
+        "className": {"type": "string"},
         "csiDriver": {"$ref": "#/definitions/nonempty"},
         "socketPath": {"type": "string", "pattern": "^/", "minLength": 2},
-        "identityPath": {"type": "string", "pattern": "^/[a-z0-9/_-]+$", "minLength": 2}
+        "identityPath": {"type": "string", "pattern": "^/[a-z0-9/_-]+$", "minLength": 2},
+        "sandboxRegistration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {"enabled": {"type": "boolean"}}
+        }
       }
     },
     "services": {
@@ -1194,6 +1201,7 @@
       "then": {
         "properties": {
           "images": {"properties": {"mint": {"$ref": "#/definitions/image"}}},
+          "spire": {"properties": {"className": {"$ref": "#/definitions/nonempty"}}},
           "config": {
             "properties": {
               "mint": {

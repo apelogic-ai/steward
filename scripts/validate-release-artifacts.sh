@@ -121,6 +121,7 @@ if [[ "${chart_contract_mode}" == customer-v1 ]]; then
     --set-string config.mint.issuer=https://mint.example.test
     --set-string config.mint.spiffeTrustDomain=customer.example.test
     --set-string config.mint.openshellNamespace=customer-openshell
+    --set-string spire.className=spire-spire
   )
 fi
 image_values+=(
@@ -1221,7 +1222,11 @@ test "$(grep -c '^kind: ServiceAccount$' "${rendered}")" -eq 3
 test "$(grep -c '^kind: NetworkPolicy$' "${rendered}")" -eq 8
 test "$(grep -c '^kind: Role$' "${rendered}")" -eq 4
 test "$(grep -c '^kind: RoleBinding$' "${rendered}")" -eq 4
-test "$(grep -c '^kind: ClusterSPIFFEID$' "${rendered}")" -eq 1
+test "$(grep -c '^kind: ClusterSPIFFEID$' "${rendered}")" -eq 2
+test "$(grep -c '^  className: spire-spire$' "${rendered}")" -eq 2
+grep -q '^  name: steward-openshell-sandboxes$' "${rendered}"
+grep -Fq 'openshell.io/sandbox-id' "${rendered}"
+grep -q '^      openshell.ai/managed-by: openshell$' "${rendered}"
 test "$(grep -c '^  namespace: team-a$' "${rendered}")" -eq 4
 test "$(grep -c '^  namespace: steward-workflows$' "${rendered}")" -eq 4
 grep -q '^kind: CustomResourceDefinition$' "${rendered}"

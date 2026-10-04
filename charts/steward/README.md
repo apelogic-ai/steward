@@ -592,11 +592,17 @@ Steward release namespace also creates `steward-workflows`.
   `config.mint.allowedScopes` defaults to `mcp inference`. These include the
   checked-in OpenShell provider contract (`audience=steward-mcp`, `scope=mcp`)
   and the inference exchange on the same Mint instance.
-- `spire.csiDriver` and `spire.socketPath` mount the SPIFFE Workload API only in
-  the mint pod. The chart creates a `ClusterSPIFFEID` selecting the release
-  namespace and Mint pod labels, with trust domain
-  `config.mint.spiffeTrustDomain` and stable path `spire.identityPath`
-  (`/steward/mint` by default).
+- `spire.className` is required in governed mode and must exactly match the
+  class watched by the installed SPIRE controller manager. `spire.csiDriver`
+  and `spire.socketPath` mount the SPIFFE Workload API only in the mint pod.
+  The chart creates class-bound `ClusterSPIFFEID` resources for Mint and, by
+  default, stock OpenShell v0.0.98 sandboxes. The sandbox registration selects
+  `networkPolicy.openshellNamespace`, the `openshell.ai/managed-by: openshell`
+  pod label, and the `openshell.io/sandbox-id` annotation to issue
+  `spiffe://<trust-domain>/openshell/sandbox/<sandbox-id>`. Set
+  `spire.sandboxRegistration.enabled=false` only when the platform owns an
+  equivalent registration. The OpenShell installation still owns
+  `server.providerTokenGrants.spiffe` and its Workload API socket setting.
 
 Both the apiserver and controller apply the embedded append-only Postgres
 migration set on startup (currently through migration `0051`). They must
@@ -618,8 +624,9 @@ execution. It does not prove a VM isolation boundary.
 
 The supported stock OpenShell v0.0.98 deployment uses the sidecar supervisor
 with process-binary-aware network policy. When provider token grants are
-enabled, configure the sandbox ClusterSPIFFEID and Workload API socket and use
-the `openshell.io/sandbox-id` annotation contract. See
+enabled, the Steward chart supplies the sandbox `ClusterSPIFFEID`; configure
+the Workload API socket in OpenShell and use the `openshell.io/sandbox-id`
+annotation contract. See
 [OpenShell 0.0.98 governed execution](../../docs/installation/openshell-v0.0.98.md)
 for the exact values, Kubernetes 1.35 sideload setting, and diagnostic command.
 

@@ -45,6 +45,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Bound the governed Mint and stock OpenShell v0.0.98 sandbox SPIFFE
+  registrations to the operator-selected SPIRE controller class, generated the
+  sandbox registration from the chart, and changed the required governed
+  Connections lane to use the published OpenShell supervisor in the supported
+  sidecar topology instead of a local patch.
 - Fail every governed Task promptly when its exact current runtime reports a
   terminal start failure, and refused to adopt a same-name runtime whose UID
   differs from the Task's durable binding.
@@ -73,6 +78,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   unknown canonical user (`403 task_identity_unknown_user`) from an invalid
   credential (`401`), and documented Identity v6 / `steward-task-v3` as the
   recommended new-install contract while retaining v5 / v2 compatibility.
+
+### Upgrade notes
+
+- Existing governed installations must set `spire.className` before upgrading.
+  List the classes already used by the installed SPIRE controller with
+  `kubectl get clusterspiffeids.spire.spiffe.io -o custom-columns=NAME:.metadata.name,CLASS:.spec.className`,
+  then put the selected class in both the platform-preflight input and the
+  Steward chart values. Governed chart validation now fails closed when the
+  value is empty.
+- The chart now enables `spire.sandboxRegistration.enabled` by default and
+  creates `ClusterSPIFFEID/steward-openshell-sandboxes`. Before upgrading, use
+  exactly one owner for the OpenShell sandbox registration: remove the
+  existing platform-owned registration before enabling the chart-owned one, or
+  set `spire.sandboxRegistration.enabled=false` and verify that the retained
+  registration has the same namespace selector, pod selector, annotation, and
+  SPIFFE ID template documented in
+  [`docs/installation/openshell-v0.0.98.md`](docs/installation/openshell-v0.0.98.md).
+  Rerun platform preflight with the chosen `spire.className` and ownership
+  setting before applying the upgrade.
 
 ## [0.3.5] - 2026-09-30
 

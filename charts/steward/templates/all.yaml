@@ -175,6 +175,7 @@ kind: ClusterSPIFFEID
 metadata:
   name: steward-mint
 spec:
+  className: {{ .Values.spire.className }}
   spiffeIDTemplate: spiffe://{{ .Values.config.mint.spiffeTrustDomain }}{{ .Values.spire.identityPath }}
   namespaceSelector:
     matchLabels:
@@ -183,6 +184,22 @@ spec:
     matchLabels:
       app.kubernetes.io/name: steward
       app.kubernetes.io/component: mint
+{{- if .Values.spire.sandboxRegistration.enabled }}
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: steward-openshell-sandboxes
+spec:
+  className: {{ .Values.spire.className }}
+  spiffeIDTemplate: 'spiffe://{{ .Values.config.mint.spiffeTrustDomain }}/openshell/sandbox/{{ `{{ index .PodMeta.Annotations "openshell.io/sandbox-id" }}` }}'
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: {{ .Values.networkPolicy.openshellNamespace }}
+  podSelector:
+    matchLabels:
+      openshell.ai/managed-by: openshell
+{{- end }}
 {{- end }}
 {{- if eq .Values.tls.mode "certManager" }}
 ---
