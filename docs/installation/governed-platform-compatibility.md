@@ -27,6 +27,7 @@ For v0.3.6 it declares:
 
 - Task API contract `steward.task/v2`;
 - the `envelopeDigest` selector requires `steward-run` v0.7.0 or later;
+- vendored workflow installation requires `steward-run` v0.7.6 or later;
 - Identity policy contract `github-oidc-exchange.apelogic.io/v5` and Task
   identity contract `steward-task-v2`;
 - GitHub connection authority `steward.connections.github/v2`;
@@ -86,7 +87,8 @@ The real BOM also names every Steward component image, its chart, Identity, and
 the external dependency coordinates used by the tested installation. Packaging
 must verify each product handoff and the Steward product-compatibility contract
 before signing the BOM. It must reject a `steward-run` release below v0.7.0 when
-the installation uses `envelopeDigest`.
+the installation uses `envelopeDigest`, and below v0.7.6 when it selects the
+vendored workflow installation mode.
 
 For Steward browser workflow generation, project the verified steward-run
 release handoff into `config.apiserver.stewardRunRelease`. The field mapping is

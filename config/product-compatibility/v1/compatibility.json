@@ -5,6 +5,9 @@
   "clientCapabilities": {
     "envelopeDigestSelector": {
       "stewardRunMinimumVersion": "0.7.0"
+    },
+    "vendoredWorkflowInstallation": {
+      "stewardRunMinimumVersion": "0.7.6"
     }
   },
   "dependencyContracts": {

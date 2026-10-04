@@ -605,7 +605,7 @@ Steward release namespace also creates `steward-workflows`.
   `server.providerTokenGrants.spiffe` and its Workload API socket setting.
 
 Both the apiserver and controller apply the embedded append-only Postgres
-migration set on startup (currently through migration `0051`). They must
+migration set on startup (currently through migration `0063`). They must
 receive the same database URL. Review the
 [installation upgrade and backup procedure](../../docs/installation/installation-guide.md#upgrade-rollback-backup-and-removal)
 before upgrading; a Helm rollback does not reverse database migrations.

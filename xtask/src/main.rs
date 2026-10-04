@@ -4078,6 +4078,14 @@ mod tests {
         );
         assert_eq!(
             manifest
+                .pointer(
+                    "/clientCapabilities/vendoredWorkflowInstallation/stewardRunMinimumVersion",
+                )
+                .and_then(serde_json::Value::as_str),
+            Some("0.7.6")
+        );
+        assert_eq!(
+            manifest
                 .pointer("/dependencyContracts/identityPolicy")
                 .and_then(serde_json::Value::as_str),
             Some("github-oidc-exchange.apelogic.io/v5")
