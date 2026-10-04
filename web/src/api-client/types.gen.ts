@@ -4263,6 +4263,10 @@ export type RerunMyRunErrors = {
      */
     409: unknown;
     /**
+     * The persisted browser package no longer fits the current Envelope
+     */
+    422: unknown;
+    /**
      * Run submission is unavailable; connections.orchestration_not_active identifies staged task orchestration
      */
     503: RerunErrorResponse;
