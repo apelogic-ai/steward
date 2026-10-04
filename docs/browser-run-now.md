@@ -28,10 +28,13 @@ them.
 Git reads use the deployment's configured source adapter. Browser runs accept only a
 repository whose stable owner and repository IDs appear as a `source` in the
 operator-managed source-repository binding catalog. Steward enforces that allowlist
-before reading package content. The adapter then authenticates the repository,
-resolves symbolic refs before reading package files, and revalidates the stable
-repository identity. The browser session remains the Task's acting-user authority and
-audit identity; repository authentication does not grant runtime authority.
+before reading package content. An unlisted repository and a repository that the
+source adapter cannot resolve return the same authorization response, so this endpoint
+does not reveal private repository existence. The adapter then authenticates the
+repository, resolves symbolic refs before reading package files, and revalidates the
+stable repository identity. The browser session remains the Task's acting-user
+authority and audit identity; repository authentication does not grant runtime
+authority.
 
 Every source resolves to the same v2 TaskDefinition and package-closure rules. Inline
 files are limited to 64 KiB in total. `inputs` must be a JSON object of at most 16 KiB
