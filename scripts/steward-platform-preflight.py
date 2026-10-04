@@ -371,10 +371,23 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
             validate_name(require_string(namespaces, key, "namespaces"), f"namespaces.{key}")
 
     spire = require_object(data, "spire", "input")
-    require_exact_keys(spire, {"className"}, "spire")
+    require_exact_keys(spire, {"className", "sandboxRegistration"}, "spire")
     if "className" not in spire:
         raise ValidationError("spire.className is required")
     validate_name(require_string(spire, "className", "spire"), "spire.className")
+    if "sandboxRegistration" in spire:
+        sandbox_registration = require_object(
+            spire, "sandboxRegistration", "spire"
+        )
+        require_exact_keys(
+            sandbox_registration,
+            {"enabled"},
+            "spire.sandboxRegistration",
+        )
+        if not isinstance(sandbox_registration.get("enabled"), bool):
+            raise ValidationError(
+                "spire.sandboxRegistration.enabled must be a boolean"
+            )
 
     lock = require_object(data, "deploymentLock", "input")
     require_exact_keys(
@@ -708,6 +721,9 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
     execution = data["execution"]
     endpoints = execution["endpoints"]
     binding = execution["binding"]
+    sandbox_registration_enabled = data["spire"].get(
+        "sandboxRegistration", {"enabled": True}
+    )["enabled"]
     values: dict[str, Any] = {
         "images": images,
         "execution": {"enabled": True},
@@ -765,7 +781,7 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
         ),
         "spire": {
             "className": data["spire"]["className"],
-            "sandboxRegistration": {"enabled": True},
+            "sandboxRegistration": {"enabled": sandbox_registration_enabled},
         },
         "connectionsBridge": {
             "enabled": True,

@@ -603,6 +603,54 @@ class PlatformPreflightTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("spire.className is required", result.stderr)
 
+    def test_preserves_platform_owned_sandbox_registration(self) -> None:
+        self.input["spire"]["sandboxRegistration"] = {"enabled": False}
+        with tempfile.TemporaryDirectory() as directory:
+            base = pathlib.Path(directory)
+            input_path = base / "input.json"
+            output = base / "rendered"
+            input_path.write_text(json.dumps(self.input), encoding="utf-8")
+            generated = subprocess.run(
+                [
+                    str(TOOL),
+                    "generate",
+                    "--input",
+                    str(input_path),
+                    "--provider-profile-bundle",
+                    str(self.profile_bundle),
+                    "--chart",
+                    str(ROOT / "charts" / "steward"),
+                    "--output",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            values = json.loads((output / "steward-values.json").read_text(encoding="utf-8"))
+            self.assertEqual(values["spire"]["sandboxRegistration"], {"enabled": False})
+
+            rendered = subprocess.run(
+                [
+                    "helm",
+                    "template",
+                    "steward",
+                    str(ROOT / "charts" / "steward"),
+                    "--namespace",
+                    "steward-system",
+                    "--values",
+                    str(output / "steward-values.json"),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            self.assertEqual(rendered.stdout.count("kind: ClusterSPIFFEID"), 1)
+            self.assertNotIn("name: steward-openshell-sandboxes", rendered.stdout)
+
     def test_rejects_incomplete_gateway_tls_or_unknown_connection_contract(self) -> None:
         del self.input["gateway"]["backendTls"]
         result = self.run_validate(self.input)

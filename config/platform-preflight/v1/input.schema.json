@@ -47,7 +47,15 @@
       "required": ["className"],
       "additionalProperties": false,
       "properties": {
-        "className": {"$ref": "#/$defs/name"}
+        "className": {"$ref": "#/$defs/name"},
+        "sandboxRegistration": {
+          "type": "object",
+          "required": ["enabled"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"}
+          }
+        }
       }
     },
     "deploymentLock": {

@@ -63,8 +63,11 @@ namespace layouts.
 The required `spire.className` input is copied into chart values so both the
 Mint and stock OpenShell v0.0.98 sandbox `ClusterSPIFFEID` resources bind to
 the controller that is actually watching them. Preflight enables the chart's
-sandbox registration; the platform must separately enable OpenShell's
-SPIFFE-backed provider token grants.
+sandbox registration by default. Set
+`spire.sandboxRegistration.enabled` to `false` in the preflight input when the
+platform retains an exactly equivalent sandbox registration; the generated
+Steward values preserve that ownership choice. The platform must separately
+enable OpenShell's SPIFFE-backed provider token grants.
 
 The capability catalog is descriptive template-editor availability; it is not
 runtime authority. The execution binding selects an immutable coding-agent
