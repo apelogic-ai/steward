@@ -2741,10 +2741,8 @@ mod tests {
         );
         for required in [
             "STEWARD_OPEN_SHELL_RELEASE=v0.0.98",
-            "sha256:80bef7bee93482c8091335ae27c3c3e968e5c78c2bb4a40b401e6af36f70f993",
+            "sha256:9f1d76b7418caca120ab1651eb5335269127b1b3bccf4abaad79132d7a64cfe4",
             "e2e/Dockerfile.workflow-sandbox",
-            "scripts/build-patched-openshell-supervisor.sh",
-            "STEWARD_OPENSHELL_SUPERVISOR_IMAGE",
             "STEWARD_OPENSHELL_SANDBOX_IMAGE",
             "e2e/Dockerfile.governed-connections-prebuilt",
             "governed-connections timing: setup-and-build-seconds=",
@@ -2753,6 +2751,27 @@ mod tests {
             assert!(
                 outer.contains(required),
                 "outer harness is missing {required}"
+            );
+        }
+        for forbidden in [
+            "scripts/build-patched-openshell-supervisor.sh",
+            "STEWARD_OPENSHELL_SUPERVISOR_IMAGE",
+        ] {
+            assert!(
+                !outer.contains(forbidden),
+                "governed Connections must use the stock published OpenShell supervisor: found {forbidden}"
+            );
+        }
+        let testbed = fs::read_to_string(root().join("scripts/openshell-testbed.sh"))
+            .map_err(|error| format!("OpenShell testbed harness is required: {error}"))?;
+        for required in [
+            "supervisor.topology=sidecar",
+            "supervisor.sidecar.processBinaryAwareNetworkPolicy=true",
+            "supervisor.sideloadMethod=init-container",
+        ] {
+            assert!(
+                testbed.contains(required),
+                "stock OpenShell governed testbed is missing {required}"
             );
         }
         for required in [
@@ -3505,6 +3524,18 @@ mod tests {
             templates.contains("spiffeIDTemplate: spiffe://{{ .Values.config.mint.spiffeTrustDomain }}{{ .Values.spire.identityPath }}"),
             "Mint ClusterSPIFFEID must bind the configured trust domain and identity path"
         );
+        for required in [
+            "className: {{ .Values.spire.className }}",
+            "name: steward-openshell-sandboxes",
+            "spiffe://{{ .Values.config.mint.spiffeTrustDomain }}/openshell/sandbox/",
+            "openshell.io/sandbox-id",
+            "openshell.ai/managed-by: openshell",
+        ] {
+            assert!(
+                templates.contains(required),
+                "governed chart is missing the stock OpenShell 0.0.98 SPIFFE registration contract: {required}"
+            );
+        }
         assert!(
             values.contains("identityPath: /steward/mint"),
             "Mint must use the stable /steward/mint SPIFFE identity by default"

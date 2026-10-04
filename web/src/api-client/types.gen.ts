@@ -431,6 +431,69 @@ export type BrowserFederatedSubjectView = {
     updatedAt: string;
 };
 
+export type BrowserMemberAssignmentAction = 'grant' | 'revoke';
+
+export type BrowserMemberAssignmentKind = 'administrator' | 'member_role';
+
+export type BrowserMemberDetailResponse = {
+    apiVersion: string;
+    member: BrowserMemberDetailView;
+};
+
+export type BrowserMemberDetailView = BrowserMemberView & {
+    identities: Array<BrowserMemberIdentityView>;
+};
+
+export type BrowserMemberIdentityView = {
+    associationMethod: string;
+    displayName?: string | null;
+    issuer: string;
+    linkedAt: string;
+    linkedBy: string;
+    revision: number;
+    state: string;
+    subject: string;
+    subjectId: string;
+};
+
+export type BrowserMemberInvitationResult = {
+    email: string;
+    member?: null | BrowserMemberView;
+    status: BrowserMemberInvitationStatus;
+};
+
+export type BrowserMemberInvitationStatus = 'invited' | 'already_member' | 'invalid';
+
+export type BrowserMemberInvitationsResponse = {
+    apiVersion: string;
+    results: Array<BrowserMemberInvitationResult>;
+};
+
+export type BrowserMemberResponse = {
+    apiVersion: string;
+    member: BrowserMemberView;
+};
+
+export type BrowserMemberStateRequestAction = 'disable' | 'enable' | 'revoke_invitation';
+
+export type BrowserMemberView = {
+    administrator: boolean;
+    createdAt: string;
+    displayEmail: string;
+    displayName?: string | null;
+    identityCount: number;
+    invitedBy?: string | null;
+    lastSignInAt?: string | null;
+    memberRoles: Array<string>;
+    state: string;
+    userId: string;
+};
+
+export type BrowserMembersResponse = {
+    apiVersion: string;
+    members: Array<BrowserMemberView>;
+};
+
 export type BrowserMutationRequest = {
     [key: string]: never;
 };
@@ -466,6 +529,13 @@ export type BrowserResolvedPackage = {
 
 export type BrowserRole = 'user' | 'admin';
 
+export type BrowserRunEventSnapshot = {
+    apiVersion: string;
+    eventId: number;
+    run: BrowserRunView;
+    timeline: BrowserRunTimelineResponse;
+};
+
 export type BrowserRunExitCategory = 'succeeded' | 'failed' | 'cancelled';
 
 export type BrowserRunFacets = {
@@ -483,7 +553,15 @@ export type BrowserRunOutputsResponse = {
     taskUid: string;
 };
 
+export type BrowserRunPackageContentResponse = {
+    files: {
+        [key: string]: string;
+    };
+    taskUid: string;
+};
+
 export type BrowserRunPackageView = {
+    contentDigest?: string | null;
     path: string;
     revision: string;
     source: string;
@@ -582,12 +660,15 @@ export type BrowserRunView = {
     codingAgentRuntime: string;
     createdAt: string;
     errorCategory?: string | null;
+    executionLog: ExecutionLogMode;
     finalizationRequested: boolean;
     finalized: boolean;
     observedSpend?: null | AgentRunSpendView;
     origin: TaskOrigin;
     package?: null | BrowserRunPackageView;
     phase: TaskPhase;
+    rerunSupported: boolean;
+    rerunUnavailableReason?: string | null;
     runtimeOwnership: RuntimeOwnership;
     runtimeUid?: string | null;
     stages: Array<BrowserRunStage>;
@@ -606,6 +687,7 @@ export type BrowserRunView = {
 export type BrowserTaskEvidence = {
     closure?: null | PackageClosure;
     closureDigest: ContentDigest;
+    diagnostics?: DiagnosticsRequest;
     inlineFiles?: {
         [key: string]: unknown;
     } | null;
@@ -615,6 +697,7 @@ export type BrowserTaskEvidence = {
 };
 
 export type BrowserTaskSubmission = {
+    diagnostics?: DiagnosticsRequest;
     envelopeDigest?: null | EnvelopeDigest;
     inputs?: unknown;
     package: BrowserPackageLocator;
@@ -675,6 +758,17 @@ export type CapabilityTool = {
     action: string;
     provider: string;
     resource: string;
+    toolsets?: Array<string>;
+};
+
+export type ChangeBrowserMemberRoleBody = {
+    action: BrowserMemberAssignmentAction;
+    kind: BrowserMemberAssignmentKind;
+    memberRole?: string | null;
+};
+
+export type ChangeBrowserMemberStateBody = {
+    action: BrowserMemberStateRequestAction;
 };
 
 export type ClosureEntry = {
@@ -688,6 +782,7 @@ export type ClosureEntryKind = 'task_definition' | 'prompt' | 'instruction_skill
 
 export type ConnectionOperationErrorResponse = {
     apiVersion: string;
+    code?: string | null;
     detail?: string | null;
     error: string;
     upstreamStatus?: number | null;
@@ -701,6 +796,7 @@ export type ConnectionStartOperationResponse = {
      * One-time HTTPS destination. It must not be persisted or logged by clients.
      */
     authorizationUrl?: string | null;
+    code?: string | null;
     detail?: string | null;
     error?: string | null;
     /**
@@ -728,6 +824,12 @@ export type ConnectionsCollectionResponse = {
 };
 
 export type ContentDigest = string;
+
+export type CreateBrowserMemberBody = {
+    administrator?: boolean;
+    emails: Array<string>;
+    memberRoles?: Array<string>;
+};
 
 export type CreateEnvelopeRequestBody = {
     idempotencyKey: string;
@@ -1149,6 +1251,10 @@ export type PublishedWorkflowOption = {
 };
 
 export type PublishedWorkflowsResponse = {
+    /**
+     * Exact logical agent references from the deployment-owned execution catalog.
+     */
+    agents: Array<ExecutionBindingAdvertisement>;
     apiVersion: string;
     workflows: Array<PublishedWorkflowOption>;
 };
@@ -1357,6 +1463,10 @@ export type TriggerRepository = {
 export type UnknownTaskIdentityErrorResponse = {
     error: string;
     message: string;
+};
+
+export type UnlinkBrowserMemberIdentityBody = {
+    expectedRevision: number;
 };
 
 export type UpdateBrowserPreferences = {
@@ -2524,6 +2634,242 @@ export type ReplaceAdminFederatedSubjectAssociationResponses = {
 };
 
 export type ReplaceAdminFederatedSubjectAssociationResponse = ReplaceAdminFederatedSubjectAssociationResponses[keyof ReplaceAdminFederatedSubjectAssociationResponses];
+
+export type ListAdminMembersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/members';
+};
+
+export type ListAdminMembersErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Member records are unavailable
+     */
+    503: unknown;
+};
+
+export type ListAdminMembersResponses = {
+    200: BrowserMembersResponse;
+};
+
+export type ListAdminMembersResponse = ListAdminMembersResponses[keyof ListAdminMembersResponses];
+
+export type CreateAdminMemberData = {
+    body: CreateBrowserMemberBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path?: never;
+    query?: never;
+    url: '/admin/api/v1/members';
+};
+
+export type CreateAdminMemberErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Member email is invalid
+     */
+    422: unknown;
+    /**
+     * Member records are unavailable
+     */
+    503: unknown;
+};
+
+export type CreateAdminMemberResponses = {
+    200: BrowserMemberInvitationsResponse;
+};
+
+export type CreateAdminMemberResponse = CreateAdminMemberResponses[keyof CreateAdminMemberResponses];
+
+export type GetAdminMemberData = {
+    body?: never;
+    path: {
+        user_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/members/{user_id}';
+};
+
+export type GetAdminMemberErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role is required
+     */
+    403: unknown;
+    /**
+     * Member was not found
+     */
+    404: unknown;
+    /**
+     * Member records are unavailable
+     */
+    503: unknown;
+};
+
+export type GetAdminMemberResponses = {
+    200: BrowserMemberDetailResponse;
+};
+
+export type GetAdminMemberResponse = GetAdminMemberResponses[keyof GetAdminMemberResponses];
+
+export type UnlinkAdminMemberIdentityData = {
+    body: UnlinkBrowserMemberIdentityBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        user_id: string;
+        subject_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/members/{user_id}/identities/{subject_id}/unlink';
+};
+
+export type UnlinkAdminMemberIdentityErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Member identity was not found
+     */
+    404: unknown;
+    /**
+     * Identity state or revision conflicts
+     */
+    409: unknown;
+    /**
+     * Unlink request is invalid
+     */
+    422: unknown;
+    /**
+     * Member identity is unavailable
+     */
+    503: unknown;
+};
+
+export type UnlinkAdminMemberIdentityResponses = {
+    /**
+     * Identity was returned to the unassociated pool
+     */
+    204: void;
+};
+
+export type UnlinkAdminMemberIdentityResponse = UnlinkAdminMemberIdentityResponses[keyof UnlinkAdminMemberIdentityResponses];
+
+export type ChangeAdminMemberRoleData = {
+    body: ChangeBrowserMemberRoleBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        user_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/members/{user_id}/roles';
+};
+
+export type ChangeAdminMemberRoleErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Member was not found
+     */
+    404: unknown;
+    /**
+     * The last active administrator cannot be revoked
+     */
+    409: unknown;
+    /**
+     * Role change is invalid
+     */
+    422: unknown;
+    /**
+     * Member records are unavailable
+     */
+    503: unknown;
+};
+
+export type ChangeAdminMemberRoleResponses = {
+    200: BrowserMemberResponse;
+};
+
+export type ChangeAdminMemberRoleResponse = ChangeAdminMemberRoleResponses[keyof ChangeAdminMemberRoleResponses];
+
+export type ChangeAdminMemberStateData = {
+    body: ChangeBrowserMemberStateBody;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        user_id: string;
+    };
+    query?: never;
+    url: '/admin/api/v1/members/{user_id}/state';
+};
+
+export type ChangeAdminMemberStateErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Administrator role, origin, fetch metadata, or CSRF proof is invalid
+     */
+    403: unknown;
+    /**
+     * Member was not found
+     */
+    404: unknown;
+    /**
+     * The member state changed, or self/last-administrator protection applied
+     */
+    409: unknown;
+    /**
+     * State change is invalid
+     */
+    422: unknown;
+    /**
+     * Member records are unavailable
+     */
+    503: unknown;
+};
+
+export type ChangeAdminMemberStateResponses = {
+    200: BrowserMemberResponse;
+};
+
+export type ChangeAdminMemberStateResponse = ChangeAdminMemberStateResponses[keyof ChangeAdminMemberStateResponses];
 
 export type ListAdminRequestsData = {
     body?: never;
@@ -3717,6 +4063,39 @@ export type CancelMyRunResponses = {
 
 export type CancelMyRunResponse = CancelMyRunResponses[keyof CancelMyRunResponses];
 
+export type MyRunEventsData = {
+    body?: never;
+    headers?: {
+        'Last-Event-ID'?: number | null;
+    };
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/events';
+};
+
+export type MyRunEventsErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Run was not found in the user's scope
+     */
+    404: unknown;
+    /**
+     * Run history is unavailable
+     */
+    503: unknown;
+};
+
+export type MyRunEventsResponses = {
+    200: string;
+};
+
+export type MyRunEventsResponse = MyRunEventsResponses[keyof MyRunEventsResponses];
+
 export type MyRunExecutionLogData = {
     body?: never;
     path: {
@@ -3820,6 +4199,36 @@ export type DownloadMyRunOutputResponses = {
 
 export type DownloadMyRunOutputResponse = DownloadMyRunOutputResponses[keyof DownloadMyRunOutputResponses];
 
+export type MyRunPackageData = {
+    body?: never;
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/package';
+};
+
+export type MyRunPackageErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Exact successful inline package is unavailable
+     */
+    404: unknown;
+    /**
+     * Run package is unavailable
+     */
+    503: unknown;
+};
+
+export type MyRunPackageResponses = {
+    200: BrowserRunPackageContentResponse;
+};
+
+export type MyRunPackageResponse = MyRunPackageResponses[keyof MyRunPackageResponses];
+
 export type RerunMyRunData = {
     body: RerunRequest;
     headers: {
@@ -3853,6 +4262,10 @@ export type RerunMyRunErrors = {
      * The original envelope is no longer active or GitHub connection authorization is pending
      */
     409: unknown;
+    /**
+     * The persisted browser package no longer fits the current Envelope
+     */
+    422: unknown;
     /**
      * Run submission is unavailable; connections.orchestration_not_active identifies staged task orchestration
      */

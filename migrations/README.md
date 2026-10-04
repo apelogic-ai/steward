@@ -143,3 +143,38 @@ deterministically backfilled from their immutable binding evidence; versioned
 Tasks begin recording the same GitHub-ratified provenance on new reservations.
 Other historical and Kubernetes-authenticated Tasks remain `NULL` and cannot be
 used as GitHub Actions readiness evidence.
+
+Migration 0057 adds the immutable authoring origin and browser Task evidence.
+It classifies existing v3 Tasks as connections, GitHub Actions, or unknown from
+their existing durable records. Migration 0054 preserves the finalized-Task
+monotonicity trigger while allowing only those three new provenance fields
+during the 0056/0057 backfills; their dedicated immutability triggers protect
+the fields once they exist. Migration 0058 restores the ordinary strict
+finalized-Task comparison.
+
+The 0054/0058 compatibility pair is additive; no existing migration checksum is
+changed. A database that failed before migration 0056 can retry normally after
+the updated binary is deployed.
+
+Migration 0059 preserves the two existing Task pin shapes and adds the distinct
+browser direct-package shape: immutable browser evidence, no legacy Workflow
+pin, and a complete approved User Envelope pin set. Published browser Workflows
+continue to use the existing complete Workflow-and-Envelope pin shape.
+
+Migration 0060 allows administrators to reserve a pending canonical member by
+verified organization email and records the inviter in the existing append-only
+identity audit. Migration 0061 adds optional OIDC display metadata and the last
+successful browser sign-in timestamp without rewriting historical members. It
+also records an administrator unlink as a new append-only federated-subject
+audit action while returning the current subject to the observed pool.
+
+Migration 0062 adds the administrator-managed member lifecycle. Disabled members
+remain canonical identities and may be re-enabled; revoked invitations remain
+immutable history but no longer reserve the organization email, so a later invite
+creates a new pending member. Every transition remains append-only in the canonical
+identity audit.
+
+Migration 0063 extends the bounded governed-connection failure detail with MCP-GW's
+optional machine-readable error code. Existing status-and-reason rows remain valid
+and unchanged. New codes are limited to 100 lowercase ASCII letters, digits,
+underscores, or hyphens; raw provider responses remain forbidden.

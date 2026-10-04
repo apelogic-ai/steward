@@ -900,6 +900,50 @@ fn task_transcript_requested(
 }
 
 #[cfg(feature = "runtime")]
+const MAX_PROVIDER_CONTROL_DIAGNOSTIC_BYTES: usize = 512;
+
+#[cfg(feature = "runtime")]
+fn sanitized_provider_control_transcript(
+    transcript: SandboxTaskTranscript,
+) -> Option<SandboxTaskTranscript> {
+    if transcript.stderr.len() > MAX_PROVIDER_CONTROL_DIAGNOSTIC_BYTES {
+        return None;
+    }
+    let stderr = std::str::from_utf8(&transcript.stderr).ok()?;
+    let line = stderr.strip_suffix('\n').unwrap_or(stderr);
+    if line.is_empty()
+        || line.contains(['\r', '\n'])
+        || !line.starts_with("steward-connections-bridge: ")
+        || !line
+            .bytes()
+            .all(|byte| byte == b' ' || byte.is_ascii_graphic())
+        || !matches!(
+            task_agent_failure_category(line.as_bytes()),
+            "bridge-runtime-authentication"
+                | "bridge-token-grant"
+                | "bridge-proxy-policy"
+                | "bridge-runtime-authorization"
+                | "bridge-response-contract"
+                | "bridge-gateway-transport"
+                | "bridge-gateway-http"
+                | "bridge-gateway-body"
+                | "bridge-gateway-unavailable"
+                | "bridge-input"
+                | "bridge-contract"
+                | "bridge-configuration"
+                | "bridge-gateway"
+                | "bridge-output"
+        )
+    {
+        return None;
+    }
+    Some(SandboxTaskTranscript {
+        stdout: Vec::new(),
+        stderr: format!("{line}\n").into_bytes(),
+    })
+}
+
+#[cfg(feature = "runtime")]
 fn task_transcript_archived(
     execution_class: SandboxExecutionClass,
     execution_log: ExecutionLogMode,
@@ -2207,9 +2251,7 @@ impl SandboxRuntime for OpenShellRuntime {
         let refs = runtime_refs(&projection);
         match snapshot.phase {
             SandboxPhase::Ready => Ok(SandboxObservation::Running { refs }),
-            SandboxPhase::Error => Err(PortError::Failed {
-                reason: "sandbox entered an error phase".to_owned(),
-            }),
+            SandboxPhase::Error => Err(PortError::SandboxFailed),
             _ => Ok(SandboxObservation::Provisioning { refs }),
         }
     }
@@ -2478,10 +2520,16 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         let transcript = if matches!(state, "running" | "succeeded" | "failed")
             && task_transcript_requested(request.execution_class, request.diagnostics.execution_log)
         {
-            Some(
-                self.task_attempt_transcript(workspace, sandbox, &attempt_directory)
-                    .await?,
-            )
+            let transcript = self
+                .task_attempt_transcript(workspace, sandbox, &attempt_directory)
+                .await?;
+            if request.execution_class == SandboxExecutionClass::ProviderControl {
+                (state == "failed")
+                    .then(|| sanitized_provider_control_transcript(transcript))
+                    .flatten()
+            } else {
+                Some(transcript)
+            }
         } else {
             None
         };
@@ -2520,8 +2568,10 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 })
             }
             "failed" => {
-                let reason =
-                    "task agent failed; inspect the bounded controller diagnostic".to_owned();
+                let reason = transcript.as_ref().map_or_else(
+                    || "task agent failed; inspect the bounded controller diagnostic".to_owned(),
+                    |transcript| task_agent_failure_category(&transcript.stderr).to_owned(),
+                );
                 Ok(if let Some(transcript) = transcript {
                     SandboxTaskObservation::FailedWithTranscript {
                         adapter_observation_id: correlation,
@@ -2806,7 +2856,7 @@ mod tests {
     #[cfg(feature = "runtime")]
     use steward_ports::{
         PortError, SandboxExecutionClass, SandboxRequest, SandboxTaskObservation,
-        SandboxTaskOutput, TaskAttemptId,
+        SandboxTaskOutput, SandboxTaskTranscript, TaskAttemptId,
     };
     #[cfg(feature = "runtime")]
     use steward_types::direct_package::ExecutionLogMode;
@@ -2828,12 +2878,12 @@ mod tests {
         attach_task_agent_failure_category, collect_task_process_stream, delete_owned_sandbox,
         deletion_names, load_source_credential, output_archive_command, project_request,
         provider_reconciliation, provider_reconciliation_plan, provider_reconciliation_targets,
-        sandbox_spec, staging_append_command, staging_archive_chunks, staging_extract_command,
-        staging_prepare_command, task_agent_failure_category, task_attempt_directory,
-        task_attempt_execution_command, task_attempt_observation_command,
-        task_attempt_transcript_stream_command, task_process_log_record, task_transcript_archived,
-        task_transcript_requested, validate_raw_sandbox_binding,
-        validate_workload_exchange_endpoint,
+        sandbox_spec, sanitized_provider_control_transcript, staging_append_command,
+        staging_archive_chunks, staging_extract_command, staging_prepare_command,
+        task_agent_failure_category, task_attempt_directory, task_attempt_execution_command,
+        task_attempt_observation_command, task_attempt_transcript_stream_command,
+        task_process_log_record, task_transcript_archived, task_transcript_requested,
+        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -3235,6 +3285,26 @@ mod tests {
             SandboxExecutionClass::Agent,
             ExecutionLogMode::Full,
         ));
+
+        assert_eq!(
+            sanitized_provider_control_transcript(SandboxTaskTranscript {
+                stdout: b"provider output that must not be persisted".to_vec(),
+                stderr: b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 [code=oauth_redirect_target_not_allowed] (OAuth redirect target is not allowed)\n".to_vec(),
+            }),
+            Some(SandboxTaskTranscript {
+                stdout: Vec::new(),
+                stderr: b"steward-connections-bridge: bridge MCP-GW returned HTTP 400 [code=oauth_redirect_target_not_allowed] (OAuth redirect target is not allowed)\n".to_vec(),
+            }),
+            "provider-control persistence must discard stdout and retain only one fixed bounded bridge diagnostic"
+        );
+        assert_eq!(
+            sanitized_provider_control_transcript(SandboxTaskTranscript {
+                stdout: Vec::new(),
+                stderr: b"steward-connections-bridge: bridge MCP-GW is unavailable\nAuthorization: Bearer obviously-fake-secret\n".to_vec(),
+            }),
+            None,
+            "multiline provider-control stderr must never reach durable task diagnostics"
+        );
     }
 
     #[cfg(feature = "runtime")]

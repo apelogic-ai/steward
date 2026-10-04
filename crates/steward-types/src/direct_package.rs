@@ -313,6 +313,8 @@ pub struct BrowserTaskSubmission {
     pub envelope_digest: Option<EnvelopeDigest>,
     #[serde(default)]
     pub inputs: serde_json::Value,
+    #[serde(default)]
+    pub diagnostics: DiagnosticsRequest,
 }
 
 impl BrowserTaskSubmission {
@@ -469,6 +471,8 @@ pub struct BrowserTaskEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Object>)]
     pub inline_files: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub diagnostics: DiagnosticsRequest,
 }
 
 impl BrowserTaskEvidence {
@@ -1208,7 +1212,7 @@ pub fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, String> 
 
 #[cfg(test)]
 mod browser_submission_tests {
-    use super::{BrowserTaskSubmission, MAX_BROWSER_INPUT_BYTES};
+    use super::{BrowserTaskEvidence, BrowserTaskSubmission, MAX_BROWSER_INPUT_BYTES};
 
     #[test]
     fn inline_package_requires_its_entry_point_and_object_inputs() -> Result<(), String> {
@@ -1252,6 +1256,52 @@ mod browser_submission_tests {
         let mut oversized = branch;
         oversized.inputs = serde_json::json!({ "value": "x".repeat(MAX_BROWSER_INPUT_BYTES) });
         assert!(oversized.validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn browser_submission_and_evidence_preserve_execution_log_diagnostics() -> Result<(), String> {
+        let submission_value = serde_json::json!({
+            "package": {
+                "source": "inline",
+                "path": "task-definition.json",
+                "files": { "task-definition.json": "{}" }
+            },
+            "inputs": {},
+            "diagnostics": { "executionLog": "full" }
+        });
+        let submission: BrowserTaskSubmission =
+            serde_json::from_value(submission_value).map_err(|error| error.to_string())?;
+        let encoded_submission =
+            serde_json::to_value(submission).map_err(|error| error.to_string())?;
+        assert_eq!(
+            encoded_submission["diagnostics"]["executionLog"],
+            serde_json::json!("full")
+        );
+
+        let evidence_value = serde_json::json!({
+            "source": "inline",
+            "revision": "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "path": "task-definition.json",
+            "closureDigest": "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "diagnostics": { "executionLog": "full" }
+        });
+        let evidence: BrowserTaskEvidence =
+            serde_json::from_value(evidence_value).map_err(|error| error.to_string())?;
+        let mut encoded_evidence =
+            serde_json::to_value(evidence).map_err(|error| error.to_string())?;
+        assert_eq!(
+            encoded_evidence["diagnostics"]["executionLog"],
+            serde_json::json!("full")
+        );
+        encoded_evidence
+            .as_object_mut()
+            .ok_or_else(|| "browser evidence was not an object".to_owned())?
+            .remove("diagnostics");
+        let legacy: BrowserTaskEvidence =
+            serde_json::from_value(encoded_evidence).map_err(|error| error.to_string())?;
+        let legacy_value = serde_json::to_value(legacy).map_err(|error| error.to_string())?;
+        assert_eq!(legacy_value["diagnostics"]["executionLog"], "off");
         Ok(())
     }
 }

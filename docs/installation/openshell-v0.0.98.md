@@ -33,34 +33,60 @@ does not require an additional RuntimeClass and makes no VM-isolation claim.
 
 ## Sandbox SPIFFE identity
 
-The SPIRE installation must create sandbox identities from OpenShell's v0.0.98
-annotation and label contract. The corresponding SPIRE chart values are:
+The Steward chart creates the sandbox registration by default when governed
+execution is enabled. Supply the exact SPIRE controller class:
 
 ```yaml
-global:
-  spire:
-    trustDomain: trust.example.test
-
-spire-server:
-  controllerManager:
-    identities:
-      clusterSPIFFEIDs:
-        openshell-sandboxes:
-          enabled: true
-          spiffeIDTemplate: >-
-            spiffe://{{ .TrustDomain }}/openshell/sandbox/{{ index .PodMeta.Annotations "openshell.io/sandbox-id" }}
-          namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: openshell
-          podSelector:
-            matchLabels:
-              openshell.ai/managed-by: openshell
+spire:
+  className: spire-spire
+  sandboxRegistration:
+    enabled: true
 ```
 
-Use the actual OpenShell namespace and the same trust domain accepted by
-Steward Mint. The identity path is derived from `openshell.io/sandbox-id` for
-OpenShell v0.0.98. The `openshell.ai/sandbox-id` annotation belongs to the
-later v0.1 line and is not compatible with this release.
+Use the class reported by the installed SPIRE chart, not the example value
+blindly. The generated registration selects the configured OpenShell namespace
+and `openshell.ai/managed-by: openshell`, and derives the identity from the
+`openshell.io/sandbox-id` annotation. The resulting identity is
+`spiffe://<config.mint.spiffeTrustDomain>/openshell/sandbox/<sandbox-id>`.
+The `openshell.ai/sandbox-id` annotation belongs to the later v0.1 line and is
+not compatible with this release. Disable the generated registration only if
+the platform deliberately installs that exact equivalent itself.
+
+### Upgrade from an existing governed installation
+
+Before upgrading, list the SPIRE classes already used by the installation:
+
+```sh
+kubectl get clusterspiffeids.spire.spiffe.io \
+  -o custom-columns=NAME:.metadata.name,CLASS:.spec.className
+```
+
+Set the class watched by the installed SPIRE controller manager as
+`spire.className` in both the platform-preflight input and the Steward values.
+An empty value now fails governed chart validation.
+
+The corresponding platform-preflight input is:
+
+```json
+{
+  "spire": {
+    "className": "spire-spire",
+    "sandboxRegistration": {"enabled": true}
+  }
+}
+```
+
+Use exactly one owner for the sandbox registration. Existing installations
+that already provide a `ClusterSPIFFEID` selecting OpenShell sandbox pods must
+either remove that platform-owned registration before leaving
+`sandboxRegistration.enabled` as `true`, or retain it and set the preflight
+input to `false`; the generated Steward value is
+`spire.sandboxRegistration.enabled: false`. A retained registration must match
+the chart contract exactly: the configured OpenShell namespace,
+`openshell.ai/managed-by: openshell`, the `openshell.io/sandbox-id` annotation,
+and `spiffe://<trust-domain>/openshell/sandbox/<sandbox-id>`. Do not leave both
+registrations selecting the same pods. Rerun platform preflight with the chosen
+class and registration ownership before applying the upgrade.
 
 The sandbox identity uses the SPIFFE Workload API. A JWT issuer is not needed
 for this provider-grant exchange. The OpenShell sandbox pod must receive the

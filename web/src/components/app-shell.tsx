@@ -27,12 +27,15 @@ const userNavigation = [
 
 const adminNavigation = [
   { href: "/admin/get-started", label: "Get started" },
+  { href: "/admin/members", label: "Members" },
   { href: "/admin/envelopes/templates", label: "Templates" },
   { href: "/admin/approvals", label: "Requests" },
   { href: "/admin/runs", label: "Runs" },
   { href: "/admin/workflows", label: "Workflows" },
   { href: "/admin/settings", label: "Settings" },
 ] as const;
+
+const onboardingStepTitles = ["Connect GitHub", "Get your first envelope", "Run hello world now", "See the result"] as const;
 
 export function isActive(pathname: string, href: string): boolean {
   if (href === "/admin/envelopes/templates" && pathname === "/admin/envelopes/provision") return true;
@@ -41,6 +44,13 @@ export function isActive(pathname: string, href: string): boolean {
 
 export function hasDualRole(session: SessionState): boolean {
   return session.status === "authenticated" && session.value.role === "admin";
+}
+
+export function isAccessPending(session: SessionState, adminMode: boolean): boolean {
+  return session.status === "authenticated"
+    && !adminMode
+    && session.value.role !== "admin"
+    && session.value.memberRoles.length === 0;
 }
 
 export function workspaceLandingPath(workspace: "admin" | "user"): string {
@@ -66,6 +76,7 @@ export function breadcrumbsForPath(pathname: string): BreadcrumbItem[] {
   if (admin && rest[0] === "envelopes" && rest[1] === "provision") {
     return [root, { href: "/admin/envelopes/templates", label: "Templates" }, { label: "Provision envelope" }];
   }
+  if (admin && rest[0] === "members") return [root, { label: "Members" }];
   if (rest[0] === "envelopes") {
     if (!rest[1]) return [root, { label: "Envelopes" }];
     if (rest[1] === "new") return [root, { href: "/envelopes", label: "Envelopes" }, { label: "New request" }];
@@ -130,6 +141,28 @@ function StatePanel({ children, title }: Readonly<{ children: ReactNode; title: 
       <h1 className="text-xl font-semibold" id="session-state-title">{title}</h1>
       <div className="mt-3 text-sm leading-6 text-muted-ink">{children}</div>
     </section>
+  );
+}
+
+function AccessPendingPanel({ email, userId }: Readonly<{ email: string; userId: string }>) {
+  const [copied, setCopied] = useState(false);
+  const copyUserId = async () => {
+    try {
+      await navigator.clipboard.writeText(userId);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  };
+  return (
+    <StatePanel title="Access pending">
+      <p><strong>{email}</strong> is signed in, but an administrator has not assigned a member role yet.</p>
+      <p className="mt-4">Share this user ID with an administrator:</p>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <code className="rounded-control border bg-canvas px-2.5 py-1.5 text-xs text-ink">{userId}</code>
+        <button className="rounded-control border px-3 py-1.5 text-xs font-semibold text-ink hover:bg-canvas" onClick={() => void copyUserId()} type="button">{copied ? "Copied" : "Copy user ID"}</button>
+      </div>
+    </StatePanel>
   );
 }
 
@@ -284,7 +317,7 @@ function AppSidebar({ adminGuideDismissed, adminMode, mobile = false, needsActio
   session: Extract<SessionState, { status: "authenticated" }>;
 }>) {
   const pathname = usePathname();
-  const onboardingComplete = onboardingCompleted === 5;
+  const onboardingComplete = onboardingCompleted === 4;
   const navigation = adminMode ? adminNavigation.filter((item) => !adminGuideDismissed || item.href !== "/admin/get-started") : userNavigation.filter((item) => !(onboardingDismissed || onboardingComplete) || item.href !== "/get-started");
   return (
     <aside className={mobile ? "flex h-full w-[216px] flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 shadow-xl" : "sticky top-0 hidden h-screen flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 md:flex"}>
@@ -297,7 +330,7 @@ function AppSidebar({ adminGuideDismissed, adminMode, mobile = false, needsActio
       <nav aria-label="Primary navigation" className="space-y-0.5">
         {navigation.map(({ href, label }) => {
           const active = isActive(pathname, href);
-          const count = href === "/admin/approvals" ? needsAction : href === "/get-started" && onboardingCompleted !== null ? `${onboardingCompleted}/5` : null;
+          const count = href === "/admin/approvals" ? needsAction : href === "/get-started" && onboardingCompleted !== null ? `${onboardingCompleted}/4` : null;
           return (
             <Link
               aria-current={active ? "page" : undefined}
@@ -321,15 +354,36 @@ function AppSidebar({ adminGuideDismissed, adminMode, mobile = false, needsActio
   );
 }
 
+function OnboardingBanner({ completed, nextTitle, onDismiss }: Readonly<{
+  completed: number;
+  nextTitle: string | null;
+  onDismiss: () => void;
+}>) {
+  return (
+    <section aria-label="Get started" className="relative flex flex-wrap items-center gap-4 rounded-card bg-brand-soft px-[18px] py-3.5 pe-14">
+      <div className="min-w-48 flex-1">
+        <p className="text-sm font-semibold">Get started</p>
+        <p className="mt-0.5 text-[13px] text-muted-ink">{completed} of 4 done{nextTitle ? ` · next: ${nextTitle}` : ""}</p>
+        <div aria-label={`${completed} of 4 onboarding steps complete`} aria-valuemax={4} aria-valuemin={0} aria-valuenow={completed} className="mt-2 h-[5px] overflow-hidden rounded-full bg-line-soft" role="progressbar"><div className="h-full rounded-full bg-brand" style={{ width: `${completed * 25}%` }} /></div>
+      </div>
+      <Link className="inline-flex h-[34px] items-center rounded-control bg-brand px-3.5 text-[13px] font-semibold text-on-brand hover:bg-brand-hover" href="/get-started">Continue</Link>
+      <button aria-label="Hide Get started" className="absolute end-3 top-3 grid size-8 place-items-center rounded-control text-lg text-muted-ink hover:bg-line-soft hover:text-ink" onClick={onDismiss} type="button"><span aria-hidden="true">×</span></button>
+    </section>
+  );
+}
+
 export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
   const pathname = usePathname();
   const session = useSession();
   const adminMode = pathname === "/admin" || pathname.startsWith("/admin/");
-  const workspaceAuthorized = session.status === "authenticated" && (!adminMode || session.value.role === "admin");
+  const accessPending = isAccessPending(session, adminMode);
+  const workspaceAuthorized = session.status === "authenticated" && !accessPending && (!adminMode || session.value.role === "admin");
   const [needsAction, setNeedsAction] = useState<number | null>(null);
   const adminGuideDismissed = useSyncExternalStore(subscribeToAdminSetupPreference, adminSetupDismissed, adminSetupVisibleOnServer);
   const [onboardingCompleted, setOnboardingCompleted] = useState<number | null>(null);
   const [onboardingDismissed, setOnboardingDismissed] = useState(false);
+  const [onboardingNextTitle, setOnboardingNextTitle] = useState<string | null>(null);
+  const onboardingDismissedRef = useRef(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const mobileMenuButtonRef = useRef<HTMLButtonElement>(null);
   const mobileNavigationRef = useRef<HTMLDivElement>(null);
@@ -338,6 +392,25 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
     setMobileMenuOpen(false);
     requestAnimationFrame(() => mobileMenuButtonRef.current?.focus());
   }, []);
+
+  const dismissOnboarding = useCallback(() => {
+    if (session.status !== "authenticated") return;
+    onboardingDismissedRef.current = true;
+    setOnboardingDismissed(true);
+    void updateBrowserPreferences({
+      body: { onboardingDismissed: true },
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "X-Steward-CSRF": session.value.csrf },
+    }).then((result) => {
+      if (result.data && result.response?.ok) {
+        window.dispatchEvent(new CustomEvent("hypershell:preferences-updated", { detail: { onboardingDismissed: true } }));
+        return;
+      }
+      onboardingDismissedRef.current = false;
+      setOnboardingDismissed(false);
+    });
+  }, [session]);
 
   useEffect(() => {
     if (!mobileMenuOpen) return;
@@ -368,13 +441,19 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
     let active = true;
     const refreshProgress = () => void loadOnboardingEvidence().then((result) => {
       if (active && result.data && result.response?.ok) {
-        setOnboardingDismissed(result.data.preferences.onboardingDismissed);
-        setOnboardingCompleted(deriveOnboardingProgress(result.data).completed);
+        const progress = deriveOnboardingProgress(result.data);
+        if (!onboardingDismissedRef.current) {
+          onboardingDismissedRef.current = result.data.preferences.onboardingDismissed;
+          setOnboardingDismissed(result.data.preferences.onboardingDismissed);
+        }
+        setOnboardingCompleted(progress.completed);
+        setOnboardingNextTitle(onboardingStepTitles[progress.done.findIndex((done) => !done)] ?? null);
       }
     });
     refreshProgress();
     const preferencesUpdated = (event: Event) => {
       if (event instanceof CustomEvent && typeof event.detail?.onboardingDismissed === "boolean") {
+        onboardingDismissedRef.current = event.detail.onboardingDismissed;
         setOnboardingDismissed(event.detail.onboardingDismissed);
       }
       refreshProgress();
@@ -406,9 +485,11 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
             {session.status === "unavailable" ? <StatePanel title="Session unavailable"><p>HyperShell could not reach the authoritative session service. Try again shortly.</p></StatePanel> : null}
             {session.status === "error" ? <StatePanel title="Session error"><p>The session response was not accepted. No workspace data has been loaded.</p></StatePanel> : null}
             {session.status === "authenticated" && adminMode && session.value.role !== "admin" ? <StatePanel title="Forbidden"><p>Your server-owned session does not grant administrator access.</p></StatePanel> : null}
+            {session.status === "authenticated" && accessPending ? <AccessPendingPanel email={session.value.principal.displayEmail} userId={session.value.principal.userId} /> : null}
             {session.status === "authenticated" && workspaceAuthorized ? (
               <>
                 <Breadcrumbs items={breadcrumbsForPath(pathname)} />
+                {!adminMode && pathname !== "/get-started" && onboardingCompleted !== null && onboardingCompleted < 4 && !onboardingDismissed ? <div className="mt-4"><OnboardingBanner completed={onboardingCompleted} nextTitle={onboardingNextTitle} onDismiss={dismissOnboarding} /></div> : null}
                 {children}
               </>
             ) : null}

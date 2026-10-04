@@ -116,8 +116,11 @@ contracts remain owned by Steward.
 
 The installation trust domain is operator-supplied and immutable. Mint uses
 `spiffe://<trust-domain>/steward/mint`. The Steward chart owns the
-`ClusterSPIFFEID` selecting Mint in the release namespace. Changing the trust
-domain is an identity migration, not an in-place value edit.
+class-bound `ClusterSPIFFEID` selecting Mint in the release namespace and the
+stock OpenShell v0.0.98 sandbox registration. The deployment input's
+`spire.className` must match the class watched by the installed SPIRE
+controller manager. Changing the trust domain or class is an identity
+migration, not an in-place value edit.
 
 ### Inference
 

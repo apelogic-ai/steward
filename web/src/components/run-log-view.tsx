@@ -23,7 +23,7 @@ export function RunLogView({
   taskUid: string;
 }>) {
   const [state, setState] = useState<ExecutionLogState>({ status: "loading" });
-  const runPath = `${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}`;
+  const runPath = `${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}?job=agent_execution&stream=${stream}`;
 
   useEffect(() => {
     let active = true;
@@ -107,9 +107,10 @@ function ExecutionLogContent({ state, stream, warning = false }: Readonly<{
   warning?: boolean;
 }>) {
   if (state.status === "loading") return <p className="text-sm text-muted-ink" role="status">Loading {stream} log…</p>;
-  if (state.status === "unavailable") return <p className="text-sm text-muted-ink" role="status">{stream} log is unavailable for this run.</p>;
+  if (state.status === "unavailable") return <div className="space-y-1 text-sm text-muted-ink" role="status"><p className="font-semibold text-ink">No execution log was captured for this run.</p><p>Enable <strong>Capture execution log</strong> when starting a run to retain stdout and stderr.</p></div>;
   if (state.status === "error") return <p className="text-sm text-err" role="alert">The {stream} log could not be loaded.</p>;
-  const lines = state.text === "" ? [""] : state.text.match(/[^\n]*\n|[^\n]+$/g) ?? [state.text];
+  if (state.complete && state.text === "") return <p className="text-sm text-muted-ink" role="status">The captured {stream} log is empty.</p>;
+  const lines = state.text.match(/[^\n]*\n|[^\n]+$/g) ?? [state.text];
   return (
     <>
       {warning ? <div className="rounded-control border border-warn/30 bg-warn-soft p-3 text-sm"><p className="font-semibold text-warn">Sensitive output warning</p><p className="mt-1 text-muted-ink">Execution logs may reproduce arbitrary user, tool, or agent output.</p></div> : null}

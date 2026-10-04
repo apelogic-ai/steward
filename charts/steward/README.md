@@ -376,11 +376,12 @@ administrators revoke it explicitly by disabling the federated subject.
 
 ### Troubleshooting a failed Connect operation
 
-The Connect API returns a bounded problem body. `gateway_http_error` includes
-the upstream HTTP status and, only when MCP-GW supplied a safe JSON `error` or
-`code` string, a sanitized detail of at most 200 bytes. Steward never copies a
-token, an unselected response field, or a URL containing a query string into
-that response. The same evidence is retained in
+The Connect API returns a bounded error body. `gateway_http_error` includes
+the upstream HTTP status, a safe MCP-GW JSON `code` of at most 100 bytes, and a
+sanitized human `error` detail of at most 200 bytes when those fields are
+present. Steward does not assume the upstream body is an RFC 9457 problem
+document. It never copies a token, an unselected response field, or a URL
+containing a query string into that response. The same evidence is retained in
 `connection_operations.failure_category` and
 `connection_operations.failure_detail`; the corresponding failed
 `task_execution_attempts.execution_stderr` contains the bridge's fixed,
@@ -388,14 +389,14 @@ bounded diagnostic.
 
 | Failure category | Meaning |
 | --- | --- |
-| `bridge-gateway-http` | MCP-GW returned an unexpected non-2xx HTTP status. Read `failure_detail` for the status and optional sanitized reason. |
+| `bridge-gateway-http` | MCP-GW returned a status other than the operation's exact success status (200 for status/start/rerun; 204 for disconnect), after the dedicated 401/403 and token-grant classifications. Read `failure_detail` for the status, stable code, and optional sanitized reason. |
 | `bridge-runtime-authentication` | MCP-GW rejected the runtime credential. Re-authorize the connection, then verify runtime credential injection if it continues. |
 | `bridge-proxy-policy` | OpenShell denied the provider request before MCP-GW handled it. |
 | `bridge-runtime-authorization` | MCP-GW rejected the runtime's authority. |
 | `bridge-token-grant` | OpenShell could not exchange the placeholder for the runtime-bound GitHub credential. Retry once, then inspect MCP-GW token-grant health. |
 | `bridge-response-contract` | MCP-GW returned a response that did not satisfy Steward's pinned provider contract. |
 | `bridge-gateway-transport` | The governed runtime could not complete the transport request to MCP-GW. |
-| `bridge-gateway-status` | MCP-GW returned status metadata that could not be validated. |
+| `bridge-gateway-status` | Historical category from older bridges for an unexpected successful disconnect response. New invalid response bodies use `bridge-response-contract`. |
 | `bridge-gateway-body` | The governed runtime could not read the bounded MCP-GW response body. |
 | `bridge-gateway-unavailable` | MCP-GW was unavailable to the governed runtime. |
 | `runtime_create_admission_rejected` | Kubernetes admission rejected creation of the governed connection runtime. Inspect Steward admission and controller events. |
@@ -480,6 +481,8 @@ Steward release namespace also creates `steward-workflows`.
             resource: actions_get
             action: read
             accessClass: read
+            # Unreleased presentation metadata.
+            toolsets: [actions]
         catalogs:
           - provider: github
             catalogId: github-tools
@@ -489,6 +492,13 @@ Steward release namespace also creates `steward-workflows`.
 
   Tool access classes and provider catalog availability are display metadata. Authority,
   budget, TTL, template, and user fields are intentionally not part of this catalog.
+
+  **Unreleased:** optional `toolsets` are also presentation metadata. A tool may belong to at
+  most 16 toolsets. The template editor groups tools only when these authoritative names are
+  supplied; it does not infer groups from tool names or provider conventions. Existing v2
+  entries without `toolsets` remain valid and appear in a deterministic fallback group.
+  Steward does not generate this metadata from an MCP-GW release asset; the deployment owner
+  supplies it with the catalog.
 - `config.apiserver.customEnvelopeSafetyCeiling` is the optional deployment-owned maximum for
   template-free requests. It is a complete Envelope and its capabilities must exist in the
   catalog. Steward revalidates the current ceiling at both request creation and administrator
@@ -582,11 +592,17 @@ Steward release namespace also creates `steward-workflows`.
   `config.mint.allowedScopes` defaults to `mcp inference`. These include the
   checked-in OpenShell provider contract (`audience=steward-mcp`, `scope=mcp`)
   and the inference exchange on the same Mint instance.
-- `spire.csiDriver` and `spire.socketPath` mount the SPIFFE Workload API only in
-  the mint pod. The chart creates a `ClusterSPIFFEID` selecting the release
-  namespace and Mint pod labels, with trust domain
-  `config.mint.spiffeTrustDomain` and stable path `spire.identityPath`
-  (`/steward/mint` by default).
+- `spire.className` is required in governed mode and must exactly match the
+  class watched by the installed SPIRE controller manager. `spire.csiDriver`
+  and `spire.socketPath` mount the SPIFFE Workload API only in the mint pod.
+  The chart creates class-bound `ClusterSPIFFEID` resources for Mint and, by
+  default, stock OpenShell v0.0.98 sandboxes. The sandbox registration selects
+  `networkPolicy.openshellNamespace`, the `openshell.ai/managed-by: openshell`
+  pod label, and the `openshell.io/sandbox-id` annotation to issue
+  `spiffe://<trust-domain>/openshell/sandbox/<sandbox-id>`. Set
+  `spire.sandboxRegistration.enabled=false` only when the platform owns an
+  equivalent registration. The OpenShell installation still owns
+  `server.providerTokenGrants.spiffe` and its Workload API socket setting.
 
 Both the apiserver and controller apply the embedded append-only Postgres
 migration set on startup (currently through migration `0051`). They must
@@ -608,8 +624,9 @@ execution. It does not prove a VM isolation boundary.
 
 The supported stock OpenShell v0.0.98 deployment uses the sidecar supervisor
 with process-binary-aware network policy. When provider token grants are
-enabled, configure the sandbox ClusterSPIFFEID and Workload API socket and use
-the `openshell.io/sandbox-id` annotation contract. See
+enabled, the Steward chart supplies the sandbox `ClusterSPIFFEID`; configure
+the Workload API socket in OpenShell and use the `openshell.io/sandbox-id`
+annotation contract. See
 [OpenShell 0.0.98 governed execution](../../docs/installation/openshell-v0.0.98.md)
 for the exact values, Kubernetes 1.35 sideload setting, and diagnostic command.
 

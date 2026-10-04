@@ -90,6 +90,15 @@ Envelope revision and digest, runtime binding carries runtime UID and ownership,
 and execution end carries a terminal exit category. Consumers must not invent
 missing transitions.
 
+`GET /app/api/v1/runs/{taskUid}/events` is the owner-scoped live-refresh
+boundary. It returns `text/event-stream`, emits a complete run-and-timeline
+snapshot with a monotonically increasing event ID, honours `Last-Event-ID`, and
+advertises a two-second reconnect interval. The browser reconnects until the
+Task is terminal and falls back to bounded polling when the stream cannot be
+used. An edge that fronts this route must disable response buffering, preserve
+`Last-Event-ID`, and use an idle timeout longer than the advertised reconnect
+interval.
+
 ### Execution logs
 
 `GET .../{taskUid}/logs/{stream}?after={byteOffset}` accepts only `stdout` or

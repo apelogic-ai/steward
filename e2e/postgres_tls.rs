@@ -21,12 +21,16 @@ use steward_apiserver::governed_connections::{
     DirectConnectionStatusConfig, DirectConnectionStatusReader, SplitConnectionsBroker,
 };
 use steward_store::{
-    FederatedSubjectAssociation, FederatedSubjectAssociationMethod, FederatedSubjectAuditAction,
-    FederatedSubjectDisable, FederatedSubjectObservation, FederatedSubjectState, PgStore,
-    StoreError,
+    BrowserMemberInvitation, BrowserMemberInvitationOutcome, BrowserMemberStateAction,
+    BrowserMemberStateChange, BrowserRbacAssignment, BrowserRbacAssignmentAction,
+    BrowserRbacAssignmentChange, FederatedSubjectAssociation, FederatedSubjectAssociationMethod,
+    FederatedSubjectAuditAction, FederatedSubjectDisable, FederatedSubjectObservation,
+    FederatedSubjectState, FederatedSubjectUnlink, PgStore, StoreError,
 };
-use steward_types::CanonicalUserId;
 use steward_types::direct_package::SourceProvenance;
+use steward_types::{
+    CanonicalUserId, Email, GOOGLE_ORGANIZATION_ISSUER, OrganizationId, OrganizationIdentityPolicy,
+};
 use tokio::net::TcpListener;
 use tokio::sync::Barrier;
 use tokio::task::JoinHandle;
@@ -213,22 +217,38 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     );
     let maximum_direct_source_provenance =
         seed_maximum_source_provenance_upgrade_fixture(&store).await?;
+    seed_finalized_task_provenance_upgrade_fixtures(&store).await?;
     seed_connection_association_upgrade_fixture(&store).await?;
+    seed_browser_member_details_upgrade_fixture(&store).await?;
+    migration_set(Some(62))
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward pre-0063 migrations must complete over the required TLS session: {error}"
+            ))
+        })?;
+    seed_connection_failure_detail_upgrade_fixture(&store).await?;
     migration_set(None)
         .run(store.pool())
         .await
         .map_err(|error| {
             io::Error::other(format!(
-                "Steward connection-verification migration must complete over the required TLS session: {error}"
+                "Steward connection failure-detail code migration must complete over the required TLS session: {error}"
             ))
         })?;
+    assert_connection_failure_detail_upgrade_result(&store).await?;
     assert_maximum_source_provenance_upgrade_result(&store, &maximum_direct_source_provenance)
         .await?;
+    assert_finalized_task_provenance_upgrade_result(&store).await?;
     verify_source_provenance_byte_limits(&store).await?;
     assert_connection_association_upgrade_result(&store).await?;
     assert_template_catalog_upgrade_result(&store).await?;
+    assert_browser_member_details_upgrade_result(&store).await?;
     verify_federated_subject_lifecycle(&store).await?;
     verify_direct_connection_auto_association(&store).await?;
+    verify_pending_member_identity_state(&store).await?;
+    verify_browser_member_invitation_lifecycle(&store).await?;
 
     let tls_active =
         sqlx::query_scalar::<_, bool>("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
@@ -334,6 +354,286 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     Ok(())
 }
 
+async fn verify_pending_member_identity_state(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let organization_id = OrganizationId::parse("org_example")?;
+    let email = Email::parse("pending.member@example.com")?;
+    let pending = store
+        .preprovision_canonical_user(
+            &organization_id,
+            &email,
+            "usr_0123456789abcdef0123456789abcdef",
+        )
+        .await?;
+    assert_eq!(pending.state, "pending");
+    assert_eq!(
+        pending.invited_by.as_deref(),
+        Some("alice@example.com"),
+        "member detail must resolve the invitation actor to the current administrator email"
+    );
+    assert!(pending.display_name.is_none());
+    assert!(pending.last_sign_in_at.is_none());
+    let assignment = BrowserRbacAssignment::MemberRole("engineer".to_owned());
+    store
+        .append_browser_rbac_assignment(BrowserRbacAssignmentChange {
+            user_id: &pending.user_id,
+            assignment: &assignment,
+            action: BrowserRbacAssignmentAction::Grant,
+            actor: "usr_0123456789abcdef0123456789abcdef",
+        })
+        .await?;
+    let identity = OrganizationIdentityPolicy::new(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "example.com",
+        organization_id.clone(),
+    )?
+    .validate(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "pending-member-subject",
+        "example.com",
+        email.as_str(),
+        true,
+    )?;
+    let activated = store
+        .register_canonical_identity(&identity, "browser-oidc")
+        .await?;
+    store
+        .record_browser_sign_in(&activated.user_id, Some("Pending Member"))
+        .await?;
+    assert_eq!(activated.user_id, pending.user_id);
+    assert_eq!(
+        store
+            .browser_rbac_assignments(&activated.user_id)
+            .await?
+            .member_roles,
+        ["engineer"],
+        "the verified sign-in must activate the exact pending member without losing its audited role"
+    );
+    let active_member = store
+        .canonical_user(&activated.user_id)
+        .await?
+        .expect("activated user");
+    assert_eq!(active_member.state, "active");
+    assert_eq!(
+        active_member.display_name.as_deref(),
+        Some("Pending Member")
+    );
+    assert!(active_member.last_sign_in_at.is_some());
+    assert_eq!(
+        active_member.invited_by.as_deref(),
+        Some("alice@example.com"),
+        "activation must not erase who invited the member"
+    );
+    let administrator = BrowserRbacAssignment::Administrator;
+    store
+        .append_browser_rbac_assignment(BrowserRbacAssignmentChange {
+            user_id: &activated.user_id,
+            assignment: &administrator,
+            action: BrowserRbacAssignmentAction::Grant,
+            actor: "usr_0123456789abcdef0123456789abcdef",
+        })
+        .await?;
+    assert!(matches!(
+        store
+            .append_browser_rbac_assignment(BrowserRbacAssignmentChange {
+                user_id: &activated.user_id,
+                assignment: &administrator,
+                action: BrowserRbacAssignmentAction::Revoke,
+                actor: "usr_0123456789abcdef0123456789abcdef",
+            })
+            .await,
+        Err(StoreError::LastBrowserAdministrator)
+    ));
+    Ok(())
+}
+
+async fn verify_browser_member_invitation_lifecycle(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let organization_id = OrganizationId::parse("org_team-a")?;
+    let email = Email::parse("alice@example.org")?;
+    let roles = vec!["engineer".to_owned()];
+    let outcome = store
+        .invite_browser_member(BrowserMemberInvitation {
+            organization_id: &organization_id,
+            email: &email,
+            actor: "usr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            administrator: true,
+            member_roles: &roles,
+        })
+        .await?;
+    let pending = match outcome {
+        BrowserMemberInvitationOutcome::Invited(user) => user,
+        BrowserMemberInvitationOutcome::AlreadyMember(_) => {
+            return Err(io::Error::other("fresh member was not invited").into());
+        }
+    };
+    let assignments = store.browser_rbac_assignments(&pending.user_id).await?;
+    assert!(assignments.is_admin);
+    assert_eq!(assignments.member_roles, roles);
+    assert!(matches!(
+        store
+            .invite_browser_member(BrowserMemberInvitation {
+                organization_id: &organization_id,
+                email: &email,
+                actor: "usr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                administrator: false,
+                member_roles: &[],
+            })
+            .await?,
+        BrowserMemberInvitationOutcome::AlreadyMember(_)
+    ));
+
+    let identity = OrganizationIdentityPolicy::new(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "example.org",
+        organization_id.clone(),
+    )?
+    .validate(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "member-lifecycle-subject",
+        "example.org",
+        email.as_str(),
+        true,
+    )?;
+    let active = store
+        .register_canonical_identity(&identity, "browser-oidc")
+        .await?;
+    assert_eq!(active.user_id, pending.user_id);
+    assert!(matches!(
+        store
+            .change_browser_member_state(BrowserMemberStateChange {
+                user_id: &active.user_id,
+                action: BrowserMemberStateAction::Disable,
+                actor: &active.user_id,
+            })
+            .await,
+        Err(StoreError::SelfBrowserMemberMutation)
+    ));
+    let other_actor = CanonicalUserId::parse("usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")?;
+    assert!(matches!(
+        store
+            .change_browser_member_state(BrowserMemberStateChange {
+                user_id: &active.user_id,
+                action: BrowserMemberStateAction::Disable,
+                actor: &other_actor,
+            })
+            .await,
+        Err(StoreError::LastBrowserAdministrator)
+    ));
+
+    let invite_email = Email::parse("bob@example.org")?;
+    let first_invitation = match store
+        .invite_browser_member(BrowserMemberInvitation {
+            organization_id: &organization_id,
+            email: &invite_email,
+            actor: active.user_id.as_str(),
+            administrator: false,
+            member_roles: &[],
+        })
+        .await?
+    {
+        BrowserMemberInvitationOutcome::Invited(user) => user,
+        BrowserMemberInvitationOutcome::AlreadyMember(_) => {
+            return Err(io::Error::other("fresh pending invitation already existed").into());
+        }
+    };
+    let revoked = store
+        .change_browser_member_state(BrowserMemberStateChange {
+            user_id: &first_invitation.user_id,
+            action: BrowserMemberStateAction::RevokeInvitation,
+            actor: &active.user_id,
+        })
+        .await?;
+    assert_eq!(revoked.state, "revoked");
+    let reinvited = match store
+        .invite_browser_member(BrowserMemberInvitation {
+            organization_id: &organization_id,
+            email: &invite_email,
+            actor: active.user_id.as_str(),
+            administrator: false,
+            member_roles: &[],
+        })
+        .await?
+    {
+        BrowserMemberInvitationOutcome::Invited(user) => user,
+        BrowserMemberInvitationOutcome::AlreadyMember(_) => {
+            return Err(io::Error::other("revoked invitation blocked reinvitation").into());
+        }
+    };
+    assert_ne!(reinvited.user_id, first_invitation.user_id);
+
+    let second_identity = OrganizationIdentityPolicy::new(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "example.org",
+        organization_id,
+    )?
+    .validate(
+        GOOGLE_ORGANIZATION_ISSUER,
+        "reinvited-member-subject",
+        "example.org",
+        invite_email.as_str(),
+        true,
+    )?;
+    let second_active = store
+        .register_canonical_identity(&second_identity, "browser-oidc")
+        .await?;
+    let disabled = store
+        .change_browser_member_state(BrowserMemberStateChange {
+            user_id: &second_active.user_id,
+            action: BrowserMemberStateAction::Disable,
+            actor: &active.user_id,
+        })
+        .await?;
+    assert_eq!(disabled.state, "disabled");
+    let enabled = store
+        .change_browser_member_state(BrowserMemberStateChange {
+            user_id: &second_active.user_id,
+            action: BrowserMemberStateAction::Enable,
+            actor: &active.user_id,
+        })
+        .await?;
+    assert_eq!(enabled.state, "active");
+    Ok(())
+}
+
+async fn seed_browser_member_details_upgrade_fixture(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    sqlx::query(
+        "INSERT INTO canonical_users (user_id, organization_id, display_email) \
+         VALUES ('usr_33333333333333333333333333333333', 'org_example', \
+                 'historical.member@example.com')",
+    )
+    .execute(store.pool())
+    .await?;
+    Ok(())
+}
+
+async fn assert_browser_member_details_upgrade_result(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let user_id = CanonicalUserId::parse("usr_33333333333333333333333333333333")?;
+    let historical = store.canonical_user(&user_id).await?.ok_or_else(|| {
+        io::Error::other("historical browser member disappeared during migration")
+    })?;
+    assert!(historical.display_name.is_none());
+    assert!(historical.last_sign_in_at.is_none());
+    assert!(historical.invited_by.is_none());
+    assert!(
+        !historical.created_at.is_empty(),
+        "historical members must receive the existing creation timestamp without rewriting it"
+    );
+
+    store
+        .record_browser_sign_in(&user_id, Some("Historical Member"))
+        .await?;
+    let signed_in = store
+        .canonical_user(&user_id)
+        .await?
+        .ok_or_else(|| io::Error::other("signed-in browser member disappeared"))?;
+    assert_eq!(signed_in.display_name.as_deref(), Some("Historical Member"));
+    assert!(signed_in.last_sign_in_at.is_some());
+    Ok(())
+}
+
 async fn seed_maximum_source_provenance_upgrade_fixture(
     store: &PgStore,
 ) -> Result<serde_json::Value, Box<dyn Error>> {
@@ -385,15 +685,15 @@ async fn seed_maximum_source_provenance_upgrade_fixture(
              workflow_digest, user_envelope_instance_id, user_envelope_revision, \
              user_envelope_digest, authority_kind, user_envelope_snapshot, coding_agent_runtime, \
              runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
-             agent_command, execution_binding, direct_task_evidence, envelope_revision, \
+             finalize_requested, finalized, agent_command, execution_binding, direct_task_evidence, envelope_revision, \
              orchestration_version, orchestration_operation_id, candidate_digest, \
              service_envelope_digest, original_admission_decision, original_admission_deltas) \
          SELECT $1::text::uuid, 'migration-0056-max-provenance', submitter_service, acting_user, \
                 acting_user_id, owner, owner_user_id, identity_binding_state, workflow, NULL, NULL, \
                 NULL, user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
                 authority_kind, user_envelope_snapshot, coding_agent_runtime, NULL, \
-                runtime_namespace, 'task-migration-0056', runtime_ownership, 'submitted', \
-                runtime_spec, agent_command, execution_binding, $3, envelope_revision, \
+                runtime_namespace, 'task-migration-0056', runtime_ownership, 'succeeded', \
+                runtime_spec, true, true, agent_command, execution_binding, $3, envelope_revision, \
                 orchestration_version, $2::text::uuid, candidate_digest, service_envelope_digest, \
                 original_admission_decision, original_admission_deltas \
          FROM task_submissions \
@@ -437,6 +737,236 @@ async fn assert_maximum_source_provenance_upgrade_result(
         migrated, *expected,
         "migration 0056 must backfill every source-provenance value accepted by the frozen contract"
     );
+    Ok(())
+}
+
+async fn seed_finalized_task_provenance_upgrade_fixtures(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    sqlx::query(
+        "UPDATE task_submissions \
+         SET phase = 'failed', finalize_requested = true, finalized = true, \
+             failure_reason = 'upgrade_fixture' \
+         WHERE idempotency_key = 'user-unfinished'",
+    )
+    .execute(store.pool())
+    .await?;
+
+    let task_uid = "00000000-0000-0000-0000-000000000057";
+    let operation_id = "00000000-0000-0000-0000-000000001057";
+    let authority_digest =
+        "sha256:9a572bcefa75b6f2b5b4931d8604c1ad3f3e7560e0e0c2843646ec4f7853ef02";
+    let mut transaction = store.pool().begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO task_submissions (\
+             task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
+             owner, owner_user_id, identity_binding_state, workflow, workflow_name, workflow_version, \
+             workflow_digest, user_envelope_instance_id, user_envelope_revision, \
+             user_envelope_digest, authority_kind, user_envelope_snapshot, internal_authority_id, \
+             internal_authority_version, internal_authority_digest, coding_agent_runtime, runtime_uid, \
+             runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
+             finalize_requested, finalized, failure_reason, agent_command, execution_binding, \
+             direct_task_evidence, envelope_revision, orchestration_version, orchestration_operation_id, \
+             candidate_digest, service_envelope_digest, original_admission_decision, original_admission_deltas) \
+         SELECT $1::text::uuid, 'migration-0057-finalized-connection', 'steward-connections', \
+                acting_user, acting_user_id, owner, owner_user_id, identity_binding_state, \
+                'connections.github.status', NULL, NULL, NULL, NULL, NULL, NULL, 'internal', NULL, \
+                'steward-connections', 2, $3, coding_agent_runtime, NULL, runtime_namespace, \
+                'task-migration-0057', runtime_ownership, 'failed', runtime_spec, true, true, \
+                'upgrade_fixture', agent_command, execution_binding, NULL, envelope_revision, \
+                orchestration_version, $2::text::uuid, candidate_digest, service_envelope_digest, \
+                original_admission_decision, original_admission_deltas \
+         FROM task_submissions \
+         WHERE task_uid = '00000000-0000-0000-0000-000000000003'",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .bind(authority_digest)
+    .execute(&mut *transaction)
+    .await?
+    .rows_affected();
+    assert_eq!(inserted, 1, "the pre-0057 internal Task fixture must exist");
+
+    sqlx::query(
+        "INSERT INTO task_runtime_operations (\
+             task_uid, operation_id, state, generation, runtime_ownership, runtime_namespace, \
+             runtime_name, inert_manifest_digest, active_manifest_digest) \
+         VALUES ($1::text::uuid, $2::text::uuid, 'intent_recorded', 1, 'provisioned', \
+                 'steward-workflows', 'task-migration-0057', $3, $4)",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .bind(format!("sha256:{}", "3".repeat(64)))
+    .bind(format!("sha256:{}", "4".repeat(64)))
+    .execute(&mut *transaction)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO connection_operations (\
+             operation_id, task_uid, canonical_user_id, provider, operation_kind, \
+             submitter_service, authority_id, authority_version, authority_digest, \
+             runtime_spec_snapshot, command_snapshot, artifact_trust_mode, bridge_image_digest, \
+             mcp_gw_origin, mcp_gw_version, runtime_namespace, runtime_class, \
+             idempotency_identity, response_deadline_at) \
+         VALUES (\
+             $2::text::uuid, $1::text::uuid, 'usr_0123456789abcdef0123456789abcdef', \
+             'github', 'status', 'steward-connections', 'steward-connections', 2, $3, \
+             '{}'::jsonb, '[]'::jsonb, 'github-attestation', \
+             'ghcr.io/example-org/connections-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+             'https://gateway.example.test', '0.4.9', 'steward-workflows', '', \
+             'migration-0057-finalized-connection', now() + interval '1 minute'\
+         )",
+    )
+    .bind(task_uid)
+    .bind(operation_id)
+    .bind(authority_digest)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    Ok(())
+}
+
+async fn assert_finalized_task_provenance_upgrade_result(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let versioned = sqlx::query_as::<_, (Option<serde_json::Value>, String)>(
+        "SELECT source_provenance, task_origin FROM task_submissions \
+         WHERE idempotency_key = 'user-unfinished'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        versioned,
+        (None, "unknown".to_owned()),
+        "migration provenance backfills must preserve finalized versioned Workflow history"
+    );
+
+    let connection_origin = sqlx::query_scalar::<_, String>(
+        "SELECT task_origin FROM task_submissions \
+         WHERE idempotency_key = 'migration-0057-finalized-connection'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        connection_origin, "connections",
+        "migration 0057 must classify finalized governed connection Tasks"
+    );
+
+    let monotonic_trigger_enabled = sqlx::query_scalar::<_, bool>(
+        "SELECT tgenabled = 'O' FROM pg_trigger \
+         WHERE tgrelid = 'task_submissions'::regclass \
+           AND tgname = 'task_commands_are_monotonic'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert!(
+        monotonic_trigger_enabled,
+        "migration backfills must re-enable the finalized-Task monotonicity trigger"
+    );
+
+    let rejected = sqlx::query(
+        "UPDATE task_submissions SET updated_at = now() \
+         WHERE idempotency_key = 'migration-0056-max-provenance'",
+    )
+    .execute(store.pool())
+    .await;
+    assert!(
+        rejected.is_err_and(|error| error
+            .to_string()
+            .contains("durable Task commands and terminal observations are monotonic")),
+        "the re-enabled monotonicity trigger must still reject later finalized-Task mutation"
+    );
+
+    Ok(())
+}
+
+async fn seed_connection_failure_detail_upgrade_fixture(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let updated = sqlx::query(
+        "UPDATE connection_operations \
+         SET operation_state = 'failed', failure_category = 'bridge-gateway-http', \
+             failure_detail = $2 \
+         WHERE operation_id = $1::text::uuid",
+    )
+    .bind("00000000-0000-0000-0000-000000001057")
+    .bind(serde_json::json!({
+        "upstreamStatus": 400,
+        "reason": "OAuth redirect target is not allowed"
+    }))
+    .execute(store.pool())
+    .await?
+    .rows_affected();
+    assert_eq!(
+        updated, 1,
+        "the pre-0063 connection operation fixture must exist"
+    );
+    Ok(())
+}
+
+async fn assert_connection_failure_detail_upgrade_result(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let operation_id = "00000000-0000-0000-0000-000000001057";
+    let historical = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT failure_detail FROM connection_operations WHERE operation_id = $1::text::uuid",
+    )
+    .bind(operation_id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        historical,
+        serde_json::json!({
+            "upstreamStatus": 400,
+            "reason": "OAuth redirect target is not allowed"
+        }),
+        "migration 0063 must preserve historical failure detail without inventing a code"
+    );
+
+    let with_code = serde_json::json!({
+        "upstreamStatus": 400,
+        "code": "oauth_redirect_target_not_allowed",
+        "reason": "OAuth redirect target is not allowed"
+    });
+    sqlx::query(
+        "UPDATE connection_operations SET failure_detail = $2 \
+         WHERE operation_id = $1::text::uuid",
+    )
+    .bind(operation_id)
+    .bind(&with_code)
+    .execute(store.pool())
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT failure_detail FROM connection_operations \
+             WHERE operation_id = $1::text::uuid",
+        )
+        .bind(operation_id)
+        .fetch_one(store.pool())
+        .await?,
+        with_code,
+        "migration 0063 must admit the bounded MCP-GW code"
+    );
+
+    for invalid in [
+        serde_json::json!({"upstreamStatus": 400, "code": "unsafe code"}),
+        serde_json::json!({"upstreamStatus": 400, "code": "x".repeat(101)}),
+        serde_json::json!({"upstreamStatus": 400, "code": "safe", "raw": "response"}),
+    ] {
+        assert!(
+            sqlx::query(
+                "UPDATE connection_operations SET failure_detail = $2 \
+                 WHERE operation_id = $1::text::uuid",
+            )
+            .bind(operation_id)
+            .bind(invalid)
+            .execute(store.pool())
+            .await
+            .is_err(),
+            "migration 0063 must reject unbounded or non-schema failure detail"
+        );
+    }
     Ok(())
 }
 
@@ -1270,6 +1800,87 @@ async fn verify_federated_subject_lifecycle(store: &PgStore) -> Result<(), Box<d
         2,
         "the losing transition must not append audit state"
     );
+
+    let unlink_candidate = store
+        .observe_federated_subject(FederatedSubjectObservation {
+            issuer: "https://identity.example.test",
+            subject: "github-actions:actor:8675309",
+            actor_login: Some("alice-unlink"),
+            display_name: Some("Alice Unlink"),
+        })
+        .await?;
+    let linked = store
+        .associate_federated_subject(FederatedSubjectAssociation {
+            subject_id: unlink_candidate.subject_id,
+            expected_revision: unlink_candidate.revision,
+            canonical_user_id: &alice,
+            actor: bob.as_str(),
+        })
+        .await?;
+    assert!(
+        store
+            .federated_subjects_for_canonical_user(&alice)
+            .await?
+            .iter()
+            .any(|subject| subject.subject_id == linked.subject_id)
+    );
+    let unlinked = store
+        .unlink_federated_subject(FederatedSubjectUnlink {
+            subject_id: linked.subject_id,
+            expected_revision: linked.revision,
+            canonical_user_id: &alice,
+            actor: bob.as_str(),
+        })
+        .await?;
+    assert_eq!(unlinked.state, FederatedSubjectState::Observed);
+    assert!(unlinked.canonical_user_id.is_none());
+    assert!(unlinked.association_method.is_none());
+    assert!(
+        !store
+            .federated_subjects_for_canonical_user(&alice)
+            .await?
+            .iter()
+            .any(|subject| subject.subject_id == linked.subject_id)
+    );
+    assert!(matches!(
+        store
+            .resolve_federated_subject(&unlinked.issuer, &unlinked.subject)
+            .await,
+        Err(StoreError::FederatedSubjectUnassociated)
+    ));
+    assert_eq!(
+        store
+            .federated_subject_audit(unlinked.subject_id)
+            .await?
+            .iter()
+            .map(|event| event.action)
+            .collect::<Vec<_>>(),
+        [
+            FederatedSubjectAuditAction::Observed,
+            FederatedSubjectAuditAction::Associated,
+            FederatedSubjectAuditAction::Unassociated,
+        ]
+    );
+    assert!(matches!(
+        store
+            .unlink_federated_subject(FederatedSubjectUnlink {
+                subject_id: linked.subject_id,
+                expected_revision: linked.revision,
+                canonical_user_id: &alice,
+                actor: bob.as_str(),
+            })
+            .await,
+        Err(StoreError::FederatedSubjectConflict)
+    ));
+    let relinked = store
+        .associate_federated_subject(FederatedSubjectAssociation {
+            subject_id: unlinked.subject_id,
+            expected_revision: unlinked.revision,
+            canonical_user_id: &alice,
+            actor: bob.as_str(),
+        })
+        .await?;
+    assert_eq!(relinked.state, FederatedSubjectState::Associated);
 
     let similarity = store
         .observe_federated_subject(FederatedSubjectObservation {

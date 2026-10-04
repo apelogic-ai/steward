@@ -117,6 +117,7 @@ metadata:
   name: steward-connections-e2e-mint
   labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
 spec:
+  className: spire-spire
   spiffeIDTemplate: spiffe://openshell.local/steward/mint
   namespaceSelector:
     matchLabels:
@@ -356,6 +357,7 @@ spec:
             - { name: GITHUB_OAUTH_REDIRECT_URI, value: http://mcp-gw.steward-system.svc.cluster.local:8080/oauth/github/callback }
             - { name: GITHUB_OAUTH_AUTHORIZATION_URL, value: https://provider.example.test/github/authorize }
             - { name: GITHUB_OAUTH_TOKEN_URL, value: http://provider-fixture.steward-system.svc.cluster.local:8090/github/token }
+            - { name: GITHUB_OAUTH_USER_URL, value: http://provider-fixture.steward-system.svc.cluster.local:8090/github/user }
             - { name: GITHUB_OAUTH_USER_EMAILS_URL, value: http://provider-fixture.steward-system.svc.cluster.local:8090/github/emails }
             - { name: GITHUB_OAUTH_TOKEN_REVOCATION_URL, value: http://provider-fixture.steward-system.svc.cluster.local:8090/github/revoke }
             - { name: GITHUB_OAUTH_SCOPES, value: repo }

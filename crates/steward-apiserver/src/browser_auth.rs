@@ -268,6 +268,14 @@ pub trait BrowserIdentityResolver: Send + Sync + 'static {
         &'a self,
         identity: &'a OrganizationIdentity,
     ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>>;
+
+    fn record_successful_sign_in<'a>(
+        &'a self,
+        _user_id: &'a CanonicalUserId,
+        _display_name: Option<&'a str>,
+    ) -> BrowserFuture<'a, Result<(), BrowserAuthFailure>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[derive(Clone)]
@@ -302,6 +310,19 @@ impl BrowserIdentityResolver for PgBrowserIdentityResolver {
                 .await
                 .map_err(map_store_error)?;
             Ok(browser_principal_from_assignments(principal, assignments))
+        })
+    }
+
+    fn record_successful_sign_in<'a>(
+        &'a self,
+        user_id: &'a CanonicalUserId,
+        display_name: Option<&'a str>,
+    ) -> BrowserFuture<'a, Result<(), BrowserAuthFailure>> {
+        Box::pin(async move {
+            self.store
+                .record_browser_sign_in(user_id, display_name)
+                .await
+                .map_err(map_store_error)
         })
     }
 }
@@ -419,6 +440,17 @@ impl BrowserAuthService {
                 flow_cookie: "__Secure-steward-oidc-flow",
             },
         })
+    }
+
+    /// Revoke every in-memory browser session issued to one canonical user.
+    ///
+    /// RBAC changes take effect on the next request: the person must establish a new session,
+    /// which resolves their current assignments from the append-only ledger.
+    pub(crate) fn revoke_canonical_user_sessions(
+        &self,
+        user_id: &CanonicalUserId,
+    ) -> Result<(), ()> {
+        self.registry.revoke_canonical_user(user_id).map_err(|_| ())
     }
 
     #[cfg(test)]
@@ -746,8 +778,9 @@ async fn callback(
         Ok(principal) => principal,
         Err(_) => return rejected_callback(&service.config),
     };
-    if let Some(display_name) = claims.display_name {
-        principal.display_name = display_name;
+    let verified_display_name = claims.display_name;
+    if let Some(display_name) = verified_display_name.as_ref() {
+        principal.display_name.clone_from(display_name);
     }
     if let Some(previous) = cookie_value(&headers, service.config.session_cookie)
         && service.registry.revoke(&previous).is_err()
@@ -758,6 +791,18 @@ async fn callback(
         Ok(session) => session,
         Err(_) => return rejected_callback(&service.config),
     };
+    if service
+        .identities
+        .record_successful_sign_in(
+            &session.principal.canonical_user_id,
+            verified_display_name.as_deref(),
+        )
+        .await
+        .is_err()
+    {
+        let _ = service.registry.revoke(&session.token);
+        return rejected_callback(&service.config);
+    }
     let mut response = response_with_cookie(
         StatusCode::SEE_OTHER,
         Some(&flow.return_to),
@@ -1226,6 +1271,15 @@ impl BrowserSessionRegistry {
             .remove(token);
         Ok(())
     }
+
+    fn revoke_canonical_user(&self, user_id: &CanonicalUserId) -> Result<(), BrowserAuthError> {
+        self.state
+            .lock()
+            .map_err(|_| BrowserAuthError::StoreUnavailable)?
+            .sessions
+            .retain(|_, session| &session.principal.canonical_user_id != user_id);
+        Ok(())
+    }
 }
 
 fn random_secret() -> String {
@@ -1573,6 +1627,38 @@ mod tests {
         assert_eq!(
             registry.resolve(&revoked.token, 201),
             Err(BrowserAuthError::InvalidSession)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_user_revocation_invalidates_only_that_users_sessions() -> Result<(), String> {
+        let registry = BrowserSessionRegistry::default();
+        let first_principal = principal()?;
+        let first = registry
+            .issue(first_principal.clone(), 100)
+            .map_err(|error| format!("issue first session: {error:?}"))?;
+        let mut second_principal = principal()?;
+        second_principal.canonical_user_id =
+            CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789")?;
+        let second = registry
+            .issue(second_principal.clone(), 100)
+            .map_err(|error| format!("issue second session: {error:?}"))?;
+
+        registry
+            .revoke_canonical_user(&first_principal.canonical_user_id)
+            .map_err(|error| format!("revoke canonical user sessions: {error:?}"))?;
+
+        assert_eq!(
+            registry.resolve(&first.token, 101),
+            Err(BrowserAuthError::InvalidSession)
+        );
+        assert_eq!(
+            registry
+                .resolve(&second.token, 101)
+                .map_err(|error| format!("resolve unaffected session: {error:?}"))?
+                .principal,
+            second_principal
         );
         Ok(())
     }

@@ -1125,6 +1125,10 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
                 .fail_connection_operation(connection.operation_id, "binding_mismatch", None)
                 .await
                 .map_err(TaskControllerError::Store)?;
+            eprintln!(
+                "{}",
+                connection_operation_failure_log_line(connection.operation_id, "binding_mismatch")
+            );
             authority
                 .enter_task_cleanup(
                     task.task_uid,
@@ -1239,6 +1243,13 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
             reason: task_failure_reason(&error),
         });
     persist_execution_observation(authority, &attempt, attempt.generation, observation).await
+}
+
+fn connection_operation_failure_log_line(
+    operation_id: impl std::fmt::Display,
+    category: &str,
+) -> String {
+    format!("connection operation failed: operation_id={operation_id} category={category}")
 }
 
 async fn reconcile_shared_runtime_observation(
@@ -1370,9 +1381,6 @@ fn task_runtime_observation_is_ready(runtime: &AgentRuntime) -> Result<bool, Tas
 }
 
 fn task_runtime_observation_is_failed(runtime: &AgentRuntime) -> Result<bool, TaskControllerError> {
-    if runtime.spec.agent_type.name != steward_connections_v1::AGENT_TYPE {
-        return Ok(false);
-    }
     let digest = spec_digest(&runtime.spec).map_err(|error| {
         TaskControllerError::InvalidState(format!("Task runtime spec cannot be digested: {error}"))
     })?;
@@ -2038,13 +2046,11 @@ fn orchestrated_task_runtime_manifest(
 
 fn runtime_identity_matches(runtime: &AgentRuntime, work: &TaskOrchestrationWorkItem) -> bool {
     let annotations = runtime.annotations();
-    let runtime_uid_matches = work.task.runtime_spec.agent_type.name
-        != steward_connections_v1::AGENT_TYPE
-        || work
-            .operation
-            .runtime_uid
-            .as_deref()
-            .is_none_or(|runtime_uid| runtime.metadata.uid.as_deref() == Some(runtime_uid));
+    let runtime_uid_matches = work
+        .operation
+        .runtime_uid
+        .as_deref()
+        .is_none_or(|runtime_uid| runtime.metadata.uid.as_deref() == Some(runtime_uid));
     runtime_uid_matches
         && annotations.get(TASK_UID_ANNOTATION) == Some(&work.task.task_uid.to_string())
         && annotations.get(TASK_OPERATION_ANNOTATION)
@@ -2334,7 +2340,11 @@ fn sandbox_task_request(
     refs: RuntimeRefs,
 ) -> SandboxTaskRequest {
     let execution_class = sandbox_execution_class(&task.runtime_spec);
-    let diagnostics = sandbox_task_diagnostics(execution_class, task.direct_task_evidence.as_ref());
+    let diagnostics = sandbox_task_diagnostics(
+        execution_class,
+        task.direct_task_evidence.as_ref(),
+        task.browser_task_evidence.as_ref(),
+    );
     SandboxTaskRequest {
         runtime: RuntimeId(runtime_uid),
         refs,
@@ -2353,10 +2363,12 @@ fn sandbox_task_request(
 fn sandbox_task_diagnostics(
     execution_class: SandboxExecutionClass,
     evidence: Option<&steward_types::direct_package::DirectTaskBindingEvidence>,
+    browser_evidence: Option<&steward_types::direct_package::BrowserTaskEvidence>,
 ) -> steward_types::direct_package::DiagnosticsRequest {
     if execution_class == SandboxExecutionClass::Agent {
         evidence
             .map(|evidence| evidence.diagnostics)
+            .or_else(|| browser_evidence.map(|evidence| evidence.diagnostics))
             .unwrap_or_default()
     } else {
         steward_types::direct_package::DiagnosticsRequest::default()
@@ -4219,8 +4231,8 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                 .await
                 {
                     Ok(decision) => decision,
-                    Err(error) if connection_runtime_start_failed(&runtime, &error) => {
-                        ReconcileDecision::Status(failed_connections_runtime_status(&runtime)?)
+                    Err(error) if runtime_start_failed(&error) => {
+                        ReconcileDecision::Status(failed_runtime_status(&runtime)?)
                     }
                     Err(error) => return Err(ControllerError::Reconcile(error)),
                 };
@@ -4605,9 +4617,7 @@ fn suspended_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, Contro
     })
 }
 
-fn failed_connections_runtime_status(
-    runtime: &AgentRuntime,
-) -> Result<AgentRuntimeStatus, ControllerError> {
+fn failed_runtime_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, ControllerError> {
     Ok(AgentRuntimeStatus {
         phase: Phase::Failed,
         observed_generation: runtime.metadata.generation.unwrap_or_default(),
@@ -4629,13 +4639,8 @@ fn failed_connections_runtime_status(
     })
 }
 
-fn connection_runtime_start_failed(runtime: &AgentRuntime, error: &ReconcileError) -> bool {
-    runtime.spec.agent_type.name == steward_connections_v1::AGENT_TYPE
-        && matches!(
-            error,
-            ReconcileError::Runtime(PortError::Failed { reason })
-                if reason == "sandbox entered an error phase"
-        )
+fn runtime_start_failed(error: &ReconcileError) -> bool {
+    matches!(error, ReconcileError::Runtime(PortError::SandboxFailed))
 }
 
 async fn replace_as_controller(
@@ -5273,7 +5278,9 @@ mod tests {
         ConnectionOperationRecord, ConnectionOperationState, GrantReversion, StoreError,
         TaskRecord,
     };
-    use steward_types::direct_package::{DirectTaskBindingEvidence, ExecutionLogMode};
+    use steward_types::direct_package::{
+        BrowserTaskEvidence, DirectTaskBindingEvidence, ExecutionLogMode,
+    };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
         CanonicalAuthorityBinding, CanonicalUserId, Duration, Email, ModelRef,
@@ -5288,14 +5295,14 @@ mod tests {
         ReconcileIntent, RuntimeCreateErrorClass, SERVICE_PRINCIPAL_ANNOTATION, TaskRuntimeAction,
         TaskRuntimeBinding, TaskRuntimeBindingStore, authority_action,
         authority_application_action, classify_runtime_create_status, cleanup_runtime,
-        connection_operation_authority_action, connection_runtime_start_failed,
-        create_task_runtime_inner, exhausted_spend_to_preserve, failed_connections_runtime_status,
+        connection_operation_authority_action, connection_operation_failure_log_line,
+        create_task_runtime_inner, exhausted_spend_to_preserve, failed_runtime_status,
         inference_action, provider_control_bindings_match, reconcile_once, replace_as_controller,
-        runtime_authority_action, runtime_ttl_action, runtime_with_spend_top_up,
-        sandbox_execution_class, sandbox_task_diagnostics, server_task_runtime_manifest,
-        status_merge_patch, suspend_runtime, suspend_runtime_with_inference_cleanup,
-        task_output_archive_failure, task_runtime, task_runtime_action,
-        task_runtime_observation_is_failed, ttl_action,
+        runtime_authority_action, runtime_start_failed, runtime_ttl_action,
+        runtime_with_spend_top_up, sandbox_execution_class, sandbox_task_diagnostics,
+        server_task_runtime_manifest, status_merge_patch, suspend_runtime,
+        suspend_runtime_with_inference_cleanup, task_output_archive_failure, task_runtime,
+        task_runtime_action, task_runtime_observation_is_failed, ttl_action,
     };
 
     #[test]
@@ -5781,6 +5788,17 @@ mod tests {
     }
 
     #[test]
+    fn provider_control_binding_mismatch_uses_the_connection_failure_log_contract() {
+        assert_eq!(
+            connection_operation_failure_log_line(
+                "00000000-0000-0000-0000-000000000000",
+                "binding_mismatch",
+            ),
+            "connection operation failed: operation_id=00000000-0000-0000-0000-000000000000 category=binding_mismatch"
+        );
+    }
+
+    #[test]
     fn provider_control_execution_class_is_exact_and_does_not_capture_long_running_services()
     -> Result<(), String> {
         let acting_user = Email::parse("alice@example.com")
@@ -5817,24 +5835,43 @@ mod tests {
     }
 
     #[test]
-    fn task_diagnostics_come_only_from_direct_evidence_and_never_provider_control()
+    fn task_diagnostics_come_from_persisted_evidence_and_never_provider_control()
     -> Result<(), String> {
         let evidence: DirectTaskBindingEvidence = serde_json::from_str(include_str!(
             "../../../docs/contracts/task/v2/fixtures/positive/task-binding-evidence.json"
         ))
         .map_err(|error| format!("parse direct evidence fixture: {error}"))?;
         assert_eq!(
-            sandbox_task_diagnostics(SandboxExecutionClass::Agent, Some(&evidence)).execution_log,
+            sandbox_task_diagnostics(SandboxExecutionClass::Agent, Some(&evidence), None)
+                .execution_log,
             ExecutionLogMode::Full
         );
         assert_eq!(
-            sandbox_task_diagnostics(SandboxExecutionClass::Agent, None).execution_log,
+            sandbox_task_diagnostics(SandboxExecutionClass::Agent, None, None).execution_log,
             ExecutionLogMode::Off,
             "legacy Tasks must not opt into caller-visible transcripts"
         );
+        let browser_evidence: BrowserTaskEvidence = serde_json::from_value(serde_json::json!({
+            "source": "inline",
+            "revision": "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "path": "task-definition.json",
+            "closureDigest": "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "diagnostics": { "executionLog": "full" }
+        }))
+        .map_err(|error| format!("parse browser evidence fixture: {error}"))?;
         assert_eq!(
-            sandbox_task_diagnostics(SandboxExecutionClass::ProviderControl, Some(&evidence))
+            sandbox_task_diagnostics(SandboxExecutionClass::Agent, None, Some(&browser_evidence),)
                 .execution_log,
+            ExecutionLogMode::Full,
+            "browser Tasks must honor their persisted diagnostics snapshot"
+        );
+        assert_eq!(
+            sandbox_task_diagnostics(
+                SandboxExecutionClass::ProviderControl,
+                Some(&evidence),
+                Some(&browser_evidence),
+            )
+            .execution_log,
             ExecutionLogMode::Off,
             "provider-control must remain forced off even with malformed direct evidence"
         );
@@ -6164,27 +6201,21 @@ mod tests {
     }
 
     #[test]
-    fn exact_failed_runtime_observation_terminalizes_connection_start() -> Result<(), String> {
+    fn exact_failed_runtime_observation_terminalizes_task_start() -> Result<(), String> {
         let mut runtime = fixture();
         runtime.spec.agent_type.name = steward_connections_v1::AGENT_TYPE.to_owned();
-        assert!(connection_runtime_start_failed(
-            &runtime,
-            &super::ReconcileError::Runtime(PortError::Failed {
-                reason: "sandbox entered an error phase".to_owned(),
-            })
-        ));
+        assert!(runtime_start_failed(&super::ReconcileError::Runtime(
+            PortError::SandboxFailed,
+        )));
         assert!(
-            !connection_runtime_start_failed(
-                &runtime,
-                &super::ReconcileError::Runtime(PortError::Failed {
-                    reason: "OpenShell is temporarily unavailable".to_owned(),
-                })
-            ),
+            !runtime_start_failed(&super::ReconcileError::Runtime(PortError::Failed {
+                reason: "OpenShell is temporarily unavailable".to_owned(),
+            })),
             "a transient adapter failure must remain retryable"
         );
         runtime.metadata.generation = Some(7);
-        let status = failed_connections_runtime_status(&runtime)
-            .map_err(|error| format!("build failed connection runtime status: {error}"))?;
+        let status = failed_runtime_status(&runtime)
+            .map_err(|error| format!("build failed runtime status: {error}"))?;
         assert_eq!(status.phase, Phase::Failed);
         assert_eq!(status.observed_generation, 7);
         runtime.status = Some(status);
@@ -6196,13 +6227,13 @@ mod tests {
         let mut ordinary_runtime = runtime.clone();
         ordinary_runtime.spec.agent_type.name = "codex".to_owned();
         ordinary_runtime.status = Some(
-            failed_connections_runtime_status(&ordinary_runtime)
+            failed_runtime_status(&ordinary_runtime)
                 .map_err(|error| format!("build ordinary failed runtime status: {error}"))?,
         );
         assert!(
-            !task_runtime_observation_is_failed(&ordinary_runtime)
+            task_runtime_observation_is_failed(&ordinary_runtime)
                 .map_err(|error| format!("classify ordinary failed runtime status: {error}"))?,
-            "the fail-fast observation must remain scoped to Connections runtimes"
+            "an exact failed observation must terminalize every governed Task runtime"
         );
 
         let Some(runtime_status) = runtime.status.as_mut() else {
@@ -8283,10 +8314,9 @@ mod webhook_tests {
     }
 
     #[test]
-    fn connection_task_runtime_identity_rejects_a_same_name_replacement_uid() -> Result<(), String>
-    {
+    fn governed_task_runtime_identity_rejects_a_same_name_replacement_uid() -> Result<(), String> {
         let admission = active_task_runtime_admission()?;
-        let mut work = TaskOrchestrationWorkItem {
+        let work = TaskOrchestrationWorkItem {
             task: admission.task.clone(),
             operation: admission.operation.clone(),
         };
@@ -8295,14 +8325,8 @@ mod webhook_tests {
         runtime.metadata.uid = Some("replacement-runtime-uid".to_owned());
 
         assert!(
-            runtime_identity_matches(&runtime, &work),
-            "ordinary Task runtime UID semantics must remain unchanged by the Connections fix"
-        );
-        work.task.runtime_spec.agent_type.name =
-            steward_admission::internal_authorities::steward_connections_v1::AGENT_TYPE.to_owned();
-        assert!(
             !runtime_identity_matches(&runtime, &work),
-            "matching annotations must not let a same-name replacement impersonate a bound Connections runtime UID"
+            "matching annotations must not let a same-name replacement impersonate any bound Task runtime UID"
         );
         Ok(())
     }

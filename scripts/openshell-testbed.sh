@@ -294,6 +294,13 @@ env \
   --wait \
   --timeout 10m
 openshell_helm_args+=(--values "${ROOT}/config/openshell/provider-token-grants.yaml")
+if [[ "${OPEN_SHELL_RELEASE}" == "v0.0.98" ]]; then
+  openshell_helm_args+=(
+    --set-string supervisor.topology=sidecar
+    --set supervisor.sidecar.processBinaryAwareNetworkPolicy=true
+    --set-string supervisor.sideloadMethod=init-container
+  )
+fi
 openshell_helm_args+=(
   --set-string server.defaultRuntimeClassName=
   --set server.auth.allowUnauthenticatedUsers=false

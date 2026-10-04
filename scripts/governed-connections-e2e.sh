@@ -16,18 +16,6 @@ done
 docker info >/dev/null
 setup_started="${SECONDS}"
 
-SUPERVISOR_IMAGE="$(
-  "${ROOT}/scripts/build-patched-openshell-supervisor.sh" --print-contract |
-    sed -n 's/^image=//p'
-)"
-if [[ -z "${SUPERVISOR_IMAGE}" ]]; then
-  echo "patched OpenShell supervisor contract omitted its image" >&2
-  exit 1
-fi
-if ! "${ROOT}/scripts/build-patched-openshell-supervisor.sh" --image-is-current; then
-  "${ROOT}/scripts/build-patched-openshell-supervisor.sh"
-fi
-
 MCP_GW_LOCAL_IMAGE="steward/mcp-gw-github-wrapper:${RUN_ID}"
 MINT_IMAGE="steward/mint:${RUN_ID}"
 BRIDGE_IMAGE="steward/connections-bridge:${RUN_ID}"
@@ -48,7 +36,7 @@ trap 'cleanup "$?"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-MCP_GW_RELEASE_IMAGE="ghcr.io/apelogic-ai/mcp-gw-github-wrapper@sha256:80bef7bee93482c8091335ae27c3c3e968e5c78c2bb4a40b401e6af36f70f993"
+MCP_GW_RELEASE_IMAGE="ghcr.io/apelogic-ai/mcp-gw-github-wrapper@sha256:9f1d76b7418caca120ab1651eb5335269127b1b3bccf4abaad79132d7a64cfe4"
 
 docker pull "${MCP_GW_RELEASE_IMAGE}"
 docker tag "${MCP_GW_RELEASE_IMAGE}" "${MCP_GW_LOCAL_IMAGE}"
@@ -121,7 +109,6 @@ STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE="${MCP_GW_LOCAL_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_MINT_IMAGE="${MINT_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE="${BRIDGE_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE="${WEBHOOK_IMAGE}" \
-STEWARD_OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
 STEWARD_OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE}" \
 bash "${ROOT}/scripts/openshell-testbed.sh" \
   bash "${ROOT}/scripts/governed-connections-inside.sh"

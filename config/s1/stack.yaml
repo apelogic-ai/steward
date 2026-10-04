@@ -92,6 +92,7 @@ kind: ClusterSPIFFEID
 metadata:
   name: steward-s1-mint
 spec:
+  className: spire-spire
   spiffeIDTemplate: spiffe://openshell.local/steward/mint
   namespaceSelector:
     matchLabels:

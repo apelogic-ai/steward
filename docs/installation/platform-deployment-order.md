@@ -65,7 +65,7 @@ only.
 | Mode | Additional products required |
 |---|---|
 | Core (`execution.enabled=false`) | PostgreSQL only. The API, webhook, browser administration when enabled, and AgentRuntime validation work; new Task submission is disabled while orchestration is staged. |
-| Governed execution (`execution.enabled=true`) | OpenShell, agent-sandbox, SPIRE CSI and `ClusterSPIFFEID`, a Mint signing Secret, LiteLLM, the Identity product's **workload** exchange mode, and optionally MCP-GW. |
+| Governed execution (`execution.enabled=true`) | OpenShell, agent-sandbox, SPIRE CSI and `ClusterSPIFFEID`, the SPIRE controller class name, a Mint signing Secret, LiteLLM, the Identity product's **workload** exchange mode, and optionally MCP-GW. |
 
 An existing MCP-GW and LiteLLM deployment does not by itself satisfy governed
 execution. The Identity product's baseline quickstart also deliberately

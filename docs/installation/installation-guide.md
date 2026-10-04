@@ -75,7 +75,10 @@ turn execution off on an installation with live AgentRuntimes or Tasks.
 For governed execution, add the OpenShell gateway URL/server name/client
 certificate Secret, LiteLLM URL/master-key Secret,
 workload exchange URL/server name/public CA projection, SPIRE CSI driver and
-`ClusterSPIFFEID` API, and the Mint Secret. OpenShell uses the cluster default
+`ClusterSPIFFEID` API, the exact SPIRE controller class in `spire.className`,
+and the Mint Secret. In governed mode the chart creates class-bound Mint and
+OpenShell-sandbox registrations; the latter can be disabled only when the
+platform owns an equivalent registration. OpenShell uses the cluster default
 runtime unless the operator supplies the optional RuntimeClass override.
 This release proves functional sandbox separation and makes no VM-isolation
 claim. See [chart configuration](../../charts/steward/README.md)

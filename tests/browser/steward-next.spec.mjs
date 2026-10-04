@@ -37,6 +37,90 @@ const administratorSession = {
   memberRoles: ["analyst"],
 };
 
+const memberFixtures = [
+  {
+    userId: administratorSession.principal.userId,
+    displayEmail: administratorSession.principal.displayEmail,
+    displayName: administratorSession.principal.displayName,
+    state: "active",
+    administrator: true,
+    memberRoles: ["analyst"],
+    createdAt: "2026-08-01T12:00:00Z",
+    lastSignInAt: "2026-08-24T17:00:00Z",
+    invitedBy: null,
+    identityCount: 0,
+  },
+  {
+    userId: "usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    displayEmail: "bob@example.org",
+    displayName: "Bob Example",
+    state: "active",
+    administrator: false,
+    memberRoles: ["developer", "retired-role"],
+    createdAt: "2026-08-02T12:00:00Z",
+    lastSignInAt: "2026-08-23T17:00:00Z",
+    invitedBy: null,
+    identityCount: 1,
+  },
+  {
+    userId: "usr_cccccccccccccccccccccccccccccccc",
+    displayEmail: "carol@example.com",
+    displayName: null,
+    state: "pending",
+    administrator: false,
+    memberRoles: [],
+    createdAt: "2026-08-24T12:00:00Z",
+    lastSignInAt: null,
+    invitedBy: administratorSession.principal.displayEmail,
+    identityCount: 0,
+  },
+  {
+    userId: "usr_dddddddddddddddddddddddddddddddd",
+    displayEmail: "dave@example.org",
+    displayName: "Dave Example",
+    state: "disabled",
+    administrator: false,
+    memberRoles: [],
+    createdAt: "2026-08-03T12:00:00Z",
+    lastSignInAt: "2026-08-10T17:00:00Z",
+    invitedBy: null,
+    identityCount: 0,
+  },
+];
+
+const federatedSubjectFixtures = [
+  {
+    subjectId: "00000000-0000-0000-0000-000000000264",
+    issuer: "https://identity.example.test",
+    subject: "github-actions:actor:24680",
+    state: "associated",
+    canonicalUserId: "usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    actorLogin: "bob-gh",
+    displayName: "Bob Example",
+    associationMethod: "admin",
+    revision: 2,
+    firstSeenAt: "2026-08-20T12:00:00Z",
+    lastSeenAt: "2026-08-23T12:00:00Z",
+    updatedAt: "2026-08-20T12:05:00Z",
+    linkedAt: "2026-08-20T12:05:00Z",
+    linkedBy: administratorSession.principal.displayEmail,
+  },
+  {
+    subjectId: "00000000-0000-0000-0000-000000000265",
+    issuer: "https://identity.example.test",
+    subject: "github-actions:actor:13579",
+    state: "observed",
+    canonicalUserId: null,
+    actorLogin: "carol-gh",
+    displayName: "Carol Example",
+    associationMethod: null,
+    revision: 1,
+    firstSeenAt: "2026-08-24T12:00:00Z",
+    lastSeenAt: "2026-08-24T12:00:00Z",
+    updatedAt: "2026-08-24T12:00:00Z",
+  },
+];
+
 const previousSessionContract = {
   ...developerSession,
   principal: {
@@ -49,7 +133,10 @@ const envelope = {
   revision: 4,
   spec: {
     budget: { currency: "USD", monthlyLimit: "25.00", singleRunLimit: "5.00" },
-    llms: [{ provider: "provider-a", model: "model-a" }],
+    llms: [
+      { provider: "provider-a", model: "model-a" },
+      { provider: "openai", model: "gpt-5.4" },
+    ],
     tools: [{ provider: "github", resource: "repository", action: "get_file_contents" }],
     ttl: "4h",
     runner: { platforms: [] },
@@ -90,6 +177,13 @@ const githubReadTools = [
   "actions_get", "actions_list", "get_job_logs", "get_file_contents", "list_commits",
   "get_commit", "get_release", "list_releases", "get_workflow", "list_workflows",
 ].map((resource) => ({ provider: "github", resource, action: "read", accessClass: "read" }));
+
+const groupedGithubTools = [
+  { provider: "github", resource: "issues_get", action: "read", accessClass: "read", toolsets: ["issues"] },
+  { provider: "github", resource: "repository_get", action: "read", accessClass: "read", toolsets: ["repositories", "search"] },
+  { provider: "github", resource: "issues_update", action: "write", accessClass: "write", toolsets: ["issues"] },
+  { provider: "github", resource: "repository_delete", action: "delete", accessClass: "destructive" },
+];
 
 const envelopeRequest = {
   id: envelopeId,
@@ -137,6 +231,9 @@ const run = {
   updatedAt: "2026-08-24T17:03:00Z",
   observedSpend: { observedAmount: "1.25", currency: "USD", exhausted: false },
   errorCategory: null,
+  executionLog: "full",
+  rerunSupported: true,
+  rerunUnavailableReason: null,
   stages: [
     { id: "admission", displayName: "Admission", state: "succeeded", steps: [] },
     { id: "provision_runtime", displayName: "Provision runtime", state: "succeeded", steps: [] },
@@ -227,6 +324,8 @@ const presentationRoutes = [
   { path: `/runs/${taskUid}`, heading: "repository-review@1", activeNavigation: "Runs" },
   { path: "/connections", heading: "Connections", activeNavigation: "Connections" },
   { path: "/settings", heading: "Settings", activeNavigation: "Settings" },
+  { path: "/admin/members", heading: "Members", activeNavigation: "Members" },
+  { path: "/admin/members/usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", heading: "Bob Example", activeNavigation: "Members" },
   { path: "/admin/envelopes/templates", heading: "Envelope templates", activeNavigation: "Templates" },
   { path: "/admin/envelopes/provision", heading: "Provision envelope", activeNavigation: "Provision" },
   { path: "/admin/envelopes/templates/analyst", heading: "Envelope template", activeNavigation: "Templates" },
@@ -307,6 +406,7 @@ async function startWeb() {
         requestUrl.pathname === "/app/api/v1/runs"
         || requestUrl.pathname === "/app/api/v1/envelope-requests"
         || requestUrl.pathname.endsWith("/github-actions-workflow")
+        || requestUrl.pathname.endsWith("/repository-bundle")
         || requestUrl.pathname.startsWith("/admin/api/v1/envelope-templates/")
         || requestUrl.pathname === "/admin/api/v1/envelopes/provision"
         || requestUrl.pathname === "/admin/api/v1/workflows"
@@ -421,6 +521,17 @@ async function startWeb() {
         if (requestUrl.pathname.endsWith("/github-actions-workflow")) {
           response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
           response.end(JSON.stringify({ apiVersion: "steward.envelope-requests/v1", workflow: { schemaVersion: "v2", contentType: "application/yaml", suggestedPath: ".github/workflows/steward-repository-review.yml", sha256: "abc123", yaml: ["name: Steward governed run", "on:", "  workflow_dispatch:", "jobs:", "  governed:", "    with:", "      workflow: repository-review@1", ""].join("\n") } }));
+          return;
+        }
+        if (requestUrl.pathname.endsWith("/repository-bundle")) {
+          response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+          response.end(JSON.stringify({
+            apiVersion: "steward.envelope-requests/v1",
+            files: {
+              ".github/workflows/steward-browser-task.yml": "name: Steward governed run\n",
+              ".steward/invocations/browser-task.json": "{\"contractVersion\":\"steward.task/v2\"}\n",
+            },
+          }));
           return;
         }
         if (requestUrl.pathname.endsWith("/file")) {
@@ -605,6 +716,8 @@ async function guardedPage(browser, {
     stderr: { body: "agent stderr\n", status: 200 },
   },
   includeSampleWorkflow = false,
+  inlineRun = false,
+  publishedWorkflows = true,
   initialOnboardingDismissed = false,
   initialWorkflowAcknowledged = false,
   onboardingPagination = false,
@@ -623,6 +736,8 @@ async function guardedPage(browser, {
   const executionLogRequests = [];
   const mutations = [];
   const setupStatusRequests = [];
+  const members = structuredClone(memberFixtures);
+  const federatedSubjects = structuredClone(federatedSubjectFixtures);
   let currentAdminSetupStatus = adminSetupStatus;
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
@@ -632,9 +747,27 @@ async function guardedPage(browser, {
     hangPoll: connectionStartHangPoll,
   });
   web.useRerunFixtures(rerunResponses);
+  const fixtureRun = inlineRun ? {
+    ...run,
+    origin: "browser",
+    workflow: "browser-task@1",
+    workflowName: null,
+    workflowVersion: null,
+    package: {
+      source: "inline",
+      revision: `steward:sha256:${"c".repeat(64)}`,
+      path: browserTaskDefinitionPath,
+      contentDigest: `steward:sha256:${"c".repeat(64)}`,
+    },
+  } : run;
   await context.addInitScript(() => {
     const BrowserAbortController = AbortController;
     Object.defineProperty(window, "__stewardAbortCount", { configurable: true, value: 0, writable: true });
+    Object.defineProperty(window, "__stewardClipboardText", { configurable: true, value: "", writable: true });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText(value) { window.__stewardClipboardText = value; return Promise.resolve(); } },
+    });
     Object.defineProperty(window, "AbortController", {
       configurable: true,
       value: class extends BrowserAbortController {
@@ -718,7 +851,11 @@ async function guardedPage(browser, {
   }));
   await context.route(`${origin}/app/api/v1/workflows`, (route) => json(route, {
     apiVersion: "steward.workflows/v1",
-    workflows: emptyCollections ? [] : [
+    agents: emptyCollections ? [] : [
+      { agentRef: "codex@0.140.0", displayName: "Codex 0.140.0" },
+      { agentRef: "claude-code@2.1.222", displayName: "Claude Code 2.1.222" },
+    ],
+    workflows: emptyCollections || !publishedWorkflows ? [] : [
       {
         agent: workflowRevision.agent,
         displayName: workflowRevision.displayName,
@@ -754,7 +891,7 @@ async function guardedPage(browser, {
     await json(route, { apiVersion: "steward.envelope-requests/v1", requests: emptyCollections ? [] : [envelopeRequest] });
   });
   await context.route(`${origin}/app/api/v1/envelope-requests/**`, async (route) => {
-    if (route.request().url().endsWith("/github-actions-workflow")) {
+    if (route.request().url().endsWith("/github-actions-workflow") || route.request().url().endsWith("/repository-bundle")) {
       await route.continue();
       return;
     }
@@ -771,23 +908,54 @@ async function guardedPage(browser, {
         runs: cursor ? [{
           ...run,
           taskUid: "00000000-0000-0000-0000-000000000007",
-          workflow: "repo-summary@2",
-          workflowName: "repo-summary",
-          workflowVersion: 2,
+          origin: "browser",
+          workflow: "browser-task@1",
+          workflowName: null,
+          workflowVersion: null,
+          package: { source: "inline", revision: `steward:sha256:${"c".repeat(64)}`, path: browserTaskDefinitionPath, contentDigest: `steward:sha256:${"c".repeat(64)}` },
+        }] : [{
+          ...run,
+          origin: "github-actions",
+          package: { source: "https://github.com/example-org/sample.git", revision: `git:sha1:${"a".repeat(40)}`, path: browserTaskDefinitionPath, contentDigest: `steward:sha256:${"c".repeat(64)}` },
           trigger: { provider: "github", repository: "https://github.com/example-org/sample" },
-        }] : [run],
+        }],
         nextCursor: cursor ? null : taskUid,
         facets: { phase: runFacets },
       });
     }
-    return json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [run], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } });
+    return json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [fixtureRun], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } });
   });
   await context.route(`${origin}/app/api/v1/runs/**`, (route) => {
     if (route.request().url().endsWith("/rerun")) return route.continue();
     return route.request().url().endsWith("/timeline")
       ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
-      : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } });
+      : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...fixtureRun, phase: runPhase } });
   });
+  await context.route(`${origin}/app/api/v1/runs/${taskUid}/events`, (route) => {
+    const snapshot = {
+      apiVersion: "steward.browser-runs/v1",
+      eventId: 1,
+      run: { ...fixtureRun, phase: runPhase },
+      timeline: {
+        apiVersion: "steward.browser-runs/v1",
+        taskUid,
+        events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }],
+      },
+    };
+    return route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: `retry: 2000\nid: 1\nevent: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n: heartbeat\n\n`,
+      headers: { "cache-control": "no-cache, no-transform", "x-accel-buffering": "no" },
+    });
+  });
+  await context.route(`${origin}/app/api/v1/runs/${taskUid}/package`, (route) => json(route, {
+    taskUid,
+    files: {
+      [browserTaskDefinitionPath]: "{\"schemaVersion\":\"steward.task-definition/v2\"}\n",
+      "prompt.md": "Create the hello-world output.\n",
+    },
+  }));
   await context.route(`${origin}/app/api/v1/runs/${taskUid}/logs/*`, async (route) => {
     const stream = new URL(route.request().url()).pathname.split("/").at(-1);
     executionLogRequests.push(route.request());
@@ -808,10 +976,10 @@ async function guardedPage(browser, {
       downloadUrl: `/app/api/v1/runs/${taskUid}/outputs/${encodeURIComponent("out/hello.txt")}`,
     }],
   }));
-  await context.route(`${origin}/admin/api/v1/all-runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [{ ...run, ownerUserId: developerSession.principal.userId, ownerDisplayEmail: developerSession.principal.displayEmail }], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } }));
+  await context.route(`${origin}/admin/api/v1/all-runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [{ ...fixtureRun, ownerUserId: developerSession.principal.userId, ownerDisplayEmail: developerSession.principal.displayEmail }], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } }));
   await context.route(`${origin}/admin/api/v1/all-runs/**`, (route) => route.request().url().endsWith("/timeline")
     ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
-    : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...run, phase: runPhase } }));
+    : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...fixtureRun, phase: runPhase } }));
   await context.route(`${origin}/admin/api/v1/all-runs/${taskUid}/logs/*`, async (route) => {
     const stream = new URL(route.request().url()).pathname.split("/").at(-1);
     executionLogRequests.push(route.request());
@@ -846,6 +1014,141 @@ async function guardedPage(browser, {
       { id: "developer", displayName: "Developer", memberRoles: ["developer"], envelope, autoProvisionThreshold: null },
     ],
   }));
+  await context.route(`${origin}/admin/api/v1/members**`, async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    const parts = pathname.split("/").filter(Boolean);
+    if (request.method() === "GET" && pathname === "/admin/api/v1/members") {
+      await json(route, { apiVersion: "steward.browser-members/v1", members: emptyCollections ? [] : members });
+      return;
+    }
+    if (request.method() === "POST" && pathname === "/admin/api/v1/members") {
+      const body = request.postDataJSON();
+      mutations.push({ path: pathname, headers: await request.allHeaders(), body });
+      const results = body.emails.map((email, index) => {
+        if (!email.includes(String.fromCharCode(64))) return { email, status: "invalid" };
+        const existing = members.find((candidate) => candidate.displayEmail.toLowerCase() === email.toLowerCase());
+        if (existing) return { email, status: "already_member", member: existing };
+        const member = {
+          userId: `usr_${String(index + 1).repeat(32)}`,
+          displayEmail: email,
+          displayName: null,
+          state: "pending",
+          administrator: body.administrator,
+          memberRoles: body.memberRoles,
+          createdAt: "2026-08-24T19:00:00Z",
+          lastSignInAt: null,
+          invitedBy: administratorSession.principal.displayEmail,
+          identityCount: 0,
+        };
+        members.push(member);
+        return { email, status: "invited", member };
+      });
+      await json(route, { apiVersion: "steward.browser-members/v1", results });
+      return;
+    }
+    const userId = decodeURIComponent(parts[4] ?? "");
+    const member = members.find((candidate) => candidate.userId === userId);
+    if (!member) {
+      await json(route, { error: "member was not found" }, 404);
+      return;
+    }
+    if (request.method() === "GET") {
+      const identities = federatedSubjects
+        .filter((subject) => subject.state === "associated" && subject.canonicalUserId === member.userId)
+        .map((subject) => ({
+          associationMethod: subject.associationMethod,
+          displayName: subject.displayName,
+          issuer: subject.issuer,
+          linkedAt: subject.linkedAt ?? subject.updatedAt,
+          linkedBy: subject.linkedBy ?? "system",
+          revision: subject.revision,
+          state: subject.state,
+          subject: subject.subject,
+          subjectId: subject.subjectId,
+        }));
+      await json(route, { apiVersion: "steward.browser-members/v1", member: { ...member, identities } });
+      return;
+    }
+    mutations.push({
+      path: pathname,
+      headers: await request.allHeaders(),
+      body: request.postDataJSON(),
+    });
+    if (pathname.endsWith("/roles")) {
+      const body = request.postDataJSON();
+      if (body.kind === "administrator") member.administrator = body.action === "grant";
+      else if (body.action === "grant" && !member.memberRoles.includes(body.memberRole)) member.memberRoles.push(body.memberRole);
+      else if (body.action === "revoke") member.memberRoles = member.memberRoles.filter((role) => role !== body.memberRole);
+      await json(route, { apiVersion: "steward.browser-members/v1", member });
+      return;
+    }
+    if (pathname.endsWith("/state")) {
+      const body = request.postDataJSON();
+      member.state = body.action === "disable" ? "disabled" : body.action === "enable" ? "active" : "revoked";
+      await json(route, { apiVersion: "steward.browser-members/v1", member });
+      return;
+    }
+    if (pathname.endsWith("/unlink")) {
+      const subjectId = parts[6];
+      const subject = federatedSubjects.find((candidate) => candidate.subjectId === subjectId && candidate.canonicalUserId === member.userId);
+      if (!subject) {
+        await json(route, { error: "member identity was not found" }, 404);
+        return;
+      }
+      subject.state = "observed";
+      subject.canonicalUserId = null;
+      subject.associationMethod = null;
+      subject.revision += 1;
+      delete subject.linkedAt;
+      delete subject.linkedBy;
+      member.identityCount -= 1;
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
+    await json(route, { apiVersion: "steward.browser-members/v1", member });
+  });
+  await context.route(`${origin}/admin/api/v1/federated-subjects**`, async (route) => {
+    const request = route.request();
+    const pathname = new URL(request.url()).pathname;
+    if (request.method() === "GET") {
+      await json(route, { apiVersion: "steward.browser-admin/v1", federatedSubjects });
+      return;
+    }
+    mutations.push({ path: pathname, headers: await request.allHeaders(), body: request.postDataJSON() });
+    if (pathname.endsWith("/associate")) {
+      const subjectId = pathname.split("/").at(-2);
+      const subject = federatedSubjects.find((candidate) => candidate.subjectId === subjectId);
+      const body = request.postDataJSON();
+      const member = members.find((candidate) => candidate.userId === body.canonicalUserId);
+      if (!subject || !member) {
+        await json(route, { error: "association target was not found" }, 404);
+        return;
+      }
+      subject.state = "associated";
+      subject.canonicalUserId = member.userId;
+      subject.associationMethod = "admin";
+      subject.revision += 1;
+      subject.linkedAt = "2026-08-24T18:00:00Z";
+      subject.linkedBy = administratorSession.principal.displayEmail;
+      member.identityCount += 1;
+      await json(route, { apiVersion: "steward.browser-admin/v1", federatedSubject: subject });
+      return;
+    }
+    if (pathname.endsWith("/disable")) {
+      const subjectId = pathname.split("/").at(-2);
+      const subject = federatedSubjects.find((candidate) => candidate.subjectId === subjectId);
+      if (!subject) {
+        await json(route, { error: "identity was not found" }, 404);
+        return;
+      }
+      subject.state = "disabled";
+      subject.revision += 1;
+      await json(route, { apiVersion: "steward.browser-admin/v1", federatedSubject: subject });
+      return;
+    }
+    await json(route, { error: "unsupported mutation" }, 422);
+  });
   await context.route(`${origin}/admin/api/v1/capabilities`, (route) => capabilityCatalogStatus === 200
     ? json(route, {
       schemaVersion: "steward.capability-catalog/v2",
@@ -1156,8 +1459,8 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
     await expect(developer.page.getByText("Sensitivity notice", { exact: true })).toBeVisible();
 
     await developer.page.goto(`${origin}/get-started`);
-    await expect(developer.page.getByText("Five steps to your first governed agent run. An envelope is the budget, models and tools an agent may use; the workflow runs your agent inside it.")).toBeVisible();
-    for (const title of ["Connect GitHub", "Get your first envelope", "Choose the sample package", "Trigger a test run", "See the result"]) {
+    await expect(developer.page.getByText("Four steps to your first governed browser run. GitHub Actions automation is available afterward, but never blocks completion.")).toBeVisible();
+    for (const title of ["Connect GitHub", "Get your first envelope", "Run hello world now", "See the result", "Automate it from GitHub Actions"]) {
       await expect(developer.page.getByRole("button", { name: new RegExp(title) })).toBeVisible();
     }
   } finally {
@@ -1172,6 +1475,111 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
     await administrator.page.getByRole("link", { name: /Developer/ }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/approvals/${unifiedEnvelopeRequest.id}`);
     await expect(administrator.page.getByRole("heading", { name: /Developer · above ceiling/i })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrators filter members and manage one member through the detail boundary", async ({ browser }) => {
+  const administrator = await guardedPage(browser, { session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/members`);
+    await expect(administrator.page.getByText("People who can sign in to this organization, their access, and the member roles that decide which templates they can request.")).toBeVisible();
+    await expect(administrator.page.getByRole("tab", { name: /All\s+4/ })).toBeVisible();
+    await expect(administrator.page.getByRole("tab", { name: /Active\s+2/ })).toBeVisible();
+    await expect(administrator.page.getByRole("tab", { name: /Invited\s+1/ })).toBeVisible();
+    await expect(administrator.page.getByRole("tab", { name: /Disabled\s+1/ })).toBeVisible();
+
+    await administrator.page.getByRole("searchbox", { name: "Search members" }).fill("bob");
+    await expect(administrator.page.getByRole("link", { name: "Open bob@example.org" })).toBeVisible();
+    await expect(administrator.page.getByRole("link", { name: "Open alice@example.com" })).toHaveCount(0);
+    await administrator.page.getByRole("searchbox", { name: "Search members" }).fill("");
+    await administrator.page.getByRole("tab", { name: /Invited\s+1/ }).click();
+    await expect(administrator.page.getByRole("link", { name: "Open carol@example.com" })).toBeVisible();
+    await expect(administrator.page.getByRole("link", { name: "Open bob@example.org" })).toHaveCount(0);
+
+    await administrator.page.getByRole("tab", { name: /All\s+4/ }).click();
+    await administrator.page.getByRole("link", { name: "Open bob@example.org" }).click();
+    await expect(administrator.page).toHaveURL(`${origin}/admin/members/usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`);
+    await expect(administrator.page.getByRole("heading", { name: "Bob Example" })).toBeVisible();
+    await expect(administrator.page.getByText("retired-role", { exact: true }).first()).toBeVisible();
+    await expect(administrator.page.getByText(/No template currently publishes this role/)).toBeVisible();
+
+    const administratorSwitch = administrator.page.getByRole("switch", { name: "Administrator access off" });
+    await administratorSwitch.click();
+    await expect(administrator.page.getByRole("alertdialog").getByRole("heading", { name: "Grant administrator access?" })).toBeVisible();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Grant administrator" }).click();
+    await expect(administrator.page.getByRole("switch", { name: "Administrator access on" })).toHaveAttribute("aria-checked", "true");
+
+    const roles = administrator.page.getByRole("combobox", { name: "Member roles" });
+    await roles.fill("analyst");
+    await roles.press("Enter");
+    await expect(administrator.page.getByText("analyst", { exact: true })).toBeVisible();
+
+    await administrator.page.getByRole("button", { name: "Unlink" }).click();
+    await expect(administrator.page.getByRole("alertdialog").getByRole("heading", { name: "Unlink this identity?" })).toBeVisible();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Unlink identity" }).click();
+    await expect(administrator.page.getByText("No linked identities.")).toBeVisible();
+
+    await administrator.page.getByRole("button", { name: "Link identity" }).click();
+    await administrator.page.getByRole("combobox", { name: "Observed identity" }).selectOption("00000000-0000-0000-0000-000000000265");
+    await administrator.page.getByRole("button", { name: "Link", exact: true }).click();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Link identity" }).click();
+    await expect(administrator.page.getByText("github-actions:actor:13579", { exact: true })).toBeVisible();
+
+    const roleMutation = administrator.mutations.find((mutation) => mutation.path.endsWith("/roles") && mutation.body.kind === "member_role");
+    expect(roleMutation.headers["x-steward-csrf"]).toBe("test-csrf");
+    expect(roleMutation.headers["content-type"]).toContain("application/json");
+    expect(roleMutation.headers.origin).toBe(origin);
+    expect(roleMutation.body).toEqual({ action: "grant", kind: "member_role", memberRole: "analyst" });
+    for (const identityMutation of [
+      administrator.mutations.find((mutation) => mutation.path.endsWith("/identities/00000000-0000-0000-0000-000000000264/unlink")),
+      administrator.mutations.find((mutation) => mutation.path.endsWith("/00000000-0000-0000-0000-000000000265/associate")),
+    ]) {
+      expect(identityMutation.headers["x-steward-csrf"]).toBe("test-csrf");
+      expect(identityMutation.headers["content-type"]).toContain("application/json");
+      expect(identityMutation.headers.origin).toBe(origin);
+    }
+
+    await administrator.page.goto(`${origin}/admin/members/${administratorSession.principal.userId}`);
+    await expect(administrator.page.getByRole("switch", { name: "Administrator access on" })).toBeDisabled();
+    await expect(administrator.page.getByText("You can't remove your own administrator access.")).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrators invite members and govern the member lifecycle", async ({ browser }) => {
+  const administrator = await guardedPage(browser, { session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/members`);
+    await administrator.page.getByRole("button", { name: "Invite people" }).click();
+    await administrator.page.getByRole("textbox", { name: "Email addresses" }).fill("erin@example.com, invalid");
+    await administrator.page.getByRole("combobox", { name: "Access" }).selectOption("administrator");
+    const roles = administrator.page.getByRole("combobox", { name: "Member roles" });
+    await roles.fill("developer");
+    await roles.press("Enter");
+    await administrator.page.getByRole("button", { name: "Send invites" }).click();
+    await expect(administrator.page.getByText("invalid · invalid")).toBeVisible();
+    const invite = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/members");
+    expect(invite.body).toEqual({ administrator: true, emails: ["erin@example.com", "invalid"], memberRoles: ["developer"] });
+
+    await administrator.page.goto(`${origin}/admin/members/usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`);
+    await administrator.page.getByRole("button", { name: "Disable member" }).click();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Disable member" }).click();
+    await expect(administrator.page.getByText("Disabled", { exact: true })).toBeVisible();
+    await administrator.page.getByRole("button", { name: "Enable member" }).click();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Enable member" }).click();
+    await expect(administrator.page.getByText("Active", { exact: true })).toBeVisible();
+
+    await administrator.page.getByRole("button", { name: "Disable identity" }).click();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Disable identity" }).click();
+    await expect(administrator.page.getByText("No linked identities.")).toBeVisible();
+
+    await administrator.page.goto(`${origin}/admin/members/usr_cccccccccccccccccccccccccccccccc`);
+    await administrator.page.getByRole("button", { name: "Revoke invitation" }).click();
+    await administrator.page.getByRole("alertdialog").getByRole("button", { name: "Revoke invitation" }).click();
+    await expect(administrator.page.getByText("Revoked", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -1198,6 +1606,21 @@ test("a user session cannot enter the administrator workspace", async ({ browser
     await expect(developer.page.getByRole("heading", { name: "All runs", exact: true })).toHaveCount(0);
   } finally {
     await closeGuardedPage(developer);
+  }
+});
+
+test("an unroled signed-in person sees access pending instead of a workspace", async ({ browser }) => {
+  const unroled = await guardedPage(browser, {
+    session: { ...developerSession, memberRoles: [] },
+  });
+  try {
+    await unroled.page.goto(`${origin}/envelopes`);
+    await expect(unroled.page.getByRole("heading", { name: "Access pending", exact: true })).toBeVisible();
+    await expect(unroled.page.getByText(developerSession.principal.displayEmail, { exact: true })).toBeVisible();
+    await expect(unroled.page.getByRole("button", { name: "Copy user ID" })).toBeVisible();
+    await expect(unroled.page.getByRole("navigation", { name: "Primary navigation" })).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(unroled);
   }
 });
 
@@ -1372,9 +1795,9 @@ test("empty entity collections show contextual product copy", async ({ browser }
       ["/envelopes", "No envelopes yet."],
       [`/envelopes/${envelopeId}/runs`, "No runs yet."],
       ["/runs", "No runs yet."],
-      [`/runs/${taskUid}`, "No steps reported"],
+      [`/runs/${taskUid}`, "The Task was admitted under the selected Envelope."],
       ["/admin/runs", "No runs yet."],
-      [`/admin/runs/${taskUid}`, "No steps reported"],
+      [`/admin/runs/${taskUid}`, "The Task was admitted under the selected Envelope."],
       ["/admin/envelopes/templates", "No templates yet."],
       ["/admin/envelopes/provision", "No templates"],
       ["/admin/workflows", "No workflows yet"],
@@ -1536,29 +1959,18 @@ test("administrators can provision a template envelope directly to a user", asyn
   }
 });
 
-test("onboarding selects the browser sample and ignores unrelated runs", async ({ browser }) => {
+test("onboarding makes the browser run core and repository automation optional", async ({ browser }) => {
   const developer = await guardedPage(browser, { includeSampleWorkflow: true });
   try {
     await developer.page.goto(`${origin}/get-started`);
-    const workflowStep = developer.page.getByRole("listitem").filter({ hasText: "Choose the sample package" });
-    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" });
-    await expect(workflowStep.getByText("Use the published sample now; a repository is optional", { exact: true })).toBeVisible();
-    await expect(runStep.getByText("Start the sample from Steward", { exact: true })).toBeVisible();
+    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Run hello world now" });
+    const automationStep = developer.page.getByRole("listitem").filter({ hasText: "Automate it from GitHub Actions" });
+    await expect(runStep.getByText(/Start directly in Steward/)).toBeVisible();
+    await expect(runStep.getByRole("link", { name: "Open Run now" })).toHaveAttribute("href", "/runs/new");
+    await expect(automationStep.getByText("Optional", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("2 of 4 done", { exact: true })).toBeVisible();
 
-    await developer.page.getByRole("button", { name: "Use this sample" }).click();
-    await expect(workflowStep.getByText("Done", { exact: true })).toBeVisible();
-    const acknowledgement = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/preferences");
-    expect(acknowledgement, "expected the durable preference mutation").toBeTruthy();
-    expect(acknowledgement.headers["x-steward-csrf"]).toBe("test-csrf");
-    expect(acknowledgement.headers["content-type"]).toContain("application/json");
-    expect(acknowledgement.headers.origin).toBe(origin);
-    expect(acknowledgement.body).toEqual({ workflowAcknowledged: true });
-
-    await developer.page.reload();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "Choose the sample package" }).getByText("Done", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" }).getByText("Start the sample from Steward", { exact: true })).toBeVisible();
-
-    await developer.page.getByRole("button", { name: /Hide this guide/ }).click();
+    await developer.page.getByRole("button", { name: "Hide Get started" }).click();
     await expect(developer.page.getByText("The onboarding guide is hidden. Your progress is preserved.")).toBeVisible();
     await expect(developer.page.getByRole("link", { name: "Get started" })).toHaveCount(0);
     const dismissal = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
@@ -1574,11 +1986,41 @@ test("onboarding selects the browser sample and ignores unrelated runs", async (
   }
 });
 
-test("onboarding navigation shows progress and disappears when all five steps are complete", async ({ browser }) => {
+test("onboarding banner is shared, dismissible, and restorable from settings", async ({ browser }) => {
+  const developer = await guardedPage(browser, { includeSampleWorkflow: true });
+  try {
+    for (const path of ["/envelopes", "/runs", "/connections", "/settings"]) {
+      await developer.page.goto(`${origin}${path}`);
+      await expect(developer.page.getByRole("region", { name: "Get started" })).toBeVisible();
+      await expect(developer.page.getByRole("button", { name: "Hide Get started" })).toBeVisible();
+    }
+
+    await developer.page.goto(`${origin}/envelopes`);
+    await developer.page.getByRole("button", { name: "Hide Get started" }).click();
+    await expect(developer.page.getByRole("region", { name: "Get started" })).toHaveCount(0);
+    await expect(developer.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Get started" })).toHaveCount(0);
+    const dismissal = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
+    expect(dismissal.body).toEqual({ onboardingDismissed: true });
+
+    await developer.page.reload();
+    await expect(developer.page.getByRole("region", { name: "Get started" })).toHaveCount(0);
+
+    await developer.page.goto(`${origin}/settings`);
+    await developer.page.getByRole("button", { name: "Reopen Get started" }).click();
+    await expect(developer.page.getByRole("region", { name: "Get started" })).toBeVisible();
+    await expect(developer.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Get started" })).toBeVisible();
+    const restored = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
+    expect(restored.body).toEqual({ onboardingDismissed: false });
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("onboarding navigation shows progress and disappears when all four core steps are complete", async ({ browser }) => {
   const inProgress = await guardedPage(browser, { includeSampleWorkflow: true });
   try {
     await inProgress.page.goto(`${origin}/envelopes`);
-    await expect(inProgress.page.getByRole("link", { name: /Get started/ })).toContainText("2/5");
+    await expect(inProgress.page.getByRole("link", { name: /Get started/ })).toContainText("2/4");
   } finally {
     await closeGuardedPage(inProgress);
   }
@@ -1610,21 +2052,22 @@ test("onboarding lets the user choose which first envelope template to request",
   }
 });
 
-test("onboarding cannot acknowledge an absent sample", async ({ browser }) => {
+test("onboarding does not require a published sample", async ({ browser }) => {
   const developer = await guardedPage(browser);
   try {
     await developer.page.goto(`${origin}/get-started`);
-    await expect(developer.page.getByText("The deployment has no executable onboarding sample.")).toBeVisible();
-    await expect(developer.page.getByRole("button", { name: "Use this sample" })).toBeDisabled();
+    await expect(developer.page.getByRole("link", { name: "Open Run now" })).toBeVisible();
+    await expect(developer.page.getByText("Optional", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
 });
 
 test("Run now submits an inline package under the selected envelope", async ({ browser }) => {
-  const developer = await guardedPage(browser);
+  const developer = await guardedPage(browser, { publishedWorkflows: false });
   try {
     await developer.page.goto(`${origin}/runs/new`);
+    await developer.page.getByRole("checkbox", { name: /Capture execution log/ }).check();
     await developer.page.getByRole("button", { name: "Run now" }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
 
@@ -1635,8 +2078,60 @@ test("Run now submits an inline package under the selected envelope", async ({ b
     expect(submission.body.package.source).toBe("inline");
     expect(submission.body.package.path).toBe(browserTaskDefinitionPath);
     expect(submission.body.package.files["prompt.md"]).toContain("hello world");
+    expect(submission.body.diagnostics).toEqual({ executionLog: "full" });
+    const taskDefinition = JSON.parse(submission.body.package.files[browserTaskDefinitionPath]);
+    expect(taskDefinition.runtime).toEqual({ agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } });
+    expect(taskDefinition.requires.authority.llms).toEqual([{ provider: "openai", model: "gpt-5.4" }]);
     expect(submission.body).not.toHaveProperty("actor");
     expect(submission.body).not.toHaveProperty("owner");
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("a successful inline run exports the exact package later admitted from GitHub Actions", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    includeSampleWorkflow: true,
+    inlineRun: true,
+    onboardingPagination: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByRole("heading", { name: "Save this task to a repository" })).toBeVisible();
+    await developer.page.getByLabel("Target repository").fill("https://github.com/example-org/sample.git");
+    await developer.page.getByRole("button", { name: "Copy repository bundle" }).click();
+    await expect(developer.page.getByRole("button", { name: "Bundle copied" })).toBeVisible();
+
+    const clipboard = JSON.parse(await developer.page.evaluate(() => window.__stewardClipboardText));
+    expect(clipboard[browserTaskDefinitionPath]).toBe("{\"schemaVersion\":\"steward.task-definition/v2\"}\n");
+    expect(clipboard["prompt.md"]).toBe("Create the hello-world output.\n");
+    expect(clipboard[".steward/invocations/browser-task.json"]).toContain("steward.task/v2");
+    expect(clipboard[".github/workflows/steward-browser-task.yml"]).toContain("Steward governed run");
+
+    const mutation = developer.mutations.find((entry) => entry.path.endsWith("/repository-bundle"));
+    expectMutationProof(mutation);
+    expect(mutation.body).toEqual({
+      repository: "https://github.com/example-org/sample.git",
+      packagePath: browserTaskDefinitionPath,
+      invocationPath: ".steward/invocations/browser-task.json",
+    });
+
+    const runs = await developer.page.evaluate(async () => {
+      const firstResponse = await fetch("/app/api/v1/runs", { credentials: "same-origin" });
+      const first = await firstResponse.json();
+      const secondResponse = await fetch(`/app/api/v1/runs?cursor=${encodeURIComponent(first.nextCursor)}`, { credentials: "same-origin" });
+      const second = await secondResponse.json();
+      return [...first.runs, ...second.runs];
+    });
+    const browserRun = runs.find((entry) => entry.origin === "browser" && entry.package?.source === "inline");
+    const githubRun = runs.find((entry) => entry.trigger?.provider === "github");
+    expect(browserRun?.package?.contentDigest).toBeTruthy();
+    expect(githubRun?.package?.source).toBe(mutation.body.repository);
+    expect(githubRun?.package?.path).toBe(mutation.body.packagePath);
+    expect(githubRun?.package?.contentDigest).toBe(browserRun.package.contentDigest);
+
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Automate it from GitHub Actions" }).getByText("Done", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -1650,8 +2145,9 @@ test("onboarding follows paginated envelope and run evidence", async ({ browser 
   try {
     await developer.page.goto(`${origin}/get-started`);
     await expect(developer.page.getByRole("listitem").filter({ hasText: "Get your first envelope" }).getByText("Done", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Run hello world now" }).getByText("Done", { exact: true })).toBeVisible();
     await expect(developer.page.getByRole("listitem").filter({ hasText: "See the result" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Automate it from GitHub Actions" }).getByText("Done", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -1717,6 +2213,143 @@ test("GitHub re-run polls with one idempotency key until the new Task is correla
   }
 });
 
+test("browser-origin re-run uses the browser admission boundary", async ({ browser }) => {
+  const developer = await guardedPage(browser, { inlineRun: true });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await developer.page.getByRole("button", { name: "Re-run" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${rerunTaskUid}`);
+
+    const rerun = developer.mutations.find((mutation) => mutation.path.endsWith("/rerun"));
+    expectMutationProof(rerun);
+    expect(rerun.body.idempotencyKey).toBeTruthy();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("run detail follows SSE snapshots from submitted to terminal without reload", async ({ browser }) => {
+  const developer = await guardedPage(browser, { runPhase: "submitted" });
+  let eventRequest = 0;
+  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}/events`, async (route) => {
+    eventRequest += 1;
+    if (eventRequest === 1) await new Promise((resolve) => setTimeout(resolve, 200));
+    const terminal = eventRequest > 1;
+    const phase = terminal ? "succeeded" : "running";
+    const snapshot = {
+      apiVersion: "steward.browser-runs/v1",
+      eventId: eventRequest,
+      run: {
+        ...run,
+        phase,
+        runtimeUid: "runtime-live-1",
+        stages: run.stages.map((stage) => ({
+          ...stage,
+          state: stage.id === "agent_execution" ? phase : "succeeded",
+        })),
+      },
+      timeline: {
+        apiVersion: "steward.browser-runs/v1",
+        taskUid,
+        events: [
+          { kind: "phase", phase, at: terminal ? "2026-08-24T17:03:00Z" : "2026-08-24T17:02:15Z" },
+          { kind: "runtimeBound", runtimeUid: "runtime-live-1", at: "2026-08-24T17:02:10Z" },
+        ],
+      },
+    };
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: `retry: 2000\nid: ${eventRequest}\nevent: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`,
+    });
+  });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByText("submitted", { exact: true }).first()).toBeVisible();
+    await expect(developer.page.locator("article > header").getByText("running", { exact: true })).toBeVisible();
+    await expect(developer.page.locator("article > header").getByText("succeeded", { exact: true })).toBeVisible({ timeout: 5_000 });
+    await expect(developer.page.getByText("runtime-live-1", { exact: true })).toBeVisible();
+    expect(eventRequest).toBeGreaterThanOrEqual(2);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("run detail falls back to bounded polling when SSE is unavailable", async ({ browser }) => {
+  const developer = await guardedPage(browser, { runPhase: "submitted" });
+  let runRequest = 0;
+  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}/events`, (route) => route.fulfill({
+    status: 200,
+    contentType: "text/event-stream",
+    body: ": no snapshot available\n\n",
+  }));
+  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}`, (route) => {
+    runRequest += 1;
+    const phase = runRequest > 1 ? "succeeded" : "submitted";
+    return route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ apiVersion: "steward.browser-runs/v1", run: { ...run, phase } }),
+    });
+  });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByText("submitted", { exact: true }).first()).toBeVisible();
+    await expect.poll(() => runRequest, { timeout: 5_000 }).toBeGreaterThanOrEqual(2);
+    await expect(developer.page.locator("article > header").getByText("succeeded", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("job and log stream deep links survive reload and browser history", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}?job=agent_execution&stream=stderr`);
+    await expect(developer.page.getByRole("heading", { name: "Agent execution" })).toBeVisible();
+    await expect(developer.page.getByRole("tab", { name: "stderr" })).toHaveAttribute("aria-selected", "true");
+    await developer.page.reload();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}?job=agent_execution&stream=stderr`);
+    await expect(developer.page.getByRole("tab", { name: "stderr" })).toHaveAttribute("aria-selected", "true");
+
+    await developer.page.getByRole("button", { name: "Admission" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}?job=admission`);
+    await developer.page.goBack();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}?job=agent_execution&stream=stderr`);
+    await expect(developer.page.getByRole("tab", { name: "stderr" })).toHaveAttribute("aria-selected", "true");
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("logging-off runs explain that no transcript was captured", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  const loggingOffRun = {
+    ...run,
+    executionLog: "off",
+    stages: run.stages.map((stage) => stage.id === "agent_execution"
+      ? { ...stage, steps: [{ ...stage.steps[0], logStreams: [] }] }
+      : stage),
+  };
+  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}/events`, (route) => route.fulfill({
+    status: 200,
+    contentType: "text/event-stream",
+    body: ": no snapshot available\n\n",
+  }));
+  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}`, (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ apiVersion: "steward.browser-runs/v1", run: loggingOffRun }),
+  }));
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}?job=agent_execution`);
+    await expect(developer.page.getByText("No execution log was captured for this run.", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("region", { name: "Execution log" })).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("failed run phases expose stdout and stderr as escaped sensitive output", async ({ browser }) => {
   const developer = await guardedPage(browser, {
     executionLogs: {
@@ -1742,9 +2375,7 @@ test("failed run phases expose stdout and stderr as escaped sensitive output", a
     await expect(developer.page.locator("#executed")).toHaveCount(0);
 
     await developer.page.getByRole("link", { name: "Back to run" }).click();
-    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
-    await developer.page.getByRole("button", { name: /Agent execution/ }).click();
-    await developer.page.getByText("Execution", { exact: true }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}?job=agent_execution&stream=stdout`);
     await developer.page.getByRole("tab", { name: "stderr" }).click();
     const stderrLink = developer.page.getByRole("link", { name: "Open full page" });
     await expect(stderrLink).toHaveAttribute("href", `/runs/${taskUid}/logs/stderr`);
@@ -1785,7 +2416,7 @@ test("administrator run logs use the administrator boundary and report unavailab
     await administrator.page.getByRole("tab", { name: "stderr" }).click();
     await administrator.page.getByRole("link", { name: "Open full page" }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/runs/${taskUid}/logs/stderr`);
-    await expect(administrator.page.getByRole("status")).toHaveText("stderr log is unavailable for this run.");
+    await expect(administrator.page.getByRole("status")).toContainText("No execution log was captured for this run.");
     const requestedPaths = administrator.executionLogRequests.map((request) => new URL(request.url()).pathname);
     expect(requestedPaths).toContain(`/admin/api/v1/all-runs/${taskUid}/logs/stderr`);
     expect(requestedPaths.every((path) => path.startsWith(`/admin/api/v1/all-runs/${taskUid}/logs/`))).toBe(true);
@@ -1859,9 +2490,9 @@ test("administrator templates and approvals use typed browser authority", async 
     await model.press("Enter");
     await expect(administrator.page.getByText("provider-b/model-b", { exact: true })).toBeVisible();
 
-    const tool = administrator.page.getByRole("combobox", { name: "Tools" });
-    await expect(tool).toBeVisible();
-    await expect(administrator.page.getByText("repository:get_file_contents", { exact: true })).toBeVisible();
+    const tools = administrator.page.getByRole("group", { name: "Tools" });
+    await expect(tools.getByRole("searchbox", { name: "Search tools" })).toBeVisible();
+    await expect(tools.getByText("github:repository:get_file_contents", { exact: true })).toBeVisible();
     await expect(administrator.page.getByRole("heading", { name: "Runner" })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByText("Template revision accepted by the Rust authority.")).toBeVisible();
@@ -2092,7 +2723,7 @@ test("administrator can revise and copy a ten-grant template listed in the capab
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/developer`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
-    await expect(tools.getByRole("button", { name: /^Remove / })).toHaveCount(10);
+    await expect(tools.getByRole("checkbox", { checked: true })).toHaveCount(10);
 
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")).toBeTruthy();
@@ -2127,12 +2758,8 @@ test("administrator can replace a template tool absent from the capability catal
     await expect(tools.getByText("Remove or replace every tool not listed in the capability catalog.")).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
 
-    const tool = tools.getByRole("combobox", { name: "Tools" });
-    await tool.focus();
-    await tool.press("Backspace");
-    await expect(tools.getByRole("button", { name: "Remove github:repository:get_file_contents" })).toHaveCount(0);
-    await tool.fill("actions_get:read");
-    await tool.press("Enter");
+    await tools.getByRole("button", { name: "Remove unavailable github:repository:get_file_contents" }).click();
+    await tools.getByRole("checkbox", { name: "github:actions_get:read" }).check();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.tools).toEqual([
@@ -2152,11 +2779,126 @@ test("administrator template tool controls offer no fallback when the capability
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
-    await expect(tools.getByRole("combobox", { name: "Tools" })).toBeDisabled();
+    await expect(tools.getByRole("searchbox", { name: "Search tools" })).toBeDisabled();
     await expect(tools.getByText("No tools are listed in the deployment capability catalog.")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.tools).toEqual([]);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator selects every grouped read tool as exact authority tuples", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    adminTemplateTools: [],
+    capabilityCatalogTools: groupedGithubTools,
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/developer`);
+    const tools = administrator.page.getByRole("group", { name: "Tools" });
+    await expect(tools.getByRole("heading", { name: "issues" })).toBeVisible();
+    await expect(tools.getByRole("heading", { name: "repositories" })).toBeVisible();
+    await expect(tools.getByRole("heading", { name: "search" })).toBeVisible();
+    await expect(tools.getByRole("heading", { name: "Ungrouped" })).toBeVisible();
+
+    await tools.getByRole("button", { name: "Select all read-only" }).click();
+    await expect(tools.getByText("2 read · 0 write · 0 destructive", { exact: true })).toBeVisible();
+    await expect(tools.getByRole("checkbox", { name: "github:repository_get:read" })).toHaveCount(2);
+    await expect(tools.getByRole("checkbox", { name: "github:repository_get:read" }).first()).toBeChecked();
+    await expect(tools.getByRole("checkbox", { name: "github:issues_update:write" })).not.toBeChecked();
+
+    await tools.getByRole("button", { name: "Clear issues" }).click();
+    await expect(tools.getByText("1 read · 0 write · 0 destructive", { exact: true })).toBeVisible();
+    await tools.getByRole("button", { name: "Select read-only in issues" }).click();
+    await tools.getByRole("button", { name: "Clear all" }).click();
+    await expect(tools.getByText("0 read · 0 write · 0 destructive", { exact: true })).toBeVisible();
+    await tools.getByRole("button", { name: "Select all read-only" }).click();
+
+    await expect(tools.getByRole("region", { name: "Tool changes in next revision" }).getByText("Added (2)")).toBeVisible();
+
+    await tools.getByRole("searchbox", { name: "Search tools" }).fill("destructive");
+    await expect(tools.getByRole("checkbox", { name: "github:repository_delete:delete" })).toBeVisible();
+    await expect(tools.getByRole("checkbox", { name: "github:issues_get:read" })).toHaveCount(0);
+
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")).toBeTruthy();
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer").body.envelope.spec.tools).toEqual([
+      { provider: "github", resource: "issues_get", action: "read" },
+      { provider: "github", resource: "repository_get", action: "read" },
+    ]);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("successive template saves diff tools against the accepted prior revision", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    adminTemplateTools: [],
+    capabilityCatalogTools: groupedGithubTools,
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/developer`);
+    const tools = administrator.page.getByRole("group", { name: "Tools" });
+    const changes = tools.getByRole("region", { name: "Tool changes in next revision" });
+    const issuesRead = tools.getByRole("checkbox", { name: "github:issues_get:read" });
+    const repositoryRead = tools.getByRole("checkbox", { name: "github:repository_get:read" }).first();
+
+    await issuesRead.check();
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.filter((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer").length).toBe(1);
+    await expect(changes.getByText("No tool authority changes.", { exact: true })).toBeVisible();
+
+    await issuesRead.uncheck();
+    await repositoryRead.check();
+    await expect(changes.getByText("Added (1)", { exact: true })).toBeVisible();
+    await expect(changes.getByText("Removed (1)", { exact: true })).toBeVisible();
+
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.filter((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer").length).toBe(2);
+    const revisions = administrator.mutations
+      .filter((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")
+      .map((mutation) => mutation.body.envelope.revision);
+    expect(revisions).toEqual([adminEnvelope.revision + 1, adminEnvelope.revision + 2]);
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator confirms write and destructive tools one at a time", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    adminTemplateTools: [],
+    capabilityCatalogTools: groupedGithubTools,
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/developer`);
+    const tools = administrator.page.getByRole("group", { name: "Tools" });
+    const writeTool = tools.getByRole("checkbox", { name: "github:issues_update:write" });
+    const destructiveTool = tools.getByRole("checkbox", { name: "github:repository_delete:delete" });
+
+    administrator.page.once("dialog", (dialog) => dialog.dismiss());
+    await writeTool.click();
+    await expect(writeTool).not.toBeChecked();
+    administrator.page.once("dialog", (dialog) => dialog.accept());
+    await writeTool.click();
+
+    administrator.page.once("dialog", (dialog) => dialog.dismiss());
+    await destructiveTool.click();
+    await expect(destructiveTool).not.toBeChecked();
+    administrator.page.once("dialog", (dialog) => dialog.accept());
+    await destructiveTool.click();
+    await expect(tools.getByText("0 read · 1 write · 1 destructive", { exact: true })).toBeVisible();
+    await expect(tools.getByRole("region", { name: "Tool changes in next revision" }).getByText("Added (2)")).toBeVisible();
+
+    await administrator.page.getByRole("button", { name: "Save new version" }).click();
+    await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer")).toBeTruthy();
+    expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer").body.envelope.spec.tools).toEqual([
+      { provider: "github", resource: "issues_update", action: "write" },
+      { provider: "github", resource: "repository_delete", action: "delete" },
+    ]);
   } finally {
     await closeGuardedPage(administrator);
   }

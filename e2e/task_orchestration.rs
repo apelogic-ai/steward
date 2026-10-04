@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::env;
 use std::error::Error;
@@ -48,7 +49,10 @@ use steward_store::{
     TaskExecutionTransition, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
     WorkflowPublication,
 };
-use steward_types::direct_package::{BrowserTaskEvidence, TaskOrigin};
+use steward_types::direct_package::{
+    BrowserTaskEvidence, ClosureEntry, ClosureEntryKind, ContentDigest, PackageClosure,
+    RelativePath, TaskOrigin, canonical_json_bytes,
+};
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
     CanonicalAuthorityBinding, DisposableExecutionBinding, Duration, Email,
@@ -132,6 +136,7 @@ struct AmbiguousKubernetes {
     fail_first_create_response: Arc<AtomicBool>,
     reject_create_with_unprocessable_entity: Arc<AtomicBool>,
     delete_preconditions: Arc<Mutex<Vec<String>>>,
+    replace_uid_after_update: Arc<AtomicBool>,
     replace_name_after_delete: Arc<AtomicBool>,
     admission: Arc<Mutex<Option<WebhookAdmissionHarness>>>,
     credential_secret: Arc<Mutex<Option<serde_json::Value>>>,
@@ -668,6 +673,40 @@ fn disposable_execution_binding() -> Result<TaskExecutionBinding, io::Error> {
     Ok(TaskExecutionBinding::Disposable(binding))
 }
 
+fn browser_direct_package_evidence(
+    source: &str,
+    repository_revision: Option<String>,
+) -> Result<BrowserTaskEvidence, Box<dyn Error>> {
+    let path = RelativePath::parse("task-definition.json")?;
+    let closure = PackageClosure {
+        contract_version: "steward.package-closure/v1".to_owned(),
+        entry_point: path.clone(),
+        entries: vec![ClosureEntry {
+            kind: ClosureEntryKind::TaskDefinition,
+            path: path.clone(),
+            digest: ContentDigest::parse(format!("steward:sha256:{:x}", Sha256::digest(b"{}")))?,
+            size_bytes: 2,
+        }],
+    };
+    closure.validate()?;
+    let closure_digest = ContentDigest::parse(format!(
+        "steward:sha256:{:x}",
+        Sha256::digest(canonical_json_bytes(&closure)?)
+    ))?;
+    let evidence = BrowserTaskEvidence {
+        source: source.to_owned(),
+        revision: repository_revision.unwrap_or_else(|| closure_digest.as_str().to_owned()),
+        path,
+        closure: Some(closure),
+        closure_digest,
+        inline_files: (source == "inline")
+            .then(|| BTreeMap::from([("task-definition.json".to_owned(), "{}".to_owned())])),
+        diagnostics: Default::default(),
+    };
+    evidence.validate()?;
+    Ok(evidence)
+}
+
 async fn reserve_browser_concurrency_fixture(
     store: &PgStore,
     idempotency_key: &str,
@@ -725,8 +764,65 @@ async fn reserve_browser_concurrency_fixture(
         .map(|reservation| reservation.inserted)
 }
 
+async fn reserve_browser_direct_package_fixture(
+    store: &PgStore,
+    idempotency_key: &str,
+    service: &str,
+    identity: &steward_types::CanonicalPrincipal,
+    envelope_instance_id: &str,
+    envelope_digest: &str,
+    envelope: &Envelope,
+    spec: &AgentRuntimeSpec,
+    execution_binding: &TaskExecutionBinding,
+    evidence: &BrowserTaskEvidence,
+) -> Result<bool, StoreError> {
+    let task_uid = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let runtime_name = format!("task-{}", operation_id.simple());
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let command = ["example-agent".to_owned(), "run".to_owned()];
+    let decision = AdmissionDecision::Admit;
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid,
+            operation_id,
+            idempotency_key,
+            submitter_service: service,
+            acting_user: Some(identity.display_email.as_str()),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: identity.display_email.as_str(),
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "direct:browser-package@1",
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: Some(envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: spec,
+            agent_command: &command,
+            execution_binding: Some(execution_binding),
+            source_provenance: None,
+            direct_task_evidence: None,
+            task_origin: TaskOrigin::Browser,
+            browser_task_evidence: Some(evidence),
+            user_envelope_snapshot: Some(envelope),
+            candidate_digest: &digest,
+            admission_decision: &decision,
+            inert_manifest_digest: &digest,
+            active_manifest_digest: &digest,
+        })
+        .await
+        .map(|reservation| reservation.inserted)
+}
+
 #[tokio::test]
-async fn browser_task_concurrency_is_bounded_without_breaking_exact_retries()
+async fn browser_task_rows_persist_and_concurrency_is_bounded_without_breaking_exact_retries()
 -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
     let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
@@ -854,8 +950,54 @@ async fn browser_task_concurrency_is_bounded_without_breaking_exact_retries()
         "closureDigest": format!("steward:sha256:{}", "b".repeat(64))
     }))?;
     let service = format!("browser-limit-{suffix}");
+    let inline_evidence = browser_direct_package_evidence("inline", None)?;
+    let repository_evidence = browser_direct_package_evidence(
+        "https://github.com/example-org/agentic-ops.git",
+        Some(format!("git:sha1:{}", "e".repeat(40))),
+    )?;
+    for (kind, evidence) in [
+        ("inline", &inline_evidence),
+        ("repository", &repository_evidence),
+    ] {
+        let key = format!("browser-{kind}-task-{suffix}");
+        assert!(
+            reserve_browser_direct_package_fixture(
+                &store,
+                &key,
+                &service,
+                &identity,
+                &envelope_instance_id,
+                &envelope_digest,
+                &envelope,
+                &spec,
+                &execution_binding,
+                evidence,
+            )
+            .await?,
+            "the {kind} browser package must persist through PgStore"
+        );
+        let persisted = store
+            .task_by_idempotency(&service, identity.user_id.as_str(), &key)
+            .await?
+            .ok_or("browser package Task was not persisted")?;
+        assert_eq!(persisted.task_origin, TaskOrigin::Browser);
+        assert!(persisted.direct_task_evidence.is_none());
+        assert_eq!(persisted.browser_task_evidence.as_ref(), Some(evidence));
+        assert!(persisted.workflow_name.is_none());
+        assert!(persisted.workflow_version.is_none());
+        assert!(persisted.workflow_digest.is_none());
+        assert_eq!(
+            persisted.user_envelope_instance_id.as_deref(),
+            Some(envelope_instance_id.as_str())
+        );
+        assert_eq!(persisted.user_envelope_revision, Some(envelope.revision));
+        assert_eq!(
+            persisted.user_envelope_digest.as_deref(),
+            Some(envelope_digest.as_str())
+        );
+    }
     let first_idempotency_key = format!("browser-limit-task-{suffix}-0");
-    for index in 0..MAX_ACTIVE_BROWSER_TASKS_PER_USER {
+    for index in 0..(MAX_ACTIVE_BROWSER_TASKS_PER_USER - 2) {
         let idempotency_key = format!("browser-limit-task-{suffix}-{index}");
         assert!(
             reserve_browser_concurrency_fixture(
@@ -926,9 +1068,7 @@ impl SandboxRuntime for AmbiguousTaskRuntime {
     async fn ensure(&self, request: &SandboxRequest) -> Result<SandboxObservation, PortError> {
         self.ensures.fetch_add(1, Ordering::SeqCst);
         if self.fail_next_ensure.swap(false, Ordering::SeqCst) {
-            return Err(PortError::Failed {
-                reason: "sandbox entered an error phase".to_owned(),
-            });
+            return Err(PortError::SandboxFailed);
         }
         Ok(SandboxObservation::Running {
             refs: RuntimeRefs {
@@ -2775,6 +2915,229 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .finalized
     );
 
+    let replacement_task_uid = Uuid::new_v4();
+    let replacement_operation_id = Uuid::new_v4();
+    let replacement_runtime_name = format!("task-{}", replacement_operation_id.simple());
+    let replacement_inert_digest = manifest_digest_with_binding(
+        replacement_task_uid,
+        replacement_operation_id,
+        &replacement_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let replacement_active_digest = manifest_digest_with_binding(
+        replacement_task_uid,
+        replacement_operation_id,
+        &replacement_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    insert_task_projection_fixture(
+        &pool,
+        TaskProjectionFixture {
+            source_task_uid: task_uid,
+            task_uid: replacement_task_uid,
+            operation_id: replacement_operation_id,
+            idempotency_key: &format!("runtime-replacement-{suffix}"),
+            task_runtime_name: &replacement_runtime_name,
+            operation_runtime_name: &replacement_runtime_name,
+            inert_manifest_digest: &replacement_inert_digest,
+            active_manifest_digest: &replacement_active_digest,
+            direct_task_evidence: None,
+        },
+    )
+    .await?;
+    store
+        .put_task_inputs(
+            replacement_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"replacement task input",
+        )
+        .await?;
+    store
+        .request_task_execution(replacement_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-original".to_owned());
+    for _ in 0..8 {
+        let current = operation(&store, replacement_task_uid).await?;
+        if current.state == TaskOrchestrationState::ActivationPending
+            && current.activation_effect_authorized_at.is_some()
+        {
+            break;
+        }
+        reconcile_current(&client, &task_runtime, &store, replacement_task_uid).await?;
+    }
+    kubernetes
+        .replace_uid_after_update
+        .store(true, Ordering::SeqCst);
+    reconcile_current(&client, &task_runtime, &store, replacement_task_uid).await?;
+    assert_eq!(
+        operation(&store, replacement_task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending,
+        "a same-name runtime replacement must never satisfy activation"
+    );
+    assert_eq!(
+        store
+            .task(replacement_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .failure_reason
+            .as_deref(),
+        Some("observed_runtime_identity_changed")
+    );
+    for _ in 0..3 {
+        if store
+            .task(replacement_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .finalized
+        {
+            break;
+        }
+        reconcile_current(&client, &task_runtime, &store, replacement_task_uid).await?;
+    }
+    assert!(
+        store
+            .task(replacement_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .finalized
+    );
+    assert_eq!(
+        kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .as_ref()
+            .and_then(|runtime| runtime.metadata.uid.as_deref()),
+        Some("runtime-uid-replacement"),
+        "cleanup must leave the unbound replacement runtime untouched"
+    );
+
+    *kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))? = None;
+    let failed_start_task_uid = Uuid::new_v4();
+    let failed_start_operation_id = Uuid::new_v4();
+    let failed_start_runtime_name = format!("task-{}", failed_start_operation_id.simple());
+    let failed_start_inert_digest = manifest_digest_with_binding(
+        failed_start_task_uid,
+        failed_start_operation_id,
+        &failed_start_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let failed_start_active_digest = manifest_digest_with_binding(
+        failed_start_task_uid,
+        failed_start_operation_id,
+        &failed_start_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    insert_task_projection_fixture(
+        &pool,
+        TaskProjectionFixture {
+            source_task_uid: task_uid,
+            task_uid: failed_start_task_uid,
+            operation_id: failed_start_operation_id,
+            idempotency_key: &format!("failed-runtime-start-{suffix}"),
+            task_runtime_name: &failed_start_runtime_name,
+            operation_runtime_name: &failed_start_runtime_name,
+            inert_manifest_digest: &failed_start_inert_digest,
+            active_manifest_digest: &failed_start_active_digest,
+            direct_task_evidence: None,
+        },
+    )
+    .await?;
+    store
+        .put_task_inputs(
+            failed_start_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"failed runtime start input",
+        )
+        .await?;
+    store
+        .request_task_execution(failed_start_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-failed-start".to_owned());
+    for _ in 0..8 {
+        let current = operation(&store, failed_start_task_uid).await?;
+        if current.state == TaskOrchestrationState::ActivationPending
+            && current.activation_effect_authorized_at.is_some()
+        {
+            break;
+        }
+        reconcile_current(&client, &task_runtime, &store, failed_start_task_uid).await?;
+    }
+    reconcile_current(&client, &task_runtime, &store, failed_start_task_uid).await?;
+    {
+        let mut runtime = kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?;
+        let runtime = runtime
+            .as_mut()
+            .ok_or_else(|| io::Error::other("failed-start runtime fixture is absent"))?;
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Failed,
+            observed_generation: runtime.metadata.generation.unwrap_or_default(),
+            spec_digest: runtime_spec_digest(&runtime.spec)?,
+            refs: RuntimeRefs::default(),
+            conditions: Vec::new(),
+            spend: None,
+        });
+    }
+    reconcile_current(&client, &task_runtime, &store, failed_start_task_uid).await?;
+    assert_eq!(
+        operation(&store, failed_start_task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending
+    );
+    assert_eq!(
+        store
+            .task(failed_start_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .failure_reason
+            .as_deref(),
+        Some("runtime_start_failed")
+    );
+    for _ in 0..4 {
+        if store
+            .task(failed_start_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .finalized
+        {
+            break;
+        }
+        reconcile_current(&client, &task_runtime, &store, failed_start_task_uid).await?;
+    }
+    let failed_start_task = store
+        .task(failed_start_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert!(failed_start_task.finalized);
+    assert_eq!(failed_start_task.phase, TaskPhase::Failed);
+    assert_eq!(
+        failed_start_task.failure_reason.as_deref(),
+        Some("runtime_start_failed")
+    );
+
     let successful_task_uid = Uuid::new_v4();
     let successful_operation_id = Uuid::new_v4();
     let successful_runtime_name = format!("task-{}", successful_operation_id.simple());
@@ -4023,6 +4386,11 @@ async fn kubernetes_request(
                 desired.metadata.generation = Some(2);
                 desired.status = current.status;
                 *stored = Some(desired.clone());
+                if state.replace_uid_after_update.swap(false, Ordering::SeqCst) {
+                    let replacement = stored.as_mut().unwrap_or_else(|| unreachable!());
+                    replacement.metadata.uid = Some("runtime-uid-replacement".to_owned());
+                    replacement.metadata.resource_version = Some("3".to_owned());
+                }
                 json_response(StatusCode::OK, serde_json::to_value(&desired))
             }
         }

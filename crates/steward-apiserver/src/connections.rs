@@ -161,6 +161,8 @@ pub(crate) struct ConnectionStartOperationResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     upstream_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
@@ -171,6 +173,8 @@ pub(crate) struct ConnectionStartOperationResponse {
 pub(crate) struct ConnectionOperationErrorResponse {
     api_version: &'static str,
     error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     upstream_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -235,7 +239,11 @@ pub enum ConnectionBrokerError {
     RuntimeCreateFailed,
     RuntimeStartFailed,
     DeadlineExceeded,
-    GatewayHttp { status: u16, reason: Option<String> },
+    GatewayHttp {
+        status: u16,
+        code: Option<String>,
+        reason: Option<String>,
+    },
     Unavailable,
 }
 
@@ -555,6 +563,7 @@ fn start_operation_response(
         authorization_url: None,
         expires_at: None,
         error: None,
+        code: None,
         upstream_status: None,
         detail: None,
     };
@@ -572,6 +581,7 @@ fn start_operation_response(
             response.state = ConnectionStartOperationState::Failed;
             let problem = connection_broker_problem(error);
             response.error = Some(problem.error);
+            response.code = problem.code;
             response.upstream_status = problem.upstream_status;
             response.detail = problem.detail;
         }
@@ -767,6 +777,7 @@ fn oauth_flow_pending_response() -> Response {
         Json(ConnectionOperationErrorResponse {
             api_version: CONNECTIONS_API_VERSION,
             error: "oauth_flow_pending",
+            code: None,
             upstream_status: None,
             detail: None,
         }),
@@ -785,36 +796,47 @@ fn connection_broker_error_response(error: ConnectionBrokerError) -> Response {
 }
 
 fn connection_broker_problem(error: ConnectionBrokerError) -> ConnectionOperationErrorResponse {
-    let (error, upstream_status, detail) = match error {
+    let (error, code, upstream_status, detail) = match error {
         ConnectionBrokerError::RuntimeAuthenticationFailed => {
-            ("runtime_authentication_failed", None, None)
+            ("runtime_authentication_failed", None, None, None)
         }
-        ConnectionBrokerError::ProxyPolicyDenied => ("proxy_policy_denied", None, None),
+        ConnectionBrokerError::ProxyPolicyDenied => ("proxy_policy_denied", None, None, None),
         ConnectionBrokerError::ProviderAuthorizationFailed => {
-            ("provider_authorization_failed", None, None)
+            ("provider_authorization_failed", None, None, None)
         }
-        ConnectionBrokerError::TokenGrantFailed => ("token_grant_failed", None, None),
-        ConnectionBrokerError::ProviderResponseInvalid => ("provider_response_invalid", None, None),
-        ConnectionBrokerError::GatewayTransportFailed => ("gateway_transport_failed", None, None),
-        ConnectionBrokerError::GatewayStatusInvalid => ("gateway_status_invalid", None, None),
-        ConnectionBrokerError::GatewayBodyUnavailable => ("gateway_body_unavailable", None, None),
-        ConnectionBrokerError::GatewayUnavailable => ("gateway_unavailable", None, None),
-        ConnectionBrokerError::RuntimeCreateFailed => ("runtime_create_failed", None, None),
-        ConnectionBrokerError::RuntimeStartFailed => ("runtime_start_failed", None, None),
-        ConnectionBrokerError::DeadlineExceeded => ("connection_deadline_exceeded", None, None),
-        ConnectionBrokerError::GatewayHttp { status, reason } => {
-            ("gateway_http_error", Some(status), reason)
+        ConnectionBrokerError::TokenGrantFailed => ("token_grant_failed", None, None, None),
+        ConnectionBrokerError::ProviderResponseInvalid => {
+            ("provider_response_invalid", None, None, None)
         }
+        ConnectionBrokerError::GatewayTransportFailed => {
+            ("gateway_transport_failed", None, None, None)
+        }
+        ConnectionBrokerError::GatewayStatusInvalid => ("gateway_status_invalid", None, None, None),
+        ConnectionBrokerError::GatewayBodyUnavailable => {
+            ("gateway_body_unavailable", None, None, None)
+        }
+        ConnectionBrokerError::GatewayUnavailable => ("gateway_unavailable", None, None, None),
+        ConnectionBrokerError::RuntimeCreateFailed => ("runtime_create_failed", None, None, None),
+        ConnectionBrokerError::RuntimeStartFailed => ("runtime_start_failed", None, None, None),
+        ConnectionBrokerError::DeadlineExceeded => {
+            ("connection_deadline_exceeded", None, None, None)
+        }
+        ConnectionBrokerError::GatewayHttp {
+            status,
+            code,
+            reason,
+        } => ("gateway_http_error", code, Some(status), reason),
         ConnectionBrokerError::OrchestrationNotActive => {
-            ("connections.orchestration_not_active", None, None)
+            ("connections.orchestration_not_active", None, None, None)
         }
         ConnectionBrokerError::OAuthFlowPending | ConnectionBrokerError::Unavailable => {
-            ("connection_broker_unavailable", None, None)
+            ("connection_broker_unavailable", None, None, None)
         }
     };
     ConnectionOperationErrorResponse {
         api_version: CONNECTIONS_API_VERSION,
         error,
+        code,
         upstream_status,
         detail,
     }
@@ -999,6 +1021,7 @@ mod tests {
                     return Ok(Some(ConnectionStartOperation::Failed(
                         ConnectionBrokerError::GatewayHttp {
                             status: *status,
+                            code: None,
                             reason: Some(detail.clone()),
                         },
                     )));
@@ -1621,6 +1644,7 @@ mod tests {
     async fn gateway_http_failure_has_an_actionable_bounded_problem_body() -> Result<(), String> {
         let response = connection_broker_error_response(ConnectionBrokerError::GatewayHttp {
             status: 400,
+            code: Some("oauth_redirect_target_not_allowed".to_owned()),
             reason: Some("OAuth redirect target is not allowed".to_owned()),
         });
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1633,6 +1657,7 @@ mod tests {
             serde_json::json!({
                 "apiVersion": CONNECTIONS_API_VERSION,
                 "error": "gateway_http_error",
+                "code": "oauth_redirect_target_not_allowed",
                 "upstreamStatus": 400,
                 "detail": "OAuth redirect target is not allowed"
             })

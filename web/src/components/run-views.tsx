@@ -1,8 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useCallback, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useState } from "react";
 
 import {
   allRun,
@@ -10,7 +10,9 @@ import {
   cancelMyRun,
   myRun,
   myRunOutputs,
+  myRunPackage,
   myRunTimeline,
+  renderRepositoryBundleForEnvelope,
   rerunMyRun,
   type AllRunsResponse,
   type BrowserRunResponse,
@@ -26,7 +28,7 @@ import { ExecutionLogPanel } from "@/components/run-log-view";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import type { ExecutionLogStream } from "@/data/execution-log";
 import { useApiResource } from "@/data/use-api-resource";
-import { loadAllMyRuns, loadAllRuns } from "@/data/paginated-api";
+import { loadAllEnvelopeRequests, loadAllMyRuns, loadAllRuns } from "@/data/paginated-api";
 import { useSession } from "@/session/session-context";
 import { EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 
@@ -85,6 +87,39 @@ function isTerminalPhase(phase: string): boolean {
   return phase === "failed" || phase === "succeeded" || phase === "cancelled";
 }
 
+type RunEventSnapshot = {
+  eventId: number;
+  run: BrowserRunView;
+  timeline: BrowserRunTimelineResponse;
+};
+
+export function parseRunEventSnapshot(body: string): RunEventSnapshot | null {
+  const data = body
+    .split("\n")
+    .find((line) => line.startsWith("data: "))
+    ?.slice("data: ".length);
+  if (!data) return null;
+  try {
+    const value = JSON.parse(data) as Partial<RunEventSnapshot>;
+    return typeof value.eventId === "number" && value.run && value.timeline
+      ? value as RunEventSnapshot
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function stageSummary(stage: BrowserRunView["stages"][number]): string {
+  if (stage.id === "admission") return "The Task was admitted under the selected Envelope.";
+  if (stage.id === "provision_runtime") return stage.state === "succeeded"
+    ? "The governed runtime was provisioned."
+    : "Steward is preparing the governed runtime.";
+  if (stage.id === "finalize") return stage.state === "succeeded"
+    ? "The Task and its evidence were finalized."
+    : "Steward will finalize the Task after execution ends.";
+  return "No execution steps were reported.";
+}
+
 type RerunAttempt = {
   data?: { retryAfterMs?: number; taskUid?: string };
   error?: unknown;
@@ -122,17 +157,20 @@ export async function pollRerun(
   return { failure: "unavailable" };
 }
 
-function RunStepRow({ admin, step, taskUid }: Readonly<{
+function RunStepRow({ admin, onStreamChange, selectedStream, step, taskUid }: Readonly<{
   admin: boolean;
+  onStreamChange: (stream: ExecutionLogStream) => void;
+  selectedStream: ExecutionLogStream | null;
   step: BrowserRunView["stages"][number]["steps"][number];
   taskUid: string;
 }>) {
   const streams = step.logStreams.filter((value): value is ExecutionLogStream => value === "stdout" || value === "stderr");
-  const [open, setOpen] = useState(false);
-  const [stream, setStream] = useState<ExecutionLogStream>(streams[0] ?? "stdout");
+  const [open, setOpen] = useState(Boolean(selectedStream));
+  const [localStream, setLocalStream] = useState<ExecutionLogStream>(streams[0] ?? "stdout");
+  const stream = selectedStream && streams.includes(selectedStream) ? selectedStream : localStream;
   return (
     <li>
-      <details className="group" onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <details className="group" onToggle={(event) => setOpen(event.currentTarget.open)} open={open || Boolean(selectedStream)}>
         <summary className="flex cursor-pointer list-none items-center gap-3 px-4 py-3.5">
           <span aria-hidden="true" className={`grid size-5 place-items-center rounded-full text-xs ${step.state === "succeeded" ? "bg-ok-soft text-ok" : step.state === "failed" ? "bg-err-soft text-err" : "bg-info-soft text-info"}`}>{step.state === "succeeded" ? "✓" : step.state === "failed" ? "×" : "•"}</span>
           <span className="min-w-0 flex-1 text-sm font-medium">{step.displayName}</span>
@@ -141,7 +179,7 @@ function RunStepRow({ admin, step, taskUid }: Readonly<{
         {open && streams.length ? (
           <div className="space-y-3 border-t border-line-soft bg-subtle px-4 py-4">
             <div className="flex flex-wrap gap-2" role="tablist" aria-label={`${step.displayName} logs`}>
-              {streams.map((availableStream) => <button aria-selected={stream === availableStream} className={`rounded-control border px-3 py-2 font-mono text-xs font-semibold ${stream === availableStream ? "border-brand bg-brand-soft" : "bg-panel"}`} key={availableStream} onClick={() => setStream(availableStream)} role="tab" type="button">{availableStream}</button>)}
+              {streams.map((availableStream) => <button aria-selected={stream === availableStream} className={`rounded-control border px-3 py-2 font-mono text-xs font-semibold ${stream === availableStream ? "border-brand bg-brand-soft" : "bg-panel"}`} key={availableStream} onClick={() => { setLocalStream(availableStream); onStreamChange(availableStream); }} role="tab" type="button">{availableStream}</button>)}
               <a className="ms-auto rounded-control border bg-panel px-3 py-2 font-mono text-xs font-semibold" href={`${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}/logs/${stream}`}>Open full page</a>
             </div>
             <ExecutionLogPanel admin={admin} stream={stream} taskUid={taskUid} />
@@ -156,6 +194,74 @@ function RunOutputs({ taskUid }: Readonly<{ taskUid: string }>) {
   const load = useCallback(() => myRunOutputs({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } }), [taskUid]);
   const state = useApiResource<BrowserRunOutputsResponse>(load);
   return <ResourceBoundary state={state}>{({ files }) => files.length ? <div className="mt-5 rounded-card border p-4"><h3 className="text-sm font-semibold">Outputs</h3><ul className="mt-3 space-y-2">{files.map((file) => <li className="flex items-center justify-between gap-4 text-sm" key={file.path}><a className="font-mono font-semibold text-brand" href={file.downloadUrl}>{file.path}</a><span className="text-muted-ink">{file.sizeBytes} bytes</span></li>)}</ul></div> : <p className="mt-5 text-sm text-muted-ink">This run produced no output files.</p>}</ResourceBoundary>;
+}
+
+export function exactRepositoryBundle(
+  exactPackage: Record<string, string>,
+  wrapperFiles: Record<string, string>,
+): Record<string, string> {
+  return { ...wrapperFiles, ...exactPackage };
+}
+
+function SaveInlineRunToRepository({ run }: Readonly<{ run: BrowserRunView }>) {
+  const session = useSession();
+  const [repository, setRepository] = useState("https://github.com/example-org/agentic-ops.git");
+  const [state, setState] = useState<"idle" | "working" | "copied" | "error">("idle");
+  const [failure, setFailure] = useState<string | null>(null);
+
+  async function copyBundle() {
+    if (session.status !== "authenticated" || !run.package || !run.userEnvelopeInstanceId) return;
+    setState("working");
+    setFailure(null);
+    try {
+      const requests = await loadAllEnvelopeRequests("provisioned");
+      const envelopeRequest = requests.data?.requests.find(
+        (request) => request.envelopeInstanceId === run.userEnvelopeInstanceId,
+      );
+      if (!envelopeRequest) {
+        setFailure("The Envelope used by this run is no longer provisioned, so Steward cannot render its GitHub Actions wrapper.");
+        setState("error");
+        return;
+      }
+      const [exact, wrapper] = await Promise.all([
+        myRunPackage({ cache: "no-store", credentials: "same-origin", path: { task_uid: run.taskUid } }),
+        renderRepositoryBundleForEnvelope({
+          body: {
+            repository: repository.trim(),
+            packagePath: run.package.path,
+            invocationPath: ".steward/invocations/browser-task.json",
+          },
+          credentials: "same-origin",
+          headers: { "X-Steward-CSRF": session.value.csrf },
+          path: { request_id: envelopeRequest.id },
+        }),
+      ]);
+      if (!exact.data || !exact.response?.ok || !wrapper.data || !wrapper.response?.ok) {
+        setFailure("Steward could not render the repository bundle for this exact successful run.");
+        setState("error");
+        return;
+      }
+      await navigator.clipboard.writeText(JSON.stringify(
+        exactRepositoryBundle(exact.data.files, wrapper.data.files),
+        null,
+        2,
+      ));
+      setState("copied");
+    } catch {
+      setFailure("Steward could not render the repository bundle. Retry the request; if it persists, contact an administrator.");
+      setState("error");
+    }
+  }
+
+  return (
+    <section className="mt-5 rounded-card border p-4" aria-labelledby="save-task-title">
+      <h3 className="text-sm font-semibold" id="save-task-title">Save this task to a repository</h3>
+      <p className="mt-2 text-sm text-muted-ink">Copy the exact package that succeeded, plus its GitHub Actions invocation and caller workflow. Steward never rebuilds the package from the form.</p>
+      <label className="mt-4 grid gap-2 text-sm font-semibold">Target repository<input className="min-h-11 w-full rounded-control border bg-panel px-3 font-mono font-normal" onChange={(event) => setRepository(event.target.value)} value={repository} /></label>
+      <button className="mt-4 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={state === "working" || !repository.trim()} onClick={() => void copyBundle()} type="button">{state === "working" ? "Rendering…" : state === "copied" ? "Bundle copied" : "Copy repository bundle"}</button>
+      {failure ? <p className="mt-3 text-sm text-err" role="alert">{failure}</p> : null}
+    </section>
+  );
 }
 
 export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; runs: Array<BrowserRunView> }>) {
@@ -214,11 +320,13 @@ export function RunsView({ admin = false }: Readonly<{ admin?: boolean }>) {
 
 export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boolean; taskUid: string }>) {
   const router = useRouter();
+  const search = useSearchParams();
   const session = useSession();
   const [cancelState, setCancelState] = useState<"idle" | "working" | "cancelled" | MutationFailureState>("idle");
   const [cancelOpen, setCancelOpen] = useState(false);
   const [rerunState, setRerunState] = useState<"idle" | "working" | ConnectionMutationState>("idle");
-  const [selectedStageId, setSelectedStageId] = useState<string | null>(null);
+  const [liveRun, setLiveRun] = useState<BrowserRunResponse | null>(null);
+  const [liveTimeline, setLiveTimeline] = useState<BrowserRunTimelineResponse | null>(null);
   const loadRun = useCallback(() => admin
     ? allRun({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } })
     : myRun({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } }), [admin, taskUid]);
@@ -227,6 +335,75 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
     : myRunTimeline({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } }), [admin, taskUid]);
   const runState = useApiResource<BrowserRunResponse>(loadRun);
   const timelineState = useApiResource<BrowserRunTimelineResponse>(loadTimeline);
+  useEffect(() => {
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let lastEventId = 0;
+    let pollingDelay = 2_000;
+
+    function schedule(next: () => Promise<void>, delay: number) {
+      if (active) timer = setTimeout(() => void next(), delay);
+    }
+
+    function apply(run: BrowserRunResponse, timeline: BrowserRunTimelineResponse) {
+      if (!active) return true;
+      setLiveRun(run);
+      setLiveTimeline(timeline);
+      return isTerminalPhase(run.run.phase);
+    }
+
+    async function poll() {
+      try {
+        const [run, timeline] = await Promise.all([loadRun(), loadTimeline()]);
+        if (run.data && timeline.data && run.response?.ok && timeline.response?.ok) {
+          pollingDelay = 2_000;
+          if (!apply(run.data, timeline.data)) schedule(poll, pollingDelay);
+          return;
+        }
+      } catch {
+        // The bounded polling fallback retries below.
+      }
+      pollingDelay = Math.min(pollingDelay * 2, 10_000);
+      schedule(poll, pollingDelay);
+    }
+
+    async function refreshFromEvents() {
+      try {
+        const response = await fetch(`/app/api/v1/runs/${encodeURIComponent(taskUid)}/events`, {
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: {
+            accept: "text/event-stream",
+            ...(lastEventId ? { "Last-Event-ID": String(lastEventId) } : {}),
+          },
+        });
+        if (!response.ok) throw new Error(`event stream returned ${response.status}`);
+        const snapshot = parseRunEventSnapshot(await response.text());
+        if (!snapshot) throw new Error("event stream snapshot was invalid");
+        lastEventId = snapshot.eventId;
+        if (!apply({ apiVersion: "steward.browser-runs/v1", run: snapshot.run }, snapshot.timeline)) {
+          schedule(refreshFromEvents, 2_000);
+        }
+      } catch {
+        if (active) schedule(poll, pollingDelay);
+      }
+    }
+
+    if (admin) void poll();
+    else void refreshFromEvents();
+    return () => {
+      active = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [admin, loadRun, loadTimeline, taskUid]);
+
+  function selectLocation(stageId: string, stream: ExecutionLogStream | null = null) {
+    const parameters = new URLSearchParams(search.toString());
+    parameters.set("job", stageId);
+    if (stream) parameters.set("stream", stream);
+    else parameters.delete("stream");
+    router.push(`${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}?${parameters.toString()}`, { scroll: false });
+  }
   async function cancelRun() {
     if (session.status !== "authenticated") return;
     setCancelState("working");
@@ -239,12 +416,16 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
   }
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <ResourceBoundary state={runState}>{({ run }) => {
+      <ResourceBoundary state={runState}>{(initial) => {
+        const { run } = liveRun ?? initial;
         const pinnedWorkflow = run.workflowName && run.workflowVersion
           ? `${run.workflowName}@${run.workflowVersion}`
           : run.workflow;
-        const selectedStage = run.stages.find((stage) => stage.id === selectedStageId) ?? run.stages.find((stage) => stage.state === "running" || stage.state === "failed") ?? run.stages[0];
-        const timelineEvents = timelineState.status === "ready" ? timelineState.value.events : [];
+        const requestedStageId = search.get("job");
+        const requestedStream = search.get("stream");
+        const selectedStream = requestedStream === "stdout" || requestedStream === "stderr" ? requestedStream : null;
+        const selectedStage = run.stages.find((stage) => stage.id === requestedStageId) ?? run.stages.find((stage) => stage.state === "running" || stage.state === "failed") ?? run.stages[0];
+        const timelineEvents = liveTimeline?.events ?? (timelineState.status === "ready" ? timelineState.value.events : []);
         const admitted = timelineEvents.find((event) => event.kind === "admitted");
         const runtimeBound = timelineEvents.find((event) => event.kind === "runtimeBound");
         return (
@@ -256,7 +437,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 {run.trigger ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.trigger.actor}</strong> via {run.trigger.event} · <a href={run.trigger.runUrl} rel="noreferrer" target="_blank">{run.trigger.repository}@{run.trigger.ref} ({run.trigger.sha.slice(0, 7)})</a> · {durationLabel(run.createdAt, run.updatedAt)}</div> : <div className="mt-2 text-sm text-muted-ink">Started {dateTime(run.createdAt)} · {durationLabel(run.createdAt, run.updatedAt)}</div>}
                 <div className="mt-1 text-sm text-muted-ink">Origin: {run.origin}{run.package ? ` · Package: ${run.package.source} @ ${run.package.revision} · ${run.package.path}` : ""}</div>
               </div>
-              {!admin ? <div className="flex flex-wrap gap-2"><button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={rerunState === "working"} onClick={async () => {
+              {!admin ? <div className="flex flex-wrap gap-2"><button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={rerunState === "working" || !run.rerunSupported} title={run.rerunSupported ? undefined : run.rerunUnavailableReason ?? "This run cannot be re-run."} onClick={async () => {
                 if (session.status !== "authenticated") return;
                 setRerunState("working");
                 const idempotencyKey = crypto.randomUUID();
@@ -271,7 +452,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
             <div className="grid min-h-[540px] overflow-hidden rounded-panel border bg-panel lg:grid-cols-[260px_minmax(0,1fr)]">
               <nav aria-label="Run jobs" className="border-b border-line lg:border-b-0 lg:border-r">
                 <div className="border-b border-line-soft px-5 py-4 text-sm font-semibold">Jobs</div>
-                {run.stages.length ? <ol className="p-2">{run.stages.map((stage) => <li key={stage.id}><button aria-current={stage.id === selectedStage?.id ? "true" : undefined} className={`flex w-full items-center gap-3 rounded-control px-3 py-3 text-left text-sm ${stage.id === selectedStage?.id ? "bg-brand-soft" : "hover:bg-subtle"}`} onClick={() => setSelectedStageId(stage.id)} type="button"><span aria-hidden="true" className={`size-2.5 shrink-0 rounded-full ${stage.state === "succeeded" ? "bg-ok" : stage.state === "failed" ? "bg-err" : stage.state === "running" ? "bg-info" : "bg-line"}`} /><span className="min-w-0 flex-1 font-medium">{stage.displayName}</span><span className="font-mono text-xs text-faint-ink">{stageDuration(stage.id, run.createdAt, timelineEvents)}</span></button></li>)}</ol> : <div className="p-5"><EmptyState title="No stages reported" /></div>}
+                {run.stages.length ? <ol className="p-2">{run.stages.map((stage) => <li key={stage.id}><button aria-current={stage.id === selectedStage?.id ? "true" : undefined} className={`flex w-full items-center gap-3 rounded-control px-3 py-3 text-left text-sm ${stage.id === selectedStage?.id ? "bg-brand-soft" : "hover:bg-subtle"}`} onClick={() => selectLocation(stage.id)} type="button"><span aria-hidden="true" className={`size-2.5 shrink-0 rounded-full ${stage.state === "succeeded" ? "bg-ok" : stage.state === "failed" ? "bg-err" : stage.state === "running" ? "bg-info" : "bg-line"}`} /><span className="min-w-0 flex-1 font-medium">{stage.displayName}</span><span className="font-mono text-xs text-faint-ink">{stageDuration(stage.id, run.createdAt, timelineEvents)}</span></button></li>)}</ol> : <div className="p-5"><EmptyState title="No stages reported" /></div>}
                 <div className="mx-5 border-t border-line-soft py-4 text-xs text-muted-ink"><p className="font-mono">{taskUid}</p><p className="mt-2">Created {dateTime(run.createdAt)}</p></div>
               </nav>
               <main className="min-w-0">
@@ -285,8 +466,10 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 <section aria-labelledby="selected-stage" className="p-5">
                   <div className="flex items-center justify-between gap-4"><h2 className="text-lg font-semibold" id="selected-stage">{selectedStage?.displayName ?? "Run stages"}</h2>{selectedStage ? <StatusBadge value={selectedStage.state} /> : null}</div>
                   <p className="mt-5 rounded-control border border-warn/30 bg-warn-soft px-4 py-3 text-sm text-warn"><strong className="block font-semibold text-warn" id="sensitivity-notice">Sensitivity notice</strong>Execution logs may reproduce arbitrary user, tool, or agent output.</p>
-                  {selectedStage?.steps.length ? <ol className="mt-5 divide-y divide-line-soft rounded-card border">{selectedStage.steps.map((step) => <RunStepRow admin={admin} key={step.id} step={step} taskUid={taskUid} />)}</ol> : <div className="mt-5"><EmptyState title="No steps reported" /></div>}
+                  {selectedStage?.id === "agent_execution" && run.executionLog === "off" ? <div className="mt-5 rounded-card border p-4"><p className="text-sm font-semibold">No execution log was captured for this run.</p><p className="mt-1 text-sm text-muted-ink">Enable <strong>Capture execution log</strong> when starting a run to retain stdout and stderr. Captured output may contain sensitive data.</p></div> : null}
+                  {selectedStage?.steps.length ? <ol className="mt-5 divide-y divide-line-soft rounded-card border">{selectedStage.steps.map((step) => <RunStepRow admin={admin} key={step.id} onStreamChange={(stream) => selectLocation(selectedStage.id, stream)} selectedStream={selectedStage.id === "agent_execution" ? selectedStream : null} step={step} taskUid={taskUid} />)}</ol> : selectedStage ? <p className="mt-5 rounded-card border p-4 text-sm text-muted-ink">{stageSummary(selectedStage)}</p> : null}
                   {!admin && run.phase === "succeeded" ? <RunOutputs taskUid={taskUid} /> : null}
+                  {!admin && run.phase === "succeeded" && run.origin === "browser" && run.package?.source === "inline" ? <SaveInlineRunToRepository run={run} /> : null}
                 </section>
               </main>
             </div>

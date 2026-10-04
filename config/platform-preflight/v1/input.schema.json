@@ -6,6 +6,7 @@
   "required": [
     "schemaVersion",
     "namespaces",
+    "spire",
     "deploymentLock",
     "database",
     "gateway",
@@ -39,6 +40,22 @@
         "identityExchange": {"$ref": "#/$defs/name"},
         "openshell": {"$ref": "#/$defs/name"},
         "dns": {"$ref": "#/$defs/name"}
+      }
+    },
+    "spire": {
+      "type": "object",
+      "required": ["className"],
+      "additionalProperties": false,
+      "properties": {
+        "className": {"$ref": "#/$defs/name"},
+        "sandboxRegistration": {
+          "type": "object",
+          "required": ["enabled"],
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {"type": "boolean"}
+          }
+        }
       }
     },
     "deploymentLock": {
