@@ -5,12 +5,14 @@
 //! All Runs route requires a browser-admin session; the existing bearer administrator API remains
 //! independent at `/admin/api/v1/runs`.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -46,6 +48,164 @@ pub(crate) struct BrowserRunsState<L> {
     ledger: L,
     github_rerunner: Arc<dyn BrowserGithubRerunner>,
     browser_task_rerunner: Arc<dyn BrowserTaskRerunner>,
+    event_streams: Arc<BrowserRunEventStreams>,
+}
+
+const MAX_BROWSER_RUN_EVENT_STREAMS_PER_USER: usize = 4;
+const MAX_BROWSER_RUN_EVENT_HISTORY: usize = 128;
+
+#[cfg(not(test))]
+const BROWSER_RUN_EVENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const BROWSER_RUN_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const BROWSER_RUN_EVENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const BROWSER_RUN_EVENT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(5);
+
+#[derive(Clone)]
+struct BufferedBrowserRunEvent {
+    id: u64,
+    kind: &'static str,
+    data: String,
+    fingerprint: String,
+    terminal: bool,
+}
+
+struct BrowserRunEventStreamsState {
+    active_by_user: BTreeMap<String, usize>,
+    history_by_task: BTreeMap<Uuid, VecDeque<BufferedBrowserRunEvent>>,
+    next_event_id: u64,
+}
+
+impl Default for BrowserRunEventStreamsState {
+    fn default() -> Self {
+        Self {
+            active_by_user: BTreeMap::new(),
+            history_by_task: BTreeMap::new(),
+            next_event_id: 1,
+        }
+    }
+}
+
+#[derive(Default)]
+struct BrowserRunEventStreams {
+    state: Mutex<BrowserRunEventStreamsState>,
+}
+
+struct BrowserRunEventStreamPermit {
+    owner_user_id: String,
+    streams: Arc<BrowserRunEventStreams>,
+}
+
+impl Drop for BrowserRunEventStreamPermit {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.streams.state.lock()
+            && let Some(active) = state.active_by_user.get_mut(&self.owner_user_id)
+        {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                state.active_by_user.remove(&self.owner_user_id);
+            }
+        }
+    }
+}
+
+impl BrowserRunEventStreams {
+    fn acquire(self: &Arc<Self>, owner_user_id: &str) -> Result<BrowserRunEventStreamPermit, ()> {
+        let mut state = self.state.lock().map_err(|_| ())?;
+        let active = state
+            .active_by_user
+            .entry(owner_user_id.to_owned())
+            .or_default();
+        if *active >= MAX_BROWSER_RUN_EVENT_STREAMS_PER_USER {
+            return Err(());
+        }
+        *active += 1;
+        Ok(BrowserRunEventStreamPermit {
+            owner_user_id: owner_user_id.to_owned(),
+            streams: self.clone(),
+        })
+    }
+
+    fn observe(&self, task_uid: Uuid, mut snapshot: BrowserRunEventSnapshot) -> Result<(), ()> {
+        snapshot.event_id = 0;
+        let fingerprint = serde_json::to_string(&snapshot).map_err(|_| ())?;
+        let mut state = self.state.lock().map_err(|_| ())?;
+        if state
+            .history_by_task
+            .get(&task_uid)
+            .and_then(VecDeque::back)
+            .is_some_and(|event| event.fingerprint == fingerprint)
+        {
+            return Ok(());
+        }
+        let event_id = state.next_event_id;
+        state.next_event_id = state.next_event_id.checked_add(1).ok_or(())?;
+        snapshot.event_id = event_id;
+        let data = serde_json::to_string(&snapshot).map_err(|_| ())?;
+        let terminal = is_terminal_phase(snapshot.run.phase) && snapshot.run.finalized;
+        let history = state.history_by_task.entry(task_uid).or_default();
+        let kind = if history.is_empty() {
+            "snapshot"
+        } else {
+            "run"
+        };
+        history.push_back(BufferedBrowserRunEvent {
+            id: event_id,
+            kind,
+            data,
+            fingerprint,
+            terminal,
+        });
+        while history.len() > MAX_BROWSER_RUN_EVENT_HISTORY {
+            history.pop_front();
+        }
+        Ok(())
+    }
+
+    fn resume(
+        &self,
+        task_uid: Uuid,
+        last_event_id: u64,
+    ) -> Result<Vec<BufferedBrowserRunEvent>, ()> {
+        let state = self.state.lock().map_err(|_| ())?;
+        let Some(history) = state.history_by_task.get(&task_uid) else {
+            return Ok(Vec::new());
+        };
+        if last_event_id == 0 {
+            return Ok(history
+                .back()
+                .cloned()
+                .into_iter()
+                .map(|mut event| {
+                    event.kind = "snapshot";
+                    event
+                })
+                .collect());
+        }
+        if let Some(position) = history.iter().position(|event| event.id == last_event_id) {
+            return Ok(history.iter().skip(position + 1).cloned().collect());
+        }
+        Ok(history
+            .back()
+            .cloned()
+            .into_iter()
+            .map(|mut event| {
+                event.kind = "snapshot";
+                event
+            })
+            .collect())
+    }
+
+    fn latest_is_terminal(&self, task_uid: Uuid) -> Result<bool, ()> {
+        let state = self.state.lock().map_err(|_| ())?;
+        Ok(state
+            .history_by_task
+            .get(&task_uid)
+            .and_then(VecDeque::back)
+            .is_some_and(|event| event.terminal))
+    }
 }
 
 trait BrowserGithubRerunner: Send + Sync {
@@ -496,6 +656,7 @@ where
             ledger,
             github_rerunner,
             browser_task_rerunner,
+            event_streams: Arc::new(BrowserRunEventStreams::default()),
         })
 }
 
@@ -560,6 +721,7 @@ where
         (status = 200, body = BrowserRunOutputsResponse),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 404, description = "Completed run output is unavailable"),
+        (status = 409, description = "Run outputs are pending finalization"),
         (status = 503, description = "Run output is unavailable")
     ),
     security(("browserSession" = []))
@@ -575,6 +737,18 @@ where
     let Some(Extension(session)) = session else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    match scoped_run(
+        &state.ledger,
+        task_uid,
+        Some(session.principal.canonical_user_id.as_str().to_owned()),
+    )
+    .await
+    {
+        Ok(Some(record)) if !record.finalized => return outputs_pending(),
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
     let archive = match state
         .ledger
         .agent_run_output_archive(task_uid, session.principal.canonical_user_id.as_str())
@@ -616,6 +790,7 @@ where
         (status = 200, description = "Opaque run output file", content_type = "application/octet-stream"),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 404, description = "Run output file is unavailable"),
+        (status = 409, description = "Run outputs are pending finalization"),
         (status = 503, description = "Run output is unavailable")
     ),
     security(("browserSession" = []))
@@ -631,6 +806,18 @@ where
     let Some(Extension(session)) = session else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
+    match scoped_run(
+        &state.ledger,
+        task_uid,
+        Some(session.principal.canonical_user_id.as_str().to_owned()),
+    )
+    .await
+    {
+        Ok(Some(record)) if !record.finalized => return outputs_pending(),
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
     let archive = match state
         .ledger
         .agent_run_output_archive(task_uid, session.principal.canonical_user_id.as_str())
@@ -664,6 +851,14 @@ where
         .into_response()
 }
 
+fn outputs_pending() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({ "error": "outputs_pending" })),
+    )
+        .into_response()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OutputArchiveEntry {
     path: String,
@@ -693,17 +888,23 @@ fn output_archive_entries(archive: &[u8]) -> Result<Vec<OutputArchiveEntry>, ()>
             .ok_or(())?;
         let kind = header[156];
         if kind == 0 || kind == b'0' {
-            let relative = path.strip_prefix("out/").ok_or(())?;
-            let relative = steward_types::direct_package::RelativePath::parse(relative.to_owned())
-                .map_err(|_| ())?;
-            if !seen.insert(relative.as_str().to_owned()) {
-                return Err(());
+            if !matches!(
+                path.as_str(),
+                ".steward/diagnostics/stdout.log" | ".steward/diagnostics/stderr.log"
+            ) {
+                let relative = path.strip_prefix("out/").ok_or(())?;
+                let relative =
+                    steward_types::direct_package::RelativePath::parse(relative.to_owned())
+                        .map_err(|_| ())?;
+                if !seen.insert(relative.as_str().to_owned()) {
+                    return Err(());
+                }
+                entries.push(OutputArchiveEntry {
+                    path: relative.as_str().to_owned(),
+                    offset: data_offset,
+                    size,
+                });
             }
-            entries.push(OutputArchiveEntry {
-                path: relative.as_str().to_owned(),
-                offset: data_offset,
-                size,
-            });
         } else if !matches!(kind, b'5' | b'x' | b'g') {
             return Err(());
         }
@@ -781,6 +982,7 @@ where
             ledger,
             github_rerunner,
             browser_task_rerunner: Arc::new(DisabledBrowserTaskRerunner),
+            event_streams: Arc::new(BrowserRunEventStreams::default()),
         })
 }
 
@@ -1059,6 +1261,7 @@ where
         (status = 200, body = String, content_type = "text/event-stream"),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 404, description = "Run was not found in the user's scope"),
+        (status = 429, description = "Per-user event-stream limit reached"),
         (status = 503, description = "Run history is unavailable")
     ),
     security(("browserSession" = []))
@@ -1075,57 +1278,77 @@ where
     let Some(Extension(session)) = session else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let owner_user_id = Some(session.principal.canonical_user_id.as_str().to_owned());
-    let record = match scoped_run(&state.ledger, task_uid, owner_user_id).await {
-        Ok(Some(record)) => record,
+    let owner_user_id = session.principal.canonical_user_id.as_str().to_owned();
+    let initial = match browser_run_event_snapshot(&state.ledger, task_uid, &owner_user_id).await {
+        Ok(Some(snapshot)) => snapshot,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let timeline = match state.ledger.agent_run_timeline(task_uid).await {
-        Ok(Some(events)) => match events
-            .into_iter()
-            .rev()
-            .map(browser_timeline_event)
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(events) => BrowserRunTimelineResponse {
-                api_version: BROWSER_AGENT_RUNS_API_VERSION,
-                task_uid,
-                events,
-            },
-            Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
-        },
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    let permit = match state.event_streams.acquire(&owner_user_id) {
+        Ok(permit) => permit,
+        Err(()) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "run_event_stream_limit" })),
+            )
+                .into_response();
+        }
     };
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0)
-        .min(u128::from(u64::MAX)) as u64;
-    let event_id = now.max(last_event_id.saturating_add(1));
-    let snapshot = BrowserRunEventSnapshot {
-        api_version: BROWSER_AGENT_RUNS_API_VERSION,
-        event_id,
-        run: browser_run_view(record),
-        timeline,
+    if state.event_streams.observe(task_uid, initial).is_err() {
+        return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let initial_events = match state.event_streams.resume(task_uid, last_event_id) {
+        Ok(events) => events,
+        Err(()) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let data = match serde_json::to_string(&snapshot) {
-        Ok(data) => data,
-        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    let ledger = state.ledger.clone();
+    let event_streams = state.event_streams.clone();
+    let stream = async_stream::stream! {
+        let _permit = permit;
+        let mut cursor = last_event_id;
+        let mut terminal = event_streams.latest_is_terminal(task_uid).unwrap_or(false);
+        for event in initial_events {
+            cursor = event.id;
+            terminal = event.terminal;
+            yield Ok::<Event, Infallible>(browser_run_sse_event(event));
+        }
+        if !terminal {
+            loop {
+                tokio::time::sleep(BROWSER_RUN_EVENT_POLL_INTERVAL).await;
+                let snapshot = match browser_run_event_snapshot(&ledger, task_uid, &owner_user_id).await {
+                    Ok(Some(snapshot)) => snapshot,
+                    Ok(None) | Err(_) => break,
+                };
+                if event_streams.observe(task_uid, snapshot).is_err() {
+                    break;
+                }
+                let events = match event_streams.resume(task_uid, cursor) {
+                    Ok(events) => events,
+                    Err(()) => break,
+                };
+                for event in events {
+                    cursor = event.id;
+                    terminal = event.terminal;
+                    yield Ok::<Event, Infallible>(browser_run_sse_event(event));
+                }
+                if terminal {
+                    break;
+                }
+            }
+        }
     };
-    let body =
-        format!("retry: 2000\nid: {event_id}\nevent: snapshot\ndata: {data}\n\n: heartbeat\n\n");
-    let mut response = body.into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream"),
-    );
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(BROWSER_RUN_EVENT_HEARTBEAT_INTERVAL)
+                .text("heartbeat"),
+        )
+        .into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-cache, no-transform"),
@@ -1135,6 +1358,44 @@ where
         HeaderValue::from_static("no"),
     );
     response
+}
+
+fn browser_run_sse_event(event: BufferedBrowserRunEvent) -> Event {
+    Event::default()
+        .id(event.id.to_string())
+        .event(event.kind)
+        .data(event.data)
+}
+
+async fn browser_run_event_snapshot<L>(
+    ledger: &L,
+    task_uid: Uuid,
+    owner_user_id: &str,
+) -> Result<Option<BrowserRunEventSnapshot>, StoreError>
+where
+    L: AgentRunLedger,
+{
+    let Some(record) = scoped_run(ledger, task_uid, Some(owner_user_id.to_owned())).await? else {
+        return Ok(None);
+    };
+    let Some(events) = ledger.agent_run_timeline(task_uid).await? else {
+        return Ok(None);
+    };
+    let events = events
+        .into_iter()
+        .rev()
+        .map(browser_timeline_event)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(BrowserRunEventSnapshot {
+        api_version: BROWSER_AGENT_RUNS_API_VERSION,
+        event_id: 0,
+        run: browser_run_view(record),
+        timeline: BrowserRunTimelineResponse {
+            api_version: BROWSER_AGENT_RUNS_API_VERSION,
+            task_uid,
+            events,
+        },
+    }))
 }
 
 #[utoipa::path(
@@ -1667,6 +1928,15 @@ where
 }
 
 fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
+    let phase = if record.runtime_uid.is_some()
+        && matches!(
+            record.phase,
+            TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Queued
+        ) {
+        TaskPhase::Running
+    } else {
+        record.phase
+    };
     let trigger = record
         .direct_task_evidence
         .as_ref()
@@ -1683,7 +1953,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         })
         .unwrap_or(ExecutionLogMode::Off);
     let stages = browser_run_stages(
-        record.phase,
+        phase,
         record.runtime_uid.is_some(),
         record.finalize_requested,
         record.finalized,
@@ -1733,7 +2003,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         coding_agent_runtime: record.coding_agent_runtime,
         runtime_uid: record.runtime_uid,
         runtime_ownership: record.runtime_ownership,
-        phase: record.phase,
+        phase,
         finalization_requested: record.finalize_requested,
         finalized: record.finalized,
         created_at: record.created_at,
@@ -1752,6 +2022,13 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
             .then_some("This run does not have a replayable package source."),
         stages,
     }
+}
+
+const fn is_terminal_phase(phase: TaskPhase) -> bool {
+    matches!(
+        phase,
+        TaskPhase::Succeeded | TaskPhase::Failed | TaskPhase::Cancelled
+    )
 }
 
 fn browser_run_trigger(
@@ -2568,8 +2845,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn run_snapshot_promotes_a_bound_runtime_and_its_job_from_queued_to_running()
+    -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let mut record = run(task_uid, owner);
+        record.phase = TaskPhase::Queued;
+        record.runtime_uid = Some("runtime-bound".to_owned());
+
+        let view = browser_run_view(record);
+        assert_eq!(view.phase, TaskPhase::Running);
+        assert_eq!(view.stages[1].id, BrowserRunStageId::ProvisionRuntime);
+        assert_eq!(view.stages[1].state, BrowserRunStageState::Succeeded);
+        assert_eq!(view.stages[2].id, BrowserRunStageId::AgentExecution);
+        assert_eq!(view.stages[2].state, BrowserRunStageState::Running);
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn run_events_are_owner_scoped_and_resume_after_last_event_id() -> Result<(), String> {
+    async fn run_events_hold_one_stream_resume_and_close_after_terminal() -> Result<(), String> {
         let owner = "usr_0123456789abcdef0123456789abcdef";
         let other_owner = "usr_abcdefabcdefabcdefabcdefabcdefab";
         let own_task = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
@@ -2577,20 +2873,24 @@ mod tests {
         let other_task = Uuid::parse_str("22222222-2222-4222-8222-222222222222")
             .map_err(|error| error.to_string())?;
         let ledger = FakeLedger::default();
+        let mut own_run = run(own_task, owner);
+        own_run.phase = TaskPhase::Running;
+        own_run.finalized = false;
+        let mut other_run = run(other_task, other_owner);
+        other_run.finalized = true;
         ledger
             .records
             .lock()
             .map_err(|_| "lock records")?
-            .extend([run(own_task, owner), run(other_task, other_owner)]);
+            .extend([own_run, other_run]);
         let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
-        let app = protected_router(ledger, service);
+        let app = protected_router(ledger.clone(), service);
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/app/api/v1/runs/{own_task}/events"))
                     .header(header::COOKIE, &session_cookie)
-                    .header("last-event-id", (u64::MAX - 1).to_string())
                     .body(Body::empty())
                     .map_err(|error| format!("build run event request: {error}"))?,
             )
@@ -2601,13 +2901,88 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE),
             Some(&header::HeaderValue::from_static("text/event-stream"))
         );
-        let body = to_bytes(response.into_body(), 64 * 1024)
+        let read = tokio::spawn(to_bytes(response.into_body(), 64 * 1024));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            !read.is_finished(),
+            "a non-terminal run must keep one event stream open"
+        );
+        {
+            let mut records = ledger.records.lock().map_err(|_| "lock records")?;
+            let record = records
+                .iter_mut()
+                .find(|record| record.task_uid == own_task)
+                .ok_or_else(|| "own run disappeared".to_owned())?;
+            record.phase = TaskPhase::Succeeded;
+            record.finalized = true;
+            record.updated_at = "2026-08-17T00:01:00.000000Z".to_owned();
+        }
+        let body = tokio::time::timeout(std::time::Duration::from_secs(2), read)
             .await
+            .map_err(|_| "terminal event stream did not close".to_owned())?
+            .map_err(|error| format!("join run event reader: {error}"))?
             .map_err(|error| format!("read run event response: {error}"))?;
         let body = std::str::from_utf8(&body)
             .map_err(|error| format!("run event response was not UTF-8: {error}"))?;
-        assert!(body.contains(&format!("id: {}", u64::MAX)));
+        assert!(body.contains("event: snapshot"));
+        assert!(body.contains("event: run"));
+        assert!(body.contains(": heartbeat"));
         assert!(body.contains(&format!("\"taskUid\":\"{own_task}\"")));
+        assert!(body.contains("\"phase\":\"running\""));
+        assert!(body.contains("\"phase\":\"succeeded\""));
+        let first_event_id = body
+            .lines()
+            .find_map(|line| line.strip_prefix("id: "))
+            .ok_or_else(|| "snapshot omitted event id".to_owned())?
+            .parse::<u64>()
+            .map_err(|error| format!("parse event id: {error}"))?;
+
+        let resumed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{own_task}/events"))
+                    .header(header::COOKIE, &session_cookie)
+                    .header("last-event-id", first_event_id.to_string())
+                    .body(Body::empty())
+                    .map_err(|error| format!("build resumed run event request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute resumed run event request: {error}"))?;
+        assert_eq!(resumed.status(), StatusCode::OK);
+        let resumed = to_bytes(resumed.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read resumed run event response: {error}"))?;
+        let resumed = std::str::from_utf8(&resumed)
+            .map_err(|error| format!("resumed event response was not UTF-8: {error}"))?;
+        assert!(resumed.contains("event: run"));
+        assert!(!resumed.contains("event: snapshot"));
+
+        let terminal_event_id = resumed
+            .lines()
+            .find_map(|line| line.strip_prefix("id: "))
+            .ok_or_else(|| "resumed terminal event omitted event id".to_owned())?;
+        let already_current = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{own_task}/events"))
+                    .header(header::COOKIE, &session_cookie)
+                    .header("last-event-id", terminal_event_id)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build current terminal event request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute current terminal event request: {error}"))?;
+        assert_eq!(already_current.status(), StatusCode::OK);
+        let already_current = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            to_bytes(already_current.into_body(), 4096),
+        )
+        .await
+        .map_err(|_| "current terminal event stream did not close".to_owned())?
+        .map_err(|error| format!("read current terminal event response: {error}"))?;
+        assert!(already_current.is_empty());
 
         let hidden = app
             .oneshot(
@@ -2620,6 +2995,57 @@ mod tests {
             .await
             .map_err(|error| format!("execute hidden run event request: {error}"))?;
         assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_events_enforce_a_per_user_concurrent_stream_cap() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let ledger = FakeLedger::default();
+        for index in 1..=5 {
+            let task_uid = Uuid::from_u128(index);
+            let mut record = run(task_uid, owner);
+            record.phase = TaskPhase::Running;
+            record.finalized = false;
+            ledger
+                .records
+                .lock()
+                .map_err(|_| "lock records")?
+                .push(record);
+        }
+        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let app = protected_router(ledger, service);
+        let mut held = Vec::new();
+        for index in 1..=4 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/app/api/v1/runs/{}/events",
+                            Uuid::from_u128(index)
+                        ))
+                        .header(header::COOKIE, &session_cookie)
+                        .body(Body::empty())
+                        .map_err(|error| format!("build capped event request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("execute capped event request: {error}"))?;
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+        let rejected = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{}/events", Uuid::from_u128(5)))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build over-cap event request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute over-cap event request: {error}"))?;
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(held);
         Ok(())
     }
 
@@ -2915,11 +3341,20 @@ mod tests {
         let other_task = Uuid::parse_str("22222222-2222-4222-8222-222222222222")
             .map_err(|error| error.to_string())?;
         let ledger = FakeLedger::default();
-        ledger
-            .records
-            .lock()
-            .map_err(|_| "lock records")?
-            .extend([run(own_task, owner), run(other_task, other_owner)]);
+        let pending_task = Uuid::parse_str("33333333-3333-4333-8333-333333333333")
+            .map_err(|error| error.to_string())?;
+        let mut own_run = run(own_task, owner);
+        own_run.finalized = true;
+        let mut other_run = run(other_task, other_owner);
+        other_run.finalized = true;
+        let mut pending_run = run(pending_task, owner);
+        pending_run.phase = TaskPhase::Running;
+        pending_run.finalized = false;
+        ledger.records.lock().map_err(|_| "lock records")?.extend([
+            own_run,
+            other_run,
+            pending_run,
+        ]);
         ledger.outputs.lock().map_err(|_| "lock outputs")?.extend([
             (own_task, output_tar("out/report.txt", b"complete\n")),
             (other_task, output_tar("out/secret.txt", b"hidden\n")),
@@ -2927,6 +3362,25 @@ mod tests {
 
         let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
         let app = protected_router(ledger.clone(), service);
+        let pending = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{pending_task}/outputs"))
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build pending output request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute pending output request: {error}"))?;
+        assert_eq!(pending.status(), StatusCode::CONFLICT);
+        let pending = to_bytes(pending.into_body(), 4096)
+            .await
+            .map_err(|error| format!("read pending output response: {error}"))?;
+        let pending: serde_json::Value = serde_json::from_slice(&pending)
+            .map_err(|error| format!("decode pending output response: {error}"))?;
+        assert_eq!(pending["error"], "outputs_pending");
+
         let listed = app
             .clone()
             .oneshot(
@@ -3349,25 +3803,34 @@ mod tests {
         Ok(())
     }
 
-    fn output_tar(path: &str, content: &[u8]) -> Vec<u8> {
-        let mut archive = vec![0_u8; 512];
-        archive[..path.len()].copy_from_slice(path.as_bytes());
-        archive[100..108].copy_from_slice(b"0000644\0");
-        archive[108..116].copy_from_slice(b"0000000\0");
-        archive[116..124].copy_from_slice(b"0000000\0");
-        let size = format!("{:011o}\0", content.len());
-        archive[124..136].copy_from_slice(size.as_bytes());
-        archive[136..148].copy_from_slice(b"00000000000\0");
-        archive[148..156].fill(b' ');
-        archive[156] = b'0';
-        archive[257..263].copy_from_slice(b"ustar\0");
-        archive[263..265].copy_from_slice(b"00");
-        let checksum: u64 = archive.iter().map(|byte| u64::from(*byte)).sum();
-        archive[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
-        archive.extend_from_slice(content);
-        archive.resize(512 + content.len().div_ceil(512) * 512, 0);
+    fn output_tar_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        for (path, content) in entries {
+            let header_offset = archive.len();
+            archive.resize(header_offset + 512, 0);
+            let header = &mut archive[header_offset..header_offset + 512];
+            header[..path.len()].copy_from_slice(path.as_bytes());
+            header[100..108].copy_from_slice(b"0000644\0");
+            header[108..116].copy_from_slice(b"0000000\0");
+            header[116..124].copy_from_slice(b"0000000\0");
+            let size = format!("{:011o}\0", content.len());
+            header[124..136].copy_from_slice(size.as_bytes());
+            header[136..148].copy_from_slice(b"00000000000\0");
+            header[148..156].fill(b' ');
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let checksum: u64 = header.iter().map(|byte| u64::from(*byte)).sum();
+            header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            archive.extend_from_slice(content);
+            archive.resize(header_offset + 512 + content.len().div_ceil(512) * 512, 0);
+        }
         archive.resize(archive.len() + 1024, 0);
         archive
+    }
+
+    fn output_tar(path: &str, content: &[u8]) -> Vec<u8> {
+        output_tar_entries(&[(path, content)])
     }
 
     #[test]
@@ -3383,5 +3846,29 @@ mod tests {
         );
         assert!(output_archive_entries(&output_tar("secret.txt", b"no")).is_err());
         assert!(output_archive_entries(&output_tar("out/../secret.txt", b"no")).is_err());
+    }
+
+    #[test]
+    fn output_archive_skips_only_reserved_execution_logs() {
+        let archive = output_tar_entries(&[
+            ("out/tool-calls.json", b"[]\n"),
+            ("out/report.md", b"complete\n"),
+            (".steward/diagnostics/stdout.log", b"agent output\n"),
+            (".steward/diagnostics/stderr.log", b"agent warning\n"),
+        ]);
+        let entries = output_archive_entries(&archive).unwrap_or_default();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool-calls.json", "report.md"]
+        );
+
+        let unexpected = output_tar_entries(&[
+            ("out/report.md", b"complete\n"),
+            (".steward/diagnostics/trace.log", b"not reserved\n"),
+        ]);
+        assert!(output_archive_entries(&unexpected).is_err());
     }
 }

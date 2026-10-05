@@ -7,6 +7,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-10-05
+
+### Added
+
+- This complete replacement includes every Added and Fixed item, plus every
+  upgrade note, recorded under the incomplete v0.3.6 entry below.
+
+### Fixed
+
+- Replaced run-detail fetch polling with one held, owner-scoped SSE connection
+  that sends an atomic run-and-timeline snapshot, incremental state events and
+  heartbeats, resumes with `Last-Event-ID`, enforces a per-user stream cap, and
+  closes after terminal finalization. Run headers and job states now derive
+  from the same snapshot, including promotion to Running once a runtime binds.
+- Kept outputs and the inline-task save panel pending until successful
+  finalization, returned `409 outputs_pending` before then, and removed the
+  false agent-compatibility warning when Run now selects a compatible fallback.
+- Kept reserved `.steward/diagnostics/stdout.log` and `stderr.log` transcripts
+  out of browser output listings and downloads while continuing to reject every
+  other regular file outside `out/`. Runs with full execution-log capture can
+  now list and download their declared output files after success.
+
+### Security
+
+- Updated the Steward web application from Next.js 16.3.3 to 16.3.6 to
+  remediate `GHSA-vcvr-r3jv-pc5j`, a critical remote-code-execution advisory
+  affecting `next/og` `ImageResponse`. The v0.3.6 publication is incomplete and
+  its artifacts must not be used; v0.3.7 is its complete replacement.
+
 ## [0.3.6] - 2026-10-04
 
 ### Added
@@ -515,7 +544,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/apelogic-ai/steward/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/apelogic-ai/steward/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/apelogic-ai/steward/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/apelogic-ai/steward/compare/v0.3.3...v0.3.4

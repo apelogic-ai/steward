@@ -4085,6 +4085,10 @@ export type MyRunEventsErrors = {
      */
     404: unknown;
     /**
+     * Per-user event-stream limit reached
+     */
+    429: unknown;
+    /**
      * Run history is unavailable
      */
     503: unknown;
@@ -4154,6 +4158,10 @@ export type MyRunOutputsErrors = {
      */
     404: unknown;
     /**
+     * Run outputs are pending finalization
+     */
+    409: unknown;
+    /**
      * Run output is unavailable
      */
     503: unknown;
@@ -4184,6 +4192,10 @@ export type DownloadMyRunOutputErrors = {
      * Run output file is unavailable
      */
     404: unknown;
+    /**
+     * Run outputs are pending finalization
+     */
+    409: unknown;
     /**
      * Run output is unavailable
      */

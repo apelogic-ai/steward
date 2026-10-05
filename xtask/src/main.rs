@@ -1125,7 +1125,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.3.6" => Ok(true),
+            "0.3.7" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -1289,7 +1289,7 @@ mod tests {
             );
         }
         for required in [
-            "\"next\": \"16.3.3\"",
+            "\"next\": \"16.3.6\"",
             "\"react\": \"19.2.8\"",
             "\"tailwindcss\": \"4.3.3\"",
             "\"@hey-api/openapi-ts\": \"0.99.0\"",
@@ -4062,7 +4062,7 @@ mod tests {
             manifest
                 .pointer("/stewardVersion")
                 .and_then(serde_json::Value::as_str),
-            Some("0.3.6")
+            Some("0.3.7")
         );
         assert_eq!(
             manifest
