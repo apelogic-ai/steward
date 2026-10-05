@@ -183,6 +183,7 @@ api_ip="$(kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
 
 stage=install
 values=(
+  --set-string spire.className=spire-spire
   --set-string "images.repository=${image_repository}"
   --set-string "images.apiserver.tag=${release_version}-apiserver"
   --set-string "images.apiserver.digest=${api_digest}"
