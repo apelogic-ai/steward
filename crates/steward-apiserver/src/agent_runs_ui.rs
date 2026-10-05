@@ -693,17 +693,23 @@ fn output_archive_entries(archive: &[u8]) -> Result<Vec<OutputArchiveEntry>, ()>
             .ok_or(())?;
         let kind = header[156];
         if kind == 0 || kind == b'0' {
-            let relative = path.strip_prefix("out/").ok_or(())?;
-            let relative = steward_types::direct_package::RelativePath::parse(relative.to_owned())
-                .map_err(|_| ())?;
-            if !seen.insert(relative.as_str().to_owned()) {
-                return Err(());
+            if !matches!(
+                path.as_str(),
+                ".steward/diagnostics/stdout.log" | ".steward/diagnostics/stderr.log"
+            ) {
+                let relative = path.strip_prefix("out/").ok_or(())?;
+                let relative =
+                    steward_types::direct_package::RelativePath::parse(relative.to_owned())
+                        .map_err(|_| ())?;
+                if !seen.insert(relative.as_str().to_owned()) {
+                    return Err(());
+                }
+                entries.push(OutputArchiveEntry {
+                    path: relative.as_str().to_owned(),
+                    offset: data_offset,
+                    size,
+                });
             }
-            entries.push(OutputArchiveEntry {
-                path: relative.as_str().to_owned(),
-                offset: data_offset,
-                size,
-            });
         } else if !matches!(kind, b'5' | b'x' | b'g') {
             return Err(());
         }
@@ -3349,25 +3355,34 @@ mod tests {
         Ok(())
     }
 
-    fn output_tar(path: &str, content: &[u8]) -> Vec<u8> {
-        let mut archive = vec![0_u8; 512];
-        archive[..path.len()].copy_from_slice(path.as_bytes());
-        archive[100..108].copy_from_slice(b"0000644\0");
-        archive[108..116].copy_from_slice(b"0000000\0");
-        archive[116..124].copy_from_slice(b"0000000\0");
-        let size = format!("{:011o}\0", content.len());
-        archive[124..136].copy_from_slice(size.as_bytes());
-        archive[136..148].copy_from_slice(b"00000000000\0");
-        archive[148..156].fill(b' ');
-        archive[156] = b'0';
-        archive[257..263].copy_from_slice(b"ustar\0");
-        archive[263..265].copy_from_slice(b"00");
-        let checksum: u64 = archive.iter().map(|byte| u64::from(*byte)).sum();
-        archive[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
-        archive.extend_from_slice(content);
-        archive.resize(512 + content.len().div_ceil(512) * 512, 0);
+    fn output_tar_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        for (path, content) in entries {
+            let header_offset = archive.len();
+            archive.resize(header_offset + 512, 0);
+            let header = &mut archive[header_offset..header_offset + 512];
+            header[..path.len()].copy_from_slice(path.as_bytes());
+            header[100..108].copy_from_slice(b"0000644\0");
+            header[108..116].copy_from_slice(b"0000000\0");
+            header[116..124].copy_from_slice(b"0000000\0");
+            let size = format!("{:011o}\0", content.len());
+            header[124..136].copy_from_slice(size.as_bytes());
+            header[136..148].copy_from_slice(b"00000000000\0");
+            header[148..156].fill(b' ');
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let checksum: u64 = header.iter().map(|byte| u64::from(*byte)).sum();
+            header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            archive.extend_from_slice(content);
+            archive.resize(header_offset + 512 + content.len().div_ceil(512) * 512, 0);
+        }
         archive.resize(archive.len() + 1024, 0);
         archive
+    }
+
+    fn output_tar(path: &str, content: &[u8]) -> Vec<u8> {
+        output_tar_entries(&[(path, content)])
     }
 
     #[test]
@@ -3383,5 +3398,29 @@ mod tests {
         );
         assert!(output_archive_entries(&output_tar("secret.txt", b"no")).is_err());
         assert!(output_archive_entries(&output_tar("out/../secret.txt", b"no")).is_err());
+    }
+
+    #[test]
+    fn output_archive_skips_only_reserved_execution_logs() {
+        let archive = output_tar_entries(&[
+            ("out/tool-calls.json", b"[]\n"),
+            ("out/report.md", b"complete\n"),
+            (".steward/diagnostics/stdout.log", b"agent output\n"),
+            (".steward/diagnostics/stderr.log", b"agent warning\n"),
+        ]);
+        let entries = output_archive_entries(&archive).unwrap_or_default();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool-calls.json", "report.md"]
+        );
+
+        let unexpected = output_tar_entries(&[
+            ("out/report.md", b"complete\n"),
+            (".steward/diagnostics/trace.log", b"not reserved\n"),
+        ]);
+        assert!(output_archive_entries(&unexpected).is_err());
     }
 }

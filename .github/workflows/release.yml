@@ -749,6 +749,7 @@ jobs:
             printf '## Highlights\n\n'
             printf 'Steward v0.3.7 adds browser Run now for governed inline, exact Git, and published Workflow sources, with canonical-user identity, selected User Envelope authority, immutable provenance, bounded inputs and concurrency, and owner-scoped output downloads.\n\n'
             printf 'The web application is updated to Next.js 16.3.6, which remediates critical advisory GHSA-vcvr-r3jv-pc5j. v0.3.7 supersedes the incomplete v0.3.6 publication.\n\n'
+            printf 'Runs with full execution-log capture can list and download declared output files while reserved stdout and stderr transcripts remain available only through the owner-scoped log endpoints.\n\n'
             printf 'This release also adds browser-first member administration and onboarding, live and replayable Run details, durable setup guidance and GitHub-ratified Task provenance, asynchronous governed Connections operations with precise failure diagnostics, and opt-in MCP-GW status v2 identity association.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'

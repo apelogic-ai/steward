@@ -2350,6 +2350,48 @@ test("logging-off runs explain that no transcript was captured", async ({ browse
   }
 });
 
+test("capture-on succeeded runs list and download outputs without exposing diagnostics", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  const outputRequests = [];
+  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}/outputs`, (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      taskUid,
+      files: [{
+        path: "report.md",
+        sizeBytes: 9,
+        downloadUrl: `/app/api/v1/runs/${taskUid}/outputs/report.md`,
+      }],
+    }),
+  }));
+  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}/outputs/report.md`, (route) => {
+    outputRequests.push(route.request());
+    return route.fulfill({
+      status: 200,
+      contentType: "application/octet-stream",
+      body: "complete\n",
+      headers: { "content-disposition": 'attachment; filename="report.md"' },
+    });
+  });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByRole("heading", { name: "Outputs" })).toBeVisible();
+    const outputLink = developer.page.getByRole("link", { name: "report.md" });
+    await expect(outputLink).toHaveAttribute("href", `/app/api/v1/runs/${taskUid}/outputs/report.md`);
+    await expect(developer.page.getByText(["stdout", "log"].join("."), { exact: true })).toHaveCount(0);
+    await expect(developer.page.getByText(["stderr", "log"].join("."), { exact: true })).toHaveCount(0);
+
+    const downloadPromise = developer.page.waitForEvent("download");
+    await outputLink.click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe("report.md");
+    expect(outputRequests).toHaveLength(1);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("failed run phases expose stdout and stderr as escaped sensitive output", async ({ browser }) => {
   const developer = await guardedPage(browser, {
     executionLogs: {

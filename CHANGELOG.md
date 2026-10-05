@@ -7,14 +7,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-## [0.3.7] - 2026-10-04
+## [0.3.7] - 2026-10-05
+
+### Added
+
+- This complete replacement includes every Added and Fixed item, plus every
+  upgrade note, recorded under the incomplete v0.3.6 entry below.
+
+### Fixed
+
+- Kept reserved `.steward/diagnostics/stdout.log` and `stderr.log` transcripts
+  out of browser output listings and downloads while continuing to reject every
+  other regular file outside `out/`. Runs with full execution-log capture can
+  now list and download their declared output files after success.
 
 ### Security
 
 - Updated the Steward web application from Next.js 16.3.3 to 16.3.6 to
   remediate `GHSA-vcvr-r3jv-pc5j`, a critical remote-code-execution advisory
-  affecting `next/og` `ImageResponse`. This release supersedes the incomplete
-  v0.3.6 publication and otherwise carries the same product contract.
+  affecting `next/og` `ImageResponse`. The v0.3.6 publication is incomplete and
+  its artifacts must not be used; v0.3.7 is its complete replacement.
 
 ## [0.3.6] - 2026-10-04
 
