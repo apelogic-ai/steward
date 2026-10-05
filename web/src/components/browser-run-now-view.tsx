@@ -36,6 +36,11 @@ type CompatibleAgent = {
   reason: string | null;
 };
 
+type EffectiveAgentSelection = {
+  selected: CompatibleAgent | undefined;
+  warning: string | null;
+};
+
 function agentModelProvider(agentRef: string): { provider: string; label: string } | null {
   if (agentRef.startsWith("codex@")) return { provider: "openai", label: "OpenAI" };
   if (agentRef.startsWith("claude-code@")) return { provider: "anthropic", label: "Anthropic" };
@@ -53,6 +58,20 @@ export function compatibleAgents(agentRefs: string[], models: Array<{ provider: 
       ? { agentRef, model, compatible: true, reason: null }
       : { agentRef, model: null, compatible: false, reason: `Requires an ${required.label} model, which this Envelope does not allow.` };
   });
+}
+
+export function effectiveAgentSelection(
+  agentOptions: CompatibleAgent[],
+  requestedAgentRef: string,
+): EffectiveAgentSelection {
+  const requested = agentOptions.find((agent) => agent.agentRef === requestedAgentRef);
+  const selected = requested?.compatible
+    ? requested
+    : agentOptions.find((agent) => agent.compatible);
+  return {
+    selected,
+    warning: selected ? null : requested?.reason ?? "No compatible coding agent is available for this Envelope.",
+  };
 }
 
 function failureHint(code: string | null, reason: string): string | null {
@@ -177,10 +196,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
     data.workflows.agents.map((agent: ExecutionBindingAdvertisement) => agent.agentRef),
     envelope?.spec.llms ?? [],
   );
-  const requestedAgent = agentOptions.find((agent) => agent.agentRef === agentRef);
-  const selectedAgent = requestedAgent?.compatible
-    ? requestedAgent
-    : agentOptions.find((agent) => agent.compatible);
+  const { selected: selectedAgent, warning: agentWarning } = effectiveAgentSelection(agentOptions, agentRef);
   const effectiveAgentRef = selectedAgent?.agentRef ?? "";
   const selectedModel = selectedAgent?.compatible ? selectedAgent.model : null;
   const files = envelope && selectedModel
@@ -247,7 +263,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
       <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} onChange={(event) => setEnvelopeId(event.target.value)} value={envelopeId}>{active.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
       <label className="grid gap-2 text-sm font-semibold">Package source<select className={fieldClass} onChange={(event) => setSourceKind(event.target.value as SourceKind)} value={sourceKind}><option disabled={!inlineAllowed} value="inline">Inline package{inlineAllowed ? "" : " (disabled by template)"}</option><option value="repository">Git repository</option><option value="registry">Published workflow</option></select></label>
     </div>
-    {sourceKind === "inline" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Coding agent<select className={`${fieldClass} font-mono`} onChange={(event) => setAgentRef(event.target.value)} value={effectiveAgentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.agentRef}{agent.compatible ? ` · ${agent.model?.provider}/${agent.model?.model}` : ` · ${agent.reason}`}</option>)}</select></label>{requestedAgent && !requestedAgent.compatible ? <p className="text-sm text-warn" role="status">{requestedAgent.reason}</p> : null}<label className="grid gap-2 text-sm font-semibold">Prompt<span className="text-xs font-normal text-muted-ink">Write results under <code>$STEWARD_OUTPUT_DIR/out/</code>. Only those files are collected; a run with no <code>out/</code> file fails.</span><textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label><p className="text-xs text-muted-ink">This inline task uses one compatible model and inherits the selected Envelope&apos;s approved tools, budget, TTL, and runner limits. After it succeeds, save the exact task from its run detail.</p></div> : null}
+    {sourceKind === "inline" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Coding agent<select className={`${fieldClass} font-mono`} onChange={(event) => setAgentRef(event.target.value)} value={effectiveAgentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.agentRef}{agent.compatible ? ` · ${agent.model?.provider}/${agent.model?.model}` : ` · ${agent.reason}`}</option>)}</select></label>{agentWarning ? <p className="text-sm text-warn" role="status">{agentWarning}</p> : null}<label className="grid gap-2 text-sm font-semibold">Prompt<span className="text-xs font-normal text-muted-ink">Write results under <code>$STEWARD_OUTPUT_DIR/out/</code>. Only those files are collected; a run with no <code>out/</code> file fails.</span><textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label><p className="text-xs text-muted-ink">This inline task uses one compatible model and inherits the selected Envelope&apos;s approved tools, budget, TTL, and runner limits. After it succeeds, save the exact task from its run detail.</p></div> : null}
     {sourceKind === "repository" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Repository<input className={`${fieldClass} font-mono`} onChange={(event) => setRepository(event.target.value)} value={repository} /></label><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Ref or immutable commit<input className={`${fieldClass} font-mono`} onChange={(event) => setRevision(event.target.value)} value={revision} /></label><label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} value={path} /></label></div><p className="text-xs text-muted-ink">The repository must be in the operator&apos;s allowed source list. Steward resolves a ref to an exact commit and validates the package&apos;s declared requirements before execution.</p></div> : null}
     {sourceKind === "registry" ? <label className="grid gap-2 text-sm font-semibold">Published workflow<select className={fieldClass} onChange={(event) => setWorkflowRef(event.target.value)} value={workflowRef}>{data.workflows.workflows.map((workflow) => <option key={`${workflow.name}@${workflow.version}`} value={`${workflow.name}@${workflow.version}`}>{workflow.displayName} · {workflow.name}@{workflow.version}</option>)}</select></label> : null}
     <label className="grid gap-2 text-sm font-semibold">Inputs (JSON object)<span className="text-xs font-normal text-muted-ink">Optional JSON (up to 16 KiB), available to the agent as <code>in/inputs.json</code>. Reference it in your prompt; it cannot change the agent, model, tools, or Envelope. Example: <code>{'{"release":"v1.2.3"}'}</code>.</span><textarea className="min-h-28 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setInputs(event.target.value)} spellCheck={false} value={inputs} /></label>

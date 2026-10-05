@@ -397,9 +397,25 @@ async function startWeb() {
   let connectionStartDeadlineMs = 30_000;
   let connectionStartAlwaysPending = false;
   let connectionStartPollHangs = false;
+  let runEventFixture = null;
+  let runEventRequests = 0;
   const proxy = createServer(async (request, response) => {
     try {
       const requestUrl = new URL(request.url ?? "/", nextOrigin);
+      if (request.method === "GET" && requestUrl.pathname === `/app/api/v1/runs/${taskUid}/events` && runEventFixture) {
+        runEventRequests += 1;
+        response.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache, no-transform",
+          "x-accel-buffering": "no",
+        });
+        for (const event of runEventFixture) {
+          await new Promise((resolve) => setTimeout(resolve, event.delayMs));
+          response.write(`id: ${event.data.eventId}\nevent: ${event.name}\ndata: ${JSON.stringify(event.data)}\n\n`);
+        }
+        response.end();
+        return;
+      }
       const templateMutation = request.method === "PUT"
         && requestUrl.pathname.startsWith("/admin/api/v1/envelope-templates/");
       const browserMutation = templateMutation || (request.method === "POST" && (
@@ -649,6 +665,11 @@ async function startWeb() {
       rerunFixtures = fixtures;
       rerunFixtureIndex = 0;
     },
+    useRunEventFixture: (events) => {
+      runEventFixture = events;
+      runEventRequests = 0;
+    },
+    runEventRequestCount: () => runEventRequests,
   };
 }
 
@@ -722,6 +743,7 @@ async function guardedPage(browser, {
   initialWorkflowAcknowledged = false,
   onboardingPagination = false,
   mutationFailures = {},
+  mockRunEvents = true,
   rerunResponses = [
     { status: 201, body: { apiVersion: "steward.browser-runs/v1", taskUid: rerunTaskUid } },
   ],
@@ -897,7 +919,7 @@ async function guardedPage(browser, {
     }
     await json(route, { apiVersion: "steward.envelope-requests/v1", request: envelopeRequest });
   });
-  await context.route(`${origin}/app/api/v1/runs*`, (route) => {
+  await context.route((url) => url.origin === origin && url.pathname === "/app/api/v1/runs", (route) => {
     if (route.request().method() === "POST") {
       return route.continue();
     }
@@ -927,27 +949,28 @@ async function guardedPage(browser, {
   });
   await context.route(`${origin}/app/api/v1/runs/**`, (route) => {
     if (route.request().url().endsWith("/rerun")) return route.continue();
+    if (route.request().url().endsWith("/events")) {
+      if (!mockRunEvents) return route.continue();
+      const snapshot = {
+        apiVersion: "steward.browser-runs/v1",
+        eventId: 1,
+        run: { ...fixtureRun, phase: runPhase },
+        timeline: {
+          apiVersion: "steward.browser-runs/v1",
+          taskUid,
+          events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }],
+        },
+      };
+      return route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: `retry: 2000\nid: 1\nevent: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n: heartbeat\n\n`,
+        headers: { "cache-control": "no-cache, no-transform", "x-accel-buffering": "no" },
+      });
+    }
     return route.request().url().endsWith("/timeline")
       ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
       : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...fixtureRun, phase: runPhase } });
-  });
-  await context.route(`${origin}/app/api/v1/runs/${taskUid}/events`, (route) => {
-    const snapshot = {
-      apiVersion: "steward.browser-runs/v1",
-      eventId: 1,
-      run: { ...fixtureRun, phase: runPhase },
-      timeline: {
-        apiVersion: "steward.browser-runs/v1",
-        taskUid,
-        events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }],
-      },
-    };
-    return route.fulfill({
-      status: 200,
-      contentType: "text/event-stream",
-      body: `retry: 2000\nid: 1\nevent: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n: heartbeat\n\n`,
-      headers: { "cache-control": "no-cache, no-transform", "x-accel-buffering": "no" },
-    });
   });
   await context.route(`${origin}/app/api/v1/runs/${taskUid}/package`, (route) => json(route, {
     taskUid,
@@ -2228,75 +2251,104 @@ test("browser-origin re-run uses the browser admission boundary", async ({ brows
   }
 });
 
-test("run detail follows SSE snapshots from submitted to terminal without reload", async ({ browser }) => {
-  const developer = await guardedPage(browser, { runPhase: "submitted" });
-  let eventRequest = 0;
-  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}/events`, async (route) => {
-    eventRequest += 1;
-    if (eventRequest === 1) await new Promise((resolve) => setTimeout(resolve, 200));
-    const terminal = eventRequest > 1;
-    const phase = terminal ? "succeeded" : "running";
-    const snapshot = {
+test("run detail uses one held event stream through queued, running, and succeeded", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    inlineRun: true,
+    mockRunEvents: false,
+    runPhase: "submitted",
+  });
+  const inlinePackage = {
+    source: "inline",
+    revision: `steward:sha256:${"c".repeat(64)}`,
+    path: browserTaskDefinitionPath,
+    contentDigest: `steward:sha256:${"c".repeat(64)}`,
+  };
+  const liveRun = (phase) => ({
+    ...run,
+    origin: "browser",
+    workflow: "browser-task@1",
+    workflowName: null,
+    workflowVersion: null,
+    package: inlinePackage,
+    phase,
+    runtimeUid: phase === "queued" ? null : "runtime-live-1",
+    finalizationRequested: phase !== "queued",
+    finalized: phase === "succeeded",
+    stages: run.stages.map((stage) => {
+      const state = stage.id === "admission"
+        ? "succeeded"
+        : stage.id === "provision_runtime"
+          ? phase === "queued" ? "running" : "succeeded"
+          : stage.id === "agent_execution"
+            ? phase === "queued" ? "pending" : "succeeded"
+            : phase === "queued" ? "pending" : phase === "running" ? "running" : "succeeded";
+      return {
+        ...stage,
+        state,
+        steps: stage.steps.map((step) => ({ ...step, state })),
+      };
+    }),
+  });
+  const eventData = (eventId, phase) => ({
+    apiVersion: "steward.browser-runs/v1",
+    eventId,
+    run: liveRun(phase),
+    timeline: {
       apiVersion: "steward.browser-runs/v1",
-      eventId: eventRequest,
-      run: {
-        ...run,
-        phase,
-        runtimeUid: "runtime-live-1",
-        stages: run.stages.map((stage) => ({
-          ...stage,
-          state: stage.id === "agent_execution" ? phase : "succeeded",
-        })),
-      },
-      timeline: {
-        apiVersion: "steward.browser-runs/v1",
-        taskUid,
-        events: [
-          { kind: "phase", phase, at: terminal ? "2026-08-24T17:03:00Z" : "2026-08-24T17:02:15Z" },
-          { kind: "runtimeBound", runtimeUid: "runtime-live-1", at: "2026-08-24T17:02:10Z" },
-        ],
-      },
-    };
-    await route.fulfill({
-      status: 200,
-      contentType: "text/event-stream",
-      body: `retry: 2000\nid: ${eventRequest}\nevent: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`,
-    });
+      taskUid,
+      events: [
+        { kind: "phase", phase, at: `2026-08-24T17:02:0${eventId}Z` },
+        ...(phase === "queued" ? [] : [{ kind: "runtimeBound", runtimeUid: "runtime-live-1", at: "2026-08-24T17:02:02Z" }]),
+      ],
+    },
+  });
+  web.useRunEventFixture([
+    { delayMs: 100, name: "snapshot", data: eventData(1, "queued") },
+    { delayMs: 150, name: "run", data: eventData(2, "running") },
+    { delayMs: 150, name: "run", data: eventData(3, "succeeded") },
+  ]);
+  let outputRequests = 0;
+  let documentRequests = 0;
+  developer.page.on("request", (request) => {
+    if (request.url().endsWith(`/app/api/v1/runs/${taskUid}/outputs`)) outputRequests += 1;
+    if (request.resourceType() === "document" && new URL(request.url()).pathname === `/runs/${taskUid}`) documentRequests += 1;
   });
   try {
     await developer.page.goto(`${origin}/runs/${taskUid}`);
-    await expect(developer.page.getByText("submitted", { exact: true }).first()).toBeVisible();
+    await expect(developer.page.locator("article > header").getByText("queued", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("heading", { name: "Save this task to a repository" })).toHaveCount(0);
+    expect(outputRequests).toBe(0);
     await expect(developer.page.locator("article > header").getByText("running", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("heading", { name: "Finalize" })).toBeVisible();
+    await expect(developer.page.getByRole("heading", { name: "Save this task to a repository" })).toHaveCount(0);
+    expect(outputRequests).toBe(0);
     await expect(developer.page.locator("article > header").getByText("succeeded", { exact: true })).toBeVisible({ timeout: 5_000 });
     await expect(developer.page.getByText("runtime-live-1", { exact: true })).toBeVisible();
-    expect(eventRequest).toBeGreaterThanOrEqual(2);
+    await expect(developer.page.getByRole("heading", { name: "Outputs" })).toBeVisible();
+    await expect(developer.page.getByRole("heading", { name: "Save this task to a repository" })).toBeVisible();
+    expect(outputRequests).toBe(1);
+    expect(web.runEventRequestCount()).toBe(1);
+    expect(documentRequests).toBe(1);
   } finally {
+    web.useRunEventFixture(null);
     await closeGuardedPage(developer);
   }
 });
 
-test("run detail falls back to bounded polling when SSE is unavailable", async ({ browser }) => {
+test("run detail leaves reconnects to EventSource without fetch polling", async ({ browser }) => {
   const developer = await guardedPage(browser, { runPhase: "submitted" });
-  let runRequest = 0;
-  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}/events`, (route) => route.fulfill({
-    status: 200,
-    contentType: "text/event-stream",
-    body: ": no snapshot available\n\n",
-  }));
-  await developer.page.route(`${origin}/app/api/v1/runs/${taskUid}`, (route) => {
-    runRequest += 1;
-    const phase = runRequest > 1 ? "succeeded" : "submitted";
-    return route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({ apiVersion: "steward.browser-runs/v1", run: { ...run, phase } }),
-    });
+  let detailRequests = 0;
+  let eventRequests = 0;
+  developer.page.on("request", (request) => {
+    const path = new URL(request.url()).pathname;
+    if (path === `/app/api/v1/runs/${taskUid}`) detailRequests += 1;
+    if (path === `/app/api/v1/runs/${taskUid}/events`) eventRequests += 1;
   });
   try {
     await developer.page.goto(`${origin}/runs/${taskUid}`);
     await expect(developer.page.getByText("submitted", { exact: true }).first()).toBeVisible();
-    await expect.poll(() => runRequest, { timeout: 5_000 }).toBeGreaterThanOrEqual(2);
-    await expect(developer.page.locator("article > header").getByText("succeeded", { exact: true })).toBeVisible();
+    await expect.poll(() => eventRequests, { timeout: 5_000 }).toBeGreaterThanOrEqual(2);
+    expect(detailRequests).toBe(1);
   } finally {
     await closeGuardedPage(developer);
   }

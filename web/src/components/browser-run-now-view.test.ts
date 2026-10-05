@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { compatibleAgents, runNowFailureMessage } from "./browser-run-now-view";
+import { compatibleAgents, effectiveAgentSelection, runNowFailureMessage } from "./browser-run-now-view";
 
 describe("Run now failures", () => {
   test("shows a bounded server message before a generic fallback", () => {
@@ -31,5 +31,9 @@ describe("inline agent compatibility", () => {
       { agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" }, compatible: true, reason: null },
       { agentRef: "claude-code@2.1.222", model: null, compatible: false, reason: "Requires an Anthropic model, which this Envelope does not allow." },
     ]);
+    expect(effectiveAgentSelection(agents, "claude-code@2.1.222")).toEqual({
+      selected: agents[0],
+      warning: null,
+    });
   });
 });

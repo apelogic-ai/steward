@@ -16,6 +16,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Replaced run-detail fetch polling with one held, owner-scoped SSE connection
+  that sends an atomic run-and-timeline snapshot, incremental state events and
+  heartbeats, resumes with `Last-Event-ID`, enforces a per-user stream cap, and
+  closes after terminal finalization. Run headers and job states now derive
+  from the same snapshot, including promotion to Running once a runtime binds.
+- Kept outputs and the inline-task save panel pending until successful
+  finalization, returned `409 outputs_pending` before then, and removed the
+  false agent-compatibility warning when Run now selects a compatible fallback.
 - Kept reserved `.steward/diagnostics/stdout.log` and `stderr.log` transcripts
   out of browser output listings and downloads while continuing to reject every
   other regular file outside `out/`. Runs with full execution-log capture can

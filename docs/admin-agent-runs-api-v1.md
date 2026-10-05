@@ -91,13 +91,22 @@ and execution end carries a terminal exit category. Consumers must not invent
 missing transitions.
 
 `GET /app/api/v1/runs/{taskUid}/events` is the owner-scoped live-refresh
-boundary. It returns `text/event-stream`, emits a complete run-and-timeline
-snapshot with a monotonically increasing event ID, honours `Last-Event-ID`, and
-advertises a two-second reconnect interval. The browser reconnects until the
-Task is terminal and falls back to bounded polling when the stream cannot be
-used. An edge that fronts this route must disable response buffering, preserve
-`Last-Event-ID`, and use an idle timeout longer than the advertised reconnect
-interval.
+boundary. It holds one `text/event-stream` response open, emits a complete
+atomic run-and-timeline `snapshot`, then emits `run` events when that state
+changes. Events have monotonically increasing IDs. A reconnect with
+`Last-Event-ID` replays retained events after that ID; a missing or expired gap
+receives a new snapshot. Steward retains at most 128 events per Task, permits
+at most four concurrent streams per user, returns `429` when that cap is
+reached, sends a heartbeat comment every 15 seconds, and closes after the Task
+is terminal and finalized. The browser uses `EventSource`; it does not fetch
+poll this endpoint. An edge that fronts this route must disable response
+buffering, preserve `Last-Event-ID`, and use an idle timeout longer than the
+heartbeat interval.
+
+`GET /app/api/v1/runs/{taskUid}/outputs` and its file-download subroute return
+`409` with `{ "error": "outputs_pending" }` until the Task is finalized. The
+run detail requests outputs, and exposes the inline-task save panel, only after
+the atomic stream snapshot reports `Succeeded`.
 
 ### Execution logs
 

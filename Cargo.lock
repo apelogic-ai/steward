@@ -4002,6 +4002,7 @@ dependencies = [
 name = "steward-apiserver"
 version = "0.0.0"
 dependencies = [
+ "async-stream",
  "axum",
  "base64",
  "jsonwebtoken",

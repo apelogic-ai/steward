@@ -99,6 +99,10 @@ export function parseRunEventSnapshot(body: string): RunEventSnapshot | null {
     .find((line) => line.startsWith("data: "))
     ?.slice("data: ".length);
   if (!data) return null;
+  return parseRunEventData(data);
+}
+
+export function parseRunEventData(data: string): RunEventSnapshot | null {
   try {
     const value = JSON.parse(data) as Partial<RunEventSnapshot>;
     return typeof value.eventId === "number" && value.run && value.timeline
@@ -338,8 +342,8 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
   useEffect(() => {
     let active = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    let lastEventId = 0;
     let pollingDelay = 2_000;
+    let eventSource: EventSource | undefined;
 
     function schedule(next: () => Promise<void>, delay: number) {
       if (active) timer = setTimeout(() => void next(), delay);
@@ -349,7 +353,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
       if (!active) return true;
       setLiveRun(run);
       setLiveTimeline(timeline);
-      return isTerminalPhase(run.run.phase);
+      return isTerminalPhase(run.run.phase) && run.run.finalized;
     }
 
     async function poll() {
@@ -367,33 +371,25 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
       schedule(poll, pollingDelay);
     }
 
-    async function refreshFromEvents() {
-      try {
-        const response = await fetch(`/app/api/v1/runs/${encodeURIComponent(taskUid)}/events`, {
-          cache: "no-store",
-          credentials: "same-origin",
-          headers: {
-            accept: "text/event-stream",
-            ...(lastEventId ? { "Last-Event-ID": String(lastEventId) } : {}),
-          },
-        });
-        if (!response.ok) throw new Error(`event stream returned ${response.status}`);
-        const snapshot = parseRunEventSnapshot(await response.text());
-        if (!snapshot) throw new Error("event stream snapshot was invalid");
-        lastEventId = snapshot.eventId;
-        if (!apply({ apiVersion: "steward.browser-runs/v1", run: snapshot.run }, snapshot.timeline)) {
-          schedule(refreshFromEvents, 2_000);
-        }
-      } catch {
-        if (active) schedule(poll, pollingDelay);
+    function applyEvent(event: MessageEvent<string>) {
+      const snapshot = parseRunEventData(event.data);
+      if (!snapshot) return;
+      if (apply({ apiVersion: "steward.browser-runs/v1", run: snapshot.run }, snapshot.timeline)) {
+        eventSource?.close();
       }
     }
 
     if (admin) void poll();
-    else void refreshFromEvents();
+    else {
+      eventSource = new EventSource(`/app/api/v1/runs/${encodeURIComponent(taskUid)}/events`);
+      for (const eventName of ["snapshot", "run", "job", "output", "log"]) {
+        eventSource.addEventListener(eventName, applyEvent as EventListener);
+      }
+    }
     return () => {
       active = false;
       if (timer) clearTimeout(timer);
+      eventSource?.close();
     };
   }, [admin, loadRun, loadTimeline, taskUid]);
 
@@ -468,8 +464,8 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                   <p className="mt-5 rounded-control border border-warn/30 bg-warn-soft px-4 py-3 text-sm text-warn"><strong className="block font-semibold text-warn" id="sensitivity-notice">Sensitivity notice</strong>Execution logs may reproduce arbitrary user, tool, or agent output.</p>
                   {selectedStage?.id === "agent_execution" && run.executionLog === "off" ? <div className="mt-5 rounded-card border p-4"><p className="text-sm font-semibold">No execution log was captured for this run.</p><p className="mt-1 text-sm text-muted-ink">Enable <strong>Capture execution log</strong> when starting a run to retain stdout and stderr. Captured output may contain sensitive data.</p></div> : null}
                   {selectedStage?.steps.length ? <ol className="mt-5 divide-y divide-line-soft rounded-card border">{selectedStage.steps.map((step) => <RunStepRow admin={admin} key={step.id} onStreamChange={(stream) => selectLocation(selectedStage.id, stream)} selectedStream={selectedStage.id === "agent_execution" ? selectedStream : null} step={step} taskUid={taskUid} />)}</ol> : selectedStage ? <p className="mt-5 rounded-card border p-4 text-sm text-muted-ink">{stageSummary(selectedStage)}</p> : null}
-                  {!admin && run.phase === "succeeded" ? <RunOutputs taskUid={taskUid} /> : null}
-                  {!admin && run.phase === "succeeded" && run.origin === "browser" && run.package?.source === "inline" ? <SaveInlineRunToRepository run={run} /> : null}
+                  {!admin && run.phase === "succeeded" && run.finalized ? <RunOutputs taskUid={taskUid} /> : null}
+                  {!admin && run.phase === "succeeded" && run.finalized && run.origin === "browser" && run.package?.source === "inline" ? <SaveInlineRunToRepository run={run} /> : null}
                 </section>
               </main>
             </div>
