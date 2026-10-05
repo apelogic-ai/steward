@@ -7,6 +7,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-10-04
+
+### Security
+
+- Updated the Steward web application from Next.js 16.3.3 to 16.3.6 to
+  remediate `GHSA-vcvr-r3jv-pc5j`, a critical remote-code-execution advisory
+  affecting `next/og` `ImageResponse`. This release supersedes the incomplete
+  v0.3.6 publication and otherwise carries the same product contract.
+
 ## [0.3.6] - 2026-10-04
 
 ### Added
@@ -515,7 +524,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/apelogic-ai/steward/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/apelogic-ai/steward/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/apelogic-ai/steward/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/apelogic-ai/steward/compare/v0.3.3...v0.3.4

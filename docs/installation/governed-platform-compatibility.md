@@ -1,6 +1,6 @@
 # Product compatibility and installation BOM
 
-Status: **Current release contract for Steward v0.3.6**
+Status: **Current release contract for Steward v0.3.7**
 
 Steward publishes a product-compatibility contract. Release/integration
 packaging publishes the installation bill of materials (BOM). These are
@@ -18,12 +18,12 @@ than treating the Steward repository as a cross-product deployment lock.
 
 ## Product compatibility
 
-The Steward v0.3.6 release includes the attested asset
-`steward-product-compatibility-0.3.6.json`. Its source is
+The Steward v0.3.7 release includes the attested asset
+`steward-product-compatibility-0.3.7.json`. Its source is
 `config/product-compatibility/v1/compatibility.json` and its schema identity is
 `steward.product-compatibility/v1`.
 
-For v0.3.6 it declares:
+For v0.3.7 it declares:
 
 - Task API contract `steward.task/v2`;
 - the `envelopeDigest` selector requires `steward-run` v0.7.0 or later;
@@ -43,16 +43,16 @@ association have explicit outcomes.
 Download and verify it from the Steward release:
 
 ```sh
-gh release download v0.3.6 \
+gh release download v0.3.7 \
   --repo apelogic-ai/steward \
-  --pattern steward-product-compatibility-0.3.6.json \
-  --pattern steward-product-compatibility-0.3.6.json.sha256 \
+  --pattern steward-product-compatibility-0.3.7.json \
+  --pattern steward-product-compatibility-0.3.7.json.sha256 \
   --pattern release-handoff.json
 
-sha256sum --check steward-product-compatibility-0.3.6.json.sha256
-gh attestation verify steward-product-compatibility-0.3.6.json \
+sha256sum --check steward-product-compatibility-0.3.7.json.sha256
+gh attestation verify steward-product-compatibility-0.3.7.json \
   --repo apelogic-ai/steward \
-  --cert-identity https://github.com/apelogic-ai/steward/.github/workflows/release.yml@refs/tags/v0.3.6
+  --cert-identity https://github.com/apelogic-ai/steward/.github/workflows/release.yml@refs/tags/v0.3.7
 ```
 
 Compare the calculated digest with `productCompatibility.digest` in
@@ -68,7 +68,7 @@ have published their immutable release handoffs. At minimum, it records:
 ```json
 {
   "steward": {
-    "version": "0.3.6",
+    "version": "0.3.7",
     "image": "registry.example.com/steward@sha256:<digest>"
   },
   "stewardRun": {
@@ -138,7 +138,7 @@ real HTTP operation for each admitted model.
 ### MCP-GW authority
 
 `connectionsBridge.mcpGatewayAuthorityContract` selects an authority contract,
-not a product version. Steward v0.3.6 uses
+not a product version. Steward v0.3.7 uses
 `steward.connections.github/v2`. Release/integration packaging chooses and
 records an MCP-GW release that implements that contract.
 
