@@ -17,7 +17,7 @@ use steward_adapter_mcp_gw::{
     github_bridge_failure_diagnostic,
 };
 use steward_admission::internal_authorities::{
-    steward_connections_v1, steward_connections_v2, steward_connections_v3,
+    steward_connections_v1, steward_connections_v2, steward_connections_v3, steward_connections_v4,
 };
 use steward_admission::{AdmissionDecision, Envelope, evaluate};
 use steward_store::{
@@ -73,6 +73,11 @@ pub enum ConnectionOperationKind {
     Start,
     Disconnect,
     Rerun,
+    Repositories,
+    Workflow,
+    RunStatus,
+    Dispatch,
+    Publish,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,10 +150,10 @@ fn valid_operator_pinned_image(value: &str) -> bool {
     })
 }
 
-fn operation_grant(
+fn operation_grants(
     operation: ConnectionOperationKind,
-) -> Result<ToolGrant, GovernedConnectionPlanError> {
-    steward_connections_v3::operation_grant(operation.action())
+) -> Result<Vec<ToolGrant>, GovernedConnectionPlanError> {
+    steward_connections_v4::operation_grants(operation.action())
         .ok_or(GovernedConnectionPlanError::Admission)
 }
 
@@ -161,10 +166,10 @@ fn connection_authority(
             steward_connections_v1::AUTHORITY_VERSION,
             steward_connections_v1::AUTHORITY_DIGEST,
         )),
-        steward_connections_v3::MCP_GW_VERSION => Ok((
-            steward_connections_v3::envelope(),
-            steward_connections_v3::AUTHORITY_VERSION,
-            steward_connections_v3::AUTHORITY_DIGEST,
+        steward_connections_v4::MCP_GW_VERSION => Ok((
+            steward_connections_v4::envelope(),
+            steward_connections_v4::AUTHORITY_VERSION,
+            steward_connections_v4::AUTHORITY_DIGEST,
         )),
         _ => Err(GovernedConnectionPlanError::InvalidBindings),
     }
@@ -177,6 +182,11 @@ impl ConnectionOperationKind {
             Self::Start => "start",
             Self::Disconnect => "disconnect",
             Self::Rerun => "rerun",
+            Self::Repositories => "repositories",
+            Self::Workflow => "workflow",
+            Self::RunStatus => "run-status",
+            Self::Dispatch => "dispatch",
+            Self::Publish => "publish",
         }
     }
 
@@ -186,6 +196,11 @@ impl ConnectionOperationKind {
             Self::Start => "github.start",
             Self::Disconnect => "github.disconnect",
             Self::Rerun => "github.rerun",
+            Self::Repositories => "github.repositories",
+            Self::Workflow => "github.workflow",
+            Self::RunStatus => "github.run-status",
+            Self::Dispatch => "github.dispatch",
+            Self::Publish => "github.publish",
         }
     }
 }
@@ -287,6 +302,10 @@ pub struct SplitConnectionsBroker<M, S> {
 impl<M, S> SplitConnectionsBroker<M, S> {
     pub fn new(mutations: M, status: S) -> Self {
         Self { mutations, status }
+    }
+
+    pub fn governed_mutations(&self) -> &M {
+        &self.mutations
     }
 }
 
@@ -574,6 +593,13 @@ pub struct GovernedConnectionsBroker<B> {
     failure_reporter: Arc<dyn Fn(String) + Send + Sync>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct ConnectionReservationIdentity<'a> {
+    operation: Option<&'a str>,
+    client_scope: Option<&'a str>,
+    publication_branch: Option<&'a str>,
+}
+
 const STAGED_CONNECTIONS_WARNING: &str = "connections bridge enabled but taskOrchestrationMode=staged; Connections operations are refused";
 
 fn connection_orchestration_error(mode: TaskOrchestrationMode) -> Option<ConnectionBrokerError> {
@@ -617,7 +643,7 @@ impl<B> GovernedConnectionsBroker<B> {
         operation: ConnectionOperationKind,
         allow_status_cache: bool,
         request_body: Option<Value>,
-        idempotency_identity: Option<&str>,
+        identity: ConnectionReservationIdentity<'_>,
     ) -> Result<ConnectionOperationRecord, ConnectionBrokerError> {
         if let Some(error) = connection_orchestration_error(self.orchestration_mode) {
             return Err(error);
@@ -634,7 +660,12 @@ impl<B> GovernedConnectionsBroker<B> {
         let body = match operation {
             ConnectionOperationKind::Start => json!({"redirectAfter": self.config.redirect_after}),
             ConnectionOperationKind::Status | ConnectionOperationKind::Disconnect => json!({}),
-            ConnectionOperationKind::Rerun => {
+            ConnectionOperationKind::Rerun
+            | ConnectionOperationKind::Repositories
+            | ConnectionOperationKind::Workflow
+            | ConnectionOperationKind::RunStatus
+            | ConnectionOperationKind::Dispatch
+            | ConnectionOperationKind::Publish => {
                 request_body.ok_or(ConnectionBrokerError::Unavailable)?
             }
         };
@@ -643,7 +674,8 @@ impl<B> GovernedConnectionsBroker<B> {
             &serde_json::to_vec(&body).map_err(|_| ConnectionBrokerError::Unavailable)?,
         )?;
         let operation_id = Uuid::new_v4();
-        let operation_key = idempotency_identity
+        let operation_key = identity
+            .operation
             .map(str::to_owned)
             .unwrap_or_else(|| operation_id.to_string());
         let runtime_name = format!("conn-{}", operation_id.simple());
@@ -683,6 +715,7 @@ impl<B> GovernedConnectionsBroker<B> {
             owner: email.as_str(),
             owner_user_id: canonical_user_id.as_str(),
             workflow: match plan.authority_version {
+                steward_connections_v4::AUTHORITY_VERSION => "internal:steward-connections/v4",
                 steward_connections_v3::AUTHORITY_VERSION => "internal:steward-connections/v3",
                 steward_connections_v2::AUTHORITY_VERSION => "internal:steward-connections/v2",
                 _ => "internal:steward-connections/v1",
@@ -721,6 +754,8 @@ impl<B> GovernedConnectionsBroker<B> {
                 authority_digest: &plan.authority_digest,
                 bindings: &bindings,
                 idempotency_identity: &operation_key,
+                idempotency_scope: identity.client_scope,
+                publication_branch: identity.publication_branch,
                 response_deadline_seconds: CONNECTION_RESPONSE_DEADLINE_SECONDS,
                 allow_status_cache,
                 input_archive: &input,
@@ -770,6 +805,91 @@ impl<B> GovernedConnectionsBroker<B> {
         }
     }
 
+    pub(crate) async fn run_automation_operation(
+        &self,
+        session: &ConnectionSession<B>,
+        operation: ConnectionOperationKind,
+        mut request_body: Value,
+        idempotency_identity: &str,
+        idempotency_scope: Option<&str>,
+        publication_subject: Option<&str>,
+    ) -> Result<Value, ConnectionBrokerError> {
+        if matches!(
+            operation,
+            ConnectionOperationKind::Status
+                | ConnectionOperationKind::Start
+                | ConnectionOperationKind::Disconnect
+                | ConnectionOperationKind::Rerun
+        ) {
+            return Err(ConnectionBrokerError::Unavailable);
+        }
+        if operation == ConnectionOperationKind::Publish {
+            let subject = publication_subject.ok_or(ConnectionBrokerError::Unavailable)?;
+            let previous_branch = self
+                .store
+                .connection_publication_branch(&session.subject.canonical_user_id, subject)
+                .await
+                .map_err(store_broker_error)?;
+            let request = request_body
+                .as_object_mut()
+                .ok_or(ConnectionBrokerError::Unavailable)?;
+            let requested_branch = request
+                .get("branch")
+                .and_then(Value::as_str)
+                .ok_or(ConnectionBrokerError::Unavailable)?;
+            let resume_owned_branch = previous_branch.is_some();
+            let branch = previous_branch
+                .unwrap_or_else(|| format!("{requested_branch}-{}", Uuid::new_v4().simple()));
+            request.insert("branch".to_owned(), Value::String(branch.clone()));
+            request.insert(
+                "resumeOwnedBranch".to_owned(),
+                Value::Bool(resume_owned_branch),
+            );
+            let record = self
+                .reserve(
+                    &session.subject.canonical_user_id,
+                    &session.subject.display_email,
+                    operation,
+                    true,
+                    Some(request_body),
+                    ConnectionReservationIdentity {
+                        operation: Some(idempotency_identity),
+                        client_scope: idempotency_scope,
+                        publication_branch: Some(&branch),
+                    },
+                )
+                .await?;
+            let completed = if record.operation_state == ConnectionOperationState::Succeeded {
+                record
+            } else {
+                self.wait(&session.subject.canonical_user_id, record.operation_id)
+                    .await?
+            };
+            return completed.result.ok_or(ConnectionBrokerError::Unavailable);
+        }
+        let record = self
+            .reserve(
+                &session.subject.canonical_user_id,
+                &session.subject.display_email,
+                operation,
+                true,
+                Some(request_body),
+                ConnectionReservationIdentity {
+                    operation: Some(idempotency_identity),
+                    client_scope: idempotency_scope,
+                    publication_branch: None,
+                },
+            )
+            .await?;
+        let completed = if record.operation_state == ConnectionOperationState::Succeeded {
+            record
+        } else {
+            self.wait(&session.subject.canonical_user_id, record.operation_id)
+                .await?
+        };
+        completed.result.ok_or(ConnectionBrokerError::Unavailable)
+    }
+
     async fn status_operation(
         &self,
         session: &ConnectionSession<B>,
@@ -782,7 +902,7 @@ impl<B> GovernedConnectionsBroker<B> {
                 ConnectionOperationKind::Status,
                 allow_cache,
                 None,
-                None,
+                ConnectionReservationIdentity::default(),
             )
             .await?;
         let completed = if record.operation_state == ConnectionOperationState::Succeeded {
@@ -815,6 +935,11 @@ impl From<ConnectionOperationKind> for StoredOperationKind {
             ConnectionOperationKind::Start => Self::Start,
             ConnectionOperationKind::Disconnect => Self::Disconnect,
             ConnectionOperationKind::Rerun => Self::Rerun,
+            ConnectionOperationKind::Repositories => Self::Repositories,
+            ConnectionOperationKind::Workflow => Self::Workflow,
+            ConnectionOperationKind::RunStatus => Self::RunStatus,
+            ConnectionOperationKind::Dispatch => Self::Dispatch,
+            ConnectionOperationKind::Publish => Self::Publish,
         }
     }
 }
@@ -857,7 +982,7 @@ where
                     ConnectionOperationKind::Start,
                     true,
                     None,
-                    None,
+                    ConnectionReservationIdentity::default(),
                 )
                 .await?;
             Ok(ReservedConnectionStart {
@@ -944,7 +1069,13 @@ where
                             ConnectionStartOperation::Failed(ConnectionBrokerError::Unavailable)
                         }
                     }
-                    StoredOperationKind::Status | StoredOperationKind::Rerun => {
+                    StoredOperationKind::Status
+                    | StoredOperationKind::Rerun
+                    | StoredOperationKind::Repositories
+                    | StoredOperationKind::Workflow
+                    | StoredOperationKind::RunStatus
+                    | StoredOperationKind::Dispatch
+                    | StoredOperationKind::Publish => {
                         ConnectionStartOperation::Failed(ConnectionBrokerError::Unavailable)
                     }
                 },
@@ -965,7 +1096,7 @@ where
                     ConnectionOperationKind::Disconnect,
                     true,
                     None,
-                    None,
+                    ConnectionReservationIdentity::default(),
                 )
                 .await?;
             Ok(ReservedConnectionStart {
@@ -986,18 +1117,31 @@ where
         request: &'a GithubWorkflowRerunRequest,
     ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
         Box::pin(async move {
+            let body = json!({
+                "owner": request.owner,
+                "repo": request.repository,
+                "runId": request.run_id,
+            });
+            let idempotency_scope = format!(
+                "github-rerun:client:{}",
+                secret_digest(&request.idempotency_key)
+            );
+            let idempotency_identity = format!(
+                "{idempotency_scope}:payload:{}",
+                secret_digest(&body.to_string())
+            );
             let record = self
                 .reserve(
                     &session.subject.canonical_user_id,
                     &session.subject.display_email,
                     ConnectionOperationKind::Rerun,
                     true,
-                    Some(json!({
-                        "owner": request.owner,
-                        "repo": request.repository,
-                        "runId": request.run_id,
-                    })),
-                    Some(&request.idempotency_key),
+                    Some(body),
+                    ConnectionReservationIdentity {
+                        operation: Some(&idempotency_identity),
+                        client_scope: Some(&idempotency_scope),
+                        publication_branch: None,
+                    },
                 )
                 .await?;
             let completed = if record.operation_state == ConnectionOperationState::Succeeded {
@@ -1542,6 +1686,9 @@ mod finalized_connection_operation_tests {
 fn store_broker_error(error: StoreError) -> ConnectionBrokerError {
     match error {
         StoreError::ConnectionOAuthFlowPending => ConnectionBrokerError::OAuthFlowPending,
+        StoreError::ConnectionOperationIdempotencyConflict => {
+            ConnectionBrokerError::IdempotencyConflict
+        }
         _ => ConnectionBrokerError::Unavailable,
     }
 }
@@ -1582,8 +1729,172 @@ fn bridge_result(operation: StoredOperationKind, archive: &[u8]) -> Result<Value
                 return Err(StoreError::InvalidConnectionOperation);
             }
         }
+        StoredOperationKind::Repositories => {
+            validate_repositories_result(&value)?;
+        }
+        StoredOperationKind::Workflow => {
+            validate_workflow_result(&value)?;
+        }
+        StoredOperationKind::RunStatus => {
+            validate_run_status_result(&value)?;
+        }
+        StoredOperationKind::Dispatch => {
+            validate_dispatch_result(&value)?;
+        }
+        StoredOperationKind::Publish => {
+            validate_publish_result(&value)?;
+        }
     }
     Ok(value)
+}
+
+fn exact_object_keys(object: &Map<String, Value>, expected: &[&str]) -> bool {
+    object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
+}
+
+fn valid_https_github_url(value: &Value) -> bool {
+    value.as_str().is_some_and(|value| {
+        Url::parse(value).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str() == Some("github.com")
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+    })
+}
+
+fn validate_repositories_result(value: &Value) -> Result<(), StoreError> {
+    let object = value
+        .as_object()
+        .ok_or(StoreError::InvalidConnectionOperation)?;
+    if !exact_object_keys(object, &["login", "repositories", "page", "hasNextPage"])
+        || object.get("login").and_then(Value::as_str).is_none()
+        || object.get("page").and_then(Value::as_u64).is_none()
+        || object.get("hasNextPage").and_then(Value::as_bool).is_none()
+    {
+        return Err(StoreError::InvalidConnectionOperation);
+    }
+    let repositories = object
+        .get("repositories")
+        .and_then(Value::as_array)
+        .filter(|repositories| repositories.len() <= 100)
+        .ok_or(StoreError::InvalidConnectionOperation)?;
+    if repositories.iter().any(|repository| {
+        let Some(repository) = repository.as_object() else {
+            return true;
+        };
+        !exact_object_keys(
+            repository,
+            &[
+                "owner",
+                "ownerId",
+                "name",
+                "repositoryId",
+                "defaultBranch",
+                "private",
+                "url",
+            ],
+        ) || repository.get("owner").and_then(Value::as_str).is_none()
+            || repository.get("ownerId").and_then(Value::as_str).is_none()
+            || repository.get("name").and_then(Value::as_str).is_none()
+            || repository
+                .get("repositoryId")
+                .and_then(Value::as_str)
+                .is_none()
+            || repository
+                .get("defaultBranch")
+                .and_then(Value::as_str)
+                .is_none()
+            || repository.get("private").and_then(Value::as_bool).is_none()
+            || !repository.get("url").is_some_and(valid_https_github_url)
+    }) {
+        return Err(StoreError::InvalidConnectionOperation);
+    }
+    Ok(())
+}
+
+fn validate_workflow_result(value: &Value) -> Result<(), StoreError> {
+    let object = value
+        .as_object()
+        .ok_or(StoreError::InvalidConnectionOperation)?;
+    if !exact_object_keys(object, &["exists", "compatible", "path", "sha"])
+        || object.get("exists").and_then(Value::as_bool).is_none()
+        || object.get("compatible").and_then(Value::as_bool).is_none()
+        || object.get("path").and_then(Value::as_str).is_none()
+        || !matches!(
+            object.get("sha"),
+            Some(Value::String(_)) | Some(Value::Null)
+        )
+    {
+        return Err(StoreError::InvalidConnectionOperation);
+    }
+    Ok(())
+}
+
+fn validate_run_status_result(value: &Value) -> Result<(), StoreError> {
+    let object = value
+        .as_object()
+        .ok_or(StoreError::InvalidConnectionOperation)?;
+    if !object.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "runId" | "runAttempt" | "phase" | "conclusion" | "url" | "jobs" | "failureLog"
+        )
+    }) || !matches!(object.len(), 6 | 7)
+        || object.get("runId").and_then(Value::as_u64).is_none()
+        || !object
+            .get("runAttempt")
+            .and_then(Value::as_u64)
+            .is_some_and(|attempt| attempt > 0 && attempt <= u64::from(u32::MAX))
+        || !matches!(
+            object.get("phase").and_then(Value::as_str),
+            Some("queued" | "in_progress" | "completed")
+        )
+        || !matches!(
+            object.get("conclusion"),
+            Some(Value::String(_)) | Some(Value::Null)
+        )
+        || !object.get("url").is_some_and(valid_https_github_url)
+        || object.get("jobs").and_then(Value::as_array).is_none()
+        || object
+            .get("failureLog")
+            .is_some_and(|value| !matches!(value, Value::String(_) | Value::Null))
+    {
+        return Err(StoreError::InvalidConnectionOperation);
+    }
+    Ok(())
+}
+
+fn validate_dispatch_result(value: &Value) -> Result<(), StoreError> {
+    let object = value
+        .as_object()
+        .ok_or(StoreError::InvalidConnectionOperation)?;
+    if !exact_object_keys(object, &["runId", "url"])
+        || object.get("runId").and_then(Value::as_u64).is_none()
+        || !object.get("url").is_some_and(valid_https_github_url)
+    {
+        return Err(StoreError::InvalidConnectionOperation);
+    }
+    Ok(())
+}
+
+fn validate_publish_result(value: &Value) -> Result<(), StoreError> {
+    let object = value
+        .as_object()
+        .ok_or(StoreError::InvalidConnectionOperation)?;
+    if !exact_object_keys(object, &["pullRequestUrl", "pullRequestNumber", "branch"])
+        || !object
+            .get("pullRequestUrl")
+            .is_some_and(valid_https_github_url)
+        || object
+            .get("pullRequestNumber")
+            .and_then(Value::as_u64)
+            .is_none()
+        || object.get("branch").and_then(Value::as_str).is_none()
+    {
+        return Err(StoreError::InvalidConnectionOperation);
+    }
+    Ok(())
 }
 
 fn provider_status(value: &Value) -> Result<ProviderConnectionStatus, ConnectionBrokerError> {
@@ -1852,7 +2163,7 @@ pub fn plan_connection_operation(
             name: "connections-bridge".to_owned(),
         },
         llms: Vec::new(),
-        tools: vec![operation_grant(operation)?],
+        tools: operation_grants(operation)?,
         budget: authority.spec.budget.clone(),
         ttl: authority.spec.ttl.clone(),
         runner: authority.spec.runner.clone(),
@@ -2295,7 +2606,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_gateway_selects_immutable_v3_authority() -> Result<(), String> {
+    fn lifecycle_gateway_selects_immutable_v4_authority() -> Result<(), String> {
         let mut lifecycle_bindings = bindings();
         lifecycle_bindings.mcp_gw_version = "0.4.9".to_owned();
         let plan = plan_connection_operation(
@@ -2308,9 +2619,9 @@ mod tests {
         .map_err(|error| format!("plan: {error:?}"))?;
         let document = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../config/internal-authorities/steward-connections/v3.json"
+            "/../../config/internal-authorities/steward-connections/v4.json"
         ));
-        assert_eq!(plan.authority_version, 3);
+        assert_eq!(plan.authority_version, 4);
         assert_eq!(
             plan.authority_digest,
             format!("sha256:{:x}", Sha256::digest(document.as_bytes()))
@@ -2319,6 +2630,56 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(document)
                 .map_err(|error| error.to_string())?["oauthContract"]["mcpGwVersion"],
             "0.4.9"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn github_automation_v4_authority_document_has_the_exact_allowlist() -> Result<(), String> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/internal-authorities/steward-connections/v4.json"
+        );
+        let document = std::fs::read_to_string(path)
+            .map_err(|error| format!("read immutable v4 authority document: {error}"))?;
+        let value: serde_json::Value = serde_json::from_str(&document)
+            .map_err(|error| format!("fixed v4 authority JSON is invalid: {error}"))?;
+        let tools = value["tools"]
+            .as_array()
+            .ok_or_else(|| "v4 authority tools must be an array".to_owned())?;
+        let grants = tools
+            .iter()
+            .map(|tool| {
+                Ok((
+                    tool["resource"]
+                        .as_str()
+                        .ok_or_else(|| "tool resource must be a string".to_owned())?,
+                    tool["action"]
+                        .as_str()
+                        .ok_or_else(|| "tool action must be a string".to_owned())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        assert_eq!(value["authorityVersion"], 4);
+        assert_eq!(
+            grants,
+            [
+                ("provider-control", "status"),
+                ("provider-control", "start"),
+                ("provider-control", "disconnect"),
+                ("actions_run_trigger", "write"),
+                ("search_repositories", "read"),
+                ("get_me", "read"),
+                ("get_file_contents", "read"),
+                ("actions_list", "read"),
+                ("actions_get", "read"),
+                ("get_job_logs", "read"),
+                ("get_commit", "read"),
+                ("list_pull_requests", "read"),
+                ("create_branch", "write"),
+                ("push_files", "write"),
+                ("create_pull_request", "write"),
+            ]
         );
         Ok(())
     }
@@ -2352,6 +2713,74 @@ mod tests {
             .map_err(|error| format!("evaluate rerun: {error:?}"))?,
             AdmissionDecision::Admit
         );
+        Ok(())
+    }
+
+    #[test]
+    fn github_automation_operations_receive_only_their_exact_v4_grants() -> Result<(), String> {
+        let user = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?;
+        let email = Email::parse("alice@example.com")?;
+        let expected = [
+            (
+                ConnectionOperationKind::Repositories,
+                "github.repositories",
+                vec![("search_repositories", "read"), ("get_me", "read")],
+            ),
+            (
+                ConnectionOperationKind::Workflow,
+                "github.workflow",
+                vec![("get_file_contents", "read")],
+            ),
+            (
+                ConnectionOperationKind::RunStatus,
+                "github.run-status",
+                vec![
+                    ("actions_list", "read"),
+                    ("actions_get", "read"),
+                    ("get_job_logs", "read"),
+                ],
+            ),
+            (
+                ConnectionOperationKind::Dispatch,
+                "github.dispatch",
+                vec![
+                    ("get_file_contents", "read"),
+                    ("actions_run_trigger", "write"),
+                    ("actions_list", "read"),
+                ],
+            ),
+            (
+                ConnectionOperationKind::Publish,
+                "github.publish",
+                vec![
+                    ("get_commit", "read"),
+                    ("get_file_contents", "read"),
+                    ("list_pull_requests", "read"),
+                    ("create_branch", "write"),
+                    ("push_files", "write"),
+                    ("create_pull_request", "write"),
+                ],
+            ),
+        ];
+        for (operation, command, grants) in expected {
+            let mut lifecycle_bindings = bindings();
+            lifecycle_bindings.mcp_gw_version = "0.4.9".to_owned();
+            let plan = plan_connection_operation(&user, &email, operation, lifecycle_bindings)
+                .map_err(|error| format!("plan {command}: {error:?}"))?;
+            assert_eq!(plan.authority_version, 4);
+            assert_eq!(plan.command[2], command);
+            assert_eq!(
+                plan.spec.tools,
+                grants
+                    .into_iter()
+                    .map(|(resource, action)| ToolGrant {
+                        provider: "github".to_owned(),
+                        resource: resource.to_owned(),
+                        action: action.to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
         Ok(())
     }
 
@@ -2443,6 +2872,38 @@ mod tests {
         )
         .map_err(|error| format!("archive leaked rerun: {error:?}"))?;
         assert!(bridge_result(steward_store::ConnectionOperationKind::Rerun, &leaked).is_err());
+        for (kind, body) in [
+            (
+                steward_store::ConnectionOperationKind::Repositories,
+                br#"{"login":"alice","repositories":[],"page":1,"hasNextPage":false}"#.as_slice(),
+            ),
+            (
+                steward_store::ConnectionOperationKind::Workflow,
+                br#"{"path":".github/workflows/steward-task.yml","exists":false,"compatible":false,"sha":null}"#.as_slice(),
+            ),
+            (
+                steward_store::ConnectionOperationKind::RunStatus,
+                br#"{"runId":12345,"runAttempt":1,"phase":"completed","conclusion":"success","url":"https://github.com/example-org/example-repo/actions/runs/12345","jobs":[]}"#.as_slice(),
+            ),
+            (
+                steward_store::ConnectionOperationKind::Dispatch,
+                br#"{"runId":12345,"url":"https://github.com/example-org/example-repo/actions/runs/12345"}"#.as_slice(),
+            ),
+            (
+                steward_store::ConnectionOperationKind::Publish,
+                br#"{"pullRequestUrl":"https://github.com/example-org/example-repo/pull/1","pullRequestNumber":1,"branch":"steward/task-00000000000000000000000000000001"}"#.as_slice(),
+            ),
+        ] {
+            let archive = single_file_archive("response.json", body)
+                .map_err(|error| format!("archive {kind:?}: {error:?}"))?;
+            assert!(bridge_result(kind, &archive).is_ok(), "{kind:?}");
+            let mut leaked: serde_json::Value =
+                serde_json::from_slice(body).map_err(|error| error.to_string())?;
+            leaked["providerResponse"] = serde_json::json!({"secret": "hidden"});
+            let leaked = single_file_archive("response.json", leaked.to_string().as_bytes())
+                .map_err(|error| format!("archive leaked {kind:?}: {error:?}"))?;
+            assert!(bridge_result(kind, &leaked).is_err(), "{kind:?}");
+        }
         Ok(())
     }
 

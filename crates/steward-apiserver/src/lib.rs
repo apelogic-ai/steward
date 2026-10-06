@@ -9,6 +9,7 @@ mod browser_security;
 pub mod connections;
 mod execution_bindings;
 mod github_actions;
+pub mod github_automation;
 pub mod google_oidc;
 pub mod governed_connections;
 pub mod operator_admin;
@@ -389,6 +390,11 @@ pub struct GrantRevocationRequest {
         connections::start_provider_connection,
         connections::provider_connection_start_operation,
         connections::disconnect_provider_connection,
+        github_automation::list_repositories,
+        github_automation::detect_workflow,
+        github_automation::publish_task,
+        github_automation::dispatch_task,
+        github_automation::github_run_status,
         preferences::get_preferences,
         preferences::update_preferences,
         browser_admin::get_envelope_template,
@@ -511,7 +517,18 @@ pub struct GrantRevocationRequest {
         agent_runs_ui::BrowserRunOutputFile,
         agent_runs_ui::BrowserRunOutputsResponse,
         agent_runs_ui::BrowserRunPackageView,
-        agent_runs_ui::BrowserRunPackageContentResponse
+        agent_runs_ui::BrowserRunPackageContentResponse,
+        github_automation::GithubRepositoryView,
+        github_automation::GithubRepositoriesResponse,
+        github_automation::RepositoryTargetRequest,
+        github_automation::PublishTaskRequest,
+        github_automation::DispatchTaskRequest,
+        github_automation::WorkflowDetectionResponse,
+        github_automation::PublishTaskResponse,
+        github_automation::DispatchTaskResponse,
+        github_automation::GithubJobView,
+        github_automation::GithubRunStatusResponse,
+        github_automation::GithubAutomationErrorResponse
     )),
     modifiers(&TaskSecurity)
 )]
@@ -2604,6 +2621,7 @@ impl IntoResponse for ApiError {
                 | StoreError::SelfBrowserMemberMutation
                 | StoreError::FederatedSubjectConflict
                 | StoreError::ConnectionOperationConflict
+                | StoreError::ConnectionOperationIdempotencyConflict
                 | StoreError::ConnectionOAuthFlowPending
                 | StoreError::CumulativeEscalationConflict,
             ) => StatusCode::CONFLICT,

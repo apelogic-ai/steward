@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BrowserRunView } from "@/api-client";
 
-import { exactRepositoryBundle, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards } from "./run-views";
+import { packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -65,16 +65,6 @@ describe("run table", () => {
     expect(html).toContain("steward:sha256:");
     expect(html).toContain("rev 7");
     expect(html).not.toContain("uppercase");
-  });
-});
-
-test("repository bundle preserves the exact successful package over wrapper files", () => {
-  expect(exactRepositoryBundle(
-    { "task-definition.json": "exact task" },
-    { "task-definition.json": "stale task", ".github/workflows/steward-browser-task.yml": "caller" },
-  )).toEqual({
-    "task-definition.json": "exact task",
-    ".github/workflows/steward-browser-task.yml": "caller",
   });
 });
 

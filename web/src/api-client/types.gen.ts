@@ -950,6 +950,21 @@ export type DisconnectConnectionRequest = {
     confirm: boolean;
 };
 
+export type DispatchTaskRequest = {
+    idempotencyKey: string;
+    inputs?: {
+        [key: string]: string;
+    };
+    owner: string;
+    repository: string;
+};
+
+export type DispatchTaskResponse = {
+    apiVersion: string;
+    runId: number;
+    url: string;
+};
+
 export type Duration = string;
 
 export type Email = string;
@@ -1070,6 +1085,52 @@ export type GeneratedGithubActionsWorkflow = {
 export type GithubActionsWorkflowResponse = {
     apiVersion: string;
     workflow: GeneratedGithubActionsWorkflow;
+};
+
+export type GithubAutomationErrorResponse = {
+    apiVersion: string;
+    error: string;
+};
+
+export type GithubJobView = {
+    conclusion?: string | null;
+    id: number;
+    name: string;
+    status: string;
+    url: string;
+};
+
+export type GithubRepositoriesResponse = {
+    apiVersion: string;
+    hasNextPage: boolean;
+    login: string;
+    page: number;
+    repositories: Array<GithubRepositoryView>;
+};
+
+export type GithubRepositoryView = {
+    defaultBranch: string;
+    missingPrerequisite?: string | null;
+    name: string;
+    owner: string;
+    ownerId: string;
+    private: boolean;
+    ready: boolean;
+    repositoryId: string;
+    url: string;
+};
+
+export type GithubRunStatusResponse = {
+    apiVersion: string;
+    conclusion?: string | null;
+    failureLog?: string | null;
+    jobs: Array<GithubJobView>;
+    linkedTaskPhase?: string | null;
+    linkedTaskUid?: string | null;
+    phase: string;
+    runAttempt: number;
+    runId: number;
+    url: string;
 };
 
 export type InvocationKind = 'manifest' | 'implicit';
@@ -1239,6 +1300,20 @@ export type ProvisionEnvelopeBody = {
     templateRevision: number;
 };
 
+export type PublishTaskRequest = {
+    idempotencyKey: string;
+    owner: string;
+    repository: string;
+};
+
+export type PublishTaskResponse = {
+    apiVersion: string;
+    branch: string;
+    packageDigest: string;
+    pullRequestNumber: number;
+    pullRequestUrl: string;
+};
+
 export type PublishWorkflowRequest = {
     agent: string;
     displayName: string;
@@ -1290,6 +1365,11 @@ export type RepositoryBundleResponse = {
     files: {
         [key: string]: string;
     };
+};
+
+export type RepositoryTargetRequest = {
+    owner: string;
+    repository: string;
 };
 
 export type RepositoryUrl = string;
@@ -1505,6 +1585,14 @@ export type UserEnvelopeRequest = {
 };
 
 export type Uuid = string;
+
+export type WorkflowDetectionResponse = {
+    apiVersion: string;
+    compatible: boolean;
+    exists: boolean;
+    path: string;
+    sha?: string | null;
+};
 
 export type WorkflowIdentity = {
     ref: BoundedRef;
@@ -3868,6 +3956,37 @@ export type ListTemplatesResponses = {
 
 export type ListTemplatesResponse = ListTemplatesResponses[keyof ListTemplatesResponses];
 
+export type ListRepositoriesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        query?: string;
+        page?: number;
+        perPage?: number;
+    };
+    url: '/app/api/v1/github/repositories';
+};
+
+export type ListRepositoriesErrors = {
+    /**
+     * Repository query is invalid
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    503: GithubAutomationErrorResponse;
+};
+
+export type ListRepositoriesError = ListRepositoriesErrors[keyof ListRepositoriesErrors];
+
+export type ListRepositoriesResponses = {
+    200: GithubRepositoriesResponse;
+};
+
+export type ListRepositoriesResponse = ListRepositoriesResponses[keyof ListRepositoriesResponses];
+
 export type GetBrowserPreferencesData = {
     body?: never;
     path?: never;
@@ -4109,6 +4228,167 @@ export type MyRunEventsResponses = {
 };
 
 export type MyRunEventsResponse = MyRunEventsResponses[keyof MyRunEventsResponses];
+
+export type DispatchTaskData = {
+    body: DispatchTaskRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/github/dispatch';
+};
+
+export type DispatchTaskErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Mutation proof is invalid or repository is not admitted
+     */
+    403: unknown;
+    /**
+     * Run, repository, or workflow is unavailable
+     */
+    404: unknown;
+    /**
+     * Published workflow does not match the tested task
+     */
+    409: unknown;
+    /**
+     * Dispatch inputs are invalid
+     */
+    422: unknown;
+    503: GithubAutomationErrorResponse;
+};
+
+export type DispatchTaskError = DispatchTaskErrors[keyof DispatchTaskErrors];
+
+export type DispatchTaskResponses = {
+    200: DispatchTaskResponse;
+};
+
+export type DispatchTaskResponse2 = DispatchTaskResponses[keyof DispatchTaskResponses];
+
+export type PublishTaskData = {
+    body: PublishTaskRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/github/publish';
+};
+
+export type PublishTaskErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Mutation proof is invalid or repository is not admitted
+     */
+    403: unknown;
+    /**
+     * Run or repository is unavailable
+     */
+    404: unknown;
+    /**
+     * Run is not publishable
+     */
+    409: unknown;
+    /**
+     * Publication request is invalid
+     */
+    422: unknown;
+    503: GithubAutomationErrorResponse;
+};
+
+export type PublishTaskError = PublishTaskErrors[keyof PublishTaskErrors];
+
+export type PublishTaskResponses = {
+    200: PublishTaskResponse;
+};
+
+export type PublishTaskResponse2 = PublishTaskResponses[keyof PublishTaskResponses];
+
+export type GithubRunStatusData = {
+    body?: never;
+    path: {
+        task_uid: string;
+        run_id: number;
+    };
+    query: {
+        owner: string;
+        repository: string;
+    };
+    url: '/app/api/v1/runs/{task_uid}/github/runs/{run_id}';
+};
+
+export type GithubRunStatusErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Run or repository is unavailable
+     */
+    404: unknown;
+    503: GithubAutomationErrorResponse;
+};
+
+export type GithubRunStatusError = GithubRunStatusErrors[keyof GithubRunStatusErrors];
+
+export type GithubRunStatusResponses = {
+    200: GithubRunStatusResponse;
+};
+
+export type GithubRunStatusResponse2 = GithubRunStatusResponses[keyof GithubRunStatusResponses];
+
+export type DetectWorkflowData = {
+    body: RepositoryTargetRequest;
+    headers: {
+        'X-Steward-CSRF': string;
+    };
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/github/workflow';
+};
+
+export type DetectWorkflowErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Mutation proof is invalid
+     */
+    403: unknown;
+    /**
+     * Run or repository is unavailable
+     */
+    404: unknown;
+    /**
+     * Run is not publishable
+     */
+    409: unknown;
+    503: GithubAutomationErrorResponse;
+};
+
+export type DetectWorkflowError = DetectWorkflowErrors[keyof DetectWorkflowErrors];
+
+export type DetectWorkflowResponses = {
+    200: WorkflowDetectionResponse;
+};
+
+export type DetectWorkflowResponse = DetectWorkflowResponses[keyof DetectWorkflowResponses];
 
 export type MyRunExecutionLogData = {
     body?: never;

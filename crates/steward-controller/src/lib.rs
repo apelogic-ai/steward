@@ -1035,6 +1035,10 @@ fn internal_task_authority_snapshot(
             steward_admission::internal_authorities::steward_connections_v3::envelope(),
             steward_admission::internal_authorities::steward_connections_v3::AUTHORITY_DIGEST,
         ),
+        Some(4) => (
+            steward_admission::internal_authorities::steward_connections_v4::envelope(),
+            steward_admission::internal_authorities::steward_connections_v4::AUTHORITY_DIGEST,
+        ),
         _ => {
             return Err(TaskControllerError::InvalidState(
                 "unknown internal authority version".to_owned(),
@@ -2425,6 +2429,11 @@ fn connection_authority_matches(operation: &ConnectionOperationRecord) -> bool {
                 steward_admission::internal_authorities::steward_connections_v3::AUTHORITY_DIGEST,
                 "0.4.9"
             )
+            | (
+                4,
+                steward_admission::internal_authorities::steward_connections_v4::AUTHORITY_DIGEST,
+                "0.4.9"
+            )
     )
 }
 
@@ -2475,6 +2484,11 @@ fn connection_operation_runtime_matches(
         ConnectionOperationKind::Start => "github.start",
         ConnectionOperationKind::Disconnect => "github.disconnect",
         ConnectionOperationKind::Rerun => "github.rerun",
+        ConnectionOperationKind::Repositories => "github.repositories",
+        ConnectionOperationKind::Workflow => "github.workflow",
+        ConnectionOperationKind::RunStatus => "github.run-status",
+        ConnectionOperationKind::Dispatch => "github.dispatch",
+        ConnectionOperationKind::Publish => "github.publish",
     };
     let expected_command = [
         steward_connections_v1::BRIDGE_BINARY,
@@ -2483,9 +2497,9 @@ fn connection_operation_runtime_matches(
         "--input",
         steward_connections_v1::INPUT_FILE,
     ];
-    let expected_grant =
-        steward_admission::internal_authorities::steward_connections_v3::operation_grant(
-            operation.operation_kind.as_str(),
+    let expected_grants =
+        steward_admission::internal_authorities::steward_connections_v4::operation_grants(
+            operation.operation_kind.authority_action(),
         )
         .ok_or_else(|| {
             ReconcileError::Authority(
@@ -2509,6 +2523,7 @@ fn connection_operation_runtime_matches(
         1 => steward_connections_v1::envelope(),
         2 => steward_admission::internal_authorities::steward_connections_v2::envelope(),
         3 => steward_admission::internal_authorities::steward_connections_v3::envelope(),
+        4 => steward_admission::internal_authorities::steward_connections_v4::envelope(),
         _ => return Ok(false),
     };
     let fixed_limits_match = runtime.spec.budget == authority.spec.budget
@@ -2532,7 +2547,7 @@ fn connection_operation_runtime_matches(
         && namespace == operation.bindings.namespace
         && runtime.spec.agent_type.name == steward_connections_v1::AGENT_TYPE
         && runtime.spec.llms.is_empty()
-        && runtime.spec.tools.as_slice() == [expected_grant]
+        && runtime.spec.tools == expected_grants
         && runtime.spec.bindings.is_none()
         && fixed_limits_match
         && identity_matches

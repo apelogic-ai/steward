@@ -102,15 +102,33 @@ deployment-owned execution-binding catalog; it does not require a published Work
 It selects only a coding agent whose model family is allowed by the selected Envelope
 and records that exact model in the package requirements.
 
-After an inline run succeeds, its detail page offers **Save this task to a repository**.
-**Copy repository bundle** reads the exact persisted package from the successful run,
-then asks the server to render the handoff against the same provisioned Envelope and
-the deployment's reviewed `steward-run` release. With `steward-run` v0.8.0 or later,
-the copied JSON file map contains the unchanged `task-definition.json` with its inline
-prompt and a caller workflow using `package-path`. Older reviewed releases receive the
-compatible invocation manifest and `invocation-path` workflow instead. Either bundle
-uses the exact reusable-workflow commit and preserves the package closure digest proven
-by the inline run; release coordinates are never guessed by the browser client.
+After an inline run succeeds, its detail page offers **Publish this task to GitHub**.
+Steward lists repositories visible through the user's governed GitHub connection and
+marks each repository as ready or not ready. Readiness requires the repository's stable
+owner and repository IDs to be admitted as a source in `githubSource.bindings`; a
+mutable repository name is not authority. Organization policy may also have to allow
+the Steward OAuth App to access the repository before it becomes visible.
+
+Publication is a server-owned operation. Steward reconstructs the successful run's
+exact one-file inline package, renders the pinned `steward-run` v0.8.0-or-later caller,
+creates a `steward/task-<taskUid>` branch from the repository's default branch, pushes
+exactly those two files, and opens a pull request. It never writes to the default
+branch. The response reports the package closure digest proven by the browser run.
+Retries for the same Task and repository reuse the same durable operation identity, so
+a changed browser retry key cannot create a second pull request.
+
+After the pull request is merged, Steward verifies the exact generated workflow on the
+default branch before enabling **Run on GitHub**. Dispatch is limited to that one
+generated workflow, its declared `workflow_dispatch` inputs, and the default branch.
+The run detail then shows the GitHub run, jobs, bounded failed-job log content, and the
+owner-scoped governed Task correlated by repository, run ID, and attempt.
+
+The browser routes are under `/app/api/v1` and remain bound to the authenticated
+canonical owner. Repository reads, publication writes, dispatch, and run observation
+execute as audited governed Connections operations. No provider token or repository
+file content is logged. Migration 0064 adds those operation kinds and internal
+authority v4 while preserving the exact v1, v2, and v3 authority tuples for historical
+rows.
 
 ## First-run prerequisite failures
 

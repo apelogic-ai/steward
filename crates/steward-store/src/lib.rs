@@ -581,6 +581,20 @@ mod migration_tests {
             "migration 57 must preserve immutable browser Task package evidence"
         );
     }
+
+    #[test]
+    fn github_repository_automation_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 64
+                    && migration
+                        .description
+                        .contains("github repository automation operations")
+            }),
+            "migration 64 must preserve v1-v3 connection rows while admitting only v4 repository automation"
+        );
+    }
 }
 
 impl PgStore {
@@ -693,6 +707,7 @@ impl PgStore {
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
+
         let current = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT max(version) FROM workflow_revisions WHERE name = $1",
         )
@@ -8482,6 +8497,26 @@ impl PgStore {
             .await
             .map_err(database_error)?;
 
+        if let Some(scope) = request.idempotency_scope {
+            let conflicting_payload = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM connection_operations \
+                 WHERE canonical_user_id = $1 AND provider = 'github' \
+                   AND operation_kind = $2 \
+                   AND left(idempotency_identity, length($3) + 1) = $3 || ':' \
+                   AND idempotency_identity <> $4)",
+            )
+            .bind(request.task.owner_user_id)
+            .bind(request.operation_kind.as_str())
+            .bind(scope)
+            .bind(request.idempotency_identity)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if conflicting_payload {
+                return Err(StoreError::ConnectionOperationIdempotencyConflict);
+            }
+        }
+
         let mut failed_operations = sqlx::query_scalar::<_, Uuid>(
             "WITH drifted AS ( \
                UPDATE connection_operations \
@@ -8581,7 +8616,7 @@ impl PgStore {
         let active_mutation = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM connection_operations \
              WHERE canonical_user_id = $1 AND provider = 'github' \
-               AND operation_kind IN ('start', 'disconnect', 'rerun') \
+               AND operation_kind IN ('start', 'disconnect', 'rerun', 'dispatch', 'publish') \
                AND operation_state IN ('queued', 'provisioning', 'running') \
                AND finalization_state = 'not_requested')",
         )
@@ -8706,7 +8741,12 @@ impl PgStore {
                 .await
                 .map_err(database_error)?
             }
-            ConnectionOperationKind::Rerun => sqlx::query(
+            ConnectionOperationKind::Rerun
+            | ConnectionOperationKind::Repositories
+            | ConnectionOperationKind::Workflow
+            | ConnectionOperationKind::RunStatus
+            | ConnectionOperationKind::Dispatch
+            | ConnectionOperationKind::Publish => sqlx::query(
                 "SELECT operations.*, \
                         to_char(operations.flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
                         to_char(operations.response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
@@ -8715,14 +8755,15 @@ impl PgStore {
                  FROM connection_operations operations \
                  JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
                  WHERE operations.canonical_user_id = $1 AND operations.provider = 'github' \
-                   AND operations.operation_kind = 'rerun' \
-                   AND operations.idempotency_identity = $2 \
+                   AND operations.operation_kind = $2 \
+                   AND operations.idempotency_identity = $3 \
                    AND (operations.operation_state IN ('queued', 'provisioning', 'running') \
                      OR (operations.operation_state = 'succeeded' \
                         AND operations.result_expires_at > now())) \
                  ORDER BY operations.created_at DESC LIMIT 1",
             )
             .bind(request.task.owner_user_id)
+            .bind(request.operation_kind.as_str())
             .bind(request.idempotency_identity)
             .fetch_optional(&mut *transaction)
             .await
@@ -8743,7 +8784,7 @@ impl PgStore {
         if active_mutation {
             return Err(StoreError::ConnectionOperationConflict);
         }
-        if request.operation_kind != ConnectionOperationKind::Status {
+        if request.operation_kind.is_mutation() {
             let preempted = sqlx::query_scalar::<_, Uuid>(
                 "WITH preempted AS ( \
                    UPDATE connection_operations \
@@ -8851,10 +8892,10 @@ impl PgStore {
              (operation_id, task_uid, canonical_user_id, provider, operation_kind, \
               submitter_service, authority_id, authority_version, authority_digest, \
               runtime_spec_snapshot, command_snapshot, artifact_trust_mode, bridge_image_digest, mcp_gw_origin, \
-              mcp_gw_version, runtime_namespace, runtime_class, idempotency_identity, uncached_status, \
-              response_deadline_at) \
+              mcp_gw_version, runtime_namespace, runtime_class, idempotency_identity, \
+              publication_branch, uncached_status, response_deadline_at) \
              VALUES ($1, $1, $2, 'github', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
-                     $13, $14, $15, $16, $17, now() + make_interval(secs => $18)) \
+                     $13, $14, $15, $16, $17, $18, now() + make_interval(secs => $19)) \
              RETURNING *, \
                        to_char(flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
                        to_char(response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
@@ -8878,6 +8919,7 @@ impl PgStore {
         .bind(&request.bindings.namespace)
         .bind(&request.bindings.runtime_class)
         .bind(request.idempotency_identity)
+        .bind(request.publication_branch)
         .bind(
             request.operation_kind == ConnectionOperationKind::Status
                 && !request.allow_status_cache,
@@ -8917,6 +8959,29 @@ impl PgStore {
         .map_err(database_error)?
         .map(connection_operation_record)
             .transpose()
+    }
+
+    pub async fn connection_publication_branch(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+        publication_subject: &str,
+    ) -> Result<Option<String>, StoreError> {
+        if publication_subject.trim().is_empty() {
+            return Err(StoreError::InvalidConnectionOperation);
+        }
+        sqlx::query_scalar::<_, String>(
+            "SELECT publication_branch FROM connection_operations \
+             WHERE canonical_user_id = $1 AND provider = 'github' \
+               AND operation_kind = 'publish' \
+               AND left(idempotency_identity, length($2) + 1) = $2 || ':' \
+               AND publication_branch IS NOT NULL \
+             ORDER BY created_at ASC, operation_id ASC LIMIT 1",
+        )
+        .bind(canonical_user_id.as_str())
+        .bind(publication_subject)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
     }
 
     /// Duration of the administrator's latest successful GitHub Connect start.
@@ -9405,7 +9470,9 @@ impl PgStore {
                  cached_status = CASE WHEN operation_kind = 'status' THEN $2 ELSE cached_status END, \
                  cache_expires_at = CASE WHEN operation_kind = 'status' \
                      THEN now() + make_interval(secs => $5) ELSE NULL END, \
-                 result_expires_at = CASE WHEN operation_kind IN ('disconnect', 'rerun') \
+                 result_expires_at = CASE WHEN operation_kind IN ( \
+                     'disconnect', 'rerun', 'repositories', 'workflow', 'run_status', 'dispatch', 'publish' \
+                 ) \
                      THEN now() + make_interval(secs => $6) ELSE result_expires_at END, \
                  oauth_phase = CASE WHEN operation_kind = 'start' THEN 'pending' ELSE oauth_phase END, \
                  authorization_url = $3, authorization_url_digest = $4, \
@@ -9429,7 +9496,7 @@ impl PgStore {
         if updated.rows_affected() != 1 {
             return Err(StoreError::InvalidConnectionOperation);
         }
-        if operation_kind != ConnectionOperationKind::Status {
+        if operation_kind.is_mutation() {
             sqlx::query(
                 "UPDATE connection_operations \
                  SET cached_status = NULL, cache_expires_at = NULL, updated_at = now() \
@@ -10146,13 +10213,11 @@ fn validate_connection_operation_request(
     validate_task_identity_binding(&request.task)?;
     validate_task_version_pins(&request.task)?;
     validate_task_runtime_binding(&request.task)?;
-    let (expected_resource, expected_action) = match request.operation_kind {
-        ConnectionOperationKind::Rerun => ("actions_run_trigger", "write"),
-        _ => ("provider-control", request.operation_kind.as_str()),
-    };
-    let [tool] = request.task.runtime_spec.tools.as_slice() else {
-        return Err(StoreError::InvalidConnectionOperation);
-    };
+    let expected_tools =
+        steward_admission::internal_authorities::steward_connections_v4::operation_grants(
+            request.operation_kind.authority_action(),
+        )
+        .ok_or(StoreError::InvalidConnectionOperation)?;
     let expected_command = [
         "/usr/local/bin/steward-connections-bridge",
         "--operation",
@@ -10161,6 +10226,11 @@ fn validate_connection_operation_request(
             ConnectionOperationKind::Start => "github.start",
             ConnectionOperationKind::Disconnect => "github.disconnect",
             ConnectionOperationKind::Rerun => "github.rerun",
+            ConnectionOperationKind::Repositories => "github.repositories",
+            ConnectionOperationKind::Workflow => "github.workflow",
+            ConnectionOperationKind::RunStatus => "github.run-status",
+            ConnectionOperationKind::Dispatch => "github.dispatch",
+            ConnectionOperationKind::Publish => "github.publish",
         },
         "--input",
         "request.json",
@@ -10191,20 +10261,43 @@ fn validate_connection_operation_request(
                 3,
                 steward_admission::internal_authorities::steward_connections_v3::AUTHORITY_DIGEST,
                 "0.4.9"
+            ) | (
+                4,
+                steward_admission::internal_authorities::steward_connections_v4::AUTHORITY_DIGEST,
+                "0.4.9"
             )
         )
         || request.response_deadline_seconds <= 0
         || request.response_deadline_seconds > 60
         || request.idempotency_identity.trim().is_empty()
+        || request.idempotency_scope.is_some_and(|scope| {
+            scope.is_empty()
+                || scope.len() > 256
+                || !scope
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_'))
+                || !request
+                    .idempotency_identity
+                    .starts_with(&format!("{scope}:"))
+        })
+        || match (request.operation_kind, request.publication_branch) {
+            (ConnectionOperationKind::Publish, Some(branch)) => {
+                branch.len() != 78
+                    || !branch.starts_with("steward/task-")
+                    || !branch[13..45].bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || branch.as_bytes().get(45) != Some(&b'-')
+                    || !branch[46..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            }
+            (ConnectionOperationKind::Publish, None) | (_, Some(_)) => true,
+            (_, None) => false,
+        }
         || (request.operation_kind != ConnectionOperationKind::Status
             && !request.allow_status_cache)
         || request.input_archive.is_empty()
         || request.task.runtime_ownership != steward_types::RuntimeOwnership::Provisioned
         || request.task.runtime_spec.agent_type.name != "connections-bridge"
         || !request.task.runtime_spec.llms.is_empty()
-        || tool.provider != "github"
-        || tool.resource != expected_resource
-        || tool.action != expected_action
+        || request.task.runtime_spec.tools != expected_tools
         || request
             .task
             .agent_command
@@ -11142,6 +11235,11 @@ pub enum ConnectionOperationKind {
     Start,
     Disconnect,
     Rerun,
+    Repositories,
+    Workflow,
+    RunStatus,
+    Dispatch,
+    Publish,
 }
 
 impl ConnectionOperationKind {
@@ -11151,7 +11249,26 @@ impl ConnectionOperationKind {
             Self::Start => "start",
             Self::Disconnect => "disconnect",
             Self::Rerun => "rerun",
+            Self::Repositories => "repositories",
+            Self::Workflow => "workflow",
+            Self::RunStatus => "run_status",
+            Self::Dispatch => "dispatch",
+            Self::Publish => "publish",
         }
+    }
+
+    pub const fn authority_action(self) -> &'static str {
+        match self {
+            Self::RunStatus => "run-status",
+            _ => self.as_str(),
+        }
+    }
+
+    pub const fn is_mutation(self) -> bool {
+        matches!(
+            self,
+            Self::Start | Self::Disconnect | Self::Rerun | Self::Dispatch | Self::Publish
+        )
     }
 }
 
@@ -11190,6 +11307,11 @@ pub struct ConnectionOperationReservationRequest<'a> {
     pub authority_digest: &'a str,
     pub bindings: &'a ConnectionExecutionBindingSnapshot,
     pub idempotency_identity: &'a str,
+    /// Stable prefix for one client-provided write idempotency key. A different full identity
+    /// under the same scope means the key was reused for a different semantic payload.
+    pub idempotency_scope: Option<&'a str>,
+    /// Unpredictable server-selected branch retained across retries of one publication.
+    pub publication_branch: Option<&'a str>,
     pub response_deadline_seconds: i64,
     /// Status-only cache control. False forces a new status operation while still joining an
     /// identical in-flight status. Mutating operations must always set this to true.
@@ -11554,6 +11676,7 @@ pub enum StoreError {
     InvalidTaskTransition,
     ConnectionOperationNotFound,
     ConnectionOperationConflict,
+    ConnectionOperationIdempotencyConflict,
     ConnectionOAuthFlowPending,
     InvalidConnectionOperation,
     InvalidRunQuery,
@@ -11710,6 +11833,12 @@ impl fmt::Display for StoreError {
                 write!(
                     formatter,
                     "connection operation conflicts with an active mutation"
+                )
+            }
+            Self::ConnectionOperationIdempotencyConflict => {
+                write!(
+                    formatter,
+                    "connection idempotency key is bound to another payload"
                 )
             }
             Self::ConnectionOAuthFlowPending => {
@@ -12058,6 +12187,11 @@ fn connection_operation_kind_from_text(value: &str) -> Result<ConnectionOperatio
         "start" => Ok(ConnectionOperationKind::Start),
         "disconnect" => Ok(ConnectionOperationKind::Disconnect),
         "rerun" => Ok(ConnectionOperationKind::Rerun),
+        "repositories" => Ok(ConnectionOperationKind::Repositories),
+        "workflow" => Ok(ConnectionOperationKind::Workflow),
+        "run_status" => Ok(ConnectionOperationKind::RunStatus),
+        "dispatch" => Ok(ConnectionOperationKind::Dispatch),
+        "publish" => Ok(ConnectionOperationKind::Publish),
         _ => Err(StoreError::InvalidConnectionOperation),
     }
 }

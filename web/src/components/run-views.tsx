@@ -2,17 +2,21 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
   allRun,
   allRunTimeline,
   cancelMyRun,
+  detectWorkflow,
+  dispatchTask,
+  githubRunStatus,
+  listRepositories,
   myRun,
   myRunOutputs,
   myRunPackage,
   myRunTimeline,
-  renderRepositoryBundleForEnvelope,
+  publishTask,
   rerunMyRun,
   type AllRunsResponse,
   type BrowserRunResponse,
@@ -20,7 +24,12 @@ import {
   type BrowserRunTimelineResponse,
   type BrowserRunOutputsResponse,
   type BrowserRunView,
+  type GithubRepositoriesResponse,
+  type GithubRepositoryView,
+  type GithubRunStatusResponse,
   type MyRunsResponse,
+  type PublishTaskResponse,
+  type WorkflowDetectionResponse,
 } from "@/api-client";
 import { DataTable, FilterChips } from "@/components/hs";
 import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
@@ -29,7 +38,7 @@ import { ExecutionLogPanel } from "@/components/run-log-view";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import type { ExecutionLogStream } from "@/data/execution-log";
 import { useApiResource } from "@/data/use-api-resource";
-import { loadAllEnvelopeRequests, loadAllMyRuns, loadAllRuns } from "@/data/paginated-api";
+import { loadAllMyRuns, loadAllRuns } from "@/data/paginated-api";
 import { useSession } from "@/session/session-context";
 import { EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 
@@ -230,68 +239,162 @@ function InlinePackageViewer({ taskUid }: Readonly<{ taskUid: string }>) {
   }}</ResourceBoundary>;
 }
 
-export function exactRepositoryBundle(
-  exactPackage: Record<string, string>,
-  wrapperFiles: Record<string, string>,
-): Record<string, string> {
-  return { ...wrapperFiles, ...exactPackage };
-}
-
-function SaveInlineRunToRepository({ run }: Readonly<{ run: BrowserRunView }>) {
+function GithubAutomationPanel({ run }: Readonly<{ run: BrowserRunView }>) {
   const session = useSession();
-  const [repository, setRepository] = useState("https://github.com/example-org/agentic-ops.git");
-  const [state, setState] = useState<"idle" | "working" | "copied" | "error">("idle");
+  const [selectedRepository, setSelectedRepository] = useState("");
+  const [workflow, setWorkflow] = useState<WorkflowDetectionResponse | null>(null);
+  const [workflowRepository, setWorkflowRepository] = useState("");
+  const [publication, setPublication] = useState<PublishTaskResponse | null>(null);
+  const [runStatus, setRunStatus] = useState<GithubRunStatusResponse | null>(null);
+  const [githubRun, setGithubRun] = useState<{ runId: number; url: string } | null>(null);
+  const [state, setState] = useState<"idle" | "checking" | "publishing" | "dispatching" | "error">("idle");
   const [failure, setFailure] = useState<string | null>(null);
+  const loadRepositories = useCallback(() => listRepositories({
+    cache: "no-store",
+    credentials: "same-origin",
+    query: { query: "", page: 1, perPage: 100 },
+  }), []);
+  const repositories = useApiResource<GithubRepositoriesResponse>(loadRepositories);
+  const repositoryList = useMemo(
+    () => repositories.status === "ready" ? repositories.value.repositories : [],
+    [repositories],
+  );
+  const defaultRepository = repositoryList.find((repository) => repository.ready) ?? repositoryList[0];
+  const effectiveRepository = selectedRepository || (defaultRepository
+    ? `${defaultRepository.owner}/${defaultRepository.name}`
+    : "");
+  const selected = repositoryList.find(
+    (repository) => `${repository.owner}/${repository.name}` === effectiveRepository,
+  );
+  const selectedWorkflow = workflowRepository === effectiveRepository ? workflow : null;
+  const csrf = session.status === "authenticated" ? session.value.csrf : null;
 
-  async function copyBundle() {
-    if (session.status !== "authenticated" || !run.package || !run.userEnvelopeInstanceId) return;
-    setState("working");
-    setFailure(null);
-    try {
-      const requests = await loadAllEnvelopeRequests("provisioned");
-      const envelopeRequest = requests.data?.requests.find(
-        (request) => request.envelopeInstanceId === run.userEnvelopeInstanceId,
-      );
-      if (!envelopeRequest) {
-        setFailure("The Envelope used by this run is no longer provisioned, so Steward cannot render its GitHub Actions wrapper.");
-        setState("error");
-        return;
-      }
-      const [exact, wrapper] = await Promise.all([
-        myRunPackage({ cache: "no-store", credentials: "same-origin", path: { task_uid: run.taskUid } }),
-        renderRepositoryBundleForEnvelope({
-          body: {
-            repository: repository.trim(),
-            packagePath: run.package.path,
-          },
-          credentials: "same-origin",
-          headers: { "X-Steward-CSRF": session.value.csrf },
-          path: { request_id: envelopeRequest.id },
-        }),
-      ]);
-      if (!exact.data || !exact.response?.ok || !wrapper.data || !wrapper.response?.ok) {
-        setFailure("Steward could not render the repository bundle for this exact successful run.");
-        setState("error");
-        return;
-      }
-      await navigator.clipboard.writeText(JSON.stringify(
-        exactRepositoryBundle(exact.data.files, wrapper.data.files),
-        null,
-        2,
-      ));
-      setState("copied");
-    } catch {
-      setFailure("Steward could not render the repository bundle. Retry the request; if it persists, contact an administrator.");
-      setState("error");
+  const checkWorkflow = useCallback(async (repository: GithubRepositoryView) => {
+    if (!csrf) return null;
+    const result = await detectWorkflow({
+      body: { owner: repository.owner, repository: repository.name },
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "X-Steward-CSRF": csrf },
+      path: { task_uid: run.taskUid },
+    });
+    return result.data && result.response?.ok ? result.data : null;
+  }, [csrf, run.taskUid]);
+
+  useEffect(() => {
+    if (!selected) return;
+    let active = true;
+    void checkWorkflow(selected).then((detected) => {
+      if (!active) return;
+      setWorkflow(detected);
+      setWorkflowRepository(effectiveRepository);
+      setState(detected ? "idle" : "error");
+      if (!detected) setFailure("Steward could not inspect the generated workflow in this repository.");
+    });
+    return () => { active = false; };
+  }, [checkWorkflow, effectiveRepository, selected]);
+
+  useEffect(() => {
+    if (!publication || !selected || selectedWorkflow?.compatible) return;
+    const timer = window.setInterval(() => {
+      void checkWorkflow(selected).then((detected) => {
+        if (detected) {
+          setWorkflow(detected);
+          setWorkflowRepository(effectiveRepository);
+        }
+      });
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [checkWorkflow, effectiveRepository, publication, selected, selectedWorkflow?.compatible]);
+
+  useEffect(() => {
+    if (!githubRun || !selected || runStatus?.phase === "completed") return;
+    let active = true;
+    async function refresh() {
+      const result = await githubRunStatus({
+        cache: "no-store",
+        credentials: "same-origin",
+        path: {
+          task_uid: run.taskUid,
+          run_id: githubRun!.runId,
+        },
+        query: { owner: selected!.owner, repository: selected!.name },
+      });
+      if (active && result.data && result.response?.ok) setRunStatus(result.data);
     }
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 5_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [githubRun, run.taskUid, runStatus?.phase, selected]);
+
+  async function publish() {
+    if (session.status !== "authenticated" || !selected?.ready) return;
+    setState("publishing");
+    setFailure(null);
+    const result = await publishTask({
+      body: {
+        owner: selected.owner,
+        repository: selected.name,
+        idempotencyKey: crypto.randomUUID(),
+      },
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "X-Steward-CSRF": session.value.csrf },
+      path: { task_uid: run.taskUid },
+    });
+    if (!result.data || !result.response?.ok) {
+      setFailure("Steward could not open the publication pull request.");
+      setState("error");
+      return;
+    }
+    setPublication(result.data);
+    setState("idle");
+  }
+
+  async function dispatch() {
+    if (session.status !== "authenticated" || !selected || !selectedWorkflow?.compatible) return;
+    setState("dispatching");
+    setFailure(null);
+    const result = await dispatchTask({
+      body: {
+        owner: selected.owner,
+        repository: selected.name,
+        inputs: {},
+        idempotencyKey: crypto.randomUUID(),
+      },
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "X-Steward-CSRF": session.value.csrf },
+      path: { task_uid: run.taskUid },
+    });
+    if (!result.data || !result.response?.ok) {
+      setFailure("Steward could not dispatch the exact published workflow.");
+      setState("error");
+      return;
+    }
+    setGithubRun(result.data);
+    setRunStatus(null);
+    setState("idle");
   }
 
   return (
-    <section className="mt-5 rounded-card border p-4" aria-labelledby="save-task-title">
-      <h3 className="text-sm font-semibold" id="save-task-title">Save this task to a repository</h3>
-      <p className="mt-2 text-sm text-muted-ink">Copy the exact package that succeeded plus its GitHub Actions caller workflow. Steward never rebuilds the package from the form.</p>
-      <label className="mt-4 grid gap-2 text-sm font-semibold">Target repository<input className="min-h-11 w-full rounded-control border bg-panel px-3 font-mono font-normal" onChange={(event) => setRepository(event.target.value)} value={repository} /></label>
-      <button className="mt-4 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={state === "working" || !repository.trim()} onClick={() => void copyBundle()} type="button">{state === "working" ? "Rendering…" : state === "copied" ? "Bundle copied" : "Copy repository bundle"}</button>
+    <section className="mt-5 rounded-card border p-4" aria-labelledby="publish-task-title">
+      <h3 className="text-sm font-semibold" id="publish-task-title">Publish this task to GitHub</h3>
+      <p className="mt-2 text-sm text-muted-ink">Steward publishes the exact tested package and its pinned caller workflow on a new branch, then opens a pull request. It never writes to the default branch.</p>
+      <ResourceBoundary state={repositories}>{({ repositories: available }) => available.length ? <>
+        <label className="mt-4 grid gap-2 text-sm font-semibold">Repository<select className="min-h-11 w-full rounded-control border bg-panel px-3 font-mono font-normal" onChange={(event) => { setSelectedRepository(event.target.value); setPublication(null); setGithubRun(null); setRunStatus(null); setState("checking"); setFailure(null); }} value={effectiveRepository}>{available.map((repository) => <option key={repository.repositoryId} value={`${repository.owner}/${repository.name}`}>{repository.owner}/{repository.name}{repository.ready ? " · Ready" : " · Not ready"}</option>)}</select></label>
+        {selected && !selected.ready ? <p className="mt-3 text-sm text-warn" role="status">This repository is visible through GitHub but is not admitted as a governed source. Ask an administrator to add its stable owner and repository IDs.</p> : null}
+        {selected?.ready ? <p className="mt-3 text-sm text-muted-ink" role="status">{workflowRepository !== effectiveRepository || state === "checking" ? "Checking the default branch…" : selectedWorkflow?.compatible ? "The exact generated workflow is present on the default branch." : publication ? "Pull request opened. Merge it to enable Run on GitHub; Steward will detect the merge automatically." : "No matching generated workflow is present yet."}</p> : null}
+        <div className="mt-4 flex flex-wrap gap-2">
+          <button className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!selected?.ready || state === "publishing" || state === "checking"} onClick={() => void publish()} type="button">{state === "publishing" ? "Publishing…" : publication ? "Reopen publication" : "Publish as pull request"}</button>
+          <button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!selectedWorkflow?.compatible || state === "dispatching"} onClick={() => void dispatch()} type="button">{state === "dispatching" ? "Starting…" : "Run on GitHub"}</button>
+        </div>
+      </> : <p className="mt-4 text-sm text-muted-ink">No GitHub repositories are visible to this connection.</p>}</ResourceBoundary>
+      {publication ? <div className="mt-4 rounded-control border bg-subtle p-3 text-sm"><p>Branch: <code>{publication.branch}</code></p><p className="mt-1">Package digest: <code className="break-all">{publication.packageDigest}</code></p><a className="mt-2 inline-block font-semibold text-brand" href={`${publication.pullRequestUrl}/files`} rel="noreferrer" target="_blank">Review the two-file pull request diff</a></div> : null}
+      {githubRun ? <div className="mt-4 rounded-control border bg-subtle p-3 text-sm" aria-live="polite"><div className="flex flex-wrap items-center gap-3"><a className="font-semibold text-brand" href={githubRun.url} rel="noreferrer" target="_blank">GitHub run {githubRun.runId}</a><StatusBadge value={runStatus?.conclusion ?? runStatus?.phase ?? "queued"} /></div>{runStatus?.jobs.length ? <ul className="mt-3 space-y-2">{runStatus.jobs.map((job) => <li className="flex flex-wrap items-center justify-between gap-2" key={job.id}><a href={job.url} rel="noreferrer" target="_blank">{job.name}</a><span>{job.conclusion ?? job.status}</span></li>)}</ul> : null}{runStatus?.failureLog ? <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap rounded-control border bg-panel p-3 text-xs">{runStatus.failureLog}</pre> : null}{runStatus?.linkedTaskUid ? <Link className="mt-3 inline-block font-semibold text-brand" href={`/runs/${runStatus.linkedTaskUid}`}>Open governed Task · {runStatus.linkedTaskPhase}</Link> : null}</div> : null}
       {failure ? <p className="mt-3 text-sm text-err" role="alert">{failure}</p> : null}
     </section>
   );
@@ -495,7 +598,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                   {selectedStage?.steps.length ? <ol className="mt-5 divide-y divide-line-soft rounded-card border">{selectedStage.steps.map((step) => <RunStepRow admin={admin} key={step.id} onStreamChange={(stream) => selectLocation(selectedStage.id, stream)} selectedStream={selectedStage.id === "agent_execution" ? selectedStream : null} step={step} taskUid={taskUid} />)}</ol> : selectedStage ? <p className="mt-5 rounded-card border p-4 text-sm text-muted-ink">{stageSummary(selectedStage)}</p> : null}
                   {!admin && run.phase === "succeeded" && run.finalized ? <RunOutputs taskUid={taskUid} /> : null}
                   {!admin && run.phase === "succeeded" && run.finalized && run.origin === "browser" && run.package?.source === "inline" ? <InlinePackageViewer taskUid={taskUid} /> : null}
-                  {!admin && run.phase === "succeeded" && run.finalized && run.origin === "browser" && run.package?.source === "inline" ? <SaveInlineRunToRepository run={run} /> : null}
+                  {!admin && run.phase === "succeeded" && run.finalized && run.origin === "browser" && run.package?.source === "inline" ? <GithubAutomationPanel run={run} /> : null}
                 </section>
               </main>
             </div>
