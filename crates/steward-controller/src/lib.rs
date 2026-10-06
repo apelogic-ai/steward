@@ -43,6 +43,10 @@ use steward_store::{
 };
 #[cfg(test)]
 use steward_types::RuntimeOwnership;
+use steward_types::task_output_archive::{
+    InvalidTaskOutputArchive, TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputArchiveCompatibility,
+    task_output_archive_entries,
+};
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, DisposableExecutionBinding, Duration,
     PENDING_APPROVAL_ANNOTATION, Phase, RuntimeId, RuntimeRefs, TASK_EXECUTION_BINDING_ANNOTATION,
@@ -1007,7 +1011,14 @@ async fn reconcile_quarantined_execution<R: SandboxTaskRuntime>(
             | SandboxTaskObservation::Failed { .. }
             | SandboxTaskObservation::FailedWithTranscript { .. }
     ) {
-        persist_execution_observation(authority, &attempt, attempt.generation, observation).await?;
+        persist_execution_observation(
+            authority,
+            &attempt,
+            attempt.generation,
+            request.execution_class,
+            observation,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1246,7 +1257,14 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
         .unwrap_or_else(|error| SandboxTaskObservation::OutcomeUnknown {
             reason: task_failure_reason(&error),
         });
-    persist_execution_observation(authority, &attempt, attempt.generation, observation).await
+    persist_execution_observation(
+        authority,
+        &attempt,
+        attempt.generation,
+        request.execution_class,
+        observation,
+    )
+    .await
 }
 
 fn connection_operation_failure_log_line(
@@ -1440,8 +1458,14 @@ async fn reconcile_task_cancellation<R: SandboxTaskRuntime>(
         } else {
             return Ok(());
         };
-        return persist_execution_observation(authority, &attempt, attempt.generation, observation)
-            .await;
+        return persist_execution_observation(
+            authority,
+            &attempt,
+            attempt.generation,
+            sandbox_execution_class(&task.runtime_spec),
+            observation,
+        )
+        .await;
     };
     let refs = runtime.status.as_ref().map(|status| status.refs.clone());
     let refs = refs.filter(|refs| {
@@ -1454,6 +1478,7 @@ async fn reconcile_task_cancellation<R: SandboxTaskRuntime>(
         .task_execution_start_observation_expired(attempt.attempt_id)
         .await
         .map_err(TaskControllerError::Store)?;
+    let execution_class = sandbox_execution_class(&task.runtime_spec);
     let observation = if let Some(refs) = refs {
         let request = sandbox_task_request(task, attempt.runtime_uid.clone(), refs);
         match sandbox_runtime
@@ -1488,8 +1513,14 @@ async fn reconcile_task_cancellation<R: SandboxTaskRuntime>(
         | SandboxTaskObservation::Running { .. }
         | SandboxTaskObservation::RunningWithTranscript { .. } => Ok(()),
         observation => {
-            persist_execution_observation(authority, &attempt, attempt.generation, observation)
-                .await
+            persist_execution_observation(
+                authority,
+                &attempt,
+                attempt.generation,
+                execution_class,
+                observation,
+            )
+            .await
         }
     }
 }
@@ -2112,7 +2143,14 @@ async fn observe_execution_attempt<R: SandboxTaskRuntime>(
     else {
         return Ok(());
     };
-    persist_execution_observation(authority, &attempt, attempt.generation, observation).await
+    persist_execution_observation(
+        authority,
+        &attempt,
+        attempt.generation,
+        request.execution_class,
+        observation,
+    )
+    .await
 }
 
 async fn terminalize_expired_attempt_observation(
@@ -2147,6 +2185,7 @@ async fn persist_execution_observation(
     authority: &PgStore,
     attempt: &steward_store::TaskExecutionAttemptRecord,
     generation: i64,
+    execution_class: SandboxExecutionClass,
     observation: SandboxTaskObservation,
 ) -> Result<(), TaskControllerError> {
     let transition = match observation {
@@ -2202,7 +2241,7 @@ async fn persist_execution_observation(
             adapter_observation_id,
             output,
         } => {
-            if let Some(reason) = task_output_archive_failure(output.archive.len()) {
+            if let Some(reason) = task_output_archive_failure(execution_class, &output.archive) {
                 authority
                     .record_task_execution_observation(
                         attempt.attempt_id,
@@ -2228,6 +2267,7 @@ async fn persist_execution_observation(
                             result_digest: &result_digest,
                             result_reference: &result_reference,
                             output_archive: &output.archive,
+                            output_archive_contract: task_output_archive_contract(execution_class),
                             execution_stdout: None,
                             execution_stderr: None,
                         },
@@ -2241,7 +2281,7 @@ async fn persist_execution_observation(
             output,
             transcript,
         } => {
-            if let Some(reason) = task_output_archive_failure(output.archive.len()) {
+            if let Some(reason) = task_output_archive_failure(execution_class, &output.archive) {
                 authority
                     .record_task_execution_observation(
                         attempt.attempt_id,
@@ -2267,6 +2307,7 @@ async fn persist_execution_observation(
                             result_digest: &result_digest,
                             result_reference: &result_reference,
                             output_archive: &output.archive,
+                            output_archive_contract: task_output_archive_contract(execution_class),
                             execution_stdout: Some(&transcript.stdout),
                             execution_stderr: Some(&transcript.stderr),
                         },
@@ -3280,9 +3321,34 @@ fn server_task_runtime_manifest(
     Ok(runtime)
 }
 
-fn task_output_archive_failure(archive_bytes: usize) -> Option<&'static str> {
+fn task_output_archive_failure(
+    execution_class: SandboxExecutionClass,
+    archive: &[u8],
+) -> Option<&'static str> {
+    if let Some(reason) = task_output_archive_size_failure(archive.len()) {
+        return Some(reason);
+    }
+    if execution_class == SandboxExecutionClass::Agent {
+        return match task_output_archive_entries(archive, TaskOutputArchiveCompatibility::Strict) {
+            Ok(_) => None,
+            Err(InvalidTaskOutputArchive::UnsupportedLink) => {
+                Some("Task output archive contains unsupported link entries")
+            }
+            Err(InvalidTaskOutputArchive::Malformed) => {
+                Some("Task output archive violates the out/-only contract")
+            }
+        };
+    }
+    None
+}
+
+fn task_output_archive_size_failure(archive_bytes: usize) -> Option<&'static str> {
     (archive_bytes > MAX_TASK_OUTPUT_ARCHIVE_BYTES)
         .then_some("Task output archive exceeds the 64 MiB limit")
+}
+
+fn task_output_archive_contract(execution_class: SandboxExecutionClass) -> Option<&'static str> {
+    (execution_class == SandboxExecutionClass::Agent).then_some(TASK_OUTPUT_ARCHIVE_CONTRACT)
 }
 
 fn task_failure_reason(error: &PortError) -> String {
@@ -5316,8 +5382,9 @@ mod tests {
         runtime_authority_action, runtime_start_failed, runtime_ttl_action,
         runtime_with_spend_top_up, sandbox_execution_class, sandbox_task_diagnostics,
         server_task_runtime_manifest, status_merge_patch, suspend_runtime,
-        suspend_runtime_with_inference_cleanup, task_output_archive_failure, task_runtime,
-        task_runtime_action, task_runtime_observation_is_failed, ttl_action,
+        suspend_runtime_with_inference_cleanup, task_output_archive_failure,
+        task_output_archive_size_failure, task_runtime, task_runtime_action,
+        task_runtime_observation_is_failed, ttl_action,
     };
 
     #[test]
@@ -6315,14 +6382,52 @@ mod tests {
     #[test]
     fn oversized_task_output_is_rejected_before_persistence() {
         assert_eq!(
-            task_output_archive_failure(MAX_TASK_OUTPUT_ARCHIVE_BYTES),
+            task_output_archive_size_failure(MAX_TASK_OUTPUT_ARCHIVE_BYTES),
             None,
             "the documented 64 MiB boundary must remain usable"
         );
         assert_eq!(
-            task_output_archive_failure(MAX_TASK_OUTPUT_ARCHIVE_BYTES + 1),
+            task_output_archive_size_failure(MAX_TASK_OUTPUT_ARCHIVE_BYTES + 1),
             Some("Task output archive exceeds the 64 MiB limit"),
             "adapter output over the contract limit must fail before Postgres persistence"
+        );
+    }
+
+    #[test]
+    fn agent_output_requires_the_out_only_archive_contract() {
+        assert_eq!(
+            task_output_archive_failure(SandboxExecutionClass::Agent, b"not a tar archive"),
+            Some("Task output archive violates the out/-only contract")
+        );
+        assert_eq!(
+            task_output_archive_failure(
+                SandboxExecutionClass::ProviderControl,
+                b"opaque provider response",
+            ),
+            None,
+            "provider-control adapters retain their separate output contracts"
+        );
+
+        let mut linked_archive = vec![0_u8; 512 * 3];
+        linked_archive[..8].copy_from_slice(b"out/link");
+        linked_archive[100..108].copy_from_slice(b"0000644\0");
+        linked_archive[108..116].copy_from_slice(b"0000000\0");
+        linked_archive[116..124].copy_from_slice(b"0000000\0");
+        linked_archive[124..136].copy_from_slice(b"00000000000\0");
+        linked_archive[136..148].copy_from_slice(b"00000000000\0");
+        linked_archive[148..156].fill(b' ');
+        linked_archive[156] = b'2';
+        linked_archive[257..263].copy_from_slice(b"ustar\0");
+        linked_archive[263..265].copy_from_slice(b"00");
+        let checksum = linked_archive[..512]
+            .iter()
+            .map(|byte| usize::from(*byte))
+            .sum::<usize>();
+        linked_archive[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        assert_eq!(
+            task_output_archive_failure(SandboxExecutionClass::Agent, &linked_archive),
+            Some("Task output archive contains unsupported link entries"),
+            "links must fail with a distinct operator-visible category"
         );
     }
 

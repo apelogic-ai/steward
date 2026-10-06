@@ -5,7 +5,7 @@
 //! All Runs route requires a browser-admin session; the existing bearer administrator API remains
 //! independent at `/admin/api/v1/runs`.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,12 +18,16 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_store::{
-    AgentRunExecutionLog, AgentRunLogStream, AgentRunPage, AgentRunQuery, AgentRunRecord,
-    AgentRunTimelineEvent, AgentRunTimelineKind, StoreError, TaskRecord,
+    AgentRunExecutionLog, AgentRunLogStream, AgentRunOutputArchive, AgentRunPage, AgentRunQuery,
+    AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind, StoreError, TaskRecord,
 };
 use steward_types::direct_package::{
     AgentRef, ContentDigest, DirectRequirements, DirectTaskDefinition, ExecutionLogMode,
     PromptSourceKind, RuntimeSelection, TaskOrigin,
+};
+use steward_types::task_output_archive::{
+    TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputArchiveCompatibility, TaskOutputArchiveEntry,
+    task_output_archive_entries,
 };
 use steward_types::{CanonicalUserId, RuntimeOwnership, TaskPhase};
 use uuid::Uuid;
@@ -1048,7 +1052,7 @@ where
     headers.insert(header::CONTENT_DISPOSITION, disposition);
     (
         headers,
-        archive[entry.offset..entry.offset + entry.size].to_vec(),
+        archive.content[entry.offset..entry.offset + entry.size].to_vec(),
     )
         .into_response()
 }
@@ -1061,91 +1065,15 @@ fn outputs_pending() -> Response {
         .into_response()
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct OutputArchiveEntry {
-    path: String,
-    offset: usize,
-    size: usize,
-}
-
-fn output_archive_entries(archive: &[u8]) -> Result<Vec<OutputArchiveEntry>, ()> {
-    let mut offset = 0_usize;
-    let mut entries = Vec::new();
-    let mut seen = BTreeSet::new();
-    while offset
-        .checked_add(512)
-        .filter(|end| *end <= archive.len())
-        .is_some()
-    {
-        let header = &archive[offset..offset + 512];
-        if header.iter().all(|byte| *byte == 0) {
-            return Ok(entries);
-        }
-        let path = tar_path(header)?;
-        let size = tar_octal(&header[124..136])?;
-        let data_offset = offset.checked_add(512).ok_or(())?;
-        let data_end = data_offset
-            .checked_add(size)
-            .filter(|end| *end <= archive.len())
-            .ok_or(())?;
-        let kind = header[156];
-        if kind == 0 || kind == b'0' {
-            if !matches!(
-                path.as_str(),
-                ".steward/diagnostics/stdout.log" | ".steward/diagnostics/stderr.log"
-            ) {
-                let relative = path.strip_prefix("out/").ok_or(())?;
-                let relative =
-                    steward_types::direct_package::RelativePath::parse(relative.to_owned())
-                        .map_err(|_| ())?;
-                if !seen.insert(relative.as_str().to_owned()) {
-                    return Err(());
-                }
-                entries.push(OutputArchiveEntry {
-                    path: relative.as_str().to_owned(),
-                    offset: data_offset,
-                    size,
-                });
-            }
-        } else if !matches!(kind, b'5' | b'x' | b'g') {
-            return Err(());
-        }
-        let padded = size.checked_add(511).ok_or(())? / 512 * 512;
-        offset = data_offset
-            .checked_add(padded)
-            .filter(|next| *next >= data_end)
-            .ok_or(())?;
-    }
-    Err(())
-}
-
-fn tar_path(header: &[u8]) -> Result<String, ()> {
-    fn field(bytes: &[u8]) -> Result<&str, ()> {
-        let end = bytes
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(bytes.len());
-        std::str::from_utf8(&bytes[..end]).map_err(|_| ())
-    }
-    let name = field(&header[..100])?;
-    let prefix = field(&header[345..500])?;
-    if name.is_empty() {
-        return Err(());
-    }
-    Ok(if prefix.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{prefix}/{name}")
-    })
-}
-
-fn tar_octal(bytes: &[u8]) -> Result<usize, ()> {
-    let text = std::str::from_utf8(bytes).map_err(|_| ())?;
-    let text = text.trim_matches(['\0', ' ']);
-    if text.is_empty() {
-        return Ok(0);
-    }
-    usize::from_str_radix(text, 8).map_err(|_| ())
+fn output_archive_entries(
+    archive: &AgentRunOutputArchive,
+) -> Result<Vec<TaskOutputArchiveEntry>, ()> {
+    let compatibility = match archive.contract.as_deref() {
+        Some(TASK_OUTPUT_ARCHIVE_CONTRACT) => TaskOutputArchiveCompatibility::Strict,
+        None => TaskOutputArchiveCompatibility::HistoricalMixedDiagnostics,
+        Some(_) => return Err(()),
+    };
+    task_output_archive_entries(&archive.content, compatibility).map_err(|_| ())
 }
 
 fn encode_output_path(path: &str) -> String {
@@ -2443,7 +2371,7 @@ mod tests {
         records: Arc<Mutex<Vec<AgentRunRecord>>>,
         queries: Arc<Mutex<Vec<AgentRunQuery>>>,
         logs: FakeExecutionLogs,
-        outputs: Arc<Mutex<HashMap<Uuid, Vec<u8>>>>,
+        outputs: Arc<Mutex<HashMap<Uuid, AgentRunOutputArchive>>>,
         rerun_sources: Arc<Mutex<HashMap<Uuid, TaskRecord>>>,
         github_matches: Arc<Mutex<VecDeque<Option<TaskRecord>>>>,
         github_queries: Arc<Mutex<Vec<GithubRerunQuery>>>,
@@ -2739,7 +2667,7 @@ mod tests {
             &'a self,
             task_uid: Uuid,
             owner_user_id: &'a str,
-        ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
+        ) -> BoxFuture<'a, Result<Option<AgentRunOutputArchive>, StoreError>> {
             Box::pin(async move {
                 let visible = self
                     .records
@@ -3636,8 +3564,20 @@ mod tests {
             pending_run,
         ]);
         ledger.outputs.lock().map_err(|_| "lock outputs")?.extend([
-            (own_task, output_tar("out/report.txt", b"complete\n")),
-            (other_task, output_tar("out/secret.txt", b"hidden\n")),
+            (
+                own_task,
+                AgentRunOutputArchive {
+                    content: output_tar("out/report.txt", b"complete\n"),
+                    contract: Some(TASK_OUTPUT_ARCHIVE_CONTRACT.to_owned()),
+                },
+            ),
+            (
+                other_task,
+                AgentRunOutputArchive {
+                    content: output_tar("out/secret.txt", b"hidden\n"),
+                    contract: Some(TASK_OUTPUT_ARCHIVE_CONTRACT.to_owned()),
+                },
+            ),
         ]);
 
         let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
@@ -4289,40 +4229,69 @@ mod tests {
 
     #[test]
     fn output_archive_exposes_only_bounded_files_below_out() {
-        let archive = output_tar("out/result.txt", b"hello\n");
+        let archive = AgentRunOutputArchive {
+            content: output_tar("out/result.txt", b"hello\n"),
+            contract: Some(TASK_OUTPUT_ARCHIVE_CONTRACT.to_owned()),
+        };
         assert_eq!(
             output_archive_entries(&archive),
-            Ok(vec![OutputArchiveEntry {
+            Ok(vec![TaskOutputArchiveEntry {
                 path: "result.txt".to_owned(),
                 offset: 512,
                 size: 6,
             }])
         );
-        assert!(output_archive_entries(&output_tar("secret.txt", b"no")).is_err());
-        assert!(output_archive_entries(&output_tar("out/../secret.txt", b"no")).is_err());
+        for content in [
+            output_tar("secret.txt", b"no"),
+            output_tar("out/../secret.txt", b"no"),
+        ] {
+            assert!(
+                output_archive_entries(&AgentRunOutputArchive {
+                    content,
+                    contract: Some(TASK_OUTPUT_ARCHIVE_CONTRACT.to_owned()),
+                })
+                .is_err()
+            );
+        }
     }
 
     #[test]
-    fn output_archive_skips_only_reserved_execution_logs() {
-        let archive = output_tar_entries(&[
+    fn output_archive_rejects_new_mixed_archives_but_reads_historical_rows() {
+        let content = output_tar_entries(&[
             ("out/tool-calls.json", b"[]\n"),
             ("out/report.md", b"complete\n"),
             (".steward/diagnostics/stdout.log", b"agent output\n"),
             (".steward/diagnostics/stderr.log", b"agent warning\n"),
         ]);
-        let entries = output_archive_entries(&archive).unwrap_or_default();
+        assert!(
+            output_archive_entries(&AgentRunOutputArchive {
+                content: content.clone(),
+                contract: Some(TASK_OUTPUT_ARCHIVE_CONTRACT.to_owned()),
+            })
+            .is_err()
+        );
+        let entries = output_archive_entries(&AgentRunOutputArchive {
+            content,
+            contract: None,
+        })
+        .unwrap_or_default();
         assert_eq!(
             entries
                 .iter()
                 .map(|entry| entry.path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["tool-calls.json", "report.md"]
+            ["tool-calls.json", "report.md"]
         );
 
-        let unexpected = output_tar_entries(&[
-            ("out/report.md", b"complete\n"),
-            (".steward/diagnostics/trace.log", b"not reserved\n"),
-        ]);
-        assert!(output_archive_entries(&unexpected).is_err());
+        assert!(
+            output_archive_entries(&AgentRunOutputArchive {
+                content: output_tar_entries(&[
+                    ("out/report.md", b"complete\n"),
+                    (".steward/diagnostics/trace.log", b"not reserved\n"),
+                ]),
+                contract: None,
+            })
+            .is_err()
+        );
     }
 }

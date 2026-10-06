@@ -471,13 +471,16 @@ fn validate_disposable_execution_binding(
 
 #[cfg(feature = "runtime")]
 fn output_archive_command(
+    execution_class: SandboxExecutionClass,
     agent_type: &AgentType,
     execution_binding: Option<&steward_types::DisposableExecutionBinding>,
 ) -> &'static str {
     if agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE {
         "set -eu; test -f /sandbox/steward-output/response.json; tar -cf - -C /sandbox/steward-output response.json"
-    } else if execution_binding.is_some() {
+    } else if execution_class == SandboxExecutionClass::Agent && execution_binding.is_some() {
         "set -eu; test -s /sandbox/steward-output/result.txt; test -d /sandbox/steward-output/out; tar -cf - -C /sandbox/steward-output out"
+    } else if execution_class == SandboxExecutionClass::Agent {
+        "set -eu; test -d /sandbox/steward-output/out; tar -cf - -C /sandbox/steward-output out"
     } else {
         "set -eu; tar -cf - -C /sandbox/steward-output ."
     }
@@ -941,14 +944,6 @@ fn sanitized_provider_control_transcript(
         stdout: Vec::new(),
         stderr: format!("{line}\n").into_bytes(),
     })
-}
-
-#[cfg(feature = "runtime")]
-fn task_transcript_archived(
-    execution_class: SandboxExecutionClass,
-    execution_log: ExecutionLogMode,
-) -> bool {
-    execution_class == SandboxExecutionClass::Agent && execution_log == ExecutionLogMode::Full
 }
 
 #[cfg(feature = "runtime")]
@@ -2413,14 +2408,16 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                     })?;
             environment.insert("STEWARD_MCP_GW_VERSION".to_owned(), version.to_owned());
         }
-        let output_archive_command =
-            output_archive_command(&request.agent_type, request.execution_binding.as_ref());
+        let output_archive_command = output_archive_command(
+            request.execution_class,
+            &request.agent_type,
+            request.execution_binding.as_ref(),
+        );
         let wrapped_command = task_attempt_execution_command(
             &attempt_directory,
             &request.command,
             output_archive_command,
             task_transcript_requested(request.execution_class, request.diagnostics.execution_log),
-            task_transcript_archived(request.execution_class, request.diagnostics.execution_log),
         );
         let executed = self
             .exec_task_process(
@@ -2674,7 +2671,6 @@ fn task_attempt_execution_command(
     command: &[String],
     output_archive_command: &str,
     capture_transcript: bool,
-    archive_transcript: bool,
 ) -> String {
     let diagnostics_directory = format!("{directory}/.steward/diagnostics");
     let stdout_path = format!("{directory}/{EXECUTION_STDOUT_ARCHIVE_PATH}");
@@ -2706,16 +2702,6 @@ fn task_attempt_execution_command(
     } else {
         format!("{command}; status=$?")
     };
-    let archive_transcript = if archive_transcript {
-        format!(
-            "tar -rf {directory}/output.tar -C {directory} \
-               {EXECUTION_STDOUT_ARCHIVE_PATH} {EXECUTION_STDERR_ARCHIVE_PATH}; status=$?; \
-             if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
-               printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi;"
-        )
-    } else {
-        String::new()
-    };
     format!(
         "set +e; pid=$$; pid_start=$(awk '{{print $22}}' /proc/$$/stat) || exit 70; \
          printf '%s' \"$pid\" > {directory}/pid; \
@@ -2735,7 +2721,6 @@ fn task_attempt_execution_command(
          ({output_archive_command}) > {directory}/output.tar; status=$?; \
          if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
            printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
-         {archive_transcript} \
          printf succeeded > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state"
     )
 }
@@ -2817,6 +2802,8 @@ mod tests {
     #[cfg(feature = "runtime")]
     use std::collections::{HashMap, VecDeque};
     #[cfg(feature = "runtime")]
+    use std::fs;
+    #[cfg(feature = "runtime")]
     use std::future::Future;
     #[cfg(feature = "runtime")]
     use std::io::{Read, Write};
@@ -2824,6 +2811,8 @@ mod tests {
     use std::net::TcpListener;
     #[cfg(feature = "runtime")]
     use std::path::PathBuf;
+    #[cfg(feature = "runtime")]
+    use std::process::Command;
     #[cfg(feature = "runtime")]
     use std::sync::Arc;
     #[cfg(feature = "runtime")]
@@ -2882,8 +2871,8 @@ mod tests {
         staging_archive_chunks, staging_extract_command, staging_prepare_command,
         task_agent_failure_category, task_attempt_directory, task_attempt_execution_command,
         task_attempt_observation_command, task_attempt_transcript_stream_command,
-        task_process_log_record, task_transcript_archived, task_transcript_requested,
-        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
+        task_process_log_record, task_transcript_requested, validate_raw_sandbox_binding,
+        validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -3543,13 +3532,8 @@ mod tests {
     #[test]
     fn task_attempt_marker_uses_a_cross_exec_liveness_lease() {
         let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
-        let execution = task_attempt_execution_command(
-            directory,
-            &["/bin/true".to_owned()],
-            "true",
-            false,
-            false,
-        );
+        let execution =
+            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true", false);
         assert!(execution.contains("pid=$$"));
         assert!(execution.contains("/proc/$$/stat"));
         assert!(execution.contains("heartbeat"));
@@ -3564,15 +3548,10 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn successful_task_execution_archives_bounded_stdout_and_stderr() {
+    fn successful_task_execution_keeps_transcripts_out_of_the_output_archive() {
         let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
-        let execution = task_attempt_execution_command(
-            directory,
-            &["/bin/true".to_owned()],
-            "true",
-            true,
-            true,
-        );
+        let execution =
+            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true", true);
 
         assert!(execution.contains(steward_types::direct_package::EXECUTION_STDOUT_ARCHIVE_PATH));
         assert!(execution.contains(steward_types::direct_package::EXECUTION_STDERR_ARCHIVE_PATH));
@@ -3586,14 +3565,8 @@ mod tests {
             )
         );
         assert!(
-            matches!(
-                (
-                    execution.find("tar -rf"),
-                    execution.find("printf succeeded")
-                ),
-                (Some(append), Some(succeeded)) if append < succeeded
-            ),
-            "diagnostics must be appended durably before the successful marker"
+            !execution.contains("tar -rf"),
+            "diagnostics must remain separate from the declared output archive"
         );
         assert!(
             std::process::Command::new("/bin/sh")
@@ -3603,13 +3576,8 @@ mod tests {
             "the bounded transcript wrapper must be valid POSIX shell"
         );
 
-        let disabled = task_attempt_execution_command(
-            directory,
-            &["/bin/true".to_owned()],
-            "true",
-            false,
-            false,
-        );
+        let disabled =
+            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true", false);
         assert!(!disabled.contains(steward_types::direct_package::EXECUTION_STDOUT_ARCHIVE_PATH));
         assert!(!disabled.contains(steward_types::direct_package::EXECUTION_STDERR_ARCHIVE_PATH));
     }
@@ -3623,10 +3591,6 @@ mod tests {
             &["/bin/true".to_owned()],
             "tar -cf - response.json",
             task_transcript_requested(
-                SandboxExecutionClass::ProviderControl,
-                ExecutionLogMode::Off,
-            ),
-            task_transcript_archived(
                 SandboxExecutionClass::ProviderControl,
                 ExecutionLogMode::Off,
             ),
@@ -4436,6 +4400,7 @@ mod tests {
             provider_profiles: ExecutionProviderProfiles::default(),
         };
         let command = output_archive_command(
+            SandboxExecutionClass::Agent,
             &AgentType {
                 name: binding.agent_ref.clone(),
             },
@@ -4453,6 +4418,81 @@ mod tests {
             command.ends_with(" out"),
             "the runtime must return the declared output root, not its internal result artifact"
         );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn unbound_agent_archives_only_the_declared_output_root() {
+        let command = output_archive_command(
+            SandboxExecutionClass::Agent,
+            &AgentType {
+                name: "base".to_owned(),
+            },
+            None,
+        );
+        assert!(command.contains("test -d /sandbox/steward-output/out"));
+        assert!(command.ends_with(" out"));
+
+        let provider_control = output_archive_command(
+            SandboxExecutionClass::ProviderControl,
+            &AgentType {
+                name: "example-control@1".to_owned(),
+            },
+            None,
+        );
+        assert!(provider_control.ends_with(" ."));
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn runtime_tar_preserves_a_long_declared_output_path() -> Result<(), String> {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "steward-output-archive-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _cleanup = Cleanup(root.clone());
+        let relative = format!("reports/{}.md", "a".repeat(120));
+        let output = root.join("out").join(&relative);
+        fs::create_dir_all(
+            output
+                .parent()
+                .ok_or_else(|| "long output fixture has no parent".to_owned())?,
+        )
+        .map_err(|error| format!("create long output fixture: {error}"))?;
+        fs::write(&output, b"complete\n")
+            .map_err(|error| format!("write long output fixture: {error}"))?;
+
+        let archive = Command::new("tar")
+            .env("COPYFILE_DISABLE", "1")
+            .args(["-cf", "-", "-C"])
+            .arg(&root)
+            .arg("out")
+            .output()
+            .map_err(|error| format!("run host tar: {error}"))?;
+        if !archive.status.success() {
+            return Err(format!(
+                "host tar rejected long output fixture: {}",
+                String::from_utf8_lossy(&archive.stderr).trim()
+            ));
+        }
+        let entries = steward_types::task_output_archive::task_output_archive_entries(
+            &archive.stdout,
+            steward_types::task_output_archive::TaskOutputArchiveCompatibility::Strict,
+        )
+        .map_err(|error| format!("runtime tar archive was rejected: {error:?}"))?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, relative);
+        Ok(())
     }
 
     #[cfg(feature = "runtime")]

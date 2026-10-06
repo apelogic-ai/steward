@@ -14,6 +14,7 @@ use steward_types::direct_package::{
     BrowserTaskEvidence, DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES,
     SOURCE_PROVENANCE_CONTRACT_VERSION, SourceProvenance, TaskOrigin,
 };
+use steward_types::task_output_archive::TASK_OUTPUT_ARCHIVE_CONTRACT;
 use steward_types::{
     AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
     OrganizationIdentity, OrganizationIdentityMigration, TaskExecutionBinding,
@@ -593,6 +594,20 @@ mod migration_tests {
                         .contains("github repository automation operations")
             }),
             "migration 64 must preserve v1-v3 connection rows while admitting only v4 repository automation"
+        );
+    }
+
+    #[test]
+    fn task_output_archive_contract_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 66
+                    && migration
+                        .description
+                        .contains("task output archive contract")
+            }),
+            "migration 66 must preserve historical mixed archives while marking new out/-only archives"
         );
     }
 }
@@ -3767,10 +3782,11 @@ impl PgStore {
         &self,
         task_uid: Uuid,
         owner_user_id: &str,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
-        sqlx::query_scalar(
-            "SELECT output_archive FROM task_submissions \
+    ) -> Result<Option<AgentRunOutputArchive>, StoreError> {
+        sqlx::query(
+            "SELECT output_archive, output_archive_contract FROM task_submissions \
              WHERE task_uid = $1 AND owner_user_id = $2 AND phase = 'succeeded' \
+               AND output_archive IS NOT NULL \
                AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
                    WHERE operations.task_uid = task_submissions.task_uid)",
         )
@@ -3778,8 +3794,18 @@ impl PgStore {
         .bind(owner_user_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(database_error)
-        .map(Option::flatten)
+        .map_err(database_error)?
+        .map(|row| {
+            Ok(AgentRunOutputArchive {
+                content: row
+                    .try_get::<Vec<u8>, _>("output_archive")
+                    .map_err(database_error)?,
+                contract: row
+                    .try_get("output_archive_contract")
+                    .map_err(database_error)?,
+            })
+        })
+        .transpose()
     }
 
     /// Request cancellation for one browser-owned run without accepting a caller-selected
@@ -8252,6 +8278,7 @@ impl PgStore {
                 result_digest,
                 result_reference,
                 output_archive,
+                output_archive_contract,
                 execution_stdout,
                 execution_stderr,
             } => {
@@ -8286,13 +8313,14 @@ impl PgStore {
                 .map_err(database_error)?;
                 let task_completed = sqlx::query(
                     "UPDATE task_submissions \
-                     SET phase = 'succeeded', output_archive = $2, \
+                     SET phase = 'succeeded', output_archive = $2, output_archive_contract = $3, \
                          finalize_requested = true, updated_at = now() \
                      WHERE task_uid = $1 AND phase IN ('queued', 'running') \
                        AND NOT finalize_requested AND NOT cancel_requested",
                 )
                 .bind(current.task_uid)
                 .bind(output_archive)
+                .bind(output_archive_contract)
                 .execute(&mut *transaction)
                 .await
                 .map_err(database_error)?
@@ -9935,6 +9963,12 @@ pub struct AgentRunExecutionLog {
     pub complete: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRunOutputArchive {
+    pub content: Vec<u8>,
+    pub contract: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentRunPage {
     pub records: Vec<AgentRunRecord>,
@@ -11060,6 +11094,7 @@ pub enum TaskExecutionObservation<'a> {
         result_digest: &'a str,
         result_reference: &'a str,
         output_archive: &'a [u8],
+        output_archive_contract: Option<&'a str>,
         execution_stdout: Option<&'a [u8]>,
         execution_stderr: Option<&'a [u8]>,
     },
@@ -11092,6 +11127,7 @@ impl TaskExecutionObservation<'_> {
                 adapter_observation_id,
                 result_digest,
                 result_reference,
+                output_archive_contract,
                 execution_stdout,
                 execution_stderr,
                 ..
@@ -11099,6 +11135,8 @@ impl TaskExecutionObservation<'_> {
                 !adapter_observation_id.is_empty()
                     && valid_sha256_reference(result_digest)
                     && !result_reference.is_empty()
+                    && output_archive_contract
+                        .is_none_or(|contract| contract == TASK_OUTPUT_ARCHIVE_CONTRACT)
                     && execution_logs_are_valid(execution_stdout, execution_stderr)
             }
             Self::Failed {
