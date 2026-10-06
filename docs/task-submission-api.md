@@ -93,9 +93,11 @@ the configured Identity JWKS directly. The unauthenticated
 Steward resource origin, the trusted Identity issuer in
 `authorization_servers`, bearer-header transport, and the accepted contracts
 in `steward_task_token_contracts`. Successful metadata is cacheable for 300
-seconds. The additive boolean `steward_direct_packages_supported` reports
-whether this deployment has exact Git source retrieval configured, allowing a
-client to reject a direct-package request before obtaining a Task token. An
+seconds. The additive booleans `steward_direct_packages_supported` and
+`steward_package_path_supported` report whether this deployment has exact Git
+source retrieval configured. The latter specifically permits same-repository
+two-file `packagePath` submissions, allowing steward-run 0.8.0 or later to
+reject an unsupported request before obtaining a Task token. An
 unconfigured document returns `503`, `Cache-Control: no-store`,
 `Retry-After: 30`, and `task_auth.discovery_unavailable`.
 
