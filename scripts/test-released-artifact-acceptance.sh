@@ -21,11 +21,12 @@ for required in \
   "docker pull \"\${image_repository}@\${digest}\"" \
   "helm pull \"\${chart_repository}@\${chart_digest}\"" \
   'kind create cluster' \
+  '--set-string spire.className=spire-spire' \
   "upgrade --install steward \"\${chart_archive}\"" \
   '_sqlx_migrations' \
   'complete-rendered.yaml'
 do
-  grep -Fq "${required}" "${harness}" || {
+  grep -Fq -- "${required}" "${harness}" || {
     echo "released-artifact acceptance omitted ${required}" >&2
     exit 1
   }

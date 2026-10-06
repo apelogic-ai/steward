@@ -7,6 +7,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-10-05
+
+### Added
+
+- This complete replacement includes every Added, Fixed, and Security item,
+  plus every upgrade note, recorded under the incomplete v0.3.7 and v0.3.6
+  entries below.
+
+### Fixed
+
+- Supplied the required SPIRE controller class to the released-artifact core
+  installation harness and added a pre-tag contract regression for that exact
+  value. The v0.3.7 chart and images were published, but its mandatory clean-
+  cluster acceptance failed before the GitHub release handoff was created;
+  those incomplete artifacts must not be used.
+
 ## [0.3.7] - 2026-10-05
 
 ### Added
@@ -34,7 +50,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Updated the Steward web application from Next.js 16.3.3 to 16.3.6 to
   remediate `GHSA-vcvr-r3jv-pc5j`, a critical remote-code-execution advisory
   affecting `next/og` `ImageResponse`. The v0.3.6 publication is incomplete and
-  its artifacts must not be used; v0.3.7 is its complete replacement.
+  its artifacts must not be used. The v0.3.7 publication later failed mandatory
+  released-artifact acceptance and is also incomplete; v0.3.8 is the complete
+  replacement.
 
 ## [0.3.6] - 2026-10-04
 
@@ -544,7 +562,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.8...HEAD
+[0.3.8]: https://github.com/apelogic-ai/steward/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/apelogic-ai/steward/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/apelogic-ai/steward/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/apelogic-ai/steward/compare/v0.3.4...v0.3.5
