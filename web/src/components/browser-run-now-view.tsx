@@ -6,9 +6,11 @@ import { useCallback, useState, type FormEvent } from "react";
 import {
   listRequests,
   listTemplates,
+  myTask,
   submitBrowserRun,
   type BrowserPackageLocator,
   type BrowserEnvelope,
+  type BrowserTaskView,
   type ExecutionBindingAdvertisement,
   type EnvelopeRequestsResponse,
   type EnvelopeTemplatesResponse,
@@ -22,6 +24,7 @@ type RunNowData = {
   envelopes: EnvelopeRequestsResponse;
   templates: EnvelopeTemplatesResponse;
   workflows: PublishedWorkflowListResponse;
+  task: BrowserTaskView | null;
 };
 
 type SourceKind = "inline" | "repository" | "registry";
@@ -138,25 +141,31 @@ export function inlineFiles(
 export function BrowserRunNowView() {
   const router = useRouter();
   const search = useSearchParams();
+  const taskDigest = search.get("task");
   const session = useSession();
   const load = useCallback(async () => {
-    const [envelopes, templates, workflows] = await Promise.all([
+    const [envelopes, templates, workflows, task] = await Promise.all([
       listRequests({ cache: "no-store", credentials: "same-origin" }),
       listTemplates({ cache: "no-store", credentials: "same-origin" }),
       listPublishedWorkflows(),
+      taskDigest ? myTask({ cache: "no-store", credentials: "same-origin", path: { content_digest: taskDigest } }) : Promise.resolve(null),
     ]);
     const response = !envelopes.response?.ok
       ? envelopes.response
       : !templates.response?.ok
         ? templates.response
-        : workflows.response;
+        : !workflows.response?.ok
+          ? workflows.response
+          : task && !task.response?.ok
+            ? task.response
+            : workflows.response;
     return {
-      data: envelopes.data && templates.data && workflows.data
-        ? { envelopes: envelopes.data, templates: templates.data, workflows: workflows.data }
+      data: envelopes.data && templates.data && workflows.data && (!taskDigest || task?.data)
+        ? { envelopes: envelopes.data, templates: templates.data, workflows: workflows.data, task: task?.data?.task ?? null }
         : undefined,
       response,
     };
-  }, []);
+  }, [taskDigest]);
   const state = useApiResource<RunNowData>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
@@ -173,7 +182,8 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
   session: ReturnType<typeof useSession>;
 }>) {
   const active = data.envelopes.requests.filter((request) => request.status === "provisioned" && request.envelopeDigest);
-  const initialKind: SourceKind = initialWorkflow ? "registry" : "inline";
+  const exactTask = data.task;
+  const initialKind: SourceKind = exactTask ? "inline" : initialWorkflow ? "registry" : "inline";
   const [sourceKind, setSourceKind] = useState<SourceKind>(initialKind);
   const [envelopeId, setEnvelopeId] = useState(active[0]?.id ?? "");
   const [agentRef, setAgentRef] = useState(data.workflows.agents[0]?.agentRef ?? "");
@@ -214,7 +224,14 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
       return;
     }
     let packageLocator: BrowserPackageLocator;
-    if (sourceKind === "inline") {
+    if (exactTask) {
+      packageLocator = {
+        source: "inline",
+        revision: exactTask.contentDigest,
+        path: exactTask.path,
+        files: exactTask.files,
+      };
+    } else if (sourceKind === "inline") {
       if (!inlineAllowed) {
         setFailure("Inline packages are disabled by the selected Envelope template.");
         setStatus("error");
@@ -260,14 +277,15 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
   return <form className="space-y-6 rounded-card border bg-panel p-6" onSubmit={(event) => void submit(event)}>
     <div className="grid gap-4 md:grid-cols-2">
       <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} onChange={(event) => setEnvelopeId(event.target.value)} value={envelopeId}>{active.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
-      <label className="grid gap-2 text-sm font-semibold">Package source<select className={fieldClass} onChange={(event) => setSourceKind(event.target.value as SourceKind)} value={sourceKind}><option disabled={!inlineAllowed} value="inline">Inline package{inlineAllowed ? "" : " (disabled by template)"}</option><option value="repository">Git repository</option><option value="registry">Published workflow</option></select></label>
+      {exactTask ? <div className="grid gap-2 text-sm font-semibold">Task<div className={`${fieldClass} flex items-center font-mono text-xs`}>{exactTask.name}@{exactTask.version} · {exactTask.contentDigest}</div></div> : <label className="grid gap-2 text-sm font-semibold">Package source<select className={fieldClass} onChange={(event) => setSourceKind(event.target.value as SourceKind)} value={sourceKind}><option disabled={!inlineAllowed} value="inline">Inline package{inlineAllowed ? "" : " (disabled by template)"}</option><option value="repository">Git repository</option><option value="registry">Published workflow</option></select></label>}
     </div>
-    {sourceKind === "inline" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Coding agent<select className={`${fieldClass} font-mono`} onChange={(event) => setAgentRef(event.target.value)} value={effectiveAgentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.agentRef}{agent.compatible ? ` · ${agent.model?.provider}/${agent.model?.model}` : ` · ${agent.reason}`}</option>)}</select></label>{agentWarning ? <p className="text-sm text-warn" role="status">{agentWarning}</p> : null}<label className="grid gap-2 text-sm font-semibold">Prompt<span className="text-xs font-normal text-muted-ink">Write results under <code>$STEWARD_OUTPUT_DIR/out/</code>. Only those files are collected; a run with no <code>out/</code> file fails.</span><textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label><p className="text-xs text-muted-ink">This inline task uses one compatible model and inherits the selected Envelope&apos;s approved tools, budget, TTL, and runner limits. After it succeeds, save the exact task from its run detail.</p></div> : null}
-    {sourceKind === "repository" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Repository<input className={`${fieldClass} font-mono`} onChange={(event) => setRepository(event.target.value)} value={repository} /></label><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Ref or immutable commit<input className={`${fieldClass} font-mono`} onChange={(event) => setRevision(event.target.value)} value={revision} /></label><label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} value={path} /></label></div><p className="text-xs text-muted-ink">The repository must be in the operator&apos;s allowed source list. Steward resolves a ref to an exact commit and validates the package&apos;s declared requirements before execution.</p></div> : null}
-    {sourceKind === "registry" ? <label className="grid gap-2 text-sm font-semibold">Published workflow<select className={fieldClass} onChange={(event) => setWorkflowRef(event.target.value)} value={workflowRef}>{data.workflows.workflows.map((workflow) => <option key={`${workflow.name}@${workflow.version}`} value={`${workflow.name}@${workflow.version}`}>{workflow.displayName} · {workflow.name}@{workflow.version}</option>)}</select></label> : null}
+    {exactTask ? <p className="text-sm text-muted-ink">The exact immutable package is locked. Choose an Envelope and optional inputs for this run.</p> : null}
+    {!exactTask && sourceKind === "inline" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Coding agent<select className={`${fieldClass} font-mono`} onChange={(event) => setAgentRef(event.target.value)} value={effectiveAgentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.agentRef}{agent.compatible ? ` · ${agent.model?.provider}/${agent.model?.model}` : ` · ${agent.reason}`}</option>)}</select></label>{agentWarning ? <p className="text-sm text-warn" role="status">{agentWarning}</p> : null}<label className="grid gap-2 text-sm font-semibold">Prompt<span className="text-xs font-normal text-muted-ink">Write results under <code>$STEWARD_OUTPUT_DIR/out/</code>. Only those files are collected; a run with no <code>out/</code> file fails.</span><textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label><p className="text-xs text-muted-ink">This inline task uses one compatible model and inherits the selected Envelope&apos;s approved tools, budget, TTL, and runner limits. Open the Task from the completed Run to reuse or publish the exact package.</p></div> : null}
+    {!exactTask && sourceKind === "repository" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Repository<input className={`${fieldClass} font-mono`} onChange={(event) => setRepository(event.target.value)} value={repository} /></label><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Ref or immutable commit<input className={`${fieldClass} font-mono`} onChange={(event) => setRevision(event.target.value)} value={revision} /></label><label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} value={path} /></label></div><p className="text-xs text-muted-ink">The repository must be in the operator&apos;s allowed source list. Steward resolves a ref to an exact commit and validates the package&apos;s declared requirements before execution.</p></div> : null}
+    {!exactTask && sourceKind === "registry" ? <label className="grid gap-2 text-sm font-semibold">Published workflow<select className={fieldClass} onChange={(event) => setWorkflowRef(event.target.value)} value={workflowRef}>{data.workflows.workflows.map((workflow) => <option key={`${workflow.name}@${workflow.version}`} value={`${workflow.name}@${workflow.version}`}>{workflow.displayName} · {workflow.name}@{workflow.version}</option>)}</select></label> : null}
     <label className="grid gap-2 text-sm font-semibold">Inputs (JSON object)<span className="text-xs font-normal text-muted-ink">Optional JSON (up to 16 KiB), available to the agent as <code>in/inputs.json</code>. Reference it in your prompt; it cannot change the agent, model, tools, or Envelope. Example: <code>{'{"release":"v1.2.3"}'}</code>.</span><textarea className="min-h-28 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setInputs(event.target.value)} spellCheck={false} value={inputs} /></label>
     <label className="flex items-start gap-3 rounded-control border border-warn/30 bg-warn-soft p-4 text-sm"><input checked={captureExecutionLog} className="mt-1 size-4" onChange={(event) => setCaptureExecutionLog(event.target.checked)} type="checkbox" /><span><strong className="block font-semibold text-warn">Capture execution log</strong><span className="mt-1 block text-muted-ink">Retain stdout and stderr for this run. Execution logs may reproduce arbitrary user, tool, or agent output.</span></span></label>
     {status === "error" ? <p className="text-sm text-err" role="alert">{failure ?? genericRunNowFailure}</p> : null}
-    <div className="flex justify-end"><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "submitting" || (sourceKind === "inline" && (!inlineAllowed || !selectedModel))} type="submit">{status === "submitting" ? "Starting…" : "Run now"}</button></div>
+    <div className="flex justify-end"><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "submitting" || (!exactTask && sourceKind === "inline" && (!inlineAllowed || !selectedModel))} type="submit">{status === "submitting" ? "Starting…" : "Run now"}</button></div>
   </form>;
 }

@@ -15,6 +15,17 @@ const taskUid = "00000000-0000-0000-0000-000000000002";
 const rerunTaskUid = "00000000-0000-0000-0000-000000000006";
 const approvalId = "00000000-0000-0000-0000-000000000003";
 const browserTaskDefinitionPath = ["task-definition", "json"].join(".");
+const browserTaskDigest = `steward:sha256:${"c".repeat(64)}`;
+const browserTaskFiles = {
+  [browserTaskDefinitionPath]: JSON.stringify({
+    schemaVersion: "steward.task-definition/v2",
+    name: "browser-task",
+    version: 1,
+    runtime: { agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } },
+    promptText: "Create the hello-world output.\n",
+    outputs: [{ path: "out", kind: "directory", required: true }],
+  }, null, 2),
+};
 let web;
 let origin;
 
@@ -322,6 +333,7 @@ const presentationRoutes = [
   { path: "/runs", heading: "Runs", activeNavigation: "Runs" },
   { path: "/runs/new", heading: "Run now", activeNavigation: "Runs" },
   { path: `/runs/${taskUid}`, heading: "repository-review@1", activeNavigation: "Runs" },
+  { path: `/tasks/${encodeURIComponent(browserTaskDigest)}`, heading: "browser-task@1", activeNavigation: "Runs" },
   { path: "/connections", heading: "Connections", activeNavigation: "Connections" },
   { path: "/settings", heading: "Settings", activeNavigation: "Settings" },
   { path: "/admin/members", heading: "Members", activeNavigation: "Members" },
@@ -804,9 +816,9 @@ async function guardedPage(browser, {
     workflowVersion: null,
     package: {
       source: "inline",
-      revision: `steward:sha256:${"c".repeat(64)}`,
+      revision: browserTaskDigest,
       path: browserTaskDefinitionPath,
-      contentDigest: `steward:sha256:${"c".repeat(64)}`,
+      contentDigest: browserTaskDigest,
       promptSource: "inline",
     },
   } : run;
@@ -947,6 +959,23 @@ async function guardedPage(browser, {
     }
     await json(route, { apiVersion: "steward.envelope-requests/v1", request: envelopeRequest });
   });
+  await context.route(`${origin}/app/api/v1/tasks/**`, (route) => json(route, {
+    apiVersion: "steward.browser-tasks/v1",
+    task: {
+      contentDigest: browserTaskDigest,
+      files: browserTaskFiles,
+      name: "browser-task",
+      version: 1,
+      runtime: { agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } },
+      requires: null,
+      source: "inline",
+      revision: browserTaskDigest,
+      path: browserTaskDefinitionPath,
+      runs: [fixtureRun, { ...fixtureRun, taskUid: "00000000-0000-0000-0000-000000000009", phase: "failed", finalized: true }],
+      nextCursor: null,
+      publicationTaskUid: taskUid,
+    },
+  }));
   await context.route((url) => url.origin === origin && url.pathname === "/app/api/v1/runs", (route) => {
     if (route.request().method() === "POST") {
       return route.continue();
@@ -1002,9 +1031,7 @@ async function guardedPage(browser, {
   });
   await context.route(`${origin}/app/api/v1/runs/*/package`, (route) => json(route, {
     taskUid: new URL(route.request().url()).pathname.split("/").at(-2),
-    files: {
-      [browserTaskDefinitionPath]: "{\"schemaVersion\":\"steward.task-definition/v2\",\"promptText\":\"Create the hello-world output.\\n\"}\n",
-    },
+    files: browserTaskFiles,
   }));
   await context.route(`${origin}/app/api/v1/github/repositories*`, (route) => json(route, {
     apiVersion: "steward.github-automation/v1",
@@ -2203,9 +2230,20 @@ test("Run now submits an inline package under the selected envelope", async ({ b
     expect(taskDefinition.requires.authority.llms).toEqual([{ provider: "openai", model: "gpt-5.4" }]);
     expect(submission.body).not.toHaveProperty("actor");
     expect(submission.body).not.toHaveProperty("owner");
-    await expect(developer.page.getByRole("heading", { name: "Task prompt" })).toBeVisible();
-    await expect(developer.page.getByText("Create the hello-world output.", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("link", { name: "out/hello.txt" })).toBeVisible();
+    await expect(developer.page.getByRole("link", { name: "Open Task" })).toHaveAttribute("href", `/tasks/${encodeURIComponent(browserTaskDigest)}`);
+    await developer.page.getByRole("link", { name: "Open Task" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/tasks/${encodeURIComponent(browserTaskDigest)}`);
+    await expect(developer.page.getByRole("heading", { name: "browser-task@1" })).toBeVisible();
+    await expect(developer.page.getByText(/Create the hello-world output/)).toBeVisible();
+    await expect(developer.page.getByRole("table", { name: "Runs" })).toContainText(taskUid);
+    await expect(developer.page.getByRole("table", { name: "Runs" })).toContainText("00000000-0000-0000-0000-000000000009");
+
+    await developer.page.getByRole("link", { name: "Run", exact: true }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/new?task=${encodeURIComponent(browserTaskDigest)}`);
+    await expect(developer.page.getByText("The exact immutable package is locked.")).toBeVisible();
+    await developer.page.getByRole("button", { name: "Run now" }).click();
+    const exactSubmission = developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/runs").at(-1);
+    expect(exactSubmission.body.package).toEqual({ source: "inline", revision: browserTaskDigest, path: browserTaskDefinitionPath, files: browserTaskFiles });
   } finally {
     await closeGuardedPage(developer);
   }
@@ -2218,7 +2256,7 @@ test("a successful inline run publishes and dispatches the exact governed GitHub
     onboardingPagination: true,
   });
   try {
-    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await developer.page.goto(`${origin}/tasks/${encodeURIComponent(browserTaskDigest)}`);
     await expect(developer.page.getByRole("heading", { name: "Publish this task to GitHub" })).toBeVisible();
     await expect(developer.page.getByLabel("Repository").locator("option")).toHaveText([
       "example-org/agentic-ops · Ready",
@@ -2232,7 +2270,7 @@ test("a successful inline run publishes and dispatches the exact governed GitHub
     expect(publication.body.owner).toBe("example-org");
     expect(publication.body.repository).toBe("agentic-ops");
     expect(publication.body.idempotencyKey).toBeTruthy();
-    await expect(developer.page.getByText(`steward:sha256:${"c".repeat(64)}`, { exact: true })).toBeVisible();
+    await expect(developer.page.getByLabel("Publish this task to GitHub").getByText(browserTaskDigest, { exact: true })).toBeVisible();
     await expect(developer.page.getByRole("link", { name: "Review the two-file pull request diff" })).toHaveAttribute("href", "https://github.com/example-org/agentic-ops/pull/42/files");
 
     await expect(developer.page.getByText("The exact generated workflow is present on the default branch.")).toBeVisible({ timeout: 10_000 });
@@ -2413,7 +2451,7 @@ test("run detail uses one held event stream through queued, running, and succeed
     await expect(developer.page.locator("article > header").getByText("succeeded", { exact: true })).toBeVisible({ timeout: 5_000 });
     await expect(developer.page.getByText("runtime-live-1", { exact: true })).toBeVisible();
     await expect(developer.page.getByRole("heading", { name: "Outputs" })).toBeVisible();
-    await expect(developer.page.getByRole("heading", { name: "Publish this task to GitHub" })).toBeVisible();
+    await expect(developer.page.getByRole("link", { name: "Open Task" })).toBeVisible();
     expect(outputRequests).toBe(1);
     expect(web.runEventRequestCount()).toBe(1);
     expect(documentRequests).toBe(1);

@@ -21,7 +21,10 @@ use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunPage, AgentRunQuery, AgentRunRecord,
     AgentRunTimelineEvent, AgentRunTimelineKind, StoreError, TaskRecord,
 };
-use steward_types::direct_package::{ExecutionLogMode, PromptSourceKind, TaskOrigin};
+use steward_types::direct_package::{
+    AgentRef, ContentDigest, DirectRequirements, DirectTaskDefinition, ExecutionLogMode,
+    PromptSourceKind, RuntimeSelection, TaskOrigin,
+};
 use steward_types::{CanonicalUserId, RuntimeOwnership, TaskPhase};
 use uuid::Uuid;
 
@@ -37,6 +40,7 @@ use crate::tasks::{BrowserTaskRerunError, BrowserTaskRerunner};
 use crate::{AgentRunLedger, AgentRunSpendView, BoxFuture, bounded_task_error_category};
 
 pub const BROWSER_AGENT_RUNS_API_VERSION: &str = "steward.browser-runs/v1";
+pub const BROWSER_TASKS_API_VERSION: &str = "steward.browser-tasks/v1";
 
 #[derive(Serialize, utoipa::ToSchema)]
 struct RerunErrorResponse {
@@ -342,6 +346,40 @@ pub(crate) struct BrowserRunPackageContentResponse {
     files: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct BrowserTaskQuery {
+    #[serde(default = "default_limit")]
+    limit: u16,
+    cursor: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserTaskView {
+    content_digest: String,
+    source: String,
+    revision: String,
+    path: String,
+    name: String,
+    version: u64,
+    runtime: RuntimeSelection,
+    requires: Option<DirectRequirements>,
+    files: BTreeMap<String, String>,
+    runs: Vec<BrowserRunView>,
+    #[schema(value_type = Option<String>, format = "uuid")]
+    next_cursor: Option<Uuid>,
+    #[schema(value_type = Option<String>, format = "uuid")]
+    publication_task_uid: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserTaskResponse {
+    api_version: &'static str,
+    task: BrowserTaskView,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrowserRunTrigger {
@@ -622,6 +660,7 @@ where
     L: AgentRunLedger,
 {
     Router::new()
+        .route("/app/api/v1/tasks/{content_digest}", get(my_task::<L>))
         .route("/app/api/v1/runs", get(my_runs::<L>))
         .route("/app/api/v1/runs/{task_uid}", get(my_run::<L>))
         .route(
@@ -658,6 +697,168 @@ where
             github_rerunner,
             browser_task_rerunner,
             event_streams: Arc::new(BrowserRunEventStreams::default()),
+        })
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "myTask",
+    path = "/app/api/v1/tasks/{content_digest}",
+    params(
+        ("content_digest" = String, Path),
+        ("limit" = Option<u16>, Query),
+        ("cursor" = Option<String>, Query, format = "uuid")
+    ),
+    responses(
+        (status = 200, body = BrowserTaskResponse),
+        (status = 400, description = "Task digest or run query is invalid"),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Task is not visible in the user's scope"),
+        (status = 503, description = "Task history is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn my_task<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    State(state): State<BrowserRunsState<L>>,
+    Path(content_digest): Path<String>,
+    Query(query): Query<BrowserTaskQuery>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if !valid_task_content_digest(&content_digest) {
+        return browser_runs_error(StatusCode::BAD_REQUEST);
+    }
+    let owner_user_id = session.principal.canonical_user_id.as_str();
+    let run_query = AgentRunQuery {
+        limit: query.limit,
+        cursor: query.cursor,
+        phase: None,
+        workflow: None,
+        owner_user_id: Some(owner_user_id.to_owned()),
+        runtime_uid: None,
+        user_envelope_instance_id: None,
+        task_uid: None,
+        package_digest: Some(content_digest.clone()),
+    };
+    let page = match state.ledger.agent_runs(&run_query).await {
+        Ok(page) => page,
+        Err(StoreError::InvalidRunQuery | StoreError::InvalidRunCursor) => {
+            return browser_runs_error(StatusCode::BAD_REQUEST);
+        }
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let publication_task_uid = page.records.iter().find_map(|record| {
+        (record.phase == TaskPhase::Succeeded
+            && record.finalized
+            && record.task_origin == TaskOrigin::Browser
+            && record
+                .browser_task_evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.source == "inline"))
+        .then_some(record.task_uid)
+    });
+    let runs = page
+        .records
+        .into_iter()
+        .map(browser_run_view)
+        .collect::<Vec<_>>();
+
+    let inline = match state
+        .ledger
+        .inline_browser_task_by_digest(owner_user_id, &content_digest)
+        .await
+    {
+        Ok(record) => record,
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let task = if let Some(record) = inline {
+        let Some(evidence) = record.browser_task_evidence else {
+            return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        let Some(files) = evidence.inline_files else {
+            return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        let Some(definition_source) = files.get(evidence.path.as_str()) else {
+            return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        let definition = match serde_json::from_str::<DirectTaskDefinition>(definition_source) {
+            Ok(definition) if definition.validate().is_ok() => definition,
+            _ => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        BrowserTaskView {
+            content_digest,
+            source: evidence.source,
+            revision: evidence.revision,
+            path: evidence.path.as_str().to_owned(),
+            name: definition.name.as_str().to_owned(),
+            version: definition.version,
+            runtime: definition.runtime,
+            requires: definition.requires,
+            files,
+            runs,
+            next_cursor: page.next_cursor,
+            publication_task_uid: publication_task_uid.or_else(|| {
+                (record.phase == TaskPhase::Succeeded && record.finalized)
+                    .then_some(record.task_uid)
+            }),
+        }
+    } else {
+        let workflow_digest = content_digest
+            .strip_prefix("steward:")
+            .unwrap_or(&content_digest);
+        let workflow = match state
+            .ledger
+            .workflow_revision_by_digest(workflow_digest)
+            .await
+        {
+            Ok(Some(workflow)) => workflow,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        let agent_ref = match AgentRef::parse(workflow.agent.clone()) {
+            Ok(agent_ref) => agent_ref,
+            Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        BrowserTaskView {
+            content_digest: workflow.content_digest.clone(),
+            source: format!("steward:registry/{}", workflow.name),
+            revision: format!("steward:version:{}", workflow.version),
+            path: "prompt.md".to_owned(),
+            name: workflow.name,
+            version: match u64::try_from(workflow.version) {
+                Ok(version) => version,
+                Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+            },
+            runtime: RuntimeSelection {
+                agent_ref,
+                model: None,
+            },
+            requires: None,
+            files: BTreeMap::from([("prompt.md".to_owned(), workflow.prompt)]),
+            runs,
+            next_cursor: page.next_cursor,
+            publication_task_uid: None,
+        }
+    };
+    Json(BrowserTaskResponse {
+        api_version: BROWSER_TASKS_API_VERSION,
+        task,
+    })
+    .into_response()
+}
+
+fn valid_task_content_digest(value: &str) -> bool {
+    ContentDigest::parse(value.to_owned()).is_ok()
+        || value.strip_prefix("sha256:").is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
 }
 
@@ -1125,6 +1326,7 @@ where
         runtime_uid: query.runtime_uid,
         user_envelope_instance_id: query.envelope_instance_id,
         task_uid: None,
+        package_digest: None,
     };
     let facets = match state.ledger.agent_run_phase_facets(&query).await {
         Ok(phase) => BrowserRunFacets {
@@ -1187,6 +1389,7 @@ where
         runtime_uid: query.runtime_uid,
         user_envelope_instance_id: None,
         task_uid: None,
+        package_digest: None,
     };
     let facets = match state.ledger.agent_run_phase_facets(&query).await {
         Ok(phase) => BrowserRunFacets {
@@ -1924,6 +2127,7 @@ where
             runtime_uid: None,
             user_envelope_instance_id: None,
             task_uid: Some(task_uid),
+            package_digest: None,
         })
         .await?;
     Ok(page.records.into_iter().next())
@@ -2027,6 +2231,21 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
             .then_some("This run does not have a replayable package source."),
         stages,
     }
+}
+
+#[cfg(test)]
+fn agent_run_content_digest(record: &AgentRunRecord) -> Option<&str> {
+    record
+        .browser_task_evidence
+        .as_ref()
+        .map(|evidence| evidence.closure_digest.as_str())
+        .or_else(|| {
+            record
+                .direct_task_evidence
+                .as_ref()
+                .map(|evidence| evidence.closure_digest.as_str())
+        })
+        .or(record.workflow_digest.as_deref())
 }
 
 const fn is_terminal_phase(phase: TaskPhase) -> bool {
@@ -2201,7 +2420,7 @@ mod tests {
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
-    use steward_store::{AgentRunSpend, AgentRunTimelineEvent, TaskRecord};
+    use steward_store::{AgentRunSpend, AgentRunTimelineEvent, TaskRecord, WorkflowRevisionRecord};
     use steward_types::direct_package::{
         BrowserTaskEvidence, ContentDigest, PromptSourceKind, RelativePath,
     };
@@ -2228,6 +2447,7 @@ mod tests {
         rerun_sources: Arc<Mutex<HashMap<Uuid, TaskRecord>>>,
         github_matches: Arc<Mutex<VecDeque<Option<TaskRecord>>>>,
         github_queries: Arc<Mutex<Vec<GithubRerunQuery>>>,
+        workflow_revisions: Arc<Mutex<Vec<WorkflowRevisionRecord>>>,
     }
 
     impl AgentRunLedger for FakeLedger {
@@ -2258,6 +2478,9 @@ mod tests {
                             ) && query
                                 .task_uid
                                 .is_none_or(|task_uid| record.task_uid == task_uid)
+                                && query.package_digest.as_deref().is_none_or(|digest| {
+                                    agent_run_content_digest(record) == Some(digest)
+                                })
                         })
                         .cloned()
                         .collect();
@@ -2273,6 +2496,56 @@ mod tests {
             _task_uid: Uuid,
         ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
             Box::pin(async { Ok(None) })
+        }
+
+        fn inline_browser_task_by_digest<'a>(
+            &'a self,
+            owner_user_id: &'a str,
+            package_digest: &'a str,
+        ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
+            Box::pin(async move {
+                let mut records = self
+                    .records
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?
+                    .iter()
+                    .filter(|record| {
+                        record.owner_user_id.as_deref() == Some(owner_user_id)
+                            && record
+                                .browser_task_evidence
+                                .as_ref()
+                                .is_some_and(|evidence| {
+                                    evidence.source == "inline"
+                                        && evidence.closure_digest.as_str() == package_digest
+                                        && evidence.inline_files.is_some()
+                                })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                records.sort_by_key(|record| {
+                    (
+                        !(record.phase == TaskPhase::Succeeded && record.finalized),
+                        std::cmp::Reverse(record.created_at.clone()),
+                        std::cmp::Reverse(record.task_uid),
+                    )
+                });
+                Ok(records.into_iter().next())
+            })
+        }
+
+        fn workflow_revision_by_digest<'a>(
+            &'a self,
+            content_digest: &'a str,
+        ) -> BoxFuture<'a, Result<Option<WorkflowRevisionRecord>, StoreError>> {
+            Box::pin(async move {
+                Ok(self
+                    .workflow_revisions
+                    .lock()
+                    .map_err(|_| StoreError::InvalidWorkflow)?
+                    .iter()
+                    .find(|workflow| workflow.content_digest == content_digest)
+                    .cloned())
+            })
         }
 
         fn agent_run_phase_facets<'a>(
@@ -3525,6 +3798,178 @@ mod tests {
                 .map_err(|error| format!("execute hidden package request: {error}"))?;
             assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_page_is_digest_scoped_and_includes_exact_owned_runs() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let other_owner = "usr_abcdefabcdefabcdefabcdefabcdefab";
+        let succeeded_task = Uuid::parse_str("33333333-3333-4333-8333-333333333333")
+            .map_err(|error| error.to_string())?;
+        let failed_task = Uuid::parse_str("55555555-5555-4555-8555-555555555555")
+            .map_err(|error| error.to_string())?;
+        let hidden_task = Uuid::parse_str("44444444-4444-4444-8444-444444444444")
+            .map_err(|error| error.to_string())?;
+        let digest = format!("steward:sha256:{}", "d".repeat(64));
+        let evidence = BrowserTaskEvidence {
+            source: "inline".to_owned(),
+            revision: digest.clone(),
+            path: RelativePath::parse("task-definition.json")?,
+            closure: None,
+            closure_digest: ContentDigest::parse(digest.clone())?,
+            inline_files: Some(BTreeMap::from([
+                ("prompt.md".to_owned(), "Say hello.\n".to_owned()),
+                (
+                    "task-definition.json".to_owned(),
+                    serde_json::json!({
+                        "schemaVersion": "steward.task-definition/v2",
+                        "name": "hello-task",
+                        "version": 3,
+                        "runtime": {"agentRef": "example-agent@1.0.0"},
+                        "prompt": "prompt.md",
+                        "outputs": [{"path": "out", "kind": "directory", "required": true}]
+                    })
+                    .to_string(),
+                ),
+            ])),
+            diagnostics: Default::default(),
+            prompt_source: PromptSourceKind::Path,
+        };
+        let mut succeeded = run(succeeded_task, owner);
+        succeeded.task_origin = TaskOrigin::Browser;
+        succeeded.finalized = true;
+        succeeded.browser_task_evidence = Some(evidence.clone());
+        let mut failed = run(failed_task, owner);
+        failed.phase = TaskPhase::Failed;
+        failed.task_origin = TaskOrigin::Browser;
+        failed.browser_task_evidence = Some(evidence.clone());
+        let mut hidden = run(hidden_task, other_owner);
+        hidden.task_origin = TaskOrigin::Browser;
+        hidden.browser_task_evidence = Some(evidence);
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .extend([succeeded, failed, hidden]);
+
+        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let response = protected_router(ledger, service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/tasks/{digest}"))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build Task request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute Task request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read Task response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode Task response: {error}"))?;
+        assert_eq!(body["task"]["contentDigest"], digest);
+        assert_eq!(body["task"]["name"], "hello-task");
+        assert_eq!(body["task"]["version"], 3);
+        assert_eq!(body["task"]["runtime"]["agentRef"], "example-agent@1.0.0");
+        assert_eq!(body["task"]["files"]["prompt.md"], "Say hello.\n");
+        assert_eq!(
+            body["task"]["publicationTaskUid"],
+            succeeded_task.to_string()
+        );
+        assert_eq!(body["task"]["runs"].as_array().map(Vec::len), Some(2));
+        assert!(body["task"]["runs"].as_array().is_some_and(|runs| {
+            runs.iter()
+                .all(|run| run["taskUid"] != hidden_task.to_string())
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_page_hides_another_users_inline_task_but_exposes_a_published_workflow()
+    -> Result<(), String> {
+        let other_owner = "usr_abcdefabcdefabcdefabcdefabcdefab";
+        let hidden_digest = format!("steward:sha256:{}", "f".repeat(64));
+        let hidden_task = Uuid::parse_str("44444444-4444-4444-8444-444444444444")
+            .map_err(|error| error.to_string())?;
+        let mut hidden = run(hidden_task, other_owner);
+        hidden.task_origin = TaskOrigin::Browser;
+        hidden.browser_task_evidence = Some(BrowserTaskEvidence {
+            source: "inline".to_owned(),
+            revision: hidden_digest.clone(),
+            path: RelativePath::parse("task-definition.json")?,
+            closure: None,
+            closure_digest: ContentDigest::parse(hidden_digest.clone())?,
+            inline_files: Some(BTreeMap::from([(
+                "task-definition.json".to_owned(),
+                "{}".to_owned(),
+            )])),
+            diagnostics: Default::default(),
+            prompt_source: PromptSourceKind::Path,
+        });
+        let workflow_digest = format!("sha256:{}", "e".repeat(64));
+        let workflow = WorkflowRevisionRecord {
+            name: "release-summary".to_owned(),
+            version: 2,
+            display_name: "Release summary".to_owned(),
+            agent: "example-agent@1.0.0".to_owned(),
+            prompt: "Summarize the release.\n".to_owned(),
+            content_digest: workflow_digest.clone(),
+            published_by: "usr_admin0000000000000000000000000".to_owned(),
+            published_at: "2026-01-02T03:04:05Z".to_owned(),
+        };
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .push(hidden);
+        ledger
+            .workflow_revisions
+            .lock()
+            .map_err(|_| "lock workflows")?
+            .push(workflow);
+
+        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let app = protected_router(ledger, service);
+        let hidden_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/tasks/{hidden_digest}"))
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build hidden Task request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute hidden Task request: {error}"))?;
+        assert_eq!(hidden_response.status(), StatusCode::NOT_FOUND);
+
+        let workflow_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/tasks/{workflow_digest}"))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build Workflow Task request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute Workflow Task request: {error}"))?;
+        assert_eq!(workflow_response.status(), StatusCode::OK);
+        let body = to_bytes(workflow_response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read Workflow Task response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode Workflow Task response: {error}"))?;
+        assert_eq!(body["task"]["name"], "release-summary");
+        assert_eq!(body["task"]["revision"], "steward:version:2");
+        assert_eq!(
+            body["task"]["files"]["prompt.md"],
+            "Summarize the release.\n"
+        );
         Ok(())
     }
 
