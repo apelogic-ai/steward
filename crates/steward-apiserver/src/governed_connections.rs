@@ -593,6 +593,13 @@ pub struct GovernedConnectionsBroker<B> {
     failure_reporter: Arc<dyn Fn(String) + Send + Sync>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct ConnectionReservationIdentity<'a> {
+    operation: Option<&'a str>,
+    client_scope: Option<&'a str>,
+    publication_branch: Option<&'a str>,
+}
+
 const STAGED_CONNECTIONS_WARNING: &str = "connections bridge enabled but taskOrchestrationMode=staged; Connections operations are refused";
 
 fn connection_orchestration_error(mode: TaskOrchestrationMode) -> Option<ConnectionBrokerError> {
@@ -636,9 +643,7 @@ impl<B> GovernedConnectionsBroker<B> {
         operation: ConnectionOperationKind,
         allow_status_cache: bool,
         request_body: Option<Value>,
-        idempotency_identity: Option<&str>,
-        idempotency_scope: Option<&str>,
-        publication_branch: Option<&str>,
+        identity: ConnectionReservationIdentity<'_>,
     ) -> Result<ConnectionOperationRecord, ConnectionBrokerError> {
         if let Some(error) = connection_orchestration_error(self.orchestration_mode) {
             return Err(error);
@@ -669,7 +674,8 @@ impl<B> GovernedConnectionsBroker<B> {
             &serde_json::to_vec(&body).map_err(|_| ConnectionBrokerError::Unavailable)?,
         )?;
         let operation_id = Uuid::new_v4();
-        let operation_key = idempotency_identity
+        let operation_key = identity
+            .operation
             .map(str::to_owned)
             .unwrap_or_else(|| operation_id.to_string());
         let runtime_name = format!("conn-{}", operation_id.simple());
@@ -748,8 +754,8 @@ impl<B> GovernedConnectionsBroker<B> {
                 authority_digest: &plan.authority_digest,
                 bindings: &bindings,
                 idempotency_identity: &operation_key,
-                idempotency_scope,
-                publication_branch,
+                idempotency_scope: identity.client_scope,
+                publication_branch: identity.publication_branch,
                 response_deadline_seconds: CONNECTION_RESPONSE_DEADLINE_SECONDS,
                 allow_status_cache,
                 input_archive: &input,
@@ -846,9 +852,11 @@ impl<B> GovernedConnectionsBroker<B> {
                     operation,
                     true,
                     Some(request_body),
-                    Some(idempotency_identity),
-                    idempotency_scope,
-                    Some(&branch),
+                    ConnectionReservationIdentity {
+                        operation: Some(idempotency_identity),
+                        client_scope: idempotency_scope,
+                        publication_branch: Some(&branch),
+                    },
                 )
                 .await?;
             let completed = if record.operation_state == ConnectionOperationState::Succeeded {
@@ -866,9 +874,11 @@ impl<B> GovernedConnectionsBroker<B> {
                 operation,
                 true,
                 Some(request_body),
-                Some(idempotency_identity),
-                idempotency_scope,
-                None,
+                ConnectionReservationIdentity {
+                    operation: Some(idempotency_identity),
+                    client_scope: idempotency_scope,
+                    publication_branch: None,
+                },
             )
             .await?;
         let completed = if record.operation_state == ConnectionOperationState::Succeeded {
@@ -892,9 +902,7 @@ impl<B> GovernedConnectionsBroker<B> {
                 ConnectionOperationKind::Status,
                 allow_cache,
                 None,
-                None,
-                None,
-                None,
+                ConnectionReservationIdentity::default(),
             )
             .await?;
         let completed = if record.operation_state == ConnectionOperationState::Succeeded {
@@ -974,9 +982,7 @@ where
                     ConnectionOperationKind::Start,
                     true,
                     None,
-                    None,
-                    None,
-                    None,
+                    ConnectionReservationIdentity::default(),
                 )
                 .await?;
             Ok(ReservedConnectionStart {
@@ -1090,9 +1096,7 @@ where
                     ConnectionOperationKind::Disconnect,
                     true,
                     None,
-                    None,
-                    None,
-                    None,
+                    ConnectionReservationIdentity::default(),
                 )
                 .await?;
             Ok(ReservedConnectionStart {
@@ -1133,9 +1137,11 @@ where
                     ConnectionOperationKind::Rerun,
                     true,
                     Some(body),
-                    Some(&idempotency_identity),
-                    Some(&idempotency_scope),
-                    None,
+                    ConnectionReservationIdentity {
+                        operation: Some(&idempotency_identity),
+                        client_scope: Some(&idempotency_scope),
+                        publication_branch: None,
+                    },
                 )
                 .await?;
             let completed = if record.operation_state == ConnectionOperationState::Succeeded {
