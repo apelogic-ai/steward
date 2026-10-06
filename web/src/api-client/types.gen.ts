@@ -91,6 +91,8 @@ export type AdminSetupStatusResponse = {
     checks: Array<AdminSetupCheck>;
 };
 
+export type AgentRef = string;
+
 export type AgentRunAvailability = 'available' | 'partial' | 'unavailable';
 
 export type AgentRunDataStatus = {
@@ -698,11 +700,33 @@ export type BrowserTaskEvidence = {
     source: string;
 };
 
+export type BrowserTaskResponse = {
+    apiVersion: string;
+    task: BrowserTaskView;
+};
+
 export type BrowserTaskSubmission = {
     diagnostics?: DiagnosticsRequest;
     envelopeDigest?: null | EnvelopeDigest;
     inputs?: unknown;
     package: BrowserPackageLocator;
+};
+
+export type BrowserTaskView = {
+    contentDigest: string;
+    files: {
+        [key: string]: string;
+    };
+    name: string;
+    nextCursor?: string | null;
+    path: string;
+    publicationTaskUid?: string | null;
+    requires?: null | DirectRequirements;
+    revision: string;
+    runs: Array<BrowserRunView>;
+    runtime: RuntimeSelection;
+    source: string;
+    version: number;
 };
 
 export type BrowserTheme = 'light' | 'dark' | 'system';
@@ -1426,6 +1450,11 @@ export type RunnerRequirements = {
 };
 
 export type RuntimeOwnership = 'provisioned' | 'adopted';
+
+export type RuntimeSelection = {
+    agentRef: AgentRef;
+    model?: null | ModelRequirement;
+};
 
 export type SessionPrincipalResponse = {
     displayEmail: Email;
@@ -4619,6 +4648,43 @@ export type MyRunTimelineResponses = {
 };
 
 export type MyRunTimelineResponse = MyRunTimelineResponses[keyof MyRunTimelineResponses];
+
+export type MyTaskData = {
+    body?: never;
+    path: {
+        content_digest: string;
+    };
+    query?: {
+        limit?: number;
+        cursor?: string;
+    };
+    url: '/app/api/v1/tasks/{content_digest}';
+};
+
+export type MyTaskErrors = {
+    /**
+     * Task digest or run query is invalid
+     */
+    400: unknown;
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Task is not visible in the user's scope
+     */
+    404: unknown;
+    /**
+     * Task history is unavailable
+     */
+    503: unknown;
+};
+
+export type MyTaskResponses = {
+    200: BrowserTaskResponse;
+};
+
+export type MyTaskResponse = MyTaskResponses[keyof MyTaskResponses];
 
 export type ListPublishedWorkflowsData = {
     body?: never;

@@ -86,6 +86,7 @@ use steward_store::{
     EnvelopeTemplateRevisionRecord, GrantApplication, GrantReversion, ParkRejection,
     ParkedAdmission, PendingApproval, PendingEnvelopeRequest, PgStore, StoreError,
     TaskAdmissionLookup, TaskAdmissionRecord, TaskRecord, TaskReservation, TaskReservationRequest,
+    WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
     BrowserPackageLocator, BrowserTaskEvidence, BrowserTaskSubmission, TaskOrigin,
@@ -369,6 +370,7 @@ pub struct GrantRevocationRequest {
         workflows::publish_next_workflow,
         tasks::submit_browser_run,
         agent_runs_ui::my_runs,
+        agent_runs_ui::my_task,
         agent_runs_ui::my_run,
         agent_runs_ui::my_run_events,
         agent_runs_ui::cancel_my_run,
@@ -518,6 +520,8 @@ pub struct GrantRevocationRequest {
         agent_runs_ui::BrowserRunOutputsResponse,
         agent_runs_ui::BrowserRunPackageView,
         agent_runs_ui::BrowserRunPackageContentResponse,
+        agent_runs_ui::BrowserTaskView,
+        agent_runs_ui::BrowserTaskResponse,
         github_automation::GithubRepositoryView,
         github_automation::GithubRepositoriesResponse,
         github_automation::RepositoryTargetRequest,
@@ -1386,6 +1390,21 @@ pub trait AgentRunLedger: Clone + Send + Sync + 'static {
         task_uid: Uuid,
     ) -> BoxFuture<'_, Result<Option<AgentRunRecord>, StoreError>>;
 
+    fn inline_browser_task_by_digest<'a>(
+        &'a self,
+        _owner_user_id: &'a str,
+        _package_digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn workflow_revision_by_digest<'a>(
+        &'a self,
+        _content_digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<WorkflowRevisionRecord>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn agent_run_phase_facets<'a>(
         &'a self,
         query: &'a AgentRunQuery,
@@ -1473,6 +1492,23 @@ impl AgentRunLedger for PgStore {
         task_uid: Uuid,
     ) -> BoxFuture<'_, Result<Option<AgentRunRecord>, StoreError>> {
         Box::pin(async move { PgStore::agent_run(self, task_uid).await })
+    }
+
+    fn inline_browser_task_by_digest<'a>(
+        &'a self,
+        owner_user_id: &'a str,
+        package_digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
+        Box::pin(async move {
+            PgStore::inline_browser_task_by_digest(self, owner_user_id, package_digest).await
+        })
+    }
+
+    fn workflow_revision_by_digest<'a>(
+        &'a self,
+        content_digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<WorkflowRevisionRecord>, StoreError>> {
+        Box::pin(async move { PgStore::workflow_revision_by_digest(self, content_digest).await })
     }
 
     fn agent_run_output_archive<'a>(
@@ -1992,6 +2028,7 @@ where
         runtime_uid: None,
         user_envelope_instance_id: None,
         task_uid: None,
+        package_digest: None,
     };
     match state.ledger.agent_runs(&query).await {
         Ok(page) => Json(AgentRunsResponse {

@@ -3513,6 +3513,9 @@ impl PgStore {
         {
             return Err(StoreError::InvalidRunQuery);
         }
+        if query.package_digest.as_deref().is_some_and(str::is_empty) {
+            return Err(StoreError::InvalidRunQuery);
+        }
         if let Some(cursor) = query.cursor {
             let mut cursor_exists = QueryBuilder::<Postgres>::new(
                 "SELECT EXISTS(SELECT 1 FROM task_submissions tasks WHERE task_uid = ",
@@ -3574,6 +3577,15 @@ impl PgStore {
             statement.push(" AND tasks.task_uid = ");
             statement.push_bind(task_uid);
         }
+        if let Some(package_digest) = query.package_digest.as_deref() {
+            statement.push(" AND (tasks.browser_task_evidence ->> 'closureDigest' = ");
+            statement.push_bind(package_digest);
+            statement.push(" OR tasks.direct_task_evidence ->> 'closureDigest' = ");
+            statement.push_bind(package_digest);
+            statement.push(" OR tasks.workflow_digest = ");
+            statement.push_bind(package_digest);
+            statement.push(")");
+        }
         statement.push(" ORDER BY tasks.created_at DESC, tasks.task_uid DESC LIMIT ");
         statement.push_bind(i64::from(query.limit) + 1);
 
@@ -3595,6 +3607,53 @@ impl PgStore {
             records,
             next_cursor,
         })
+    }
+
+    pub async fn inline_browser_task_by_digest(
+        &self,
+        owner_user_id: &str,
+        package_digest: &str,
+    ) -> Result<Option<AgentRunRecord>, StoreError> {
+        let mut statement = QueryBuilder::<Postgres>::new(AGENT_RUN_SELECT);
+        statement.push(
+            " WHERE NOT EXISTS (SELECT 1 FROM connection_operations operations \
+               WHERE operations.task_uid = tasks.task_uid) \
+               AND tasks.owner_user_id = ",
+        );
+        statement.push_bind(owner_user_id);
+        statement.push(" AND tasks.browser_task_evidence ->> 'source' = 'inline'");
+        statement.push(" AND tasks.browser_task_evidence ->> 'closureDigest' = ");
+        statement.push_bind(package_digest);
+        statement.push(" AND tasks.browser_task_evidence -> 'inlineFiles' IS NOT NULL");
+        statement.push(
+            " ORDER BY (tasks.phase = 'succeeded' AND tasks.finalized) DESC, \
+                      tasks.created_at DESC, tasks.task_uid DESC LIMIT 1",
+        );
+        statement
+            .build()
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+            .map(agent_run_record)
+            .transpose()
+    }
+
+    pub async fn workflow_revision_by_digest(
+        &self,
+        content_digest: &str,
+    ) -> Result<Option<WorkflowRevisionRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT name, version, display_name, agent, prompt, content_digest, published_by, \
+                    to_char(published_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS published_at \
+             FROM workflow_revisions WHERE content_digest = $1 \
+             ORDER BY published_at DESC, name ASC, version DESC LIMIT 1",
+        )
+        .bind(content_digest)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        row.map(workflow_revision_record).transpose()
     }
 
     /// Return bounded GitHub Actions setup evidence without treating unrelated Tasks as proof.
@@ -9860,6 +9919,8 @@ pub struct AgentRunQuery {
     pub user_envelope_instance_id: Option<String>,
     /// Exact durable task identity, used for a single run detail read.
     pub task_uid: Option<Uuid>,
+    /// Exact immutable package digest shared by every execution of one Task package.
+    pub package_digest: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

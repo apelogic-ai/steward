@@ -14,13 +14,11 @@ import {
   listRepositories,
   myRun,
   myRunOutputs,
-  myRunPackage,
   myRunTimeline,
   publishTask,
   rerunMyRun,
   type AllRunsResponse,
   type BrowserRunResponse,
-  type BrowserRunPackageContentResponse,
   type BrowserRunTimelineResponse,
   type BrowserRunOutputsResponse,
   type BrowserRunView,
@@ -215,31 +213,15 @@ export function packagePrompt(files: Record<string, string>): { label: string; t
   if (!definitionSource) return null;
   try {
     const definition = JSON.parse(definitionSource) as Record<string, unknown>;
-    if (typeof definition.promptText === "string") {
-      return { label: "Inline prompt", text: definition.promptText };
-    }
-    if (typeof definition.prompt === "string" && typeof files[definition.prompt] === "string") {
-      return { label: definition.prompt, text: files[definition.prompt] };
-    }
+    if (typeof definition.promptText === "string") return { label: "Inline prompt", text: definition.promptText };
+    if (typeof definition.prompt === "string" && typeof files[definition.prompt] === "string") return { label: definition.prompt, text: files[definition.prompt] };
   } catch {
     return null;
   }
   return null;
 }
 
-function InlinePackageViewer({ taskUid }: Readonly<{ taskUid: string }>) {
-  const load = useCallback(() => myRunPackage({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } }), [taskUid]);
-  const state = useApiResource<BrowserRunPackageContentResponse>(load);
-  return <ResourceBoundary state={state}>{({ files }) => {
-    const prompt = packagePrompt(files);
-    return <section className="mt-5 rounded-card border p-4" aria-labelledby="package-prompt-title">
-      <h3 className="text-sm font-semibold" id="package-prompt-title">Task prompt</h3>
-      {prompt ? <><p className="mt-2 font-mono text-xs text-muted-ink">{prompt.label}</p><pre className="mt-3 whitespace-pre-wrap rounded-control border bg-subtle p-4 text-sm">{prompt.text}</pre></> : <p className="mt-2 text-sm text-muted-ink">The exact package did not contain a readable prompt.</p>}
-    </section>;
-  }}</ResourceBoundary>;
-}
-
-function GithubAutomationPanel({ run }: Readonly<{ run: BrowserRunView }>) {
+export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: string }>) {
   const session = useSession();
   const [selectedRepository, setSelectedRepository] = useState("");
   const [workflow, setWorkflow] = useState<WorkflowDetectionResponse | null>(null);
@@ -276,10 +258,10 @@ function GithubAutomationPanel({ run }: Readonly<{ run: BrowserRunView }>) {
       cache: "no-store",
       credentials: "same-origin",
       headers: { "X-Steward-CSRF": csrf },
-      path: { task_uid: run.taskUid },
+      path: { task_uid: taskUid },
     });
     return result.data && result.response?.ok ? result.data : null;
-  }, [csrf, run.taskUid]);
+  }, [csrf, taskUid]);
 
   useEffect(() => {
     if (!selected) return;
@@ -315,7 +297,7 @@ function GithubAutomationPanel({ run }: Readonly<{ run: BrowserRunView }>) {
         cache: "no-store",
         credentials: "same-origin",
         path: {
-          task_uid: run.taskUid,
+          task_uid: taskUid,
           run_id: githubRun!.runId,
         },
         query: { owner: selected!.owner, repository: selected!.name },
@@ -328,7 +310,7 @@ function GithubAutomationPanel({ run }: Readonly<{ run: BrowserRunView }>) {
       active = false;
       window.clearInterval(timer);
     };
-  }, [githubRun, run.taskUid, runStatus?.phase, selected]);
+  }, [githubRun, taskUid, runStatus?.phase, selected]);
 
   async function publish() {
     if (session.status !== "authenticated" || !selected?.ready) return;
@@ -343,7 +325,7 @@ function GithubAutomationPanel({ run }: Readonly<{ run: BrowserRunView }>) {
       cache: "no-store",
       credentials: "same-origin",
       headers: { "X-Steward-CSRF": session.value.csrf },
-      path: { task_uid: run.taskUid },
+      path: { task_uid: taskUid },
     });
     if (!result.data || !result.response?.ok) {
       setFailure("Steward could not open the publication pull request.");
@@ -368,7 +350,7 @@ function GithubAutomationPanel({ run }: Readonly<{ run: BrowserRunView }>) {
       cache: "no-store",
       credentials: "same-origin",
       headers: { "X-Steward-CSRF": session.value.csrf },
-      path: { task_uid: run.taskUid },
+      path: { task_uid: taskUid },
     });
     if (!result.data || !result.response?.ok) {
       setFailure("Steward could not dispatch the exact published workflow.");
@@ -597,8 +579,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                   {selectedStage?.id === "agent_execution" && run.executionLog === "off" ? <div className="mt-5 rounded-card border p-4"><p className="text-sm font-semibold">No execution log was captured for this run.</p><p className="mt-1 text-sm text-muted-ink">Enable <strong>Capture execution log</strong> when starting a run to retain stdout and stderr. Captured output may contain sensitive data.</p></div> : null}
                   {selectedStage?.steps.length ? <ol className="mt-5 divide-y divide-line-soft rounded-card border">{selectedStage.steps.map((step) => <RunStepRow admin={admin} key={step.id} onStreamChange={(stream) => selectLocation(selectedStage.id, stream)} selectedStream={selectedStage.id === "agent_execution" ? selectedStream : null} step={step} taskUid={taskUid} />)}</ol> : selectedStage ? <p className="mt-5 rounded-card border p-4 text-sm text-muted-ink">{stageSummary(selectedStage)}</p> : null}
                   {!admin && run.phase === "succeeded" && run.finalized ? <RunOutputs taskUid={taskUid} /> : null}
-                  {!admin && run.phase === "succeeded" && run.finalized && run.origin === "browser" && run.package?.source === "inline" ? <InlinePackageViewer taskUid={taskUid} /> : null}
-                  {!admin && run.phase === "succeeded" && run.finalized && run.origin === "browser" && run.package?.source === "inline" ? <GithubAutomationPanel run={run} /> : null}
+                  {!admin && run.origin === "browser" && run.package?.source === "inline" && run.package.contentDigest ? <p className="mt-5 text-sm"><Link className="font-semibold text-brand" href={`/tasks/${encodeURIComponent(run.package.contentDigest)}`}>Open Task</Link> · package definition and run history</p> : null}
                 </section>
               </main>
             </div>

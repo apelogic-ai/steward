@@ -39,6 +39,7 @@ const onboardingStepTitles = ["Connect GitHub", "Get your first envelope", "Run 
 
 export function isActive(pathname: string, href: string): boolean {
   if (href === "/admin/envelopes/templates" && pathname === "/admin/envelopes/provision") return true;
+  if (href === "/runs" && pathname.startsWith("/tasks/")) return true;
   return pathname === href || pathname.startsWith(`${href}/`);
 }
 
@@ -91,6 +92,9 @@ export function breadcrumbsForPath(pathname: string): BreadcrumbItem[] {
     return rest[1]
       ? [root, { href: admin ? "/admin/runs" : "/runs", label: "Runs" }, { label: shortId(rest[1]), mono: true }]
       : [root, { label: "Runs" }];
+  }
+  if (!admin && rest[0] === "tasks") {
+    return [root, { href: "/runs", label: "Runs" }, { label: shortId(rest[1] ?? "task"), mono: true }];
   }
   if (admin && rest[0] === "approvals") {
     return rest[1]

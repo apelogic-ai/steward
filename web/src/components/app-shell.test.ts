@@ -19,6 +19,10 @@ describe("primary navigation", () => {
     expect(isActive("/admin/envelopes/templates", "/envelopes")).toBe(false);
     expect(isActive("/admin/settings", "/settings")).toBe(false);
   });
+
+  test("keeps immutable Task detail in the Runs workspace", () => {
+    expect(isActive("/tasks/steward%3Asha256%3Aexample", "/runs")).toBe(true);
+  });
 });
 
 describe("workspace mode availability", () => {

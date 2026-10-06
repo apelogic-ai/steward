@@ -1430,6 +1430,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
             runtime_uid: None,
             user_envelope_instance_id: None,
             task_uid: None,
+            package_digest: None,
         })
         .await?;
     assert!(
