@@ -1347,10 +1347,10 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     .bind(rerun_operation)
     .fetch_one(&harness.database)
     .await?;
-    assert_eq!(rerun_row.try_get::<i64, _>("authority_version")?, 3);
+    assert_eq!(rerun_row.try_get::<i64, _>("authority_version")?, 4);
     assert_eq!(
         rerun_row.try_get::<String, _>("authority_digest")?,
-        steward_admission::internal_authorities::steward_connections_v3::AUTHORITY_DIGEST
+        steward_admission::internal_authorities::steward_connections_v4::AUTHORITY_DIGEST
     );
     assert_eq!(
         rerun_row.try_get::<String, _>("idempotency_identity")?,
