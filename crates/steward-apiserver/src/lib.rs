@@ -33,7 +33,8 @@ pub use github_actions::{
     VersionedGithubActionsWorkflowContext, parse_github_actions_render_request,
     render_direct_package_github_actions_workflow, render_github_actions_workflow,
     render_versioned_github_actions_workflow, steward_run_release_from_installation_bom,
-    validate_generated_github_actions_yaml, validate_steward_run_workflow_installation,
+    steward_run_supports_package_path_invocation, validate_generated_github_actions_yaml,
+    validate_steward_run_workflow_installation,
 };
 
 pub use tasks::{

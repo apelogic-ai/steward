@@ -51,8 +51,8 @@ caller-to-source binding remain active.
 
 ## GitHub Actions contract
 
-The default same-repository caller passes the package's workspace-relative path and
-needs no invocation file:
+With `steward-run` v0.8.0 or later, the default same-repository caller passes the
+package's workspace-relative path and needs no invocation file:
 
 ```yaml
 jobs:
@@ -64,7 +64,9 @@ jobs:
 ```
 
 Steward binds that package path to the verified invoking repository and exact
-triggered SHA. `package-path` and `invocation-path` are mutually exclusive.
+triggered SHA. `package-path` and `invocation-path` are mutually exclusive. When the
+configured reviewed `steward-run` release is older than v0.8.0, browser repository
+generation emits the compatible invocation manifest instead.
 
 Cross-repository callers pass an invocation manifest instead:
 

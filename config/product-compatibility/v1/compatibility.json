@@ -6,6 +6,9 @@
     "envelopeDigestSelector": {
       "stewardRunMinimumVersion": "0.7.0"
     },
+    "packagePathInvocation": {
+      "stewardRunMinimumVersion": "0.8.0"
+    },
     "vendoredWorkflowInstallation": {
       "stewardRunMinimumVersion": "0.7.6"
     }

@@ -4078,6 +4078,12 @@ mod tests {
         );
         assert_eq!(
             manifest
+                .pointer("/clientCapabilities/packagePathInvocation/stewardRunMinimumVersion",)
+                .and_then(serde_json::Value::as_str),
+            Some("0.8.0")
+        );
+        assert_eq!(
+            manifest
                 .pointer(
                     "/clientCapabilities/vendoredWorkflowInstallation/stewardRunMinimumVersion",
                 )

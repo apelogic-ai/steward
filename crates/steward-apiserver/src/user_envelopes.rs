@@ -37,6 +37,7 @@ use crate::{
     ExecutionBindingAdvertisement, GithubActionsEnvelopeSelection, StewardRunRelease,
     StewardRunWorkflowInstallationMode, VersionedGithubActionsWorkflowContext,
     render_direct_package_github_actions_workflow, render_versioned_github_actions_workflow,
+    steward_run_supports_package_path_invocation,
 };
 
 pub const ENVELOPE_REQUESTS_API_VERSION: &str = "steward.envelope-requests/v1";
@@ -1309,7 +1310,15 @@ where
     let Some(reviewed_release) = state.broker.steward_run_release() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let invocation = body.invocation_path.as_ref().map(|_| InvocationManifest {
+    let invocation_path = match body.invocation_path {
+        Some(path) => Some(path),
+        None if steward_run_supports_package_path_invocation(&reviewed_release) => None,
+        None => match RelativePath::parse(".steward/invocations/browser-task.json") {
+            Ok(path) => Some(path),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
+    };
+    let invocation = invocation_path.as_ref().map(|_| InvocationManifest {
         contract_version: DIRECT_TASK_CONTRACT_VERSION.to_owned(),
         package: PackageReference {
             repository: body.repository.clone(),
@@ -1331,15 +1340,13 @@ where
     let workflow = match render_direct_package_github_actions_workflow(
         &DirectPackageGithubActionsWorkflowContext {
             envelope,
-            invocation_path: body
-                .invocation_path
+            invocation_path: invocation_path
                 .as_ref()
                 .map(|path| path.as_str().to_owned()),
-            package_path: body
-                .invocation_path
+            package_path: invocation_path
                 .is_none()
                 .then(|| body.package_path.as_str().to_owned()),
-            execution_log: if body.invocation_path.is_some() {
+            execution_log: if invocation_path.is_some() {
                 ExecutionLogMode::Off
             } else {
                 ExecutionLogMode::Full
@@ -1353,7 +1360,7 @@ where
         Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
     };
     let mut files = BTreeMap::new();
-    if let (Some(invocation_path), Some(invocation)) = (&body.invocation_path, invocation) {
+    if let (Some(invocation_path), Some(invocation)) = (&invocation_path, invocation) {
         let invocation_json = match serde_json::to_string_pretty(&invocation) {
             Ok(value) => value + "\n",
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1432,6 +1439,7 @@ mod tests {
         create_owners: Arc<Mutex<Vec<CanonicalUserId>>>,
         custom_capabilities_valid: bool,
         custom_platform_safety_valid: bool,
+        steward_run_version: String,
         workflow_installation_mode: StewardRunWorkflowInstallationMode,
         task_identity_discovery_enabled: bool,
     }
@@ -1442,6 +1450,7 @@ mod tests {
                 create_owners: Arc::new(Mutex::new(Vec::new())),
                 custom_capabilities_valid: true,
                 custom_platform_safety_valid: true,
+                steward_run_version: "0.7.6".to_owned(),
                 workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
                 task_identity_discovery_enabled: false,
             }
@@ -1452,7 +1461,7 @@ mod tests {
         fn steward_run_release(&self) -> Option<StewardRunRelease> {
             Some(StewardRunRelease {
                 manifest_schema_version: 3,
-                version: "0.7.6".to_owned(),
+                version: self.steward_run_version.clone(),
                 workflow_repository: "example-org/steward-run".to_owned(),
                 workflow_commit: "3333333333333333333333333333333333333333".to_owned(),
                 action_commit: "4444444444444444444444444444444444444444".to_owned(),
@@ -2085,9 +2094,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provisioned_envelope_renders_a_complete_direct_package_repository_bundle()
+    async fn provisioned_envelope_falls_back_for_a_release_without_package_path_support()
     -> Result<(), String> {
         let app = inner_router(TestBroker {
+            task_identity_discovery_enabled: true,
+            ..TestBroker::default()
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests/00000000-0000-0000-0000-000000000001/repository-bundle")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "repository": "https://github.com/example-org/agentic-ops.git",
+                            "packagePath": ".steward/tasks/browser-task/task-definition.json"
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build bundle request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("render bundle: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .map_err(|error| format!("read bundle response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse bundle response: {error}"))?;
+        assert_eq!(
+            value["files"].as_object().map(serde_json::Map::len),
+            Some(2)
+        );
+        assert!(value["files"][".steward/invocations/browser-task.json"].is_string());
+        let workflow = value["files"][".github/workflows/steward-browser-task.yml"]
+            .as_str()
+            .ok_or_else(|| "bundle omitted caller workflow".to_owned())?;
+        assert!(workflow.contains("invocation-path: .steward/invocations/browser-task.json"));
+        assert!(!workflow.contains("package-path:"));
+        assert!(!workflow.contains("execution-log:"));
+        assert!(workflow.contains(
+            "uses: example-org/steward-run/.github/workflows/steward-task-self-hosted.yml@3333333333333333333333333333333333333333"
+        ));
+        assert!(!workflow.contains("identity-exchange-url:"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provisioned_envelope_uses_two_file_bundle_for_a_capable_release() -> Result<(), String>
+    {
+        let app = inner_router(TestBroker {
+            steward_run_version: "0.8.0".to_owned(),
             task_identity_discovery_enabled: true,
             ..TestBroker::default()
         });
@@ -2128,10 +2188,6 @@ mod tests {
         );
         assert!(workflow.contains("execution-log: full"));
         assert!(!workflow.contains("invocation-path:"));
-        assert!(workflow.contains(
-            "uses: example-org/steward-run/.github/workflows/steward-task-self-hosted.yml@3333333333333333333333333333333333333333"
-        ));
-        assert!(!workflow.contains("identity-exchange-url:"));
         Ok(())
     }
 

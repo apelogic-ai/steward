@@ -410,6 +410,10 @@ pub fn validate_steward_run_workflow_installation(
     Ok(())
 }
 
+pub fn steward_run_supports_package_path_invocation(release: &StewardRunRelease) -> bool {
+    semver_is_at_least(&release.version, 0, 8, 0)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GithubActionsRenderError {
     InvalidRequest,
@@ -1158,6 +1162,19 @@ mod tests {
             Err("steward-run 0.7.0 or later is required for envelopeDigest".to_owned())
         );
         Ok(())
+    }
+
+    #[test]
+    fn package_path_invocation_requires_the_declared_steward_run_floor() {
+        let mut release = versioned_release();
+        release.version = "0.7.6".to_owned();
+        assert!(!super::steward_run_supports_package_path_invocation(
+            &release
+        ));
+        release.version = "0.8.0".to_owned();
+        assert!(super::steward_run_supports_package_path_invocation(
+            &release
+        ));
     }
 
     #[test]

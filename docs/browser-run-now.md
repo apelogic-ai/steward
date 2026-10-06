@@ -105,11 +105,12 @@ and records that exact model in the package requirements.
 After an inline run succeeds, its detail page offers **Save this task to a repository**.
 **Copy repository bundle** reads the exact persisted package from the successful run,
 then asks the server to render the handoff against the same provisioned Envelope and
-the deployment's reviewed `steward-run` release. The copied JSON file map contains the
-unchanged `task-definition.json` with its inline prompt and a caller workflow using
-`package-path` with the exact reusable-workflow commit. Committing those two files
-preserves the package closure digest proven by the inline run; release coordinates are
-never guessed by the browser client.
+the deployment's reviewed `steward-run` release. With `steward-run` v0.8.0 or later,
+the copied JSON file map contains the unchanged `task-definition.json` with its inline
+prompt and a caller workflow using `package-path`. Older reviewed releases receive the
+compatible invocation manifest and `invocation-path` workflow instead. Either bundle
+uses the exact reusable-workflow commit and preserves the package closure digest proven
+by the inline run; release coordinates are never guessed by the browser client.
 
 ## First-run prerequisite failures
 

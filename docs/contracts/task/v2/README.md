@@ -203,6 +203,12 @@ process logs.
 versions reject these unknown fields instead of executing different content. Existing
 manifest-backed submissions and path-backed prompts remain byte-for-byte compatible.
 
+Generated caller workflows use `package-path` with `steward-run` **0.8.0 or later**.
+When the configured reviewed release is older, Steward emits the compatible
+`invocation-path` bundle instead. For an implicit invocation, `invocation.digest`
+covers the synthesized canonical invocation manifest; it is not a digest of the
+TaskDefinition located at `invocation.path`.
+
 The Rust contract tests parse every positive semantic shape, exercise fail-closed
 version, path, privilege-injection, duplicate, diagnostic, and cross-source cases,
 verify canonical bytes, and compare the v1 compatibility fixture to the authoritative

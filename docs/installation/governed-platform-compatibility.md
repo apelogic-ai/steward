@@ -40,6 +40,10 @@ deprecated. New installations should choose Identity policy v6 with
 `steward-task-v3` so first-run subject enrollment and connection-verified
 association have explicit outcomes.
 
+Two-file repository generation through `package-path` requires `steward-run`
+v0.8.0 or later. When the reviewed release projected into Steward is older, the
+browser generator emits the compatible three-file `invocation-path` bundle.
+
 Download and verify it from the Steward release:
 
 ```sh

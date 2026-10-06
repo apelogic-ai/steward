@@ -13,9 +13,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   execution-log diagnostics and immutable implicit-invocation evidence. Existing
   invocation manifests remain the cross-repository mechanism.
 - Added `promptText` as a bounded inline alternative to a prompt file in
-  `steward.task-definition/v2`. Run now and Save this task now produce the two-file
-  repository path: one TaskDefinition and one caller workflow. These fields require
-  Steward 0.3.9 or later.
+  `steward.task-definition/v2`. Save this task now produces the two-file repository
+  path with `steward-run` 0.8.0 or later and falls back to the compatible invocation
+  manifest for older reviewed releases. These fields require Steward 0.3.9 or later.
 
 ## [0.3.8] - 2026-10-05
 
