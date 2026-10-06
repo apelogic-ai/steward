@@ -544,7 +544,11 @@ async function startWeb() {
           response.end(JSON.stringify({
             apiVersion: "steward.envelope-requests/v1",
             files: {
-              ".github/workflows/steward-browser-task.yml": "name: Steward governed run\n      package-path: task-definition.json\n",
+              ".github/workflows/steward-browser-task.yml": [
+                "name: Steward governed run",
+                `      package-path: ${browserTaskDefinitionPath}`,
+                "",
+              ].join("\n"),
             },
           }));
           return;
