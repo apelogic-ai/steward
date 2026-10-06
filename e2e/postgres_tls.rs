@@ -993,53 +993,113 @@ async fn assert_github_repository_automation_upgrade_result(
     );
 
     let mut transaction = store.pool().begin().await?;
-    for (version, digest, gateway) in [
+    let probes = [
         (
+            "00000000-0000-0000-0000-000000000058",
+            "00000000-0000-0000-0000-000000001058",
             1_i64,
             "sha256:7735d22e083daef4bdbd51bb63a652720ef06f5499422e7a8eef4930a6c58663",
             "0.3.2",
+            "status",
         ),
         (
+            "00000000-0000-0000-0000-000000000059",
+            "00000000-0000-0000-0000-000000001059",
             2_i64,
             "sha256:9a572bcefa75b6f2b5b4931d8604c1ad3f3e7560e0e0c2843646ec4f7853ef02",
             "0.4.9",
+            "status",
         ),
         (
+            "00000000-0000-0000-0000-000000000060",
+            "00000000-0000-0000-0000-000000001060",
             3_i64,
             "sha256:d5878c6ae538174c5e0c32ac6aa4617f4ac8e6787b1495b08bd5af9e48f7fbe3",
             "0.4.9",
+            "status",
         ),
-    ] {
+        (
+            "00000000-0000-0000-0000-000000000061",
+            "00000000-0000-0000-0000-000000001061",
+            4_i64,
+            "sha256:6ece401f71b5c71939ef1580b438505380b4f12d29a6fd717ac78a9d9c93848a",
+            "0.4.9",
+            "dispatch",
+        ),
+    ];
+    for (task_uid, probe_operation_id, version, digest, gateway, operation_kind) in probes {
         sqlx::query(
-            "UPDATE connection_operations \
-             SET operation_kind = 'status', authority_version = $2, \
-                 authority_digest = $3, mcp_gw_version = $4 \
-             WHERE operation_id = $1::text::uuid",
+            "INSERT INTO task_submissions (\
+                 task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
+                 owner, owner_user_id, identity_binding_state, workflow, workflow_name, workflow_version, \
+                 workflow_digest, user_envelope_instance_id, user_envelope_revision, \
+                 user_envelope_digest, authority_kind, user_envelope_snapshot, internal_authority_id, \
+                 internal_authority_version, internal_authority_digest, coding_agent_runtime, runtime_uid, \
+                 runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
+                 finalize_requested, finalized, failure_reason, agent_command, execution_binding, \
+                 direct_task_evidence, envelope_revision, orchestration_version, orchestration_operation_id, \
+                 candidate_digest, service_envelope_digest, original_admission_decision, original_admission_deltas) \
+             SELECT $1::text::uuid, $4, 'steward-connections', acting_user, acting_user_id, \
+                    owner, owner_user_id, identity_binding_state, 'connections.github.status', \
+                    NULL, NULL, NULL, NULL, NULL, NULL, 'internal', NULL, 'steward-connections', \
+                    $2, $3, coding_agent_runtime, NULL, runtime_namespace, \
+                    'task-migration-0064', runtime_ownership, 'failed', runtime_spec, true, true, \
+                    'upgrade_fixture', agent_command, execution_binding, NULL, envelope_revision, \
+                    orchestration_version, $5::text::uuid, candidate_digest, service_envelope_digest, \
+                    original_admission_decision, original_admission_deltas \
+             FROM task_submissions \
+             WHERE task_uid = '00000000-0000-0000-0000-000000000003'",
         )
-        .bind(operation_id)
+        .bind(task_uid)
+        .bind(version)
+        .bind(digest)
+        .bind(format!("migration-0064-authority-v{version}"))
+        .bind(probe_operation_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO connection_operations (\
+                 operation_id, task_uid, canonical_user_id, provider, operation_kind, \
+                 submitter_service, authority_id, authority_version, authority_digest, \
+                 runtime_spec_snapshot, command_snapshot, artifact_trust_mode, bridge_image_digest, \
+                 mcp_gw_origin, mcp_gw_version, runtime_namespace, runtime_class, \
+                 idempotency_identity, response_deadline_at) \
+             VALUES (\
+                 $1::text::uuid, $2::text::uuid, \
+                 'usr_0123456789abcdef0123456789abcdef', 'github', $7, \
+                 'steward-connections', 'steward-connections', $3, $4, '{}'::jsonb, \
+                 '[]'::jsonb, 'github-attestation', \
+                 'ghcr.io/example-org/connections-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+                 'https://gateway.example.test', $5, 'steward-workflows', '', \
+                 $6, now() + interval '1 minute')",
+        )
+        .bind(probe_operation_id)
+        .bind(task_uid)
         .bind(version)
         .bind(digest)
         .bind(gateway)
+        .bind(format!("migration-0064-authority-v{version}"))
+        .bind(operation_kind)
         .execute(&mut *transaction)
         .await?;
+        if version < 4 {
+            sqlx::query(
+                "UPDATE connection_operations SET operation_state = 'succeeded' \
+                 WHERE operation_id = $1::text::uuid",
+            )
+            .bind(probe_operation_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
     }
-    sqlx::query(
-        "UPDATE connection_operations \
-         SET operation_kind = 'dispatch', authority_version = 4, \
-             authority_digest = 'sha256:6ece401f71b5c71939ef1580b438505380b4f12d29a6fd717ac78a9d9c93848a', \
-             mcp_gw_version = '0.4.9' \
-         WHERE operation_id = $1::text::uuid",
-    )
-    .bind(operation_id)
-    .execute(&mut *transaction)
-    .await?;
+    let v4_operation_id = "00000000-0000-0000-0000-000000001061";
     let downgraded = sqlx::query(
         "UPDATE connection_operations \
          SET authority_version = 3, \
              authority_digest = 'sha256:d5878c6ae538174c5e0c32ac6aa4617f4ac8e6787b1495b08bd5af9e48f7fbe3' \
          WHERE operation_id = $1::text::uuid",
     )
-    .bind(operation_id)
+    .bind(v4_operation_id)
     .execute(&mut *transaction)
     .await;
     assert!(
