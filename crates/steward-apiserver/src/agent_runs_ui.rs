@@ -19,11 +19,12 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunOutputArchive, AgentRunPage, AgentRunQuery,
-    AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind, StoreError, TaskRecord,
+    AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind, BrowserTaskVersionPublication,
+    BrowserTaskVersionRecord, StoreError, TaskRecord, WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
     AgentRef, ContentDigest, DirectRequirements, DirectTaskDefinition, ExecutionLogMode,
-    PromptSourceKind, RuntimeSelection, TaskOrigin,
+    PackageClosure, PromptSourceKind, RelativePath, RuntimeSelection, TaskOrigin,
 };
 use steward_types::task_output_archive::{
     TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputArchiveCompatibility, TaskOutputArchiveEntry,
@@ -478,9 +479,62 @@ pub(crate) struct BrowserTaskQuery {
     cursor: Option<Uuid>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SaveBrowserTaskRequest {
+    #[schema(value_type = Option<String>, format = "uuid")]
+    task_id: Option<Uuid>,
+    path: RelativePath,
+    #[schema(value_type = Object)]
+    files: BTreeMap<String, String>,
+    #[serde(default)]
+    shared_roles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserTaskVersionView {
+    version: u64,
+    content_digest: String,
+    created_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserTaskListItem {
+    #[schema(value_type = Option<String>, format = "uuid")]
+    task_id: Option<Uuid>,
+    content_digest: String,
+    source: String,
+    revision: String,
+    path: String,
+    name: String,
+    version: u64,
+    owned: bool,
+    editable: bool,
+    shared_roles: Vec<String>,
+    updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserTasksResponse {
+    api_version: &'static str,
+    tasks: Vec<BrowserTaskListItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SaveBrowserTaskResponse {
+    api_version: &'static str,
+    task: BrowserTaskListItem,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BrowserTaskView {
+    #[schema(value_type = Option<String>, format = "uuid")]
+    task_id: Option<Uuid>,
     content_digest: String,
     source: String,
     revision: String,
@@ -490,6 +544,11 @@ pub(crate) struct BrowserTaskView {
     runtime: RuntimeSelection,
     requires: Option<DirectRequirements>,
     files: BTreeMap<String, String>,
+    closure: Option<PackageClosure>,
+    owned: bool,
+    editable: bool,
+    shared_roles: Vec<String>,
+    versions: Vec<BrowserTaskVersionView>,
     runs: Vec<BrowserRunView>,
     #[schema(value_type = Option<String>, format = "uuid")]
     next_cursor: Option<Uuid>,
@@ -784,6 +843,10 @@ where
     L: AgentRunLedger,
 {
     Router::new()
+        .route(
+            "/app/api/v1/tasks",
+            get(my_tasks::<L>).post(save_my_task::<L>),
+        )
         .route("/app/api/v1/tasks/{content_digest}", get(my_task::<L>))
         .route("/app/api/v1/runs", get(my_runs::<L>))
         .route("/app/api/v1/runs/{task_uid}", get(my_run::<L>))
@@ -892,38 +955,136 @@ where
         .map(browser_run_view)
         .collect::<Vec<_>>();
 
-    let inline = match state
+    let saved = match state
         .ledger
-        .inline_browser_task_by_digest(owner_user_id, &content_digest)
+        .browser_task_version_by_digest(
+            owner_user_id,
+            &session.principal.member_roles,
+            &content_digest,
+        )
         .await
     {
         Ok(record) => record,
         Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let task = if let Some(record) = inline {
-        let Some(evidence) = record.browser_task_evidence else {
+    let executed = match state
+        .ledger
+        .browser_task_by_digest(owner_user_id, &content_digest)
+        .await
+    {
+        Ok(record) => record,
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let task = if let Some(record) = saved {
+        let definition = match saved_task_definition(&record) {
+            Ok(definition) => definition,
+            Err(()) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        let package_path = match RelativePath::parse(record.package_path.clone()) {
+            Ok(path) => path,
+            Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        let Some(definition_source) = record.files.get(&record.package_path) else {
             return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
         };
-        let Some(files) = evidence.inline_files else {
-            return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
+        let (_, closure, computed_digest) = match crate::tasks::resolve_inline_package_closure(
+            &package_path,
+            &definition,
+            definition_source.as_bytes(),
+            &record.files,
+        ) {
+            Ok(resolved) => resolved,
+            Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
         };
-        let Some(definition_source) = files.get(evidence.path.as_str()) else {
+        if computed_digest.as_str() != record.content_digest {
             return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        let owned = record.owner_user_id == owner_user_id;
+        let version_records = if owned {
+            match state
+                .ledger
+                .browser_task_draft_versions(owner_user_id, record.task_id)
+                .await
+            {
+                Ok(records) => records,
+                Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+            }
+        } else {
+            vec![record.clone()]
         };
-        let definition = match serde_json::from_str::<DirectTaskDefinition>(definition_source) {
-            Ok(definition) if definition.validate().is_ok() => definition,
-            _ => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+        let versions = match browser_task_version_views(version_records) {
+            Ok(versions) => versions,
+            Err(()) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
         };
         BrowserTaskView {
+            task_id: Some(record.task_id),
             content_digest,
-            source: evidence.source,
-            revision: evidence.revision,
-            path: evidence.path.as_str().to_owned(),
+            source: "inline".to_owned(),
+            revision: record.content_digest,
+            path: record.package_path,
             name: definition.name.as_str().to_owned(),
             version: definition.version,
             runtime: definition.runtime,
             requires: definition.requires,
+            files: record.files,
+            closure: Some(closure),
+            owned,
+            editable: owned,
+            shared_roles: record.shared_roles,
+            versions,
+            runs,
+            next_cursor: page.next_cursor,
+            publication_task_uid,
+        }
+    } else if let Some(record) = executed {
+        let Some(evidence) = record.browser_task_evidence else {
+            return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        let files = evidence.inline_files.clone().unwrap_or_default();
+        let definition = if evidence.source == "inline" {
+            let Some(definition_source) = files.get(evidence.path.as_str()) else {
+                return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
+            };
+            match serde_json::from_str::<DirectTaskDefinition>(definition_source) {
+                Ok(definition) if definition.validate().is_ok() => Some(definition),
+                _ => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+            }
+        } else {
+            None
+        };
+        let (name, version) = match definition.as_ref() {
+            Some(definition) => (definition.name.as_str().to_owned(), definition.version),
+            None => match direct_workflow_identity(&record.workflow) {
+                Some(identity) => identity,
+                None => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+            },
+        };
+        let runtime = match definition.as_ref() {
+            Some(definition) => definition.runtime.clone(),
+            None => match AgentRef::parse(record.coding_agent_runtime.clone()) {
+                Ok(agent_ref) => RuntimeSelection {
+                    agent_ref,
+                    model: None,
+                },
+                Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+            },
+        };
+        BrowserTaskView {
+            task_id: None,
+            content_digest,
+            source: evidence.source,
+            revision: evidence.revision,
+            path: evidence.path.as_str().to_owned(),
+            name,
+            version,
+            runtime,
+            requires: definition.and_then(|definition| definition.requires),
             files,
+            closure: evidence.closure,
+            owned: true,
+            editable: false,
+            shared_roles: Vec::new(),
+            versions: Vec::new(),
             runs,
             next_cursor: page.next_cursor,
             publication_task_uid: publication_task_uid.or_else(|| {
@@ -949,10 +1110,11 @@ where
             Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
         };
         BrowserTaskView {
+            task_id: None,
             content_digest: workflow.content_digest.clone(),
             source: format!("steward:registry/{}", workflow.name),
             revision: format!("steward:version:{}", workflow.version),
-            path: "prompt.md".to_owned(),
+            path: "task-definition.json".to_owned(),
             name: workflow.name,
             version: match u64::try_from(workflow.version) {
                 Ok(version) => version,
@@ -964,6 +1126,11 @@ where
             },
             requires: None,
             files: BTreeMap::from([("prompt.md".to_owned(), workflow.prompt)]),
+            closure: None,
+            owned: false,
+            editable: false,
+            shared_roles: Vec::new(),
+            versions: Vec::new(),
             runs,
             next_cursor: page.next_cursor,
             publication_task_uid: None,
@@ -1037,6 +1204,282 @@ where
         }
         Err(_) => browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
     }
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "myTasks",
+    path = "/app/api/v1/tasks",
+    responses(
+        (status = 200, body = BrowserTasksResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 503, description = "Task library is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn my_tasks<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    State(state): State<BrowserRunsState<L>>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let owner_user_id = session.principal.canonical_user_id.as_str();
+    let saved = match state
+        .ledger
+        .browser_task_versions(owner_user_id, &session.principal.member_roles)
+        .await
+    {
+        Ok(saved) => saved,
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let executed = match state.ledger.browser_tasks_for_owner(owner_user_id).await {
+        Ok(executed) => executed,
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let workflows = match state.ledger.list_latest_workflows().await {
+        Ok(workflows) => workflows,
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+
+    let mut tasks = BTreeMap::<String, BrowserTaskListItem>::new();
+    for record in saved {
+        let item = match saved_task_list_item(&record, owner_user_id) {
+            Ok(item) => item,
+            Err(()) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        tasks.insert(item.content_digest.clone(), item);
+    }
+    for record in executed {
+        let Some(item) = executed_task_list_item(&record) else {
+            return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        tasks.entry(item.content_digest.clone()).or_insert(item);
+    }
+    for workflow in workflows {
+        let Some(item) = workflow_task_list_item(workflow) else {
+            return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        tasks.entry(item.content_digest.clone()).or_insert(item);
+    }
+    let mut tasks = tasks.into_values().collect::<Vec<_>>();
+    tasks.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| right.version.cmp(&left.version))
+    });
+    Json(BrowserTasksResponse {
+        api_version: BROWSER_TASKS_API_VERSION,
+        tasks,
+    })
+    .into_response()
+}
+
+#[utoipa::path(
+    post,
+    operation_id = "saveMyTask",
+    path = "/app/api/v1/tasks",
+    request_body = SaveBrowserTaskRequest,
+    responses(
+        (status = 200, body = SaveBrowserTaskResponse),
+        (status = 201, body = SaveBrowserTaskResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "CSRF proof is invalid or a sharing role is unauthorized"),
+        (status = 404, description = "The owner-scoped Task draft does not exist"),
+        (status = 409, description = "The Task version is not the next immutable version"),
+        (status = 422, description = "The Task package is invalid"),
+        (status = 503, description = "Task library is unavailable")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn save_my_task<L>(
+    session: Option<Extension<BrowserSessionContext>>,
+    proof: Option<Extension<BrowserMutationProof>>,
+    State(state): State<BrowserRunsState<L>>,
+    Json(mut body): Json<SaveBrowserTaskRequest>,
+) -> Response
+where
+    L: AgentRunLedger,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if proof.is_none() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    body.shared_roles.sort();
+    if body.shared_roles.len() > 32
+        || body
+            .shared_roles
+            .windows(2)
+            .any(|roles| roles[0] == roles[1])
+        || body
+            .shared_roles
+            .iter()
+            .any(|role| !session.principal.member_roles.contains(role))
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(definition_source) = body.files.get(body.path.as_str()) else {
+        return browser_runs_error(StatusCode::UNPROCESSABLE_ENTITY);
+    };
+    let definition = match serde_json::from_str::<DirectTaskDefinition>(definition_source) {
+        Ok(definition) if definition.validate().is_ok() => definition,
+        _ => return browser_runs_error(StatusCode::UNPROCESSABLE_ENTITY),
+    };
+    if body.task_id.is_none() && definition.version != 1 {
+        return browser_runs_error(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let (_, _, content_digest) = match crate::tasks::resolve_inline_package_closure(
+        &body.path,
+        &definition,
+        definition_source.as_bytes(),
+        &body.files,
+    ) {
+        Ok(resolved) => resolved,
+        Err(_) => return browser_runs_error(StatusCode::UNPROCESSABLE_ENTITY),
+    };
+    let version = match i64::try_from(definition.version) {
+        Ok(version) if version > 0 => version,
+        _ => return browser_runs_error(StatusCode::UNPROCESSABLE_ENTITY),
+    };
+    let creating = body.task_id.is_none();
+    let task_id = body.task_id.unwrap_or_else(Uuid::new_v4);
+    let owner_user_id = session.principal.canonical_user_id.as_str();
+    let record = match state
+        .ledger
+        .save_browser_task_version(BrowserTaskVersionPublication {
+            task_id,
+            owner_user_id,
+            name: definition.name.as_str(),
+            shared_roles: &body.shared_roles,
+            version,
+            content_digest: content_digest.as_str(),
+            package_path: body.path.as_str(),
+            files: &body.files,
+        })
+        .await
+    {
+        Ok(record) => record,
+        Err(StoreError::TaskNotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(StoreError::TaskIdempotencyConflict) => {
+            return browser_runs_error(StatusCode::CONFLICT);
+        }
+        Err(StoreError::InvalidTaskTransition) => {
+            return browser_runs_error(StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let task = match saved_task_list_item(&record, owner_user_id) {
+        Ok(task) => task,
+        Err(()) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    (
+        if creating {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(SaveBrowserTaskResponse {
+            api_version: BROWSER_TASKS_API_VERSION,
+            task,
+        }),
+    )
+        .into_response()
+}
+
+fn saved_task_definition(record: &BrowserTaskVersionRecord) -> Result<DirectTaskDefinition, ()> {
+    let source = record.files.get(&record.package_path).ok_or(())?;
+    let definition = serde_json::from_str::<DirectTaskDefinition>(source).map_err(|_| ())?;
+    definition.validate().map_err(|_| ())?;
+    if definition.name.as_str() != record.name
+        || i64::try_from(definition.version).ok() != Some(record.version)
+    {
+        return Err(());
+    }
+    Ok(definition)
+}
+
+fn saved_task_list_item(
+    record: &BrowserTaskVersionRecord,
+    viewer_user_id: &str,
+) -> Result<BrowserTaskListItem, ()> {
+    let definition = saved_task_definition(record)?;
+    Ok(BrowserTaskListItem {
+        task_id: Some(record.task_id),
+        content_digest: record.content_digest.clone(),
+        source: "inline".to_owned(),
+        revision: record.content_digest.clone(),
+        path: record.package_path.clone(),
+        name: definition.name.as_str().to_owned(),
+        version: definition.version,
+        owned: record.owner_user_id == viewer_user_id,
+        editable: record.owner_user_id == viewer_user_id,
+        shared_roles: record.shared_roles.clone(),
+        updated_at: Some(record.updated_at.clone()),
+    })
+}
+
+fn browser_task_version_views(
+    records: Vec<BrowserTaskVersionRecord>,
+) -> Result<Vec<BrowserTaskVersionView>, ()> {
+    records
+        .into_iter()
+        .map(|record| {
+            Ok(BrowserTaskVersionView {
+                version: u64::try_from(record.version).map_err(|_| ())?,
+                content_digest: record.content_digest,
+                created_at: record.created_at,
+            })
+        })
+        .collect()
+}
+
+fn direct_workflow_identity(workflow: &str) -> Option<(String, u64)> {
+    let (name, version) = workflow.strip_prefix("direct:")?.rsplit_once('@')?;
+    let version = version.parse::<u64>().ok().filter(|version| *version > 0)?;
+    Some((name.to_owned(), version))
+}
+
+fn executed_task_list_item(record: &AgentRunRecord) -> Option<BrowserTaskListItem> {
+    let evidence = record.browser_task_evidence.as_ref()?;
+    let (name, version) = direct_workflow_identity(&record.workflow)?;
+    Some(BrowserTaskListItem {
+        task_id: None,
+        content_digest: evidence.closure_digest.as_str().to_owned(),
+        source: evidence.source.clone(),
+        revision: evidence.revision.clone(),
+        path: evidence.path.as_str().to_owned(),
+        name,
+        version,
+        owned: true,
+        editable: false,
+        shared_roles: Vec::new(),
+        updated_at: Some(record.updated_at.clone()),
+    })
+}
+
+fn workflow_task_list_item(workflow: WorkflowRevisionRecord) -> Option<BrowserTaskListItem> {
+    Some(BrowserTaskListItem {
+        task_id: None,
+        content_digest: workflow.content_digest,
+        source: format!("steward:registry/{}", workflow.name),
+        revision: format!("steward:version:{}", workflow.version),
+        path: "task-definition.json".to_owned(),
+        name: workflow.name,
+        version: u64::try_from(workflow.version)
+            .ok()
+            .filter(|version| *version > 0)?,
+        owned: false,
+        editable: false,
+        shared_roles: Vec::new(),
+        updated_at: Some(workflow.published_at),
+    })
 }
 
 #[utoipa::path(
@@ -2496,6 +2939,7 @@ mod tests {
         github_matches: Arc<Mutex<VecDeque<Option<TaskRecord>>>>,
         github_queries: Arc<Mutex<Vec<GithubRerunQuery>>>,
         workflow_revisions: Arc<Mutex<Vec<WorkflowRevisionRecord>>>,
+        task_versions: Arc<Mutex<Vec<BrowserTaskVersionRecord>>>,
     }
 
     impl AgentRunLedger for FakeLedger {
@@ -2593,6 +3037,171 @@ mod tests {
                     .iter()
                     .find(|workflow| workflow.content_digest == content_digest)
                     .cloned())
+            })
+        }
+
+        fn browser_tasks_for_owner<'a>(
+            &'a self,
+            owner_user_id: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<AgentRunRecord>, StoreError>> {
+            Box::pin(async move {
+                Ok(self
+                    .records
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?
+                    .iter()
+                    .filter(|record| {
+                        record.owner_user_id.as_deref() == Some(owner_user_id)
+                            && record.browser_task_evidence.is_some()
+                    })
+                    .cloned()
+                    .collect())
+            })
+        }
+
+        fn browser_task_by_digest<'a>(
+            &'a self,
+            owner_user_id: &'a str,
+            package_digest: &'a str,
+        ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
+            Box::pin(async move {
+                Ok(self
+                    .records
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?
+                    .iter()
+                    .find(|record| {
+                        record.owner_user_id.as_deref() == Some(owner_user_id)
+                            && record
+                                .browser_task_evidence
+                                .as_ref()
+                                .is_some_and(|evidence| {
+                                    evidence.closure_digest.as_str() == package_digest
+                                })
+                    })
+                    .cloned())
+            })
+        }
+
+        fn browser_task_versions<'a>(
+            &'a self,
+            viewer_user_id: &'a str,
+            viewer_roles: &'a [String],
+        ) -> BoxFuture<'a, Result<Vec<BrowserTaskVersionRecord>, StoreError>> {
+            Box::pin(async move {
+                Ok(self
+                    .task_versions
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?
+                    .iter()
+                    .filter(|record| {
+                        record.owner_user_id == viewer_user_id
+                            || record
+                                .shared_roles
+                                .iter()
+                                .any(|role| viewer_roles.contains(role))
+                    })
+                    .cloned()
+                    .collect())
+            })
+        }
+
+        fn browser_task_version_by_digest<'a>(
+            &'a self,
+            viewer_user_id: &'a str,
+            viewer_roles: &'a [String],
+            content_digest: &'a str,
+        ) -> BoxFuture<'a, Result<Option<BrowserTaskVersionRecord>, StoreError>> {
+            Box::pin(async move {
+                Ok(self
+                    .task_versions
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?
+                    .iter()
+                    .find(|record| {
+                        record.content_digest == content_digest
+                            && (record.owner_user_id == viewer_user_id
+                                || record
+                                    .shared_roles
+                                    .iter()
+                                    .any(|role| viewer_roles.contains(role)))
+                    })
+                    .cloned())
+            })
+        }
+
+        fn browser_task_draft_versions<'a>(
+            &'a self,
+            owner_user_id: &'a str,
+            task_id: Uuid,
+        ) -> BoxFuture<'a, Result<Vec<BrowserTaskVersionRecord>, StoreError>> {
+            Box::pin(async move {
+                Ok(self
+                    .task_versions
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?
+                    .iter()
+                    .filter(|record| {
+                        record.task_id == task_id && record.owner_user_id == owner_user_id
+                    })
+                    .cloned()
+                    .collect())
+            })
+        }
+
+        fn save_browser_task_version<'a>(
+            &'a self,
+            publication: BrowserTaskVersionPublication<'a>,
+        ) -> BoxFuture<'a, Result<BrowserTaskVersionRecord, StoreError>> {
+            Box::pin(async move {
+                let mut records = self
+                    .task_versions
+                    .lock()
+                    .map_err(|_| StoreError::InvalidRunQuery)?;
+                let current = records
+                    .iter()
+                    .filter(|record| record.task_id == publication.task_id)
+                    .map(|record| record.version)
+                    .max()
+                    .unwrap_or(0);
+                if publication.version != current + 1 {
+                    return Err(StoreError::TaskIdempotencyConflict);
+                }
+                if current > 0
+                    && records.iter().any(|record| {
+                        record.task_id == publication.task_id
+                            && (record.owner_user_id != publication.owner_user_id
+                                || record.name != publication.name)
+                    })
+                {
+                    return Err(StoreError::TaskNotFound);
+                }
+                let record = BrowserTaskVersionRecord {
+                    task_id: publication.task_id,
+                    owner_user_id: publication.owner_user_id.to_owned(),
+                    name: publication.name.to_owned(),
+                    shared_roles: publication.shared_roles.to_vec(),
+                    version: publication.version,
+                    content_digest: publication.content_digest.to_owned(),
+                    package_path: publication.package_path.to_owned(),
+                    files: publication.files.clone(),
+                    created_at: format!("2026-01-01T00:00:0{}Z", publication.version),
+                    updated_at: format!("2026-01-01T00:00:0{}Z", publication.version),
+                };
+                records.push(record.clone());
+                Ok(record)
+            })
+        }
+
+        fn list_latest_workflows(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<WorkflowRevisionRecord>, StoreError>> {
+            Box::pin(async move {
+                Ok(self
+                    .workflow_revisions
+                    .lock()
+                    .map_err(|_| StoreError::InvalidWorkflow)?
+                    .clone())
             })
         }
 
@@ -4155,6 +4764,136 @@ mod tests {
             body["task"]["files"]["prompt.md"],
             "Summarize the release.\n"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_library_saves_immutable_versions_and_preserves_each_digest_route()
+    -> Result<(), String> {
+        fn save_body(version: u64, prompt: &str, task_id: Option<String>) -> serde_json::Value {
+            let definition = serde_json::json!({
+                "schemaVersion": "steward.task-definition/v2",
+                "name": "release-review",
+                "version": version,
+                "runtime": {"agentRef": "example-agent@1.0.0"},
+                "promptText": prompt,
+                "outputs": [{"path": "out", "kind": "directory", "required": true}]
+            });
+            serde_json::json!({
+                "taskId": task_id,
+                "path": "task-definition.json",
+                "files": {"task-definition.json": definition.to_string()},
+                "sharedRoles": []
+            })
+        }
+
+        async fn save(
+            app: &Router,
+            cookie: &str,
+            csrf: &str,
+            body: serde_json::Value,
+        ) -> Result<(StatusCode, serde_json::Value), String> {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/app/api/v1/tasks")
+                        .header(header::COOKIE, cookie)
+                        .header(header::ORIGIN, "http://127.0.0.1:33001")
+                        .header("sec-fetch-site", "same-origin")
+                        .header("x-steward-csrf", csrf)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .map_err(|error| format!("build Task save request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("execute Task save request: {error}"))?;
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 32 * 1024)
+                .await
+                .map_err(|error| format!("read Task save response: {error}"))?;
+            let body = serde_json::from_slice(&body)
+                .map_err(|error| format!("decode Task save response: {error}"))?;
+            Ok((status, body))
+        }
+
+        let ledger = FakeLedger::default();
+        let (service, session_cookie, csrf) =
+            signed_in_cookie_and_csrf(LocalFakeIdentity::User).await?;
+        let app = protected_router(ledger, service);
+        let (status, v1) = save(
+            &app,
+            &session_cookie,
+            &csrf,
+            save_body(1, "Review release one.", None),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        let task_id = v1["task"]["taskId"]
+            .as_str()
+            .ok_or_else(|| "v1 response omitted taskId".to_owned())?
+            .to_owned();
+        let v1_digest = v1["task"]["contentDigest"]
+            .as_str()
+            .ok_or_else(|| "v1 response omitted digest".to_owned())?
+            .to_owned();
+
+        let (status, v2) = save(
+            &app,
+            &session_cookie,
+            &csrf,
+            save_body(2, "Review release two.", Some(task_id)),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        let v2_digest = v2["task"]["contentDigest"]
+            .as_str()
+            .ok_or_else(|| "v2 response omitted digest".to_owned())?
+            .to_owned();
+        assert_ne!(v1_digest, v2_digest);
+
+        for (digest, version) in [(&v1_digest, 1), (&v2_digest, 2)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/app/api/v1/tasks/{digest}"))
+                        .header(header::COOKIE, &session_cookie)
+                        .body(Body::empty())
+                        .map_err(|error| format!("build Task detail request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("execute Task detail request: {error}"))?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), 32 * 1024)
+                    .await
+                    .map_err(|error| format!("read Task detail response: {error}"))?,
+            )
+            .map_err(|error| format!("decode Task detail response: {error}"))?;
+            assert_eq!(body["task"]["version"], version);
+            assert_eq!(body["task"]["versions"].as_array().map(Vec::len), Some(2));
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/tasks")
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build Task list request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute Task list request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 32 * 1024)
+                .await
+                .map_err(|error| format!("read Task list response: {error}"))?,
+        )
+        .map_err(|error| format!("decode Task list response: {error}"))?;
+        assert_eq!(body["tasks"].as_array().map(Vec::len), Some(2));
         Ok(())
     }
 

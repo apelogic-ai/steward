@@ -700,6 +700,20 @@ export type BrowserTaskEvidence = {
     source: string;
 };
 
+export type BrowserTaskListItem = {
+    contentDigest: string;
+    editable: boolean;
+    name: string;
+    owned: boolean;
+    path: string;
+    revision: string;
+    sharedRoles: Array<string>;
+    source: string;
+    taskId?: string | null;
+    updatedAt?: string | null;
+    version: number;
+};
+
 export type BrowserTaskResponse = {
     apiVersion: string;
     task: BrowserTaskView;
@@ -712,21 +726,38 @@ export type BrowserTaskSubmission = {
     package: BrowserPackageLocator;
 };
 
-export type BrowserTaskView = {
+export type BrowserTaskVersionView = {
     contentDigest: string;
+    createdAt: string;
+    version: number;
+};
+
+export type BrowserTaskView = {
+    closure?: null | PackageClosure;
+    contentDigest: string;
+    editable: boolean;
     files: {
         [key: string]: string;
     };
     name: string;
     nextCursor?: string | null;
+    owned: boolean;
     path: string;
     publicationTaskUid?: string | null;
     requires?: null | DirectRequirements;
     revision: string;
     runs: Array<BrowserRunView>;
     runtime: RuntimeSelection;
+    sharedRoles: Array<string>;
     source: string;
+    taskId?: string | null;
     version: number;
+    versions: Array<BrowserTaskVersionView>;
+};
+
+export type BrowserTasksResponse = {
+    apiVersion: string;
+    tasks: Array<BrowserTaskListItem>;
 };
 
 export type BrowserTheme = 'light' | 'dark' | 'system';
@@ -1454,6 +1485,20 @@ export type RuntimeOwnership = 'provisioned' | 'adopted';
 export type RuntimeSelection = {
     agentRef: AgentRef;
     model?: null | ModelRequirement;
+};
+
+export type SaveBrowserTaskRequest = {
+    files: {
+        [key: string]: unknown;
+    };
+    path: RelativePath;
+    sharedRoles?: Array<string>;
+    taskId?: string | null;
+};
+
+export type SaveBrowserTaskResponse = {
+    apiVersion: string;
+    task: BrowserTaskListItem;
 };
 
 export type SessionPrincipalResponse = {
@@ -4648,6 +4693,71 @@ export type MyRunTimelineResponses = {
 };
 
 export type MyRunTimelineResponse = MyRunTimelineResponses[keyof MyRunTimelineResponses];
+
+export type MyTasksData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/tasks';
+};
+
+export type MyTasksErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Task library is unavailable
+     */
+    503: unknown;
+};
+
+export type MyTasksResponses = {
+    200: BrowserTasksResponse;
+};
+
+export type MyTasksResponse = MyTasksResponses[keyof MyTasksResponses];
+
+export type SaveMyTaskData = {
+    body: SaveBrowserTaskRequest;
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/tasks';
+};
+
+export type SaveMyTaskErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * CSRF proof is invalid or a sharing role is unauthorized
+     */
+    403: unknown;
+    /**
+     * The owner-scoped Task draft does not exist
+     */
+    404: unknown;
+    /**
+     * The Task version is not the next immutable version
+     */
+    409: unknown;
+    /**
+     * The Task package is invalid
+     */
+    422: unknown;
+    /**
+     * Task library is unavailable
+     */
+    503: unknown;
+};
+
+export type SaveMyTaskResponses = {
+    200: SaveBrowserTaskResponse;
+    201: SaveBrowserTaskResponse;
+};
+
+export type SaveMyTaskResponse = SaveMyTaskResponses[keyof SaveMyTaskResponses];
 
 export type MyTaskData = {
     body?: never;

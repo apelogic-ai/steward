@@ -20,8 +20,9 @@ describe("primary navigation", () => {
     expect(isActive("/admin/settings", "/settings")).toBe(false);
   });
 
-  test("keeps immutable Task detail in the Runs workspace", () => {
-    expect(isActive("/tasks/steward%3Asha256%3Aexample", "/runs")).toBe(true);
+  test("keeps Task library and detail in the Tasks workspace", () => {
+    expect(isActive("/tasks/steward%3Asha256%3Aexample", "/tasks")).toBe(true);
+    expect(isActive("/tasks/steward%3Asha256%3Aexample", "/runs")).toBe(false);
   });
 });
 

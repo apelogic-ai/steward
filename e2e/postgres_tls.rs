@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::io;
@@ -23,9 +24,10 @@ use steward_apiserver::governed_connections::{
 use steward_store::{
     BrowserMemberInvitation, BrowserMemberInvitationOutcome, BrowserMemberStateAction,
     BrowserMemberStateChange, BrowserRbacAssignment, BrowserRbacAssignmentAction,
-    BrowserRbacAssignmentChange, FederatedSubjectAssociation, FederatedSubjectAssociationMethod,
-    FederatedSubjectAuditAction, FederatedSubjectDisable, FederatedSubjectObservation,
-    FederatedSubjectState, FederatedSubjectUnlink, PgStore, StoreError,
+    BrowserRbacAssignmentChange, BrowserTaskVersionPublication, FederatedSubjectAssociation,
+    FederatedSubjectAssociationMethod, FederatedSubjectAuditAction, FederatedSubjectDisable,
+    FederatedSubjectObservation, FederatedSubjectState, FederatedSubjectUnlink, PgStore,
+    StoreError,
 };
 use steward_types::direct_package::SourceProvenance;
 use steward_types::{
@@ -229,14 +231,26 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
             ))
         })?;
     seed_connection_failure_detail_upgrade_fixture(&store).await?;
-    migration_set(None)
+    migration_set(Some(66))
         .run(store.pool())
         .await
         .map_err(|error| {
             io::Error::other(format!(
-                "Steward connection failure-detail code migration must complete over the required TLS session: {error}"
+                "Steward pre-0067 migrations must complete over the required TLS session: {error}"
             ))
         })?;
+    let historical_before_task_library = historical_task_identity_snapshot(&store).await?;
+    migration_set(None).run(store.pool()).await.map_err(|error| {
+        io::Error::other(format!(
+            "Steward Task-library migration must complete over the required TLS session: {error}"
+        ))
+    })?;
+    assert_eq!(
+        historical_task_identity_snapshot(&store).await?,
+        historical_before_task_library,
+        "migration 0067 must not rewrite historical Tasks, runs, or canonical identities"
+    );
+    verify_browser_task_library_upgrade(&store).await?;
     assert_connection_failure_detail_upgrade_result(&store).await?;
     assert_github_repository_automation_upgrade_result(&store).await?;
     assert_maximum_source_provenance_upgrade_result(&store, &maximum_direct_source_provenance)
@@ -352,6 +366,114 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         "new Task writers must use the User-Envelope-only orchestration contract: {new_writer_constraint}"
     );
 
+    Ok(())
+}
+
+async fn verify_browser_task_library_upgrade(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let task_id = Uuid::parse_str("00000000-0000-0000-0000-000000000279")?;
+    let owner_user_id = "usr_0123456789abcdef0123456789abcdef";
+    let shared_roles = vec!["engineer".to_owned()];
+    let v1_digest = format!("steward:sha256:{}", "1".repeat(64));
+    let v2_digest = format!("steward:sha256:{}", "2".repeat(64));
+    let v1_files = BTreeMap::from([(
+        "task-definition.json".to_owned(),
+        serde_json::json!({
+            "schemaVersion": "steward.task-definition/v2",
+            "name": "upgrade-task",
+            "version": 1,
+            "runtime": { "agentRef": "codex@0.140.0" },
+            "promptText": "Write the requested output.",
+            "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+        })
+        .to_string(),
+    )]);
+    let mut v2_files = v1_files.clone();
+    v2_files.insert(
+        "task-definition.json".to_owned(),
+        serde_json::json!({
+            "schemaVersion": "steward.task-definition/v2",
+            "name": "upgrade-task",
+            "version": 2,
+            "runtime": { "agentRef": "codex@0.140.0" },
+            "promptText": "Write the revised requested output.",
+            "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+        })
+        .to_string(),
+    );
+
+    let v1 = store
+        .save_browser_task_version(BrowserTaskVersionPublication {
+            task_id,
+            owner_user_id,
+            name: "upgrade-task",
+            shared_roles: &shared_roles,
+            version: 1,
+            content_digest: &v1_digest,
+            package_path: "task-definition.json",
+            files: &v1_files,
+        })
+        .await?;
+    let v2 = store
+        .save_browser_task_version(BrowserTaskVersionPublication {
+            task_id,
+            owner_user_id,
+            name: "upgrade-task",
+            shared_roles: &shared_roles,
+            version: 2,
+            content_digest: &v2_digest,
+            package_path: "task-definition.json",
+            files: &v2_files,
+        })
+        .await?;
+    assert_eq!(v1.version, 1);
+    assert_eq!(v2.version, 2);
+    assert_ne!(v1.content_digest, v2.content_digest);
+
+    let versions = store
+        .browser_task_draft_versions(owner_user_id, task_id)
+        .await?;
+    assert_eq!(
+        versions
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        [2, 1],
+        "the additive Task library must preserve every immutable saved version"
+    );
+    assert!(
+        store
+            .browser_task_version_by_digest(
+                "usr_abcdef0123456789abcdef0123456789",
+                &shared_roles,
+                &v1_digest,
+            )
+            .await?
+            .is_some(),
+        "a shared role must resolve an exact historical Task version by digest"
+    );
+    assert!(
+        store
+            .browser_task_version_by_digest(
+                "usr_abcdef0123456789abcdef0123456789",
+                &["analyst".to_owned()],
+                &v1_digest,
+            )
+            .await?
+            .is_none(),
+        "an unrelated role must not discover a shared Task version"
+    );
+
+    let mutation = sqlx::query(
+        "UPDATE browser_task_versions SET files = '{}'::jsonb \
+         WHERE task_id = $1 AND version = 1",
+    )
+    .bind(task_id)
+    .execute(store.pool())
+    .await;
+    assert!(
+        mutation.is_err(),
+        "saved Task package bytes must remain immutable after migration"
+    );
     Ok(())
 }
 

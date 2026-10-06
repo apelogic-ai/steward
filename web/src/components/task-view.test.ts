@@ -14,5 +14,5 @@ test("Task runs preserve the package source contract", () => {
     name: "repository-review",
     source: "steward:registry/repository-review",
     version: 3,
-  })).toBe("/runs/new?workflow=repository-review%403");
+  })).toBe("/runs/new?task=sha256%3Aexample");
 });

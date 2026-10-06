@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useState, type FormEvent } from "react";
 
@@ -7,10 +8,12 @@ import {
   listRequests,
   listTemplates,
   myTask,
+  myTasks,
   submitBrowserRun,
   type BrowserPackageLocator,
   type BrowserEnvelope,
   type BrowserTaskView,
+  type BrowserTasksResponse,
   type ExecutionBindingAdvertisement,
   type EnvelopeRequestsResponse,
   type EnvelopeTemplatesResponse,
@@ -24,6 +27,7 @@ type RunNowData = {
   envelopes: EnvelopeRequestsResponse;
   templates: EnvelopeTemplatesResponse;
   workflows: PublishedWorkflowListResponse;
+  tasks: BrowserTasksResponse;
   task: BrowserTaskView | null;
 };
 
@@ -43,6 +47,17 @@ type EffectiveAgentSelection = {
   selected: CompatibleAgent | undefined;
   warning: string | null;
 };
+
+type ExactTaskLocator = Pick<BrowserTaskView, "files" | "path" | "revision" | "source">;
+
+export function packageLocatorForTask(task: ExactTaskLocator): BrowserPackageLocator {
+  return {
+    source: task.source,
+    revision: task.revision,
+    path: task.path,
+    ...(task.source === "inline" ? { files: task.files } : {}),
+  };
+}
 
 function agentModelProvider(agentRef: string): { provider: string; label: string } | null {
   if (agentRef.startsWith("codex@")) return { provider: "openai", label: "OpenAI" };
@@ -144,10 +159,11 @@ export function BrowserRunNowView() {
   const taskDigest = search.get("task");
   const session = useSession();
   const load = useCallback(async () => {
-    const [envelopes, templates, workflows, task] = await Promise.all([
+    const [envelopes, templates, workflows, tasks, task] = await Promise.all([
       listRequests({ cache: "no-store", credentials: "same-origin" }),
       listTemplates({ cache: "no-store", credentials: "same-origin" }),
       listPublishedWorkflows(),
+      myTasks({ cache: "no-store", credentials: "same-origin" }),
       taskDigest ? myTask({ cache: "no-store", credentials: "same-origin", path: { content_digest: taskDigest } }) : Promise.resolve(null),
     ]);
     const response = !envelopes.response?.ok
@@ -156,12 +172,14 @@ export function BrowserRunNowView() {
         ? templates.response
         : !workflows.response?.ok
           ? workflows.response
+          : !tasks.response?.ok
+            ? tasks.response
           : task && !task.response?.ok
             ? task.response
             : workflows.response;
     return {
-      data: envelopes.data && templates.data && workflows.data && (!taskDigest || task?.data)
-        ? { envelopes: envelopes.data, templates: templates.data, workflows: workflows.data, task: task?.data?.task ?? null }
+      data: envelopes.data && templates.data && workflows.data && tasks.data && (!taskDigest || task?.data)
+        ? { envelopes: envelopes.data, templates: templates.data, workflows: workflows.data, tasks: tasks.data, task: task?.data?.task ?? null }
         : undefined,
       response,
     };
@@ -170,9 +188,34 @@ export function BrowserRunNowView() {
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader description="Run an immutable inline, repository, or published package under one of your active Envelopes." title="Run now" />
-      <ResourceBoundary state={state}>{(data) => <RunNowForm data={data} initialWorkflow={search.get("workflow")} onCreated={(taskUid) => router.push(`/runs/${taskUid}`)} session={session} />}</ResourceBoundary>
+      <ResourceBoundary state={state}>{(data) => data.task
+        ? <RunNowForm data={data} initialWorkflow={search.get("workflow")} onCreated={(taskUid) => router.push(`/runs/${taskUid}`)} session={session} />
+        : <TaskPicker data={data} initialWorkflow={search.get("workflow")} onSelect={(digest) => router.replace(`/runs/new?task=${encodeURIComponent(digest)}`)} />}</ResourceBoundary>
     </section>
   );
+}
+
+function TaskPicker({ data, initialWorkflow, onSelect }: Readonly<{
+  data: RunNowData;
+  initialWorkflow: string | null;
+  onSelect: (digest: string) => void;
+}>) {
+  const requestedWorkflow = initialWorkflow
+    ? (() => {
+        const separator = initialWorkflow.lastIndexOf("@");
+        if (separator <= 0 || separator === initialWorkflow.length - 1) return null;
+        const name = initialWorkflow.slice(0, separator);
+        const version = initialWorkflow.slice(separator + 1);
+        return data.tasks.tasks.find((task) => task.source === `steward:registry/${name}` && task.revision === `steward:version:${version}`) ?? null;
+      })()
+    : null;
+  const [digest, setDigest] = useState(requestedWorkflow?.contentDigest ?? data.tasks.tasks[0]?.contentDigest ?? "");
+  if (data.tasks.tasks.length === 0) return <div className="rounded-card border bg-panel p-6"><p className="text-sm text-muted-ink">Create and review a Task before starting a Run.</p><Link className="mt-4 inline-flex rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href="/tasks/new">Create Task</Link></div>;
+  return <div className="space-y-5 rounded-card border bg-panel p-6">
+    <label className="grid gap-2 text-sm font-semibold">Task<select className={fieldClass} onChange={(event) => setDigest(event.target.value)} value={digest}>{data.tasks.tasks.map((task) => <option key={`${task.contentDigest}-${task.source}`} value={task.contentDigest}>{task.name}@{task.version} · {task.source === "inline" ? "draft" : task.source.startsWith("steward:registry/") ? "published" : "Git"}</option>)}</select></label>
+    <p className="text-sm text-muted-ink">Choose one exact immutable Task version. You can review its package before selecting an Envelope and running it.</p>
+    <div className="flex flex-wrap justify-end gap-2"><Link className="inline-flex min-h-10 items-center rounded-control border px-4 text-sm font-semibold" href="/tasks/new">Create Task</Link><Link className="inline-flex min-h-10 items-center rounded-control border px-4 text-sm font-semibold" href={`/tasks/${encodeURIComponent(digest)}`}>Review</Link><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand" onClick={() => onSelect(digest)} type="button">Continue</button></div>
+  </div>;
 }
 
 function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
@@ -225,12 +268,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
     }
     let packageLocator: BrowserPackageLocator;
     if (exactTask) {
-      packageLocator = {
-        source: "inline",
-        revision: exactTask.contentDigest,
-        path: exactTask.path,
-        files: exactTask.files,
-      };
+      packageLocator = packageLocatorForTask(exactTask);
     } else if (sourceKind === "inline") {
       if (!inlineAllowed) {
         setFailure("Inline packages are disabled by the selected Envelope template.");

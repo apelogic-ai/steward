@@ -1,5 +1,6 @@
 //! Append-only operational history and approval-queue persistence.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -78,6 +79,33 @@ pub struct WorkflowPublication<'a> {
     pub prompt: &'a str,
     pub content_digest: &'a str,
     pub published_by: &'a str,
+}
+
+/// One immutable browser-authored Task package version and its mutable sharing handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserTaskVersionRecord {
+    pub task_id: Uuid,
+    pub owner_user_id: String,
+    pub name: String,
+    pub shared_roles: Vec<String>,
+    pub version: i64,
+    pub content_digest: String,
+    pub package_path: String,
+    pub files: BTreeMap<String, String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Exact package bytes supplied to the append-only browser Task library boundary.
+pub struct BrowserTaskVersionPublication<'a> {
+    pub task_id: Uuid,
+    pub owner_user_id: &'a str,
+    pub name: &'a str,
+    pub shared_roles: &'a [String],
+    pub version: i64,
+    pub content_digest: &'a str,
+    pub package_path: &'a str,
+    pub files: &'a BTreeMap<String, String>,
 }
 
 /// One immutable administrator-authored User Envelope Template revision.
@@ -610,6 +638,17 @@ mod migration_tests {
             "migration 66 must preserve historical mixed archives while marking new out/-only archives"
         );
     }
+
+    #[test]
+    fn browser_task_library_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 67 && migration.description.contains("browser task library")
+            }),
+            "migration 67 must add owner-scoped drafts and immutable Task versions without rewriting historical runs"
+        );
+    }
 }
 
 impl PgStore {
@@ -775,6 +814,200 @@ impl PgStore {
         .map_err(database_error)?;
         transaction.commit().await.map_err(database_error)?;
         workflow_revision_record(row)
+    }
+
+    pub async fn save_browser_task_version(
+        &self,
+        publication: BrowserTaskVersionPublication<'_>,
+    ) -> Result<BrowserTaskVersionRecord, StoreError> {
+        if !valid_browser_task_version_publication(&publication) {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 279))")
+            .bind(format!(
+                "browser-task:{}:{}",
+                publication.owner_user_id, publication.task_id
+            ))
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+
+        let existing = sqlx::query(
+            "SELECT owner_user_id, name FROM browser_task_drafts WHERE task_id = $1 FOR UPDATE",
+        )
+        .bind(publication.task_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        match existing {
+            Some(row) => {
+                let owner_user_id = row
+                    .try_get::<String, _>("owner_user_id")
+                    .map_err(database_error)?;
+                let name = row.try_get::<String, _>("name").map_err(database_error)?;
+                if owner_user_id != publication.owner_user_id || name != publication.name {
+                    return Err(StoreError::TaskNotFound);
+                }
+            }
+            None if publication.version == 1 => {
+                sqlx::query(
+                    "INSERT INTO browser_task_drafts \
+                     (task_id, owner_user_id, name, shared_roles) VALUES ($1, $2, $3, $4)",
+                )
+                .bind(publication.task_id)
+                .bind(publication.owner_user_id)
+                .bind(publication.name)
+                .bind(publication.shared_roles)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+            }
+            None => return Err(StoreError::TaskNotFound),
+        }
+
+        let current = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT max(version) FROM browser_task_versions WHERE task_id = $1",
+        )
+        .bind(publication.task_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .unwrap_or(0);
+        let expected = current
+            .checked_add(1)
+            .ok_or(StoreError::InvalidTaskTransition)?;
+        if publication.version != expected {
+            return Err(StoreError::TaskIdempotencyConflict);
+        }
+
+        sqlx::query(
+            "UPDATE browser_task_drafts \
+             SET shared_roles = $2, updated_at = clock_timestamp() WHERE task_id = $1",
+        )
+        .bind(publication.task_id)
+        .bind(publication.shared_roles)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let row = sqlx::query(
+            "INSERT INTO browser_task_versions \
+             (task_id, version, content_digest, package_path, files) \
+             VALUES ($1, $2, $3, $4, $5) \
+             RETURNING task_id, version, content_digest, package_path, files, \
+                       to_char(created_at AT TIME ZONE 'UTC', \
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at",
+        )
+        .bind(publication.task_id)
+        .bind(publication.version)
+        .bind(publication.content_digest)
+        .bind(publication.package_path)
+        .bind(Json(publication.files))
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let updated_at = sqlx::query_scalar::<_, String>(
+            "SELECT to_char(updated_at AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+             FROM browser_task_drafts WHERE task_id = $1",
+        )
+        .bind(publication.task_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        browser_task_version_record(
+            row,
+            publication.owner_user_id.to_owned(),
+            publication.name.to_owned(),
+            publication.shared_roles.to_vec(),
+            updated_at,
+        )
+    }
+
+    pub async fn browser_task_versions(
+        &self,
+        viewer_user_id: &str,
+        viewer_roles: &[String],
+    ) -> Result<Vec<BrowserTaskVersionRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT versions.task_id, drafts.owner_user_id, drafts.name, drafts.shared_roles, \
+                    versions.version, versions.content_digest, versions.package_path, \
+                    versions.files, \
+                    to_char(versions.created_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+                    to_char(drafts.updated_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+             FROM browser_task_versions versions \
+             JOIN browser_task_drafts drafts ON drafts.task_id = versions.task_id \
+             WHERE drafts.owner_user_id = $1 OR drafts.shared_roles && $2::text[] \
+             ORDER BY drafts.updated_at DESC, drafts.name, versions.version DESC",
+        )
+        .bind(viewer_user_id)
+        .bind(viewer_roles)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter()
+            .map(browser_task_version_joined_record)
+            .collect()
+    }
+
+    pub async fn browser_task_version_by_digest(
+        &self,
+        viewer_user_id: &str,
+        viewer_roles: &[String],
+        content_digest: &str,
+    ) -> Result<Option<BrowserTaskVersionRecord>, StoreError> {
+        let row = sqlx::query(
+            "SELECT versions.task_id, drafts.owner_user_id, drafts.name, drafts.shared_roles, \
+                    versions.version, versions.content_digest, versions.package_path, \
+                    versions.files, \
+                    to_char(versions.created_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+                    to_char(drafts.updated_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+             FROM browser_task_versions versions \
+             JOIN browser_task_drafts drafts ON drafts.task_id = versions.task_id \
+             WHERE versions.content_digest = $1 \
+               AND (drafts.owner_user_id = $2 OR drafts.shared_roles && $3::text[]) \
+             ORDER BY (drafts.owner_user_id = $2) DESC, versions.created_at DESC LIMIT 1",
+        )
+        .bind(content_digest)
+        .bind(viewer_user_id)
+        .bind(viewer_roles)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        row.map(browser_task_version_joined_record).transpose()
+    }
+
+    pub async fn browser_task_draft_versions(
+        &self,
+        owner_user_id: &str,
+        task_id: Uuid,
+    ) -> Result<Vec<BrowserTaskVersionRecord>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT versions.task_id, drafts.owner_user_id, drafts.name, drafts.shared_roles, \
+                    versions.version, versions.content_digest, versions.package_path, \
+                    versions.files, \
+                    to_char(versions.created_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
+                    to_char(drafts.updated_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at \
+             FROM browser_task_versions versions \
+             JOIN browser_task_drafts drafts ON drafts.task_id = versions.task_id \
+             WHERE drafts.task_id = $1 AND drafts.owner_user_id = $2 \
+             ORDER BY versions.version DESC",
+        )
+        .bind(task_id)
+        .bind(owner_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter()
+            .map(browser_task_version_joined_record)
+            .collect()
     }
 
     /// Read the latest append-only local RBAC decisions for this exact canonical user.
@@ -3640,6 +3873,68 @@ impl PgStore {
         statement.push(" AND tasks.browser_task_evidence ->> 'closureDigest' = ");
         statement.push_bind(package_digest);
         statement.push(" AND tasks.browser_task_evidence -> 'inlineFiles' IS NOT NULL");
+        statement.push(
+            " ORDER BY (tasks.phase = 'succeeded' AND tasks.finalized) DESC, \
+                      tasks.created_at DESC, tasks.task_uid DESC LIMIT 1",
+        );
+        statement
+            .build()
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+            .map(agent_run_record)
+            .transpose()
+    }
+
+    /// Return the newest owned browser execution for every immutable package digest.
+    ///
+    /// This is the compatibility bridge from Phase 1 run-derived Tasks into the Task library;
+    /// it deliberately includes inline, exact Git and published-registry browser packages.
+    pub async fn browser_tasks_for_owner(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Vec<AgentRunRecord>, StoreError> {
+        let mut statement = QueryBuilder::<Postgres>::new(AGENT_RUN_SELECT);
+        statement.push(
+            " WHERE tasks.task_uid IN (\
+                 SELECT DISTINCT ON (submissions.browser_task_evidence ->> 'closureDigest') \
+                        submissions.task_uid \
+                 FROM task_submissions submissions \
+                 WHERE submissions.owner_user_id = ",
+        );
+        statement.push_bind(owner_user_id);
+        statement.push(
+            " AND submissions.browser_task_evidence IS NOT NULL \
+                   AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
+                       WHERE operations.task_uid = submissions.task_uid) \
+                 ORDER BY submissions.browser_task_evidence ->> 'closureDigest', \
+                          submissions.created_at DESC, submissions.task_uid DESC\
+             ) ORDER BY tasks.updated_at DESC, tasks.task_uid DESC",
+        );
+        statement
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(database_error)?
+            .into_iter()
+            .map(agent_run_record)
+            .collect()
+    }
+
+    pub async fn browser_task_by_digest(
+        &self,
+        owner_user_id: &str,
+        package_digest: &str,
+    ) -> Result<Option<AgentRunRecord>, StoreError> {
+        let mut statement = QueryBuilder::<Postgres>::new(AGENT_RUN_SELECT);
+        statement.push(
+            " WHERE NOT EXISTS (SELECT 1 FROM connection_operations operations \
+               WHERE operations.task_uid = tasks.task_uid) \
+               AND tasks.owner_user_id = ",
+        );
+        statement.push_bind(owner_user_id);
+        statement.push(" AND tasks.browser_task_evidence ->> 'closureDigest' = ");
+        statement.push_bind(package_digest);
         statement.push(
             " ORDER BY (tasks.phase = 'succeeded' AND tasks.finalized) DESC, \
                       tasks.created_at DESC, tasks.task_uid DESC LIMIT 1",
@@ -13547,6 +13842,85 @@ fn valid_workflow_publication(publication: &WorkflowPublication<'_>) -> bool {
         && !publication.prompt.trim().is_empty()
         && !publication.content_digest.is_empty()
         && !publication.published_by.trim().is_empty()
+}
+
+fn valid_browser_task_version_publication(publication: &BrowserTaskVersionPublication<'_>) -> bool {
+    let valid_name = !publication.name.is_empty()
+        && publication.name.len() <= 128
+        && publication.name.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
+        && publication
+            .name
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_lowercase);
+    let valid_role = |role: &String| {
+        !role.is_empty()
+            && role.len() <= 64
+            && role.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            && role.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+    };
+    let mut roles = publication.shared_roles.to_vec();
+    roles.sort();
+    roles.dedup();
+    !publication.owner_user_id.trim().is_empty()
+        && valid_name
+        && publication.shared_roles.len() <= 32
+        && roles.len() == publication.shared_roles.len()
+        && publication.shared_roles.iter().all(valid_role)
+        && publication.version > 0
+        && publication
+            .content_digest
+            .strip_prefix("steward:sha256:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            })
+        && !publication.package_path.is_empty()
+        && publication.package_path.len() <= 512
+        && !publication.files.is_empty()
+}
+
+fn browser_task_version_record(
+    row: sqlx::postgres::PgRow,
+    owner_user_id: String,
+    name: String,
+    shared_roles: Vec<String>,
+    updated_at: String,
+) -> Result<BrowserTaskVersionRecord, StoreError> {
+    Ok(BrowserTaskVersionRecord {
+        task_id: row.try_get("task_id").map_err(database_error)?,
+        owner_user_id,
+        name,
+        shared_roles,
+        version: row.try_get("version").map_err(database_error)?,
+        content_digest: row.try_get("content_digest").map_err(database_error)?,
+        package_path: row.try_get("package_path").map_err(database_error)?,
+        files: row
+            .try_get::<Json<BTreeMap<String, String>>, _>("files")
+            .map_err(database_error)?
+            .0,
+        created_at: row.try_get("created_at").map_err(database_error)?,
+        updated_at,
+    })
+}
+
+fn browser_task_version_joined_record(
+    row: sqlx::postgres::PgRow,
+) -> Result<BrowserTaskVersionRecord, StoreError> {
+    let owner_user_id = row.try_get("owner_user_id").map_err(database_error)?;
+    let name = row.try_get("name").map_err(database_error)?;
+    let shared_roles = row.try_get("shared_roles").map_err(database_error)?;
+    let updated_at = row.try_get("updated_at").map_err(database_error)?;
+    browser_task_version_record(row, owner_user_id, name, shared_roles, updated_at)
 }
 
 fn workflow_revision_record(
