@@ -37,6 +37,13 @@ pub const GITHUB_AUTOMATION_API_VERSION: &str = "steward.github-automation/v1";
 const DEFAULT_PAGE_SIZE: u32 = 30;
 const MAX_PAGE_SIZE: u32 = 100;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GithubAutomationIdentity {
+    pub(crate) idempotency_identity: String,
+    pub(crate) idempotency_scope: Option<String>,
+    pub(crate) publication_subject: Option<String>,
+}
+
 pub trait GithubAutomationBroker<B>: Clone + Send + Sync + 'static
 where
     B: Clone + Eq + Hash + Send + Sync + 'static,
@@ -46,7 +53,7 @@ where
         session: &'a ConnectionSession<B>,
         operation: ConnectionOperationKind,
         request: Value,
-        idempotency_identity: &'a str,
+        identity: &'a GithubAutomationIdentity,
     ) -> BoxFuture<'a, Result<Value, ConnectionBrokerError>>;
 }
 
@@ -59,11 +66,18 @@ where
         session: &'a ConnectionSession<B>,
         operation: ConnectionOperationKind,
         request: Value,
-        idempotency_identity: &'a str,
+        identity: &'a GithubAutomationIdentity,
     ) -> BoxFuture<'a, Result<Value, ConnectionBrokerError>> {
         Box::pin(async move {
-            self.run_automation_operation(session, operation, request, idempotency_identity)
-                .await
+            self.run_automation_operation(
+                session,
+                operation,
+                request,
+                &identity.idempotency_identity,
+                identity.idempotency_scope.as_deref(),
+                identity.publication_subject.as_deref(),
+            )
+            .await
         })
     }
 }
@@ -79,10 +93,10 @@ where
         session: &'a ConnectionSession<B>,
         operation: ConnectionOperationKind,
         request: Value,
-        idempotency_identity: &'a str,
+        identity: &'a GithubAutomationIdentity,
     ) -> BoxFuture<'a, Result<Value, ConnectionBrokerError>> {
         self.governed_mutations()
-            .execute(session, operation, request, idempotency_identity)
+            .execute(session, operation, request, identity)
     }
 }
 
@@ -339,10 +353,7 @@ where
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let key = idempotency_key(
-        "repositories",
-        &format!("{}:{}:{}", query.query, query.page, query.per_page),
-    );
+    let identity = fresh_operation_identity("repositories");
     let result = match state
         .broker
         .execute(
@@ -353,7 +364,7 @@ where
                 "page": query.page,
                 "perPage": query.per_page,
             }),
-            &key,
+            &identity,
         )
         .await
     {
@@ -407,10 +418,7 @@ where
         Ok(bundle) => bundle,
         Err(response) => return response,
     };
-    let key = idempotency_key(
-        "workflow",
-        &format!("{task_uid}:{}/{}", repository.owner, repository.name),
-    );
+    let identity = fresh_operation_identity("workflow");
     let result = match state
         .broker
         .execute(
@@ -423,7 +431,7 @@ where
                 "ref": repository.default_branch,
                 "expectedContent": bundle.workflow_content,
             }),
-            &key,
+            &identity,
         )
         .await
     {
@@ -488,25 +496,29 @@ where
         .iter()
         .map(|(path, content)| json!({"path": path, "content": content}))
         .collect::<Vec<_>>();
-    let key = idempotency_key(
+    let operation_request = json!({
+        "owner": repository.owner,
+        "repo": repository.name,
+        "baseBranch": repository.default_branch,
+        "branch": branch,
+        "title": "chore: add Steward governed task",
+        "body": format!("Publishes the exact governed package tested by Steward Task `{task_uid}`."),
+        "files": files,
+    });
+    let publication_subject = format!("{task_uid}:{}/{}", repository.owner, repository.name);
+    let identity = write_operation_identity(
         "publish",
-        &format!("{task_uid}:{}/{}", repository.owner, repository.name),
+        &request.idempotency_key,
+        &operation_request,
+        Some(&publication_subject),
     );
     let result = match state
         .broker
         .execute(
             &session,
             ConnectionOperationKind::Publish,
-            json!({
-                "owner": repository.owner,
-                "repo": repository.name,
-                "baseBranch": repository.default_branch,
-                "branch": branch,
-                "title": "chore: add Steward governed task",
-                "body": format!("Publishes the exact governed package tested by Steward Task `{task_uid}`."),
-                "files": files,
-            }),
-            &key,
+            operation_request,
+            &identity,
         )
         .await
     {
@@ -570,27 +582,27 @@ where
         Ok(bundle) => bundle,
         Err(response) => return response,
     };
-    let key = idempotency_key(
+    let operation_request = json!({
+        "owner": repository.owner,
+        "repo": repository.name,
+        "workflowId": bundle.workflow_path,
+        "ref": repository.default_branch,
+        "inputs": request.inputs,
+        "expectedContent": bundle.workflow_content,
+    });
+    let identity = write_operation_identity(
         "dispatch",
-        &format!(
-            "{}:{task_uid}:{}/{}",
-            request.idempotency_key, repository.owner, repository.name
-        ),
+        &request.idempotency_key,
+        &operation_request,
+        None,
     );
     let result = match state
         .broker
         .execute(
             &session,
             ConnectionOperationKind::Dispatch,
-            json!({
-                "owner": repository.owner,
-                "repo": repository.name,
-                "workflowId": bundle.workflow_path,
-                "ref": repository.default_branch,
-                "inputs": request.inputs,
-                "expectedContent": bundle.workflow_content,
-            }),
-            &key,
+            operation_request,
+            &identity,
         )
         .await
     {
@@ -639,17 +651,14 @@ where
             Ok(repository) => repository,
             Err(response) => return response,
         };
-    let key = idempotency_key(
-        "run-status",
-        &format!("{run_id}:{}/{}", repository.owner, repository.name),
-    );
+    let identity = fresh_operation_identity("run-status");
     let result = match state
         .broker
         .execute(
             &session,
             ConnectionOperationKind::RunStatus,
             json!({"owner": repository.owner, "repo": repository.name, "runId": run_id}),
-            &key,
+            &identity,
         )
         .await
     {
@@ -693,14 +702,14 @@ where
         return Err(StatusCode::NOT_FOUND.into_response());
     }
     let query = format!("repo:{owner}/{repository}");
-    let key = idempotency_key("repository", &query);
+    let identity = fresh_operation_identity("repository");
     let result = state
         .broker
         .execute(
             session,
             ConnectionOperationKind::Repositories,
             json!({"query": query, "page": 1, "perPage": 10}),
-            &key,
+            &identity,
         )
         .await
         .map_err(automation_error)?;
@@ -982,11 +991,45 @@ fn valid_idempotency_key(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
-fn idempotency_key(operation: &str, value: &str) -> String {
-    format!(
-        "github-{operation}:sha256:{:x}",
-        Sha256::digest(value.as_bytes())
-    )
+fn fresh_operation_identity(operation: &str) -> GithubAutomationIdentity {
+    GithubAutomationIdentity {
+        idempotency_identity: format!("github-{operation}:{}", Uuid::new_v4()),
+        idempotency_scope: None,
+        publication_subject: None,
+    }
+}
+
+fn write_operation_identity(
+    operation: &str,
+    client_key: &str,
+    payload: &Value,
+    publication_subject: Option<&str>,
+) -> GithubAutomationIdentity {
+    let publication_subject = publication_subject.map(|subject| {
+        format!(
+            "github-publish:subject:sha256:{:x}",
+            Sha256::digest(subject.as_bytes())
+        )
+    });
+    let scope = match publication_subject.as_deref() {
+        Some(subject) => format!(
+            "{subject}:client:sha256:{:x}",
+            Sha256::digest(client_key.as_bytes())
+        ),
+        None => format!(
+            "github-{operation}:client:sha256:{:x}",
+            Sha256::digest(client_key.as_bytes())
+        ),
+    };
+    let payload = payload.to_string();
+    GithubAutomationIdentity {
+        idempotency_identity: format!(
+            "{scope}:payload:sha256:{:x}",
+            Sha256::digest(payload.as_bytes())
+        ),
+        idempotency_scope: Some(scope),
+        publication_subject,
+    }
 }
 
 fn no_store_json<T: Serialize>(value: T) -> Response {
@@ -1001,6 +1044,7 @@ fn no_store_json<T: Serialize>(value: T) -> Response {
 fn automation_error(error: ConnectionBrokerError) -> Response {
     let status = match error {
         ConnectionBrokerError::OAuthFlowPending => StatusCode::CONFLICT,
+        ConnectionBrokerError::IdempotencyConflict => StatusCode::UNPROCESSABLE_ENTITY,
         ConnectionBrokerError::RuntimeAuthenticationFailed
         | ConnectionBrokerError::ProxyPolicyDenied
         | ConnectionBrokerError::ProviderAuthorizationFailed => StatusCode::FORBIDDEN,
@@ -1130,7 +1174,7 @@ mod tests {
             _session: &'a ConnectionSession<BrowserSessionBinding>,
             operation: ConnectionOperationKind,
             request: Value,
-            idempotency_identity: &'a str,
+            identity: &'a GithubAutomationIdentity,
         ) -> BoxFuture<'a, Result<Value, ConnectionBrokerError>> {
             Box::pin(async move {
                 self.calls
@@ -1139,7 +1183,7 @@ mod tests {
                     .push(BrokerCall {
                         operation,
                         request,
-                        idempotency_identity: idempotency_identity.to_owned(),
+                        idempotency_identity: identity.idempotency_identity.clone(),
                     });
                 match operation {
                     ConnectionOperationKind::Repositories => Ok(json!({
@@ -1414,6 +1458,40 @@ mod tests {
         assert!(!valid_idempotency_key("publish/123"));
     }
 
+    #[test]
+    fn write_idempotency_binds_one_client_key_to_one_semantic_payload() {
+        let first_read = fresh_operation_identity("repositories");
+        let second_read = fresh_operation_identity("repositories");
+        assert_ne!(
+            first_read.idempotency_identity,
+            second_read.idempotency_identity
+        );
+        assert_eq!(first_read.idempotency_scope, None);
+        assert_eq!(second_read.idempotency_scope, None);
+
+        let first = write_operation_identity(
+            "dispatch",
+            "client-key",
+            &json!({"inputs": {"message": "first"}}),
+            None,
+        );
+        let retry = write_operation_identity(
+            "dispatch",
+            "client-key",
+            &json!({"inputs": {"message": "first"}}),
+            None,
+        );
+        let conflict = write_operation_identity(
+            "dispatch",
+            "client-key",
+            &json!({"inputs": {"message": "other"}}),
+            None,
+        );
+        assert_eq!(first, retry);
+        assert_eq!(first.idempotency_scope, conflict.idempotency_scope);
+        assert_ne!(first.idempotency_identity, conflict.idempotency_identity);
+    }
+
     #[tokio::test]
     async fn publication_is_owner_scoped_exact_and_idempotent_for_the_task_and_repository()
     -> Result<(), String> {
@@ -1492,9 +1570,20 @@ mod tests {
                 .filter(|call| call.operation == ConnectionOperationKind::Publish)
                 .collect::<Vec<_>>();
             assert_eq!(publications.len(), 2);
-            assert_eq!(
+            assert_ne!(
                 publications[0].idempotency_identity, publications[1].idempotency_identity,
-                "client retry keys must not create another publication operation"
+                "distinct client keys must retain distinct operation identities"
+            );
+            assert_eq!(
+                publications[0]
+                    .idempotency_identity
+                    .split(":client:")
+                    .next(),
+                publications[1]
+                    .idempotency_identity
+                    .split(":client:")
+                    .next(),
+                "all retries of one Task and repository must share the publication subject"
             );
             let files = publications[0].request["files"]
                 .as_array()

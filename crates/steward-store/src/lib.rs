@@ -707,6 +707,7 @@ impl PgStore {
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
+
         let current = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT max(version) FROM workflow_revisions WHERE name = $1",
         )
@@ -8496,6 +8497,26 @@ impl PgStore {
             .await
             .map_err(database_error)?;
 
+        if let Some(scope) = request.idempotency_scope {
+            let conflicting_payload = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM connection_operations \
+                 WHERE canonical_user_id = $1 AND provider = 'github' \
+                   AND operation_kind = $2 \
+                   AND left(idempotency_identity, length($3) + 1) = $3 || ':' \
+                   AND idempotency_identity <> $4)",
+            )
+            .bind(request.task.owner_user_id)
+            .bind(request.operation_kind.as_str())
+            .bind(scope)
+            .bind(request.idempotency_identity)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if conflicting_payload {
+                return Err(StoreError::ConnectionOperationIdempotencyConflict);
+            }
+        }
+
         let mut failed_operations = sqlx::query_scalar::<_, Uuid>(
             "WITH drifted AS ( \
                UPDATE connection_operations \
@@ -8738,9 +8759,7 @@ impl PgStore {
                    AND operations.idempotency_identity = $3 \
                    AND (operations.operation_state IN ('queued', 'provisioning', 'running') \
                      OR (operations.operation_state = 'succeeded' \
-                        AND (operations.result_expires_at > now() \
-                          OR (operations.operation_kind = 'publish' \
-                            AND operations.result IS NOT NULL)))) \
+                        AND operations.result_expires_at > now())) \
                  ORDER BY operations.created_at DESC LIMIT 1",
             )
             .bind(request.task.owner_user_id)
@@ -8752,16 +8771,7 @@ impl PgStore {
         };
         if let Some(row) = reusable {
             let record = connection_operation_record(row)?;
-            // A completed publication is an external side effect. Its semantic identity is bound
-            // to the owner, Task, and repository, so retain the exact result across bridge-image
-            // or authority rotations rather than attempting to create a second branch or PR.
-            let durable_publication = request.operation_kind == ConnectionOperationKind::Publish
-                && record.operation_kind == ConnectionOperationKind::Publish
-                && record.operation_state == ConnectionOperationState::Succeeded
-                && record.result.is_some();
-            if durable_publication
-                || connection_execution_bindings_match(&record.bindings, request.bindings)
-            {
+            if connection_execution_bindings_match(&record.bindings, request.bindings) {
                 transaction.commit().await.map_err(database_error)?;
                 return Ok(ConnectionOperationReservation {
                     inserted: false,
@@ -8882,10 +8892,10 @@ impl PgStore {
              (operation_id, task_uid, canonical_user_id, provider, operation_kind, \
               submitter_service, authority_id, authority_version, authority_digest, \
               runtime_spec_snapshot, command_snapshot, artifact_trust_mode, bridge_image_digest, mcp_gw_origin, \
-              mcp_gw_version, runtime_namespace, runtime_class, idempotency_identity, uncached_status, \
-              response_deadline_at) \
+              mcp_gw_version, runtime_namespace, runtime_class, idempotency_identity, \
+              publication_branch, uncached_status, response_deadline_at) \
              VALUES ($1, $1, $2, 'github', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
-                     $13, $14, $15, $16, $17, now() + make_interval(secs => $18)) \
+                     $13, $14, $15, $16, $17, $18, now() + make_interval(secs => $19)) \
              RETURNING *, \
                        to_char(flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
                        to_char(response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
@@ -8909,6 +8919,7 @@ impl PgStore {
         .bind(&request.bindings.namespace)
         .bind(&request.bindings.runtime_class)
         .bind(request.idempotency_identity)
+        .bind(request.publication_branch)
         .bind(
             request.operation_kind == ConnectionOperationKind::Status
                 && !request.allow_status_cache,
@@ -8948,6 +8959,29 @@ impl PgStore {
         .map_err(database_error)?
         .map(connection_operation_record)
             .transpose()
+    }
+
+    pub async fn connection_publication_branch(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+        publication_subject: &str,
+    ) -> Result<Option<String>, StoreError> {
+        if publication_subject.trim().is_empty() {
+            return Err(StoreError::InvalidConnectionOperation);
+        }
+        sqlx::query_scalar::<_, String>(
+            "SELECT publication_branch FROM connection_operations \
+             WHERE canonical_user_id = $1 AND provider = 'github' \
+               AND operation_kind = 'publish' \
+               AND left(idempotency_identity, length($2) + 1) = $2 || ':' \
+               AND publication_branch IS NOT NULL \
+             ORDER BY created_at ASC, operation_id ASC LIMIT 1",
+        )
+        .bind(canonical_user_id.as_str())
+        .bind(publication_subject)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
     }
 
     /// Duration of the administrator's latest successful GitHub Connect start.
@@ -10236,6 +10270,27 @@ fn validate_connection_operation_request(
         || request.response_deadline_seconds <= 0
         || request.response_deadline_seconds > 60
         || request.idempotency_identity.trim().is_empty()
+        || request.idempotency_scope.is_some_and(|scope| {
+            scope.is_empty()
+                || scope.len() > 256
+                || !scope
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_'))
+                || !request
+                    .idempotency_identity
+                    .starts_with(&format!("{scope}:"))
+        })
+        || match (request.operation_kind, request.publication_branch) {
+            (ConnectionOperationKind::Publish, Some(branch)) => {
+                branch.len() != 78
+                    || !branch.starts_with("steward/task-")
+                    || !branch[13..45].bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || branch.as_bytes().get(45) != Some(&b'-')
+                    || !branch[46..].bytes().all(|byte| byte.is_ascii_hexdigit())
+            }
+            (ConnectionOperationKind::Publish, None) | (_, Some(_)) => true,
+            (_, None) => false,
+        }
         || (request.operation_kind != ConnectionOperationKind::Status
             && !request.allow_status_cache)
         || request.input_archive.is_empty()
@@ -11252,6 +11307,11 @@ pub struct ConnectionOperationReservationRequest<'a> {
     pub authority_digest: &'a str,
     pub bindings: &'a ConnectionExecutionBindingSnapshot,
     pub idempotency_identity: &'a str,
+    /// Stable prefix for one client-provided write idempotency key. A different full identity
+    /// under the same scope means the key was reused for a different semantic payload.
+    pub idempotency_scope: Option<&'a str>,
+    /// Unpredictable server-selected branch retained across retries of one publication.
+    pub publication_branch: Option<&'a str>,
     pub response_deadline_seconds: i64,
     /// Status-only cache control. False forces a new status operation while still joining an
     /// identical in-flight status. Mutating operations must always set this to true.
@@ -11616,6 +11676,7 @@ pub enum StoreError {
     InvalidTaskTransition,
     ConnectionOperationNotFound,
     ConnectionOperationConflict,
+    ConnectionOperationIdempotencyConflict,
     ConnectionOAuthFlowPending,
     InvalidConnectionOperation,
     InvalidRunQuery,
@@ -11772,6 +11833,12 @@ impl fmt::Display for StoreError {
                 write!(
                     formatter,
                     "connection operation conflicts with an active mutation"
+                )
+            }
+            Self::ConnectionOperationIdempotencyConflict => {
+                write!(
+                    formatter,
+                    "connection idempotency key is bound to another payload"
                 )
             }
             Self::ConnectionOAuthFlowPending => {

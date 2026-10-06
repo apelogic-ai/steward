@@ -637,6 +637,8 @@ impl<B> GovernedConnectionsBroker<B> {
         allow_status_cache: bool,
         request_body: Option<Value>,
         idempotency_identity: Option<&str>,
+        idempotency_scope: Option<&str>,
+        publication_branch: Option<&str>,
     ) -> Result<ConnectionOperationRecord, ConnectionBrokerError> {
         if let Some(error) = connection_orchestration_error(self.orchestration_mode) {
             return Err(error);
@@ -746,6 +748,8 @@ impl<B> GovernedConnectionsBroker<B> {
                 authority_digest: &plan.authority_digest,
                 bindings: &bindings,
                 idempotency_identity: &operation_key,
+                idempotency_scope,
+                publication_branch,
                 response_deadline_seconds: CONNECTION_RESPONSE_DEADLINE_SECONDS,
                 allow_status_cache,
                 input_archive: &input,
@@ -799,8 +803,10 @@ impl<B> GovernedConnectionsBroker<B> {
         &self,
         session: &ConnectionSession<B>,
         operation: ConnectionOperationKind,
-        request_body: Value,
+        mut request_body: Value,
         idempotency_identity: &str,
+        idempotency_scope: Option<&str>,
+        publication_subject: Option<&str>,
     ) -> Result<Value, ConnectionBrokerError> {
         if matches!(
             operation,
@@ -811,6 +817,48 @@ impl<B> GovernedConnectionsBroker<B> {
         ) {
             return Err(ConnectionBrokerError::Unavailable);
         }
+        if operation == ConnectionOperationKind::Publish {
+            let subject = publication_subject.ok_or(ConnectionBrokerError::Unavailable)?;
+            let previous_branch = self
+                .store
+                .connection_publication_branch(&session.subject.canonical_user_id, subject)
+                .await
+                .map_err(store_broker_error)?;
+            let request = request_body
+                .as_object_mut()
+                .ok_or(ConnectionBrokerError::Unavailable)?;
+            let requested_branch = request
+                .get("branch")
+                .and_then(Value::as_str)
+                .ok_or(ConnectionBrokerError::Unavailable)?;
+            let resume_owned_branch = previous_branch.is_some();
+            let branch = previous_branch
+                .unwrap_or_else(|| format!("{requested_branch}-{}", Uuid::new_v4().simple()));
+            request.insert("branch".to_owned(), Value::String(branch.clone()));
+            request.insert(
+                "resumeOwnedBranch".to_owned(),
+                Value::Bool(resume_owned_branch),
+            );
+            let record = self
+                .reserve(
+                    &session.subject.canonical_user_id,
+                    &session.subject.display_email,
+                    operation,
+                    true,
+                    Some(request_body),
+                    Some(idempotency_identity),
+                    idempotency_scope,
+                    Some(&branch),
+                )
+                .await?;
+            let completed = if record.operation_state == ConnectionOperationState::Succeeded {
+                record
+            } else {
+                self.wait(&session.subject.canonical_user_id, record.operation_id)
+                    .await?
+            };
+            return completed.result.ok_or(ConnectionBrokerError::Unavailable);
+        }
         let record = self
             .reserve(
                 &session.subject.canonical_user_id,
@@ -819,6 +867,8 @@ impl<B> GovernedConnectionsBroker<B> {
                 true,
                 Some(request_body),
                 Some(idempotency_identity),
+                idempotency_scope,
+                None,
             )
             .await?;
         let completed = if record.operation_state == ConnectionOperationState::Succeeded {
@@ -841,6 +891,8 @@ impl<B> GovernedConnectionsBroker<B> {
                 &session.subject.display_email,
                 ConnectionOperationKind::Status,
                 allow_cache,
+                None,
+                None,
                 None,
                 None,
             )
@@ -921,6 +973,8 @@ where
                     &session.subject.display_email,
                     ConnectionOperationKind::Start,
                     true,
+                    None,
+                    None,
                     None,
                     None,
                 )
@@ -1037,6 +1091,8 @@ where
                     true,
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .await?;
             Ok(ReservedConnectionStart {
@@ -1057,18 +1113,29 @@ where
         request: &'a GithubWorkflowRerunRequest,
     ) -> BoxFuture<'a, Result<(), ConnectionBrokerError>> {
         Box::pin(async move {
+            let body = json!({
+                "owner": request.owner,
+                "repo": request.repository,
+                "runId": request.run_id,
+            });
+            let idempotency_scope = format!(
+                "github-rerun:client:{}",
+                secret_digest(&request.idempotency_key)
+            );
+            let idempotency_identity = format!(
+                "{idempotency_scope}:payload:{}",
+                secret_digest(&body.to_string())
+            );
             let record = self
                 .reserve(
                     &session.subject.canonical_user_id,
                     &session.subject.display_email,
                     ConnectionOperationKind::Rerun,
                     true,
-                    Some(json!({
-                        "owner": request.owner,
-                        "repo": request.repository,
-                        "runId": request.run_id,
-                    })),
-                    Some(&request.idempotency_key),
+                    Some(body),
+                    Some(&idempotency_identity),
+                    Some(&idempotency_scope),
+                    None,
                 )
                 .await?;
             let completed = if record.operation_state == ConnectionOperationState::Succeeded {
@@ -1613,6 +1680,9 @@ mod finalized_connection_operation_tests {
 fn store_broker_error(error: StoreError) -> ConnectionBrokerError {
     match error {
         StoreError::ConnectionOAuthFlowPending => ConnectionBrokerError::OAuthFlowPending,
+        StoreError::ConnectionOperationIdempotencyConflict => {
+            ConnectionBrokerError::IdempotencyConflict
+        }
         _ => ConnectionBrokerError::Unavailable,
     }
 }
@@ -2598,6 +2668,8 @@ mod tests {
                 ("actions_list", "read"),
                 ("actions_get", "read"),
                 ("get_job_logs", "read"),
+                ("get_commit", "read"),
+                ("list_pull_requests", "read"),
                 ("create_branch", "write"),
                 ("push_files", "write"),
                 ("create_pull_request", "write"),
@@ -2675,6 +2747,9 @@ mod tests {
                 ConnectionOperationKind::Publish,
                 "github.publish",
                 vec![
+                    ("get_commit", "read"),
+                    ("get_file_contents", "read"),
+                    ("list_pull_requests", "read"),
                     ("create_branch", "write"),
                     ("push_files", "write"),
                     ("create_pull_request", "write"),

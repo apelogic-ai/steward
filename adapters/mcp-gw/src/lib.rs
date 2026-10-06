@@ -6,6 +6,8 @@
 
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use reqwest::header::{ACCEPT, AUTHORIZATION};
 use reqwest::{Client, Method, StatusCode, Url};
 use serde_json::{Map, Value, json};
@@ -263,6 +265,7 @@ pub enum GithubBridgeRequest {
         title: String,
         body: String,
         files: Vec<GithubPublishedFile>,
+        resume_owned_branch: bool,
     },
 }
 
@@ -405,6 +408,7 @@ impl GithubBridgeRequest {
                         "title",
                         "body",
                         "files",
+                        "resumeOwnedBranch",
                     ],
                 )?;
                 let (owner, repo) = repository_fields(&object)?;
@@ -416,6 +420,10 @@ impl GithubBridgeRequest {
                 let title = bounded_string_field(&object, "title", 200)?;
                 let body = bounded_string_field(&object, "body", 4 * 1024)?;
                 let files = published_files_field(&object)?;
+                let resume_owned_branch = object
+                    .get("resumeOwnedBranch")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| rejected("GitHub publication resume proof is invalid"))?;
                 Ok(Self::Publish {
                     owner,
                     repo,
@@ -424,6 +432,7 @@ impl GithubBridgeRequest {
                     title,
                     body,
                     files,
+                    resume_owned_branch,
                 })
             }
         }
@@ -997,34 +1006,132 @@ impl GithubMcpGateway {
                     title,
                     body,
                     files,
+                    resume_owned_branch,
                 },
             ) => {
-                self.call_mcp(
-                    "steward-github-create-branch",
-                    "create_branch",
-                    json!({
-                        "owner": owner,
-                        "repo": repo,
-                        "branch": branch,
-                        "from_branch": base_branch,
-                    }),
-                )
-                .await?;
-                self.call_mcp(
-                    "steward-github-push-files",
-                    "push_files",
-                    json!({
-                        "owner": owner,
-                        "repo": repo,
-                        "branch": branch,
-                        "message": "chore: add Steward governed task",
-                        "files": files.iter().map(|file| json!({
-                            "path": file.path,
-                            "content": file.content,
-                        })).collect::<Vec<_>>(),
-                    }),
-                )
-                .await?;
+                let mut existing_pull_request = None;
+                let mut branch_exists = false;
+                let mut files_are_current = false;
+                if resume_owned_branch {
+                    let branch_commit = self
+                        .call_mcp(
+                            "steward-github-publication-branch",
+                            "get_commit",
+                            json!({
+                                "owner": owner,
+                                "repo": repo,
+                                "sha": branch,
+                                "detail": "stats",
+                                "perPage": 100,
+                            }),
+                        )
+                        .await?;
+                    branch_exists = !mcp_not_found(&branch_commit);
+                    if branch_exists {
+                        let pull_requests = self
+                            .call_mcp(
+                                "steward-github-publication-pr",
+                                "list_pull_requests",
+                                json!({
+                                    "owner": owner,
+                                    "repo": repo,
+                                    "state": "open",
+                                    "base": base_branch,
+                                    "head": format!("{owner}:{branch}"),
+                                    "page": 1,
+                                    "perPage": 10,
+                                    "fields": ["number", "html_url", "state", "head", "base"],
+                                }),
+                            )
+                            .await?;
+                        existing_pull_request =
+                            exact_open_pull_request(&pull_requests, &branch, &base_branch)?;
+
+                        let base_commit = self
+                            .call_mcp(
+                                "steward-github-publication-base",
+                                "get_commit",
+                                json!({
+                                    "owner": owner,
+                                    "repo": repo,
+                                    "sha": base_branch,
+                                    "detail": "none",
+                                }),
+                            )
+                            .await?;
+                        let branch_is_unchanged = commit_sha(&branch_commit)
+                            .zip(commit_sha(&base_commit))
+                            .is_some_and(|(branch_sha, base_sha)| branch_sha == base_sha);
+                        if !branch_is_unchanged
+                            && !steward_publication_head(&branch_commit, &branch, &files)
+                        {
+                            return Err(rejected(
+                                "GitHub publication branch ownership could not be proven",
+                            ));
+                        }
+                        if !branch_is_unchanged {
+                            files_are_current = true;
+                            for file in &files {
+                                let current = self
+                                    .call_mcp(
+                                        "steward-github-publication-file",
+                                        "get_file_contents",
+                                        json!({
+                                            "owner": owner,
+                                            "repo": repo,
+                                            "path": file.path,
+                                            "ref": branch,
+                                        }),
+                                    )
+                                    .await?;
+                                files_are_current &=
+                                    workflow_content(&current).as_deref() == Some(&file.content);
+                            }
+                            if existing_pull_request.is_none() && !files_are_current {
+                                return Err(rejected(
+                                    "GitHub publication branch content is not Steward-owned",
+                                ));
+                            }
+                        }
+                    }
+                }
+                if !branch_exists {
+                    let created = self
+                        .call_mcp(
+                            "steward-github-create-branch",
+                            "create_branch",
+                            json!({
+                                "owner": owner,
+                                "repo": repo,
+                                "branch": branch,
+                                "from_branch": base_branch,
+                            }),
+                        )
+                        .await?;
+                    require_write_success(&created, "create GitHub publication branch")?;
+                }
+                if !files_are_current {
+                    let pushed = self
+                        .call_mcp(
+                            "steward-github-push-files",
+                            "push_files",
+                            json!({
+                                "owner": owner,
+                                "repo": repo,
+                                "branch": branch,
+                                "message": publication_commit_message(&branch),
+                                "files": files.iter().map(|file| json!({
+                                    "path": file.path,
+                                    "content": file.content,
+                                })).collect::<Vec<_>>(),
+                            }),
+                        )
+                        .await?;
+                    require_write_success(&pushed, "push GitHub publication files")?;
+                }
+                if let Some(pull_request) = existing_pull_request {
+                    return normalize_pull_request(&pull_request, &branch);
+                }
                 let pull_request = self
                     .call_mcp(
                         "steward-github-create-pull-request",
@@ -1040,6 +1147,7 @@ impl GithubMcpGateway {
                         }),
                     )
                     .await?;
+                require_write_success(&pull_request, "create GitHub publication pull request")?;
                 normalize_pull_request(&pull_request, &branch)
             }
             _ => Err(rejected(
@@ -1205,15 +1313,21 @@ fn mcp_tool_payload(body: &[u8], request_id: &str) -> Result<Value, PortError> {
         .and_then(Value::as_object)
         .ok_or_else(|| rejected("GitHub MCP response omitted its result"))?;
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        let not_found = result
+        let messages = result
             .get("content")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .any(|text| text.to_ascii_lowercase().contains("not found"));
-        return if not_found {
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        return if messages.iter().any(|text| text.contains("not found")) {
             Ok(json!({"__stewardNotFound": true}))
+        } else if messages
+            .iter()
+            .any(|text| text.contains("already exists") || text.contains("reference exists"))
+        {
+            Ok(json!({"__stewardAlreadyExists": true}))
         } else {
             Err(failed("GitHub MCP tool call failed"))
         };
@@ -1221,16 +1335,59 @@ fn mcp_tool_payload(body: &[u8], request_id: &str) -> Result<Value, PortError> {
     if let Some(payload) = result.get("structuredContent") {
         return Ok(payload.clone());
     }
-    let text = result
+    let content = result
         .get("content")
         .and_then(Value::as_array)
-        .and_then(|content| {
-            content
-                .iter()
-                .find_map(|item| item.get("text").and_then(Value::as_str))
-        })
+        .ok_or_else(|| rejected("GitHub MCP response omitted structured output"))?;
+    if let Some(resource) = content.iter().find_map(|item| {
+        (item.get("type").and_then(Value::as_str) == Some("resource"))
+            .then(|| item.get("resource").and_then(Value::as_object))
+            .flatten()
+    }) {
+        let resource_content = match (
+            resource.get("text").and_then(Value::as_str),
+            resource.get("blob").and_then(Value::as_str),
+        ) {
+            (Some(text), None) if text.len() <= MAX_WORKFLOW_BYTES => text.to_owned(),
+            (None, Some(blob)) => {
+                let decoded = BASE64_STANDARD
+                    .decode(blob)
+                    .map_err(|_| rejected("GitHub MCP resource blob is not valid base64"))?;
+                if decoded.len() > MAX_WORKFLOW_BYTES {
+                    return Err(rejected("GitHub MCP resource blob is too large"));
+                }
+                String::from_utf8(decoded)
+                    .map_err(|_| rejected("GitHub MCP resource blob is not UTF-8"))?
+            }
+            _ => return Err(rejected("GitHub MCP resource content is invalid")),
+        };
+        let sha = content
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .chain(resource.get("uri").and_then(Value::as_str))
+            .find_map(github_blob_sha)
+            .ok_or_else(|| rejected("GitHub MCP resource omitted its blob SHA"))?;
+        return Ok(json!({"content": resource_content, "sha": sha}));
+    }
+    let text = content
+        .iter()
+        .find_map(|item| item.get("text").and_then(Value::as_str))
         .ok_or_else(|| rejected("GitHub MCP response omitted structured output"))?;
     serde_json::from_str(text).or_else(|_| Ok(Value::String(text.to_owned())))
+}
+
+fn github_blob_sha(value: &str) -> Option<String> {
+    value
+        .as_bytes()
+        .windows(40)
+        .enumerate()
+        .find_map(|(index, bytes)| {
+            let bounded_before = index == 0 || !value.as_bytes()[index - 1].is_ascii_hexdigit();
+            let bounded_after =
+                index + 40 == value.len() || !value.as_bytes()[index + 40].is_ascii_hexdigit();
+            (bounded_before && bounded_after && bytes.iter().all(u8::is_ascii_hexdigit))
+                .then(|| String::from_utf8_lossy(bytes).into_owned())
+        })
 }
 
 fn payload_array<'a>(payload: &'a Value, fields: &[&str]) -> Option<&'a Vec<Value>> {
@@ -1276,6 +1433,12 @@ fn normalize_repository(repository: &Value) -> Result<Value, PortError> {
         .get("owner")
         .and_then(|owner| owner.get("login").or(Some(owner)))
         .and_then(Value::as_str)
+        .or_else(|| {
+            repository
+                .get("full_name")
+                .and_then(Value::as_str)
+                .and_then(|full_name| full_name.split_once('/').map(|(owner, _)| owner))
+        })
         .filter(|owner| valid_repository_component(owner, 39))
         .ok_or_else(|| rejected("GitHub repository response omitted its owner"))?;
     let repository_id = numeric_provider_id(repository.get("id"))
@@ -1283,6 +1446,8 @@ fn normalize_repository(repository: &Value) -> Result<Value, PortError> {
     let owner_id = repository
         .get("owner")
         .and_then(|owner| numeric_provider_id(owner.get("id")))
+        .or_else(|| numeric_provider_id(repository.get("owner_id")))
+        .or_else(|| numeric_provider_id(repository.get("ownerId")))
         .ok_or_else(|| rejected("GitHub repository response omitted its owner stable ID"))?;
     let default_branch = repository
         .get("default_branch")
@@ -1537,6 +1702,98 @@ fn normalize_pull_request(payload: &Value, branch: &str) -> Result<Value, PortEr
         "pullRequestNumber": number,
         "branch": branch,
     }))
+}
+
+fn mcp_not_found(payload: &Value) -> bool {
+    payload.get("__stewardNotFound").and_then(Value::as_bool) == Some(true)
+}
+
+fn require_write_success(payload: &Value, operation: &str) -> Result<(), PortError> {
+    if mcp_not_found(payload)
+        || payload
+            .get("__stewardAlreadyExists")
+            .and_then(Value::as_bool)
+            == Some(true)
+    {
+        Err(failed(&format!("GitHub MCP failed to {operation}")))
+    } else {
+        Ok(())
+    }
+}
+
+fn commit_sha(payload: &Value) -> Option<&str> {
+    payload
+        .get("sha")
+        .or_else(|| payload.get("commit").and_then(|commit| commit.get("sha")))
+        .and_then(Value::as_str)
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn publication_commit_message(branch: &str) -> String {
+    format!("chore: publish Steward governed task on {branch}")
+}
+
+fn steward_publication_head(
+    payload: &Value,
+    branch: &str,
+    expected_files: &[GithubPublishedFile],
+) -> bool {
+    let message = payload
+        .get("commit")
+        .and_then(|commit| commit.get("message"))
+        .or_else(|| payload.get("message"))
+        .and_then(Value::as_str);
+    let Some(files) = payload.get("files").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut actual = files
+        .iter()
+        .filter_map(|file| {
+            file.get("filename")
+                .or_else(|| file.get("path"))
+                .and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>();
+    let mut expected = expected_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    message == Some(publication_commit_message(branch).as_str()) && actual == expected
+}
+
+fn exact_open_pull_request(
+    payload: &Value,
+    branch: &str,
+    base_branch: &str,
+) -> Result<Option<Value>, PortError> {
+    let pull_requests = payload_array(payload, &["pull_requests", "items"])
+        .ok_or_else(|| rejected("GitHub pull request list response is invalid"))?;
+    let matches = pull_requests
+        .iter()
+        .filter(|pull_request| {
+            pull_request.get("state").and_then(Value::as_str) == Some("open")
+                && pull_request
+                    .get("head")
+                    .and_then(|head| head.get("ref"))
+                    .and_then(Value::as_str)
+                    == Some(branch)
+                && pull_request
+                    .get("base")
+                    .and_then(|base| base.get("ref"))
+                    .and_then(Value::as_str)
+                    == Some(base_branch)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [pull_request] => Ok(Some(pull_request.clone())),
+        _ => Err(rejected(
+            "GitHub publication branch has ambiguous pull requests",
+        )),
+    }
 }
 
 fn valid_github_url(value: &str) -> bool {
@@ -2110,9 +2367,9 @@ mod tests {
 
     use super::{
         GatewayContract, GithubBridgeFailureDiagnostic, GithubBridgeOperation, GithubBridgeRequest,
-        GithubMcpGateway, GithubStatusCredential, GithubStatusReader, compatible_workflow,
-        github_bridge_failure_diagnostic, normalize_run_status, parse_response,
-        pre_dispatch_provider_failure,
+        GithubMcpGateway, GithubPublishedFile, GithubStatusCredential, GithubStatusReader,
+        compatible_workflow, github_bridge_failure_diagnostic, mcp_tool_payload,
+        normalize_repository, normalize_run_status, parse_response, pre_dispatch_provider_failure,
     };
     use reqwest::StatusCode;
     use steward_ports::PortError;
@@ -2294,6 +2551,77 @@ mod tests {
     }
 
     #[test]
+    fn pinned_github_mcp_embedded_resource_preserves_file_content_and_blob_sha()
+    -> Result<(), String> {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "fixture",
+            "result": {
+                "isError": false,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": format!("successfully downloaded text file (SHA: {sha})")
+                    },
+                    {
+                        "type": "resource",
+                        "resource": {
+                            "uri": format!("repo://example-org/example-repo/contents/task.yml?sha={sha}"),
+                            "text": "name: governed\n"
+                        }
+                    }
+                ]
+            }
+        });
+        let payload = mcp_tool_payload(response.to_string().as_bytes(), "fixture")
+            .map_err(|error| format!("parse pinned response: {error:?}"))?;
+        assert_eq!(payload["content"], "name: governed\n");
+        assert_eq!(payload["sha"], sha);
+
+        let blob = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "blob-fixture",
+            "result": {
+                "isError": false,
+                "content": [
+                    {"type": "text", "text": format!("SHA: {sha}")},
+                    {
+                        "type": "resource",
+                        "resource": {
+                            "uri": "repo://example-org/example-repo/contents/task.yml",
+                            "blob": "bmFtZTogZ292ZXJuZWQK"
+                        }
+                    }
+                ]
+            }
+        });
+        let payload = mcp_tool_payload(blob.to_string().as_bytes(), "blob-fixture")
+            .map_err(|error| format!("parse pinned blob response: {error:?}"))?;
+        assert_eq!(payload["content"], "name: governed\n");
+        assert_eq!(payload["sha"], sha);
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_repository_search_accepts_flat_owner_identity() -> Result<(), String> {
+        let repository = normalize_repository(&serde_json::json!({
+            "id": 123,
+            "name": "example-repo",
+            "full_name": "example-org/example-repo",
+            "owner_id": 456,
+            "default_branch": "main",
+            "private": true,
+            "html_url": "https://github.com/example-org/example-repo"
+        }))
+        .map_err(|error| format!("normalize pinned repository result: {error:?}"))?;
+        assert_eq!(repository["owner"], "example-org");
+        assert_eq!(repository["ownerId"], "456");
+        assert_eq!(repository["repositoryId"], "123");
+        Ok(())
+    }
+
+    #[test]
     fn run_status_preserves_the_signed_github_attempt_for_task_linking() -> Result<(), String> {
         let result = normalize_run_status(
             &serde_json::json!({
@@ -2425,6 +2753,127 @@ mod tests {
                 "url": "https://github.com/example-org/example-repo/actions/runs/101"
             })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publication_updates_only_its_proven_existing_open_pull_request() -> Result<(), String>
+    {
+        let branch =
+            "steward/task-11111111111141118111111111111111-22222222222242228222222222222222";
+        let workflow_path = ".github/workflows/steward-browser-task.yml";
+        let package_path = ".steward/tasks/hello/task-definition.json";
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind publication fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read publication fixture address: {error}"))?;
+        let branch_for_server = branch.to_owned();
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (stream, request) = read_json_request(&listener)?;
+            assert_eq!(request["params"]["name"], "get_commit");
+            assert_eq!(request["params"]["arguments"]["sha"], branch_for_server);
+            write_mcp_payload(
+                stream,
+                "steward-github-publication-branch",
+                serde_json::json!({
+                    "sha": "1111111111111111111111111111111111111111",
+                    "commit": {"message": format!("chore: publish Steward governed task on {branch_for_server}")},
+                    "files": [
+                        {"filename": workflow_path},
+                        {"filename": package_path}
+                    ]
+                }),
+            )?;
+
+            let (stream, request) = read_json_request(&listener)?;
+            assert_eq!(request["params"]["name"], "list_pull_requests");
+            assert_eq!(
+                request["params"]["arguments"]["head"],
+                format!("example-org:{branch_for_server}")
+            );
+            write_mcp_payload(
+                stream,
+                "steward-github-publication-pr",
+                serde_json::json!({"pull_requests": [{
+                    "number": 17,
+                    "html_url": "https://github.com/example-org/example-repo/pull/17",
+                    "state": "open",
+                    "head": {"ref": branch_for_server},
+                    "base": {"ref": "main"}
+                }]}),
+            )?;
+
+            let (stream, request) = read_json_request(&listener)?;
+            assert_eq!(request["params"]["name"], "get_commit");
+            assert_eq!(request["params"]["arguments"]["sha"], "main");
+            write_mcp_payload(
+                stream,
+                "steward-github-publication-base",
+                serde_json::json!({"sha": "0000000000000000000000000000000000000000"}),
+            )?;
+
+            for (path, content) in [
+                (workflow_path, "old workflow"),
+                (package_path, "old package"),
+            ] {
+                let (stream, request) = read_json_request(&listener)?;
+                assert_eq!(request["params"]["name"], "get_file_contents");
+                assert_eq!(request["params"]["arguments"]["path"], path);
+                write_mcp_payload(
+                    stream,
+                    "steward-github-publication-file",
+                    serde_json::json!({"content": content}),
+                )?;
+            }
+
+            let (stream, request) = read_json_request(&listener)?;
+            assert_eq!(request["params"]["name"], "push_files");
+            assert_eq!(request["params"]["arguments"]["branch"], branch_for_server);
+            assert_eq!(
+                request["params"]["arguments"]["files"]
+                    .as_array()
+                    .map(Vec::len),
+                Some(2)
+            );
+            write_mcp_payload(
+                stream,
+                "steward-github-push-files",
+                serde_json::json!({"commit": {"sha": "2222222222222222222222222222222222222222"}}),
+            )
+        });
+        let gateway = GithubMcpGateway::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build publication gateway: {error:?}"))?;
+        let response = gateway
+            .execute(
+                GithubBridgeOperation::Publish,
+                GithubBridgeRequest::Publish {
+                    owner: "example-org".to_owned(),
+                    repo: "example-repo".to_owned(),
+                    base_branch: "main".to_owned(),
+                    branch: branch.to_owned(),
+                    title: "Publish governed task".to_owned(),
+                    body: "Exact tested package".to_owned(),
+                    files: vec![
+                        GithubPublishedFile {
+                            path: workflow_path.to_owned(),
+                            content: "new workflow".to_owned(),
+                        },
+                        GithubPublishedFile {
+                            path: package_path.to_owned(),
+                            content: "new package".to_owned(),
+                        },
+                    ],
+                    resume_owned_branch: true,
+                },
+            )
+            .await
+            .map_err(|error| format!("execute publication update: {error:?}"))?;
+        server
+            .join()
+            .map_err(|_| "publication fixture panicked".to_owned())??;
+        assert_eq!(response["pullRequestNumber"], 17);
+        assert_eq!(response["branch"], branch);
         Ok(())
     }
 

@@ -185,3 +185,11 @@ PR-only publication operation kinds. The operation constraint couples each kind
 to the first authority version that grants it: v1-v3 rows remain valid, rerun
 still requires v3 or later, and only v4 may create the new rows. No historical
 connection operation is rewritten.
+
+Migration 0065 replaces the permanent connection-operation idempotency
+constraint with an indexed application-level contract. Active and fresh
+results still coalesce under the owner's advisory lock, a client key remains
+bound to one semantic payload, and failed or expired operations can be retried
+as new immutable audit rows. Publication rows additionally retain the
+server-selected, unguessable branch capability so a later attempt can resume
+only the branch Steward selected for that owner, Task, and repository.

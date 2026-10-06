@@ -2621,6 +2621,7 @@ impl IntoResponse for ApiError {
                 | StoreError::SelfBrowserMemberMutation
                 | StoreError::FederatedSubjectConflict
                 | StoreError::ConnectionOperationConflict
+                | StoreError::ConnectionOperationIdempotencyConflict
                 | StoreError::ConnectionOAuthFlowPending
                 | StoreError::CumulativeEscalationConflict,
             ) => StatusCode::CONFLICT,

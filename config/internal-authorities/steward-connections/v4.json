@@ -58,6 +58,16 @@
     },
     {
       "provider": "github",
+      "resource": "get_commit",
+      "action": "read"
+    },
+    {
+      "provider": "github",
+      "resource": "list_pull_requests",
+      "action": "read"
+    },
+    {
+      "provider": "github",
       "resource": "create_branch",
       "action": "write"
     },

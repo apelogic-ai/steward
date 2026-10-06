@@ -1022,7 +1022,7 @@ async fn assert_github_repository_automation_upgrade_result(
             "00000000-0000-0000-0000-000000000061",
             "00000000-0000-0000-0000-000000001061",
             4_i64,
-            "sha256:6ece401f71b5c71939ef1580b438505380b4f12d29a6fd717ac78a9d9c93848a",
+            "sha256:55e4c02ca61f399b105ac87195913092753c0e398f7b3ef4241478e3ffa99945",
             "0.4.9",
             "dispatch",
         ),
@@ -1092,6 +1092,74 @@ async fn assert_github_repository_automation_upgrade_result(
             .await?;
         }
     }
+
+    for (operation_kind, expired_result) in [
+        ("repositories", true),
+        ("workflow", true),
+        ("run_status", true),
+        ("dispatch", false),
+        ("publish", false),
+    ] {
+        let identity = format!("migration-0065-{operation_kind}");
+        let publication_branch = (operation_kind == "publish").then_some(
+            "steward/task-0123456789abcdef0123456789abcdef-fedcba9876543210fedcba9876543210",
+        );
+        insert_github_automation_retry_probe(
+            &mut transaction,
+            Uuid::new_v4(),
+            operation_kind,
+            &identity,
+            publication_branch,
+            expired_result,
+        )
+        .await?;
+        insert_github_automation_retry_probe(
+            &mut transaction,
+            Uuid::new_v4(),
+            operation_kind,
+            &identity,
+            publication_branch,
+            expired_result,
+        )
+        .await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*)::bigint FROM connection_operations \
+                 WHERE canonical_user_id = 'usr_0123456789abcdef0123456789abcdef' \
+                   AND provider = 'github' AND operation_kind = $1 \
+                   AND idempotency_identity = $2",
+            )
+            .bind(operation_kind)
+            .bind(&identity)
+            .fetch_one(&mut *transaction)
+            .await?,
+            2,
+            "migration 0065 must allow a fresh immutable row after an expired read result or failed write"
+        );
+    }
+
+    let malformed_publication_branch = sqlx::query(
+        "UPDATE connection_operations SET publication_branch = 'steward/task-invalid' \
+         WHERE idempotency_identity = 'migration-0065-publish'",
+    )
+    .execute(&mut *transaction)
+    .await;
+    assert!(
+        malformed_publication_branch.is_err(),
+        "migration 0065 must reject malformed publication branch capabilities"
+    );
+    let branch_on_read = sqlx::query(
+        "UPDATE connection_operations \
+         SET publication_branch = 'steward/task-0123456789abcdef0123456789abcdef-fedcba9876543210fedcba9876543210' \
+         WHERE idempotency_identity = 'migration-0065-repositories'",
+    )
+    .execute(&mut *transaction)
+    .await;
+    assert!(
+        branch_on_read.is_err(),
+        "migration 0065 must retain publication branches only for publish operations"
+    );
+
     let v4_operation_id = "00000000-0000-0000-0000-000000001061";
     let downgraded = sqlx::query(
         "UPDATE connection_operations \
@@ -1107,6 +1175,71 @@ async fn assert_github_repository_automation_upgrade_result(
         "a v1-v3 authority must never authorize a v4 repository operation"
     );
     transaction.rollback().await?;
+    Ok(())
+}
+
+async fn insert_github_automation_retry_probe(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    operation_id: Uuid,
+    operation_kind: &str,
+    idempotency_identity: &str,
+    publication_branch: Option<&str>,
+    expired_result: bool,
+) -> Result<(), Box<dyn Error>> {
+    sqlx::query(
+        "INSERT INTO task_submissions (\
+             task_uid, idempotency_key, submitter_service, acting_user, acting_user_id, \
+             owner, owner_user_id, identity_binding_state, workflow, workflow_name, workflow_version, \
+             workflow_digest, user_envelope_instance_id, user_envelope_revision, \
+             user_envelope_digest, authority_kind, user_envelope_snapshot, internal_authority_id, \
+             internal_authority_version, internal_authority_digest, coding_agent_runtime, runtime_uid, \
+             runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
+             finalize_requested, finalized, failure_reason, agent_command, execution_binding, \
+             direct_task_evidence, envelope_revision, orchestration_version, orchestration_operation_id, \
+             candidate_digest, service_envelope_digest, original_admission_decision, original_admission_deltas) \
+         SELECT $1, 'migration-0065-' || $1::text, 'steward-connections', acting_user, acting_user_id, \
+                owner, owner_user_id, identity_binding_state, 'connections.github.' || $2, \
+                NULL, NULL, NULL, NULL, NULL, NULL, 'internal', NULL, 'steward-connections', \
+                4, $3, coding_agent_runtime, NULL, runtime_namespace, \
+                'task-migration-0065-' || replace($1::text, '-', ''), runtime_ownership, 'failed', \
+                runtime_spec, true, true, 'upgrade_fixture', agent_command, execution_binding, NULL, \
+                envelope_revision, orchestration_version, $1, candidate_digest, \
+                service_envelope_digest, original_admission_decision, original_admission_deltas \
+         FROM task_submissions \
+         WHERE task_uid = '00000000-0000-0000-0000-000000000003'",
+    )
+    .bind(operation_id)
+    .bind(operation_kind)
+    .bind("sha256:55e4c02ca61f399b105ac87195913092753c0e398f7b3ef4241478e3ffa99945")
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO connection_operations (\
+             operation_id, task_uid, canonical_user_id, provider, operation_kind, \
+             submitter_service, authority_id, authority_version, authority_digest, \
+             runtime_spec_snapshot, command_snapshot, artifact_trust_mode, bridge_image_digest, \
+             mcp_gw_origin, mcp_gw_version, runtime_namespace, runtime_class, \
+             idempotency_identity, publication_branch, operation_state, result, result_expires_at, \
+             failure_category, finalization_state, cleanup_state, response_deadline_at) \
+         VALUES ($1, $1, 'usr_0123456789abcdef0123456789abcdef', 'github', $2, \
+             'steward-connections', 'steward-connections', 4, \
+             'sha256:55e4c02ca61f399b105ac87195913092753c0e398f7b3ef4241478e3ffa99945', \
+             '{}'::jsonb, '[]'::jsonb, 'github-attestation', \
+             'ghcr.io/example-org/connections-bridge@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+             'https://gateway.example.test', '0.4.9', 'steward-workflows', '', $3, $4, \
+             CASE WHEN $5 THEN 'succeeded' ELSE 'failed' END, \
+             CASE WHEN $5 THEN '{}'::jsonb ELSE NULL END, \
+             CASE WHEN $5 THEN now() - interval '1 second' ELSE NULL END, \
+             CASE WHEN $5 THEN NULL ELSE 'upgrade_fixture' END, \
+             'finalized', 'clean', now() + interval '1 minute')",
+    )
+    .bind(operation_id)
+    .bind(operation_kind)
+    .bind(idempotency_identity)
+    .bind(publication_branch)
+    .bind(expired_result)
+    .execute(&mut **transaction)
+    .await?;
     Ok(())
 }
 

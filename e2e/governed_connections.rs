@@ -1352,9 +1352,15 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         rerun_row.try_get::<String, _>("authority_digest")?,
         steward_admission::internal_authorities::steward_connections_v4::AUTHORITY_DIGEST
     );
-    assert_eq!(
-        rerun_row.try_get::<String, _>("idempotency_identity")?,
-        rerun_request.idempotency_key
+    let rerun_identity = rerun_row.try_get::<String, _>("idempotency_identity")?;
+    assert!(
+        rerun_identity.starts_with("github-rerun:client:sha256:")
+            && rerun_identity.contains(":payload:sha256:"),
+        "the governed rerun identity must bind the client key to its semantic payload"
+    );
+    assert!(
+        !rerun_identity.contains(&rerun_request.idempotency_key),
+        "the client key must not be persisted verbatim"
     );
     assert_eq!(
         rerun_row.try_get::<serde_json::Value, _>("result")?,

@@ -226,6 +226,7 @@ pub enum ConnectionStartOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectionBrokerError {
     OAuthFlowPending,
+    IdempotencyConflict,
     OrchestrationNotActive,
     RuntimeAuthenticationFailed,
     ProxyPolicyDenied,
@@ -828,6 +829,9 @@ fn connection_broker_problem(error: ConnectionBrokerError) -> ConnectionOperatio
         } => ("gateway_http_error", code, Some(status), reason),
         ConnectionBrokerError::OrchestrationNotActive => {
             ("connections.orchestration_not_active", None, None, None)
+        }
+        ConnectionBrokerError::IdempotencyConflict => {
+            ("connection_idempotency_conflict", None, None, None)
         }
         ConnectionBrokerError::OAuthFlowPending | ConnectionBrokerError::Unavailable => {
             ("connection_broker_unavailable", None, None, None)

@@ -7,6 +7,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+# Decode MCP embedded-resource blobs from the pinned GitHub provider.
+base64.workspace = true
 # Forward the bridge's three fixed operations through the provider-attached MCP-GW boundary.
 reqwest.workspace = true
 # Parse and emit the narrow one-shot bridge archive payloads without a compatibility identity.

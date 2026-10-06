@@ -3668,6 +3668,7 @@ dependencies = [
 name = "steward-adapter-mcp-gw"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "reqwest 0.12.28",
  "serde_json",
  "steward-ports",

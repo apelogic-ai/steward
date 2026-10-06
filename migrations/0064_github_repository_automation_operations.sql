@@ -45,7 +45,7 @@ ALTER TABLE connection_operations
         )
         OR (
             authority_version = 4
-            AND authority_digest = 'sha256:6ece401f71b5c71939ef1580b438505380b4f12d29a6fd717ac78a9d9c93848a'
+            AND authority_digest = 'sha256:55e4c02ca61f399b105ac87195913092753c0e398f7b3ef4241478e3ffa99945'
             AND mcp_gw_version = '0.4.9'
         )
     );

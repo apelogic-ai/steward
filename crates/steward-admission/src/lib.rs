@@ -155,7 +155,7 @@ pub mod internal_authorities {
         pub const AUTHORITY_ID: &str = steward_connections_v1::AUTHORITY_ID;
         pub const AUTHORITY_VERSION: i64 = 4;
         pub const AUTHORITY_DIGEST: &str =
-            "sha256:6ece401f71b5c71939ef1580b438505380b4f12d29a6fd717ac78a9d9c93848a";
+            "sha256:55e4c02ca61f399b105ac87195913092753c0e398f7b3ef4241478e3ffa99945";
         pub const SERVICE: &str = steward_connections_v1::SERVICE;
         pub const AGENT_TYPE: &str = steward_connections_v1::AGENT_TYPE;
         pub const BRIDGE_BINARY: &str = steward_connections_v1::BRIDGE_BINARY;
@@ -197,6 +197,9 @@ pub mod internal_authorities {
                     github_grant("actions_list", "read"),
                 ]),
                 "publish" => Some(vec![
+                    github_grant("get_commit", "read"),
+                    github_grant("get_file_contents", "read"),
+                    github_grant("list_pull_requests", "read"),
                     github_grant("create_branch", "write"),
                     github_grant("push_files", "write"),
                     github_grant("create_pull_request", "write"),
@@ -215,6 +218,8 @@ pub mod internal_authorities {
                 github_grant("actions_list", "read"),
                 github_grant("actions_get", "read"),
                 github_grant("get_job_logs", "read"),
+                github_grant("get_commit", "read"),
+                github_grant("list_pull_requests", "read"),
                 github_grant("create_branch", "write"),
                 github_grant("push_files", "write"),
                 github_grant("create_pull_request", "write"),

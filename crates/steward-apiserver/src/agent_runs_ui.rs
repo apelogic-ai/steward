@@ -1544,6 +1544,7 @@ where
                 )
                     .into_response(),
                 ConnectionBrokerError::RuntimeAuthenticationFailed
+                | ConnectionBrokerError::IdempotencyConflict
                 | ConnectionBrokerError::ProxyPolicyDenied
                 | ConnectionBrokerError::ProviderAuthorizationFailed
                 | ConnectionBrokerError::TokenGrantFailed
