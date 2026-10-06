@@ -12,6 +12,7 @@ mod github_actions;
 pub mod github_automation;
 pub mod google_oidc;
 pub mod governed_connections;
+pub mod onboarding;
 pub mod operator_admin;
 pub mod preferences;
 pub mod stable_runtime_bridge;
@@ -439,6 +440,7 @@ pub struct GrantRevocationRequest {
         operator_admin::latest_template,
         operator_admin::apply_template,
         operator_admin::provision,
+        onboarding::get_starter_task,
         agent_runs_contract,
         agent_run_contract,
         agent_run_timeline_contract
@@ -514,6 +516,9 @@ pub struct GrantRevocationRequest {
         operator_admin::OperatorTemplateResponse,
         operator_admin::OperatorProvisionRequest,
         operator_admin::OperatorProvisionResponse,
+        onboarding::StarterTaskGitExample,
+        onboarding::StarterTaskSetting,
+        onboarding::StarterTaskResponse,
         AgentRunAvailability,
         AgentRunDataStatus,
         AgentRunSpendView,

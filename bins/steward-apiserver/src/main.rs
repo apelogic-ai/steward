@@ -739,6 +739,17 @@ async fn browser_application_router(
         github_actor_issuer: application_config.github_actor_issuer,
         capability_catalog: capability_catalog.clone(),
     };
+    let starter_task_json = configured_bounded_json(
+        "STEWARD_STARTER_TASK_JSON",
+        "STEWARD_STARTER_TASK_FILE",
+        steward_apiserver::onboarding::MAX_STARTER_TASK_BYTES,
+        "starter task setting",
+    )?;
+    let starter_task = steward_apiserver::onboarding::StarterTaskSetting::from_optional_json(
+        starter_task_json.as_deref(),
+        &workflow_agents,
+    )
+    .map_err(|error| io::Error::other(format!("starter task configuration failed: {error}")))?;
     let custom_envelope_safety_ceiling = configured_bounded_json(
         "STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON",
         "STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE",
@@ -830,6 +841,10 @@ async fn browser_application_router(
         ))
         .merge(steward_apiserver::preferences::protected_router(
             store.clone(),
+            auth.clone(),
+        ))
+        .merge(steward_apiserver::onboarding::protected_router(
+            starter_task,
             auth.clone(),
         ))
         .merge(browser_admin::protected_router_with_custom_envelope_safety(

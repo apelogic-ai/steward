@@ -904,6 +904,12 @@ export type Currency = string;
 
 export type Decimal = string;
 
+export type DeclaredOutput = {
+    kind: OutputKind;
+    path: RelativePath;
+    required: boolean;
+};
+
 export type DiagnosticsRequest = {
     executionLog?: ExecutionLogMode;
 };
@@ -971,6 +977,18 @@ export type DirectTaskBindingEvidence = {
     schemaVersion: string;
     sourceProvenance: SourceProvenance;
     taskUid: Uuid;
+};
+
+export type DirectTaskDefinition = {
+    name: Slug;
+    outputs: Array<DeclaredOutput>;
+    prompt?: null | RelativePath;
+    promptText?: string | null;
+    requires?: null | DirectRequirements;
+    runtime: RuntimeSelection;
+    schemaVersion: string;
+    skills?: Array<RelativePath>;
+    version: number;
 };
 
 export type DirectTaskPhase = 'submitted' | 'parked' | 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -1310,6 +1328,8 @@ export type OperatorUsersResponse = {
     users: Array<OperatorUserView>;
 };
 
+export type OutputKind = 'directory' | 'file';
+
 export type PackageClosure = {
     contractVersion: string;
     entries: Array<ClosureEntry>;
@@ -1461,9 +1481,6 @@ export type ResolvedSource = {
 
 export type ResourceQuantity = string;
 
-/**
- * Canonical platform names accepted by the governed runner contract.
- */
 export type RunnerPlatform = 'linux' | 'mac' | 'windows';
 
 export type RunnerRequirement = {
@@ -1544,6 +1561,30 @@ export type StartConnectionAcceptedResponse = {
      */
     pollDeadlineAt: string;
     provider: string;
+};
+
+export type StarterTaskGitExample = {
+    path: RelativePath;
+    repository: string;
+    revision: string;
+};
+
+export type StarterTaskResponse = {
+    apiVersion: string;
+    starterTask: StarterTaskSetting;
+};
+
+export type StarterTaskSetting = {
+    description?: string | null;
+    executionLog: ExecutionLogMode;
+    git?: null | StarterTaskGitExample;
+    inputs: {
+        [key: string]: unknown;
+    };
+    packagePath: RelativePath;
+    publishedWorkflow?: string | null;
+    taskDefinition: DirectTaskDefinition;
+    title?: string | null;
 };
 
 /**
@@ -4060,6 +4101,26 @@ export type ListRepositoriesResponses = {
 };
 
 export type ListRepositoriesResponse = ListRepositoriesResponses[keyof ListRepositoriesResponses];
+
+export type GetStarterTaskData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/onboarding/starter-task';
+};
+
+export type GetStarterTaskErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+};
+
+export type GetStarterTaskResponses = {
+    200: StarterTaskResponse;
+};
+
+export type GetStarterTaskResponse = GetStarterTaskResponses[keyof GetStarterTaskResponses];
 
 export type GetBrowserPreferencesData = {
     body?: never;

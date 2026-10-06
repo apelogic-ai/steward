@@ -26,6 +26,27 @@ fi
 
 helm_template \
   --set-string tls.webhook.caBundlePem=public-test-ca > "${rendered}"
+if rg -q 'STEWARD_STARTER_TASK_JSON' "${rendered}"; then
+  echo 'unset starter task must use the apiserver built-in without an environment override' >&2
+  exit 1
+fi
+
+starter_task_json='{"taskDefinition":{"schemaVersion":"steward.task-definition/v2","name":"hello-world","version":2,"runtime":{"agentRef":"codex@0.140.0"},"promptText":"Write hello world to out/hello.txt.","outputs":[{"path":"out/hello.txt","kind":"file","required":true}]},"inputs":{"greeting":"hello"},"executionLog":"full","packagePath":".steward/tasks/hello-world/task-definition.json","title":"Hello world","description":"A deployment-owned starter task.","git":{"repository":"https://github.com/example-org/agentic-ops.git","revision":"git:ref:main","path":"catalog/hello/task-definition.json"},"publishedWorkflow":"repo-summary@2"}'
+helm_template \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  --set-json "config.apiserver.starterTask=${starter_task_json}" > "${rendered}"
+rg -q 'STEWARD_STARTER_TASK_JSON' "${rendered}"
+rg -q '\.steward/tasks/hello-world/task-definition\.json' "${rendered}"
+rg -q 'Write hello world to out/hello\.txt' "${rendered}"
+
+if helm_template \
+  --set-string tls.webhook.caBundlePem=public-test-ca \
+  --set-json "config.apiserver.starterTask=${starter_task_json}" \
+  --set-string config.apiserver.starterTask.packagePath=catalog/hello/task-definition.json > /dev/null 2>&1; then
+  echo 'starter task must reject a non-canonical repository package path' >&2
+  exit 1
+fi
+
 for forbidden in \
   'kind: ClusterSPIFFEID' \
   'name: steward-mint' \
@@ -72,6 +93,7 @@ governed_inputs=(
   --set-string config.controller.workloadExchangeEndpoint=https://identity.example.test/v1/workload/exchange
   --set-string config.controller.workloadExchangeServerName=identity.example.test
   --set-string config.controller.litellmUrl=https://litellm.example.test
+  --set-string spire.className=steward
 )
 default_runtime_inputs=(
   --set-string tls.webhook.caBundlePem=public-test-ca
@@ -87,6 +109,7 @@ default_runtime_inputs=(
   --set-string config.mint.issuer=https://mint.example.test
   --set-string config.mint.spiffeTrustDomain=customer.example.test
   --set-string config.mint.openshellNamespace=customer-openshell
+  --set-string spire.className=steward
 )
 if helm_template "${default_runtime_inputs[@]}" > /dev/null 2>"${missing_namespace_error}"; then
   echo 'governed execution must reject a missing steward-workflows runtime namespace' >&2
