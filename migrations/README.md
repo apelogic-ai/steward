@@ -198,4 +198,5 @@ Migration 0066 marks newly validated Task output archives with the immutable
 `steward.task-output/v1` contract. Existing rows remain unmarked so the browser can
 retain a bounded compatibility path for historical archives that mixed the two
 reserved execution-log transcripts with `out/` files. No finalized Task or archive
-is rewritten; new transcripts remain in `task_execution_attempts` only.
+is rewritten; new transcripts remain in `task_execution_attempts` only. The archive
+validator resolves GNU and PAX long-path metadata but rejects symbolic and hard links.

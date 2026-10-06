@@ -44,7 +44,8 @@ use steward_store::{
 #[cfg(test)]
 use steward_types::RuntimeOwnership;
 use steward_types::task_output_archive::{
-    TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputArchiveCompatibility, task_output_archive_entries,
+    InvalidTaskOutputArchive, TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputArchiveCompatibility,
+    task_output_archive_entries,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, DisposableExecutionBinding, Duration,
@@ -3327,10 +3328,16 @@ fn task_output_archive_failure(
     if let Some(reason) = task_output_archive_size_failure(archive.len()) {
         return Some(reason);
     }
-    if execution_class == SandboxExecutionClass::Agent
-        && task_output_archive_entries(archive, TaskOutputArchiveCompatibility::Strict).is_err()
-    {
-        return Some("Task output archive violates the out/-only contract");
+    if execution_class == SandboxExecutionClass::Agent {
+        return match task_output_archive_entries(archive, TaskOutputArchiveCompatibility::Strict) {
+            Ok(_) => None,
+            Err(InvalidTaskOutputArchive::UnsupportedLink) => {
+                Some("Task output archive contains unsupported link entries")
+            }
+            Err(InvalidTaskOutputArchive::Malformed) => {
+                Some("Task output archive violates the out/-only contract")
+            }
+        };
     }
     None
 }
@@ -6399,6 +6406,28 @@ mod tests {
             ),
             None,
             "provider-control adapters retain their separate output contracts"
+        );
+
+        let mut linked_archive = vec![0_u8; 512 * 3];
+        linked_archive[..8].copy_from_slice(b"out/link");
+        linked_archive[100..108].copy_from_slice(b"0000644\0");
+        linked_archive[108..116].copy_from_slice(b"0000000\0");
+        linked_archive[116..124].copy_from_slice(b"0000000\0");
+        linked_archive[124..136].copy_from_slice(b"00000000000\0");
+        linked_archive[136..148].copy_from_slice(b"00000000000\0");
+        linked_archive[148..156].fill(b' ');
+        linked_archive[156] = b'2';
+        linked_archive[257..263].copy_from_slice(b"ustar\0");
+        linked_archive[263..265].copy_from_slice(b"00");
+        let checksum = linked_archive[..512]
+            .iter()
+            .map(|byte| usize::from(*byte))
+            .sum::<usize>();
+        linked_archive[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        assert_eq!(
+            task_output_archive_failure(SandboxExecutionClass::Agent, &linked_archive),
+            Some("Task output archive contains unsupported link entries"),
+            "links must fail with a distinct operator-visible category"
         );
     }
 

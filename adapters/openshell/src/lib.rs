@@ -2802,6 +2802,8 @@ mod tests {
     #[cfg(feature = "runtime")]
     use std::collections::{HashMap, VecDeque};
     #[cfg(feature = "runtime")]
+    use std::fs;
+    #[cfg(feature = "runtime")]
     use std::future::Future;
     #[cfg(feature = "runtime")]
     use std::io::{Read, Write};
@@ -2809,6 +2811,8 @@ mod tests {
     use std::net::TcpListener;
     #[cfg(feature = "runtime")]
     use std::path::PathBuf;
+    #[cfg(feature = "runtime")]
+    use std::process::Command;
     #[cfg(feature = "runtime")]
     use std::sync::Arc;
     #[cfg(feature = "runtime")]
@@ -4437,6 +4441,58 @@ mod tests {
             None,
         );
         assert!(provider_control.ends_with(" ."));
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn runtime_tar_preserves_a_long_declared_output_path() -> Result<(), String> {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "steward-output-archive-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed),
+        ));
+        let _cleanup = Cleanup(root.clone());
+        let relative = format!("reports/{}.md", "a".repeat(120));
+        let output = root.join("out").join(&relative);
+        fs::create_dir_all(
+            output
+                .parent()
+                .ok_or_else(|| "long output fixture has no parent".to_owned())?,
+        )
+        .map_err(|error| format!("create long output fixture: {error}"))?;
+        fs::write(&output, b"complete\n")
+            .map_err(|error| format!("write long output fixture: {error}"))?;
+
+        let archive = Command::new("tar")
+            .env("COPYFILE_DISABLE", "1")
+            .args(["-cf", "-", "-C"])
+            .arg(&root)
+            .arg("out")
+            .output()
+            .map_err(|error| format!("run host tar: {error}"))?;
+        if !archive.status.success() {
+            return Err(format!(
+                "host tar rejected long output fixture: {}",
+                String::from_utf8_lossy(&archive.stderr).trim()
+            ));
+        }
+        let entries = steward_types::task_output_archive::task_output_archive_entries(
+            &archive.stdout,
+            steward_types::task_output_archive::TaskOutputArchiveCompatibility::Strict,
+        )
+        .map_err(|error| format!("runtime tar archive was rejected: {error:?}"))?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, relative);
+        Ok(())
     }
 
     #[cfg(feature = "runtime")]
