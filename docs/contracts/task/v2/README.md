@@ -14,20 +14,26 @@ consumers share the validated wire types and constants in
 
 ## Submission and invocation
 
-The reusable workflow creates a direct Task with only the contract selector and the
-repository-relative invocation-manifest path:
+For a package in the invoking repository, the reusable workflow creates a direct Task
+with the contract selector and the repository-relative package path:
 
 ```json
 {
   "contractVersion": "steward.task/v2",
-  "invocationPath": ".steward/tasks/release-summary.json"
+  "packagePath": ".steward/tasks/release-summary/task-definition.json",
+  "diagnostics": { "executionLog": "full" }
 }
 ```
 
-The caller never uploads or supplies the invocation bytes. Steward fetches the path
-from the Identity-ratified invoking repository at its exact triggered commit. Paths
-are bounded canonical slash-separated paths: absolute paths, empty components, `.`,
-`..`, backslashes, control characters, and symlink escapes are invalid.
+Steward constructs the invocation from the Identity-ratified repository, exact
+triggered commit and supplied package path. `packagePath` and `invocationPath` are
+mutually exclusive. Request diagnostics are accepted only with `packagePath`.
+
+Cross-repository packages continue to use `invocationPath`. The caller never uploads
+or supplies the invocation bytes: Steward fetches the manifest from the invoking
+repository at its exact triggered commit. All paths are bounded canonical
+slash-separated paths: absolute paths, empty components, `.`, `..`, backslashes,
+control characters, and symlink escapes are invalid.
 
 The fetched invocation manifest has this exact shape:
 
@@ -72,7 +78,8 @@ The direct TaskDefinition schema is `steward.task-definition/v2`. It contains:
 - a lowercase logical name and positive package version;
 - an exact `runtime.agentRef` that selects advertised deployment metadata, never an
   image, executable, provider profile, or native policy;
-- one prompt Markdown path relative to the TaskDefinition directory;
+- exactly one prompt source: a Markdown path relative to the TaskDefinition directory
+  in `prompt`, or verbatim inline UTF-8 text in `promptText`;
 - zero or more instruction-skill descriptor paths, also relative to that directory;
 - one or more workspace-relative declared outputs beneath `out`; and
 - optional complete `requires`.
@@ -83,6 +90,11 @@ invalid. An instruction-skill descriptor uses `steward.instruction-skill/v1`.
 Its instruction and asset paths resolve relative to the descriptor directory. A
 future executable kind requires a new skill schema and explicit runtime and Envelope
 authority; this v1 schema can never acquire executable meaning.
+
+`promptText` must contain non-whitespace content and is limited to 32 KiB of UTF-8.
+It is part of the canonical TaskDefinition bytes and therefore needs no separate
+prompt closure entry. There is no templating or substitution. Existing `prompt`
+packages retain their exact bytes, closure, digest and runtime behavior.
 
 Omitted `requires` means the resolved Envelope's entire approved authority values
 become effective. A present `requires` object is a complete narrower candidate: its
@@ -119,7 +131,8 @@ tokens, credentials, and provider authorization material are forbidden.
 The package root is the directory containing the TaskDefinition. References are
 resolved as follows:
 
-1. resolve `prompt` and every `skills` entry relative to the TaskDefinition directory;
+1. use `promptText` verbatim, or resolve `prompt` relative to the TaskDefinition
+   directory, then resolve every `skills` entry;
 2. parse each skill descriptor strictly, then resolve its `instructions` and `assets`
    relative to that descriptor's directory;
 3. reject absolute paths, traversal, symlinks, duplicate logical paths, objects outside
@@ -147,7 +160,9 @@ is normative.
 fragment for a direct Task. It records:
 
 - the Task UID and verified signed source provenance;
-- invoking-manifest and package repository URLs, stable repository/owner IDs, exact
+- whether the invocation was manifest-backed or implicit, and whether the prompt was
+  path-backed or inline;
+- invocation and package repository URLs, stable repository/owner IDs, exact
   commits, paths, and content digests;
 - the complete canonical closure and closure digest;
 - the resolved internal Envelope UID, revision, and approved digest;
@@ -183,6 +198,16 @@ authenticated owner at `/app/api/v1/runs/{taskUid}/logs/stdout` and
 process logs.
 
 ## Compatibility and validation
+
+`packagePath` and `promptText` require Steward **0.3.9 or later**. Older Steward
+versions reject these unknown fields instead of executing different content. Existing
+manifest-backed submissions and path-backed prompts remain byte-for-byte compatible.
+
+Generated caller workflows use `package-path` with `steward-run` **0.8.0 or later**.
+When the configured reviewed release is older, Steward emits the compatible
+`invocation-path` bundle instead. For an implicit invocation, `invocation.digest`
+covers the synthesized canonical invocation manifest; it is not a digest of the
+TaskDefinition located at `invocation.path`.
 
 The Rust contract tests parse every positive semantic shape, exercise fail-closed
 version, path, privilege-injection, duplicate, diagnostic, and cross-source cases,

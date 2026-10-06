@@ -3,6 +3,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use steward_types::direct_package::ExecutionLogMode;
 
 use crate::WorkflowReference;
 
@@ -111,7 +112,9 @@ pub struct VersionedGithubActionsWorkflowContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectPackageGithubActionsWorkflowContext {
     pub envelope: GithubActionsEnvelopeSelection,
-    pub invocation_path: String,
+    pub invocation_path: Option<String>,
+    pub package_path: Option<String>,
+    pub execution_log: ExecutionLogMode,
     pub reviewed_release: StewardRunRelease,
     pub workflow_installation_mode: StewardRunWorkflowInstallationMode,
     pub task_identity_discovery_enabled: bool,
@@ -122,9 +125,26 @@ pub fn render_direct_package_github_actions_workflow(
 ) -> Result<GeneratedGithubActionsWorkflow, GithubActionsRenderError> {
     validate_envelope(&context.envelope)?;
     validate_release(&context.reviewed_release)?;
-    if !valid_path(&context.invocation_path) {
-        return Err(GithubActionsRenderError::InvalidPath);
-    }
+    let (source_comment, source_input) = match (&context.invocation_path, &context.package_path) {
+        (Some(invocation_path), None)
+            if valid_path(invocation_path) && context.execution_log == ExecutionLogMode::Off =>
+        {
+            (
+                format!("# invocation-path: {invocation_path}"),
+                format!("      invocation-path: {invocation_path}"),
+            )
+        }
+        (None, Some(package_path)) if valid_path(package_path) => (
+            format!("# package-path: {package_path}"),
+            match context.execution_log {
+                ExecutionLogMode::Off => format!("      package-path: {package_path}"),
+                ExecutionLogMode::Full => {
+                    format!("      package-path: {package_path}\n      execution-log: full")
+                }
+            },
+        ),
+        _ => return Err(GithubActionsRenderError::InvalidPath),
+    };
     validate_steward_run_workflow_installation(
         context.workflow_installation_mode,
         &context.reviewed_release,
@@ -138,7 +158,7 @@ pub fn render_direct_package_github_actions_workflow(
         format!("# envelope-id: {}", context.envelope.id),
         format!("# envelope-revision: {}", context.envelope.revision),
         format!("# envelope-digest: {}", context.envelope.digest),
-        format!("# invocation-path: {}", context.invocation_path),
+        source_comment,
         format!("# steward-run-version: {}", release.version),
         format!(
             "# steward-run-workflow-installation-mode: {}",
@@ -200,7 +220,7 @@ pub fn render_direct_package_github_actions_workflow(
         ),
         "    with:".to_owned(),
         "      runner-label: ${{ vars.STEWARD_RUNNER_LABEL }}".to_owned(),
-        format!("      invocation-path: {}", context.invocation_path),
+        source_input,
         format!("      envelope-digest: steward:{}", context.envelope.digest),
         "      input-artifact: steward-task-input".to_owned(),
         "      output-artifact: steward-task-output".to_owned(),
@@ -388,6 +408,10 @@ pub fn validate_steward_run_workflow_installation(
         );
     }
     Ok(())
+}
+
+pub fn steward_run_supports_package_path_invocation(release: &StewardRunRelease) -> bool {
+    semver_is_at_least(&release.version, 0, 8, 0)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -839,6 +863,8 @@ fn yaml_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use steward_types::direct_package::ExecutionLogMode;
+
     use super::{
         DirectPackageGithubActionsWorkflowContext, GITHUB_ACTIONS_RENDER_REQUEST_SCHEMA,
         GITHUB_FILE_READ_TEMPLATE, GithubActionsEnvelopeSelection, GithubActionsRenderContext,
@@ -871,7 +897,9 @@ mod tests {
         let generated = render_direct_package_github_actions_workflow(
             &DirectPackageGithubActionsWorkflowContext {
                 envelope: envelope(),
-                invocation_path: ".steward/invocations/browser-task.json".to_owned(),
+                invocation_path: Some(".steward/invocations/browser-task.json".to_owned()),
+                package_path: None,
+                execution_log: ExecutionLogMode::Off,
                 reviewed_release: versioned_release(),
                 workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
                 task_identity_discovery_enabled: true,
@@ -901,11 +929,38 @@ mod tests {
     }
 
     #[test]
+    fn direct_package_generator_prefers_a_package_path_and_request_diagnostics()
+    -> Result<(), GithubActionsRenderError> {
+        let generated = render_direct_package_github_actions_workflow(
+            &DirectPackageGithubActionsWorkflowContext {
+                envelope: envelope(),
+                invocation_path: None,
+                package_path: Some(".steward/tasks/browser-task/task-definition.json".to_owned()),
+                execution_log: ExecutionLogMode::Full,
+                reviewed_release: versioned_release(),
+                workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
+                task_identity_discovery_enabled: true,
+            },
+        )?;
+
+        assert!(
+            generated
+                .yaml
+                .contains("      package-path: .steward/tasks/browser-task/task-definition.json")
+        );
+        assert!(generated.yaml.contains("      execution-log: full"));
+        assert!(!generated.yaml.contains("invocation-path:"));
+        Ok(())
+    }
+
+    #[test]
     fn direct_package_generator_rejects_unsafe_invocation_paths() {
         let result = render_direct_package_github_actions_workflow(
             &DirectPackageGithubActionsWorkflowContext {
                 envelope: envelope(),
-                invocation_path: "../task.json".to_owned(),
+                invocation_path: Some("../task.json".to_owned()),
+                package_path: None,
+                execution_log: ExecutionLogMode::Off,
                 reviewed_release: versioned_release(),
                 workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
                 task_identity_discovery_enabled: true,
@@ -1107,6 +1162,19 @@ mod tests {
             Err("steward-run 0.7.0 or later is required for envelopeDigest".to_owned())
         );
         Ok(())
+    }
+
+    #[test]
+    fn package_path_invocation_requires_the_declared_steward_run_floor() {
+        let mut release = versioned_release();
+        release.version = "0.7.6".to_owned();
+        assert!(!super::steward_run_supports_package_path_invocation(
+            &release
+        ));
+        release.version = "0.8.0".to_owned();
+        assert!(super::steward_run_supports_package_path_invocation(
+            &release
+        ));
     }
 
     #[test]

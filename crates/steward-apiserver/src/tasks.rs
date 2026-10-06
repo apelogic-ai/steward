@@ -37,10 +37,11 @@ use steward_types::direct_package::{
     BoundedText, BrowserTaskEvidence, BrowserTaskSubmission, ClosureEntry, ClosureEntryKind,
     ContentDigest, DirectAdmissionDelta, DirectRequirements, DirectRuntimeOwnership,
     DirectTaskBindingEvidence, DirectTaskDefinition, DirectTaskPhase, DirectTaskStatusResponse,
-    DirectTaskSubmission, EnvelopeDigest, EnvelopeEvidence, InstructionSkill, InvocationManifest,
-    PACKAGE_CLOSURE_CONTRACT_VERSION, PackageClosure, PackageCommit, RelativePath, RepositoryUrl,
-    ResolvedSource, SourceProvenance, StableProviderId, TASK_BINDING_EVIDENCE_SCHEMA, TaskOrigin,
-    TriggerRepository, canonical_json_bytes,
+    DirectTaskSubmission, EnvelopeDigest, EnvelopeEvidence, InstructionSkill, InvocationKind,
+    InvocationManifest, PACKAGE_CLOSURE_CONTRACT_VERSION, PackageClosure, PackageCommit,
+    PromptSourceKind, RelativePath, RepositoryUrl, ResolvedSource, SourceProvenance,
+    StableProviderId, TASK_BINDING_EVIDENCE_SCHEMA, TaskOrigin, TriggerRepository,
+    canonical_json_bytes,
 };
 use steward_types::{
     AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, Email,
@@ -127,11 +128,13 @@ struct VersionedTaskPlan {
 
 struct DirectTaskPreAdmission {
     definition: DirectTaskDefinition,
+    invocation_kind: InvocationKind,
     invocation: ResolvedSource,
     package: ResolvedSource,
     closure: PackageClosure,
     closure_digest: ContentDigest,
     diagnostics: steward_types::direct_package::DiagnosticsRequest,
+    prompt_source: PromptSourceKind,
     envelope: EnvelopeRequestRecord,
     effective_requirements: DirectRequirements,
     spec: AgentRuntimeSpec,
@@ -2110,6 +2113,7 @@ where
             closure_digest,
             inline_files: None,
             diagnostics: request.diagnostics,
+            prompt_source: PromptSourceKind::Path,
         };
         evidence.validate().map_err(ApiError::Admission)?;
         let task_request = TaskSubmissionRequest {
@@ -2255,6 +2259,11 @@ where
         identity: TaskIdentity,
         request: &DirectTaskSubmission,
     ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
+        if request.invocation_path.is_some() == request.package_path.is_some() {
+            return Err(ApiError::InvalidRequest(
+                "exactly one of invocationPath or packagePath is required".to_owned(),
+            ));
+        }
         request.validate().map_err(ApiError::Admission)?;
         if self.config.direct_git_resolver.is_none() {
             self.config.report_direct_package_source_disabled();
@@ -2811,6 +2820,7 @@ where
         closure_digest,
         inline_files,
         diagnostics: request.diagnostics,
+        prompt_source: PromptSourceKind::for_definition(&definition),
     };
     evidence.validate().map_err(ApiError::Admission)?;
     Ok(BrowserTaskPreAdmission {
@@ -2843,21 +2853,31 @@ fn resolve_inline_package_closure(
         entry_point.clone(),
         &canonical_definition,
     )?;
-    let prompt_path = resolve_package_relative_path(
-        package_root,
-        containing_directory(entry_point.as_str()),
-        &definition.prompt,
-    )?;
-    let prompt_bytes = inline_file(files, &prompt_path)?;
-    insert_closure_entry(
-        &mut entries,
-        ClosureEntryKind::Prompt,
-        prompt_path,
-        prompt_bytes,
-    )?;
-    let mut rendered_prompt = std::str::from_utf8(prompt_bytes)
-        .map_err(|_| ApiError::Admission("direct package prompt must be UTF-8".to_owned()))?
-        .to_owned();
+    let mut rendered_prompt = match (&definition.prompt, &definition.prompt_text) {
+        (Some(prompt), None) => {
+            let prompt_path = resolve_package_relative_path(
+                package_root,
+                containing_directory(entry_point.as_str()),
+                prompt,
+            )?;
+            let prompt_bytes = inline_file(files, &prompt_path)?;
+            insert_closure_entry(
+                &mut entries,
+                ClosureEntryKind::Prompt,
+                prompt_path,
+                prompt_bytes,
+            )?;
+            std::str::from_utf8(prompt_bytes)
+                .map_err(|_| ApiError::Admission("direct package prompt must be UTF-8".to_owned()))?
+                .to_owned()
+        }
+        (None, Some(prompt)) => prompt.clone(),
+        _ => {
+            return Err(ApiError::Admission(
+                "TaskDefinition requires exactly one of prompt or promptText".to_owned(),
+            ));
+        }
+    };
     for skill_reference in &definition.skills {
         let skill_path = resolve_package_relative_path(
             package_root,
@@ -3078,19 +3098,47 @@ where
     {
         return Err(ApiError::TaskAuthentication);
     }
-    let invocation_request = GitFileRequest {
-        repository: invocation_identity.clone(),
-        commit: provenance.triggered_sha.clone(),
-        path: request.invocation_path.clone(),
-        max_bytes: steward_types::direct_package::MAX_PACKAGE_FILE_BYTES,
-    };
-    let invocation_file = git
-        .read_file(&invocation_request)
-        .await
-        .map_err(source_port_error)?;
-    let invocation_bytes = verified_git_file(invocation_file, &invocation_request)?;
-    let manifest = serde_json::from_slice::<InvocationManifest>(&invocation_bytes)
-        .map_err(|_| ApiError::Admission("invocation manifest is invalid".to_owned()))?;
+    let (manifest, invocation_kind, invocation_path) =
+        match (&request.invocation_path, &request.package_path) {
+            (Some(invocation_path), None) => {
+                let invocation_request = GitFileRequest {
+                    repository: invocation_identity.clone(),
+                    commit: provenance.triggered_sha.clone(),
+                    path: invocation_path.clone(),
+                    max_bytes: steward_types::direct_package::MAX_PACKAGE_FILE_BYTES,
+                };
+                let invocation_file = git
+                    .read_file(&invocation_request)
+                    .await
+                    .map_err(source_port_error)?;
+                let invocation_bytes = verified_git_file(invocation_file, &invocation_request)?;
+                let manifest = serde_json::from_slice::<InvocationManifest>(&invocation_bytes)
+                    .map_err(|_| {
+                        ApiError::Admission("invocation manifest is invalid".to_owned())
+                    })?;
+                (manifest, InvocationKind::Manifest, invocation_path.clone())
+            }
+            (None, Some(package_path)) => (
+                InvocationManifest {
+                    contract_version: steward_types::direct_package::DIRECT_TASK_CONTRACT_VERSION
+                        .to_owned(),
+                    package: steward_types::direct_package::PackageReference {
+                        repository: invocation_repository.clone(),
+                        commit: PackageCommit::Trigger,
+                        path: package_path.clone(),
+                    },
+                    envelope: None,
+                    diagnostics: (!request.diagnostics.is_off()).then_some(request.diagnostics),
+                },
+                InvocationKind::Implicit,
+                package_path.clone(),
+            ),
+            _ => {
+                return Err(ApiError::InvalidRequest(
+                    "exactly one of invocationPath or packagePath is required".to_owned(),
+                ));
+            }
+        };
     manifest
         .validate_for_invoking_repository(&invocation_repository)
         .map_err(ApiError::Admission)?;
@@ -3146,8 +3194,8 @@ where
 
     let invocation = resolved_source(
         &invocation_identity,
-        &invocation_request.commit,
-        &invocation_request.path,
+        &provenance.triggered_sha,
+        &invocation_path,
         &canonical_json_bytes(&manifest).map_err(ApiError::Admission)?,
     )?;
     let package = resolved_source(
@@ -3228,13 +3276,16 @@ where
     };
     let (command, execution_binding) =
         resolve_direct_execution_plan(config, &definition, &prompt, &spec, &model)?;
+    let prompt_source = PromptSourceKind::for_definition(&definition);
     Ok(DirectTaskPreAdmission {
         definition,
+        invocation_kind,
         invocation,
         package,
         closure,
         closure_digest,
         diagnostics: manifest.effective_diagnostics(),
+        prompt_source,
         envelope,
         effective_requirements,
         spec,
@@ -3315,6 +3366,7 @@ fn direct_task_evidence(
         task_uid: steward_types::direct_package::Uuid::parse(task_uid.to_string())
             .map_err(ApiError::Admission)?,
         source_provenance,
+        invocation_kind: pre_admission.invocation_kind,
         invocation: pre_admission.invocation.clone(),
         package: pre_admission.package.clone(),
         closure: pre_admission.closure.clone(),
@@ -3328,6 +3380,7 @@ fn direct_task_evidence(
         },
         effective_requirements: pre_admission.effective_requirements.clone(),
         diagnostics: pre_admission.diagnostics,
+        prompt_source: pre_admission.prompt_source,
     };
     evidence.validate().map_err(ApiError::Admission)?;
     Ok(evidence)
@@ -3383,23 +3436,31 @@ async fn resolve_package_closure(
         ));
     }
 
-    let prompt_path = resolve_package_relative_path(
-        package_root,
-        containing_directory(entry_point.as_str()),
-        &definition.prompt,
-    )?;
-    let prompt_bytes = read_package_file(git, repository, commit, &prompt_path).await?;
-    insert_closure_entry(
-        &mut entries,
-        ClosureEntryKind::Prompt,
-        prompt_path,
-        &prompt_bytes,
-    )?;
-    let prompt = std::str::from_utf8(&prompt_bytes)
-        .map_err(|_| ApiError::Admission("direct package prompt must be UTF-8".to_owned()))?
-        .to_owned();
-
-    let mut rendered_prompt = prompt;
+    let mut rendered_prompt = match (&definition.prompt, &definition.prompt_text) {
+        (Some(prompt), None) => {
+            let prompt_path = resolve_package_relative_path(
+                package_root,
+                containing_directory(entry_point.as_str()),
+                prompt,
+            )?;
+            let prompt_bytes = read_package_file(git, repository, commit, &prompt_path).await?;
+            insert_closure_entry(
+                &mut entries,
+                ClosureEntryKind::Prompt,
+                prompt_path,
+                &prompt_bytes,
+            )?;
+            std::str::from_utf8(&prompt_bytes)
+                .map_err(|_| ApiError::Admission("direct package prompt must be UTF-8".to_owned()))?
+                .to_owned()
+        }
+        (None, Some(prompt)) => prompt.clone(),
+        _ => {
+            return Err(ApiError::Admission(
+                "TaskDefinition requires exactly one of prompt or promptText".to_owned(),
+            ));
+        }
+    };
     for skill_reference in &definition.skills {
         let skill_path = resolve_package_relative_path(
             package_root,

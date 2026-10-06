@@ -14,8 +14,9 @@ catalog publication, and richer diagnostics.
 ## Outcome
 
 A developer or platform engineer authors a versioned Task package in an admitted
-operations repository. A workflow in an admitted caller repository references the
-exact package source through a checked-in invocation manifest. Steward resolves the
+operations repository. A workflow in that same repository references the package by
+path; a cross-repository caller references an exact package through a checked-in
+invocation manifest. Steward resolves the
 source and the authenticated user's unique active provisioned Envelope, admits the
 effective request, executes
 the Task with the caller's Steward Principal, and returns declared outputs and an
@@ -50,18 +51,24 @@ caller-to-source binding remain active.
 
 ## GitHub Actions contract
 
-The invoking repository checks in a manifest and passes only its workspace-relative
-path to the reusable workflow:
+With `steward-run` v0.8.0 or later, the default same-repository caller passes the
+package's workspace-relative path and needs no invocation file:
 
 ```yaml
 jobs:
   governed:
     uses: apelogic-ai/steward-run/.github/workflows/steward-task.yml@<pinned-commit>
     with:
-      invocation-path: .steward/tasks/release-summary.json
+      package-path: .steward/tasks/release-summary/task-definition.json
+      execution-log: full
 ```
 
-An initial cross-repository manifest is:
+Steward binds that package path to the verified invoking repository and exact
+triggered SHA. `package-path` and `invocation-path` are mutually exclusive. When the
+configured reviewed `steward-run` release is older than v0.8.0, browser repository
+generation emits the compatible invocation manifest instead.
+
+Cross-repository callers pass an invocation manifest instead:
 
 ```json
 {
@@ -107,8 +114,9 @@ not route the exchanged GitHub identity through Kubernetes TokenReview or encode
 provenance into group strings; Kubernetes TokenReview remains the alternate
 service-account credential path.
 
-`steward-run` submits `invocation-path`. Verified trigger metadata reaches Steward only
-as signed claims in the exchanged Identity credential; the Task request does not
+`steward-run` submits either `package-path` or `invocation-path`. Verified trigger
+metadata reaches Steward only as signed claims in the exchanged Identity credential;
+the Task request does not
 duplicate caller-asserted provenance. The runner does not upload the invocation
 manifest or attest to package bytes.
 
@@ -117,7 +125,8 @@ uses a read-only GitHub App installed only on admitted repositories. Steward min
 short-lived installation tokens with metadata-read and contents-read permissions. It
 never accepts the workflow `GITHUB_TOKEN`, a PAT, or caller-supplied Git credentials.
 
-Steward fetches:
+For an implicit same-repository invocation Steward fetches the package entry point and
+its dependencies directly. For a manifest-backed invocation Steward fetches:
 
 1. the invocation manifest from the invoking repository at the verified triggered
    commit;
@@ -143,6 +152,8 @@ optional skill descriptors, and optional narrower authority requirements. The ex
 wire schemas are owned by the contract ticket, but these semantics are fixed:
 
 - `skills` omitted or `[]` means no skills;
+- exactly one of `prompt` and `promptText` is required; inline prompt text is passed
+  verbatim and remains covered by the TaskDefinition digest;
 - zero or multiple package-local skills are valid;
 - an omitted skill kind means `instruction_only`;
 - the initial implementation accepts instruction-only skills;
@@ -184,7 +195,8 @@ The server performs, in order:
 
 1. authenticate the existing Steward `Principal`;
 2. verify Identity-ratified GitHub trigger provenance;
-3. fetch and validate the invocation manifest at the triggered commit;
+3. construct the same-repository invocation from `package-path`, or fetch and validate
+   the cross-repository invocation manifest at the triggered commit;
 4. authorize the invoking and package repository identities;
 5. resolve and snapshot the exact package closure;
 6. resolve exactly one active provisioned Envelope for the authenticated user, or

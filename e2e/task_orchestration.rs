@@ -51,7 +51,7 @@ use steward_store::{
 };
 use steward_types::direct_package::{
     BrowserTaskEvidence, ClosureEntry, ClosureEntryKind, ContentDigest, PackageClosure,
-    RelativePath, TaskOrigin, canonical_json_bytes,
+    PromptSourceKind, RelativePath, TaskOrigin, canonical_json_bytes,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
@@ -702,6 +702,7 @@ fn browser_direct_package_evidence(
         inline_files: (source == "inline")
             .then(|| BTreeMap::from([("task-definition.json".to_owned(), "{}".to_owned())])),
         diagnostics: Default::default(),
+        prompt_source: PromptSourceKind::Inline,
     };
     evidence.validate()?;
     Ok(evidence)

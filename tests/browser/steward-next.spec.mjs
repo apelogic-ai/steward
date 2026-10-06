@@ -544,8 +544,11 @@ async function startWeb() {
           response.end(JSON.stringify({
             apiVersion: "steward.envelope-requests/v1",
             files: {
-              ".github/workflows/steward-browser-task.yml": "name: Steward governed run\n",
-              ".steward/invocations/browser-task.json": "{\"contractVersion\":\"steward.task/v2\"}\n",
+              ".github/workflows/steward-browser-task.yml": [
+                "name: Steward governed run",
+                `      package-path: ${browserTaskDefinitionPath}`,
+                "",
+              ].join("\n"),
             },
           }));
           return;
@@ -780,6 +783,7 @@ async function guardedPage(browser, {
       revision: `steward:sha256:${"c".repeat(64)}`,
       path: browserTaskDefinitionPath,
       contentDigest: `steward:sha256:${"c".repeat(64)}`,
+      promptSource: "inline",
     },
   } : run;
   await context.addInitScript(() => {
@@ -934,11 +938,11 @@ async function guardedPage(browser, {
           workflow: "browser-task@1",
           workflowName: null,
           workflowVersion: null,
-          package: { source: "inline", revision: `steward:sha256:${"c".repeat(64)}`, path: browserTaskDefinitionPath, contentDigest: `steward:sha256:${"c".repeat(64)}` },
+          package: { source: "inline", revision: `steward:sha256:${"c".repeat(64)}`, path: browserTaskDefinitionPath, contentDigest: `steward:sha256:${"c".repeat(64)}`, promptSource: "inline" },
         }] : [{
           ...run,
           origin: "github-actions",
-          package: { source: "https://github.com/example-org/sample.git", revision: `git:sha1:${"a".repeat(40)}`, path: browserTaskDefinitionPath, contentDigest: `steward:sha256:${"c".repeat(64)}` },
+          package: { source: "https://github.com/example-org/sample.git", revision: `git:sha1:${"a".repeat(40)}`, path: browserTaskDefinitionPath, contentDigest: `steward:sha256:${"c".repeat(64)}`, promptSource: "inline" },
           trigger: { provider: "github", repository: "https://github.com/example-org/sample" },
         }],
         nextCursor: cursor ? null : taskUid,
@@ -972,11 +976,10 @@ async function guardedPage(browser, {
       ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
       : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...fixtureRun, phase: runPhase } });
   });
-  await context.route(`${origin}/app/api/v1/runs/${taskUid}/package`, (route) => json(route, {
-    taskUid,
+  await context.route(`${origin}/app/api/v1/runs/*/package`, (route) => json(route, {
+    taskUid: new URL(route.request().url()).pathname.split("/").at(-2),
     files: {
-      [browserTaskDefinitionPath]: "{\"schemaVersion\":\"steward.task-definition/v2\"}\n",
-      "prompt.md": "Create the hello-world output.\n",
+      [browserTaskDefinitionPath]: "{\"schemaVersion\":\"steward.task-definition/v2\",\"promptText\":\"Create the hello-world output.\\n\"}\n",
     },
   }));
   await context.route(`${origin}/app/api/v1/runs/${taskUid}/logs/*`, async (route) => {
@@ -2087,7 +2090,7 @@ test("onboarding does not require a published sample", async ({ browser }) => {
 });
 
 test("Run now submits an inline package under the selected envelope", async ({ browser }) => {
-  const developer = await guardedPage(browser, { publishedWorkflows: false });
+  const developer = await guardedPage(browser, { inlineRun: true, publishedWorkflows: false });
   try {
     await developer.page.goto(`${origin}/runs/new`);
     await developer.page.getByRole("checkbox", { name: /Capture execution log/ }).check();
@@ -2100,13 +2103,17 @@ test("Run now submits an inline package under the selected envelope", async ({ b
     expect(submission.body.envelopeDigest).toBe(`steward:${envelopeRequest.envelopeDigest}`);
     expect(submission.body.package.source).toBe("inline");
     expect(submission.body.package.path).toBe(browserTaskDefinitionPath);
-    expect(submission.body.package.files["prompt.md"]).toContain("hello world");
+    expect(Object.keys(submission.body.package.files)).toEqual([browserTaskDefinitionPath]);
     expect(submission.body.diagnostics).toEqual({ executionLog: "full" });
     const taskDefinition = JSON.parse(submission.body.package.files[browserTaskDefinitionPath]);
+    expect(taskDefinition.promptText).toContain("hello world");
     expect(taskDefinition.runtime).toEqual({ agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } });
     expect(taskDefinition.requires.authority.llms).toEqual([{ provider: "openai", model: "gpt-5.4" }]);
     expect(submission.body).not.toHaveProperty("actor");
     expect(submission.body).not.toHaveProperty("owner");
+    await expect(developer.page.getByRole("heading", { name: "Task prompt" })).toBeVisible();
+    await expect(developer.page.getByText("Create the hello-world output.", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("link", { name: "out/hello.txt" })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -2126,17 +2133,18 @@ test("a successful inline run exports the exact package later admitted from GitH
     await expect(developer.page.getByRole("button", { name: "Bundle copied" })).toBeVisible();
 
     const clipboard = JSON.parse(await developer.page.evaluate(() => window.__stewardClipboardText));
-    expect(clipboard[browserTaskDefinitionPath]).toBe("{\"schemaVersion\":\"steward.task-definition/v2\"}\n");
-    expect(clipboard["prompt.md"]).toBe("Create the hello-world output.\n");
-    expect(clipboard[".steward/invocations/browser-task.json"]).toContain("steward.task/v2");
-    expect(clipboard[".github/workflows/steward-browser-task.yml"]).toContain("Steward governed run");
+    expect(Object.keys(clipboard).sort()).toEqual([
+      ".github/workflows/steward-browser-task.yml",
+      browserTaskDefinitionPath,
+    ].sort());
+    expect(clipboard[browserTaskDefinitionPath]).toContain("promptText");
+    expect(clipboard[".github/workflows/steward-browser-task.yml"]).toContain("package-path");
 
     const mutation = developer.mutations.find((entry) => entry.path.endsWith("/repository-bundle"));
     expectMutationProof(mutation);
     expect(mutation.body).toEqual({
       repository: "https://github.com/example-org/sample.git",
       packagePath: browserTaskDefinitionPath,
-      invocationPath: ".steward/invocations/browser-task.json",
     });
 
     const runs = await developer.page.evaluate(async () => {
@@ -2262,6 +2270,7 @@ test("run detail uses one held event stream through queued, running, and succeed
     revision: `steward:sha256:${"c".repeat(64)}`,
     path: browserTaskDefinitionPath,
     contentDigest: `steward:sha256:${"c".repeat(64)}`,
+    promptSource: "inline",
   };
   const liveRun = (phase) => ({
     ...run,

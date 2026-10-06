@@ -80,11 +80,27 @@
     },
     "directTaskSubmission": {
       "type": "object",
-      "required": ["contractVersion", "invocationPath"],
+      "required": ["contractVersion"],
       "properties": {
         "contractVersion": { "$ref": "#/$defs/contractVersion" },
-        "invocationPath": { "$ref": "#/$defs/relativePath" }
+        "invocationPath": { "$ref": "#/$defs/relativePath" },
+        "packagePath": { "$ref": "#/$defs/relativePath" },
+        "envelopeDigest": { "$ref": "#/$defs/stewardDigest" },
+        "diagnostics": { "$ref": "#/$defs/diagnostics" }
       },
+      "oneOf": [
+        {
+          "required": ["invocationPath"],
+          "properties": {
+            "packagePath": false,
+            "diagnostics": false
+          }
+        },
+        {
+          "required": ["packagePath"],
+          "properties": { "invocationPath": false }
+        }
+      ],
       "additionalProperties": false
     },
     "invocationManifest": {
@@ -324,13 +340,14 @@
     },
     "taskDefinition": {
       "type": "object",
-      "required": ["schemaVersion", "name", "version", "runtime", "prompt", "outputs"],
+      "required": ["schemaVersion", "name", "version", "runtime", "outputs"],
       "properties": {
         "schemaVersion": { "const": "steward.task-definition/v2" },
         "name": { "$ref": "#/$defs/slug" },
         "version": { "type": "integer", "minimum": 1 },
         "runtime": { "$ref": "#/$defs/runtimeSelection" },
         "prompt": { "$ref": "#/$defs/relativePath" },
+        "promptText": { "type": "string", "minLength": 1, "maxLength": 32768 },
         "skills": {
           "type": "array",
           "uniqueItems": true,
@@ -346,6 +363,16 @@
         },
         "requires": { "$ref": "#/$defs/directRequirements" }
       },
+      "oneOf": [
+        {
+          "required": ["prompt"],
+          "properties": { "promptText": false }
+        },
+        {
+          "required": ["promptText"],
+          "properties": { "prompt": false }
+        }
+      ],
       "additionalProperties": false
     },
     "instructionSkill": {
@@ -475,13 +502,15 @@
         "schemaVersion": { "const": "steward.task/source-authority-evidence/v1" },
         "taskUid": { "$ref": "#/$defs/uuid" },
         "sourceProvenance": { "$ref": "#/$defs/sourceProvenance" },
+        "invocationKind": { "enum": ["manifest", "implicit"], "default": "manifest" },
         "invocation": { "$ref": "#/$defs/resolvedSource" },
         "package": { "$ref": "#/$defs/resolvedSource" },
         "closure": { "$ref": "#/$defs/packageClosure" },
         "closureDigest": { "$ref": "#/$defs/stewardDigest" },
         "envelope": { "$ref": "#/$defs/envelopeEvidence" },
         "effectiveRequirements": { "$ref": "#/$defs/directRequirements" },
-        "diagnostics": { "$ref": "#/$defs/diagnostics" }
+        "diagnostics": { "$ref": "#/$defs/diagnostics" },
+        "promptSource": { "enum": ["path", "inline"], "default": "path" }
       },
       "additionalProperties": false
     }

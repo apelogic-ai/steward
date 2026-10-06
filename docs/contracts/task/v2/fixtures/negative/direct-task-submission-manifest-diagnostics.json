@@ -1,0 +1,7 @@
+{
+  "contractVersion": "steward.task/v2",
+  "invocationPath": ".steward/invocations/task.json",
+  "diagnostics": {
+    "executionLog": "full"
+  }
+}

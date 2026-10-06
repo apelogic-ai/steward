@@ -1,6 +1,28 @@
 import { describe, expect, test } from "bun:test";
 
-import { compatibleAgents, effectiveAgentSelection, runNowFailureMessage } from "./browser-run-now-view";
+import { compatibleAgents, effectiveAgentSelection, inlineFiles, runNowFailureMessage } from "./browser-run-now-view";
+
+test("inline Run now packages keep the prompt in the single TaskDefinition file", () => {
+  const files = inlineFiles(
+    "codex@0.140.0",
+    "Write hello to out/hello.txt.",
+    {
+      revision: 1,
+      spec: {
+        budget: { monthlyLimit: "10.00", currency: "USD" },
+        llms: [{ provider: "openai", model: "gpt-5.4" }],
+        tools: [],
+        ttl: "1h",
+      },
+    },
+    { provider: "openai", model: "gpt-5.4" },
+  );
+
+  expect(Object.keys(files)).toEqual(["task-definition.json"]);
+  expect(JSON.parse(files["task-definition.json"] ?? "{}")).toMatchObject({
+    promptText: "Write hello to out/hello.txt.",
+  });
+});
 
 describe("Run now failures", () => {
   test("shows a bounded server message before a generic fallback", () => {

@@ -25,6 +25,7 @@ pub const MAX_PACKAGE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_PACKAGE_CLOSURE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_INLINE_PACKAGE_BYTES: usize = 64 * 1024;
 pub const MAX_BROWSER_INPUT_BYTES: usize = 16 * 1024;
+pub const MAX_INLINE_PROMPT_BYTES: usize = 32 * 1024;
 
 macro_rules! validated_string {
     ($name:ident, $validator:ident) => {
@@ -298,11 +299,16 @@ fn require_unique_paths<'a>(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DirectTaskSubmission {
     pub contract_version: String,
-    pub invocation_path: RelativePath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_path: Option<RelativePath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_path: Option<RelativePath>,
     /// Optional public content selector for one active User Envelope owned by the caller.
     /// The invocation manifest field remains accepted during the compatibility window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope_digest: Option<EnvelopeDigest>,
+    #[serde(default, skip_serializing_if = "DiagnosticsRequest::is_off")]
+    pub diagnostics: DiagnosticsRequest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -473,6 +479,8 @@ pub struct BrowserTaskEvidence {
     pub inline_files: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub diagnostics: DiagnosticsRequest,
+    #[serde(default, skip_serializing_if = "PromptSourceKind::is_path")]
+    pub prompt_source: PromptSourceKind,
 }
 
 impl BrowserTaskEvidence {
@@ -498,6 +506,7 @@ impl BrowserTaskEvidence {
             .as_ref()
             .ok_or_else(|| "browser package closure is missing".to_owned())?;
         closure.validate()?;
+        validate_prompt_source(self.prompt_source, closure)?;
         if closure.entry_point != self.path {
             return Err("browser package path differs from its closure entry point".to_owned());
         }
@@ -515,7 +524,15 @@ impl DirectTaskSubmission {
             &self.contract_version,
             DIRECT_TASK_CONTRACT_VERSION,
             "direct Task contract",
-        )
+        )?;
+        match (&self.invocation_path, &self.package_path) {
+            (Some(_), None) if self.diagnostics.is_off() => Ok(()),
+            (Some(_), None) => {
+                Err("request diagnostics require an implicit packagePath invocation".to_owned())
+            }
+            (None, Some(_)) => Ok(()),
+            _ => Err("exactly one of invocationPath or packagePath is required".to_owned()),
+        }
     }
 }
 
@@ -610,6 +627,12 @@ pub enum ExecutionLogMode {
 pub struct DiagnosticsRequest {
     #[serde(default)]
     pub execution_log: ExecutionLogMode,
+}
+
+impl DiagnosticsRequest {
+    pub fn is_off(&self) -> bool {
+        self.execution_log == ExecutionLogMode::Off
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -726,7 +749,10 @@ pub struct DirectTaskDefinition {
     pub name: Slug,
     pub version: u64,
     pub runtime: RuntimeSelection,
-    pub prompt: RelativePath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<RelativePath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_text: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<RelativePath>,
     pub outputs: Vec<DeclaredOutput>,
@@ -743,6 +769,21 @@ impl DirectTaskDefinition {
         )?;
         if self.version == 0 {
             return Err("TaskDefinition version must be positive".to_owned());
+        }
+        match (&self.prompt, &self.prompt_text) {
+            (Some(_), None) => {}
+            (None, Some(prompt))
+                if !prompt.trim().is_empty() && prompt.len() <= MAX_INLINE_PROMPT_BYTES => {}
+            (None, Some(_)) => {
+                return Err(
+                    "TaskDefinition promptText must be non-empty and at most 32 KiB".to_owned(),
+                );
+            }
+            _ => {
+                return Err(
+                    "TaskDefinition requires exactly one of prompt or promptText".to_owned(),
+                );
+            }
         }
         if self.outputs.is_empty() {
             return Err("TaskDefinition must declare at least one output".to_owned());
@@ -765,6 +806,28 @@ impl DirectTaskDefinition {
         }
         require_unique_paths(self.skills.iter())?;
         require_unique_paths(self.outputs.iter().map(|output| &output.path))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSourceKind {
+    #[default]
+    Path,
+    Inline,
+}
+
+impl PromptSourceKind {
+    pub fn for_definition(definition: &DirectTaskDefinition) -> Self {
+        if definition.prompt_text.is_some() {
+            Self::Inline
+        } else {
+            Self::Path
+        }
+    }
+
+    fn is_path(value: &Self) -> bool {
+        *value == Self::Path
     }
 }
 
@@ -1137,6 +1200,8 @@ pub struct DirectTaskBindingEvidence {
     pub schema_version: String,
     pub task_uid: Uuid,
     pub source_provenance: SourceProvenance,
+    #[serde(default, skip_serializing_if = "InvocationKind::is_manifest")]
+    pub invocation_kind: InvocationKind,
     pub invocation: ResolvedSource,
     pub package: ResolvedSource,
     pub closure: PackageClosure,
@@ -1144,6 +1209,8 @@ pub struct DirectTaskBindingEvidence {
     pub envelope: EnvelopeEvidence,
     pub effective_requirements: DirectRequirements,
     pub diagnostics: DiagnosticsRequest,
+    #[serde(default, skip_serializing_if = "PromptSourceKind::is_path")]
+    pub prompt_source: PromptSourceKind,
 }
 
 impl DirectTaskBindingEvidence {
@@ -1155,6 +1222,7 @@ impl DirectTaskBindingEvidence {
         )?;
         self.source_provenance.validate()?;
         self.closure.validate()?;
+        validate_prompt_source(self.prompt_source, &self.closure)?;
         self.effective_requirements.validate()?;
         if self.envelope.revision == 0 {
             return Err("Envelope evidence revision must be positive".to_owned());
@@ -1173,6 +1241,15 @@ impl DirectTaskBindingEvidence {
             return Err(
                 "invocation repository differs from its signed source provenance".to_owned(),
             );
+        }
+        if self.invocation_kind == InvocationKind::Implicit
+            && (self.invocation.repository != self.package.repository
+                || self.invocation.repository_id != self.package.repository_id
+                || self.invocation.repository_owner_id != self.package.repository_owner_id
+                || self.invocation.commit != self.package.commit
+                || self.invocation.path != self.package.path)
+        {
+            return Err("implicit invocation differs from its same-repository package".to_owned());
         }
         if self.package.path != self.closure.entry_point {
             return Err("package path differs from the closure entry point".to_owned());
@@ -1195,6 +1272,40 @@ impl DirectTaskBindingEvidence {
             return Err("closure digest does not match the canonical package closure".to_owned());
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationKind {
+    #[default]
+    Manifest,
+    Implicit,
+}
+
+impl InvocationKind {
+    fn is_manifest(value: &Self) -> bool {
+        *value == Self::Manifest
+    }
+}
+
+fn validate_prompt_source(
+    source: PromptSourceKind,
+    closure: &PackageClosure,
+) -> Result<(), String> {
+    let prompt_entries = closure
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == ClosureEntryKind::Prompt)
+        .count();
+    match (source, prompt_entries) {
+        (PromptSourceKind::Path, 1) | (PromptSourceKind::Inline, 0) => Ok(()),
+        (PromptSourceKind::Path, _) => {
+            Err("path prompt evidence requires one prompt closure entry".to_owned())
+        }
+        (PromptSourceKind::Inline, _) => {
+            Err("inline prompt evidence must not contain a prompt closure entry".to_owned())
+        }
     }
 }
 

@@ -21,7 +21,7 @@ use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunPage, AgentRunQuery, AgentRunRecord,
     AgentRunTimelineEvent, AgentRunTimelineKind, StoreError, TaskRecord,
 };
-use steward_types::direct_package::{ExecutionLogMode, TaskOrigin};
+use steward_types::direct_package::{ExecutionLogMode, PromptSourceKind, TaskOrigin};
 use steward_types::{CanonicalUserId, RuntimeOwnership, TaskPhase};
 use uuid::Uuid;
 
@@ -331,6 +331,7 @@ pub(crate) struct BrowserRunPackageView {
     revision: String,
     path: String,
     content_digest: Option<String>,
+    prompt_source: PromptSourceKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -1969,6 +1970,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
             revision: evidence.revision.clone(),
             path: evidence.path.as_str().to_owned(),
             content_digest: Some(evidence.closure_digest.as_str().to_owned()),
+            prompt_source: evidence.prompt_source,
         })
         .or_else(|| {
             record
@@ -1979,6 +1981,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
                     revision: evidence.package.commit.as_str().to_owned(),
                     path: evidence.package.path.as_str().to_owned(),
                     content_digest: Some(evidence.closure_digest.as_str().to_owned()),
+                    prompt_source: evidence.prompt_source,
                 })
         })
         .or_else(|| {
@@ -1987,6 +1990,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
                 revision: format!("steward:version:{}", record.workflow_version?),
                 path: "task-definition.json".to_owned(),
                 content_digest: record.workflow_digest.clone(),
+                prompt_source: PromptSourceKind::Path,
             })
         });
     BrowserRunView {
@@ -2197,7 +2201,9 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
     use steward_store::{AgentRunSpend, AgentRunTimelineEvent, TaskRecord};
-    use steward_types::direct_package::{BrowserTaskEvidence, ContentDigest, RelativePath};
+    use steward_types::direct_package::{
+        BrowserTaskEvidence, ContentDigest, PromptSourceKind, RelativePath,
+    };
     use steward_types::{
         AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal,
     };
@@ -3463,6 +3469,7 @@ mod tests {
                 ),
             ])),
             diagnostics: Default::default(),
+            prompt_source: PromptSourceKind::Path,
         };
         let mut own = run(own_task, owner);
         own.task_origin = TaskOrigin::Browser;
@@ -3541,6 +3548,7 @@ mod tests {
                 "{}".to_owned(),
             )])),
             diagnostics: Default::default(),
+            prompt_source: PromptSourceKind::Path,
         });
         let ledger = FakeLedger::default();
         ledger

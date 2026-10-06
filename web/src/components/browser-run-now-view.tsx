@@ -99,7 +99,7 @@ export function runNowFailureMessage(error: unknown): string {
   return genericRunNowFailure;
 }
 
-function inlineFiles(
+export function inlineFiles(
   agentRef: string,
   prompt: string,
   envelope: BrowserEnvelope,
@@ -111,7 +111,7 @@ function inlineFiles(
       name: "browser-task",
       version: 1,
       runtime: { agentRef, model },
-      prompt: "prompt.md",
+      promptText: prompt,
       outputs: [{ path: "out", kind: "directory", required: true }],
       requires: {
         authority: {
@@ -132,7 +132,6 @@ function inlineFiles(
         },
       },
     }, null, 2),
-    "prompt.md": prompt,
   };
 }
 
