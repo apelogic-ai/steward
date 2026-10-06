@@ -404,7 +404,8 @@ caller/source stable-ID bindings for cross-repository packages, and configure
 `networkPolicy.githubApiCidrs` when NetworkPolicy is enabled. After rollout,
 prove one exact-commit read before activating the workflow. When
 `taskIdentity.resource` configures protected-resource discovery, also check
-`steward_direct_packages_supported: true` at
+`steward_direct_packages_supported: true` and
+`steward_package_path_supported: true` at
 `/.well-known/oauth-protected-resource`. A false capability produces
 `task.direct_package_source_disabled`; do not diagnose it as an Identity or
 User Envelope failure.

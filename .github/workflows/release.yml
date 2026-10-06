@@ -752,7 +752,7 @@ jobs:
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
             printf 'Steward v0.3.9 adds an owner-scoped Task library with immutable versions, exact digest links, role sharing, and one Tasks and Run now UI for authored, exact Git, and published Workflow sources.\n\n'
-            printf 'Same-repository automation can now publish the exact two-file Task package and pinned caller workflow through a governed pull request, observe its merge, dispatch it, and report the resulting GitHub run.\n\n'
+            printf 'Same-repository automation can now publish the exact two-file Task package and pinned caller workflow through a governed pull request, observe its merge, dispatch it, and report the resulting GitHub run. The package-path caller requires steward-run 0.8.0 or later and the advertised steward_package_path_supported capability.\n\n'
             printf 'Task output archives now contain only declared out/ files; stdout and stderr remain in the owner-scoped execution-log endpoints. Terminal event-stream history is bounded while Last-Event-ID reconnect remains available during its grace period.\n\n'
             printf 'This release retains the browser Run now, member administration, onboarding, live Run detail, connection orchestration, and Next.js 16.3.6 security fixes completed in v0.3.8.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'

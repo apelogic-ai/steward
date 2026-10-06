@@ -12,12 +12,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Added
 
 - Added same-repository direct Task submission by `packagePath`, with request-level
-  execution-log diagnostics and immutable implicit-invocation evidence. Existing
-  invocation manifests remain the cross-repository mechanism.
+  execution-log diagnostics and immutable implicit-invocation evidence. The
+  protected-resource metadata now advertises `steward_package_path_supported` so
+  steward-run 0.8.0 or later can gate this path. Existing invocation manifests
+  remain the cross-repository mechanism.
 - Added `promptText` as a bounded inline alternative to a prompt file in
   `steward.task-definition/v2`. Save this task now produces the two-file repository
   path with `steward-run` 0.8.0 or later and falls back to the compatible invocation
-  manifest for older reviewed releases. These fields require Steward 0.3.9 or later.
+  manifest for older reviewed releases. These fields require Steward 0.3.9 or later;
+  earlier Steward releases reject them.
 - Added governed GitHub repository automation that discovers an owner-scoped target,
   publishes an exact Task package and pinned caller workflow through a pull request,
   observes merge readiness, dispatches the workflow, and reports the resulting run.
