@@ -66,6 +66,7 @@ struct ProtectedResourceMetadata<'a> {
     bearer_methods_supported: [&'static str; 1],
     steward_task_token_contracts: Vec<&'static str>,
     steward_direct_packages_supported: bool,
+    steward_package_path_supported: bool,
 }
 
 pub fn task_auth_discovery_router(config: Option<TaskAuthDiscoveryConfig>) -> Router {
@@ -94,6 +95,7 @@ async fn protected_resource_metadata(State(state): State<DiscoveryState>) -> Res
             bearer_methods_supported: ["header"],
             steward_task_token_contracts: contracts,
             steward_direct_packages_supported: config.direct_packages_supported,
+            steward_package_path_supported: config.direct_packages_supported,
         }),
     )
         .into_response()
@@ -217,6 +219,7 @@ mod tests {
         for document in [api, chart, installation] {
             for required in [
                 "steward_direct_packages_supported",
+                "steward_package_path_supported",
                 "task.direct_package_source_disabled",
             ] {
                 assert!(
@@ -285,6 +288,7 @@ mod tests {
             serde_json::json!(["steward-task-v2", "steward-task-v3"])
         );
         assert_eq!(body["steward_direct_packages_supported"], true);
+        assert_eq!(body["steward_package_path_supported"], true);
         Ok(())
     }
 
@@ -359,6 +363,7 @@ mod tests {
             serde_json::json!(["steward-task-v2"])
         );
         assert_eq!(body["steward_direct_packages_supported"], false);
+        assert_eq!(body["steward_package_path_supported"], false);
         Ok(())
     }
 
