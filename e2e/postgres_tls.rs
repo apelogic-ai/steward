@@ -372,7 +372,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
 async fn verify_browser_task_library_upgrade(store: &PgStore) -> Result<(), Box<dyn Error>> {
     let task_id = Uuid::parse_str("00000000-0000-0000-0000-000000000279")?;
     let owner_user_id = "usr_0123456789abcdef0123456789abcdef";
-    let shared_roles = vec!["engineer".to_owned()];
+    let shared_roles = vec!["Platform.Eng".to_owned(), "org:eng".to_owned()];
     let v1_digest = format!("steward:sha256:{}", "1".repeat(64));
     let v2_digest = format!("steward:sha256:{}", "2".repeat(64));
     let v1_files = BTreeMap::from([(
@@ -428,6 +428,24 @@ async fn verify_browser_task_library_upgrade(store: &PgStore) -> Result<(), Box<
     assert_eq!(v1.version, 1);
     assert_eq!(v2.version, 2);
     assert_ne!(v1.content_digest, v2.content_digest);
+
+    let duplicate_digest = format!("steward:sha256:{}", "3".repeat(64));
+    let duplicate_name = store
+        .save_browser_task_version(BrowserTaskVersionPublication {
+            task_id: Uuid::parse_str("00000000-0000-0000-0000-000000000280")?,
+            owner_user_id,
+            name: "upgrade-task",
+            shared_roles: &shared_roles,
+            version: 1,
+            content_digest: &duplicate_digest,
+            package_path: "task-definition.json",
+            files: &v1_files,
+        })
+        .await;
+    assert!(
+        matches!(duplicate_name, Err(StoreError::TaskIdempotencyConflict)),
+        "an owner-scoped duplicate Task name must return the documented conflict"
+    );
 
     let versions = store
         .browser_task_draft_versions(owner_user_id, task_id)

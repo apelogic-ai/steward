@@ -8,7 +8,7 @@ CREATE TABLE browser_task_drafts (
     shared_roles text[] NOT NULL DEFAULT '{}',
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (owner_user_id, name),
+    CONSTRAINT browser_task_drafts_owner_name_key UNIQUE (owner_user_id, name),
     CHECK (cardinality(shared_roles) <= 32)
 );
 

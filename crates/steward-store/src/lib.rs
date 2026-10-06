@@ -861,7 +861,7 @@ impl PgStore {
                 .bind(publication.shared_roles)
                 .execute(&mut *transaction)
                 .await
-                .map_err(database_error)?;
+                .map_err(browser_task_draft_database_error)?;
             }
             None => return Err(StoreError::TaskNotFound),
         }
@@ -12532,6 +12532,18 @@ fn canonical_identity_database_error(error: sqlx::Error) -> StoreError {
     }
 }
 
+fn browser_task_draft_database_error(error: sqlx::Error) -> StoreError {
+    let duplicate_owner_name = error.as_database_error().is_some_and(|database_error| {
+        database_error.code().as_deref() == Some("23505")
+            && database_error.constraint() == Some("browser_task_drafts_owner_name_key")
+    });
+    if duplicate_owner_name {
+        StoreError::TaskIdempotencyConflict
+    } else {
+        database_error(error)
+    }
+}
+
 fn canonical_principal_from_row(
     row: &sqlx::postgres::PgRow,
     expected_organization_id: &OrganizationId,
@@ -13858,14 +13870,6 @@ fn valid_browser_task_version_publication(publication: &BrowserTaskVersionPublic
             .as_bytes()
             .first()
             .is_some_and(u8::is_ascii_lowercase);
-    let valid_role = |role: &String| {
-        !role.is_empty()
-            && role.len() <= 64
-            && role.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-            && role.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-            })
-    };
     let mut roles = publication.shared_roles.to_vec();
     roles.sort();
     roles.dedup();
@@ -13873,7 +13877,10 @@ fn valid_browser_task_version_publication(publication: &BrowserTaskVersionPublic
         && valid_name
         && publication.shared_roles.len() <= 32
         && roles.len() == publication.shared_roles.len()
-        && publication.shared_roles.iter().all(valid_role)
+        && publication
+            .shared_roles
+            .iter()
+            .all(|role| is_valid_member_role(role))
         && publication.version > 0
         && publication
             .content_digest

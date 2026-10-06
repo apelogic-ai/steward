@@ -974,7 +974,24 @@ where
     {
         Ok(record) => record,
         Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
-    };
+    }
+    .and_then(|record| {
+        let readable = record
+            .browser_task_evidence
+            .as_ref()
+            .is_some_and(|evidence| {
+                evidence.source == "inline" || executed_task_identity(&record).is_some()
+            });
+        if readable {
+            Some(record)
+        } else {
+            eprintln!(
+                "skipping unreadable browser Task run {} while resolving Task detail",
+                record.task_uid
+            );
+            None
+        }
+    });
     let task = if let Some(record) = saved {
         let definition = match saved_task_definition(&record) {
             Ok(definition) => definition,
@@ -1037,6 +1054,7 @@ where
             publication_task_uid,
         }
     } else if let Some(record) = executed {
+        let executed_identity = executed_task_identity(&record);
         let Some(evidence) = record.browser_task_evidence else {
             return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
         };
@@ -1054,7 +1072,7 @@ where
         };
         let (name, version) = match definition.as_ref() {
             Some(definition) => (definition.name.as_str().to_owned(), definition.version),
-            None => match direct_workflow_identity(&record.workflow) {
+            None => match executed_identity {
                 Some(identity) => identity,
                 None => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
             },
@@ -1255,7 +1273,11 @@ where
     }
     for record in executed {
         let Some(item) = executed_task_list_item(&record) else {
-            return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE);
+            eprintln!(
+                "skipping unreadable browser Task run {} while listing Task library",
+                record.task_uid
+            );
+            continue;
         };
         tasks.entry(item.content_digest.clone()).or_insert(item);
     }
@@ -1446,9 +1468,24 @@ fn direct_workflow_identity(workflow: &str) -> Option<(String, u64)> {
     Some((name.to_owned(), version))
 }
 
+fn executed_task_identity(record: &AgentRunRecord) -> Option<(String, u64)> {
+    let evidence = record.browser_task_evidence.as_ref()?;
+    if let Some(source_name) = evidence.source.strip_prefix("steward:registry/") {
+        let name = record.workflow_name.as_deref()?;
+        let version = u64::try_from(record.workflow_version?)
+            .ok()
+            .filter(|version| *version > 0)?;
+        if source_name != name || evidence.revision != format!("steward:version:{version}") {
+            return None;
+        }
+        return Some((name.to_owned(), version));
+    }
+    direct_workflow_identity(&record.workflow)
+}
+
 fn executed_task_list_item(record: &AgentRunRecord) -> Option<BrowserTaskListItem> {
     let evidence = record.browser_task_evidence.as_ref()?;
-    let (name, version) = direct_workflow_identity(&record.workflow)?;
+    let (name, version) = executed_task_identity(record)?;
     Some(BrowserTaskListItem {
         task_id: None,
         content_digest: evidence.closure_digest.as_str().to_owned(),
@@ -4715,12 +4752,46 @@ mod tests {
             published_by: "usr_admin0000000000000000000000000".to_owned(),
             published_at: "2026-01-02T03:04:05Z".to_owned(),
         };
+        let registry_digest = format!("steward:{workflow_digest}");
+        let registry_task = Uuid::parse_str("66666666-6666-4666-8666-666666666666")
+            .map_err(|error| error.to_string())?;
+        let mut registry_run = run(registry_task, "usr_0123456789abcdef0123456789abcdef");
+        registry_run.task_origin = TaskOrigin::Browser;
+        registry_run.workflow = "release-summary@2".to_owned();
+        registry_run.workflow_name = Some("release-summary".to_owned());
+        registry_run.workflow_version = Some(2);
+        registry_run.workflow_digest = Some(workflow_digest.clone());
+        registry_run.coding_agent_runtime = "example-agent@1.0.0".to_owned();
+        registry_run.browser_task_evidence = Some(BrowserTaskEvidence {
+            source: "steward:registry/release-summary".to_owned(),
+            revision: "steward:version:2".to_owned(),
+            path: RelativePath::parse("task-definition.json")?,
+            closure: None,
+            closure_digest: ContentDigest::parse(registry_digest.clone())?,
+            inline_files: None,
+            diagnostics: Default::default(),
+            prompt_source: PromptSourceKind::Path,
+        });
+        let malformed_task = Uuid::parse_str("77777777-7777-4777-8777-777777777777")
+            .map_err(|error| error.to_string())?;
+        let mut malformed_run = run(malformed_task, "usr_0123456789abcdef0123456789abcdef");
+        malformed_run.task_origin = TaskOrigin::Browser;
+        malformed_run.browser_task_evidence = Some(BrowserTaskEvidence {
+            source: "https://github.com/example-org/example-repo.git".to_owned(),
+            revision: format!("git:sha1:{}", "a".repeat(40)),
+            path: RelativePath::parse("task-definition.json")?,
+            closure: None,
+            closure_digest: ContentDigest::parse(format!("steward:sha256:{}", "d".repeat(64)))?,
+            inline_files: None,
+            diagnostics: Default::default(),
+            prompt_source: PromptSourceKind::Path,
+        });
         let ledger = FakeLedger::default();
-        ledger
-            .records
-            .lock()
-            .map_err(|_| "lock records")?
-            .push(hidden);
+        ledger.records.lock().map_err(|_| "lock records")?.extend([
+            hidden,
+            registry_run,
+            malformed_run,
+        ]);
         ledger
             .workflow_revisions
             .lock()
@@ -4743,10 +4814,11 @@ mod tests {
         assert_eq!(hidden_response.status(), StatusCode::NOT_FOUND);
 
         let workflow_response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!("/app/api/v1/tasks/{workflow_digest}"))
-                    .header(header::COOKIE, session_cookie)
+                    .header(header::COOKIE, &session_cookie)
                     .body(Body::empty())
                     .map_err(|error| format!("build Workflow Task request: {error}"))?,
             )
@@ -4764,6 +4836,44 @@ mod tests {
             body["task"]["files"]["prompt.md"],
             "Summarize the release.\n"
         );
+
+        let registry_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/tasks/{registry_digest}"))
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build registry Task request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute registry Task request: {error}"))?;
+        assert_eq!(registry_response.status(), StatusCode::OK);
+
+        let list_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/tasks")
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build Task list request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute Task list request: {error}"))?;
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(list_response.into_body(), 16 * 1024)
+                .await
+                .map_err(|error| format!("read Task list response: {error}"))?,
+        )
+        .map_err(|error| format!("decode Task list response: {error}"))?;
+        assert!(body["tasks"].as_array().is_some_and(|tasks| {
+            tasks.iter().any(|task| {
+                task["contentDigest"] == registry_digest
+                    && task["name"] == "release-summary"
+                    && task["version"] == 2
+            })
+        }));
         Ok(())
     }
 
