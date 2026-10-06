@@ -369,6 +369,18 @@ impl TaskApiConfig {
         )
     }
 
+    pub(crate) fn browser_source_repository_ids_are_authorized(
+        &self,
+        owner_id: &str,
+        repository_id: &str,
+    ) -> bool {
+        self.source_repository_bindings.iter().any(
+            |(_, _, source_owner_id, source_repository_id)| {
+                source_owner_id == owner_id && source_repository_id == repository_id
+            },
+        )
+    }
+
     pub fn execution_binding_refs(&self) -> Vec<String> {
         if self.execution_bindings_active {
             self.execution_bindings

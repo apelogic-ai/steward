@@ -581,6 +581,20 @@ mod migration_tests {
             "migration 57 must preserve immutable browser Task package evidence"
         );
     }
+
+    #[test]
+    fn github_repository_automation_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 64
+                    && migration
+                        .description
+                        .contains("github repository automation operations")
+            }),
+            "migration 64 must preserve v1-v3 connection rows while admitting only v4 repository automation"
+        );
+    }
 }
 
 impl PgStore {
@@ -8581,7 +8595,7 @@ impl PgStore {
         let active_mutation = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM connection_operations \
              WHERE canonical_user_id = $1 AND provider = 'github' \
-               AND operation_kind IN ('start', 'disconnect', 'rerun') \
+               AND operation_kind IN ('start', 'disconnect', 'rerun', 'dispatch', 'publish') \
                AND operation_state IN ('queued', 'provisioning', 'running') \
                AND finalization_state = 'not_requested')",
         )
@@ -8706,7 +8720,12 @@ impl PgStore {
                 .await
                 .map_err(database_error)?
             }
-            ConnectionOperationKind::Rerun => sqlx::query(
+            ConnectionOperationKind::Rerun
+            | ConnectionOperationKind::Repositories
+            | ConnectionOperationKind::Workflow
+            | ConnectionOperationKind::RunStatus
+            | ConnectionOperationKind::Dispatch
+            | ConnectionOperationKind::Publish => sqlx::query(
                 "SELECT operations.*, \
                         to_char(operations.flow_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS flow_expires_at_text, \
                         to_char(operations.response_deadline_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS response_deadline_at_text, \
@@ -8715,14 +8734,17 @@ impl PgStore {
                  FROM connection_operations operations \
                  JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
                  WHERE operations.canonical_user_id = $1 AND operations.provider = 'github' \
-                   AND operations.operation_kind = 'rerun' \
-                   AND operations.idempotency_identity = $2 \
+                   AND operations.operation_kind = $2 \
+                   AND operations.idempotency_identity = $3 \
                    AND (operations.operation_state IN ('queued', 'provisioning', 'running') \
                      OR (operations.operation_state = 'succeeded' \
-                        AND operations.result_expires_at > now())) \
+                        AND (operations.result_expires_at > now() \
+                          OR (operations.operation_kind = 'publish' \
+                            AND operations.result IS NOT NULL)))) \
                  ORDER BY operations.created_at DESC LIMIT 1",
             )
             .bind(request.task.owner_user_id)
+            .bind(request.operation_kind.as_str())
             .bind(request.idempotency_identity)
             .fetch_optional(&mut *transaction)
             .await
@@ -8730,7 +8752,16 @@ impl PgStore {
         };
         if let Some(row) = reusable {
             let record = connection_operation_record(row)?;
-            if connection_execution_bindings_match(&record.bindings, request.bindings) {
+            // A completed publication is an external side effect. Its semantic identity is bound
+            // to the owner, Task, and repository, so retain the exact result across bridge-image
+            // or authority rotations rather than attempting to create a second branch or PR.
+            let durable_publication = request.operation_kind == ConnectionOperationKind::Publish
+                && record.operation_kind == ConnectionOperationKind::Publish
+                && record.operation_state == ConnectionOperationState::Succeeded
+                && record.result.is_some();
+            if durable_publication
+                || connection_execution_bindings_match(&record.bindings, request.bindings)
+            {
                 transaction.commit().await.map_err(database_error)?;
                 return Ok(ConnectionOperationReservation {
                     inserted: false,
@@ -8743,7 +8774,7 @@ impl PgStore {
         if active_mutation {
             return Err(StoreError::ConnectionOperationConflict);
         }
-        if request.operation_kind != ConnectionOperationKind::Status {
+        if request.operation_kind.is_mutation() {
             let preempted = sqlx::query_scalar::<_, Uuid>(
                 "WITH preempted AS ( \
                    UPDATE connection_operations \
@@ -9405,7 +9436,9 @@ impl PgStore {
                  cached_status = CASE WHEN operation_kind = 'status' THEN $2 ELSE cached_status END, \
                  cache_expires_at = CASE WHEN operation_kind = 'status' \
                      THEN now() + make_interval(secs => $5) ELSE NULL END, \
-                 result_expires_at = CASE WHEN operation_kind IN ('disconnect', 'rerun') \
+                 result_expires_at = CASE WHEN operation_kind IN ( \
+                     'disconnect', 'rerun', 'repositories', 'workflow', 'run_status', 'dispatch', 'publish' \
+                 ) \
                      THEN now() + make_interval(secs => $6) ELSE result_expires_at END, \
                  oauth_phase = CASE WHEN operation_kind = 'start' THEN 'pending' ELSE oauth_phase END, \
                  authorization_url = $3, authorization_url_digest = $4, \
@@ -9429,7 +9462,7 @@ impl PgStore {
         if updated.rows_affected() != 1 {
             return Err(StoreError::InvalidConnectionOperation);
         }
-        if operation_kind != ConnectionOperationKind::Status {
+        if operation_kind.is_mutation() {
             sqlx::query(
                 "UPDATE connection_operations \
                  SET cached_status = NULL, cache_expires_at = NULL, updated_at = now() \
@@ -10146,13 +10179,11 @@ fn validate_connection_operation_request(
     validate_task_identity_binding(&request.task)?;
     validate_task_version_pins(&request.task)?;
     validate_task_runtime_binding(&request.task)?;
-    let (expected_resource, expected_action) = match request.operation_kind {
-        ConnectionOperationKind::Rerun => ("actions_run_trigger", "write"),
-        _ => ("provider-control", request.operation_kind.as_str()),
-    };
-    let [tool] = request.task.runtime_spec.tools.as_slice() else {
-        return Err(StoreError::InvalidConnectionOperation);
-    };
+    let expected_tools =
+        steward_admission::internal_authorities::steward_connections_v4::operation_grants(
+            request.operation_kind.authority_action(),
+        )
+        .ok_or(StoreError::InvalidConnectionOperation)?;
     let expected_command = [
         "/usr/local/bin/steward-connections-bridge",
         "--operation",
@@ -10161,6 +10192,11 @@ fn validate_connection_operation_request(
             ConnectionOperationKind::Start => "github.start",
             ConnectionOperationKind::Disconnect => "github.disconnect",
             ConnectionOperationKind::Rerun => "github.rerun",
+            ConnectionOperationKind::Repositories => "github.repositories",
+            ConnectionOperationKind::Workflow => "github.workflow",
+            ConnectionOperationKind::RunStatus => "github.run-status",
+            ConnectionOperationKind::Dispatch => "github.dispatch",
+            ConnectionOperationKind::Publish => "github.publish",
         },
         "--input",
         "request.json",
@@ -10191,6 +10227,10 @@ fn validate_connection_operation_request(
                 3,
                 steward_admission::internal_authorities::steward_connections_v3::AUTHORITY_DIGEST,
                 "0.4.9"
+            ) | (
+                4,
+                steward_admission::internal_authorities::steward_connections_v4::AUTHORITY_DIGEST,
+                "0.4.9"
             )
         )
         || request.response_deadline_seconds <= 0
@@ -10202,9 +10242,7 @@ fn validate_connection_operation_request(
         || request.task.runtime_ownership != steward_types::RuntimeOwnership::Provisioned
         || request.task.runtime_spec.agent_type.name != "connections-bridge"
         || !request.task.runtime_spec.llms.is_empty()
-        || tool.provider != "github"
-        || tool.resource != expected_resource
-        || tool.action != expected_action
+        || request.task.runtime_spec.tools != expected_tools
         || request
             .task
             .agent_command
@@ -11142,6 +11180,11 @@ pub enum ConnectionOperationKind {
     Start,
     Disconnect,
     Rerun,
+    Repositories,
+    Workflow,
+    RunStatus,
+    Dispatch,
+    Publish,
 }
 
 impl ConnectionOperationKind {
@@ -11151,7 +11194,26 @@ impl ConnectionOperationKind {
             Self::Start => "start",
             Self::Disconnect => "disconnect",
             Self::Rerun => "rerun",
+            Self::Repositories => "repositories",
+            Self::Workflow => "workflow",
+            Self::RunStatus => "run_status",
+            Self::Dispatch => "dispatch",
+            Self::Publish => "publish",
         }
+    }
+
+    pub const fn authority_action(self) -> &'static str {
+        match self {
+            Self::RunStatus => "run-status",
+            _ => self.as_str(),
+        }
+    }
+
+    pub const fn is_mutation(self) -> bool {
+        matches!(
+            self,
+            Self::Start | Self::Disconnect | Self::Rerun | Self::Dispatch | Self::Publish
+        )
     }
 }
 
@@ -12058,6 +12120,11 @@ fn connection_operation_kind_from_text(value: &str) -> Result<ConnectionOperatio
         "start" => Ok(ConnectionOperationKind::Start),
         "disconnect" => Ok(ConnectionOperationKind::Disconnect),
         "rerun" => Ok(ConnectionOperationKind::Rerun),
+        "repositories" => Ok(ConnectionOperationKind::Repositories),
+        "workflow" => Ok(ConnectionOperationKind::Workflow),
+        "run_status" => Ok(ConnectionOperationKind::RunStatus),
+        "dispatch" => Ok(ConnectionOperationKind::Dispatch),
+        "publish" => Ok(ConnectionOperationKind::Publish),
         _ => Err(StoreError::InvalidConnectionOperation),
     }
 }

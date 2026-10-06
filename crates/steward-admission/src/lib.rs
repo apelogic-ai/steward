@@ -145,6 +145,83 @@ pub mod internal_authorities {
             envelope
         }
     }
+
+    pub mod steward_connections_v4 {
+        use super::{
+            Envelope, steward_connections_v1, steward_connections_v2, steward_connections_v3,
+        };
+        use steward_types::ToolGrant;
+
+        pub const AUTHORITY_ID: &str = steward_connections_v1::AUTHORITY_ID;
+        pub const AUTHORITY_VERSION: i64 = 4;
+        pub const AUTHORITY_DIGEST: &str =
+            "sha256:6ece401f71b5c71939ef1580b438505380b4f12d29a6fd717ac78a9d9c93848a";
+        pub const SERVICE: &str = steward_connections_v1::SERVICE;
+        pub const AGENT_TYPE: &str = steward_connections_v1::AGENT_TYPE;
+        pub const BRIDGE_BINARY: &str = steward_connections_v1::BRIDGE_BINARY;
+        pub const INPUT_FILE: &str = steward_connections_v1::INPUT_FILE;
+        pub const OUTPUT_FILE: &str = steward_connections_v1::OUTPUT_FILE;
+        pub const RESPONSE_DEADLINE_SECONDS: i64 =
+            steward_connections_v1::RESPONSE_DEADLINE_SECONDS;
+        pub const MCP_GW_VERSION: &str = steward_connections_v2::MCP_GW_VERSION;
+        pub const OAUTH_STATE_LIFETIME_SECONDS: i64 =
+            steward_connections_v1::OAUTH_STATE_LIFETIME_SECONDS;
+        pub const OAUTH_CLOCK_SKEW_SECONDS: i64 = steward_connections_v1::OAUTH_CLOCK_SKEW_SECONDS;
+
+        fn github_grant(resource: &str, action: &str) -> ToolGrant {
+            ToolGrant {
+                provider: "github".to_owned(),
+                resource: resource.to_owned(),
+                action: action.to_owned(),
+            }
+        }
+
+        pub fn operation_grants(operation: &str) -> Option<Vec<ToolGrant>> {
+            match operation {
+                "status" | "start" | "disconnect" | "rerun" => {
+                    steward_connections_v3::operation_grant(operation).map(|grant| vec![grant])
+                }
+                "repositories" => Some(vec![
+                    github_grant("search_repositories", "read"),
+                    github_grant("get_me", "read"),
+                ]),
+                "workflow" => Some(vec![github_grant("get_file_contents", "read")]),
+                "run-status" => Some(vec![
+                    github_grant("actions_list", "read"),
+                    github_grant("actions_get", "read"),
+                    github_grant("get_job_logs", "read"),
+                ]),
+                "dispatch" => Some(vec![
+                    github_grant("get_file_contents", "read"),
+                    github_grant("actions_run_trigger", "write"),
+                    github_grant("actions_list", "read"),
+                ]),
+                "publish" => Some(vec![
+                    github_grant("create_branch", "write"),
+                    github_grant("push_files", "write"),
+                    github_grant("create_pull_request", "write"),
+                ]),
+                _ => None,
+            }
+        }
+
+        pub fn envelope() -> Envelope {
+            let mut envelope = steward_connections_v3::envelope();
+            envelope.revision = AUTHORITY_VERSION;
+            envelope.spec.tools.extend([
+                github_grant("search_repositories", "read"),
+                github_grant("get_me", "read"),
+                github_grant("get_file_contents", "read"),
+                github_grant("actions_list", "read"),
+                github_grant("actions_get", "read"),
+                github_grant("get_job_logs", "read"),
+                github_grant("create_branch", "write"),
+                github_grant("push_files", "write"),
+                github_grant("create_pull_request", "write"),
+            ]);
+            envelope
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

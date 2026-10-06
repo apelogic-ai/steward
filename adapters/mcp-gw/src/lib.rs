@@ -128,6 +128,8 @@ const DISCONNECT_PATH: &str = "/oauth/github/disconnect";
 const MCP_PATH: &str = "/mcp";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const RERUN_REQUEST_ID: &str = "steward-github-rerun";
+const MAX_WORKFLOW_BYTES: usize = 256 * 1024;
+const MAX_PUBLISHED_FILE_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GithubBridgeOperation {
@@ -135,6 +137,11 @@ pub enum GithubBridgeOperation {
     Start,
     Disconnect,
     Rerun,
+    Repositories,
+    Workflow,
+    RunStatus,
+    Dispatch,
+    Publish,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,7 +165,14 @@ impl GatewayContract {
 impl GithubBridgeOperation {
     fn expected_status(self) -> StatusCode {
         match self {
-            Self::Status | Self::Start | Self::Rerun => StatusCode::OK,
+            Self::Status
+            | Self::Start
+            | Self::Rerun
+            | Self::Repositories
+            | Self::Workflow
+            | Self::RunStatus
+            | Self::Dispatch
+            | Self::Publish => StatusCode::OK,
             Self::Disconnect => StatusCode::NO_CONTENT,
         }
     }
@@ -169,6 +183,11 @@ impl GithubBridgeOperation {
             "github.start" => Ok(Self::Start),
             "github.disconnect" => Ok(Self::Disconnect),
             "github.rerun" => Ok(Self::Rerun),
+            "github.repositories" => Ok(Self::Repositories),
+            "github.workflow" => Ok(Self::Workflow),
+            "github.run-status" => Ok(Self::RunStatus),
+            "github.dispatch" => Ok(Self::Dispatch),
+            "github.publish" => Ok(Self::Publish),
             _ => Err(rejected("Connections bridge operation is not allowlisted")),
         }
     }
@@ -184,9 +203,20 @@ impl GithubBridgeOperation {
             ),
             Self::Start => (Method::POST, START_PATH),
             Self::Disconnect => (Method::POST, DISCONNECT_PATH),
-            Self::Rerun => (Method::POST, MCP_PATH),
+            Self::Rerun
+            | Self::Repositories
+            | Self::Workflow
+            | Self::RunStatus
+            | Self::Dispatch
+            | Self::Publish => (Method::POST, MCP_PATH),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GithubPublishedFile {
+    pub path: String,
+    pub content: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +229,40 @@ pub enum GithubBridgeRequest {
         owner: String,
         repo: String,
         run_id: u64,
+    },
+    Repositories {
+        query: String,
+        page: u32,
+        per_page: u32,
+    },
+    Workflow {
+        owner: String,
+        repo: String,
+        path: String,
+        git_ref: String,
+        expected_content: String,
+    },
+    RunStatus {
+        owner: String,
+        repo: String,
+        run_id: u64,
+    },
+    Dispatch {
+        owner: String,
+        repo: String,
+        workflow_id: String,
+        git_ref: String,
+        inputs: Map<String, Value>,
+        expected_content: String,
+    },
+    Publish {
+        owner: String,
+        repo: String,
+        base_branch: String,
+        branch: String,
+        title: String,
+        body: String,
+        files: Vec<GithubPublishedFile>,
     },
 }
 
@@ -250,6 +314,118 @@ impl GithubBridgeRequest {
                     run_id,
                 })
             }
+            GithubBridgeOperation::Repositories => {
+                require_exact_fields(&object, &["query", "page", "perPage"])?;
+                let query = bounded_string_field(&object, "query", 200)?;
+                if query.bytes().any(|byte| byte.is_ascii_control()) {
+                    return Err(rejected("GitHub repository query is invalid"));
+                }
+                let page = bounded_u32_field(&object, "page", 1, u32::MAX)?;
+                let per_page = bounded_u32_field(&object, "perPage", 1, 100)?;
+                Ok(Self::Repositories {
+                    query,
+                    page,
+                    per_page,
+                })
+            }
+            GithubBridgeOperation::Workflow => {
+                require_exact_fields(
+                    &object,
+                    &["owner", "repo", "path", "ref", "expectedContent"],
+                )?;
+                let (owner, repo) = repository_fields(&object)?;
+                let path = workflow_path_field(&object, "path")?;
+                let git_ref = git_ref_field(&object, "ref")?;
+                let expected_content =
+                    bounded_string_field(&object, "expectedContent", MAX_WORKFLOW_BYTES)?;
+                Ok(Self::Workflow {
+                    owner,
+                    repo,
+                    path,
+                    git_ref,
+                    expected_content,
+                })
+            }
+            GithubBridgeOperation::RunStatus => {
+                require_exact_fields(&object, &["owner", "repo", "runId"])?;
+                let (owner, repo) = repository_fields(&object)?;
+                let run_id = positive_u64_field(&object, "runId")?;
+                Ok(Self::RunStatus {
+                    owner,
+                    repo,
+                    run_id,
+                })
+            }
+            GithubBridgeOperation::Dispatch => {
+                require_exact_fields(
+                    &object,
+                    &[
+                        "owner",
+                        "repo",
+                        "workflowId",
+                        "ref",
+                        "inputs",
+                        "expectedContent",
+                    ],
+                )?;
+                let (owner, repo) = repository_fields(&object)?;
+                let workflow_id = workflow_path_field(&object, "workflowId")?;
+                let git_ref = git_ref_field(&object, "ref")?;
+                let inputs = object
+                    .get("inputs")
+                    .and_then(Value::as_object)
+                    .filter(|inputs| inputs.len() <= 20)
+                    .cloned()
+                    .ok_or_else(|| rejected("GitHub dispatch inputs are invalid"))?;
+                if inputs.iter().any(|(name, value)| {
+                    !valid_input_name(name)
+                        || value.as_str().is_none_or(|value| value.len() > 8 * 1024)
+                }) {
+                    return Err(rejected("GitHub dispatch inputs are invalid"));
+                }
+                let expected_content =
+                    bounded_string_field(&object, "expectedContent", MAX_WORKFLOW_BYTES)?;
+                Ok(Self::Dispatch {
+                    owner,
+                    repo,
+                    workflow_id,
+                    git_ref,
+                    inputs,
+                    expected_content,
+                })
+            }
+            GithubBridgeOperation::Publish => {
+                require_exact_fields(
+                    &object,
+                    &[
+                        "owner",
+                        "repo",
+                        "baseBranch",
+                        "branch",
+                        "title",
+                        "body",
+                        "files",
+                    ],
+                )?;
+                let (owner, repo) = repository_fields(&object)?;
+                let base_branch = git_ref_field(&object, "baseBranch")?;
+                let branch = git_ref_field(&object, "branch")?;
+                if !branch.starts_with("steward/task-") || branch == base_branch {
+                    return Err(rejected("GitHub publication branch is invalid"));
+                }
+                let title = bounded_string_field(&object, "title", 200)?;
+                let body = bounded_string_field(&object, "body", 4 * 1024)?;
+                let files = published_files_field(&object)?;
+                Ok(Self::Publish {
+                    owner,
+                    repo,
+                    base_branch,
+                    branch,
+                    title,
+                    body,
+                    files,
+                })
+            }
         }
     }
 
@@ -275,8 +451,173 @@ impl GithubBridgeRequest {
                     }
                 }
             })),
+            Self::Repositories { .. }
+            | Self::Workflow { .. }
+            | Self::RunStatus { .. }
+            | Self::Dispatch { .. }
+            | Self::Publish { .. } => None,
         }
     }
+}
+
+fn require_exact_fields(object: &Map<String, Value>, fields: &[&str]) -> Result<(), PortError> {
+    if object.len() == fields.len() && fields.iter().all(|field| object.contains_key(*field)) {
+        Ok(())
+    } else {
+        Err(rejected("GitHub operation request has unexpected fields"))
+    }
+}
+
+fn bounded_string_field(
+    object: &Map<String, Value>,
+    field: &str,
+    maximum: usize,
+) -> Result<String, PortError> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= maximum)
+        .map(str::to_owned)
+        .ok_or_else(|| rejected("GitHub operation string field is invalid"))
+}
+
+fn bounded_u32_field(
+    object: &Map<String, Value>,
+    field: &str,
+    minimum: u32,
+    maximum: u32,
+) -> Result<u32, PortError> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| (*value >= minimum) && (*value <= maximum))
+        .ok_or_else(|| rejected("GitHub operation integer field is invalid"))
+}
+
+fn positive_u64_field(object: &Map<String, Value>, field: &str) -> Result<u64, PortError> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| rejected("GitHub operation identifier is invalid"))
+}
+
+fn repository_fields(object: &Map<String, Value>) -> Result<(String, String), PortError> {
+    let owner = object
+        .get("owner")
+        .and_then(Value::as_str)
+        .filter(|value| valid_repository_component(value, 39))
+        .map(str::to_owned)
+        .ok_or_else(|| rejected("GitHub owner is invalid"))?;
+    let repo = object
+        .get("repo")
+        .and_then(Value::as_str)
+        .filter(|value| valid_repository_component(value, 100))
+        .map(str::to_owned)
+        .ok_or_else(|| rejected("GitHub repository is invalid"))?;
+    Ok((owner, repo))
+}
+
+fn valid_git_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && !value.contains("..")
+        && !value.contains("//")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-'))
+}
+
+fn git_ref_field(object: &Map<String, Value>, field: &str) -> Result<String, PortError> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| valid_git_ref(value))
+        .map(str::to_owned)
+        .ok_or_else(|| rejected("GitHub ref is invalid"))
+}
+
+fn valid_workflow_path(value: &str) -> bool {
+    let Some(name) = value.strip_prefix(".github/workflows/") else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.starts_with('.')
+        && matches!(name.rsplit_once('.'), Some((stem, "yml" | "yaml")) if !stem.is_empty())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn workflow_path_field(object: &Map<String, Value>, field: &str) -> Result<String, PortError> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| valid_workflow_path(value))
+        .map(str::to_owned)
+        .ok_or_else(|| rejected("GitHub workflow path is invalid"))
+}
+
+fn valid_input_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+fn valid_package_path(value: &str) -> bool {
+    let Some(remainder) = value.strip_prefix(".steward/tasks/") else {
+        return false;
+    };
+    !remainder.is_empty()
+        && remainder.ends_with("/task-definition.json")
+        && !remainder.contains("..")
+        && !remainder.contains("//")
+        && remainder
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-'))
+}
+
+fn published_files_field(
+    object: &Map<String, Value>,
+) -> Result<Vec<GithubPublishedFile>, PortError> {
+    let files = object
+        .get("files")
+        .and_then(Value::as_array)
+        .filter(|files| files.len() == 2)
+        .ok_or_else(|| rejected("GitHub publication must contain exactly two generated files"))?;
+    let mut parsed = Vec::with_capacity(files.len());
+    for file in files {
+        let file = file
+            .as_object()
+            .ok_or_else(|| rejected("GitHub publication file is invalid"))?;
+        require_exact_fields(file, &["path", "content"])?;
+        let path = bounded_string_field(file, "path", 512)?;
+        let content = bounded_string_field(file, "content", MAX_PUBLISHED_FILE_BYTES)?;
+        parsed.push(GithubPublishedFile { path, content });
+    }
+    if parsed[0].path == parsed[1].path
+        || parsed
+            .iter()
+            .filter(|file| valid_workflow_path(&file.path))
+            .count()
+            != 1
+        || parsed
+            .iter()
+            .filter(|file| valid_package_path(&file.path))
+            .count()
+            != 1
+    {
+        return Err(rejected(
+            "GitHub publication paths are outside the generated workflow and package allowlist",
+        ));
+    }
+    Ok(parsed)
 }
 
 #[derive(Clone)]
@@ -381,6 +722,16 @@ impl GithubMcpGateway {
         operation: GithubBridgeOperation,
         request: GithubBridgeRequest,
     ) -> Result<Value, PortError> {
+        if matches!(
+            operation,
+            GithubBridgeOperation::Repositories
+                | GithubBridgeOperation::Workflow
+                | GithubBridgeOperation::RunStatus
+                | GithubBridgeOperation::Dispatch
+                | GithubBridgeOperation::Publish
+        ) {
+            return self.execute_automation(operation, request).await;
+        }
         if !matches!(
             (operation, &request),
             (
@@ -444,6 +795,309 @@ impl GithubMcpGateway {
             break (status, body);
         };
         parse_response(self.contract, operation, status, &body)
+    }
+
+    async fn execute_automation(
+        &self,
+        operation: GithubBridgeOperation,
+        request: GithubBridgeRequest,
+    ) -> Result<Value, PortError> {
+        if self.contract != GatewayContract::LifecycleV049 {
+            return Err(rejected(
+                "GitHub repository automation requires the lifecycle gateway contract",
+            ));
+        }
+        match (operation, request) {
+            (
+                GithubBridgeOperation::Repositories,
+                GithubBridgeRequest::Repositories {
+                    query,
+                    page,
+                    per_page,
+                },
+            ) => {
+                let me = self
+                    .call_mcp("steward-github-me", "get_me", json!({}))
+                    .await?;
+                let repositories = self
+                    .call_mcp(
+                        "steward-github-repositories",
+                        "search_repositories",
+                        json!({"query": query, "page": page, "perPage": per_page}),
+                    )
+                    .await?;
+                normalize_repositories(&me, &repositories, page, per_page)
+            }
+            (
+                GithubBridgeOperation::Workflow,
+                GithubBridgeRequest::Workflow {
+                    owner,
+                    repo,
+                    path,
+                    git_ref,
+                    expected_content,
+                },
+            ) => {
+                let file = self
+                    .call_mcp(
+                        "steward-github-workflow",
+                        "get_file_contents",
+                        json!({"owner": owner, "repo": repo, "path": path, "ref": git_ref}),
+                    )
+                    .await?;
+                normalize_workflow(&file, &path, &expected_content)
+            }
+            (
+                GithubBridgeOperation::RunStatus,
+                GithubBridgeRequest::RunStatus {
+                    owner,
+                    repo,
+                    run_id,
+                },
+            ) => {
+                let run = self
+                    .call_mcp(
+                        "steward-github-run",
+                        "actions_get",
+                        json!({
+                            "method": "get_workflow_run",
+                            "owner": owner,
+                            "repo": repo,
+                            "resource_id": run_id.to_string(),
+                        }),
+                    )
+                    .await?;
+                let jobs = self
+                    .call_mcp(
+                        "steward-github-jobs",
+                        "actions_list",
+                        json!({
+                            "method": "list_workflow_jobs",
+                            "owner": owner,
+                            "repo": repo,
+                            "resource_id": run_id.to_string(),
+                            "perPage": 100,
+                        }),
+                    )
+                    .await?;
+                let failure_log = if run_conclusion(&run).is_some_and(|value| value != "success") {
+                    self.call_mcp(
+                        "steward-github-job-logs",
+                        "get_job_logs",
+                        json!({
+                            "owner": owner,
+                            "repo": repo,
+                            "run_id": run_id,
+                            "failed_only": true,
+                            "return_content": true,
+                            "tail_lines": 200,
+                        }),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|payload| bounded_log(&payload))
+                } else {
+                    None
+                };
+                normalize_run_status(&run, &jobs, run_id, failure_log)
+            }
+            (
+                GithubBridgeOperation::Dispatch,
+                GithubBridgeRequest::Dispatch {
+                    owner,
+                    repo,
+                    workflow_id,
+                    git_ref,
+                    inputs,
+                    expected_content,
+                },
+            ) => {
+                let workflow = self
+                    .call_mcp(
+                        "steward-github-dispatch-workflow",
+                        "get_file_contents",
+                        json!({
+                            "owner": owner,
+                            "repo": repo,
+                            "path": workflow_id,
+                            "ref": git_ref,
+                        }),
+                    )
+                    .await?;
+                let content = workflow_content(&workflow)
+                    .ok_or_else(|| rejected("GitHub workflow content is unavailable"))?;
+                if content != expected_content
+                    || !compatible_workflow(&content)
+                    || !dispatch_inputs_declared(&content, &inputs)
+                {
+                    return Err(rejected(
+                        "GitHub workflow does not match the exact Steward-generated caller",
+                    ));
+                }
+                let before = self
+                    .call_mcp(
+                        "steward-github-runs-before",
+                        "actions_list",
+                        json!({
+                            "method": "list_workflow_runs",
+                            "owner": owner,
+                            "repo": repo,
+                            "resource_id": workflow_id,
+                            "workflow_runs_filter": {"branch": git_ref},
+                            "perPage": 10,
+                        }),
+                    )
+                    .await?;
+                let previous_run_id = maximum_run_id(&before);
+                self.call_mcp(
+                    "steward-github-dispatch",
+                    "actions_run_trigger",
+                    json!({
+                        "method": "run_workflow",
+                        "owner": owner,
+                        "repo": repo,
+                        "workflow_id": workflow_id,
+                        "ref": git_ref,
+                        "inputs": inputs,
+                    }),
+                )
+                .await?;
+                let deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    let runs = self
+                        .call_mcp(
+                            "steward-github-runs-after",
+                            "actions_list",
+                            json!({
+                                "method": "list_workflow_runs",
+                                "owner": owner,
+                                "repo": repo,
+                                "resource_id": workflow_id,
+                                "workflow_runs_filter": {"branch": git_ref},
+                                "perPage": 10,
+                            }),
+                        )
+                        .await?;
+                    if let Some((run_id, url)) = newest_dispatched_run(&runs, previous_run_id) {
+                        return Ok(json!({"runId": run_id, "url": url}));
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(unavailable("observe dispatched GitHub workflow run"));
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+            (
+                GithubBridgeOperation::Publish,
+                GithubBridgeRequest::Publish {
+                    owner,
+                    repo,
+                    base_branch,
+                    branch,
+                    title,
+                    body,
+                    files,
+                },
+            ) => {
+                self.call_mcp(
+                    "steward-github-create-branch",
+                    "create_branch",
+                    json!({
+                        "owner": owner,
+                        "repo": repo,
+                        "branch": branch,
+                        "from_branch": base_branch,
+                    }),
+                )
+                .await?;
+                self.call_mcp(
+                    "steward-github-push-files",
+                    "push_files",
+                    json!({
+                        "owner": owner,
+                        "repo": repo,
+                        "branch": branch,
+                        "message": "chore: add Steward governed task",
+                        "files": files.iter().map(|file| json!({
+                            "path": file.path,
+                            "content": file.content,
+                        })).collect::<Vec<_>>(),
+                    }),
+                )
+                .await?;
+                let pull_request = self
+                    .call_mcp(
+                        "steward-github-create-pull-request",
+                        "create_pull_request",
+                        json!({
+                            "owner": owner,
+                            "repo": repo,
+                            "base": base_branch,
+                            "head": branch,
+                            "title": title,
+                            "body": body,
+                            "draft": false,
+                        }),
+                    )
+                    .await?;
+                normalize_pull_request(&pull_request, &branch)
+            }
+            _ => Err(rejected(
+                "Connections bridge request does not match its allowlisted operation",
+            )),
+        }
+    }
+
+    async fn call_mcp(
+        &self,
+        request_id: &str,
+        tool: &str,
+        arguments: Value,
+    ) -> Result<Value, PortError> {
+        let target = endpoint(&self.origin, MCP_PATH)?;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments},
+        });
+        let started = Instant::now();
+        loop {
+            let response = match self
+                .client
+                .post(target.clone())
+                .header(
+                    AUTHORIZATION,
+                    format!("Bearer {OPEN_SHELL_BEARER_PLACEHOLDER}"),
+                )
+                .header("Mcp-Protocol-Version", MCP_PROTOCOL_VERSION)
+                .header("Accept", "application/json, text/event-stream")
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error)
+                    if error.is_connect()
+                        && started.elapsed() < PROVIDER_TRANSPORT_READY_TIMEOUT =>
+                {
+                    tokio::time::sleep(PROVIDER_TRANSPORT_RETRY_INTERVAL).await;
+                    continue;
+                }
+                Err(_) => return Err(unavailable("call MCP-GW")),
+            };
+            let status = response.status();
+            let body =
+                bounded_body_or_status(status, StatusCode::OK, read_bounded(response).await?)?;
+            if pre_dispatch_provider_failure(status, &body)
+                && started.elapsed() < PROVIDER_TRANSPORT_READY_TIMEOUT
+            {
+                tokio::time::sleep(PROVIDER_TRANSPORT_RETRY_INTERVAL).await;
+                continue;
+            }
+            require_status(status, StatusCode::OK, &body)?;
+            return mcp_tool_payload(&body, request_id);
+        }
     }
 }
 
@@ -528,7 +1182,370 @@ fn parse_response(
             }
             Ok(json!({"dispatched": true}))
         }
+        GithubBridgeOperation::Repositories
+        | GithubBridgeOperation::Workflow
+        | GithubBridgeOperation::RunStatus
+        | GithubBridgeOperation::Dispatch
+        | GithubBridgeOperation::Publish => Err(rejected(
+            "GitHub automation responses require the typed multi-call adapter path",
+        )),
     }
+}
+
+fn mcp_tool_payload(body: &[u8], request_id: &str) -> Result<Value, PortError> {
+    let object = mcp_json_object(body, "GitHub MCP response")?;
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || object.get("id").and_then(Value::as_str) != Some(request_id)
+        || object.contains_key("error")
+    {
+        return Err(rejected("GitHub MCP response has an invalid envelope"));
+    }
+    let result = object
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(|| rejected("GitHub MCP response omitted its result"))?;
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        let not_found = result
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .any(|text| text.to_ascii_lowercase().contains("not found"));
+        return if not_found {
+            Ok(json!({"__stewardNotFound": true}))
+        } else {
+            Err(failed("GitHub MCP tool call failed"))
+        };
+    }
+    if let Some(payload) = result.get("structuredContent") {
+        return Ok(payload.clone());
+    }
+    let text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| {
+            content
+                .iter()
+                .find_map(|item| item.get("text").and_then(Value::as_str))
+        })
+        .ok_or_else(|| rejected("GitHub MCP response omitted structured output"))?;
+    serde_json::from_str(text).or_else(|_| Ok(Value::String(text.to_owned())))
+}
+
+fn payload_array<'a>(payload: &'a Value, fields: &[&str]) -> Option<&'a Vec<Value>> {
+    fields
+        .iter()
+        .find_map(|field| payload.get(*field).and_then(Value::as_array))
+        .or_else(|| payload.as_array())
+}
+
+fn normalize_repositories(
+    me: &Value,
+    payload: &Value,
+    page: u32,
+    per_page: u32,
+) -> Result<Value, PortError> {
+    let login = me
+        .get("login")
+        .and_then(Value::as_str)
+        .filter(|login| valid_repository_component(login, 39))
+        .ok_or_else(|| rejected("GitHub profile response omitted its login"))?;
+    let items = payload_array(payload, &["items", "repositories"])
+        .filter(|items| items.len() <= usize::try_from(per_page).unwrap_or(100))
+        .ok_or_else(|| rejected("GitHub repository search response is invalid"))?;
+    let repositories = items
+        .iter()
+        .map(normalize_repository)
+        .collect::<Result<Vec<_>, PortError>>()?;
+    Ok(json!({
+        "login": login,
+        "repositories": repositories,
+        "page": page,
+        "hasNextPage": items.len() == usize::try_from(per_page).unwrap_or(100),
+    }))
+}
+
+fn normalize_repository(repository: &Value) -> Result<Value, PortError> {
+    let name = repository
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| valid_repository_component(name, 100))
+        .ok_or_else(|| rejected("GitHub repository response omitted its name"))?;
+    let owner = repository
+        .get("owner")
+        .and_then(|owner| owner.get("login").or(Some(owner)))
+        .and_then(Value::as_str)
+        .filter(|owner| valid_repository_component(owner, 39))
+        .ok_or_else(|| rejected("GitHub repository response omitted its owner"))?;
+    let repository_id = numeric_provider_id(repository.get("id"))
+        .ok_or_else(|| rejected("GitHub repository response omitted its stable ID"))?;
+    let owner_id = repository
+        .get("owner")
+        .and_then(|owner| numeric_provider_id(owner.get("id")))
+        .ok_or_else(|| rejected("GitHub repository response omitted its owner stable ID"))?;
+    let default_branch = repository
+        .get("default_branch")
+        .or_else(|| repository.get("defaultBranch"))
+        .and_then(Value::as_str)
+        .filter(|branch| valid_git_ref(branch))
+        .ok_or_else(|| rejected("GitHub repository response omitted its default branch"))?;
+    let private = repository
+        .get("private")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| rejected("GitHub repository response omitted its visibility"))?;
+    let url = repository
+        .get("html_url")
+        .or_else(|| repository.get("url"))
+        .and_then(Value::as_str)
+        .filter(|url| valid_github_url(url))
+        .ok_or_else(|| rejected("GitHub repository response omitted its URL"))?;
+    Ok(json!({
+        "owner": owner,
+        "ownerId": owner_id,
+        "name": name,
+        "repositoryId": repository_id,
+        "defaultBranch": default_branch,
+        "private": private,
+        "url": url,
+    }))
+}
+
+fn numeric_provider_id(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::Number(value) => value.as_u64().map(|value| value.to_string()),
+        Value::String(value)
+            if !value.is_empty()
+                && value.len() <= 20
+                && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            Some(value.clone())
+        }
+        _ => None,
+    }
+}
+
+fn normalize_workflow(
+    payload: &Value,
+    path: &str,
+    expected_content: &str,
+) -> Result<Value, PortError> {
+    if payload.get("__stewardNotFound").and_then(Value::as_bool) == Some(true) {
+        return Ok(json!({
+            "exists": false,
+            "compatible": false,
+            "path": path,
+            "sha": Value::Null,
+        }));
+    }
+    let content = workflow_content(payload)
+        .ok_or_else(|| rejected("GitHub workflow response omitted file content"))?;
+    let sha = payload
+        .get("sha")
+        .or_else(|| payload.get("data").and_then(|data| data.get("sha")))
+        .and_then(Value::as_str)
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| rejected("GitHub workflow response omitted its blob SHA"))?;
+    Ok(json!({
+        "exists": true,
+        "compatible": content == expected_content && compatible_workflow(&content),
+        "path": path,
+        "sha": sha,
+    }))
+}
+
+fn workflow_content(payload: &Value) -> Option<String> {
+    payload
+        .get("content")
+        .or_else(|| payload.get("data").and_then(|data| data.get("content")))
+        .and_then(Value::as_str)
+        .filter(|content| content.len() <= MAX_WORKFLOW_BYTES)
+        .map(str::to_owned)
+        .or_else(|| {
+            payload
+                .as_str()
+                .filter(|content| content.len() <= MAX_WORKFLOW_BYTES)
+                .map(str::to_owned)
+        })
+}
+
+fn compatible_workflow(content: &str) -> bool {
+    let has_dispatch = content
+        .lines()
+        .any(|line| line.trim() == "workflow_dispatch:");
+    let has_pinned_steward_run = content.lines().any(|line| {
+        let line = line.trim();
+        let Some(reference) = line.strip_prefix("uses: ") else {
+            return false;
+        };
+        let Some((workflow, revision)) = reference.rsplit_once('@') else {
+            return false;
+        };
+        workflow.contains("/steward-run/.github/workflows/steward-task")
+            && revision.len() == 40
+            && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    });
+    has_dispatch && has_pinned_steward_run
+}
+
+fn dispatch_inputs_declared(content: &str, inputs: &Map<String, Value>) -> bool {
+    inputs.keys().all(|input| {
+        let declaration = format!("{input}:");
+        content
+            .lines()
+            .any(|line| line.len() - line.trim_start().len() >= 6 && line.trim() == declaration)
+    })
+}
+
+fn run_conclusion(payload: &Value) -> Option<&str> {
+    payload.get("conclusion").and_then(Value::as_str)
+}
+
+fn bounded_log(payload: &Value) -> Option<String> {
+    let text = payload
+        .as_str()
+        .or_else(|| payload.get("text").and_then(Value::as_str))?;
+    let mut end = text.len().min(8 * 1024);
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    Some(text[..end].to_owned())
+}
+
+fn normalize_run_status(
+    run: &Value,
+    jobs: &Value,
+    run_id: u64,
+    failure_log: Option<String>,
+) -> Result<Value, PortError> {
+    let run_attempt = run
+        .get("run_attempt")
+        .or_else(|| run.get("runAttempt"))
+        .and_then(Value::as_u64)
+        .filter(|attempt| *attempt > 0)
+        .ok_or_else(|| rejected("GitHub run response omitted its attempt"))?;
+    let status = run
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| matches!(*status, "queued" | "in_progress" | "completed"))
+        .ok_or_else(|| rejected("GitHub run response omitted its status"))?;
+    let conclusion = run.get("conclusion").cloned().unwrap_or(Value::Null);
+    if !matches!(conclusion, Value::Null | Value::String(_)) {
+        return Err(rejected("GitHub run response has an invalid conclusion"));
+    }
+    let url = run
+        .get("html_url")
+        .or_else(|| run.get("url"))
+        .and_then(Value::as_str)
+        .filter(|url| valid_github_url(url))
+        .ok_or_else(|| rejected("GitHub run response omitted its URL"))?;
+    let jobs = payload_array(jobs, &["jobs"])
+        .filter(|jobs| jobs.len() <= 100)
+        .ok_or_else(|| rejected("GitHub jobs response is invalid"))?
+        .iter()
+        .map(normalize_job)
+        .collect::<Result<Vec<_>, PortError>>()?;
+    let mut result = json!({
+        "runId": run_id,
+        "runAttempt": run_attempt,
+        "phase": status,
+        "conclusion": conclusion,
+        "url": url,
+        "jobs": jobs,
+    });
+    if let Some(failure_log) = failure_log {
+        result["failureLog"] = Value::String(failure_log);
+    }
+    Ok(result)
+}
+
+fn normalize_job(job: &Value) -> Result<Value, PortError> {
+    let id = job
+        .get("id")
+        .and_then(Value::as_u64)
+        .filter(|id| *id > 0)
+        .ok_or_else(|| rejected("GitHub job response omitted its ID"))?;
+    let name = job
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty() && name.len() <= 500)
+        .ok_or_else(|| rejected("GitHub job response omitted its name"))?;
+    let status = job
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| matches!(*status, "queued" | "in_progress" | "completed"))
+        .ok_or_else(|| rejected("GitHub job response omitted its status"))?;
+    let conclusion = job.get("conclusion").cloned().unwrap_or(Value::Null);
+    let url = job
+        .get("html_url")
+        .or_else(|| job.get("url"))
+        .and_then(Value::as_str)
+        .filter(|url| valid_github_url(url))
+        .ok_or_else(|| rejected("GitHub job response omitted its URL"))?;
+    Ok(json!({
+        "id": id,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "url": url,
+    }))
+}
+
+fn maximum_run_id(payload: &Value) -> u64 {
+    payload_array(payload, &["workflow_runs", "runs", "items"])
+        .into_iter()
+        .flatten()
+        .filter_map(|run| run.get("id").and_then(Value::as_u64))
+        .max()
+        .unwrap_or(0)
+}
+
+fn newest_dispatched_run(payload: &Value, previous_run_id: u64) -> Option<(u64, String)> {
+    payload_array(payload, &["workflow_runs", "runs", "items"])?
+        .iter()
+        .filter(|run| {
+            run.get("event")
+                .and_then(Value::as_str)
+                .is_none_or(|event| event == "workflow_dispatch")
+        })
+        .filter_map(|run| {
+            let id = run.get("id").and_then(Value::as_u64)?;
+            let url = run
+                .get("html_url")
+                .or_else(|| run.get("url"))
+                .and_then(Value::as_str)
+                .filter(|url| valid_github_url(url))?;
+            (id > previous_run_id).then(|| (id, url.to_owned()))
+        })
+        .max_by_key(|(id, _)| *id)
+}
+
+fn normalize_pull_request(payload: &Value, branch: &str) -> Result<Value, PortError> {
+    let number = payload
+        .get("number")
+        .and_then(Value::as_u64)
+        .filter(|number| *number > 0)
+        .ok_or_else(|| rejected("GitHub pull request response omitted its number"))?;
+    let url = payload
+        .get("html_url")
+        .or_else(|| payload.get("url"))
+        .and_then(Value::as_str)
+        .filter(|url| valid_github_url(url))
+        .ok_or_else(|| rejected("GitHub pull request response omitted its URL"))?;
+    Ok(json!({
+        "pullRequestUrl": url,
+        "pullRequestNumber": number,
+        "branch": branch,
+    }))
+}
+
+fn valid_github_url(value: &str) -> bool {
+    Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("github.com")
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
 }
 
 fn require_status(actual: StatusCode, expected: StatusCode, body: &[u8]) -> Result<(), PortError> {
@@ -1093,11 +2110,78 @@ mod tests {
 
     use super::{
         GatewayContract, GithubBridgeFailureDiagnostic, GithubBridgeOperation, GithubBridgeRequest,
-        GithubMcpGateway, GithubStatusCredential, GithubStatusReader,
-        github_bridge_failure_diagnostic, parse_response, pre_dispatch_provider_failure,
+        GithubMcpGateway, GithubStatusCredential, GithubStatusReader, compatible_workflow,
+        github_bridge_failure_diagnostic, normalize_run_status, parse_response,
+        pre_dispatch_provider_failure,
     };
     use reqwest::StatusCode;
     use steward_ports::PortError;
+
+    fn read_json_request(listener: &TcpListener) -> Result<(TcpStream, serde_json::Value), String> {
+        let (mut stream, _) = listener
+            .accept()
+            .map_err(|error| format!("accept MCP request: {error}"))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|error| format!("bound MCP fixture read: {error}"))?;
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let (header_end, content_length) = loop {
+            let read = stream
+                .read(&mut buffer)
+                .map_err(|error| format!("read MCP request: {error}"))?;
+            if read == 0 {
+                return Err("MCP request ended before its body".to_owned());
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let header_end = header_end + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    })
+                    .ok_or_else(|| "MCP request omitted content-length".to_owned())?;
+                break (header_end, content_length);
+            }
+        };
+        while request.len() < header_end + content_length {
+            let read = stream
+                .read(&mut buffer)
+                .map_err(|error| format!("read MCP request body: {error}"))?;
+            if read == 0 {
+                return Err("MCP request body was truncated".to_owned());
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
+        let body = serde_json::from_slice(&request[header_end..header_end + content_length])
+            .map_err(|error| format!("decode MCP request: {error}"))?;
+        Ok((stream, body))
+    }
+
+    fn write_mcp_payload(
+        mut stream: TcpStream,
+        request_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"structuredContent": payload, "isError": false}
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+            response.len()
+        )
+        .map_err(|error| format!("write MCP response: {error}"))
+    }
 
     #[test]
     fn start_request_rejects_non_allowlisted_redirect_and_unknown_fields() {
@@ -1168,7 +2252,179 @@ mod tests {
         ] {
             assert!(GithubBridgeRequest::parse(operation, invalid).is_err());
         }
-        assert!(GithubBridgeOperation::parse("github.dispatch").is_err());
+        for operation in [
+            "github.repositories",
+            "github.workflow",
+            "github.run-status",
+            "github.dispatch",
+            "github.publish",
+        ] {
+            assert!(
+                GithubBridgeOperation::parse(operation).is_ok(),
+                "v4 operation {operation} must be explicitly allowlisted"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn repository_automation_requests_reject_paths_branches_and_workflows_outside_the_contract() {
+        assert!(
+            GithubBridgeRequest::parse(
+                GithubBridgeOperation::Workflow,
+                br#"{"owner":"example-org","repo":"example-repo","path":"README.md","ref":"main","expectedContent":"content"}"#,
+            )
+            .is_err(),
+            "workflow reads must stay under .github/workflows"
+        );
+        assert!(
+            GithubBridgeRequest::parse(
+                GithubBridgeOperation::Publish,
+                br#"{"owner":"example-org","repo":"example-repo","baseBranch":"main","branch":"main","title":"title","body":"body","files":[{"path":".github/workflows/steward-task.yml","content":"workflow"},{"path":".steward/tasks/task/task-definition.json","content":"{}"}]}"#,
+            )
+            .is_err(),
+            "publication must never target the default branch"
+        );
+        assert!(
+            !compatible_workflow(
+                "on:\n  workflow_dispatch:\njobs:\n  run:\n    uses: example-org/other/.github/workflows/task.yml@0123456789012345678901234567890123456789\n"
+            ),
+            "an arbitrary workflow_dispatch caller is not a Steward caller"
+        );
+    }
+
+    #[test]
+    fn run_status_preserves_the_signed_github_attempt_for_task_linking() -> Result<(), String> {
+        let result = normalize_run_status(
+            &serde_json::json!({
+                "id": 12345,
+                "run_attempt": 3,
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": "https://github.com/example-org/example-repo/actions/runs/12345"
+            }),
+            &serde_json::json!({"jobs": []}),
+            12345,
+            None,
+        )
+        .map_err(|error| format!("normalize run status: {error:?}"))?;
+        assert_eq!(result["runAttempt"], 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_rechecks_the_exact_workflow_and_uses_official_actions_tool_arguments()
+    -> Result<(), String> {
+        let workflow = concat!(
+            "on:\n",
+            "  workflow_dispatch:\n",
+            "    inputs:\n",
+            "      message:\n",
+            "jobs:\n",
+            "  governed:\n",
+            "    uses: example-org/steward-run/.github/workflows/steward-task.yml@0123456789012345678901234567890123456789\n"
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind dispatch fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read dispatch fixture address: {error}"))?;
+        let expected_workflow = workflow.to_owned();
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (stream, workflow_request) = read_json_request(&listener)?;
+            assert_eq!(workflow_request["params"]["name"], "get_file_contents");
+            assert_eq!(
+                workflow_request["params"]["arguments"],
+                serde_json::json!({
+                    "owner": "example-org",
+                    "repo": "example-repo",
+                    "path": ".github/workflows/steward-browser-task.yml",
+                    "ref": "main"
+                })
+            );
+            write_mcp_payload(
+                stream,
+                "steward-github-dispatch-workflow",
+                serde_json::json!({"content": expected_workflow}),
+            )?;
+
+            let (stream, before_request) = read_json_request(&listener)?;
+            assert_eq!(before_request["params"]["name"], "actions_list");
+            assert_eq!(
+                before_request["params"]["arguments"],
+                serde_json::json!({
+                    "method": "list_workflow_runs",
+                    "owner": "example-org",
+                    "repo": "example-repo",
+                    "resource_id": ".github/workflows/steward-browser-task.yml",
+                    "workflow_runs_filter": {"branch": "main"},
+                    "perPage": 10
+                })
+            );
+            write_mcp_payload(
+                stream,
+                "steward-github-runs-before",
+                serde_json::json!({"workflow_runs": [{"id": 100}]}),
+            )?;
+
+            let (stream, dispatch_request) = read_json_request(&listener)?;
+            assert_eq!(dispatch_request["params"]["name"], "actions_run_trigger");
+            assert_eq!(
+                dispatch_request["params"]["arguments"],
+                serde_json::json!({
+                    "method": "run_workflow",
+                    "owner": "example-org",
+                    "repo": "example-repo",
+                    "workflow_id": ".github/workflows/steward-browser-task.yml",
+                    "ref": "main",
+                    "inputs": {"message": "hello"}
+                })
+            );
+            write_mcp_payload(stream, "steward-github-dispatch", serde_json::json!({}))?;
+
+            let (stream, after_request) = read_json_request(&listener)?;
+            assert_eq!(after_request["params"]["name"], "actions_list");
+            write_mcp_payload(
+                stream,
+                "steward-github-runs-after",
+                serde_json::json!({
+                    "workflow_runs": [{
+                        "id": 101,
+                        "event": "workflow_dispatch",
+                        "html_url": "https://github.com/example-org/example-repo/actions/runs/101"
+                    }]
+                }),
+            )
+        });
+        let gateway = GithubMcpGateway::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build dispatch gateway: {error:?}"))?;
+        let response = gateway
+            .execute(
+                GithubBridgeOperation::Dispatch,
+                GithubBridgeRequest::Dispatch {
+                    owner: "example-org".to_owned(),
+                    repo: "example-repo".to_owned(),
+                    workflow_id: ".github/workflows/steward-browser-task.yml".to_owned(),
+                    git_ref: "main".to_owned(),
+                    inputs: serde_json::Map::from_iter([(
+                        "message".to_owned(),
+                        serde_json::json!("hello"),
+                    )]),
+                    expected_content: workflow.to_owned(),
+                },
+            )
+            .await
+            .map_err(|error| format!("execute dispatch: {error:?}"))?;
+        server
+            .join()
+            .map_err(|_| "dispatch fixture panicked".to_owned())??;
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "runId": 101,
+                "url": "https://github.com/example-org/example-repo/actions/runs/101"
+            })
+        );
         Ok(())
     }
 

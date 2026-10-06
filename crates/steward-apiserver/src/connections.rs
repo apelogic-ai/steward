@@ -358,7 +358,7 @@ where
     protect_browser_routes(routes, browser_auth)
 }
 
-async fn adapt_browser_context(mut request: Request, next: Next) -> Response {
+pub(crate) async fn adapt_browser_context(mut request: Request, next: Next) -> Response {
     if let Some(context) = request.extensions().get::<BrowserSessionContext>().cloned() {
         request.extensions_mut().insert(ConnectionSession {
             subject: ConnectionSubject {

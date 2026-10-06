@@ -238,6 +238,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
             ))
         })?;
     assert_connection_failure_detail_upgrade_result(&store).await?;
+    assert_github_repository_automation_upgrade_result(&store).await?;
     assert_maximum_source_provenance_upgrade_result(&store, &maximum_direct_source_provenance)
         .await?;
     assert_finalized_task_provenance_upgrade_result(&store).await?;
@@ -967,6 +968,85 @@ async fn assert_connection_failure_detail_upgrade_result(
             "migration 0063 must reject unbounded or non-schema failure detail"
         );
     }
+    Ok(())
+}
+
+async fn assert_github_repository_automation_upgrade_result(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let operation_id = "00000000-0000-0000-0000-000000001057";
+    let historical = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT authority_version, authority_digest, mcp_gw_version \
+         FROM connection_operations WHERE operation_id = $1::text::uuid",
+    )
+    .bind(operation_id)
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        historical,
+        (
+            2,
+            "sha256:9a572bcefa75b6f2b5b4931d8604c1ad3f3e7560e0e0c2843646ec4f7853ef02".to_owned(),
+            "0.4.9".to_owned(),
+        ),
+        "migration 0064 must preserve an existing v2 connection operation exactly"
+    );
+
+    let mut transaction = store.pool().begin().await?;
+    for (version, digest, gateway) in [
+        (
+            1_i64,
+            "sha256:7735d22e083daef4bdbd51bb63a652720ef06f5499422e7a8eef4930a6c58663",
+            "0.3.2",
+        ),
+        (
+            2_i64,
+            "sha256:9a572bcefa75b6f2b5b4931d8604c1ad3f3e7560e0e0c2843646ec4f7853ef02",
+            "0.4.9",
+        ),
+        (
+            3_i64,
+            "sha256:d5878c6ae538174c5e0c32ac6aa4617f4ac8e6787b1495b08bd5af9e48f7fbe3",
+            "0.4.9",
+        ),
+    ] {
+        sqlx::query(
+            "UPDATE connection_operations \
+             SET operation_kind = 'status', authority_version = $2, \
+                 authority_digest = $3, mcp_gw_version = $4 \
+             WHERE operation_id = $1::text::uuid",
+        )
+        .bind(operation_id)
+        .bind(version)
+        .bind(digest)
+        .bind(gateway)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE connection_operations \
+         SET operation_kind = 'dispatch', authority_version = 4, \
+             authority_digest = 'sha256:6ece401f71b5c71939ef1580b438505380b4f12d29a6fd717ac78a9d9c93848a', \
+             mcp_gw_version = '0.4.9' \
+         WHERE operation_id = $1::text::uuid",
+    )
+    .bind(operation_id)
+    .execute(&mut *transaction)
+    .await?;
+    let downgraded = sqlx::query(
+        "UPDATE connection_operations \
+         SET authority_version = 3, \
+             authority_digest = 'sha256:d5878c6ae538174c5e0c32ac6aa4617f4ac8e6787b1495b08bd5af9e48f7fbe3' \
+         WHERE operation_id = $1::text::uuid",
+    )
+    .bind(operation_id)
+    .execute(&mut *transaction)
+    .await;
+    assert!(
+        downgraded.is_err(),
+        "a v1-v3 authority must never authorize a v4 repository operation"
+    );
+    transaction.rollback().await?;
     Ok(())
 }
 

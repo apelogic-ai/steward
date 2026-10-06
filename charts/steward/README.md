@@ -323,6 +323,15 @@ the frozen internal authority snapshot on each operation; the controller
 verifies the same snapshot before creating or executing the short-lived
 `steward-connections` runtime.
 
+Steward automatically selects internal authority v4 for browser GitHub repository
+automation. It adds only the operation-specific grants needed to list repositories,
+read the generated caller workflow, publish the exact two-file package on a new branch,
+dispatch that caller, and observe its run. Operators do not select v4 in product
+configuration. Repository publication additionally requires the target repository's
+stable IDs to appear as a source in `githubSource.bindings`, a reviewed `steward-run`
+release at v0.8.0 or later, and GitHub OAuth App access to the repository. Upgrading
+adds migration 0064; existing v1-v3 governed connection rows remain valid.
+
 `connectionsBridge.artifactTrust.mode` defaults to `github-attestation`, the
 recommended mode for released Steward artifacts. It requires the existing
 signer identity, GitHub source repository, exact source commit, and public

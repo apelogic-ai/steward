@@ -30,8 +30,8 @@ use steward_apiserver::{
     KubernetesTokenReviewAudience, MAX_EXECUTION_BINDING_CATALOG_BYTES,
     MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, StewardRunWorkflowInstallationMode, TaskApiConfig,
     agent_runs_ui, browser_admin, browser_auth, browser_task_rerunner, browser_task_router,
-    connections, google_oidc, governed_connections, operator_admin, router, stable_runtime_bridge,
-    task_router, user_envelopes, workflows,
+    connections, github_automation, google_oidc, governed_connections, operator_admin, router,
+    stable_runtime_bridge, task_router, user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
@@ -809,6 +809,12 @@ async fn browser_application_router(
         );
     }
     let browser_task_rerunner = browser_task_rerunner(store.clone(), task_api_config.clone());
+    let github_automation_config = github_automation::GithubAutomationConfig::new(
+        task_api_config.clone(),
+        steward_run_release.clone(),
+        workflow_installation_mode,
+        application_config.task_identity_discovery_enabled,
+    );
     let app = browser_auth::browser_auth_router(auth.clone())
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(
@@ -863,6 +869,12 @@ async fn browser_application_router(
                 store.clone(),
                 broker.clone(),
                 browser_task_rerunner,
+                auth.clone(),
+            ))
+            .merge(github_automation::protected_router(
+                store.clone(),
+                broker.clone(),
+                github_automation_config,
                 auth.clone(),
             ))
             .merge(connections::protected_router(broker, auth.clone())),

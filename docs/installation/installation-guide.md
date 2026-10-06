@@ -409,6 +409,15 @@ prove one exact-commit read before activating the workflow. When
 `task.direct_package_source_disabled`; do not diagnose it as an Identity or
 User Envelope failure.
 
+To enable browser publication after a successful inline run, the same repository must
+also be visible through the user's governed GitHub connection and admitted by stable
+owner and repository IDs in `githubSource.bindings`. Deploy a reviewed `steward-run`
+release at v0.8.0 or later. Steward then owns the branch, two-file commit, pull request,
+exact-workflow verification, dispatch, and run-status operations; no GitHub token or
+workflow content belongs in Helm values. If a repository is visible but marked **Not
+ready**, add its stable source IDs. If it is absent, first check organization OAuth App
+access rather than widening Steward authority.
+
 This path binds the generated Helm values and execution binding to the verified
 destination artifacts. Manual values assembly remains possible, but it must
 preserve the same immutable coordinates and cross-component relationships.
