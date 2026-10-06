@@ -19,10 +19,12 @@ export function browserHelloWorldRun(
   runs: MyRunsResponse["runs"],
   provisionedEnvelopeIds: ReadonlySet<string>,
 ) {
-  return runs.find((run) => run.origin === "browser"
-    && run.package?.source === "inline"
-    && Boolean(run.userEnvelopeInstanceId)
-    && provisionedEnvelopeIds.has(String(run.userEnvelopeInstanceId)));
+  return runs
+    .filter((run) => run.origin === "browser"
+      && run.package?.source === "inline"
+      && Boolean(run.userEnvelopeInstanceId)
+      && provisionedEnvelopeIds.has(String(run.userEnvelopeInstanceId)))
+    .sort((left, right) => new Date(right.updatedAt).valueOf() - new Date(left.updatedAt).valueOf())[0];
 }
 
 export function automatedPackageRun(
@@ -32,10 +34,12 @@ export function automatedPackageRun(
 ) {
   const digest = browserRun?.package?.contentDigest;
   if (!digest) return undefined;
-  return runs.find((run) => run.trigger?.provider === "github"
-    && run.package?.contentDigest === digest
-    && Boolean(run.userEnvelopeInstanceId)
-    && provisionedEnvelopeIds.has(String(run.userEnvelopeInstanceId)));
+  return runs
+    .filter((run) => run.trigger?.provider === "github"
+      && run.package?.contentDigest === digest
+      && Boolean(run.userEnvelopeInstanceId)
+      && provisionedEnvelopeIds.has(String(run.userEnvelopeInstanceId)))
+    .sort((left, right) => new Date(right.updatedAt).valueOf() - new Date(left.updatedAt).valueOf())[0];
 }
 
 export function deriveOnboardingProgress(data: OnboardingEvidence) {
@@ -44,11 +48,17 @@ export function deriveOnboardingProgress(data: OnboardingEvidence) {
     .map((request) => String(request.envelopeInstanceId)));
   const helloWorldRun = browserHelloWorldRun(data.runs.runs, provisionedEnvelopeIds);
   const automationRun = automatedPackageRun(data.runs.runs, helloWorldRun, provisionedEnvelopeIds);
+  const testSucceeded = helloWorldRun?.phase === "succeeded" && helloWorldRun.finalized;
+  const automationObserved = Boolean(automationRun);
+  const automationTerminal = Boolean(automationRun?.finalized && ["succeeded", "failed", "cancelled"].includes(automationRun.phase));
   const done = [
     data.connections.connections.some((connection) => connection.status.phase === "connected"),
     provisionedEnvelopeIds.size > 0,
-    Boolean(helloWorldRun),
-    helloWorldRun?.phase === "succeeded",
+    testSucceeded,
+    automationObserved,
+    automationObserved,
+    automationObserved,
+    automationTerminal,
   ];
   return { completed: done.filter(Boolean).length, done, provisionedEnvelopeIds, helloWorldRun, automationRun };
 }

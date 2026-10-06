@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use steward_store::AgentRunRecord;
-use steward_types::TaskPhase;
 use steward_types::direct_package::{ExecutionLogMode, TaskOrigin};
+use steward_types::{CanonicalUserId, TaskPhase};
 use uuid::Uuid;
 
 use crate::browser_auth::{BrowserAuthService, BrowserSessionBinding, protect_browser_routes};
@@ -55,6 +55,13 @@ where
         request: Value,
         identity: &'a GithubAutomationIdentity,
     ) -> BoxFuture<'a, Result<Value, ConnectionBrokerError>>;
+
+    fn evidence<'a>(
+        &'a self,
+        canonical_user_id: &'a CanonicalUserId,
+        operation: ConnectionOperationKind,
+        idempotency_identity_prefix: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Value>, ConnectionBrokerError>>;
 }
 
 impl<B> GithubAutomationBroker<B> for GovernedConnectionsBroker<B>
@@ -80,6 +87,18 @@ where
             .await
         })
     }
+
+    fn evidence<'a>(
+        &'a self,
+        canonical_user_id: &'a CanonicalUserId,
+        operation: ConnectionOperationKind,
+        idempotency_identity_prefix: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Value>, ConnectionBrokerError>> {
+        Box::pin(async move {
+            self.stored_automation_result(canonical_user_id, operation, idempotency_identity_prefix)
+                .await
+        })
+    }
 }
 
 impl<B, M, S> GithubAutomationBroker<B> for SplitConnectionsBroker<M, S>
@@ -97,6 +116,19 @@ where
     ) -> BoxFuture<'a, Result<Value, ConnectionBrokerError>> {
         self.governed_mutations()
             .execute(session, operation, request, identity)
+    }
+
+    fn evidence<'a>(
+        &'a self,
+        canonical_user_id: &'a CanonicalUserId,
+        operation: ConnectionOperationKind,
+        idempotency_identity_prefix: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Value>, ConnectionBrokerError>> {
+        self.governed_mutations().evidence(
+            canonical_user_id,
+            operation,
+            idempotency_identity_prefix,
+        )
     }
 }
 
@@ -238,6 +270,25 @@ pub(crate) struct DispatchTaskResponse {
     url: String,
 }
 
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GithubTaskBundleResponse {
+    api_version: &'static str,
+    files: BTreeMap<String, String>,
+    workflow_path: String,
+    package_digest: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GithubAutomationEvidenceResponse {
+    api_version: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    publication: Option<PublishTaskResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch: Option<DispatchTaskResponse>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GithubJobView {
@@ -301,6 +352,14 @@ where
             post(detect_workflow::<L, P>),
         )
         .route(
+            "/app/api/v1/runs/{task_uid}/github/bundle",
+            get(github_task_bundle::<L, P>),
+        )
+        .route(
+            "/app/api/v1/runs/{task_uid}/github/evidence",
+            get(github_automation_evidence::<L, P>),
+        )
+        .route(
             "/app/api/v1/runs/{task_uid}/github/publish",
             post(publish_task::<L, P>),
         )
@@ -319,6 +378,122 @@ where
         })
         .route_layer(middleware::from_fn(adapt_browser_context));
     protect_browser_routes(routes, browser_auth)
+}
+
+#[utoipa::path(
+    get,
+    path = "/app/api/v1/runs/{task_uid}/github/bundle",
+    params(("task_uid" = String, Path, format = "uuid")),
+    responses(
+        (status = 200, body = GithubTaskBundleResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Run is unavailable"),
+        (status = 409, description = "Run is not publishable"),
+        (status = 503, body = GithubAutomationErrorResponse)
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn github_task_bundle<L, P>(
+    session: Option<Extension<ConnectionSession<BrowserSessionBinding>>>,
+    State(state): State<GithubAutomationState<L, P>>,
+    Path(task_uid): Path<Uuid>,
+) -> Response
+where
+    L: AgentRunLedger,
+    P: GithubAutomationBroker<BrowserSessionBinding>,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match exact_bundle(&state, &session, task_uid).await {
+        Ok(bundle) => no_store_json(GithubTaskBundleResponse {
+            api_version: GITHUB_AUTOMATION_API_VERSION,
+            files: bundle.files,
+            workflow_path: bundle.workflow_path,
+            package_digest: bundle.package_digest,
+        }),
+        Err(response) => response,
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/app/api/v1/runs/{task_uid}/github/evidence",
+    params(("task_uid" = String, Path, format = "uuid"), RunStatusQuery),
+    responses(
+        (status = 200, body = GithubAutomationEvidenceResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 403, description = "Repository is not admitted"),
+        (status = 404, description = "Run or repository is unavailable"),
+        (status = 409, description = "Run evidence is unavailable or invalid"),
+        (status = 503, body = GithubAutomationErrorResponse)
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn github_automation_evidence<L, P>(
+    session: Option<Extension<ConnectionSession<BrowserSessionBinding>>>,
+    State(state): State<GithubAutomationState<L, P>>,
+    Path(task_uid): Path<Uuid>,
+    Query(query): Query<RunStatusQuery>,
+) -> Response
+where
+    L: AgentRunLedger,
+    P: GithubAutomationBroker<BrowserSessionBinding>,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match resolve_repository(&state, &session, &query.owner, &query.repository).await {
+        Ok(repository) if repository.ready => {}
+        Ok(_) => return StatusCode::FORBIDDEN.into_response(),
+        Err(response) => return response,
+    }
+    let run = match owned_successful_browser_run(&state.ledger, &session, task_uid).await {
+        Ok(run) => run,
+        Err(response) => return response,
+    };
+    let package_digest = match run.browser_task_evidence {
+        Some(evidence) if evidence.validate().is_ok() => evidence.closure_digest,
+        _ => return StatusCode::CONFLICT.into_response(),
+    };
+    let subject = automation_subject(task_uid, &query.owner, &query.repository);
+    let publication = match state
+        .broker
+        .evidence(
+            &session.subject.canonical_user_id,
+            ConnectionOperationKind::Publish,
+            &operation_subject("publish", &subject),
+        )
+        .await
+    {
+        Ok(Some(value)) => match publish_response(value, package_digest.as_str().to_owned()) {
+            Ok(response) => Some(response),
+            Err(()) => return unavailable(),
+        },
+        Ok(None) => None,
+        Err(error) => return automation_error(error),
+    };
+    let dispatch = match state
+        .broker
+        .evidence(
+            &session.subject.canonical_user_id,
+            ConnectionOperationKind::Dispatch,
+            &operation_subject("dispatch", &subject),
+        )
+        .await
+    {
+        Ok(Some(value)) => match dispatch_response(value) {
+            Ok(response) => Some(response),
+            Err(()) => return unavailable(),
+        },
+        Ok(None) => None,
+        Err(error) => return automation_error(error),
+    };
+    no_store_json(GithubAutomationEvidenceResponse {
+        api_version: GITHUB_AUTOMATION_API_VERSION,
+        publication,
+        dispatch,
+    })
 }
 
 #[utoipa::path(
@@ -505,7 +680,7 @@ where
         "body": format!("Publishes the exact governed package tested by Steward Task `{task_uid}`."),
         "files": files,
     });
-    let publication_subject = format!("{task_uid}:{}/{}", repository.owner, repository.name);
+    let publication_subject = automation_subject(task_uid, &repository.owner, &repository.name);
     let identity = write_operation_identity(
         "publish",
         &request.idempotency_key,
@@ -594,7 +769,11 @@ where
         "dispatch",
         &request.idempotency_key,
         &operation_request,
-        None,
+        Some(&automation_subject(
+            task_uid,
+            &repository.owner,
+            &repository.name,
+        )),
     );
     let result = match state
         .broker
@@ -1003,15 +1182,10 @@ fn write_operation_identity(
     operation: &str,
     client_key: &str,
     payload: &Value,
-    publication_subject: Option<&str>,
+    subject: Option<&str>,
 ) -> GithubAutomationIdentity {
-    let publication_subject = publication_subject.map(|subject| {
-        format!(
-            "github-publish:subject:sha256:{:x}",
-            Sha256::digest(subject.as_bytes())
-        )
-    });
-    let scope = match publication_subject.as_deref() {
+    let subject = subject.map(|subject| operation_subject(operation, subject));
+    let scope = match subject.as_deref() {
         Some(subject) => format!(
             "{subject}:client:sha256:{:x}",
             Sha256::digest(client_key.as_bytes())
@@ -1028,8 +1202,19 @@ fn write_operation_identity(
             Sha256::digest(payload.as_bytes())
         ),
         idempotency_scope: Some(scope),
-        publication_subject,
+        publication_subject: (operation == "publish").then_some(subject).flatten(),
     }
+}
+
+fn automation_subject(task_uid: Uuid, owner: &str, repository: &str) -> String {
+    format!("{task_uid}:{owner}/{repository}")
+}
+
+fn operation_subject(operation: &str, subject: &str) -> String {
+    format!(
+        "github-{operation}:subject:sha256:{:x}",
+        Sha256::digest(subject.as_bytes())
+    )
 }
 
 fn no_store_json<T: Serialize>(value: T) -> Response {
@@ -1212,10 +1397,10 @@ mod tests {
                         "hasNextPage": false
                     })),
                     ConnectionOperationKind::Workflow => Ok(json!({
-                        "path": ".github/workflows/steward-browser-task.yml",
-                        "exists": false,
-                        "compatible": false,
-                        "sha": null
+                        "path": ".github/workflows/hypershell-hello.yml",
+                        "exists": true,
+                        "compatible": true,
+                        "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     })),
                     ConnectionOperationKind::Publish => Ok(json!({
                         "pullRequestUrl": "https://github.com/example-org/agentic-ops/pull/42",
@@ -1235,6 +1420,40 @@ mod tests {
                         "jobs": []
                     })),
                     _ => Err(ConnectionBrokerError::Unavailable),
+                }
+            })
+        }
+
+        fn evidence<'a>(
+            &'a self,
+            _canonical_user_id: &'a CanonicalUserId,
+            operation: ConnectionOperationKind,
+            idempotency_identity_prefix: &'a str,
+        ) -> BoxFuture<'a, Result<Option<Value>, ConnectionBrokerError>> {
+            Box::pin(async move {
+                let calls = self
+                    .calls
+                    .lock()
+                    .map_err(|_| ConnectionBrokerError::Unavailable)?;
+                if !calls.iter().any(|call| {
+                    call.operation == operation
+                        && call
+                            .idempotency_identity
+                            .starts_with(idempotency_identity_prefix)
+                }) {
+                    return Ok(None);
+                }
+                match operation {
+                    ConnectionOperationKind::Publish => Ok(Some(json!({
+                        "pullRequestUrl": "https://github.com/example-org/agentic-ops/pull/42",
+                        "pullRequestNumber": 42,
+                        "branch": "steward/task-11111111111141118111111111111111"
+                    }))),
+                    ConnectionOperationKind::Dispatch => Ok(Some(json!({
+                        "runId": 12345,
+                        "url": "https://github.com/example-org/agentic-ops/actions/runs/12345"
+                    }))),
+                    _ => Ok(None),
                 }
             })
         }
@@ -1490,6 +1709,19 @@ mod tests {
         assert_eq!(first, retry);
         assert_eq!(first.idempotency_scope, conflict.idempotency_scope);
         assert_ne!(first.idempotency_identity, conflict.idempotency_identity);
+
+        let subject = "11111111-1111-4111-8111-111111111111:example-org/agentic-ops";
+        let scoped = write_operation_identity(
+            "dispatch",
+            "client-key",
+            &json!({"inputs": {}}),
+            Some(subject),
+        );
+        assert!(scoped.idempotency_identity.starts_with(&format!(
+            "{}:client:",
+            operation_subject("dispatch", subject)
+        )));
+        assert_eq!(scoped.publication_subject, None);
     }
 
     #[tokio::test]
@@ -1515,6 +1747,34 @@ mod tests {
         let broker = FakeBroker::default();
         let (auth, session_cookie, csrf) = signed_in_cookie_and_csrf().await?;
         let app = protected_router(ledger, broker.clone(), config()?, auth);
+
+        let bundle = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{task_uid}/github/bundle"))
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(bundle.status(), StatusCode::OK);
+        let bundle = to_bytes(bundle.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let bundle: Value = serde_json::from_slice(&bundle).map_err(|error| error.to_string())?;
+        assert_eq!(
+            bundle["workflowPath"],
+            ".github/workflows/hypershell-hello.yml"
+        );
+        assert_eq!(bundle["packageDigest"], expected_digest);
+        assert!(
+            bundle["files"][".github/workflows/hypershell-hello.yml"]
+                .as_str()
+                .is_some_and(|workflow| workflow
+                    .contains("package-path: .steward/tasks/hello/task-definition.json"))
+        );
 
         let repositories = app
             .clone()
@@ -1563,6 +1823,66 @@ mod tests {
             assert_eq!(body["packageDigest"], expected_digest);
         }
 
+        let evidence = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/app/api/v1/runs/{task_uid}/github/evidence?owner=example-org&repository=agentic-ops"
+                    ))
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(evidence.status(), StatusCode::OK);
+        let evidence = to_bytes(evidence.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let evidence: Value =
+            serde_json::from_slice(&evidence).map_err(|error| error.to_string())?;
+        assert_eq!(evidence["publication"]["pullRequestNumber"], 42);
+        assert_eq!(evidence["publication"]["packageDigest"], expected_digest);
+        assert!(evidence.get("dispatch").is_none());
+
+        let dispatch = app
+            .clone()
+            .oneshot(mutation_request(
+                format!("/app/api/v1/runs/{task_uid}/github/dispatch"),
+                &session_cookie,
+                &csrf,
+                json!({
+                    "owner": "example-org",
+                    "repository": "agentic-ops",
+                    "inputs": {"task-inputs": "{}"},
+                    "idempotencyKey": "dispatch"
+                }),
+            )?)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(dispatch.status(), StatusCode::OK);
+
+        let evidence = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/app/api/v1/runs/{task_uid}/github/evidence?owner=example-org&repository=agentic-ops"
+                    ))
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let evidence = to_bytes(evidence.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let evidence: Value =
+            serde_json::from_slice(&evidence).map_err(|error| error.to_string())?;
+        assert_eq!(evidence["dispatch"]["runId"], 12345);
+
         {
             let calls = broker.calls.lock().map_err(|_| "lock broker calls")?;
             let publications = calls
@@ -1597,7 +1917,7 @@ mod tests {
             assert!(
                 files
                     .iter()
-                    .any(|file| file["path"] == ".github/workflows/steward-browser-task.yml")
+                    .any(|file| file["path"] == ".github/workflows/hypershell-hello.yml")
             );
             assert_eq!(publications[0].request["baseBranch"], "main");
             assert_ne!(publications[0].request["branch"], "main");

@@ -890,6 +890,28 @@ impl<B> GovernedConnectionsBroker<B> {
         completed.result.ok_or(ConnectionBrokerError::Unavailable)
     }
 
+    pub(crate) async fn stored_automation_result(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+        operation: ConnectionOperationKind,
+        idempotency_identity_prefix: &str,
+    ) -> Result<Option<Value>, ConnectionBrokerError> {
+        if !matches!(
+            operation,
+            ConnectionOperationKind::Publish | ConnectionOperationKind::Dispatch
+        ) {
+            return Err(ConnectionBrokerError::Unavailable);
+        }
+        self.store
+            .latest_connection_operation_result(
+                canonical_user_id,
+                operation.into(),
+                idempotency_identity_prefix,
+            )
+            .await
+            .map_err(store_broker_error)
+    }
+
     async fn status_operation(
         &self,
         session: &ConnectionSession<B>,

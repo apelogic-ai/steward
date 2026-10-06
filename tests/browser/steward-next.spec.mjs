@@ -821,11 +821,14 @@ async function guardedPage(browser, {
     stderr: { body: "agent stderr\n", status: 200 },
   },
   includeSampleWorkflow = false,
+  githubBundleStatus = 200,
+  githubRepositoriesStatus = 200,
   inlineRun = false,
   publishedWorkflows = true,
   taskLibraryMutable = false,
   initialOnboardingDismissed = false,
   initialWorkflowAcknowledged = false,
+  onboardingJourney = false,
   onboardingPagination = false,
   mutationFailures = {},
   mockRunEvents = true,
@@ -842,12 +845,17 @@ async function guardedPage(browser, {
 } = {}) {
   const context = await browser.newContext({ colorScheme, viewport });
   const executionLogRequests = [];
+  const runEventRequests = [];
   const mutations = [];
   const setupStatusRequests = [];
   const members = structuredClone(memberFixtures);
   const federatedSubjects = structuredClone(federatedSubjectFixtures);
   let githubWorkflowPublished = false;
   let githubRunStatusRequests = 0;
+  let onboardingRunCreated = false;
+  let githubAutomationCompleted = false;
+  let publicationEvidence = null;
+  let dispatchEvidence = null;
   let currentAdminSetupStatus = adminSetupStatus;
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
@@ -1182,6 +1190,14 @@ async function guardedPage(browser, {
   });
   await context.route((url) => url.origin === origin && url.pathname === "/app/api/v1/runs", (route) => {
     if (route.request().method() === "POST") {
+      if (onboardingJourney) {
+        return (async () => {
+          const request = route.request();
+          onboardingRunCreated = true;
+          mutations.push({ path: new URL(request.url()).pathname, headers: await request.allHeaders(), body: request.postDataJSON() });
+          return json(route, { apiVersion: "steward.browser-runs/v1", taskUid }, 201);
+        })();
+      }
       if (!taskLibraryMutable) return route.continue();
       return (async () => {
         const request = route.request();
@@ -1206,6 +1222,51 @@ async function guardedPage(browser, {
         }
         return json(route, { apiVersion: "steward.browser-runs/v1", taskUid: createdTaskUid }, 201);
       })();
+    }
+    if (onboardingJourney) {
+      const inline = {
+        ...run,
+        taskUid,
+        origin: "browser",
+        workflow: "browser-task@1",
+        workflowName: null,
+        workflowVersion: null,
+        package: {
+          source: "inline",
+          revision: browserTaskDigest,
+          path: starterTask.packagePath,
+          contentDigest: browserTaskDigest,
+          promptSource: "inline",
+        },
+      };
+      const automated = {
+        ...run,
+        taskUid: "00000000-0000-0000-0000-000000000007",
+        origin: "github-actions",
+        package: {
+          source: "https://github.com/example-org/agentic-ops.git",
+          revision: `git:sha1:${"a".repeat(40)}`,
+          path: starterTask.packagePath,
+          contentDigest: browserTaskDigest,
+          promptSource: "inline",
+        },
+        trigger: {
+          provider: "github",
+          repository: "example-org/agentic-ops",
+          event: "workflow_dispatch",
+          actor: "alice",
+          ref: "refs/heads/main",
+          sha: "a".repeat(40),
+          runId: "12345",
+          runAttempt: 1,
+          runUrl: "https://github.com/example-org/agentic-ops/actions/runs/12345",
+          callerWorkflow: `.github/workflows/hypershell-${starterTask.taskDefinition.name}.yml`,
+        },
+      };
+      const runs = [];
+      if (githubAutomationCompleted) runs.push(automated);
+      if (onboardingRunCreated) runs.push(inline);
+      return json(route, { apiVersion: "steward.browser-runs/v1", runs, nextCursor: null, facets: { phase: { ...runFacets, succeeded: runs.length } } });
     }
     if (onboardingPagination) {
       const cursor = new URL(route.request().url()).searchParams.get("cursor");
@@ -1235,6 +1296,7 @@ async function guardedPage(browser, {
     if (route.request().url().endsWith("/rerun")) return route.continue();
     if (route.request().url().endsWith("/events")) {
       if (!mockRunEvents) return route.continue();
+      runEventRequests.push(route.request());
       const snapshot = {
         apiVersion: "steward.browser-runs/v1",
         eventId: 1,
@@ -1260,7 +1322,7 @@ async function guardedPage(browser, {
     taskUid: new URL(route.request().url()).pathname.split("/").at(-2),
     files: browserTaskFiles,
   }));
-  await context.route(`${origin}/app/api/v1/github/repositories*`, (route) => json(route, {
+  await context.route(`${origin}/app/api/v1/github/repositories*`, (route) => githubRepositoriesStatus === 200 ? json(route, {
     apiVersion: "steward.github-automation/v1",
     login: "alice",
     repositories: [
@@ -1288,28 +1350,84 @@ async function guardedPage(browser, {
     ],
     page: 1,
     hasNextPage: false,
+  }) : json(route, { apiVersion: "steward.github-automation/v1", error: "connection_unavailable" }, githubRepositoriesStatus));
+  const onboardingWorkflowPath = `.github/workflows/hypershell-${starterTask.taskDefinition.name}.yml`;
+  const onboardingPackage = JSON.stringify(starterTask.taskDefinition, null, 2);
+  const onboardingWorkflow = [
+    "name: HyperShell governed task",
+    "on:",
+    "  workflow_dispatch:",
+    "    inputs:",
+    "      task-inputs:",
+    "        required: false",
+    "        type: string",
+    "jobs:",
+    "  prepare:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    `      - uses: actions/upload-artifact${workflowVersionSeparator}0000000000000000000000000000000000000000`,
+    "        with:",
+    "          path: in/inputs.json",
+    "  governed:",
+    "    needs: prepare",
+    "    permissions:",
+    "      contents: read",
+    "      id-token: write",
+    `    uses: example-org/steward-run/.github/workflows/steward-task-self-hosted.yml${workflowVersionSeparator}1111111111111111111111111111111111111111`,
+    "    with:",
+    `      package-path: ${starterTask.packagePath}`,
+    "",
+  ].join("\n");
+  await context.route(`${origin}/app/api/v1/runs/*/github/bundle`, (route) => githubBundleStatus === 200
+    ? json(route, {
+        apiVersion: "steward.github-automation/v1",
+        files: {
+          [starterTask.packagePath]: onboardingPackage,
+          [onboardingWorkflowPath]: onboardingWorkflow,
+        },
+        workflowPath: onboardingWorkflowPath,
+        packageDigest: browserTaskDigest,
+      })
+    : json(route, { apiVersion: "steward.github-automation/v1", error: "steward_run_release_unsupported" }, githubBundleStatus));
+  await context.route(`${origin}/app/api/v1/runs/*/github/evidence*`, (route) => json(route, {
+    apiVersion: "steward.github-automation/v1",
+    publication: publicationEvidence,
+    dispatch: dispatchEvidence,
   }));
-  await context.route(`${origin}/app/api/v1/runs/${taskUid}/github/workflow`, async (route) => {
+  await context.route(`${origin}/app/api/v1/runs/*/github/workflow`, async (route) => {
     const request = route.request();
     mutations.push({ path: new URL(request.url()).pathname, headers: await request.allHeaders(), body: request.postDataJSON() });
     await json(route, {
       apiVersion: "steward.github-automation/v1",
-      path: ".github/workflows/steward-browser-task.yml",
+      path: onboardingWorkflowPath,
       exists: githubWorkflowPublished,
       compatible: githubWorkflowPublished,
       sha: githubWorkflowPublished ? "a".repeat(40) : null,
     });
   });
-  await context.route(`${origin}/app/api/v1/runs/${taskUid}/github/publish`, async (route) => {
+  await context.route(`${origin}/app/api/v1/runs/*/github/publish`, async (route) => {
     githubWorkflowPublished = true;
+    publicationEvidence = {
+      apiVersion: "steward.github-automation/v1",
+      pullRequestUrl: "https://github.com/example-org/agentic-ops/pull/42",
+      pullRequestNumber: 42,
+      branch: `steward/task-${taskUid.replaceAll("-", "")}`,
+      packageDigest: browserTaskDigest,
+    };
     await route.continue();
   });
-  await context.route(`${origin}/app/api/v1/runs/${taskUid}/github/dispatch`, async (route) => {
+  await context.route(`${origin}/app/api/v1/runs/*/github/dispatch`, async (route) => {
+    dispatchEvidence = {
+      apiVersion: "steward.github-automation/v1",
+      runId: 12345,
+      url: "https://github.com/example-org/agentic-ops/actions/runs/12345",
+    };
     await route.continue();
   });
-  await context.route(`${origin}/app/api/v1/runs/${taskUid}/github/runs/12345*`, async (route) => {
+  await context.route(`${origin}/app/api/v1/runs/*/github/runs/12345*`, async (route) => {
     githubRunStatusRequests += 1;
     const completed = githubRunStatusRequests > 1;
+    if (completed) githubAutomationCompleted = true;
     await json(route, {
       apiVersion: "steward.github-automation/v1",
       runId: 12345,
@@ -1328,7 +1446,7 @@ async function guardedPage(browser, {
       linkedTaskPhase: completed ? "succeeded" : null,
     });
   });
-  await context.route(`${origin}/app/api/v1/runs/${taskUid}/logs/*`, async (route) => {
+  await context.route(`${origin}/app/api/v1/runs/*/logs/*`, async (route) => {
     const stream = new URL(route.request().url()).pathname.split("/").at(-1);
     executionLogRequests.push(route.request());
     const fixture = executionLogs[stream];
@@ -1656,6 +1774,7 @@ async function guardedPage(browser, {
     executionLogRequests,
     httpErrors,
     mutations,
+    runEventRequests,
     setupStatusRequests,
     useAdminSetupStatus: (status) => { currentAdminSetupStatus = status; },
   };
@@ -1844,8 +1963,8 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
     await expect(developer.page.getByText("Sensitivity notice", { exact: true })).toBeVisible();
 
     await developer.page.goto(`${origin}/get-started`);
-    await expect(developer.page.getByText("Four steps to your first governed browser run. GitHub Actions automation is available afterward, but never blocks completion.")).toBeVisible();
-    for (const title of ["Connect GitHub", "Get your first envelope", "Run hello world now", "See the result", "Automate it from GitHub Actions"]) {
+    await expect(developer.page.getByText("Seven steps from a first test run to a governed GitHub workflow. An envelope is the budget, models and tools an agent may use; the workflow runs your agent inside it.")).toBeVisible();
+    for (const title of ["Connect GitHub", "Get your first envelope", "Try a test run", "Publish the task definition", "Add the workflow to your repository", "Trigger a test run", "See the result"]) {
       await expect(developer.page.getByRole("button", { name: new RegExp(title) })).toBeVisible();
     }
   } finally {
@@ -2344,21 +2463,21 @@ test("administrators can provision a template envelope directly to a user", asyn
   }
 });
 
-test("onboarding makes the browser run core and repository automation optional", async ({ browser }) => {
+test("onboarding starts with configured server defaults and preserves dismissal", async ({ browser }) => {
   const developer = await guardedPage(browser, { includeSampleWorkflow: true });
   try {
     await developer.page.goto(`${origin}/get-started`);
-    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Run hello world now" });
-    const automationStep = developer.page.getByRole("listitem").filter({ hasText: "Automate it from GitHub Actions" });
-    await expect(runStep.getByText(/Start directly in Steward/)).toBeVisible();
-    await expect(runStep.getByRole("link", { name: "Open Run now" })).toHaveAttribute("href", "/runs/new");
-    await expect(runStep).toContainText(starterTaskFixture.title);
-    await expect(runStep).toContainText(starterTaskFixture.taskDefinition.promptText);
-    await expect(runStep).toContainText(JSON.stringify(starterTaskFixture.inputs));
-    await expect(runStep).toContainText("Capture execution log");
-    await expect(runStep).toContainText("On");
-    await expect(automationStep.getByText("Optional", { exact: true })).toBeVisible();
-    await expect(developer.page.getByText("2 of 4 done", { exact: true })).toBeVisible();
+    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
+    await expect(runStep.getByLabel("Repository").locator("option")).toHaveText([
+      "example-org/agentic-ops · Ready",
+      "example-org/not-admitted · Not ready",
+    ]);
+    await expect(runStep.getByLabel("Coding agent")).toHaveValue(starterTaskFixture.taskDefinition.runtime.agentRef);
+    await expect(runStep.getByLabel("Prompt")).toHaveValue(starterTaskFixture.taskDefinition.promptText);
+    await expect(runStep.getByLabel("Input name")).toHaveValue("greeting");
+    await expect(runStep.getByLabel("Input value for greeting")).toHaveValue("hello from config");
+    await expect(runStep).toContainText("Inputs are passed to the agent as in/inputs.json.");
+    await expect(developer.page.getByText("2 of 7 done", { exact: true })).toBeVisible();
 
     await developer.page.getByRole("button", { name: "Hide Get started" }).click();
     await expect(developer.page.getByText("The onboarding guide is hidden. Your progress is preserved.")).toBeVisible();
@@ -2371,6 +2490,105 @@ test("onboarding makes the browser run core and repository automation optional",
     await expect(developer.page.getByRole("link", { name: "Get started" })).toBeVisible();
     const restored = developer.mutations.findLast((mutation) => mutation.path === "/app/api/v1/preferences");
     expect(restored.body).toEqual({ onboardingDismissed: false });
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Get started completes the governed test-to-GitHub journey from server evidence", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    includeSampleWorkflow: true,
+    onboardingJourney: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    const step = (title) => developer.page.getByRole("listitem").filter({ hasText: title });
+    const openStep = async (title) => {
+      const row = step(title);
+      const toggle = row.getByRole("button").first();
+      if (await toggle.getAttribute("aria-expanded") !== "true") await toggle.click();
+      return row;
+    };
+    await expect(step("Connect GitHub").getByText("Done", { exact: true })).toBeVisible();
+    await expect(step("Get your first envelope").getByText("Done", { exact: true })).toBeVisible();
+
+    const testRun = step("Try a test run");
+    await expect(testRun.getByLabel("Prompt")).toHaveValue(starterTaskFixture.taskDefinition.promptText);
+    await testRun.getByRole("button", { name: "Run test" }).click();
+    await expect(testRun.getByText("Done", { exact: true })).toBeVisible({ timeout: 10_000 });
+    expect(developer.runEventRequests).toHaveLength(1);
+    const submission = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/runs");
+    expect(submission.body.package.path).toBe(starterTaskFixture.packagePath);
+    const definition = JSON.parse(submission.body.package.files[starterTaskFixture.packagePath]);
+    expect(definition).toMatchObject({
+      schemaVersion: "steward.task-definition/v2",
+      name: starterTaskFixture.taskDefinition.name,
+      version: starterTaskFixture.taskDefinition.version,
+      promptText: starterTaskFixture.taskDefinition.promptText,
+      outputs: starterTaskFixture.taskDefinition.outputs,
+    });
+    expect(definition).not.toHaveProperty("envelopeDigest");
+    expect(submission.body.inputs).toEqual(starterTaskFixture.inputs);
+
+    const publicationStep = await openStep("Publish the task definition");
+    await expect(publicationStep.locator("strong").filter({ hasText: starterTaskFixture.packagePath })).toBeVisible();
+    await expect(publicationStep.locator("pre")).toContainText('"schemaVersion": "steward.task-definition/v2"');
+    await publicationStep.getByRole("button", { name: "Open pull request" }).click();
+    await expect(publicationStep.getByRole("link", { name: "View pull request ↗" })).toHaveAttribute("href", "https://github.com/example-org/agentic-ops/pull/42");
+    const publication = developer.mutations.find((mutation) => mutation.path.endsWith("/github/publish"));
+    expectMutationProof(publication);
+    expect(publication.body).toMatchObject({ owner: "example-org", repository: "agentic-ops" });
+    await publicationStep.getByRole("button", { name: "I've committed it" }).click();
+    await expect(step("Add the workflow to your repository").getByText("Done", { exact: true })).toBeVisible({ timeout: 10_000 });
+
+    const workflowStep = await openStep("Add the workflow to your repository");
+    await expect(workflowStep.getByText(`.github/workflows/hypershell-${starterTaskFixture.taskDefinition.name}.yml`, { exact: true })).toBeVisible();
+    await expect(workflowStep.locator("pre")).toContainText(`package-path: ${starterTaskFixture.packagePath}`);
+    await workflowStep.getByRole("tab", { name: "Governed job only" }).click();
+    await expect(workflowStep.locator("pre")).toContainText("jobs:\n  governed:");
+    await expect(workflowStep.locator("pre")).not.toContainText("  prepare:");
+
+    const triggerStep = await openStep("Trigger a test run");
+    await triggerStep.getByRole("button", { name: "Run on GitHub" }).click();
+    const dispatch = developer.mutations.find((mutation) => mutation.path.endsWith("/github/dispatch"));
+    expectMutationProof(dispatch);
+    expect(dispatch.body).toMatchObject({ owner: "example-org", repository: "agentic-ops" });
+    expect(JSON.parse(dispatch.body.inputs["task-inputs"])).toEqual(starterTaskFixture.inputs);
+
+    await expect(step("See the result").getByText("Done", { exact: true })).toBeVisible({ timeout: 15_000 });
+    const resultStep = await openStep("See the result");
+    await expect(resultStep.getByRole("link", { name: "Open in HyperShell" })).toHaveAttribute("href", "/runs/00000000-0000-0000-0000-000000000007");
+    await expect(resultStep.getByRole("link", { name: "Run 12345 ↗" })).toHaveAttribute("href", "https://github.com/example-org/agentic-ops/actions/runs/12345");
+    await expect(resultStep.getByText("agent stdout", { exact: true })).toBeVisible();
+
+    await developer.page.reload();
+    for (const title of ["Connect GitHub", "Get your first envelope", "Try a test run", "Publish the task definition", "Add the workflow to your repository", "Trigger a test run", "See the result"]) {
+      await expect(step(title).getByText("Done", { exact: true })).toBeVisible();
+    }
+    await developer.page.getByRole("button", { name: "Hide Get started" }).click();
+    await developer.page.goto(`${origin}/settings`);
+    await developer.page.getByRole("button", { name: "Reopen Get started" }).click();
+    await expect(developer.page.getByRole("button", { name: "Guide is visible" })).toBeVisible();
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.getByRole("region", { name: "Get started" })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Get started explains unsupported releases and repository prerequisites", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    expectedHttpStatuses: [503],
+    githubBundleStatus: 503,
+    inlineRun: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.getByText("Publishing this package requires steward-run 0.8.0 or later. Use the manual path until the reviewed release is upgraded.")).toBeVisible();
+    const testRun = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
+    await testRun.getByRole("button").first().click();
+    await testRun.getByLabel("Repository").selectOption("repo_not_admitted");
+    await expect(testRun.getByText("Not ready: source_repository_not_admitted.", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -2406,11 +2624,11 @@ test("onboarding banner is shared, dismissible, and restorable from settings", a
   }
 });
 
-test("onboarding navigation shows progress and disappears when all four core steps are complete", async ({ browser }) => {
+test("onboarding navigation shows seven-step progress and disappears when the journey is complete", async ({ browser }) => {
   const inProgress = await guardedPage(browser, { includeSampleWorkflow: true });
   try {
     await inProgress.page.goto(`${origin}/envelopes`);
-    await expect(inProgress.page.getByRole("link", { name: /Get started/ })).toContainText("2/4");
+    await expect(inProgress.page.getByRole("link", { name: /Get started/ })).toContainText("2/7");
   } finally {
     await closeGuardedPage(inProgress);
   }
@@ -2442,12 +2660,19 @@ test("onboarding lets the user choose which first envelope template to request",
   }
 });
 
-test("onboarding does not require a published sample", async ({ browser }) => {
-  const developer = await guardedPage(browser);
+test("onboarding loads without a published sample or GitHub repository metadata", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    connectionPhase: "disconnected",
+    expectedHttpStatuses: [503],
+    githubRepositoriesStatus: 503,
+  });
   try {
     await developer.page.goto(`${origin}/get-started`);
-    await expect(developer.page.getByRole("link", { name: "Open Run now" })).toBeVisible();
-    await expect(developer.page.getByText("Optional", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("link", { name: "Connect GitHub" })).toBeVisible();
+    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
+    await runStep.getByRole("button").first().click();
+    await expect(runStep.getByRole("button", { name: "Run test" })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Publish the task definition" })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -2667,9 +2892,11 @@ test("onboarding follows paginated envelope and run evidence", async ({ browser 
   try {
     await developer.page.goto(`${origin}/get-started`);
     await expect(developer.page.getByRole("listitem").filter({ hasText: "Get your first envelope" }).getByText("Done", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "Run hello world now" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Try a test run" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Publish the task definition" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Add the workflow to your repository" }).getByText("Done", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Trigger a test run" }).getByText("Done", { exact: true })).toBeVisible();
     await expect(developer.page.getByRole("listitem").filter({ hasText: "See the result" }).getByText("Done", { exact: true })).toBeVisible();
-    await expect(developer.page.getByRole("listitem").filter({ hasText: "Automate it from GitHub Actions" }).getByText("Done", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }

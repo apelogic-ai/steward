@@ -36,7 +36,15 @@ const adminNavigation = [
   { href: "/admin/settings", label: "Settings" },
 ] as const;
 
-const onboardingStepTitles = ["Connect GitHub", "Get your first envelope", "Run hello world now", "See the result"] as const;
+const onboardingStepTitles = [
+  "Connect GitHub",
+  "Get your first envelope",
+  "Try a test run",
+  "Publish the task definition",
+  "Add the workflow to your repository",
+  "Trigger a test run",
+  "See the result",
+] as const;
 
 export function isActive(pathname: string, href: string): boolean {
   if (href === "/admin/envelopes/templates" && pathname === "/admin/envelopes/provision") return true;
@@ -328,7 +336,7 @@ function AppSidebar({ adminGuideDismissed, adminMode, mobile = false, needsActio
   session: Extract<SessionState, { status: "authenticated" }>;
 }>) {
   const pathname = usePathname();
-  const onboardingComplete = onboardingCompleted === 4;
+  const onboardingComplete = onboardingCompleted === 7;
   const navigation = adminMode ? adminNavigation.filter((item) => !adminGuideDismissed || item.href !== "/admin/get-started") : userNavigation.filter((item) => !(onboardingDismissed || onboardingComplete) || item.href !== "/get-started");
   return (
     <aside className={mobile ? "flex h-full w-[216px] flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 shadow-xl" : "sticky top-0 hidden h-screen flex-col border-e border-line bg-panel px-3 pt-[18px] pb-3 md:flex"}>
@@ -341,7 +349,7 @@ function AppSidebar({ adminGuideDismissed, adminMode, mobile = false, needsActio
       <nav aria-label="Primary navigation" className="space-y-0.5">
         {navigation.map(({ href, label }) => {
           const active = isActive(pathname, href);
-          const count = href === "/admin/approvals" ? needsAction : href === "/get-started" && onboardingCompleted !== null ? `${onboardingCompleted}/4` : null;
+          const count = href === "/admin/approvals" ? needsAction : href === "/get-started" && onboardingCompleted !== null ? `${onboardingCompleted}/7` : null;
           return (
             <Link
               aria-current={active ? "page" : undefined}
@@ -374,8 +382,8 @@ function OnboardingBanner({ completed, nextTitle, onDismiss }: Readonly<{
     <section aria-label="Get started" className="relative flex flex-wrap items-center gap-4 rounded-card bg-brand-soft px-[18px] py-3.5 pe-14">
       <div className="min-w-48 flex-1">
         <p className="text-sm font-semibold">Get started</p>
-        <p className="mt-0.5 text-[13px] text-muted-ink">{completed} of 4 done{nextTitle ? ` · next: ${nextTitle}` : ""}</p>
-        <div aria-label={`${completed} of 4 onboarding steps complete`} aria-valuemax={4} aria-valuemin={0} aria-valuenow={completed} className="mt-2 h-[5px] overflow-hidden rounded-full bg-line-soft" role="progressbar"><div className="h-full rounded-full bg-brand" style={{ width: `${completed * 25}%` }} /></div>
+        <p className="mt-0.5 text-[13px] text-muted-ink">{completed} of 7 done{nextTitle ? ` · next: ${nextTitle}` : ""}</p>
+        <div aria-label={`${completed} of 7 onboarding steps complete`} aria-valuemax={7} aria-valuemin={0} aria-valuenow={completed} className="mt-2 h-[5px] overflow-hidden rounded-full bg-line-soft" role="progressbar"><div className="h-full rounded-full bg-brand" style={{ width: `${(completed / 7) * 100}%` }} /></div>
       </div>
       <Link className="inline-flex h-[34px] items-center rounded-control bg-brand px-3.5 text-[13px] font-semibold text-on-brand hover:bg-brand-hover" href="/get-started">Continue</Link>
       <button aria-label="Hide Get started" className="absolute end-3 top-3 grid size-8 place-items-center rounded-control text-lg text-muted-ink hover:bg-line-soft hover:text-ink" onClick={onDismiss} type="button"><span aria-hidden="true">×</span></button>
@@ -500,7 +508,7 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
             {session.status === "authenticated" && workspaceAuthorized ? (
               <>
                 <Breadcrumbs items={breadcrumbsForPath(pathname)} />
-                {!adminMode && pathname !== "/get-started" && onboardingCompleted !== null && onboardingCompleted < 4 && !onboardingDismissed ? <div className="mt-4"><OnboardingBanner completed={onboardingCompleted} nextTitle={onboardingNextTitle} onDismiss={dismissOnboarding} /></div> : null}
+                {!adminMode && pathname !== "/get-started" && onboardingCompleted !== null && onboardingCompleted < 7 && !onboardingDismissed ? <div className="mt-4"><OnboardingBanner completed={onboardingCompleted} nextTitle={onboardingNextTitle} onDismiss={dismissOnboarding} /></div> : null}
                 {children}
               </>
             ) : null}

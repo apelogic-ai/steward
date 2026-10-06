@@ -9366,6 +9366,35 @@ impl PgStore {
         .map_err(database_error)
     }
 
+    /// Return the latest successful, adapter-sanitized result for one owner-scoped operation
+    /// subject. The caller supplies the server-computed identity prefix; client idempotency keys
+    /// and raw provider credentials are never exposed through this projection.
+    pub async fn latest_connection_operation_result(
+        &self,
+        canonical_user_id: &CanonicalUserId,
+        operation_kind: ConnectionOperationKind,
+        idempotency_identity_prefix: &str,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        if idempotency_identity_prefix.trim().is_empty() {
+            return Err(StoreError::InvalidConnectionOperation);
+        }
+        sqlx::query_scalar::<_, Json<serde_json::Value>>(
+            "SELECT result FROM connection_operations \
+             WHERE canonical_user_id = $1 AND provider = 'github' \
+               AND operation_kind = $2 AND operation_state = 'succeeded' \
+               AND left(idempotency_identity, length($3) + 1) = $3 || ':' \
+               AND result IS NOT NULL \
+             ORDER BY created_at DESC, operation_id DESC LIMIT 1",
+        )
+        .bind(canonical_user_id.as_str())
+        .bind(operation_kind.as_str())
+        .bind(idempotency_identity_prefix)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|result| result.map(|Json(value)| value))
+        .map_err(database_error)
+    }
+
     /// Duration of the administrator's latest successful GitHub Connect start.
     ///
     /// This deliberately returns only a bounded timing fact. OAuth continuation material and
