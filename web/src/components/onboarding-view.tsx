@@ -4,9 +4,11 @@ import Link from "next/link";
 import { useCallback, useMemo, useState } from "react";
 
 import {
+  getStarterTask,
   listTemplates,
   updateBrowserPreferences,
   type EnvelopeTemplatesResponse,
+  type StarterTaskSetting,
 } from "@/api-client";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { deriveOnboardingProgress, loadOnboardingEvidence, type OnboardingEvidence } from "@/data/onboarding-progress";
@@ -15,6 +17,7 @@ import { useSession } from "@/session/session-context";
 
 type OnboardingData = OnboardingEvidence & {
   templates: EnvelopeTemplatesResponse;
+  starterTask: StarterTaskSetting;
 };
 
 function runDuration(createdAt: string, updatedAt: string): string {
@@ -32,13 +35,18 @@ export { browserHelloWorldRun } from "@/data/onboarding-progress";
 
 export function OnboardingView() {
   const load = useCallback(async () => {
-    const [evidence, templates] = await Promise.all([
+    const [evidence, templates, starterTask] = await Promise.all([
       loadOnboardingEvidence(),
       listTemplates({ cache: "no-store", credentials: "same-origin" }),
+      getStarterTask({ cache: "no-store", credentials: "same-origin" }),
     ]);
-    const response = !evidence.response?.ok ? evidence.response : templates.response;
-    const data = evidence.data && templates.data
-      ? { ...evidence.data, templates: templates.data }
+    const response = !evidence.response?.ok
+      ? evidence.response
+      : !templates.response?.ok
+        ? templates.response
+        : starterTask.response;
+    const data = evidence.data && templates.data && starterTask.data
+      ? { ...evidence.data, templates: templates.data, starterTask: starterTask.data.starterTask }
       : undefined;
     return { data, response };
   }, []);
@@ -58,6 +66,7 @@ function OnboardingChecklist({ data }: Readonly<{ data: OnboardingData }>) {
   const provisionedRequest = data.envelopes.requests.find((request) => request.status === "provisioned" && request.envelopeInstanceId);
   const progress = useMemo(() => deriveOnboardingProgress(data), [data]);
   const { automationRun, helloWorldRun } = progress;
+  const starterPrompt = data.starterTask.taskDefinition.promptText ?? "";
   const done = progress.done;
   const completed = progress.completed;
   const current = done.findIndex((value) => !value);
@@ -108,7 +117,7 @@ function OnboardingChecklist({ data }: Readonly<{ data: OnboardingData }>) {
     {
       title: "Run hello world now",
       status: done[2] ? `Inline run ${helloWorldRun?.taskUid} detected` : "Start directly in Steward—no repository, runner, or Identity policy required",
-      body: <div className="space-y-4"><p className="text-sm text-muted-ink">Choose a compatible coding agent and the provisioned Envelope. Steward creates an immutable inline package, admits it, and starts the governed runtime.</p><Link className="inline-flex rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href="/runs/new">Open Run now</Link></div>,
+      body: <div className="space-y-4"><div><strong>{data.starterTask.title ?? data.starterTask.taskDefinition.name}</strong>{data.starterTask.description ? <p className="mt-1 text-sm text-muted-ink">{data.starterTask.description}</p> : null}</div><pre className="whitespace-pre-wrap rounded-control bg-code p-3 text-xs text-code-ink">{starterPrompt}</pre><dl className="grid gap-2 text-xs text-muted-ink sm:grid-cols-2"><div><dt className="font-semibold text-ink">Default inputs</dt><dd><code>{JSON.stringify(data.starterTask.inputs)}</code></dd></div><div><dt className="font-semibold text-ink">Capture execution log</dt><dd>{data.starterTask.executionLog === "full" ? "On" : "Off"}</dd></div></dl><p className="text-sm text-muted-ink">Choose a compatible coding agent and the provisioned Envelope. Steward creates an immutable inline package, admits it, and starts the governed runtime.</p><Link className="inline-flex rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href="/runs/new">Open Run now</Link></div>,
     },
     {
       title: "See the result",

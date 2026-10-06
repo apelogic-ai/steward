@@ -30,6 +30,47 @@ const browserTaskFiles = {
     outputs: [{ path: "out", kind: "directory", required: true }],
   }, null, 2),
 };
+const starterTaskFixture = {
+  taskDefinition: {
+    schemaVersion: "steward.task-definition/v2",
+    name: "configured-hello",
+    version: 3,
+    runtime: { agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } },
+    promptText: "Write the configured greeting to out/hello.txt.",
+    outputs: [{ path: "out/hello.txt", kind: "file", required: true }],
+  },
+  inputs: { greeting: "hello from config" },
+  executionLog: "full",
+  packagePath: ".steward/tasks/configured-hello/task-definition.json",
+  title: "Configured hello world",
+  description: "This starter task came from deployment settings.",
+  git: {
+    repository: "https://github.com/example-org/agentic-ops.git",
+    revision: "git:ref:main",
+    path: "catalog/configured-hello/task-definition.json",
+  },
+  publishedWorkflow: "repository-review@1",
+};
+const builtInStarterTaskFixture = {
+  taskDefinition: {
+    schemaVersion: "steward.task-definition/v2",
+    name: "browser-task",
+    version: 1,
+    runtime: { agentRef: "codex@0.140.0" },
+    promptText: "Write the single line hello world to $STEWARD_OUTPUT_DIR/out/hello.txt using your shell, for example mkdir -p \"$STEWARD_OUTPUT_DIR/out\" && printf 'hello world\\n' > \"$STEWARD_OUTPUT_DIR/out/hello.txt\". Do not create any other files, do not use the network, and do not call any MCP or GitHub tools.",
+    outputs: [{ path: "out/hello.txt", kind: "file", required: true }],
+  },
+  inputs: {},
+  executionLog: "off",
+  packagePath: ".steward/tasks/browser-task/task-definition.json",
+  title: "Hello world",
+  description: "Run a governed coding agent and collect its exact output.",
+  git: {
+    repository: "https://github.com/example-org/agentic-ops.git",
+    revision: "git:ref:main",
+    path: "catalog/hello/task-definition.json",
+  },
+};
 let web;
 let origin;
 
@@ -796,6 +837,7 @@ async function guardedPage(browser, {
   capabilityCatalogTools = capabilityCatalog.tools,
   capabilityCatalogStatus = 200,
   session = developerSession,
+  starterTask = starterTaskFixture,
   viewport = { width: 1280, height: 800 },
 } = {}) {
   const context = await browser.newContext({ colorScheme, viewport });
@@ -900,6 +942,10 @@ async function guardedPage(browser, {
     }));
   }
   const json = (route, body, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
+  await context.route(`${origin}/app/api/v1/onboarding/starter-task`, (route) => json(route, {
+    apiVersion: "steward.onboarding-starter-task/v1",
+    starterTask,
+  }));
   if (connectionStartFailure) {
     await context.route(`${origin}/app/api/v1/connections/github/operations/*`, (route) => json(route, {
       apiVersion: "steward.connections/v1",
@@ -1301,6 +1347,12 @@ async function guardedPage(browser, {
       sizeBytes: 12,
       downloadUrl: `/app/api/v1/runs/${taskUid}/outputs/${encodeURIComponent("out/hello.txt")}`,
     }],
+  }));
+  await context.route(`${origin}/app/api/v1/runs/*/outputs/**`, (route) => route.fulfill({
+    status: 200,
+    contentType: "text/plain; charset=utf-8",
+    body: "hello world\n",
+    headers: { "cache-control": "no-store" },
   }));
   await context.route(`${origin}/admin/api/v1/all-runs*`, (route) => json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [{ ...fixtureRun, ownerUserId: developerSession.principal.userId, ownerDisplayEmail: developerSession.principal.displayEmail }], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } }));
   await context.route(`${origin}/admin/api/v1/all-runs/**`, (route) => route.request().url().endsWith("/timeline")
@@ -2300,6 +2352,11 @@ test("onboarding makes the browser run core and repository automation optional",
     const automationStep = developer.page.getByRole("listitem").filter({ hasText: "Automate it from GitHub Actions" });
     await expect(runStep.getByText(/Start directly in Steward/)).toBeVisible();
     await expect(runStep.getByRole("link", { name: "Open Run now" })).toHaveAttribute("href", "/runs/new");
+    await expect(runStep).toContainText(starterTaskFixture.title);
+    await expect(runStep).toContainText(starterTaskFixture.taskDefinition.promptText);
+    await expect(runStep).toContainText(JSON.stringify(starterTaskFixture.inputs));
+    await expect(runStep).toContainText("Capture execution log");
+    await expect(runStep).toContainText("On");
     await expect(automationStep.getByText("Optional", { exact: true })).toBeVisible();
     await expect(developer.page.getByText("2 of 4 done", { exact: true })).toBeVisible();
 
@@ -2467,20 +2524,48 @@ test("Run now submits an inline package under the selected envelope", async ({ b
   const developer = await guardedPage(browser, { inlineRun: true, publishedWorkflows: false });
   try {
     await developer.page.goto(`${origin}/runs/new`);
+    await expect(developer.page.getByRole("heading", { name: starterTaskFixture.title })).toBeVisible();
+    await expect(developer.page.getByRole("textbox", { name: /^Prompt\b/ })).toHaveValue(starterTaskFixture.taskDefinition.promptText);
+    await expect(developer.page.getByRole("textbox", { name: /^Inputs \(JSON object\)/ })).toHaveValue(JSON.stringify(starterTaskFixture.inputs, null, 2));
+    await expect(developer.page.getByRole("checkbox", { name: /Capture execution log/ })).toBeChecked();
+    await developer.page.getByRole("button", { name: "Run now" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
+
+    const starterSubmission = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/runs");
+    expectMutationProof(starterSubmission);
+    expect(starterSubmission.headers["idempotency-key"]).toBeTruthy();
+    expect(starterSubmission.body.envelopeDigest).toBe(`steward:${envelopeRequest.envelopeDigest}`);
+    expect(starterSubmission.body.package.source).toBe("inline");
+    expect(starterSubmission.body.package.path).toBe(starterTaskFixture.packagePath);
+    expect(Object.keys(starterSubmission.body.package.files)).toEqual([starterTaskFixture.packagePath]);
+    expect(starterSubmission.body.inputs).toEqual(starterTaskFixture.inputs);
+    expect(starterSubmission.body.diagnostics).toEqual({ executionLog: "full" });
+    const starterDefinition = JSON.parse(starterSubmission.body.package.files[starterTaskFixture.packagePath]);
+    expect(starterDefinition).toMatchObject({
+      name: "configured-hello",
+      version: 3,
+      promptText: starterTaskFixture.taskDefinition.promptText,
+      outputs: starterTaskFixture.taskDefinition.outputs,
+      runtime: { agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } },
+    });
+
+    await developer.page.goto(`${origin}/runs/new?choose=task`);
     await expect(developer.page.getByRole("combobox", { name: "Task" })).toHaveValue(browserTaskDigest);
     await developer.page.getByRole("button", { name: "Continue" }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/new?task=${encodeURIComponent(browserTaskDigest)}`);
+    await expect(developer.page.getByRole("textbox", { name: /^Inputs \(JSON object\)/ })).toHaveValue("{}");
     await developer.page.getByRole("checkbox", { name: /Capture execution log/ }).check();
     await developer.page.getByRole("button", { name: "Run now" }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
 
-    const submission = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/runs");
+    const submission = developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/runs").at(-1);
     expectMutationProof(submission);
     expect(submission.headers["idempotency-key"]).toBeTruthy();
     expect(submission.body.envelopeDigest).toBe(`steward:${envelopeRequest.envelopeDigest}`);
     expect(submission.body.package.source).toBe("inline");
     expect(submission.body.package.path).toBe(browserTaskDefinitionPath);
     expect(Object.keys(submission.body.package.files)).toEqual([browserTaskDefinitionPath]);
+    expect(submission.body.inputs).toEqual({});
     expect(submission.body.diagnostics).toEqual({ executionLog: "full" });
     const taskDefinition = JSON.parse(submission.body.package.files[browserTaskDefinitionPath]);
     expect(taskDefinition.promptText).toContain("hello-world");
@@ -2501,6 +2586,38 @@ test("Run now submits an inline package under the selected envelope", async ({ b
     await developer.page.getByRole("button", { name: "Run now" }).click();
     const exactSubmission = developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/runs").at(-1);
     expect(exactSubmission.body.package).toEqual({ source: "inline", revision: browserTaskDigest, path: browserTaskDefinitionPath, files: browserTaskFiles });
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("the built-in starter task completes with the exact hello world output", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    inlineRun: true,
+    publishedWorkflows: false,
+    starterTask: builtInStarterTaskFixture,
+  });
+  try {
+    await developer.page.goto(`${origin}/runs/new`);
+    await expect(developer.page.getByRole("textbox", { name: /^Prompt\b/ })).toHaveValue(builtInStarterTaskFixture.taskDefinition.promptText);
+    await developer.page.getByRole("button", { name: "Run now" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
+
+    const submission = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/runs");
+    const definition = JSON.parse(submission.body.package.files[builtInStarterTaskFixture.packagePath]);
+    expect(definition.promptText).toBe(builtInStarterTaskFixture.taskDefinition.promptText);
+    expect(definition.outputs).toEqual([{ path: "out/hello.txt", kind: "file", required: true }]);
+
+    const outputLink = developer.page.getByRole("link", { name: "out/hello.txt" });
+    await expect(outputLink).toBeVisible();
+    const outputHref = await outputLink.getAttribute("href");
+    expect(outputHref).toBeTruthy();
+    const output = await developer.page.evaluate(async (href) => {
+      const response = await fetch(href);
+      return { ok: response.ok, text: await response.text() };
+    }, outputHref);
+    expect(output.ok).toBe(true);
+    expect(output.text).toBe("hello world\n");
   } finally {
     await closeGuardedPage(developer);
   }
