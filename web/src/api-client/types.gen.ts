@@ -563,6 +563,7 @@ export type BrowserRunPackageContentResponse = {
 export type BrowserRunPackageView = {
     contentDigest?: string | null;
     path: string;
+    promptSource: PromptSourceKind;
     revision: string;
     source: string;
 };
@@ -692,6 +693,7 @@ export type BrowserTaskEvidence = {
         [key: string]: unknown;
     } | null;
     path: RelativePath;
+    promptSource?: PromptSourceKind;
     revision: string;
     source: string;
 };
@@ -908,7 +910,9 @@ export type DirectTaskBindingEvidence = {
     effectiveRequirements: DirectRequirements;
     envelope: EnvelopeEvidence;
     invocation: ResolvedSource;
+    invocationKind?: InvocationKind;
     package: ResolvedSource;
+    promptSource?: PromptSourceKind;
     schemaVersion: string;
     sourceProvenance: SourceProvenance;
     taskUid: Uuid;
@@ -931,8 +935,10 @@ export type DirectTaskStatusResponse = {
 
 export type DirectTaskSubmission = {
     contractVersion: string;
+    diagnostics?: DiagnosticsRequest;
     envelopeDigest?: null | EnvelopeDigest;
-    invocationPath: RelativePath;
+    invocationPath?: null | RelativePath;
+    packagePath?: null | RelativePath;
 };
 
 export type DisableFederatedSubjectBody = {
@@ -1065,6 +1071,8 @@ export type GithubActionsWorkflowResponse = {
     apiVersion: string;
     workflow: GeneratedGithubActionsWorkflow;
 };
+
+export type InvocationKind = 'manifest' | 'implicit';
 
 /**
  * A Kubernetes resource quantity. Admission validates the supported unit family for each
@@ -1201,6 +1209,8 @@ export type Principal = {
     name: string;
 };
 
+export type PromptSourceKind = 'path' | 'inline';
+
 export type ProviderConnectionStatus = {
     accountEmail?: string | null;
     accountId?: string | null;
@@ -1270,7 +1280,7 @@ export type RenderGithubActionsWorkflowBody = {
 };
 
 export type RenderRepositoryBundleBody = {
-    invocationPath: RelativePath;
+    invocationPath?: null | RelativePath;
     packagePath: RelativePath;
     repository: RepositoryUrl;
 };

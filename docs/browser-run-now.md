@@ -39,7 +39,8 @@ authority.
 Every source resolves to the same v2 TaskDefinition and package-closure rules. Inline
 files are limited to 64 KiB in total. `inputs` must be a JSON object of at most 16 KiB
 and is materialized as `in/inputs.json`; it cannot select an agent, model, tool, or
-Envelope.
+Envelope. The prefilled single-prompt package stores its prompt as `promptText` in the
+TaskDefinition, so the exact inline package contains one file.
 
 ## Admission and lifecycle
 
@@ -85,7 +86,8 @@ GET /app/api/v1/runs/{taskUid}/package
 
 Failed, incomplete, non-inline, and cross-owner runs return not found. This prevents a
 failed attempt or mutable browser form state from being presented as a known-good
-repository package.
+repository package. The run detail renders either inline `promptText` or the resolved
+prompt file in the same Task prompt panel and records the prompt source in Run detail.
 
 ## Template control
 
@@ -104,8 +106,8 @@ After an inline run succeeds, its detail page offers **Save this task to a repos
 **Copy repository bundle** reads the exact persisted package from the successful run,
 then asks the server to render the handoff against the same provisioned Envelope and
 the deployment's reviewed `steward-run` release. The copied JSON file map contains the
-unchanged `task-definition.json` and `prompt.md`, a `git:trigger` invocation manifest,
-and a caller workflow with the exact reusable-workflow commit. Committing those files
+unchanged `task-definition.json` with its inline prompt and a caller workflow using
+`package-path` with the exact reusable-workflow commit. Committing those two files
 preserves the package closure digest proven by the inline run; release coordinates are
 never guessed by the browser client.
 

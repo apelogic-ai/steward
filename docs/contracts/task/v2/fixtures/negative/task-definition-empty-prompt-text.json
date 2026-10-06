@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "steward.task-definition/v2",
+  "name": "task",
+  "version": 1,
+  "runtime": {
+    "agentRef": "example-agent@1.2.3"
+  },
+  "promptText": "",
+  "outputs": [
+    {
+      "path": "out",
+      "kind": "directory",
+      "required": true
+    }
+  ]
+}

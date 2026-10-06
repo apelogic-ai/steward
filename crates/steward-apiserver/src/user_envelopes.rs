@@ -273,7 +273,8 @@ pub(crate) struct RenderGithubActionsWorkflowBody {
 pub(crate) struct RenderRepositoryBundleBody {
     repository: RepositoryUrl,
     package_path: RelativePath,
-    invocation_path: RelativePath,
+    #[serde(default)]
+    invocation_path: Option<RelativePath>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -1288,7 +1289,10 @@ where
         return StatusCode::FORBIDDEN.into_response();
     }
     if !body.repository.as_str().starts_with("https://github.com/")
-        || body.package_path == body.invocation_path
+        || body
+            .invocation_path
+            .as_ref()
+            .is_some_and(|path| path == &body.package_path)
     {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
@@ -1305,7 +1309,7 @@ where
     let Some(reviewed_release) = state.broker.steward_run_release() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let invocation = InvocationManifest {
+    let invocation = body.invocation_path.as_ref().map(|_| InvocationManifest {
         contract_version: DIRECT_TASK_CONTRACT_VERSION.to_owned(),
         package: PackageReference {
             repository: body.repository.clone(),
@@ -1316,17 +1320,30 @@ where
         diagnostics: Some(DiagnosticsRequest {
             execution_log: ExecutionLogMode::Full,
         }),
-    };
-    if invocation
-        .validate_for_invoking_repository(&body.repository)
-        .is_err()
-    {
+    });
+    if invocation.as_ref().is_some_and(|invocation| {
+        invocation
+            .validate_for_invoking_repository(&body.repository)
+            .is_err()
+    }) {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
     let workflow = match render_direct_package_github_actions_workflow(
         &DirectPackageGithubActionsWorkflowContext {
             envelope,
-            invocation_path: body.invocation_path.as_str().to_owned(),
+            invocation_path: body
+                .invocation_path
+                .as_ref()
+                .map(|path| path.as_str().to_owned()),
+            package_path: body
+                .invocation_path
+                .is_none()
+                .then(|| body.package_path.as_str().to_owned()),
+            execution_log: if body.invocation_path.is_some() {
+                ExecutionLogMode::Off
+            } else {
+                ExecutionLogMode::Full
+            },
             reviewed_release,
             workflow_installation_mode: state.broker.workflow_installation_mode(),
             task_identity_discovery_enabled: state.broker.task_identity_discovery_enabled(),
@@ -1335,12 +1352,14 @@ where
         Ok(workflow) => workflow,
         Err(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
     };
-    let invocation_json = match serde_json::to_string_pretty(&invocation) {
-        Ok(value) => value + "\n",
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
     let mut files = BTreeMap::new();
-    files.insert(body.invocation_path.as_str().to_owned(), invocation_json);
+    if let (Some(invocation_path), Some(invocation)) = (&body.invocation_path, invocation) {
+        let invocation_json = match serde_json::to_string_pretty(&invocation) {
+            Ok(value) => value + "\n",
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        files.insert(invocation_path.as_str().to_owned(), invocation_json);
+    }
     if files
         .insert(workflow.suggested_path, workflow.yaml)
         .is_some()
@@ -2083,8 +2102,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::json!({
                             "repository": "https://github.com/example-org/agentic-ops.git",
-                            "packagePath": ".steward/tasks/browser-task/task-definition.json",
-                            "invocationPath": ".steward/invocations/browser-task.json",
+                            "packagePath": ".steward/tasks/browser-task/task-definition.json"
                         })
                         .to_string(),
                     ))
@@ -2098,23 +2116,72 @@ mod tests {
             .map_err(|error| format!("read bundle response: {error}"))?;
         let value: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("parse bundle response: {error}"))?;
-        let invocation = value["files"][".steward/invocations/browser-task.json"]
-            .as_str()
-            .ok_or_else(|| "bundle omitted invocation manifest".to_owned())?;
-        assert!(invocation.contains("\"commit\": \"git:trigger\""));
-        assert!(
-            invocation
-                .contains("\"repository\": \"https://github.com/example-org/agentic-ops.git\"")
+        assert_eq!(
+            value["files"].as_object().map(serde_json::Map::len),
+            Some(1)
         );
-        assert!(!invocation.contains("envelope"));
         let workflow = value["files"][".github/workflows/steward-browser-task.yml"]
             .as_str()
             .ok_or_else(|| "bundle omitted caller workflow".to_owned())?;
-        assert!(workflow.contains("invocation-path: .steward/invocations/browser-task.json"));
+        assert!(
+            workflow.contains("package-path: .steward/tasks/browser-task/task-definition.json")
+        );
+        assert!(workflow.contains("execution-log: full"));
+        assert!(!workflow.contains("invocation-path:"));
         assert!(workflow.contains(
             "uses: example-org/steward-run/.github/workflows/steward-task-self-hosted.yml@3333333333333333333333333333333333333333"
         ));
         assert!(!workflow.contains("identity-exchange-url:"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provisioned_envelope_retains_the_explicit_legacy_invocation_bundle()
+    -> Result<(), String> {
+        let app = inner_router(TestBroker {
+            task_identity_discovery_enabled: true,
+            ..TestBroker::default()
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests/00000000-0000-0000-0000-000000000001/repository-bundle")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "repository": "https://github.com/example-org/agentic-ops.git",
+                            "packagePath": ".steward/tasks/browser-task/task-definition.json",
+                            "invocationPath": ".steward/invocations/browser-task.json"
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build bundle request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("render bundle: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .map_err(|error| format!("read bundle response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse bundle response: {error}"))?;
+        assert_eq!(
+            value["files"].as_object().map(serde_json::Map::len),
+            Some(2)
+        );
+        assert!(value["files"][".steward/invocations/browser-task.json"].is_string());
+        let workflow = value["files"][".github/workflows/steward-browser-task.yml"]
+            .as_str()
+            .ok_or_else(|| "bundle omitted caller workflow".to_owned())?;
+        assert!(workflow.contains("invocation-path: .steward/invocations/browser-task.json"));
+        assert!(!workflow.contains("package-path:"));
+        assert!(!workflow.contains("execution-log:"));
+        assert!(!workflow.contains(
+            "invocation-path: .steward/invocations/browser-task.json\n\n      envelope-digest:"
+        ));
         Ok(())
     }
 

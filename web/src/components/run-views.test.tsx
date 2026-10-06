@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BrowserRunView } from "@/api-client";
 
-import { exactRepositoryBundle, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards } from "./run-views";
+import { exactRepositoryBundle, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -44,7 +44,7 @@ describe("run table", () => {
         updatedAt: "2026-08-25T21:00:00Z",
         phase: "succeeded",
         origin: "browser",
-        package: { source: "inline", revision: `steward:sha256:${"a".repeat(64)}`, path: "task-definition.json" },
+        package: { source: "inline", revision: `steward:sha256:${"a".repeat(64)}`, path: "task-definition.json", promptSource: "inline" },
         userEnvelopeRevision: 7,
       }),
     ]} />);
@@ -70,13 +70,23 @@ describe("run table", () => {
 
 test("repository bundle preserves the exact successful package over wrapper files", () => {
   expect(exactRepositoryBundle(
-    { "task-definition.json": "exact task", "prompt.md": "exact prompt" },
-    { "task-definition.json": "stale task", ".steward/invocations/browser-task.json": "invocation" },
+    { "task-definition.json": "exact task" },
+    { "task-definition.json": "stale task", ".github/workflows/steward-browser-task.yml": "caller" },
   )).toEqual({
     "task-definition.json": "exact task",
-    "prompt.md": "exact prompt",
-    ".steward/invocations/browser-task.json": "invocation",
+    ".github/workflows/steward-browser-task.yml": "caller",
   });
+});
+
+test("package viewer resolves inline and file prompts to the same text", () => {
+  const text = "Write hello to out/hello.txt.";
+  expect(packagePrompt({
+    "task-definition.json": JSON.stringify({ promptText: text }),
+  })).toEqual({ label: "Inline prompt", text });
+  expect(packagePrompt({
+    "task-definition.json": JSON.stringify({ prompt: "prompt.md" }),
+    "prompt.md": text,
+  })).toEqual({ label: "prompt.md", text });
 });
 
 describe("GitHub reruns", () => {

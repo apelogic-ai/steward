@@ -918,6 +918,7 @@ pub enum ApiError {
     MissingRuntimeUid,
     PrincipalMismatch,
     MissingEnvelope,
+    InvalidRequest(String),
     InvalidBudgetIncrease { value: String },
     Admission(String),
     DecisionChannel(String),
@@ -2572,6 +2573,7 @@ impl IntoResponse for ApiError {
             Self::TaskOutputNotReady => StatusCode::CONFLICT,
             Self::Store(StoreError::BrowserTaskConcurrencyLimit) => StatusCode::TOO_MANY_REQUESTS,
             Self::MissingEnvelope | Self::MissingRuntimeUid => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             Self::InvalidBudgetIncrease { .. } | Self::Admission(_) => {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
@@ -3540,8 +3542,8 @@ mod tests {
         WorkflowRevisionRecord,
     };
     use steward_types::direct_package::{
-        ClosureEntryKind, ExactGitCommit, RepositoryUrl, SourceProvenance, SourceProvider,
-        StableProviderId, TaskOrigin,
+        ClosureEntryKind, ExactGitCommit, InvocationKind, PromptSourceKind, RepositoryUrl,
+        SourceProvenance, SourceProvider, StableProviderId, TaskOrigin,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
@@ -10908,15 +10910,11 @@ mod tests {
                     "name": "hello-world",
                     "version": 1,
                     "runtime": { "agentRef": TEST_VERSIONED_AGENT },
-                    "prompt": "prompt.md",
+                    "promptText": "Write hello to out/hello.txt.",
                     "skills": ["skills/review/skill.json"],
                     "outputs": [{ "path": "out", "kind": "directory", "required": true }]
                 })
                 .to_string(),
-            ),
-            (
-                "prompt.md".to_owned(),
-                "Write hello to out/hello.txt.".to_owned(),
             ),
             (
                 "skills/review/skill.json".to_owned(),
@@ -11305,6 +11303,7 @@ mod tests {
             .cloned()
             .ok_or_else(|| "inline Task omitted closure evidence".to_owned())?;
         let inline_digest = inline_evidence.closure_digest.clone();
+        assert_eq!(inline_evidence.prompt_source, PromptSourceKind::Inline);
         let inline_closure = inline_evidence
             .closure
             .as_ref()
@@ -11322,6 +11321,13 @@ mod tests {
                 .iter()
                 .any(|entry| entry.kind == ClosureEntryKind::Instructions),
             "the digest-equivalence proof must include instruction content"
+        );
+        assert!(
+            inline_closure
+                .entries
+                .iter()
+                .all(|entry| entry.kind != ClosureEntryKind::Prompt),
+            "an inline prompt is already covered by the TaskDefinition digest"
         );
 
         let repo_ledger = versioned_task_ledger_with_runtime_minutes()?;
@@ -11369,6 +11375,7 @@ mod tests {
                 .and_then(|task| task.browser_task_evidence.as_ref())
                 .ok_or_else(|| "repository Task omitted closure evidence".to_owned())?;
             assert_eq!(repo_evidence.closure_digest, inline_digest);
+            assert_eq!(repo_evidence.prompt_source, PromptSourceKind::Inline);
             assert_eq!(
                 repo_evidence.revision,
                 format!("git:sha1:{}", "c".repeat(40))
@@ -11409,6 +11416,150 @@ mod tests {
             .map(|evidence| evidence.closure_digest.as_str())
             .ok_or_else(|| "GitHub Actions Task omitted closure evidence".to_owned())?;
         assert_eq!(github_actions_digest, inline_digest.as_str());
+        assert_eq!(
+            github_actions_tasks
+                .first()
+                .and_then(|task| task.direct_task_evidence.as_ref())
+                .map(|evidence| evidence.prompt_source),
+            Some(PromptSourceKind::Inline)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_repository_package_path_builds_an_implicit_invocation_without_reading_one()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        let git = same_repository_direct_git_fixture()?;
+        let reads = git.reads.clone();
+        let response = direct_test_app(ledger.clone(), git)?
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "github-actions-implicit-package")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "packagePath": "task-definition.json",
+                            "diagnostics": { "executionLog": "full" }
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build implicit package request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit implicit package request: {error}"))?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read implicit package response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode implicit package response: {error}"))?;
+
+        assert_eq!(status, StatusCode::ACCEPTED, "unexpected response: {body}");
+        assert_eq!(
+            body.pointer("/evidence/invocationKind"),
+            Some(&serde_json::json!("implicit"))
+        );
+        assert_eq!(
+            body.pointer("/evidence/promptSource"),
+            Some(&serde_json::json!("inline"))
+        );
+        assert_eq!(
+            body.pointer("/evidence/invocation/commit"),
+            Some(&serde_json::json!(format!("git:sha1:{}", "c".repeat(40))))
+        );
+        assert_eq!(
+            body.pointer("/diagnostics/executionLog"),
+            Some(&serde_json::json!("full"))
+        );
+        let evidence = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake Task ledger lock was poisoned")?
+            .first()
+            .and_then(|task| task.direct_task_evidence.as_ref())
+            .cloned()
+            .ok_or_else(|| "implicit package Task omitted binding evidence".to_owned())?;
+        assert_eq!(evidence.invocation_kind, InvocationKind::Implicit);
+        assert_eq!(evidence.invocation.path, evidence.package.path);
+        assert_eq!(evidence.invocation.commit, evidence.package.commit);
+        assert!(
+            reads
+                .lock()
+                .map_err(|_| "fake Git read ledger was poisoned")?
+                .iter()
+                .all(|(_, _, path)| !path.contains("invocations")),
+            "an implicit same-repository invocation must not read an invocation manifest"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_or_missing_package_path_requests_fail_before_reservation() -> Result<(), String>
+    {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        let app = direct_test_app(ledger.clone(), same_repository_direct_git_fixture()?)?;
+        let request = |idempotency_key: &str, body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", idempotency_key)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .map_err(|error| format!("build package-path rejection request: {error}"))
+        };
+
+        let both = app
+            .clone()
+            .oneshot(request(
+                "package-path-both",
+                serde_json::json!({
+                    "contractVersion": "steward.task/v2",
+                    "invocationPath": ".steward/invocations/browser-task.json",
+                    "packagePath": "task-definition.json"
+                }),
+            )?)
+            .await
+            .map_err(|error| format!("submit both-path request: {error}"))?;
+        assert_eq!(both.status(), StatusCode::BAD_REQUEST);
+
+        let traversal = app
+            .clone()
+            .oneshot(request(
+                "package-path-traversal",
+                serde_json::json!({
+                    "contractVersion": "steward.task/v2",
+                    "packagePath": "../task-definition.json"
+                }),
+            )?)
+            .await
+            .map_err(|error| format!("submit traversal request: {error}"))?;
+        assert_eq!(traversal.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let missing = app
+            .oneshot(request(
+                "package-path-missing",
+                serde_json::json!({
+                    "contractVersion": "steward.task/v2",
+                    "packagePath": "missing-task-definition.json"
+                }),
+            )?)
+            .await
+            .map_err(|error| format!("submit missing-file request: {error}"))?;
+        assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?
+                .is_empty(),
+            "invalid package paths must fail before Task reservation"
+        );
         Ok(())
     }
 
@@ -11536,8 +11687,15 @@ mod tests {
         }
 
         let mut changed = inline_browser_task_body();
-        changed["package"]["files"]["prompt.md"] =
-            serde_json::Value::String("Write something else.".to_owned());
+        let definition = changed
+            .pointer_mut("/package/files/task-definition.json")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "inline fixture omitted its definition".to_owned())?;
+        let mut definition: serde_json::Value = serde_json::from_str(definition)
+            .map_err(|error| format!("parse inline fixture definition: {error}"))?;
+        definition["promptText"] = serde_json::Value::String("Write something else.".to_owned());
+        changed["package"]["files"]["task-definition.json"] =
+            serde_json::Value::String(definition.to_string());
         let conflict = app
             .oneshot(request(&changed)?)
             .await

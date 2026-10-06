@@ -1,0 +1,5 @@
+{
+  "contractVersion": "steward.task/v2",
+  "invocationPath": ".steward/invocations/task.json",
+  "packagePath": ".steward/tasks/task/task-definition.json"
+}

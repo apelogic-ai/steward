@@ -1,0 +1,7 @@
+{
+  "contractVersion": "steward.task/v2",
+  "packagePath": ".steward/tasks/release-summary/task-definition.json",
+  "diagnostics": {
+    "executionLog": "full"
+  }
+}

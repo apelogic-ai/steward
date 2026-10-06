@@ -552,6 +552,91 @@ fn positive_wire_fixtures_parse_and_validate() -> Result<(), String> {
 }
 
 #[test]
+fn two_file_task_contract_accepts_package_path_and_inline_prompt() -> Result<(), String> {
+    let submission: DirectTaskSubmission = serde_json::from_value(serde_json::json!({
+        "contractVersion": "steward.task/v2",
+        "packagePath": ".steward/tasks/release-summary/task-definition.json",
+        "diagnostics": { "executionLog": "full" }
+    }))
+    .map_err(|error| format!("package-path submission must parse: {error}"))?;
+    submission.validate()?;
+
+    let definition: DirectTaskDefinition = serde_json::from_value(serde_json::json!({
+        "schemaVersion": "steward.task-definition/v2",
+        "name": "release-summary",
+        "version": 1,
+        "runtime": { "agentRef": "example-agent@1.2.3" },
+        "promptText": "Write the requested summary to out/summary.md.\n",
+        "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+    }))
+    .map_err(|error| format!("inline-prompt TaskDefinition must parse: {error}"))?;
+    definition.validate()?;
+    Ok(())
+}
+
+#[test]
+fn package_path_and_inline_prompt_ambiguity_fail_closed() -> Result<(), String> {
+    for value in [
+        serde_json::json!({ "contractVersion": "steward.task/v2" }),
+        serde_json::json!({
+            "contractVersion": "steward.task/v2",
+            "invocationPath": ".steward/invocations/task.json",
+            "packagePath": ".steward/tasks/task/task-definition.json"
+        }),
+    ] {
+        let submission: DirectTaskSubmission = serde_json::from_value(value)
+            .map_err(|error| format!("ambiguous submission must parse for validation: {error}"))?;
+        assert!(submission.validate().is_err());
+    }
+
+    for value in [
+        serde_json::json!({
+            "schemaVersion": "steward.task-definition/v2",
+            "name": "task",
+            "version": 1,
+            "runtime": { "agentRef": "example-agent@1.2.3" },
+            "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+        }),
+        serde_json::json!({
+            "schemaVersion": "steward.task-definition/v2",
+            "name": "task",
+            "version": 1,
+            "runtime": { "agentRef": "example-agent@1.2.3" },
+            "prompt": "prompt.md",
+            "promptText": "inline",
+            "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+        }),
+        serde_json::json!({
+            "schemaVersion": "steward.task-definition/v2",
+            "name": "task",
+            "version": 1,
+            "runtime": { "agentRef": "example-agent@1.2.3" },
+            "promptText": "   \n",
+            "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+        }),
+    ] {
+        let definition: DirectTaskDefinition = serde_json::from_value(value).map_err(|error| {
+            format!("invalid TaskDefinition must parse for validation: {error}")
+        })?;
+        assert!(definition.validate().is_err());
+    }
+
+    let mut oversized = "x".repeat(32 * 1024);
+    oversized.push('x');
+    let definition: DirectTaskDefinition = serde_json::from_value(serde_json::json!({
+        "schemaVersion": "steward.task-definition/v2",
+        "name": "task",
+        "version": 1,
+        "runtime": { "agentRef": "example-agent@1.2.3" },
+        "promptText": oversized,
+        "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+    }))
+    .map_err(|error| format!("oversized TaskDefinition must parse for validation: {error}"))?;
+    assert!(definition.validate().is_err());
+    Ok(())
+}
+
+#[test]
 fn direct_status_exposes_matching_source_authority_evidence() -> Result<(), String> {
     let status: DirectTaskStatusResponse = parse("fixtures/positive/direct-task-status.json")?;
     status.validate()?;

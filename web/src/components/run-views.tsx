@@ -16,6 +16,7 @@ import {
   rerunMyRun,
   type AllRunsResponse,
   type BrowserRunResponse,
+  type BrowserRunPackageContentResponse,
   type BrowserRunTimelineResponse,
   type BrowserRunOutputsResponse,
   type BrowserRunView,
@@ -200,6 +201,35 @@ function RunOutputs({ taskUid }: Readonly<{ taskUid: string }>) {
   return <ResourceBoundary state={state}>{({ files }) => files.length ? <div className="mt-5 rounded-card border p-4"><h3 className="text-sm font-semibold">Outputs</h3><ul className="mt-3 space-y-2">{files.map((file) => <li className="flex items-center justify-between gap-4 text-sm" key={file.path}><a className="font-mono font-semibold text-brand" href={file.downloadUrl}>{file.path}</a><span className="text-muted-ink">{file.sizeBytes} bytes</span></li>)}</ul></div> : <p className="mt-5 text-sm text-muted-ink">This run produced no output files.</p>}</ResourceBoundary>;
 }
 
+export function packagePrompt(files: Record<string, string>): { label: string; text: string } | null {
+  const definitionSource = files["task-definition.json"];
+  if (!definitionSource) return null;
+  try {
+    const definition = JSON.parse(definitionSource) as Record<string, unknown>;
+    if (typeof definition.promptText === "string") {
+      return { label: "Inline prompt", text: definition.promptText };
+    }
+    if (typeof definition.prompt === "string" && typeof files[definition.prompt] === "string") {
+      return { label: definition.prompt, text: files[definition.prompt] };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function InlinePackageViewer({ taskUid }: Readonly<{ taskUid: string }>) {
+  const load = useCallback(() => myRunPackage({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } }), [taskUid]);
+  const state = useApiResource<BrowserRunPackageContentResponse>(load);
+  return <ResourceBoundary state={state}>{({ files }) => {
+    const prompt = packagePrompt(files);
+    return <section className="mt-5 rounded-card border p-4" aria-labelledby="package-prompt-title">
+      <h3 className="text-sm font-semibold" id="package-prompt-title">Task prompt</h3>
+      {prompt ? <><p className="mt-2 font-mono text-xs text-muted-ink">{prompt.label}</p><pre className="mt-3 whitespace-pre-wrap rounded-control border bg-subtle p-4 text-sm">{prompt.text}</pre></> : <p className="mt-2 text-sm text-muted-ink">The exact package did not contain a readable prompt.</p>}
+    </section>;
+  }}</ResourceBoundary>;
+}
+
 export function exactRepositoryBundle(
   exactPackage: Record<string, string>,
   wrapperFiles: Record<string, string>,
@@ -233,7 +263,6 @@ function SaveInlineRunToRepository({ run }: Readonly<{ run: BrowserRunView }>) {
           body: {
             repository: repository.trim(),
             packagePath: run.package.path,
-            invocationPath: ".steward/invocations/browser-task.json",
           },
           credentials: "same-origin",
           headers: { "X-Steward-CSRF": session.value.csrf },
@@ -260,7 +289,7 @@ function SaveInlineRunToRepository({ run }: Readonly<{ run: BrowserRunView }>) {
   return (
     <section className="mt-5 rounded-card border p-4" aria-labelledby="save-task-title">
       <h3 className="text-sm font-semibold" id="save-task-title">Save this task to a repository</h3>
-      <p className="mt-2 text-sm text-muted-ink">Copy the exact package that succeeded, plus its GitHub Actions invocation and caller workflow. Steward never rebuilds the package from the form.</p>
+      <p className="mt-2 text-sm text-muted-ink">Copy the exact package that succeeded plus its GitHub Actions caller workflow. Steward never rebuilds the package from the form.</p>
       <label className="mt-4 grid gap-2 text-sm font-semibold">Target repository<input className="min-h-11 w-full rounded-control border bg-panel px-3 font-mono font-normal" onChange={(event) => setRepository(event.target.value)} value={repository} /></label>
       <button className="mt-4 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={state === "working" || !repository.trim()} onClick={() => void copyBundle()} type="button">{state === "working" ? "Rendering…" : state === "copied" ? "Bundle copied" : "Copy repository bundle"}</button>
       {failure ? <p className="mt-3 text-sm text-err" role="alert">{failure}</p> : null}
@@ -431,7 +460,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 <div className="flex flex-wrap items-center gap-3"><h1 className="text-[28px] font-semibold tracking-tight" id="page-title">{pinnedWorkflow}</h1><StatusBadge value={run.phase} /></div>
                 <p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p>
                 {run.trigger ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.trigger.actor}</strong> via {run.trigger.event} · <a href={run.trigger.runUrl} rel="noreferrer" target="_blank">{run.trigger.repository}@{run.trigger.ref} ({run.trigger.sha.slice(0, 7)})</a> · {durationLabel(run.createdAt, run.updatedAt)}</div> : <div className="mt-2 text-sm text-muted-ink">Started {dateTime(run.createdAt)} · {durationLabel(run.createdAt, run.updatedAt)}</div>}
-                <div className="mt-1 text-sm text-muted-ink">Origin: {run.origin}{run.package ? ` · Package: ${run.package.source} @ ${run.package.revision} · ${run.package.path}` : ""}</div>
+                <div className="mt-1 text-sm text-muted-ink">Origin: {run.origin}{run.package ? ` · Package: ${run.package.source} @ ${run.package.revision} · ${run.package.path} · Prompt: ${run.package.promptSource}` : ""}</div>
               </div>
               {!admin ? <div className="flex flex-wrap gap-2"><button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={rerunState === "working" || !run.rerunSupported} title={run.rerunSupported ? undefined : run.rerunUnavailableReason ?? "This run cannot be re-run."} onClick={async () => {
                 if (session.status !== "authenticated") return;
@@ -465,6 +494,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                   {selectedStage?.id === "agent_execution" && run.executionLog === "off" ? <div className="mt-5 rounded-card border p-4"><p className="text-sm font-semibold">No execution log was captured for this run.</p><p className="mt-1 text-sm text-muted-ink">Enable <strong>Capture execution log</strong> when starting a run to retain stdout and stderr. Captured output may contain sensitive data.</p></div> : null}
                   {selectedStage?.steps.length ? <ol className="mt-5 divide-y divide-line-soft rounded-card border">{selectedStage.steps.map((step) => <RunStepRow admin={admin} key={step.id} onStreamChange={(stream) => selectLocation(selectedStage.id, stream)} selectedStream={selectedStage.id === "agent_execution" ? selectedStream : null} step={step} taskUid={taskUid} />)}</ol> : selectedStage ? <p className="mt-5 rounded-card border p-4 text-sm text-muted-ink">{stageSummary(selectedStage)}</p> : null}
                   {!admin && run.phase === "succeeded" && run.finalized ? <RunOutputs taskUid={taskUid} /> : null}
+                  {!admin && run.phase === "succeeded" && run.finalized && run.origin === "browser" && run.package?.source === "inline" ? <InlinePackageViewer taskUid={taskUid} /> : null}
                   {!admin && run.phase === "succeeded" && run.finalized && run.origin === "browser" && run.package?.source === "inline" ? <SaveInlineRunToRepository run={run} /> : null}
                 </section>
               </main>

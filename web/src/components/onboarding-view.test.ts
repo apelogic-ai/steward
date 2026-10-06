@@ -29,17 +29,17 @@ test("browser hello world progress accepts only an inline browser run under a pr
   expect(browserHelloWorldRun([], envelopes)).toBeUndefined();
   expect(browserHelloWorldRun([run({
     origin: "browser",
-    package: { source: "https://github.com/example-org/example-repo.git", revision: "git:sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", path: "task-definition.json" },
+    package: { source: "https://github.com/example-org/example-repo.git", revision: "git:sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", path: "task-definition.json", promptSource: "path" },
     userEnvelopeInstanceId: "sample-envelope",
   })], envelopes)).toBeUndefined();
   expect(browserHelloWorldRun([run({
     origin: "browser",
-    package: { source: "inline", revision: "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", path: "task-definition.json" },
+    package: { source: "inline", revision: "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", path: "task-definition.json", promptSource: "inline" },
     userEnvelopeInstanceId: "other-envelope",
   })], envelopes)).toBeUndefined();
   expect(browserHelloWorldRun([run({
     origin: "browser",
-    package: { source: "inline", revision: "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", path: "task-definition.json" },
+    package: { source: "inline", revision: "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", path: "task-definition.json", promptSource: "inline" },
     userEnvelopeInstanceId: "sample-envelope",
   })], envelopes)?.package?.source).toBe("inline");
 });
@@ -47,12 +47,12 @@ test("browser hello world progress accepts only an inline browser run under a pr
 test("optional automation completes only for the exact successful browser package", () => {
   const envelopeIds = new Set(["sample-envelope"]);
   const browser = run({
-    package: { source: "inline", revision: `steward:sha256:${"a".repeat(64)}`, path: "task-definition.json", contentDigest: `steward:sha256:${"a".repeat(64)}` },
+    package: { source: "inline", revision: `steward:sha256:${"a".repeat(64)}`, path: "task-definition.json", contentDigest: `steward:sha256:${"a".repeat(64)}`, promptSource: "inline" },
     userEnvelopeInstanceId: "sample-envelope",
   });
   const unrelated = run({
     origin: "github-actions",
-    package: { source: "https://github.com/example-org/agentic-ops.git", revision: `git:sha1:${"b".repeat(40)}`, path: "task-definition.json", contentDigest: `steward:sha256:${"b".repeat(64)}` },
+    package: { source: "https://github.com/example-org/agentic-ops.git", revision: `git:sha1:${"b".repeat(40)}`, path: "task-definition.json", contentDigest: `steward:sha256:${"b".repeat(64)}`, promptSource: "path" },
     trigger: { provider: "github", repository: "example-org/agentic-ops", event: "workflow_dispatch", actor: "alice", ref: "refs/heads/main", sha: "b".repeat(40), runId: "1", runAttempt: 1, runUrl: "https://github.com/example-org/agentic-ops/actions/runs/1", callerWorkflow: ".github/workflows/steward.yml" },
     userEnvelopeInstanceId: "sample-envelope",
   });
