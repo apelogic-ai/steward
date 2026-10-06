@@ -20,6 +20,7 @@ import { useSession, type SessionState } from "@/session/session-context";
 const userNavigation = [
   { href: "/get-started", label: "Get started" },
   { href: "/envelopes", label: "Envelopes" },
+  { href: "/tasks", label: "Tasks" },
   { href: "/runs", label: "Runs" },
   { href: "/connections", label: "Connections" },
   { href: "/settings", label: "Settings" },
@@ -39,7 +40,6 @@ const onboardingStepTitles = ["Connect GitHub", "Get your first envelope", "Run 
 
 export function isActive(pathname: string, href: string): boolean {
   if (href === "/admin/envelopes/templates" && pathname === "/admin/envelopes/provision") return true;
-  if (href === "/runs" && pathname.startsWith("/tasks/")) return true;
   return pathname === href || pathname.startsWith(`${href}/`);
 }
 
@@ -94,7 +94,14 @@ export function breadcrumbsForPath(pathname: string): BreadcrumbItem[] {
       : [root, { label: "Runs" }];
   }
   if (!admin && rest[0] === "tasks") {
-    return [root, { href: "/runs", label: "Runs" }, { label: shortId(rest[1] ?? "task"), mono: true }];
+    if (!rest[1]) return [root, { label: "Tasks" }];
+    if (rest[1] === "new") return [root, { href: "/tasks", label: "Tasks" }, { label: "New Task" }];
+    const items: BreadcrumbItem[] = [root, { href: "/tasks", label: "Tasks" }, { label: shortId(rest[1]), mono: true }];
+    if (rest[2] === "edit") {
+      items[items.length - 1] = { href: `/tasks/${rest[1]}`, label: shortId(rest[1]), mono: true };
+      items.push({ label: "Edit" });
+    }
+    return items;
   }
   if (admin && rest[0] === "approvals") {
     return rest[1]

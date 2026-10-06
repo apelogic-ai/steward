@@ -80,13 +80,13 @@ use steward_store::{
     AdminApprovalRecord, AdminEnvelopeProvisionRequest, AdminEnvelopeRequestRecord,
     AgentRunExecutionLog, AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent,
     AgentRunTimelineKind, AgentRunTimelineProvenance, ApprovalCandidate, ApproveAdmission,
-    ApprovedAdmission, CumulativeEscalationRecord, DecisionFiling, DecisionFilingClaim,
-    EnvelopeInstanceGrantRecord, EnvelopeRequestDecisionReference, EnvelopeRequestRecord,
-    EnvelopeRequestStatusEventRecord, EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication,
-    EnvelopeTemplateRevisionRecord, GrantApplication, GrantReversion, ParkRejection,
-    ParkedAdmission, PendingApproval, PendingEnvelopeRequest, PgStore, StoreError,
-    TaskAdmissionLookup, TaskAdmissionRecord, TaskRecord, TaskReservation, TaskReservationRequest,
-    WorkflowRevisionRecord,
+    ApprovedAdmission, BrowserTaskVersionPublication, BrowserTaskVersionRecord,
+    CumulativeEscalationRecord, DecisionFiling, DecisionFilingClaim, EnvelopeInstanceGrantRecord,
+    EnvelopeRequestDecisionReference, EnvelopeRequestRecord, EnvelopeRequestStatusEventRecord,
+    EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, EnvelopeTemplateRevisionRecord,
+    GrantApplication, GrantReversion, ParkRejection, ParkedAdmission, PendingApproval,
+    PendingEnvelopeRequest, PgStore, StoreError, TaskAdmissionLookup, TaskAdmissionRecord,
+    TaskRecord, TaskReservation, TaskReservationRequest, WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
     BrowserPackageLocator, BrowserTaskEvidence, BrowserTaskSubmission, TaskOrigin,
@@ -369,6 +369,8 @@ pub struct GrantRevocationRequest {
         workflows::publish_initial_workflow,
         workflows::publish_next_workflow,
         tasks::submit_browser_run,
+        agent_runs_ui::my_tasks,
+        agent_runs_ui::save_my_task,
         agent_runs_ui::my_runs,
         agent_runs_ui::my_task,
         agent_runs_ui::my_run,
@@ -461,6 +463,11 @@ pub struct GrantRevocationRequest {
         BrowserResolvedPackage,
         BrowserResolvedEnvelope,
         agent_runs_ui::BrowserRunEventSnapshot,
+        agent_runs_ui::SaveBrowserTaskRequest,
+        agent_runs_ui::SaveBrowserTaskResponse,
+        agent_runs_ui::BrowserTasksResponse,
+        agent_runs_ui::BrowserTaskListItem,
+        agent_runs_ui::BrowserTaskVersionView,
         browser_auth::BrowserRole,
         browser_auth::SessionPrincipalResponse,
         browser_auth::SessionResponse,
@@ -1398,6 +1405,59 @@ pub trait AgentRunLedger: Clone + Send + Sync + 'static {
         Box::pin(async { Ok(None) })
     }
 
+    fn browser_tasks_for_owner<'a>(
+        &'a self,
+        _owner_user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<AgentRunRecord>, StoreError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn browser_task_by_digest<'a>(
+        &'a self,
+        owner_user_id: &'a str,
+        package_digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
+        self.inline_browser_task_by_digest(owner_user_id, package_digest)
+    }
+
+    fn browser_task_versions<'a>(
+        &'a self,
+        _viewer_user_id: &'a str,
+        _viewer_roles: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<BrowserTaskVersionRecord>, StoreError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn browser_task_version_by_digest<'a>(
+        &'a self,
+        _viewer_user_id: &'a str,
+        _viewer_roles: &'a [String],
+        _content_digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BrowserTaskVersionRecord>, StoreError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn browser_task_draft_versions<'a>(
+        &'a self,
+        _owner_user_id: &'a str,
+        _task_id: Uuid,
+    ) -> BoxFuture<'a, Result<Vec<BrowserTaskVersionRecord>, StoreError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn save_browser_task_version<'a>(
+        &'a self,
+        _publication: BrowserTaskVersionPublication<'a>,
+    ) -> BoxFuture<'a, Result<BrowserTaskVersionRecord, StoreError>> {
+        Box::pin(async { Err(StoreError::InvalidTaskTransition) })
+    }
+
+    fn list_latest_workflows(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<WorkflowRevisionRecord>, StoreError>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn workflow_revision_by_digest<'a>(
         &'a self,
         _content_digest: &'a str,
@@ -1502,6 +1562,73 @@ impl AgentRunLedger for PgStore {
         Box::pin(async move {
             PgStore::inline_browser_task_by_digest(self, owner_user_id, package_digest).await
         })
+    }
+
+    fn browser_tasks_for_owner<'a>(
+        &'a self,
+        owner_user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<AgentRunRecord>, StoreError>> {
+        Box::pin(async move { PgStore::browser_tasks_for_owner(self, owner_user_id).await })
+    }
+
+    fn browser_task_by_digest<'a>(
+        &'a self,
+        owner_user_id: &'a str,
+        package_digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<AgentRunRecord>, StoreError>> {
+        Box::pin(async move {
+            PgStore::browser_task_by_digest(self, owner_user_id, package_digest).await
+        })
+    }
+
+    fn browser_task_versions<'a>(
+        &'a self,
+        viewer_user_id: &'a str,
+        viewer_roles: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<BrowserTaskVersionRecord>, StoreError>> {
+        Box::pin(
+            async move { PgStore::browser_task_versions(self, viewer_user_id, viewer_roles).await },
+        )
+    }
+
+    fn browser_task_version_by_digest<'a>(
+        &'a self,
+        viewer_user_id: &'a str,
+        viewer_roles: &'a [String],
+        content_digest: &'a str,
+    ) -> BoxFuture<'a, Result<Option<BrowserTaskVersionRecord>, StoreError>> {
+        Box::pin(async move {
+            PgStore::browser_task_version_by_digest(
+                self,
+                viewer_user_id,
+                viewer_roles,
+                content_digest,
+            )
+            .await
+        })
+    }
+
+    fn browser_task_draft_versions<'a>(
+        &'a self,
+        owner_user_id: &'a str,
+        task_id: Uuid,
+    ) -> BoxFuture<'a, Result<Vec<BrowserTaskVersionRecord>, StoreError>> {
+        Box::pin(
+            async move { PgStore::browser_task_draft_versions(self, owner_user_id, task_id).await },
+        )
+    }
+
+    fn save_browser_task_version<'a>(
+        &'a self,
+        publication: BrowserTaskVersionPublication<'a>,
+    ) -> BoxFuture<'a, Result<BrowserTaskVersionRecord, StoreError>> {
+        Box::pin(async move { PgStore::save_browser_task_version(self, publication).await })
+    }
+
+    fn list_latest_workflows(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<WorkflowRevisionRecord>, StoreError>> {
+        Box::pin(async move { PgStore::list_latest_workflows(self).await })
     }
 
     fn workflow_revision_by_digest<'a>(

@@ -37,7 +37,7 @@ async function loadTask(contentDigest: string): Promise<{ data?: BrowserTaskResp
 }
 
 function downloadTask(task: BrowserTaskView) {
-  const blob = new Blob([JSON.stringify({ contentDigest: task.contentDigest, path: task.path, files: task.files }, null, 2)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify({ contentDigest: task.contentDigest, source: task.source, revision: task.revision, path: task.path, closure: task.closure, files: task.files }, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
@@ -47,9 +47,7 @@ function downloadTask(task: BrowserTaskView) {
 }
 
 export function taskRunHref(task: Pick<BrowserTaskView, "contentDigest" | "name" | "source" | "version">): string {
-  return task.source.startsWith("steward:registry/")
-    ? `/runs/new?workflow=${encodeURIComponent(`${task.name}@${task.version}`)}`
-    : `/runs/new?task=${encodeURIComponent(task.contentDigest)}`;
+  return `/runs/new?task=${encodeURIComponent(task.contentDigest)}`;
 }
 
 function TaskContent({ task }: Readonly<{ task: BrowserTaskView }>) {
@@ -57,7 +55,7 @@ function TaskContent({ task }: Readonly<{ task: BrowserTaskView }>) {
   const runHref = taskRunHref(task);
   return <div className="space-y-6">
     <PageHeader
-      actions={<div className="flex flex-wrap gap-2"><button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold" onClick={() => downloadTask(task)} type="button">Download</button><Link className="inline-flex min-h-10 items-center rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href={runHref}>Run</Link></div>}
+      actions={<div className="flex flex-wrap gap-2">{task.editable ? <Link className="inline-flex min-h-10 items-center rounded-control border px-4 text-sm font-semibold" href={`/tasks/${encodeURIComponent(task.contentDigest)}/edit`}>Edit into v{Math.max(task.version, ...task.versions.map((version) => version.version)) + 1}</Link> : null}<button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold" onClick={() => downloadTask(task)} type="button">Download</button><Link className="inline-flex min-h-10 items-center rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href={runHref}>Run</Link></div>}
       description="Immutable package definition and every run of this exact content digest."
       title={`${task.name}@${task.version}`}
     />
@@ -70,13 +68,16 @@ function TaskContent({ task }: Readonly<{ task: BrowserTaskView }>) {
         ["Coding agent", <code key="agent">{task.runtime.agentRef}</code>],
         ["Model", <code key="model">{model}</code>],
         ["Authority", task.requires ? "Declared by this Task" : "Inherits the Envelope’s authority"],
+        ["Ownership", task.owned ? "Owned by you" : "Shared"],
+        ["Shared roles", task.sharedRoles.length > 0 ? task.sharedRoles.join(", ") : "None"],
       ]} />
       {task.requires ? <details className="mt-5"><summary className="cursor-pointer text-sm font-semibold">Required authority</summary><pre className="mt-3 overflow-auto rounded-control border bg-subtle p-4 text-xs">{JSON.stringify(task.requires, null, 2)}</pre></details> : null}
     </section>
     <section aria-labelledby="task-files-title" className="space-y-3">
       <h2 className="text-lg font-semibold" id="task-files-title">Files</h2>
-      {Object.entries(task.files).map(([path, contents]) => <details className="rounded-card border bg-panel" key={path} open={path === task.path}><summary className="cursor-pointer px-4 py-3 font-mono text-sm font-semibold">{path}</summary><pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap border-t bg-subtle p-4 text-xs">{contents}</pre></details>)}
+      {Object.entries(task.files).length > 0 ? Object.entries(task.files).map(([path, contents]) => <details className="rounded-card border bg-panel" key={path} open={path === task.path}><summary className="cursor-pointer px-4 py-3 font-mono text-sm font-semibold">{path}</summary><pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap border-t bg-subtle p-4 text-xs">{contents}</pre></details>) : <div className="rounded-card border bg-panel p-5 text-sm text-muted-ink">Git package bytes remain in the source repository. Steward recorded the exact commit and verified closure.</div>}
     </section>
+    {task.versions.length > 0 ? <section aria-labelledby="task-versions-title" className="space-y-3"><h2 className="text-lg font-semibold" id="task-versions-title">Versions</h2><div className="flex flex-wrap gap-2">{task.versions.map((version) => <Link className={`rounded-control border px-3 py-2 text-sm font-semibold ${version.contentDigest === task.contentDigest ? "bg-subtle" : "bg-panel"}`} href={`/tasks/${encodeURIComponent(version.contentDigest)}`} key={version.contentDigest}>v{version.version}</Link>)}</div></section> : null}
     <section aria-labelledby="task-runs-title" className="space-y-3">
       <h2 className="text-lg font-semibold" id="task-runs-title">Runs</h2>
       <RunCards runs={task.runs} />

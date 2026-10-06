@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { compatibleAgents, effectiveAgentSelection, inlineFiles, runNowFailureMessage } from "./browser-run-now-view";
+import {
+  compatibleAgents,
+  effectiveAgentSelection,
+  inlineFiles,
+  packageLocatorForTask,
+  runNowFailureMessage,
+} from "./browser-run-now-view";
 
 test("inline Run now packages keep the prompt in the single TaskDefinition file", () => {
   const files = inlineFiles(
@@ -21,6 +27,40 @@ test("inline Run now packages keep the prompt in the single TaskDefinition file"
   expect(Object.keys(files)).toEqual(["task-definition.json"]);
   expect(JSON.parse(files["task-definition.json"] ?? "{}")).toMatchObject({
     promptText: "Write hello to out/hello.txt.",
+  });
+});
+
+test("exact Tasks preserve inline bytes but use only immutable locators for Git and published sources", () => {
+  expect(packageLocatorForTask({
+    files: { "task-definition.json": "{}" },
+    path: "task-definition.json",
+    revision: `steward:sha256:${"a".repeat(64)}`,
+    source: "inline",
+  })).toEqual({
+    files: { "task-definition.json": "{}" },
+    path: "task-definition.json",
+    revision: `steward:sha256:${"a".repeat(64)}`,
+    source: "inline",
+  });
+  expect(packageLocatorForTask({
+    files: {},
+    path: "catalog/review/task-definition.json",
+    revision: `git:sha1:${"b".repeat(40)}`,
+    source: "https://github.com/example-org/agentic-ops.git",
+  })).toEqual({
+    path: "catalog/review/task-definition.json",
+    revision: `git:sha1:${"b".repeat(40)}`,
+    source: "https://github.com/example-org/agentic-ops.git",
+  });
+  expect(packageLocatorForTask({
+    files: { "prompt.md": "Review the repository." },
+    path: "task-definition.json",
+    revision: "steward:version:3",
+    source: "steward:registry/repository-review",
+  })).toEqual({
+    path: "task-definition.json",
+    revision: "steward:version:3",
+    source: "steward:registry/repository-review",
   });
 });
 

@@ -15,7 +15,11 @@ const taskUid = "00000000-0000-0000-0000-000000000002";
 const rerunTaskUid = "00000000-0000-0000-0000-000000000006";
 const approvalId = "00000000-0000-0000-0000-000000000003";
 const browserTaskDefinitionPath = ["task-definition", "json"].join(".");
+const browserTaskId = "00000000-0000-0000-0000-000000000279";
+const workflowVersionSeparator = String.fromCharCode(64);
 const browserTaskDigest = `steward:sha256:${"c".repeat(64)}`;
+const gitTaskDigest = `steward:sha256:${"d".repeat(64)}`;
+const gitTaskRevision = `git:sha1:${"a".repeat(40)}`;
 const browserTaskFiles = {
   [browserTaskDefinitionPath]: JSON.stringify({
     schemaVersion: "steward.task-definition/v2",
@@ -333,7 +337,9 @@ const presentationRoutes = [
   { path: "/runs", heading: "Runs", activeNavigation: "Runs" },
   { path: "/runs/new", heading: "Run now", activeNavigation: "Runs" },
   { path: `/runs/${taskUid}`, heading: "repository-review@1", activeNavigation: "Runs" },
-  { path: `/tasks/${encodeURIComponent(browserTaskDigest)}`, heading: "browser-task@1", activeNavigation: "Runs" },
+  { path: "/tasks", heading: "Tasks", activeNavigation: "Tasks" },
+  { path: "/tasks/new", heading: "New Task", activeNavigation: "Tasks" },
+  { path: `/tasks/${encodeURIComponent(browserTaskDigest)}`, heading: "browser-task@1", activeNavigation: "Tasks" },
   { path: "/connections", heading: "Connections", activeNavigation: "Connections" },
   { path: "/settings", heading: "Settings", activeNavigation: "Settings" },
   { path: "/admin/members", heading: "Members", activeNavigation: "Members" },
@@ -776,6 +782,7 @@ async function guardedPage(browser, {
   includeSampleWorkflow = false,
   inlineRun = false,
   publishedWorkflows = true,
+  taskLibraryMutable = false,
   initialOnboardingDismissed = false,
   initialWorkflowAcknowledged = false,
   onboardingPagination = false,
@@ -959,9 +966,8 @@ async function guardedPage(browser, {
     }
     await json(route, { apiVersion: "steward.envelope-requests/v1", request: envelopeRequest });
   });
-  await context.route(`${origin}/app/api/v1/tasks/**`, (route) => json(route, {
-    apiVersion: "steward.browser-tasks/v1",
-    task: {
+  const inlineTask = {
+      taskId: browserTaskId,
       contentDigest: browserTaskDigest,
       files: browserTaskFiles,
       name: "browser-task",
@@ -971,14 +977,189 @@ async function guardedPage(browser, {
       source: "inline",
       revision: browserTaskDigest,
       path: browserTaskDefinitionPath,
+      closure: null,
+      owned: true,
+      editable: true,
+      sharedRoles: ["developer"],
+      versions: [{ version: 1, contentDigest: browserTaskDigest, createdAt: "2026-08-24T16:50:00Z" }],
       runs: [fixtureRun, { ...fixtureRun, taskUid: "00000000-0000-0000-0000-000000000009", phase: "failed", finalized: true }],
       nextCursor: null,
       publicationTaskUid: taskUid,
-    },
-  }));
+  };
+  const gitTask = {
+    taskId: null,
+    contentDigest: gitTaskDigest,
+    files: {},
+    name: "git-review",
+    version: 1,
+    runtime: { agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } },
+    requires: null,
+    source: "https://github.com/example-org/agentic-ops.git",
+    revision: gitTaskRevision,
+    path: "catalog/git-review/task-definition.json",
+    closure: null,
+    owned: true,
+    editable: false,
+    sharedRoles: [],
+    versions: [],
+    runs: [{ ...fixtureRun, workflow: `direct:git-review${workflowVersionSeparator}1`, package: { source: "https://github.com/example-org/agentic-ops.git", revision: gitTaskRevision, path: "catalog/git-review/task-definition.json", contentDigest: gitTaskDigest, promptSource: "inline" } }],
+    nextCursor: null,
+    publicationTaskUid: taskUid,
+  };
+  const publishedTask = {
+    taskId: null,
+    contentDigest: workflowRevision.contentDigest,
+    files: { "prompt.md": workflowRevision.prompt },
+    name: workflowRevision.name,
+    version: workflowRevision.version,
+    runtime: { agentRef: workflowRevision.agent, model: null },
+    requires: null,
+    source: `steward:registry/${workflowRevision.name}`,
+    revision: `steward:version:${workflowRevision.version}`,
+    path: browserTaskDefinitionPath,
+    closure: null,
+    owned: false,
+    editable: false,
+    sharedRoles: [],
+    versions: [],
+    runs: [fixtureRun],
+    nextCursor: null,
+    publicationTaskUid: null,
+  };
+  const savedTasks = inlineRun ? [inlineTask] : [];
+  const taskListItem = (task) => ({
+    taskId: task.taskId,
+    contentDigest: task.contentDigest,
+    source: task.source,
+    revision: task.revision,
+    path: task.path,
+    name: task.name,
+    version: task.version,
+    owned: task.owned,
+    editable: task.editable,
+    sharedRoles: task.sharedRoles,
+    updatedAt: "2026-08-24T16:50:00Z",
+  });
+  const savedTask = (digest) => {
+    const task = savedTasks.find((candidate) => candidate.contentDigest === digest);
+    if (!task) return null;
+    return {
+      ...task,
+      versions: savedTasks
+        .filter((candidate) => candidate.taskId === task.taskId)
+        .map((candidate) => ({
+          version: candidate.version,
+          contentDigest: candidate.contentDigest,
+          createdAt: `2026-08-24T16:${String(49 + candidate.version).padStart(2, "0")}:00Z`,
+        }))
+        .sort((left, right) => right.version - left.version),
+    };
+  };
+  await context.route(`${origin}/app/api/v1/tasks`, async (route) => {
+    const request = route.request();
+    if (request.method() === "POST") {
+      const body = request.postDataJSON();
+      const definition = JSON.parse(body.files[body.path]);
+      const contentDigest = `steward:sha256:${String(definition.version).repeat(64)}`;
+      const taskId = body.taskId ?? browserTaskId;
+      const task = {
+        taskId,
+        contentDigest,
+        files: body.files,
+        name: definition.name,
+        version: definition.version,
+        runtime: definition.runtime,
+        requires: definition.requires ?? null,
+        source: "inline",
+        revision: contentDigest,
+        path: body.path,
+        closure: null,
+        owned: true,
+        editable: true,
+        sharedRoles: body.sharedRoles ?? [],
+        versions: [],
+        runs: [],
+        nextCursor: null,
+        publicationTaskUid: null,
+      };
+      savedTasks.push(task);
+      mutations.push({ path: new URL(request.url()).pathname, headers: await request.allHeaders(), body });
+      return json(route, {
+        apiVersion: "steward.browser-tasks/v1",
+        task: taskListItem(task),
+      }, body.taskId ? 200 : 201);
+    }
+    return json(route, {
+      apiVersion: "steward.browser-tasks/v1",
+      tasks: emptyCollections ? [] : [
+        ...savedTasks.map(taskListItem),
+      {
+        contentDigest: gitTask.contentDigest,
+        source: gitTask.source,
+        revision: gitTask.revision,
+        path: gitTask.path,
+        name: gitTask.name,
+        version: gitTask.version,
+        owned: gitTask.owned,
+        editable: gitTask.editable,
+        sharedRoles: [],
+        updatedAt: "2026-08-24T16:45:00Z",
+      },
+      ...(publishedWorkflows ? [{
+        contentDigest: publishedTask.contentDigest,
+        source: publishedTask.source,
+        revision: publishedTask.revision,
+        path: publishedTask.path,
+        name: publishedTask.name,
+        version: publishedTask.version,
+        owned: publishedTask.owned,
+        editable: publishedTask.editable,
+        sharedRoles: [],
+        updatedAt: workflowRevision.publishedAt,
+      }] : []),
+      ],
+    });
+  });
+  await context.route(`${origin}/app/api/v1/tasks/**`, (route) => {
+    const digest = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-1) ?? "");
+    const task = savedTask(digest)
+      ?? (digest === browserTaskDigest
+        ? inlineTask
+        : digest === gitTaskDigest
+        ? gitTask
+        : digest === workflowRevision.contentDigest
+          ? publishedTask
+          : null);
+    return task
+      ? json(route, { apiVersion: "steward.browser-tasks/v1", task })
+      : route.fulfill({ status: 404, body: "" });
+  });
   await context.route((url) => url.origin === origin && url.pathname === "/app/api/v1/runs", (route) => {
     if (route.request().method() === "POST") {
-      return route.continue();
+      if (!taskLibraryMutable) return route.continue();
+      return (async () => {
+        const request = route.request();
+        const body = request.postDataJSON();
+        const runNumber = mutations.filter((mutation) => mutation.path === "/app/api/v1/runs").length + 21;
+        const createdTaskUid = `00000000-0000-0000-0000-${String(runNumber).padStart(12, "0")}`;
+        mutations.push({ path: new URL(request.url()).pathname, headers: await request.allHeaders(), body });
+        const task = savedTasks.find((candidate) => candidate.revision === body.package.revision);
+        if (task) {
+          task.runs.push({
+            ...fixtureRun,
+            taskUid: createdTaskUid,
+            workflow: `direct:${task.name}${workflowVersionSeparator}${task.version}`,
+            package: {
+              source: task.source,
+              revision: task.revision,
+              path: task.path,
+              contentDigest: task.contentDigest,
+              promptSource: "inline",
+            },
+          });
+        }
+        return json(route, { apiVersion: "steward.browser-runs/v1", taskUid: createdTaskUid }, 201);
+      })();
     }
     if (onboardingPagination) {
       const cursor = new URL(route.request().url()).searchParams.get("cursor");
@@ -1444,6 +1625,13 @@ function expectMutationProof(mutation) {
   expect(mutation.headers["content-type"]).toContain("application/json");
   expect(mutation.headers.origin).toBe(origin);
   expect(mutation.headers["sec-fetch-site"]).toBe("same-origin");
+}
+
+function expectInterceptedMutationProof(mutation) {
+  expect(mutation, "expected browser mutation was not observed at the same-origin boundary").toBeTruthy();
+  expect(mutation.headers["x-steward-csrf"]).toBe("test-csrf");
+  expect(mutation.headers["content-type"]).toContain("application/json");
+  expect(mutation.headers.origin).toBe(origin);
 }
 
 test.beforeAll(async () => {
@@ -2208,10 +2396,80 @@ test("onboarding does not require a published sample", async ({ browser }) => {
   }
 });
 
+test("the Task library creates immutable versions and runs inline, Git, and published Tasks through one UI", async ({ browser }) => {
+  const developer = await guardedPage(browser, { taskLibraryMutable: true });
+  const v1Digest = `steward:sha256:${"1".repeat(64)}`;
+  const v2Digest = `steward:sha256:${"2".repeat(64)}`;
+  try {
+    await developer.page.goto(`${origin}/tasks`);
+    await expect(developer.page.getByRole("heading", { name: "Tasks", exact: true })).toBeVisible();
+    await expect(developer.page.getByText("git-review@1", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("repository-review@1", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Git", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Published", { exact: true })).toBeVisible();
+
+    await developer.page.getByRole("link", { name: "New Task" }).click();
+    await developer.page.getByLabel("Name").fill("release-notes");
+    await developer.page.getByLabel("Prompt").fill("Write release notes to the output directory.");
+    await developer.page.getByRole("checkbox", { name: "developer" }).check();
+    await expect(developer.page.getByRole("heading", { name: "Review exact Task definition" })).toBeVisible();
+    await developer.page.getByRole("button", { name: "Save version 1" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/tasks/${encodeURIComponent(v1Digest)}`);
+    await expect(developer.page.getByRole("heading", { name: "release-notes@1" })).toBeVisible();
+    await expect(developer.page.getByText("developer", { exact: true })).toBeVisible();
+
+    await developer.page.getByRole("link", { name: "Run", exact: true }).click();
+    await developer.page.getByRole("button", { name: "Run now" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/00000000-0000-0000-0000-000000000021`);
+
+    await developer.page.goto(`${origin}/tasks/${encodeURIComponent(v1Digest)}`);
+    await developer.page.getByRole("link", { name: "Edit into v2" }).click();
+    await developer.page.getByLabel("Prompt").fill("Write revised release notes to the output directory.");
+    await developer.page.getByRole("button", { name: "Save version 2" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/tasks/${encodeURIComponent(v2Digest)}`);
+    await expect(developer.page.getByRole("link", { name: "v1" })).toHaveAttribute("href", `/tasks/${encodeURIComponent(v1Digest)}`);
+    await expect(developer.page.getByRole("link", { name: "v2" })).toHaveAttribute("href", `/tasks/${encodeURIComponent(v2Digest)}`);
+    await developer.page.getByRole("link", { name: "Run", exact: true }).click();
+    await developer.page.getByRole("button", { name: "Run now" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/00000000-0000-0000-0000-000000000022`);
+
+    await developer.page.goto(`${origin}/tasks/${encodeURIComponent(v1Digest)}`);
+    await expect(developer.page.getByRole("table", { name: "Runs" })).toContainText("00000000-0000-0000-0000-000000000021");
+    await developer.page.goto(`${origin}/tasks/${encodeURIComponent(v2Digest)}`);
+    await expect(developer.page.getByRole("table", { name: "Runs" })).toContainText("00000000-0000-0000-0000-000000000022");
+
+    for (const [digest, expectedPackage] of [
+      [gitTaskDigest, { source: "https://github.com/example-org/agentic-ops.git", revision: gitTaskRevision, path: "catalog/git-review/task-definition.json" }],
+      [workflowRevision.contentDigest, { source: "steward:registry/repository-review", revision: "steward:version:1", path: browserTaskDefinitionPath }],
+    ]) {
+      await developer.page.goto(`${origin}/tasks/${encodeURIComponent(digest)}`);
+      await developer.page.getByRole("link", { name: "Run", exact: true }).click();
+      await developer.page.getByRole("button", { name: "Run now" }).click();
+      const submission = developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/runs").at(-1);
+      expect(submission.body.package).toEqual(expectedPackage);
+    }
+
+    const saves = developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/tasks");
+    expect(saves).toHaveLength(2);
+    for (const save of saves) expectInterceptedMutationProof(save);
+    expect(saves[0].body.taskId).toBeNull();
+    expect(saves[1].body.taskId).toBe(browserTaskId);
+    expect(JSON.parse(saves[0].body.files[browserTaskDefinitionPath]).version).toBe(1);
+    expect(JSON.parse(saves[1].body.files[browserTaskDefinitionPath]).version).toBe(2);
+    const inlineRuns = developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/runs").slice(0, 2);
+    expect(inlineRuns.map((submission) => submission.body.package.revision)).toEqual([v1Digest, v2Digest]);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("Run now submits an inline package under the selected envelope", async ({ browser }) => {
   const developer = await guardedPage(browser, { inlineRun: true, publishedWorkflows: false });
   try {
     await developer.page.goto(`${origin}/runs/new`);
+    await expect(developer.page.getByRole("combobox", { name: "Task" })).toHaveValue(browserTaskDigest);
+    await developer.page.getByRole("button", { name: "Continue" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/runs/new?task=${encodeURIComponent(browserTaskDigest)}`);
     await developer.page.getByRole("checkbox", { name: /Capture execution log/ }).check();
     await developer.page.getByRole("button", { name: "Run now" }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
@@ -2225,9 +2483,8 @@ test("Run now submits an inline package under the selected envelope", async ({ b
     expect(Object.keys(submission.body.package.files)).toEqual([browserTaskDefinitionPath]);
     expect(submission.body.diagnostics).toEqual({ executionLog: "full" });
     const taskDefinition = JSON.parse(submission.body.package.files[browserTaskDefinitionPath]);
-    expect(taskDefinition.promptText).toContain("hello world");
+    expect(taskDefinition.promptText).toContain("hello-world");
     expect(taskDefinition.runtime).toEqual({ agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } });
-    expect(taskDefinition.requires.authority.llms).toEqual([{ provider: "openai", model: "gpt-5.4" }]);
     expect(submission.body).not.toHaveProperty("actor");
     expect(submission.body).not.toHaveProperty("owner");
     await expect(developer.page.getByRole("link", { name: "Open Task" })).toHaveAttribute("href", `/tasks/${encodeURIComponent(browserTaskDigest)}`);

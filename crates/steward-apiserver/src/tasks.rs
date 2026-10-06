@@ -2845,7 +2845,7 @@ where
     })
 }
 
-fn resolve_inline_package_closure(
+pub(crate) fn resolve_inline_package_closure(
     entry_point: &RelativePath,
     definition: &DirectTaskDefinition,
     definition_bytes: &[u8],
