@@ -972,8 +972,8 @@ async function guardedPage(browser, {
       ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
       : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...fixtureRun, phase: runPhase } });
   });
-  await context.route(`${origin}/app/api/v1/runs/${taskUid}/package`, (route) => json(route, {
-    taskUid,
+  await context.route(`${origin}/app/api/v1/runs/*/package`, (route) => json(route, {
+    taskUid: new URL(route.request().url()).pathname.split("/").at(-2),
     files: {
       [browserTaskDefinitionPath]: "{\"schemaVersion\":\"steward.task-definition/v2\",\"promptText\":\"Create the hello-world output.\\n\"}\n",
     },
@@ -2086,7 +2086,7 @@ test("onboarding does not require a published sample", async ({ browser }) => {
 });
 
 test("Run now submits an inline package under the selected envelope", async ({ browser }) => {
-  const developer = await guardedPage(browser, { publishedWorkflows: false });
+  const developer = await guardedPage(browser, { inlineRun: true, publishedWorkflows: false });
   try {
     await developer.page.goto(`${origin}/runs/new`);
     await developer.page.getByRole("checkbox", { name: /Capture execution log/ }).check();
