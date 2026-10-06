@@ -1474,7 +1474,7 @@ pub trait AgentRunLedger: Clone + Send + Sync + 'static {
         &'a self,
         _task_uid: Uuid,
         _owner_user_id: &'a str,
-    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
+    ) -> BoxFuture<'a, Result<Option<steward_store::AgentRunOutputArchive>, StoreError>> {
         Box::pin(async { Ok(None) })
     }
 }
@@ -1515,7 +1515,7 @@ impl AgentRunLedger for PgStore {
         &'a self,
         task_uid: Uuid,
         owner_user_id: &'a str,
-    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, StoreError>> {
+    ) -> BoxFuture<'a, Result<Option<steward_store::AgentRunOutputArchive>, StoreError>> {
         Box::pin(
             async move { PgStore::agent_run_output_archive(self, task_uid, owner_user_id).await },
         )

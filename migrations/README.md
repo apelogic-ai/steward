@@ -193,3 +193,9 @@ bound to one semantic payload, and failed or expired operations can be retried
 as new immutable audit rows. Publication rows additionally retain the
 server-selected, unguessable branch capability so a later attempt can resume
 only the branch Steward selected for that owner, Task, and repository.
+
+Migration 0066 marks newly validated Task output archives with the immutable
+`steward.task-output/v1` contract. Existing rows remain unmarked so the browser can
+retain a bounded compatibility path for historical archives that mixed the two
+reserved execution-log transcripts with `out/` files. No finalized Task or archive
+is rewritten; new transcripts remain in `task_execution_attempts` only.

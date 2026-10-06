@@ -40,7 +40,7 @@ use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
     InferenceRequest, PortError, ProviderControlExecutionBindings, ProvisionedInference,
     SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput,
-    SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
+    SandboxTaskRequest, SandboxTaskRuntime, SandboxTaskTranscript, TaskAttemptId,
 };
 use steward_store::{
     AgentRunLogStream, EnvelopeRequestReservationRequest, EnvelopeRequestStatus,
@@ -50,8 +50,12 @@ use steward_store::{
     WorkflowPublication,
 };
 use steward_types::direct_package::{
-    BrowserTaskEvidence, ClosureEntry, ClosureEntryKind, ContentDigest, PackageClosure,
-    PromptSourceKind, RelativePath, TaskOrigin, canonical_json_bytes,
+    BrowserTaskEvidence, ClosureEntry, ClosureEntryKind, ContentDigest, DiagnosticsRequest,
+    ExecutionLogMode, PackageClosure, PromptSourceKind, RelativePath, TaskOrigin,
+    canonical_json_bytes,
+};
+use steward_types::task_output_archive::{
+    TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputArchiveCompatibility, task_output_archive_entries,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
@@ -116,6 +120,35 @@ async fn operator_api_request(
 async fn response_json(response: Response<Body>) -> Result<serde_json::Value, Box<dyn Error>> {
     let body = to_bytes(response.into_body(), 1024 * 1024).await?;
     Ok(serde_json::from_slice(&body)?)
+}
+
+fn task_output_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    for (path, content) in entries {
+        let header_offset = archive.len();
+        archive.resize(header_offset + 512, 0);
+        archive[header_offset..header_offset + path.len()].copy_from_slice(path.as_bytes());
+        archive[header_offset + 100..header_offset + 108].copy_from_slice(b"0000644\0");
+        archive[header_offset + 108..header_offset + 116].copy_from_slice(b"0000000\0");
+        archive[header_offset + 116..header_offset + 124].copy_from_slice(b"0000000\0");
+        let size = format!("{:011o}\0", content.len());
+        archive[header_offset + 124..header_offset + 136].copy_from_slice(size.as_bytes());
+        archive[header_offset + 136..header_offset + 148].copy_from_slice(b"00000000000\0");
+        archive[header_offset + 148..header_offset + 156].fill(b' ');
+        archive[header_offset + 156] = b'0';
+        archive[header_offset + 257..header_offset + 263].copy_from_slice(b"ustar\0");
+        archive[header_offset + 263..header_offset + 265].copy_from_slice(b"00");
+        let checksum = archive[header_offset..header_offset + 512]
+            .iter()
+            .map(|byte| usize::from(*byte))
+            .sum::<usize>();
+        let checksum = format!("{:06o}\0 ", checksum);
+        archive[header_offset + 148..header_offset + 156].copy_from_slice(checksum.as_bytes());
+        archive.extend_from_slice(content);
+        archive.resize(header_offset + 512 + content.len().div_ceil(512) * 512, 0);
+    }
+    archive.resize(archive.len() + 1024, 0);
+    archive
 }
 
 #[derive(Clone)]
@@ -1147,15 +1180,25 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
     async fn start_task(
         &self,
         _attempt_id: &TaskAttemptId,
-        _request: &SandboxTaskRequest,
+        request: &SandboxTaskRequest,
         _input_archive: &[u8],
     ) -> Result<SandboxTaskObservation, PortError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         if self.succeed_next_start.swap(false, Ordering::SeqCst) {
-            return Ok(SandboxTaskObservation::Succeeded {
+            if request.diagnostics.execution_log != ExecutionLogMode::Full {
+                return Err(PortError::Failed {
+                    reason: "successful fixture did not request full execution diagnostics"
+                        .to_owned(),
+                });
+            }
+            return Ok(SandboxTaskObservation::SucceededWithTranscript {
                 adapter_observation_id: "successful-task-execution".to_owned(),
                 output: SandboxTaskOutput {
-                    archive: b"successful task output".to_vec(),
+                    archive: task_output_archive(&[("out/result.txt", b"successful task output")]),
+                },
+                transcript: SandboxTaskTranscript {
+                    stdout: b"successful task stdout".to_vec(),
+                    stderr: b"successful task stderr".to_vec(),
                 },
             });
         }
@@ -2031,7 +2074,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             .into());
         }
     };
-    store
+    let attempt = match store
         .record_task_execution_observation(
             attempt.attempt_id,
             attempt.generation,
@@ -2042,7 +2085,16 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             },
             "test-controller",
         )
-        .await?;
+        .await?
+    {
+        TaskExecutionTransition::Applied(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "live-log execution observation was not applied: {transition:?}"
+            ))
+            .into());
+        }
+    };
     let live_log = store
         .agent_run_execution_log(
             task_uid,
@@ -2199,6 +2251,68 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
     assert_eq!(decided.grant_id, Some(grant.id));
     assert_eq!(decided.limit, "125.00");
     assert_eq!(decided.grant_active, Some(true));
+
+    let historical_archive = task_output_archive(&[
+        ("out/report.md", b"historical output"),
+        (
+            ".steward/diagnostics/stdout.log",
+            b"historical archived stdout",
+        ),
+        (
+            ".steward/diagnostics/stderr.log",
+            b"historical archived stderr",
+        ),
+    ]);
+    let terminal = store
+        .record_task_execution_observation(
+            attempt.attempt_id,
+            attempt.generation,
+            TaskExecutionObservation::Succeeded {
+                adapter_observation_id: "live-attempt",
+                result_digest: &format!("sha256:{}", "c".repeat(64)),
+                result_reference: "historical-mixed-output",
+                output_archive: &historical_archive,
+                output_archive_contract: None,
+                execution_stdout: Some(b"separate historical stdout"),
+                execution_stderr: Some(b"separate historical stderr"),
+            },
+            "test-controller",
+        )
+        .await?;
+    assert!(matches!(terminal, TaskExecutionTransition::Applied(_)));
+    let stored_historical = store
+        .agent_run_output_archive(task_uid, identity.user_id.as_str())
+        .await?
+        .ok_or_else(|| io::Error::other("historical mixed archive was not projected"))?;
+    assert_eq!(stored_historical.contract, None);
+    let historical_entries = task_output_archive_entries(
+        &stored_historical.content,
+        TaskOutputArchiveCompatibility::HistoricalMixedDiagnostics,
+    )
+    .map_err(|_| io::Error::other("historical mixed archive became unreadable"))?;
+    assert_eq!(historical_entries.len(), 1);
+    assert_eq!(historical_entries[0].path, "report.md");
+    let historical_stdout = store
+        .agent_run_execution_log(
+            task_uid,
+            Some(identity.user_id.as_str()),
+            AgentRunLogStream::Stdout,
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("separate historical stdout is absent"))?;
+    assert_eq!(historical_stdout.content, b"separate historical stdout");
+    assert!(historical_stdout.complete);
+    assert!(
+        sqlx::query(
+            "UPDATE task_submissions SET output_archive_contract = $2 WHERE task_uid = $1",
+        )
+        .bind(task_uid)
+        .bind(TASK_OUTPUT_ARCHIVE_CONTRACT)
+        .execute(&pool)
+        .await
+        .is_err(),
+        "a historical archive must not be relabelled after its bytes become immutable"
+    );
     Ok(())
 }
 
@@ -3159,6 +3273,11 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         "active",
         Some(&execution_binding),
     )?;
+    let mut successful_evidence = browser_direct_package_evidence("inline", None)?;
+    successful_evidence.diagnostics = DiagnosticsRequest {
+        execution_log: ExecutionLogMode::Full,
+    };
+    successful_evidence.validate()?;
     *kubernetes
         .next_runtime_uid
         .lock()
@@ -3174,10 +3293,10 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             acting_user_id: Some(identity.user_id.as_str()),
             owner: "alice@example.com",
             owner_user_id: identity.user_id.as_str(),
-            workflow: "fault-injection",
-            workflow_name: Some("fault-injection"),
-            workflow_version: Some(1),
-            workflow_digest: Some(&workflow_digest),
+            workflow: "direct:browser-package@1",
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
             user_envelope_instance_id: Some(&envelope_instance_id),
             user_envelope_revision: Some(envelope.revision),
             user_envelope_digest: Some(&envelope_digest),
@@ -3191,8 +3310,8 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             execution_binding: Some(&execution_binding),
             source_provenance: None,
             direct_task_evidence: None,
-            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
-            browser_task_evidence: None,
+            task_origin: TaskOrigin::Browser,
+            browser_task_evidence: Some(&successful_evidence),
             user_envelope_snapshot: Some(&envelope),
             candidate_digest: &successful_candidate_digest,
             admission_decision: &admission_decision,
@@ -3309,10 +3428,43 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         .ok_or(StoreError::TaskNotFound)?;
     assert!(successful_task.finalized);
     assert_eq!(successful_task.phase, TaskPhase::Succeeded);
+    let successful_archive = store
+        .agent_run_output_archive(successful_task_uid, identity.user_id.as_str())
+        .await?
+        .ok_or_else(|| io::Error::other("successful output archive is absent"))?;
     assert_eq!(
-        successful_task.output_archive.as_deref(),
-        Some(b"successful task output".as_slice())
+        successful_archive.contract.as_deref(),
+        Some(TASK_OUTPUT_ARCHIVE_CONTRACT)
     );
+    let successful_entries = task_output_archive_entries(
+        &successful_archive.content,
+        TaskOutputArchiveCompatibility::Strict,
+    )
+    .map_err(|_| io::Error::other("successful output archive violated its contract"))?;
+    assert_eq!(successful_entries.len(), 1);
+    assert_eq!(successful_entries[0].path, "result.txt");
+    assert_eq!(
+        &successful_archive.content[successful_entries[0].offset
+            ..successful_entries[0].offset + successful_entries[0].size],
+        b"successful task output"
+    );
+    for (stream, expected) in [
+        (
+            AgentRunLogStream::Stdout,
+            b"successful task stdout".as_slice(),
+        ),
+        (
+            AgentRunLogStream::Stderr,
+            b"successful task stderr".as_slice(),
+        ),
+    ] {
+        let log = store
+            .agent_run_execution_log(successful_task_uid, Some(identity.user_id.as_str()), stream)
+            .await?
+            .ok_or_else(|| io::Error::other("successful execution transcript is absent"))?;
+        assert_eq!(log.content, expected);
+        assert!(log.complete);
+    }
     assert!(
         kubernetes
             .runtime
