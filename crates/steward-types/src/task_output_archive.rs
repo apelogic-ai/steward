@@ -92,10 +92,10 @@ pub fn task_output_archive_entries(
                 if attributes.link_path {
                     return Err(InvalidTaskOutputArchive::UnsupportedLink);
                 }
-                if let Some(path) = attributes.path {
-                    if next_path.replace(path).is_some() {
-                        return Err(InvalidTaskOutputArchive::Malformed);
-                    }
+                if let Some(path) = attributes.path
+                    && next_path.replace(path).is_some()
+                {
+                    return Err(InvalidTaskOutputArchive::Malformed);
                 }
             }
             b'g' => {
