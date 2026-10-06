@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -61,6 +61,12 @@ pub(crate) struct BrowserRunsState<L> {
 
 const MAX_BROWSER_RUN_EVENT_STREAMS_PER_USER: usize = 4;
 const MAX_BROWSER_RUN_EVENT_HISTORY: usize = 128;
+const MAX_BROWSER_RUN_EVENT_TASKS: usize = 256;
+
+#[cfg(not(test))]
+const BROWSER_RUN_EVENT_TERMINAL_GRACE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const BROWSER_RUN_EVENT_TERMINAL_GRACE: Duration = Duration::from_millis(50);
 
 #[cfg(not(test))]
 const BROWSER_RUN_EVENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -80,19 +86,67 @@ struct BufferedBrowserRunEvent {
     terminal: bool,
 }
 
+struct BrowserRunEventHistory {
+    events: VecDeque<BufferedBrowserRunEvent>,
+    last_access_id: u64,
+    terminal_delivered_at: Option<Instant>,
+}
+
 struct BrowserRunEventStreamsState {
     active_by_user: BTreeMap<String, usize>,
-    history_by_task: BTreeMap<Uuid, VecDeque<BufferedBrowserRunEvent>>,
+    active_by_task: BTreeMap<Uuid, usize>,
+    history_by_task: BTreeMap<Uuid, BrowserRunEventHistory>,
     next_event_id: u64,
+    next_access_id: u64,
 }
 
 impl Default for BrowserRunEventStreamsState {
     fn default() -> Self {
         Self {
             active_by_user: BTreeMap::new(),
+            active_by_task: BTreeMap::new(),
             history_by_task: BTreeMap::new(),
             next_event_id: 1,
+            next_access_id: 1,
         }
+    }
+}
+
+impl BrowserRunEventStreamsState {
+    fn next_access_id(&mut self) -> Result<u64, ()> {
+        let access_id = self.next_access_id;
+        self.next_access_id = self.next_access_id.checked_add(1).ok_or(())?;
+        Ok(access_id)
+    }
+
+    fn prune_expired_terminal_history(&mut self, now: Instant) {
+        self.history_by_task.retain(|task_uid, history| {
+            self.active_by_task.get(task_uid).copied().unwrap_or(0) > 0
+                || history.terminal_delivered_at.is_none_or(|delivered_at| {
+                    now.saturating_duration_since(delivered_at) < BROWSER_RUN_EVENT_TERMINAL_GRACE
+                })
+        });
+    }
+
+    fn make_room_for_task(&mut self, task_uid: Uuid) -> Result<(), ()> {
+        if self.history_by_task.contains_key(&task_uid) {
+            return Ok(());
+        }
+        while self.history_by_task.len() >= MAX_BROWSER_RUN_EVENT_TASKS {
+            let Some(eviction) = self
+                .history_by_task
+                .iter()
+                .filter(|(candidate, _)| {
+                    self.active_by_task.get(candidate).copied().unwrap_or(0) == 0
+                })
+                .min_by_key(|(_, history)| history.last_access_id)
+                .map(|(candidate, _)| *candidate)
+            else {
+                return Err(());
+            };
+            self.history_by_task.remove(&eviction);
+        }
+        Ok(())
     }
 }
 
@@ -103,35 +157,56 @@ struct BrowserRunEventStreams {
 
 struct BrowserRunEventStreamPermit {
     owner_user_id: String,
+    task_uid: Uuid,
     streams: Arc<BrowserRunEventStreams>,
 }
 
 impl Drop for BrowserRunEventStreamPermit {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.streams.state.lock()
-            && let Some(active) = state.active_by_user.get_mut(&self.owner_user_id)
-        {
-            *active = active.saturating_sub(1);
-            if *active == 0 {
-                state.active_by_user.remove(&self.owner_user_id);
+        if let Ok(mut state) = self.streams.state.lock() {
+            if let Some(active) = state.active_by_user.get_mut(&self.owner_user_id) {
+                *active = active.saturating_sub(1);
+                if *active == 0 {
+                    state.active_by_user.remove(&self.owner_user_id);
+                }
             }
+            if let Some(active) = state.active_by_task.get_mut(&self.task_uid) {
+                *active = active.saturating_sub(1);
+                if *active == 0 {
+                    state.active_by_task.remove(&self.task_uid);
+                }
+            }
+            state.prune_expired_terminal_history(Instant::now());
         }
     }
 }
 
 impl BrowserRunEventStreams {
-    fn acquire(self: &Arc<Self>, owner_user_id: &str) -> Result<BrowserRunEventStreamPermit, ()> {
+    fn acquire(
+        self: &Arc<Self>,
+        owner_user_id: &str,
+        task_uid: Uuid,
+    ) -> Result<BrowserRunEventStreamPermit, ()> {
         let mut state = self.state.lock().map_err(|_| ())?;
-        let active = state
+        state.prune_expired_terminal_history(Instant::now());
+        let active_for_user = state
             .active_by_user
-            .entry(owner_user_id.to_owned())
-            .or_default();
-        if *active >= MAX_BROWSER_RUN_EVENT_STREAMS_PER_USER {
+            .get(owner_user_id)
+            .copied()
+            .unwrap_or(0);
+        if active_for_user >= MAX_BROWSER_RUN_EVENT_STREAMS_PER_USER {
             return Err(());
         }
-        *active += 1;
+        let active_for_task = state.active_by_task.get(&task_uid).copied().unwrap_or(0);
+        let next_active_for_user = active_for_user.checked_add(1).ok_or(())?;
+        let next_active_for_task = active_for_task.checked_add(1).ok_or(())?;
+        state
+            .active_by_user
+            .insert(owner_user_id.to_owned(), next_active_for_user);
+        state.active_by_task.insert(task_uid, next_active_for_task);
         Ok(BrowserRunEventStreamPermit {
             owner_user_id: owner_user_id.to_owned(),
+            task_uid,
             streams: self.clone(),
         })
     }
@@ -140,70 +215,109 @@ impl BrowserRunEventStreams {
         snapshot.event_id = 0;
         let fingerprint = serde_json::to_string(&snapshot).map_err(|_| ())?;
         let mut state = self.state.lock().map_err(|_| ())?;
+        state.prune_expired_terminal_history(Instant::now());
         if state
             .history_by_task
             .get(&task_uid)
-            .and_then(VecDeque::back)
+            .and_then(|history| history.events.back())
             .is_some_and(|event| event.fingerprint == fingerprint)
         {
             return Ok(());
         }
+        state.make_room_for_task(task_uid)?;
         let event_id = state.next_event_id;
         state.next_event_id = state.next_event_id.checked_add(1).ok_or(())?;
+        let access_id = state.next_access_id()?;
         snapshot.event_id = event_id;
         let data = serde_json::to_string(&snapshot).map_err(|_| ())?;
         let terminal = is_terminal_phase(snapshot.run.phase) && snapshot.run.finalized;
-        let history = state.history_by_task.entry(task_uid).or_default();
-        let kind = if history.is_empty() {
+        let history =
+            state
+                .history_by_task
+                .entry(task_uid)
+                .or_insert_with(|| BrowserRunEventHistory {
+                    events: VecDeque::new(),
+                    last_access_id: access_id,
+                    terminal_delivered_at: None,
+                });
+        history.last_access_id = access_id;
+        history.terminal_delivered_at = None;
+        let kind = if history.events.is_empty() {
             "snapshot"
         } else {
             "run"
         };
-        history.push_back(BufferedBrowserRunEvent {
+        history.events.push_back(BufferedBrowserRunEvent {
             id: event_id,
             kind,
             data,
             fingerprint,
             terminal,
         });
-        while history.len() > MAX_BROWSER_RUN_EVENT_HISTORY {
-            history.pop_front();
+        while history.events.len() > MAX_BROWSER_RUN_EVENT_HISTORY {
+            history.events.pop_front();
         }
         Ok(())
     }
 
     fn resume(
-        &self,
+        self: &Arc<Self>,
         task_uid: Uuid,
         last_event_id: u64,
     ) -> Result<Vec<BufferedBrowserRunEvent>, ()> {
-        let state = self.state.lock().map_err(|_| ())?;
-        let Some(history) = state.history_by_task.get(&task_uid) else {
-            return Ok(Vec::new());
+        let now = Instant::now();
+        let (events, schedule_terminal_eviction) = {
+            let mut state = self.state.lock().map_err(|_| ())?;
+            state.prune_expired_terminal_history(now);
+            let access_id = state.next_access_id()?;
+            let Some(history) = state.history_by_task.get_mut(&task_uid) else {
+                return Ok(Vec::new());
+            };
+            history.last_access_id = access_id;
+            let events = if last_event_id == 0 {
+                history
+                    .events
+                    .back()
+                    .cloned()
+                    .into_iter()
+                    .map(|mut event| {
+                        event.kind = "snapshot";
+                        event
+                    })
+                    .collect::<Vec<_>>()
+            } else if let Some(position) = history
+                .events
+                .iter()
+                .position(|event| event.id == last_event_id)
+            {
+                history.events.iter().skip(position + 1).cloned().collect()
+            } else {
+                history
+                    .events
+                    .back()
+                    .cloned()
+                    .into_iter()
+                    .map(|mut event| {
+                        event.kind = "snapshot";
+                        event
+                    })
+                    .collect()
+            };
+            let delivered_terminal = events.iter().any(|event| event.terminal);
+            let schedule = delivered_terminal && history.terminal_delivered_at.is_none();
+            if schedule {
+                history.terminal_delivered_at = Some(now);
+            }
+            (events, schedule)
         };
-        if last_event_id == 0 {
-            return Ok(history
-                .back()
-                .cloned()
-                .into_iter()
-                .map(|mut event| {
-                    event.kind = "snapshot";
-                    event
-                })
-                .collect());
+        if schedule_terminal_eviction && let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let streams = self.clone();
+            runtime.spawn(async move {
+                tokio::time::sleep(BROWSER_RUN_EVENT_TERMINAL_GRACE).await;
+                streams.prune_expired_terminal_history();
+            });
         }
-        if let Some(position) = history.iter().position(|event| event.id == last_event_id) {
-            return Ok(history.iter().skip(position + 1).cloned().collect());
-        }
-        Ok(history
-            .back()
-            .cloned()
-            .into_iter()
-            .map(|mut event| {
-                event.kind = "snapshot";
-                event
-            })
-            .collect())
+        Ok(events)
     }
 
     fn latest_is_terminal(&self, task_uid: Uuid) -> Result<bool, ()> {
@@ -211,8 +325,14 @@ impl BrowserRunEventStreams {
         Ok(state
             .history_by_task
             .get(&task_uid)
-            .and_then(VecDeque::back)
+            .and_then(|history| history.events.back())
             .is_some_and(|event| event.terminal))
+    }
+
+    fn prune_expired_terminal_history(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.prune_expired_terminal_history(Instant::now());
+        }
     }
 }
 
@@ -1416,7 +1536,7 @@ where
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return browser_runs_error(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let permit = match state.event_streams.acquire(&owner_user_id) {
+    let permit = match state.event_streams.acquire(&owner_user_id, task_uid) {
         Ok(permit) => permit,
         Err(()) => {
             return (
@@ -3069,6 +3189,131 @@ mod tests {
         assert_eq!(view.stages[1].state, BrowserRunStageState::Succeeded);
         assert_eq!(view.stages[2].id, BrowserRunStageId::AgentExecution);
         assert_eq!(view.stages[2].state, BrowserRunStageState::Running);
+        Ok(())
+    }
+
+    fn run_event_snapshot(
+        task_uid: Uuid,
+        owner_user_id: &str,
+        phase: TaskPhase,
+        finalized: bool,
+    ) -> BrowserRunEventSnapshot {
+        let mut record = run(task_uid, owner_user_id);
+        record.phase = phase;
+        record.finalized = finalized;
+        BrowserRunEventSnapshot {
+            api_version: BROWSER_AGENT_RUNS_API_VERSION,
+            event_id: 0,
+            run: browser_run_view(record),
+            timeline: BrowserRunTimelineResponse {
+                api_version: BROWSER_AGENT_RUNS_API_VERSION,
+                task_uid,
+                events: Vec::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_run_event_history_expires_after_delivery_and_stream_close()
+    -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let task_uid = Uuid::from_u128(1);
+        let streams = Arc::new(BrowserRunEventStreams::default());
+        let permit = streams
+            .acquire(owner, task_uid)
+            .map_err(|()| "acquire stream")?;
+        streams
+            .observe(
+                task_uid,
+                run_event_snapshot(task_uid, owner, TaskPhase::Succeeded, true),
+            )
+            .map_err(|()| "observe terminal event")?;
+        let delivered = streams
+            .resume(task_uid, 0)
+            .map_err(|()| "deliver terminal event")?;
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].terminal);
+        drop(permit);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !streams
+                .state
+                .lock()
+                .map_err(|_| "lock stream state")?
+                .history_by_task
+                .contains_key(&task_uid),
+            "terminal event history must be evicted after its resume grace"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_run_event_history_resumes_inside_the_grace_period() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let task_uid = Uuid::from_u128(2);
+        let streams = Arc::new(BrowserRunEventStreams::default());
+        let permit = streams
+            .acquire(owner, task_uid)
+            .map_err(|()| "acquire stream")?;
+        streams
+            .observe(
+                task_uid,
+                run_event_snapshot(task_uid, owner, TaskPhase::Running, false),
+            )
+            .map_err(|()| "observe running event")?;
+        let running_event_id = streams
+            .resume(task_uid, 0)
+            .map_err(|()| "deliver running event")?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "running event missing".to_owned())?
+            .id;
+        streams
+            .observe(
+                task_uid,
+                run_event_snapshot(task_uid, owner, TaskPhase::Succeeded, true),
+            )
+            .map_err(|()| "observe terminal event")?;
+        let terminal = streams
+            .resume(task_uid, running_event_id)
+            .map_err(|()| "deliver terminal event")?;
+        assert_eq!(terminal.len(), 1);
+        assert!(terminal[0].terminal);
+        drop(permit);
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let resumed = streams
+            .resume(task_uid, running_event_id)
+            .map_err(|()| "resume inside grace")?;
+        assert_eq!(resumed.len(), 1);
+        assert!(resumed[0].terminal);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_run_event_tasks_never_exceed_the_global_bound() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let streams = BrowserRunEventStreams::default();
+        for index in 1..=257_u128 {
+            let task_uid = Uuid::from_u128(index);
+            streams
+                .observe(
+                    task_uid,
+                    run_event_snapshot(task_uid, owner, TaskPhase::Running, false),
+                )
+                .map_err(|()| "observe run event")?;
+        }
+        assert!(
+            streams
+                .state
+                .lock()
+                .map_err(|_| "lock stream state")?
+                .history_by_task
+                .len()
+                <= 256,
+            "run event history must retain no more than 256 tasks"
+        );
         Ok(())
     }
 
