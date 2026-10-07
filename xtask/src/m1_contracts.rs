@@ -1,7 +1,7 @@
+use crate::process::checked_command;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
@@ -674,7 +674,7 @@ fn verify_ed25519_with_openssl(
             format!("failed to stage deterministic DSSE {description}: {error}")
         })?;
     }
-    let output = Command::new("openssl")
+    let output = checked_command("openssl")?
         .args(["pkeyutl", "-verify", "-pubin", "-inkey"])
         .arg(&public_key_path)
         .args(["-keyform", "DER", "-rawin", "-in"])
@@ -696,7 +696,7 @@ fn sha256_with_openssl(value: &[u8], description: &str) -> Result<[u8; 32], Stri
     let input_path = directory.0.join("input.bin");
     fs::write(&input_path, value)
         .map_err(|error| format!("failed to stage deterministic {description}: {error}"))?;
-    let output = Command::new("openssl")
+    let output = checked_command("openssl")?
         .args(["dgst", "-sha256", "-binary"])
         .arg(&input_path)
         .output()

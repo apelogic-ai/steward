@@ -19,7 +19,10 @@ use xtask::{
     validate_register_content,
 };
 
+mod process;
 mod storage;
+
+use process::{checked_command, require_executed_tool_version, require_tool_version};
 
 type TaskResult = Result<(), String>;
 
@@ -115,12 +118,18 @@ fn root() -> PathBuf {
 }
 
 fn ci() -> TaskResult {
-    quality()?;
+    require_ci_tool_versions()?;
+    quality_after_tool_checks()?;
     run("bash", &["scripts/test-core-install-chart.sh"])?;
     conformance(&["--pinned".to_owned()])
 }
 
 fn quality() -> TaskResult {
+    require_quality_tool_versions()?;
+    quality_after_tool_checks()
+}
+
+fn quality_after_tool_checks() -> TaskResult {
     storage::check(&root())?;
     workflow_lint()?;
     run("cargo", &["fmt", "--all", "--", "--check"])?;
@@ -169,6 +178,62 @@ fn quality() -> TaskResult {
     layering_test()
 }
 
+fn require_quality_tool_versions() -> TaskResult {
+    require_tool_version("cargo", &["--version"], "1.95.0", "https://rustup.rs/")?;
+    require_tool_version(
+        "cargo",
+        &["deny", "--version"],
+        "0.20.2",
+        "https://github.com/EmbarkStudios/cargo-deny/releases/tag/0.20.2",
+    )?;
+    require_tool_version(
+        "opa",
+        &["version"],
+        "1.18.2",
+        "https://github.com/open-policy-agent/opa/releases/tag/v1.18.2",
+    )?;
+    require_tool_version("git", &["--version"], "*", "https://git-scm.com/downloads")?;
+    require_tool_version(
+        "sha256sum",
+        &["--version"],
+        "*",
+        "https://www.gnu.org/software/coreutils/",
+    )
+}
+
+fn require_ci_tool_versions() -> TaskResult {
+    require_quality_tool_versions()?;
+    for (program, arguments, expected, installation_url) in [
+        (
+            "bash",
+            &["--version"][..],
+            "*",
+            "https://www.gnu.org/software/bash/",
+        ),
+        (
+            "helm",
+            &["version", "--short"][..],
+            "3.17.1",
+            "https://github.com/helm/helm/releases/tag/v3.17.1",
+        ),
+        (
+            "grep",
+            &["--version"][..],
+            "*",
+            "https://pubs.opengroup.org/onlinepubs/9799919799/utilities/grep.html",
+        ),
+        (
+            "bun",
+            &["--version"][..],
+            "1.2.21",
+            "https://github.com/oven-sh/bun/releases/tag/bun-v1.2.21",
+        ),
+    ] {
+        require_tool_version(program, arguments, expected, installation_url)?;
+    }
+    Ok(())
+}
+
 fn workflow_lint() -> TaskResult {
     require_tool_version(
         "actionlint",
@@ -184,7 +249,7 @@ fn workflow_lint() -> TaskResult {
     )?;
     run("actionlint", &[])?;
 
-    let output = git_command_in_repository(&root())
+    let output = git_command_in_repository(&root())?
         .args(["ls-files", "-z", "--", "*.sh"])
         .output()
         .map_err(|error| format!("failed to discover tracked shell scripts: {error}"))?;
@@ -208,7 +273,7 @@ fn workflow_lint() -> TaskResult {
     }
 
     println!("+ shellcheck {}", scripts.join(" "));
-    let status = Command::new("shellcheck")
+    let status = checked_command("shellcheck")?
         .args(&scripts)
         .current_dir(root())
         .status()
@@ -217,42 +282,6 @@ fn workflow_lint() -> TaskResult {
         Ok(())
     } else {
         Err(format!("shellcheck exited with {status}"))
-    }
-}
-
-fn require_tool_version(
-    program: &str,
-    arguments: &[&str],
-    expected: &str,
-    installation_url: &str,
-) -> TaskResult {
-    let output = Command::new(program)
-        .args(arguments)
-        .output()
-        .map_err(|error| {
-            format!("{program} {expected} is required; install it from {installation_url}: {error}")
-        })?;
-    if !output.status.success() {
-        return Err(format!(
-            "{program} version check failed with {}; install {program} {expected} from {installation_url}",
-            output.status
-        ));
-    }
-    let version_output = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if version_output
-        .split(|character: char| character.is_whitespace())
-        .any(|word| word.trim_start_matches('v') == expected)
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "{program} {expected} is required, observed `{}`; install the pinned version from {installation_url}",
-            version_output.trim()
-        ))
     }
 }
 
@@ -475,8 +504,8 @@ fn migrate_check() -> TaskResult {
     Ok(())
 }
 
-fn git_command_in_repository(repository: &Path) -> Command {
-    let mut command = Command::new("git");
+fn git_command_in_repository(repository: &Path) -> Result<Command, String> {
+    let mut command = checked_command("git")?;
     command.current_dir(repository);
     for variable in [
         "GIT_DIR",
@@ -491,12 +520,12 @@ fn git_command_in_repository(repository: &Path) -> Command {
     ] {
         command.env_remove(variable);
     }
-    command
+    Ok(command)
 }
 
 fn migration_changes(repository: &Path, base: &str) -> Result<String, String> {
     let range = format!("{base}...HEAD");
-    let output = git_command_in_repository(repository)
+    let output = git_command_in_repository(repository)?
         .args([
             "diff",
             "--name-status",
@@ -533,7 +562,7 @@ fn resolve_migration_base() -> Result<String, String> {
 
 fn resolve_git_commit(reference: &str) -> Result<Option<String>, String> {
     let commitish = format!("{reference}^{{commit}}");
-    let output = Command::new("git")
+    let output = checked_command("git")?
         .args([
             "rev-parse",
             "--verify",
@@ -660,6 +689,8 @@ fn check_secrets() -> TaskResult {
 }
 
 fn conformance(arguments: &[String]) -> TaskResult {
+    require_executed_tool_version("cargo")?;
+    require_executed_tool_version("bun")?;
     if arguments != ["--pinned"] && arguments != ["--latest"] {
         return Err("conformance requires exactly --pinned or --latest".to_owned());
     }
@@ -676,7 +707,7 @@ fn conformance(arguments: &[String]) -> TaskResult {
 }
 
 fn run_conformance_module(target: &str, guarantee: &str, module: &str) -> TaskResult {
-    let output = Command::new("cargo")
+    let output = checked_command("cargo")?
         .args([
             "test",
             "--manifest-path",
@@ -819,6 +850,12 @@ fn real_implemented_ports() -> BTreeSet<&'static str> {
 }
 
 fn layering_test() -> TaskResult {
+    require_tool_version(
+        "cargo",
+        &["deny", "--version"],
+        "0.20.2",
+        "https://github.com/EmbarkStudios/cargo-deny/releases/tag/0.20.2",
+    )?;
     let fixture = root()
         .join("target")
         .join("xtask")
@@ -848,7 +885,7 @@ fn layering_test() -> TaskResult {
     )?;
 
     write_layering_fixture(guard.path(), true)?;
-    let output = Command::new("cargo")
+    let output = checked_command("cargo")?
         .args([
             "deny",
             "--manifest-path",
@@ -971,7 +1008,7 @@ fn run(program: &str, arguments: &[&str]) -> TaskResult {
 
 fn run_with_env(program: &str, arguments: &[&str], environment: &[(&str, &OsStr)]) -> TaskResult {
     println!("+ {program} {}", arguments.join(" "));
-    let status = Command::new(program)
+    let status = checked_command(program)?
         .args(arguments)
         .envs(environment.iter().copied())
         .current_dir(root())
@@ -986,7 +1023,7 @@ fn run_with_env(program: &str, arguments: &[&str], environment: &[(&str, &OsStr)
 
 fn run_in(directory: &Path, program: &str, arguments: &[&str]) -> TaskResult {
     println!("+ {program} {}", arguments.join(" "));
-    let status = Command::new(program)
+    let status = checked_command(program)?
         .args(arguments)
         .current_dir(directory)
         .status()
@@ -1105,8 +1142,9 @@ impl Drop for TemporaryTree {
 #[cfg(test)]
 mod tests {
     use super::{
-        git_command_in_repository, migration_changes, provider_profile_bundle_directory_for_inputs,
-        root, should_skip_directory, validate_conformance_test_result,
+        checked_command, git_command_in_repository, migration_changes,
+        provider_profile_bundle_directory_for_inputs, root, should_skip_directory,
+        validate_conformance_test_result,
     };
     use std::collections::BTreeSet;
     use std::fs;
@@ -1126,7 +1164,7 @@ mod tests {
             .ok_or_else(|| "Steward chart version is required".to_owned())?;
         match version {
             "0.1.23" => Ok(false),
-            "0.3.10" => Ok(true),
+            "0.3.11" => Ok(true),
             other => Err(format!(
                 "release enforcement has not reviewed Steward chart version {other}"
             )),
@@ -1677,7 +1715,7 @@ mod tests {
                 "6b56705eecf7bb06fce0f779bd571334fa9aa0c06d812eecad28f4db4223449f",
             ),
         ] {
-            let output = Command::new("sha256sum")
+            let output = checked_command("sha256sum")?
                 .arg(root().join(released_path))
                 .output()
                 .map_err(|error| {
@@ -1723,7 +1761,7 @@ mod tests {
                 "b2f5883be97fa4ede9e32260c487c1eb4cf0ea3ad94d6f9a6b9450da4f6eb6c1",
             ),
         ] {
-            let output = Command::new("sha256sum")
+            let output = checked_command("sha256sum")?
                 .arg(root().join(released_path))
                 .output()
                 .map_err(|error| {
@@ -1794,7 +1832,7 @@ mod tests {
             .and_then(|jobs| jobs.split("\n  pinned:").next())
             .ok_or_else(|| "release-candidate CI job is required".to_owned())?;
 
-        for component in ["apiserver", "controller", "mint", "bridge"] {
+        for component in ["apiserver", "controller", "mint", "bridge", "web"] {
             assert!(
                 release_candidate.contains(&format!(
                     "image-ref: steward-{component}:release-validation"
@@ -1816,18 +1854,18 @@ mod tests {
             release_candidate
                 .matches("aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8")
                 .count(),
-            4,
-            "release-candidate CI must use the pinned Trivy action for every Steward component image"
+            6,
+            "release-candidate CI must use the pinned Trivy action for every Steward component image and the chart"
         );
         assert_eq!(
             release_candidate.matches("exit-code: \"1\"").count(),
-            4,
-            "every release-candidate image scan must fail closed"
+            6,
+            "every release-candidate image and chart scan must fail closed"
         );
         assert_eq!(
             release_candidate.matches("severity: CRITICAL").count(),
-            4,
-            "every release-candidate image scan must enforce CRITICAL findings"
+            6,
+            "every release-candidate image and chart scan must enforce CRITICAL findings"
         );
         assert!(
             workflow.contains("      - codex-reference-runtime"),
@@ -3376,7 +3414,7 @@ mod tests {
         );
         assert!(
             xtask.contains(".args([\"ls-files\", \"-z\", \"--\", \"*.sh\"])")
-                && xtask.contains("Command::new(\"shellcheck\")"),
+                && xtask.contains("checked_command(\"shellcheck\")?"),
             "the shared ShellCheck gate must discover every tracked shell script"
         );
         assert!(
@@ -3385,14 +3423,112 @@ mod tests {
         );
         for (name, workflow) in [("pull-request", ci), ("release", release)] {
             assert!(
-                workflow.contains("cargo xtask workflow-lint"),
-                "{name} workflow must invoke the shared workflow lint"
+                workflow.contains("cargo xtask ci"),
+                "{name} workflow must invoke the shared CI entrypoint containing workflow lint"
             );
             assert!(
                 !workflow.contains("shellcheck \\\n"),
                 "{name} workflow must not maintain a ShellCheck file list"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn pull_request_and_release_share_the_exact_validation_gate() -> Result<(), String> {
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let release = fs::read_to_string(root().join(".github/workflows/release.yml"))
+            .map_err(|error| format!("Steward release workflow is required: {error}"))?;
+        let ci_quality = ci
+            .split_once("  quality:\n")
+            .and_then(|(_before, after)| after.split_once("\n  conformance-pinned:"))
+            .map(|(job, _after)| job)
+            .ok_or_else(|| "pull-request quality job could not be isolated".to_owned())?;
+        let release_validate = release
+            .split_once("  validate:\n")
+            .and_then(|(_before, after)| after.split_once("\n  publish-images:"))
+            .map(|(job, _after)| job)
+            .ok_or_else(|| "release validation job could not be isolated".to_owned())?;
+
+        for (lane, job) in [
+            ("pull-request quality", ci_quality),
+            ("tagged release validation", release_validate),
+        ] {
+            for required in [
+                "runs-on: ubuntu-24.04",
+                "gate-tools: \"true\"",
+                "workflow-tools: \"true\"",
+                "kubernetes-tools: \"true\"",
+                "uses: oven-sh/setup-bun@ecf28ddc73e819eb6fa29df6b34ef8921c743461",
+                "run: cargo xtask ci",
+            ] {
+                assert!(job.contains(required), "{lane} omitted `{required}`");
+            }
+            assert!(
+                !job.contains("cargo xtask quality"),
+                "{lane} must not bypass the shared release validation entrypoint"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn conformance_jobs_install_the_bun_version_required_by_xtask() -> Result<(), String> {
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        for (job_name, next_job) in [
+            ("conformance-pinned", "openshell-adapter"),
+            ("latest-nightly", ""),
+        ] {
+            let after = ci
+                .split_once(&format!("  {job_name}:\n"))
+                .map(|(_before, after)| after)
+                .ok_or_else(|| format!("{job_name} job could not be isolated"))?;
+            let job = if next_job.is_empty() {
+                after
+            } else {
+                after
+                    .split_once(&format!("\n  {next_job}:"))
+                    .map(|(job, _after)| job)
+                    .ok_or_else(|| format!("{job_name} job could not be isolated"))?
+            };
+            assert!(
+                job.contains("uses: oven-sh/setup-bun@ecf28ddc73e819eb6fa29df6b34ef8921c743461")
+                    && job.contains("bun-version-file: .bun-version"),
+                "{job_name} must install the Bun version required by cargo xtask conformance"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_xtask_process_is_created_after_a_version_check() -> Result<(), String> {
+        let sources = [
+            "lib.rs",
+            "m1_contracts.rs",
+            "main.rs",
+            "process.rs",
+            "storage.rs",
+        ]
+        .map(|name| {
+            fs::read_to_string(root().join("xtask/src").join(name))
+                .map_err(|error| format!("xtask source {name} is required: {error}"))
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+        let xtask = sources.join("\n");
+        let constructor = ["Command", "::new("].concat();
+        assert_eq!(
+            xtask.matches(&constructor).count(),
+            2,
+            "external processes must be created only by require_tool_version or checked_command"
+        );
+        assert!(
+            xtask.contains("fn checked_command(program: &str) -> Result<Command, String>")
+                && xtask.contains("require_executed_tool_version(program)?;"),
+            "checked_command must fail closed through require_executed_tool_version"
+        );
         Ok(())
     }
 
@@ -3785,18 +3921,18 @@ mod tests {
         }
     }
 
-    fn test_git_command(repository: &Path, arguments: &[&str]) -> Command {
-        let mut command = git_command_in_repository(repository);
+    fn test_git_command(repository: &Path, arguments: &[&str]) -> Result<Command, String> {
+        let mut command = git_command_in_repository(repository)?;
         command
             .args(["-c", "commit.gpgsign=false"])
             .args(arguments)
             .env("GIT_CONFIG_GLOBAL", repository.join(".gitconfig-disabled"))
             .env("GIT_CONFIG_NOSYSTEM", "1");
-        command
+        Ok(command)
     }
 
     fn git(repository: &Path, arguments: &[&str]) -> Result<(), String> {
-        let output = test_git_command(repository, arguments)
+        let output = test_git_command(repository, arguments)?
             .output()
             .map_err(|error| format!("failed to run git {}: {error}", arguments.join(" ")))?;
         if output.status.success() {
@@ -3813,7 +3949,7 @@ mod tests {
     #[test]
     fn migration_test_git_isolates_signing_configuration() -> Result<(), String> {
         let repository = TestRepository::create()?;
-        let command = test_git_command(&repository.path, &["commit"]);
+        let command = test_git_command(&repository.path, &["commit"])?;
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -4063,7 +4199,7 @@ mod tests {
             manifest
                 .pointer("/stewardVersion")
                 .and_then(serde_json::Value::as_str),
-            Some("0.3.10")
+            Some("0.3.11")
         );
         assert_eq!(
             manifest

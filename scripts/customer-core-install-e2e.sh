@@ -84,7 +84,10 @@ fi
 kind_node_image="kindest/node:v1.32.1@sha256:6afef2b7f69d627ea7bf27ee6696b6868d18e03bf98167c420df486da4662db6"
 release_version="${STEWARD_RELEASE_VERSION:?STEWARD_RELEASE_VERSION is required}"
 image_repository="${STEWARD_RELEASE_IMAGE_REPOSITORY:?STEWARD_RELEASE_IMAGE_REPOSITORY is required}"
+image_pull_repository="${STEWARD_RELEASE_IMAGE_PULL_REPOSITORY:-${image_repository}}"
 chart_repository="${STEWARD_RELEASE_CHART_REPOSITORY:?STEWARD_RELEASE_CHART_REPOSITORY is required}"
+registry_mirror="${STEWARD_RELEASE_REGISTRY_MIRROR:-}"
+plain_http="${STEWARD_RELEASE_PLAIN_HTTP:-false}"
 chart_digest="${STEWARD_RELEASE_CHART_DIGEST:?STEWARD_RELEASE_CHART_DIGEST is required}"
 api_digest="${STEWARD_RELEASE_APISERVER_DIGEST:?STEWARD_RELEASE_APISERVER_DIGEST is required}"
 controller_digest="${STEWARD_RELEASE_CONTROLLER_DIGEST:?STEWARD_RELEASE_CONTROLLER_DIGEST is required}"
@@ -146,6 +149,14 @@ for digest in "${chart_digest}" "${api_digest}" "${controller_digest}" "${mint_d
     exit 2
   fi
 done
+if [[ "${plain_http}" != false && "${plain_http}" != true ]]; then
+  echo 'STEWARD_RELEASE_PLAIN_HTTP must be true or false' >&2
+  exit 2
+fi
+if [[ -n "${registry_mirror}" && ! "${registry_mirror}" =~ ^[a-z0-9][a-z0-9.-]*:[0-9]+$ ]]; then
+  echo 'STEWARD_RELEASE_REGISTRY_MIRROR must be a container hostname and port' >&2
+  exit 2
+fi
 printf 'release_version=%s\ncluster=%s\ncontext=%s\nkubeconfig=%s\nrun_dir=%s\n' \
   "${release_version}" "${cluster}" "${context}" "${kubeconfig}" "${run_dir}" \
   > "${run_dir}/ownership.txt"
@@ -153,9 +164,13 @@ echo "core install release ${release_version}; owned cluster ${cluster}"
 
 stage=release-artifacts
 for digest in "${api_digest}" "${controller_digest}" "${mint_digest}" "${bridge_digest}" "${web_digest}"; do
-  docker pull "${image_repository}@${digest}" >/dev/null
+  docker pull "${image_pull_repository}@${digest}" >/dev/null
 done
-helm pull "${chart_repository}@${chart_digest}" --destination "${run_dir}"
+helm_pull=(pull "${chart_repository}@${chart_digest}" --destination "${run_dir}")
+if [[ "${plain_http}" == true ]]; then
+  helm_pull+=(--plain-http)
+fi
+helm "${helm_pull[@]}"
 chart_archive="$(find "${run_dir}" -maxdepth 1 -type f -name 'steward*.tgz' -print -quit)"
 test -s "${chart_archive}"
 tar -xOf "${chart_archive}" steward/Chart.yaml > "${run_dir}/Chart.yaml"
@@ -163,11 +178,24 @@ grep -Fxq "version: ${release_version}" "${run_dir}/Chart.yaml"
 grep -Fxq "appVersion: ${release_version}" "${run_dir}/Chart.yaml"
 
 stage=cluster
-printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n' > "${run_dir}/kind.yaml"
+if [[ -n "${registry_mirror}" ]]; then
+  printf '%s\n' \
+    'kind: Cluster' \
+    'apiVersion: kind.x-k8s.io/v1alpha4' \
+    'containerdConfigPatches:' \
+    '- |-' \
+    "  [plugins.\"io.containerd.grpc.v1.cri\".registry.mirrors.\"${registry_mirror}\"]" \
+    "    endpoint = [\"http://${registry_mirror}\"]" > "${run_dir}/kind.yaml"
+else
+  printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n' > "${run_dir}/kind.yaml"
+fi
 cluster_created=1
 kind create cluster \
   --name "${cluster}" --kubeconfig "${kubeconfig}" \
   --config "${run_dir}/kind.yaml" --image "${kind_node_image}" --wait 120s
+if [[ -n "${registry_mirror}" ]]; then
+  docker network connect kind "${registry_mirror%%:*}"
+fi
 chmod 600 "${kubeconfig}"
 actual_context="$(kubectl --kubeconfig "${kubeconfig}" config current-context)"
 if [[ "${actual_context}" != "${context}" ]]; then

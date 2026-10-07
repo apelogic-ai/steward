@@ -1,6 +1,6 @@
 # OpenShell 0.0.98 governed execution
 
-Steward v0.3.10 supports the stock OpenShell v0.0.98 release with the
+Steward v0.3.11 supports the stock OpenShell v0.0.98 release with the
 sidecar supervisor topology. This is the supported compatibility shape for
 this patch line; it does not require a patched OpenShell image.
 
@@ -122,7 +122,7 @@ emit the corresponding warning. Read the `openshell-supervisor-network`
 records for the first provider request.
 A proxy policy or SSRF denial means the endpoint policy rejected the request.
 An MCP-GW authorization denial means the request reached MCP-GW but its runtime
-authority was rejected. Steward v0.3.10 preserves these as the distinct,
+authority was rejected. Steward v0.3.11 preserves these as the distinct,
 non-secret connection errors `proxy_policy_denied` and
 `provider_authorization_failed`.
 

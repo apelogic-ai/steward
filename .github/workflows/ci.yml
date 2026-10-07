@@ -40,11 +40,17 @@ jobs:
         with:
           gate-tools: "true"
           workflow-tools: "true"
+          kubernetes-tools: "true"
 
-      - name: Run quality gates
+      - name: Install pinned Bun runtime
+        uses: oven-sh/setup-bun@ecf28ddc73e819eb6fa29df6b34ef8921c743461 # v2.1.3
+        with:
+          bun-version-file: .bun-version
+
+      - name: Run the release validation entrypoint
         env:
           STEWARD_MIGRATION_BASE: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.sha }}
-        run: cargo xtask quality
+        run: cargo xtask ci
 
       - name: Build governed Connections test artifacts
         run: scripts/package-governed-connections-artifacts.sh
@@ -81,6 +87,11 @@ jobs:
         uses: ./.github/actions/setup-tools
         with:
           kubernetes-tools: "true"
+
+      - name: Install pinned Bun runtime
+        uses: oven-sh/setup-bun@ecf28ddc73e819eb6fa29df6b34ef8921c743461 # v2.1.3
+        with:
+          bun-version-file: .bun-version
 
       - name: Run pinned upstream conformance
         run: cargo xtask conformance --pinned
@@ -243,8 +254,9 @@ jobs:
 
   release-candidate:
     name: release / chart and images
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -260,8 +272,21 @@ jobs:
       - name: Lint privileged workflows and release scripts
         run: cargo xtask workflow-lint
 
+      - name: Lint exact core and complete source-chart profiles
+        run: bash scripts/customer-core-install-e2e.sh --lint-source-chart charts/steward
+
       - name: Render the chart and build all component images
         run: scripts/validate-release-artifacts.sh --build-images
+
+      - name: Prepare chart vulnerability scan
+        run: |
+          set -euo pipefail
+          version="$(awk '$1 == "version:" { print $2; exit }' charts/steward/Chart.yaml)"
+          mkdir -p target/release-candidate/chart
+          helm package charts/steward --destination target/release-candidate \
+            --version "$version" --app-version "$version"
+          tar -xzf "target/release-candidate/steward-$version.tgz" \
+            -C target/release-candidate/chart
 
       - name: Verify Gateway API backend TLS with Envoy Gateway
         run: scripts/steward-gateway-backend-tls-e2e.sh
@@ -297,6 +322,26 @@ jobs:
           format: table
           exit-code: "1"
           severity: CRITICAL
+
+      - name: Enforce critical web image policy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: steward-web:release-validation
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+
+      - name: Enforce critical chart policy
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          scan-type: fs
+          scan-ref: target/release-candidate/chart
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+
+      - name: Install release-candidate artifacts in a clean cluster
+        run: bash scripts/release-candidate-acceptance.sh
 
   pinned:
     name: pinned
@@ -360,6 +405,11 @@ jobs:
         uses: ./.github/actions/setup-tools
         with:
           kubernetes-tools: "true"
+
+      - name: Install pinned Bun runtime
+        uses: oven-sh/setup-bun@ecf28ddc73e819eb6fa29df6b34ef8921c743461 # v2.1.3
+        with:
+          bun-version-file: .bun-version
 
       - name: Run informational latest-upstream lane
         id: latest_conformance

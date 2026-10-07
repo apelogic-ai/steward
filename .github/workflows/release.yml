@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Check out repository
@@ -32,8 +32,10 @@ jobs:
           kubernetes-tools: "true"
           workflow-tools: "true"
 
-      - name: Lint privileged workflows and release scripts
-        run: cargo xtask workflow-lint
+      - name: Install pinned Bun runtime
+        uses: oven-sh/setup-bun@ecf28ddc73e819eb6fa29df6b34ef8921c743461 # v2.1.3
+        with:
+          bun-version-file: .bun-version
 
       - name: Run Steward quality gates
         env:
@@ -626,7 +628,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.10"
+          test "$version" = "0.3.11"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
@@ -751,15 +753,15 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.10 replaces the incomplete v0.3.9 artifacts and adds an owner-scoped Task library with immutable versions, exact digest links, role sharing, and one Tasks and Run now UI for authored, exact Git, and published Workflow sources.\n\n'
+            printf 'Steward v0.3.11 replaces the failed, unpublished v0.3.10 tag and incomplete v0.3.9 artifacts. It adds an owner-scoped Task library with immutable versions, exact digest links, role sharing, and one Tasks and Run now UI for authored, exact Git, and published Workflow sources.\n\n'
             printf 'Same-repository automation can now publish the exact two-file Task package and pinned caller workflow through a governed pull request, observe its merge, dispatch it, and report the resulting GitHub run. The package-path caller requires steward-run 0.8.0 or later and the advertised steward_package_path_supported capability.\n\n'
             printf 'Task output archives now contain only declared out/ files; stdout and stderr remain in the owner-scoped execution-log endpoints. Terminal event-stream history is bounded while Last-Event-ID reconnect remains available during its grace period.\n\n'
             printf 'This release retains the browser Run now, member administration, onboarding, live Run detail, connection orchestration, and Next.js 16.3.6 security fixes completed in v0.3.8.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
             printf 'This patch adds migrations 0064-0067. Installations upgrading from versions before v0.3.8 must also complete the earlier v0.3 prerequisites before rollout.\n\n'
-            printf 'Deploy the v0.3.10 chart and images as one release unit and allow the additive migrations to complete before serving traffic. Do not deploy the incomplete v0.3.9 artifacts. No provider-profile transition is required.\n\n'
-            printf 'Rollback from v0.3.10 requires restoring the matching pre-upgrade database together with the prior chart and component-image set because the release adds durable repository-operation, output-archive, and Task-library state.\n\n'
+            printf 'Deploy the v0.3.11 chart and images as one release unit and allow the additive migrations to complete before serving traffic. Do not use the failed v0.3.10 tag or incomplete v0.3.9 artifacts. No provider-profile transition is required.\n\n'
+            printf 'Rollback from v0.3.11 requires restoring the matching pre-upgrade database together with the prior chart and component-image set because the release adds durable repository-operation, output-archive, and Task-library state.\n\n'
             printf '## Required action\n\n'
             printf 'Before upgrading governed installations, set spire.className to the installed SPIRE controller class and choose exactly one owner for the OpenShell sandbox registration: keep the chart default, or disable spire.sandboxRegistration only when the platform retains the equivalent registration. Before enabling browser Run now, authorize each Git source through the operator-managed source-repository binding catalog and configure the intended Envelope templates.\n\n'
             printf '## Acceptance\n\n'
@@ -831,7 +833,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.10.json
+          subject-path: dist/steward-product-compatibility-0.3.11.json
 
       - name: Archive product compatibility verification material
         env:
@@ -841,7 +843,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.10.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.11.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 

@@ -7,6 +7,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.11] - 2026-10-06
+
+### Added
+
+- This complete replacement includes every Added and Fixed item recorded under
+  the failed, unpublished v0.3.10 entry and the incomplete v0.3.9 entry below.
+
+### Fixed
+
+- Removed the undeclared ripgrep dependency from release-path shell scripts;
+  their exact and regular-expression assertions now use portable `grep` modes.
+- Made pull-request quality validation and tagged-release validation run the
+  same `cargo xtask ci` entrypoint on Ubuntu 24.04, with fail-closed tool
+  preflight before any external command is executed.
+- Added pull-request release-candidate validation for the same source-chart
+  profiles, locally built component images, critical vulnerability policy, and
+  clean-cluster installation exercised by the tagged release.
+- The v0.3.10 tag failed during repository validation before any images, chart,
+  assets, or GitHub release were published; it must not be used.
+
 ## [0.3.10] - 2026-10-06
 
 ### Added
@@ -619,7 +639,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.10...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.11...HEAD
+[0.3.11]: https://github.com/apelogic-ai/steward/compare/v0.3.10...v0.3.11
 [0.3.10]: https://github.com/apelogic-ai/steward/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/apelogic-ai/steward/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/apelogic-ai/steward/compare/v0.3.7...v0.3.8
