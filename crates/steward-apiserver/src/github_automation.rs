@@ -27,8 +27,8 @@ use crate::github_actions::{
     steward_run_supports_package_path_invocation,
 };
 use crate::governed_connections::{
-    ConnectionOperationKind, GovernedConnectionsBroker, ProviderConnectionStatusSource,
-    SplitConnectionsBroker,
+    AutomationOperationIdentity, ConnectionOperationKind, GovernedConnectionsBroker,
+    ProviderConnectionStatusSource, SplitConnectionsBroker,
 };
 use crate::tasks::TaskApiConfig;
 use crate::{AgentRunLedger, BoxFuture};
@@ -42,6 +42,7 @@ pub struct GithubAutomationIdentity {
     pub(crate) idempotency_identity: String,
     pub(crate) idempotency_scope: Option<String>,
     pub(crate) publication_subject: Option<String>,
+    pub(crate) allow_result_cache: bool,
 }
 
 pub trait GithubAutomationBroker<B>: Clone + Send + Sync + 'static
@@ -80,9 +81,12 @@ where
                 session,
                 operation,
                 request,
-                &identity.idempotency_identity,
-                identity.idempotency_scope.as_deref(),
-                identity.publication_subject.as_deref(),
+                AutomationOperationIdentity {
+                    idempotency_identity: &identity.idempotency_identity,
+                    idempotency_scope: identity.idempotency_scope.as_deref(),
+                    publication_subject: identity.publication_subject.as_deref(),
+                    allow_result_cache: identity.allow_result_cache,
+                },
             )
             .await
         })
@@ -174,6 +178,9 @@ pub(crate) struct RepositoryQuery {
     page: u32,
     #[serde(default = "default_page_size")]
     per_page: u32,
+    /// Bypass a completed cached listing while still joining an identical in-flight request.
+    #[serde(default)]
+    refresh: bool,
 }
 
 const fn first_page() -> u32 {
@@ -635,17 +642,18 @@ where
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let identity = fresh_operation_identity("repositories");
+    let request = json!({
+        "query": query.query,
+        "page": query.page,
+        "perPage": query.per_page,
+    });
+    let identity = cached_read_operation_identity("repositories", &request, !query.refresh);
     let result = match state
         .broker
         .execute(
             &session,
             ConnectionOperationKind::Repositories,
-            json!({
-                "query": query.query,
-                "page": query.page,
-                "perPage": query.per_page,
-            }),
+            request,
             &identity,
         )
         .await
@@ -1286,6 +1294,23 @@ fn fresh_operation_identity(operation: &str) -> GithubAutomationIdentity {
         idempotency_identity: format!("github-{operation}:{}", Uuid::new_v4()),
         idempotency_scope: None,
         publication_subject: None,
+        allow_result_cache: false,
+    }
+}
+
+fn cached_read_operation_identity(
+    operation: &str,
+    payload: &Value,
+    allow_result_cache: bool,
+) -> GithubAutomationIdentity {
+    GithubAutomationIdentity {
+        idempotency_identity: format!(
+            "github-{operation}:payload:sha256:{:x}",
+            Sha256::digest(payload.to_string().as_bytes())
+        ),
+        idempotency_scope: None,
+        publication_subject: None,
+        allow_result_cache,
     }
 }
 
@@ -1298,6 +1323,7 @@ fn scoped_read_operation_identity(operation: &str, subject: &str) -> GithubAutom
         ),
         idempotency_scope: None,
         publication_subject: None,
+        allow_result_cache: false,
     }
 }
 
@@ -1326,6 +1352,7 @@ fn write_operation_identity(
         ),
         idempotency_scope: Some(scope),
         publication_subject: (operation == "publish").then_some(subject).flatten(),
+        allow_result_cache: true,
     }
 }
 
@@ -1498,6 +1525,7 @@ mod tests {
         operation: ConnectionOperationKind,
         request: Value,
         idempotency_identity: String,
+        allow_result_cache: bool,
     }
 
     #[derive(Clone, Default)]
@@ -1521,6 +1549,7 @@ mod tests {
                         operation,
                         request,
                         idempotency_identity: identity.idempotency_identity.clone(),
+                        allow_result_cache: identity.allow_result_cache,
                     });
                 match operation {
                     ConnectionOperationKind::Repositories => Ok(json!({
@@ -2033,6 +2062,43 @@ mod tests {
         .map_err(|error| {
             format!("apiserver repository payload violates bridge contract: {error:?}")
         })?;
+
+        for suffix in ["", "&refresh=true"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/app/api/v1/github/repositories?perPage=100{suffix}"
+                        ))
+                        .header(header::COOKIE, &session_cookie)
+                        .body(Body::empty())
+                        .map_err(|error| error.to_string())?,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let repository_calls = broker
+            .calls
+            .lock()
+            .map_err(|_| "lock broker calls")?
+            .iter()
+            .filter(|call| call.operation == ConnectionOperationKind::Repositories)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(repository_calls.len(), 3);
+        assert_eq!(
+            repository_calls[0].idempotency_identity, repository_calls[1].idempotency_identity,
+            "identical repository reads must share one cache key"
+        );
+        assert_eq!(
+            repository_calls[0].idempotency_identity, repository_calls[2].idempotency_identity,
+            "refresh must bypass the completed value without creating a distinct cache key"
+        );
+        assert!(repository_calls[0].allow_result_cache);
+        assert!(repository_calls[1].allow_result_cache);
+        assert!(!repository_calls[2].allow_result_cache);
 
         for retry_key in ["first", "second"] {
             let response = app

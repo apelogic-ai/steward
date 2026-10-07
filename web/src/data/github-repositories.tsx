@@ -21,14 +21,14 @@ function repositoryFailure(problem: GithubAutomationErrorResponse | undefined): 
 }
 
 export function useGithubRepositories() {
-  const [attempt, setAttempt] = useState(0);
+  const [request, setRequest] = useState({ sequence: 0, refresh: false });
   const [state, setState] = useState<RepositoryResourceState>({ status: "loading" });
   useEffect(() => {
     let active = true;
     void listRepositories({
       cache: "no-store",
       credentials: "same-origin",
-      query: { query: "", page: 1, perPage: 100 },
+      query: { query: "", page: 1, perPage: 100, ...(request.refresh ? { refresh: true } : {}) },
     }).then((result) => {
       if (!active) return;
       if (result.data && result.response?.ok) {
@@ -40,11 +40,11 @@ export function useGithubRepositories() {
       if (active) setState({ status: "error", error: "repository_query_failed", reason: null });
     });
     return () => { active = false; };
-  }, [attempt]);
+  }, [request]);
   return {
     retry: () => {
       setState({ status: "loading" });
-      setAttempt((value) => value + 1);
+      setRequest(({ sequence }) => ({ sequence: sequence + 1, refresh: true }));
     },
     state,
   };
