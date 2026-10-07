@@ -134,8 +134,12 @@ const MCP_PATH: &str = "/mcp";
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const RERUN_REQUEST_ID: &str = "steward-github-rerun";
 const MAX_WORKFLOW_BYTES: usize = 256 * 1024;
-// `https://github.com/` plus a 39-byte owner and a 100-byte name is 159 bytes.
-const MAX_REPOSITORY_URL_BYTES: usize = 255;
+// `https://github.com/` plus a 39-byte owner and a 100-byte name is 159 bytes; run
+// and job URLs add `/actions/runs/<id>/job/<id>`.
+const MAX_GITHUB_URL_BYTES: usize = 255;
+// The pinned server's effective default page before it honored `perPage`; it keeps
+// the normalized run status within its bridge result bound.
+const MAX_RUN_STATUS_JOBS: usize = 30;
 const MAX_PUBLISHED_FILE_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -923,7 +927,7 @@ impl GithubMcpGateway {
                             "resource_id": run_id.to_string(),
                             // v1.6.0 advertises `per_page` but reads `perPage`
                             // (`OptionalPaginationParams`); `per_page` is ignored.
-                            "perPage": 100,
+                            "perPage": MAX_RUN_STATUS_JOBS,
                         }),
                     )
                     .await?;
@@ -1014,7 +1018,10 @@ impl GithubMcpGateway {
                         }),
                     )
                     .await?;
-                require_write_success(&dispatched, "dispatch GitHub workflow")?;
+                // A tool error here is GitHub refusing this dispatch, not an MCP-GW
+                // outage: report it as a definite rejection, never as retryable.
+                require_write_success(&dispatched, "dispatch GitHub workflow")
+                    .map_err(|_| rejected("GitHub rejected the workflow dispatch"))?;
                 let deadline = Instant::now() + Duration::from_secs(20);
                 loop {
                     let runs = self
@@ -1578,7 +1585,7 @@ fn normalize_repository(
         .get("html_url")
         .or_else(|| repository.get("url"))
         .and_then(Value::as_str)
-        .filter(|url| url.len() <= MAX_REPOSITORY_URL_BYTES && valid_github_url(url))
+        .filter(|url| url.len() <= MAX_GITHUB_URL_BYTES && valid_github_url(url))
         .ok_or_else(|| rejected("GitHub repository response omitted its URL"))?;
     Ok(json!({
         "owner": owner,
@@ -1717,10 +1724,10 @@ fn normalize_run_status(
         .get("html_url")
         .or_else(|| run.get("url"))
         .and_then(Value::as_str)
-        .filter(|url| valid_github_url(url))
+        .filter(|url| url.len() <= MAX_GITHUB_URL_BYTES && valid_github_url(url))
         .ok_or_else(|| rejected("GitHub run response omitted its URL"))?;
     let jobs = payload_items(jobs, &["jobs"])
-        .filter(|jobs| jobs.len() <= 100)
+        .filter(|jobs| jobs.len() <= MAX_RUN_STATUS_JOBS)
         .ok_or_else(|| rejected("GitHub jobs response is invalid"))?
         .iter()
         .map(normalize_job)
@@ -1771,7 +1778,7 @@ fn normalize_job(job: &Value) -> Result<Value, PortError> {
         .get("html_url")
         .or_else(|| job.get("url"))
         .and_then(Value::as_str)
-        .filter(|url| valid_github_url(url))
+        .filter(|url| url.len() <= MAX_GITHUB_URL_BYTES && valid_github_url(url))
         .ok_or_else(|| rejected("GitHub job response omitted its URL"))?;
     Ok(json!({
         "id": id,
@@ -3230,9 +3237,9 @@ mod tests {
                     "owner": "alice",
                     "repo": "example-repo",
                     "resource_id": "3000002",
-                    "perPage": 100
+                    "perPage": 30
                 }),
-                "the pinned server reads perPage; per_page would leave jobs at its default of 30"
+                "the pinned server reads perPage, and 30 jobs keep the run status within its bound"
             );
             write_mcp_payload(stream, "steward-github-jobs", jobs)
         });
@@ -3316,10 +3323,10 @@ mod tests {
             .map_err(|_| "rejected dispatch fixture panicked".to_owned())??;
         assert_eq!(
             result,
-            Err(PortError::Failed {
-                reason: "GitHub MCP failed to dispatch GitHub workflow".to_owned(),
+            Err(PortError::Rejected {
+                reason: "GitHub rejected the workflow dispatch".to_owned(),
             }),
-            "a not-found dispatch must not be treated as queued"
+            "a not-found dispatch is a definite rejection, neither queued nor an outage"
         );
         Ok(())
     }

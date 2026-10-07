@@ -1946,7 +1946,7 @@ mod tests {
                 format!("/app/api/v1/runs/{task_uid}/github/workflow"),
                 &session_cookie,
                 &csrf,
-                json!({"owner": "example-org", "repository": "agentic-ops"}),
+                json!({"owner": "example-org", "repository": "example-repo"}),
             )?)
             .await
             .map_err(|error| error.to_string())?;
@@ -1959,7 +1959,7 @@ mod tests {
             .find(|call| call.operation == ConnectionOperationKind::Repositories)
             .map(|call| call.request.clone())
             .ok_or("repository lookup was not captured")?;
-        assert_eq!(lookup["query"], "repo:example-org/agentic-ops");
+        assert_eq!(lookup["query"], "repo:example-org/example-repo");
         Ok(())
     }
 

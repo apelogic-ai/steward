@@ -416,7 +416,7 @@ bounded diagnostic.
 | `bridge_failed` | The bridge failed without a recognized safe diagnostic. |
 | `deadline_exceeded` | The governed connection operation did not finish before its response deadline. |
 | `invalid_bridge_result` | The bridge exited successfully but its output violated the fixed result contract. |
-| `bridge_result_too_large` | The bridge exited successfully but its output exceeded Steward's bound for that operation's result (128 KiB for a repository listing, 32 KiB otherwise). This is Steward's own limit, not a provider contract failure. |
+| `bridge_result_too_large` | The bridge exited successfully but its output exceeded Steward's bound for that operation's result (128 KiB for a repository listing or a run status, 32 KiB otherwise). This is Steward's own limit, not a provider contract failure. |
 
 For a start failure whose reason says the OAuth redirect target is not allowed,
 configure MCP-GW `redirectAfterAllowedOrigins` with Steward's exact public

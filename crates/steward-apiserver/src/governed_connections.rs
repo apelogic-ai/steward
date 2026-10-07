@@ -66,6 +66,13 @@ const MAX_BRIDGE_RESULT_BYTES: usize = 32 * 1024;
 // URL (255), so one serialized item is at most about 800 bytes, or about 1 KiB
 // even if every URL byte needed escaping: 100 items stay below 128 KiB.
 const MAX_REPOSITORIES_BRIDGE_RESULT_BYTES: usize = 128 * 1024;
+// A run status holds up to 30 jobs (the bridge requests at most 30). Each job has
+// a name of at most 500 bytes and a URL of at most 255, about 1.7 KiB even with
+// every quote or backslash escaped, and the failure log is at most 8 KiB (16 KiB
+// escaped): about 70 KiB in all, below 128 KiB.
+const MAX_RUN_STATUS_BRIDGE_RESULT_BYTES: usize = 128 * 1024;
+const MAX_RUN_STATUS_JOBS: usize = 30;
+const MAX_RUN_STATUS_FAILURE_LOG_BYTES: usize = 8 * 1024;
 const TAR_BLOCK_BYTES: usize = 512;
 const RECONCILE_INTERVAL: StdDuration = StdDuration::from_millis(100);
 const DIRECT_STATUS_DEADLINE: StdDuration = StdDuration::from_secs(1);
@@ -1755,6 +1762,7 @@ impl BridgeResultError {
 const fn bridge_result_limit(operation: StoredOperationKind) -> usize {
     match operation {
         StoredOperationKind::Repositories => MAX_REPOSITORIES_BRIDGE_RESULT_BYTES,
+        StoredOperationKind::RunStatus => MAX_RUN_STATUS_BRIDGE_RESULT_BYTES,
         _ => MAX_BRIDGE_RESULT_BYTES,
     }
 }
@@ -1929,11 +1937,22 @@ fn validate_run_status_result(value: &Value) -> Result<(), StoreError> {
             object.get("conclusion"),
             Some(Value::String(_)) | Some(Value::Null)
         )
+        || !bounded_str(object.get("url"), 255)
         || !object.get("url").is_some_and(valid_https_github_url)
-        || object.get("jobs").and_then(Value::as_array).is_none()
-        || object
-            .get("failureLog")
-            .is_some_and(|value| !matches!(value, Value::String(_) | Value::Null))
+        || !object
+            .get("jobs")
+            .and_then(Value::as_array)
+            .is_some_and(|jobs| {
+                jobs.len() <= MAX_RUN_STATUS_JOBS
+                    && jobs.iter().all(|job| {
+                        bounded_str(job.get("name"), 500) && bounded_str(job.get("url"), 255)
+                    })
+            })
+        || object.get("failureLog").is_some_and(|value| match value {
+            Value::String(log) => log.len() > MAX_RUN_STATUS_FAILURE_LOG_BYTES,
+            Value::Null => false,
+            _ => true,
+        })
     {
         return Err(StoreError::InvalidConnectionOperation);
     }
@@ -2295,6 +2314,7 @@ mod tests {
         CONNECTIONS_AUTHORITY_DOCUMENT, CONNECTIONS_AUTHORITY_VERSION, CONNECTIONS_SERVICE,
         ConnectionExecutionBindings, ConnectionOperationKind, GITHUB_ATTESTATION_TRUST_MODE,
         GovernedConnectionPlanError, MAX_BRIDGE_RESULT_BYTES, MAX_REPOSITORIES_BRIDGE_RESULT_BYTES,
+        MAX_RUN_STATUS_BRIDGE_RESULT_BYTES, MAX_RUN_STATUS_FAILURE_LOG_BYTES, MAX_RUN_STATUS_JOBS,
         MCP_GW_CONTRACT_VERSION, MCP_GW_OAUTH_CLOCK_SKEW_SECONDS,
         MCP_GW_OAUTH_STATE_LIFETIME_SECONDS, OPERATOR_PINNED_TRUST_MODE,
         ProviderConnectionStatusSource, SplitConnectionsBroker, bounded_single_file_archive,
@@ -3051,6 +3071,56 @@ mod tests {
             ),
             Err(BridgeResultError::Invalid),
             "the bound holds only while every field stays within its limit"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worst_case_run_status_fits_its_own_result_bound() -> Result<(), String> {
+        let job = |index: usize| {
+            let base =
+                format!("https://github.com/example-org/example-repo/actions/runs/1/job/{index}/");
+            serde_json::json!({
+                "id": index + 1,
+                "name": "\"".repeat(500),
+                "status": "completed",
+                "conclusion": "failure",
+                "url": format!("{base}{}", "u".repeat(255 - base.len())),
+            })
+        };
+        let status = |jobs: usize| {
+            serde_json::json!({
+                "runId": 1,
+                "runAttempt": 1,
+                "phase": "completed",
+                "conclusion": "failure",
+                "url": "https://github.com/example-org/example-repo/actions/runs/1",
+                "jobs": (0..jobs).map(job).collect::<Vec<_>>(),
+                "failureLog": "\\".repeat(MAX_RUN_STATUS_FAILURE_LOG_BYTES),
+            })
+            .to_string()
+        };
+        let body = status(MAX_RUN_STATUS_JOBS);
+        assert!(
+            body.len() > MAX_BRIDGE_RESULT_BYTES,
+            "a full run status exceeds the general 32 KiB bridge result bound"
+        );
+        let archive = bounded_single_file_archive(
+            "response.json",
+            body.as_bytes(),
+            MAX_RUN_STATUS_BRIDGE_RESULT_BYTES,
+        )
+        .map_err(|error| format!("archive worst-case run status: {error:?}"))?;
+        bridge_result(steward_store::ConnectionOperationKind::RunStatus, &archive)
+            .map_err(|error| format!("worst-case run status rejected: {error:?}"))?;
+
+        let too_many = status(MAX_RUN_STATUS_JOBS + 1);
+        let archive = bounded_single_file_archive("response.json", too_many.as_bytes(), usize::MAX)
+            .map_err(|error| format!("archive run status with extra job: {error:?}"))?;
+        assert_eq!(
+            bridge_result(steward_store::ConnectionOperationKind::RunStatus, &archive),
+            Err(BridgeResultError::Invalid),
+            "the bound holds only while the job count stays within the bridge's page"
         );
         Ok(())
     }
