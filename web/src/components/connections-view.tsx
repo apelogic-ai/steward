@@ -250,6 +250,7 @@ function connectionFailureMessage(failure: ConnectionOperationErrorResponse): st
     runtime_create_failed: "The governed connection runtime could not be created. Ask an administrator to inspect Steward runtime admission and controller events.",
     runtime_start_failed: "The governed connection runtime failed to start. Ask an administrator to inspect the AgentRuntime and OpenShell sandbox status.",
     connection_deadline_exceeded: "The governed connection did not become ready before its deadline. Retry once; if it continues, ask an administrator to inspect runtime health.",
+    bridge_result_too_large: "The governed connection returned a result larger than Steward accepts for this operation. Ask an administrator to inspect the connection operation's failure category.",
   };
   const actionable = messages[failure.error];
   if (actionable) return actionable;

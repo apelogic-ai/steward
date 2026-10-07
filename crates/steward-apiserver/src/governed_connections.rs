@@ -61,6 +61,11 @@ pub const MCP_GW_CONTRACT_VERSION: &str = steward_connections_v1::MCP_GW_VERSION
 pub const GITHUB_ATTESTATION_TRUST_MODE: &str = "github-attestation";
 pub const OPERATOR_PINNED_TRUST_MODE: &str = "operator-pinned";
 const MAX_BRIDGE_RESULT_BYTES: usize = 32 * 1024;
+// A repository listing holds up to 100 items. The bridge bounds each item's owner
+// (39 bytes), name (100), stable IDs (20 digits each), default branch (255) and
+// URL (255), so one serialized item is at most about 800 bytes, or about 1 KiB
+// even if every URL byte needed escaping: 100 items stay below 128 KiB.
+const MAX_REPOSITORIES_BRIDGE_RESULT_BYTES: usize = 128 * 1024;
 const TAR_BLOCK_BYTES: usize = 512;
 const RECONCILE_INTERVAL: StdDuration = StdDuration::from_millis(100);
 const DIRECT_STATUS_DEADLINE: StdDuration = StdDuration::from_secs(1);
@@ -1340,7 +1345,7 @@ impl ConnectionOperationReconciler {
                     let result = operation
                         .output_archive
                         .as_deref()
-                        .ok_or(StoreError::InvalidConnectionOperation)
+                        .ok_or(BridgeResultError::Invalid)
                         .and_then(|archive| bridge_result(operation.operation_kind, archive));
                     match result {
                         Ok(result) => {
@@ -1368,11 +1373,11 @@ impl ConnectionOperationReconciler {
                                 )
                                 .await?;
                         }
-                        Err(_) => {
+                        Err(error) => {
                             self.fail_operation(
                                 operation.operation_id,
                                 &ConnectionOperationFailure {
-                                    category: "invalid_bridge_result",
+                                    category: error.category(),
                                     detail: None,
                                 },
                             )
@@ -1495,6 +1500,7 @@ fn connection_broker_error(
         Some("bridge-gateway-body") => ConnectionBrokerError::GatewayBodyUnavailable,
         Some("bridge-gateway-unavailable") => ConnectionBrokerError::GatewayUnavailable,
         Some("invalid_bridge_result") => ConnectionBrokerError::ProviderResponseInvalid,
+        Some("bridge_result_too_large") => ConnectionBrokerError::BridgeResultTooLarge,
         Some("runtime_create_admission_rejected") => ConnectionBrokerError::RuntimeCreateFailed,
         Some("runtime_start_failed") => ConnectionBrokerError::RuntimeStartFailed,
         Some("deadline_exceeded") => ConnectionBrokerError::DeadlineExceeded,
@@ -1669,6 +1675,11 @@ mod finalized_connection_operation_tests {
             crate::connections::ConnectionBrokerError::ProviderResponseInvalid,
             "an invalid successful bridge result must remain distinct at the API boundary"
         );
+        assert_eq!(
+            connection_broker_error(Some("bridge_result_too_large"), None),
+            crate::connections::ConnectionBrokerError::BridgeResultTooLarge,
+            "Steward's own result bound is not a provider response contract failure"
+        );
     }
 
     #[test]
@@ -1724,12 +1735,42 @@ fn store_broker_error(error: StoreError) -> ConnectionBrokerError {
     }
 }
 
-fn bridge_result(operation: StoredOperationKind, archive: &[u8]) -> Result<Value, StoreError> {
-    let body = single_file_payload(archive, "response.json")
-        .ok_or(StoreError::InvalidConnectionOperation)?;
-    if body.len() > MAX_BRIDGE_RESULT_BYTES {
-        return Err(StoreError::InvalidConnectionOperation);
+/// Why a successful bridge's output was not accepted. A result above Steward's own
+/// size bound is not a provider contract failure, so it is reported separately.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BridgeResultError {
+    TooLarge,
+    Invalid,
+}
+
+impl BridgeResultError {
+    const fn category(self) -> &'static str {
+        match self {
+            Self::TooLarge => "bridge_result_too_large",
+            Self::Invalid => "invalid_bridge_result",
+        }
     }
+}
+
+const fn bridge_result_limit(operation: StoredOperationKind) -> usize {
+    match operation {
+        StoredOperationKind::Repositories => MAX_REPOSITORIES_BRIDGE_RESULT_BYTES,
+        _ => MAX_BRIDGE_RESULT_BYTES,
+    }
+}
+
+fn bridge_result(
+    operation: StoredOperationKind,
+    archive: &[u8],
+) -> Result<Value, BridgeResultError> {
+    let body = single_file_payload(archive, "response.json").ok_or(BridgeResultError::Invalid)?;
+    if body.len() > bridge_result_limit(operation) {
+        return Err(BridgeResultError::TooLarge);
+    }
+    bridge_result_value(operation, body).map_err(|_| BridgeResultError::Invalid)
+}
+
+fn bridge_result_value(operation: StoredOperationKind, body: &[u8]) -> Result<Value, StoreError> {
     let value: Value =
         serde_json::from_slice(body).map_err(|_| StoreError::InvalidConnectionOperation)?;
     match operation {
@@ -1794,12 +1835,20 @@ fn valid_https_github_url(value: &Value) -> bool {
     })
 }
 
+/// The repository result bound assumes these per-field limits, which the bridge
+/// also enforces.
+fn bounded_str(value: Option<&Value>, maximum: usize) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.len() <= maximum)
+}
+
 fn validate_repositories_result(value: &Value) -> Result<(), StoreError> {
     let object = value
         .as_object()
         .ok_or(StoreError::InvalidConnectionOperation)?;
     if !exact_object_keys(object, &["login", "repositories", "page", "hasNextPage"])
-        || object.get("login").and_then(Value::as_str).is_none()
+        || !bounded_str(object.get("login"), 39)
         || object.get("page").and_then(Value::as_u64).is_none()
         || object.get("hasNextPage").and_then(Value::as_bool).is_none()
     {
@@ -1825,18 +1874,13 @@ fn validate_repositories_result(value: &Value) -> Result<(), StoreError> {
                 "private",
                 "url",
             ],
-        ) || repository.get("owner").and_then(Value::as_str).is_none()
-            || repository.get("ownerId").and_then(Value::as_str).is_none()
-            || repository.get("name").and_then(Value::as_str).is_none()
-            || repository
-                .get("repositoryId")
-                .and_then(Value::as_str)
-                .is_none()
-            || repository
-                .get("defaultBranch")
-                .and_then(Value::as_str)
-                .is_none()
+        ) || !bounded_str(repository.get("owner"), 39)
+            || !bounded_str(repository.get("ownerId"), 20)
+            || !bounded_str(repository.get("name"), 100)
+            || !bounded_str(repository.get("repositoryId"), 20)
+            || !bounded_str(repository.get("defaultBranch"), 255)
             || repository.get("private").and_then(Value::as_bool).is_none()
+            || !bounded_str(repository.get("url"), 255)
             || !repository.get("url").is_some_and(valid_https_github_url)
     }) {
         return Err(StoreError::InvalidConnectionOperation);
@@ -2080,7 +2124,15 @@ fn secret_digest(value: &str) -> String {
 }
 
 fn single_file_archive(name: &str, body: &[u8]) -> Result<Vec<u8>, ConnectionBrokerError> {
-    if name.is_empty() || name.len() > 100 || body.len() > MAX_BRIDGE_RESULT_BYTES {
+    bounded_single_file_archive(name, body, MAX_BRIDGE_RESULT_BYTES)
+}
+
+fn bounded_single_file_archive(
+    name: &str,
+    body: &[u8],
+    limit: usize,
+) -> Result<Vec<u8>, ConnectionBrokerError> {
+    if name.is_empty() || name.len() > 100 || body.len() > limit {
         return Err(ConnectionBrokerError::Unavailable);
     }
     let mut header = vec![0_u8; TAR_BLOCK_BYTES];
@@ -2239,14 +2291,16 @@ mod tests {
     };
 
     use super::{
-        CONNECTION_RESPONSE_DEADLINE_SECONDS, CONNECTIONS_AUTHORITY_DIGEST,
+        BridgeResultError, CONNECTION_RESPONSE_DEADLINE_SECONDS, CONNECTIONS_AUTHORITY_DIGEST,
         CONNECTIONS_AUTHORITY_DOCUMENT, CONNECTIONS_AUTHORITY_VERSION, CONNECTIONS_SERVICE,
         ConnectionExecutionBindings, ConnectionOperationKind, GITHUB_ATTESTATION_TRUST_MODE,
-        GovernedConnectionPlanError, MCP_GW_CONTRACT_VERSION, MCP_GW_OAUTH_CLOCK_SKEW_SECONDS,
+        GovernedConnectionPlanError, MAX_BRIDGE_RESULT_BYTES, MAX_REPOSITORIES_BRIDGE_RESULT_BYTES,
+        MCP_GW_CONTRACT_VERSION, MCP_GW_OAUTH_CLOCK_SKEW_SECONDS,
         MCP_GW_OAUTH_STATE_LIFETIME_SECONDS, OPERATOR_PINNED_TRUST_MODE,
-        ProviderConnectionStatusSource, SplitConnectionsBroker, bridge_result,
-        connection_orchestration_error, connections_startup_warning, plan_connection_operation,
-        provider_status, single_file_archive, start_poll_deadline, valid_operator_pinned_image,
+        ProviderConnectionStatusSource, SplitConnectionsBroker, bounded_single_file_archive,
+        bridge_result, connection_orchestration_error, connections_startup_warning,
+        plan_connection_operation, provider_status, single_file_archive, start_poll_deadline,
+        valid_operator_pinned_image,
     };
     use steward_store::{ConnectionOAuthPhase, ConnectionOperationState};
 
@@ -2935,6 +2989,102 @@ mod tests {
                 .map_err(|error| format!("archive leaked {kind:?}: {error:?}"))?;
             assert!(bridge_result(kind, &leaked).is_err(), "{kind:?}");
         }
+        Ok(())
+    }
+
+    fn worst_case_repository_listing(branch_bytes: usize) -> serde_json::Value {
+        let owner = "o".repeat(39);
+        let name = "n".repeat(100);
+        let base = format!("https://github.com/{owner}/{name}/");
+        let url = format!("{base}{}", "u".repeat(255 - base.len()));
+        let repositories = (0..100)
+            .map(|_| {
+                serde_json::json!({
+                    "owner": owner,
+                    "ownerId": "9".repeat(20),
+                    "name": name,
+                    "repositoryId": "9".repeat(20),
+                    "defaultBranch": "b".repeat(branch_bytes),
+                    "private": true,
+                    "url": url,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "login": "l".repeat(39),
+            "repositories": repositories,
+            "page": 1,
+            "hasNextPage": true,
+        })
+    }
+
+    #[test]
+    fn worst_case_repository_listing_fits_its_own_result_bound() -> Result<(), String> {
+        let body = worst_case_repository_listing(255).to_string();
+        assert!(
+            body.len() > MAX_BRIDGE_RESULT_BYTES,
+            "a full 100-item listing exceeds the general 32 KiB bridge result bound"
+        );
+        let archive = bounded_single_file_archive(
+            "response.json",
+            body.as_bytes(),
+            MAX_REPOSITORIES_BRIDGE_RESULT_BYTES,
+        )
+        .map_err(|error| format!("archive worst-case listing: {error:?}"))?;
+        bridge_result(
+            steward_store::ConnectionOperationKind::Repositories,
+            &archive,
+        )
+        .map_err(|error| format!("worst-case listing rejected: {error:?}"))?;
+
+        let overlong = worst_case_repository_listing(256).to_string();
+        let archive = bounded_single_file_archive(
+            "response.json",
+            overlong.as_bytes(),
+            MAX_REPOSITORIES_BRIDGE_RESULT_BYTES,
+        )
+        .map_err(|error| format!("archive overlong listing: {error:?}"))?;
+        assert_eq!(
+            bridge_result(
+                steward_store::ConnectionOperationKind::Repositories,
+                &archive
+            ),
+            Err(BridgeResultError::Invalid),
+            "the bound holds only while every field stays within its limit"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_results_above_their_bound_are_too_large_not_invalid() -> Result<(), String> {
+        let padding = "x".repeat(MAX_REPOSITORIES_BRIDGE_RESULT_BYTES);
+        let body = format!(
+            r#"{{"login":"alice","repositories":[],"page":1,"hasNextPage":false,"padding":"{padding}"}}"#
+        );
+        let archive = bounded_single_file_archive("response.json", body.as_bytes(), usize::MAX)
+            .map_err(|error| format!("archive oversized listing: {error:?}"))?;
+        assert_eq!(
+            bridge_result(
+                steward_store::ConnectionOperationKind::Repositories,
+                &archive
+            ),
+            Err(BridgeResultError::TooLarge)
+        );
+        let status = format!(
+            r#"{{"connected":false,"padding":"{}"}}"#,
+            "x".repeat(MAX_BRIDGE_RESULT_BYTES)
+        );
+        let archive = bounded_single_file_archive("response.json", status.as_bytes(), usize::MAX)
+            .map_err(|error| format!("archive oversized status: {error:?}"))?;
+        assert_eq!(
+            bridge_result(steward_store::ConnectionOperationKind::Status, &archive),
+            Err(BridgeResultError::TooLarge),
+            "every other operation keeps the general bound"
+        );
+        assert_eq!(
+            BridgeResultError::TooLarge.category(),
+            "bridge_result_too_large"
+        );
         Ok(())
     }
 

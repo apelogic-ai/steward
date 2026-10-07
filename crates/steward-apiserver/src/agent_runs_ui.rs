@@ -2281,6 +2281,7 @@ where
                 | ConnectionBrokerError::ProviderAuthorizationFailed
                 | ConnectionBrokerError::TokenGrantFailed
                 | ConnectionBrokerError::ProviderResponseInvalid
+                | ConnectionBrokerError::BridgeResultTooLarge
                 | ConnectionBrokerError::GatewayTransportFailed
                 | ConnectionBrokerError::GatewayStatusInvalid
                 | ConnectionBrokerError::GatewayBodyUnavailable

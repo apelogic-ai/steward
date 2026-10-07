@@ -1,14 +1,14 @@
 {
  "content": [
   {
-   "text": "successfully downloaded text file (SHA: 8934eb4a5fabfca2502492140bfb51e89f9e0394)",
+   "text": "successfully downloaded text file (SHA: 3333333333333333333333333333333333333333)",
    "type": "text"
   },
   {
    "resource": {
     "mimeType": "text/plain; charset=utf-8",
-    "text": "[toolchain]\nchannel = \"1.95.0\"\ncomponents = [\"clippy\", \"rustfmt\"]\nprofile = \"minimal\"\n",
-    "uri": "repo://alice/example-repo/sha/7be8b0a1b913ddee3e0836658caec598192a1161/contents/rust-toolchain.toml"
+    "text": "# example-repo\n\nAn example repository.\n",
+    "uri": "repo://alice/example-repo/sha/0123456789abcdef0123456789abcdef01234567/contents/README.md"
    },
    "type": "resource"
   }
