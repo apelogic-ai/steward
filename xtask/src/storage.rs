@@ -1,8 +1,8 @@
+use crate::process::checked_command;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
@@ -259,7 +259,7 @@ fn validate_root_target(repository: &Path) -> Result<(), String> {
 }
 
 fn worktree_paths(repository: &Path) -> Result<Vec<WorktreeEntry>, String> {
-    let output = Command::new("git")
+    let output = checked_command("git")?
         .args(["worktree", "list", "--porcelain"])
         .current_dir(repository)
         .output()
@@ -299,7 +299,7 @@ fn worktree_location_is_allowed(primary: &Path, candidate: &Path) -> bool {
 }
 
 fn worktree_state(worktree: &Path) -> Result<&'static str, String> {
-    let output = Command::new("git")
+    let output = checked_command("git")?
         .args(["status", "--porcelain=v1", "--untracked-files=normal"])
         .current_dir(worktree)
         .output()

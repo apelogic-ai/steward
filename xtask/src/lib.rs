@@ -6,6 +6,7 @@ use std::path::Path;
 use serde_json::Value;
 
 mod m1_contracts;
+mod process;
 
 pub use m1_contracts::{M1ContractSummary, validate_m1_contract_directory};
 

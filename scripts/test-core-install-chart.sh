@@ -26,7 +26,7 @@ fi
 
 helm_template \
   --set-string tls.webhook.caBundlePem=public-test-ca > "${rendered}"
-if rg -q 'STEWARD_STARTER_TASK_JSON' "${rendered}"; then
+if grep -qF 'STEWARD_STARTER_TASK_JSON' "${rendered}"; then
   echo 'unset starter task must use the apiserver built-in without an environment override' >&2
   exit 1
 fi
@@ -37,9 +37,9 @@ starter_task_json='{"taskDefinition":{"schemaVersion":"steward.task-definition/v
 helm_template \
   --set-string tls.webhook.caBundlePem=public-test-ca \
   --set-json "config.apiserver.starterTask=${starter_task_json}" > "${rendered}"
-rg -q 'STEWARD_STARTER_TASK_JSON' "${rendered}"
-rg -q '\.steward/tasks/hello-world/task-definition\.json' "${rendered}"
-rg -q 'Write hello world to out/hello\.txt' "${rendered}"
+grep -qF 'STEWARD_STARTER_TASK_JSON' "${rendered}"
+grep -qF '.steward/tasks/hello-world/task-definition.json' "${rendered}"
+grep -qF 'Write hello world to out/hello.txt' "${rendered}"
 
 if helm_template \
   --set-string tls.webhook.caBundlePem=public-test-ca \
@@ -60,7 +60,7 @@ for forbidden in \
   'secretName: steward-openshell-client' \
   'name: steward-litellm'
 do
-  if rg -q "${forbidden}" "${rendered}"; then
+  if grep -qF "${forbidden}" "${rendered}"; then
     echo "core-only chart retained an execution prerequisite: ${forbidden}" >&2
     exit 1
   fi
@@ -121,7 +121,7 @@ grep -Fq 'execution.enabled requires steward-workflows in runtimeNamespaces' \
   "${missing_namespace_error}"
 helm_template "${default_runtime_inputs[@]}" \
   --set-string 'runtimeNamespaces[0]=steward-workflows' > "${rendered}"
-if rg -q 'STEWARD_OPENSHELL_RUNTIME_CLASS_NAME' "${rendered}"; then
+if grep -qF 'STEWARD_OPENSHELL_RUNTIME_CLASS_NAME' "${rendered}"; then
   echo 'default runtime render must not request a RuntimeClass' >&2
   exit 1
 fi
@@ -129,12 +129,12 @@ if helm_template "${governed_inputs[@]}" > /dev/null 2> "${rendered}"; then
   echo 'governed mode must not use an assumed Mint issuer or SPIFFE trust domain' >&2
   exit 1
 fi
-rg -q 'mint.issuer|spiffeTrustDomain' "${rendered}"
+grep -qE 'mint\.issuer|spiffeTrustDomain' "${rendered}"
 helm_template "${governed_inputs[@]}" \
   --set-string config.mint.issuer=https://mint.example.test \
   --set-string config.mint.spiffeTrustDomain=customer.example.test \
   --set-string config.mint.openshellNamespace=customer-openshell > "${rendered}"
-rg -q 'kind: ClusterSPIFFEID' "${rendered}"
-rg -q 'name: steward-mint' "${rendered}"
+grep -qF 'kind: ClusterSPIFFEID' "${rendered}"
+grep -qF 'name: steward-mint' "${rendered}"
 
 echo 'core-only chart dependency boundary passed'
