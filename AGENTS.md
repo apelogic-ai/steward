@@ -104,9 +104,23 @@ act rather than re-requesting the workflow around it.
 
 - When a maintainer identifies a change as the next release before its PR
   merges, include every required version, changelog, chart, documentation,
-  release-workflow, and release-contract update in that same PR. Its existing
-  CI run is the release-candidate gate; do not defer mechanical release metadata
-  to a second PR.
+  release-workflow, and release-contract update in that same PR. Do not defer
+  mechanical release metadata to a second PR.
+- PR CI is **not** the release gate by itself. Before a release PR is ready, every
+  check the tag-triggered release workflow runs must have passed on the PR head
+  with the same entrypoints, runner image and tools: the release `validate` job
+  (`cargo xtask ci`), vulnerability scans, released-artifact acceptance (including
+  `scripts/customer-core-install-e2e.sh --lint-source-chart`), and migration
+  rehearsal. Use the release dry-run when it exists; until then, run each
+  release-only job against the head and link the evidence in the PR. Never claim
+  a check "runs on every PR" without naming the workflow job that invokes it.
+- Scripts on the release path may use only tools the release runner provides or
+  that the gate checks explicitly (`require_tool_version`). Do not depend on
+  tools that happen to exist locally.
+- For every Helm values schema change, confirm that a default install (no
+  optional values) still lints and renders. Helm drops `null` keys before
+  validation, so a `required` key whose default is `null` breaks every install
+  that does not set it.
 - A request to cut, tag, or publish a release after the product PR has merged is
   not authority to create a standalone release-preparation PR. If `main` is not
   release-ready, stop before creating a branch, commit, push, PR, or tag. Report
@@ -116,6 +130,11 @@ act rather than re-requesting the workflow around it.
 - Never tag a commit that the current release contract will reject. Do not call
   a standalone release-preparation change cheap or simple when repository rules
   require the full gate.
+- Do not push release tags. A release tag is created by a maintainer (or the
+  maintainer-authorized coordinator) only after CI, or the release dry-run, has
+  passed on the exact merge commit. A pushed tag is immutable: if its release
+  fails, even before publishing, the fix ships as the next patch version, and
+  the CHANGELOG records the failed version as unusable.
 
 ### Public repository artifacts
 
