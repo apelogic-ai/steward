@@ -21,6 +21,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   path with `steward-run` 0.8.0 or later and falls back to the compatible invocation
   manifest for older reviewed releases. These fields require Steward 0.3.9 or later;
   earlier Steward releases reject them.
+- Added a deployment-configurable starter Task, served at runtime to the browser with
+  configurable package path, inputs, execution-log default, presentation fields and
+  source examples. The built-in Hello World prompt now explicitly permits the shell
+  write it requires while prohibiting network and MCP access.
+- Added the seven-step Get started journey from GitHub connection and first Envelope
+  through a governed browser test, exact package publication, workflow verification,
+  GitHub dispatch and linked result. Progress and navigation are restored from
+  persisted server evidence without running governed GitHub probes on page load.
 - Added governed GitHub repository automation that discovers an owner-scoped target,
   publishes an exact Task package and pinned caller workflow through a pull request,
   observes merge readiness, dispatches the workflow, and reports the resulting run.
