@@ -2,6 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+bash "${root}/scripts/test-core-install-chart.sh"
 bash "${root}/scripts/test-validate-release-version.sh"
 bash "${root}/scripts/validate-release-version.sh" >/dev/null
 bash "${root}/scripts/test-released-artifact-acceptance.sh"

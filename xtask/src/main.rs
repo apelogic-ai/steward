@@ -116,6 +116,7 @@ fn root() -> PathBuf {
 
 fn ci() -> TaskResult {
     quality()?;
+    run("bash", &["scripts/test-core-install-chart.sh"])?;
     conformance(&["--pinned".to_owned()])
 }
 
