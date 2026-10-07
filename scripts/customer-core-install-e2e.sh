@@ -2,6 +2,85 @@
 # Disposable customer-style core install from released OCI artifacts only.
 set -euo pipefail
 
+build_release_value_sets() {
+  values=(
+    --set-string spire.className=spire-spire
+    --set-string "images.repository=${image_repository}"
+    --set-string "images.apiserver.tag=${release_version}-apiserver"
+    --set-string "images.apiserver.digest=${api_digest}"
+    --set-string "images.controller.tag=${release_version}-controller"
+    --set-string "images.controller.digest=${controller_digest}"
+    --set-string "networkPolicy.kubeApiCidrs[0]=${api_ip}/32"
+    --set-string "networkPolicy.postgresCidrs[0]=${postgres_ip}/32"
+    --set-file "tls.webhook.caBundlePem=${run_dir}/ca.crt"
+  )
+  complete_values=(
+    "${values[@]}"
+    --set-json 'config.apiserver.stewardRunRelease={"manifestSchemaVersion":3,"version":"0.7.0","workflowRepository":"example-org/steward-run","workflowCommit":"3333333333333333333333333333333333333333","actionCommit":"4444444444444444444444444444444444444444"}'
+    --set execution.enabled=true
+    --set web.enabled=true
+    --set browserAuth.enabled=true
+    --set-string images.mint.tag="${release_version}-mint"
+    --set-string images.mint.digest="${mint_digest}"
+    --set-string images.web.tag="${release_version}-web"
+    --set-string images.web.digest="${web_digest}"
+    --set-string config.apiserver.inferenceEndpoint=https://inference.example.test/v1/responses
+    --set-string config.controller.openshellEndpoint=https://openshell.example.test
+    --set-string config.controller.openshellServerName=openshell.example.test
+    --set-string config.controller.workloadExchangeEndpoint=https://identity.example.test/v1/workload/exchange
+    --set-string config.controller.workloadExchangeServerName=identity.example.test
+    --set-string config.controller.litellmUrl=https://litellm.example.test
+    --set-string config.mint.issuer=https://mint.example.test
+    --set-string config.mint.spiffeTrustDomain=example.test
+    --set-string config.mint.openshellNamespace=openshell
+    --set-string browserAuth.google.clientId=obviously-fake-client-id
+    --set-string browserAuth.google.origin=https://steward.example.test
+    --set-string browserAuth.google.workspaceDomain=example.test
+    --set-string browserAuth.google.organizationId=org_example
+    --set-string browserAuth.google.clientSecret.name=steward-browser-auth
+    --set-string browserAuth.google.clientSecret.key=client-secret
+    --set-string 'networkPolicy.browserAuthEgressCidrs[0]=192.0.2.0/24'
+    --set connectionsBridge.enabled=true
+    --set-string connectionsBridge.artifactTrust.mode=operator-pinned
+    --set-string connectionsBridge.image="${image_repository}@${bridge_digest}"
+    --set-string connectionsBridge.mcpGatewayOrigin=https://mcp-gw.example.test
+    --set-string connectionsBridge.mcpGatewayVersion=0.4.9
+    --set-string connectionsBridge.runtimeNamespace=steward-runtimes
+    --set-string 'runtimeNamespaces[0]=steward-runtimes'
+    --set-string 'runtimeNamespaces[1]=steward-workflows'
+  )
+}
+
+if [[ "${1:-}" == --lint-source-chart ]]; then
+  source_chart="${2:?source chart path is required}"
+  if [[ "$#" != 2 ]]; then
+    echo 'usage: customer-core-install-e2e.sh --lint-source-chart <chart>' >&2
+    exit 2
+  fi
+  lint_dir="$(mktemp -d)"
+  trap 'find "${lint_dir}" -depth -delete' EXIT
+  printf '%s\n' public-release-validation-ca > "${lint_dir}/ca.crt"
+  run_dir="${lint_dir}"
+  release_version="$(awk '$1 == "version:" { print $2; exit }' "${source_chart}/Chart.yaml")"
+  image_repository=registry.example.test/steward
+  api_digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  controller_digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
+  mint_digest=sha256:2222222222222222222222222222222222222222222222222222222222222222
+  bridge_digest=sha256:3333333333333333333333333333333333333333333333333333333333333333
+  web_digest=sha256:4444444444444444444444444444444444444444444444444444444444444444
+  api_ip=192.0.2.10
+  postgres_ip=192.0.2.11
+  build_release_value_sets
+  helm lint "${source_chart}" "${values[@]}" >/dev/null
+  helm lint "${source_chart}" "${complete_values[@]}" >/dev/null
+  echo 'released-artifact core and complete source-chart profiles passed'
+  exit 0
+fi
+if [[ "$#" != 0 ]]; then
+  echo 'usage: customer-core-install-e2e.sh' >&2
+  exit 2
+fi
+
 kind_node_image="kindest/node:v1.32.1@sha256:6afef2b7f69d627ea7bf27ee6696b6868d18e03bf98167c420df486da4662db6"
 release_version="${STEWARD_RELEASE_VERSION:?STEWARD_RELEASE_VERSION is required}"
 image_repository="${STEWARD_RELEASE_IMAGE_REPOSITORY:?STEWARD_RELEASE_IMAGE_REPOSITORY is required}"
@@ -182,52 +261,7 @@ api_ip="$(kubectl --kubeconfig "${kubeconfig}" --context "${context}" \
   -n default get service kubernetes -o jsonpath='{.spec.clusterIP}')"
 
 stage=install
-values=(
-  --set-string spire.className=spire-spire
-  --set-string "images.repository=${image_repository}"
-  --set-string "images.apiserver.tag=${release_version}-apiserver"
-  --set-string "images.apiserver.digest=${api_digest}"
-  --set-string "images.controller.tag=${release_version}-controller"
-  --set-string "images.controller.digest=${controller_digest}"
-  --set-string "networkPolicy.kubeApiCidrs[0]=${api_ip}/32"
-  --set-string "networkPolicy.postgresCidrs[0]=${postgres_ip}/32"
-  --set-file "tls.webhook.caBundlePem=${run_dir}/ca.crt"
-)
-complete_values=(
-  "${values[@]}"
-  --set-json 'config.apiserver.stewardRunRelease={"manifestSchemaVersion":3,"version":"0.7.0","workflowRepository":"example-org/steward-run","workflowCommit":"3333333333333333333333333333333333333333","actionCommit":"4444444444444444444444444444444444444444"}'
-  --set execution.enabled=true
-  --set web.enabled=true
-  --set browserAuth.enabled=true
-  --set-string images.mint.tag="${release_version}-mint"
-  --set-string images.mint.digest="${mint_digest}"
-  --set-string images.web.tag="${release_version}-web"
-  --set-string images.web.digest="${web_digest}"
-  --set-string config.apiserver.inferenceEndpoint=https://inference.example.test/v1/responses
-  --set-string config.controller.openshellEndpoint=https://openshell.example.test
-  --set-string config.controller.openshellServerName=openshell.example.test
-  --set-string config.controller.workloadExchangeEndpoint=https://identity.example.test/v1/workload/exchange
-  --set-string config.controller.workloadExchangeServerName=identity.example.test
-  --set-string config.controller.litellmUrl=https://litellm.example.test
-  --set-string config.mint.issuer=https://mint.example.test
-  --set-string config.mint.spiffeTrustDomain=example.test
-  --set-string config.mint.openshellNamespace=openshell
-  --set-string browserAuth.google.clientId=obviously-fake-client-id
-  --set-string browserAuth.google.origin=https://steward.example.test
-  --set-string browserAuth.google.workspaceDomain=example.test
-  --set-string browserAuth.google.organizationId=org_example
-  --set-string browserAuth.google.clientSecret.name=steward-browser-auth
-  --set-string browserAuth.google.clientSecret.key=client-secret
-  --set-string 'networkPolicy.browserAuthEgressCidrs[0]=192.0.2.0/24'
-  --set connectionsBridge.enabled=true
-  --set-string connectionsBridge.artifactTrust.mode=operator-pinned
-  --set-string connectionsBridge.image="${image_repository}@${bridge_digest}"
-  --set-string connectionsBridge.mcpGatewayOrigin=https://mcp-gw.example.test
-  --set-string connectionsBridge.mcpGatewayVersion=0.4.9
-  --set-string connectionsBridge.runtimeNamespace=steward-runtimes
-  --set-string 'runtimeNamespaces[0]=steward-runtimes'
-  --set-string 'runtimeNamespaces[1]=steward-workflows'
-)
+build_release_value_sets
 helm lint "${chart_archive}" "${complete_values[@]}" >/dev/null
 helm template steward "${chart_archive}" --namespace steward \
   "${complete_values[@]}" > "${run_dir}/complete-rendered.yaml"

@@ -199,7 +199,7 @@ process logs.
 
 ## Compatibility and validation
 
-`packagePath` and `promptText` require Steward **0.3.9 or later**. Older Steward
+`packagePath` and `promptText` require Steward **0.3.10 or later**. Older Steward
 versions reject these unknown fields instead of executing different content. Existing
 manifest-backed submissions and path-backed prompts remain byte-for-byte compatible.
 

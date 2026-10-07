@@ -30,6 +30,8 @@ if rg -q 'STEWARD_STARTER_TASK_JSON' "${rendered}"; then
   echo 'unset starter task must use the apiserver built-in without an environment override' >&2
   exit 1
 fi
+bash "${root}/scripts/customer-core-install-e2e.sh" \
+  --lint-source-chart "${root}/charts/steward"
 
 starter_task_json='{"taskDefinition":{"schemaVersion":"steward.task-definition/v2","name":"hello-world","version":2,"runtime":{"agentRef":"codex@0.140.0"},"promptText":"Write hello world to out/hello.txt.","outputs":[{"path":"out/hello.txt","kind":"file","required":true}]},"inputs":{"greeting":"hello"},"executionLog":"full","packagePath":".steward/tasks/hello-world/task-definition.json","title":"Hello world","description":"A deployment-owned starter task.","git":{"repository":"https://github.com/example-org/agentic-ops.git","revision":"git:ref:main","path":"catalog/hello/task-definition.json"},"publishedWorkflow":"repo-summary@2"}'
 helm_template \
