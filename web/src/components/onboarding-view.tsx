@@ -11,7 +11,6 @@ import {
   githubRunStatus,
   githubTaskBundle,
   listPublishedWorkflows,
-  listRepositories,
   listTemplates,
   myRunExecutionLog,
   publishTask,
@@ -22,7 +21,6 @@ import {
   type EnvelopeTemplatesResponse,
   type GithubAutomationEvidenceResponse,
   type GithubAutomationErrorResponse,
-  type GithubRepositoriesResponse,
   type GithubRunStatusResponse,
   type GithubTaskBundleResponse,
   type PublishTaskResponse,
@@ -39,6 +37,7 @@ import {
 } from "@/components/browser-run-now-view";
 import { parseRunEventData } from "@/components/run-views";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
+import { RepositoryResource, useGithubRepositories, type RepositoryResourceState } from "@/data/github-repositories";
 import { defaultOnboardingRepository, deriveOnboardingProgress, loadOnboardingEvidence, ONBOARDING_PROGRESS_EVENT, type OnboardingEvidence } from "@/data/onboarding-progress";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
@@ -46,7 +45,6 @@ import { useSession } from "@/session/session-context";
 type OnboardingData = OnboardingEvidence & {
   templates: EnvelopeTemplatesResponse;
   starterTask: StarterTaskSetting;
-  repositories: GithubRepositoriesResponse;
   workflows: PublishedWorkflowsResponse;
 };
 
@@ -102,29 +100,21 @@ export { browserHelloWorldRun } from "@/data/onboarding-progress";
 
 export function OnboardingView() {
   const [refresh, setRefresh] = useState(0);
+  const repositories = useGithubRepositories();
   const load = useCallback(async () => {
     void refresh;
-    const [evidence, templates, starterTask, repositories, workflows] = await Promise.all([
+    const [evidence, templates, starterTask, workflows] = await Promise.all([
       loadOnboardingEvidence(),
       listTemplates({ cache: "no-store", credentials: "same-origin" }),
       getStarterTask({ cache: "no-store", credentials: "same-origin" }),
-      listRepositories({ cache: "no-store", credentials: "same-origin", query: { query: "", page: 1, perPage: 100 } }),
       listPublishedWorkflows({ cache: "no-store", credentials: "same-origin" }),
     ]);
     const required = [evidence, templates, starterTask, workflows];
-    const repositoryData = repositories.data ?? {
-      apiVersion: "steward.github-automation/v1",
-      hasNextPage: false,
-      login: "",
-      page: 1,
-      repositories: [],
-    };
     const data = evidence.data && templates.data && starterTask.data && workflows.data
       ? {
           ...evidence.data,
           templates: templates.data,
           starterTask: starterTask.data.starterTask,
-          repositories: repositoryData,
           workflows: workflows.data,
         }
       : undefined;
@@ -134,18 +124,25 @@ export function OnboardingView() {
   const handleRefresh = useCallback(() => setRefresh((value) => value + 1), []);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <ResourceBoundary state={state}>{(data) => <OnboardingChecklist data={data} onRefresh={handleRefresh} />}</ResourceBoundary>
+      <ResourceBoundary state={state}>{(data) => <OnboardingChecklist data={data} onRefresh={handleRefresh} onRetryRepositories={repositories.retry} repositories={repositories.state} />}</ResourceBoundary>
     </section>
   );
 }
 
-function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingData; onRefresh: () => void }>) {
+function OnboardingChecklist({ data, onRefresh, onRetryRepositories, repositories }: Readonly<{
+  data: OnboardingData;
+  onRefresh: () => void;
+  onRetryRepositories: () => void;
+  repositories: RepositoryResourceState;
+}>) {
   const session = useSession();
   const baseProgress = useMemo(() => deriveOnboardingProgress(data), [data]);
   const activeEnvelopes = data.envelopes.requests.filter((request) => request.status === "provisioned" && request.envelopeDigest);
   const connectedConnection = data.connections.connections.find((connection) => connection.status.phase === "connected");
   const provisionedRequest = activeEnvelopes[0];
-  const readyRepository = defaultOnboardingRepository(data.repositories.repositories);
+  const repositoryData = repositories.status === "ready" ? repositories.value : null;
+  const repositoryList = useMemo(() => repositoryData?.repositories ?? [], [repositoryData]);
+  const readyRepository = defaultOnboardingRepository(repositoryList);
   const [selectedTemplateId, setSelectedTemplateId] = useState(data.templates.templates[0]?.id ?? "");
   const [selectedEnvelopeId, setSelectedEnvelopeId] = useState(provisionedRequest?.id ?? "");
   const [selectedRepositoryId, setSelectedRepositoryId] = useState(readyRepository?.repositoryId ?? "");
@@ -155,9 +152,12 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
   const [createdRunUid, setCreatedRunUid] = useState<string | null>(null);
   const [runState, setRunState] = useState<"idle" | "submitting" | "error">("idle");
   const [runFailure, setRunFailure] = useState<string | null>(null);
-  const [bundle, setBundle] = useState<GithubTaskBundleResponse | null>(null);
-  const [manualFiles, setManualFiles] = useState<Record<string, string>>({});
-  const [bundleFailure, setBundleFailure] = useState<string | null>(null);
+  const [bundleResource, setBundleResource] = useState<{
+    bundle: GithubTaskBundleResponse | null;
+    failure: string | null;
+    manualFiles: Record<string, string>;
+    taskUid: string;
+  } | null>(null);
   const [publication, setPublication] = useState<PublishTaskResponse | null>(null);
   const [workflow, setWorkflow] = useState<WorkflowDetectionResponse | null>(null);
   const [dispatch, setDispatch] = useState<DispatchTaskResponse | null>(null);
@@ -169,7 +169,7 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
   const [workflowTab, setWorkflowTab] = useState<"full" | "job">("full");
 
   const selectedEnvelope = activeEnvelopes.find((request) => request.id === selectedEnvelopeId) ?? activeEnvelopes[0];
-  const selectedRepository = data.repositories.repositories.find((repository) => repository.repositoryId === selectedRepositoryId) ?? readyRepository;
+  const selectedRepository = repositoryList.find((repository) => repository.repositoryId === selectedRepositoryId) ?? readyRepository;
   const envelope = selectedEnvelope?.approvedEnvelope ?? selectedEnvelope?.requestedEnvelope;
   const agentOptions = compatibleAgents(data.workflows.agents.map((agent) => agent.agentRef), envelope?.spec.llms ?? []);
   const { selected: selectedAgent, warning: agentWarning } = effectiveAgentSelection(agentOptions, agentRef);
@@ -190,6 +190,10 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
   const successfulTestRun = testRun?.phase === "succeeded" && testRun.finalized ? testRun : undefined;
   const taskUid = successfulTestRun?.taskUid ?? null;
   const packagePath = successfulTestRun?.package?.path ?? data.starterTask.packagePath;
+  const currentBundleResource = bundleResource?.taskUid === taskUid ? bundleResource : null;
+  const bundle = currentBundleResource?.bundle ?? null;
+  const manualFiles = currentBundleResource?.manualFiles ?? {};
+  const bundleFailure = currentBundleResource?.failure ?? null;
   const packagePreview = bundle?.files[packagePath] ?? manualFiles[packagePath] ?? null;
   const workflowPreview = bundle ? bundle.files[bundle.workflowPath] ?? null : null;
   const automationRun = baseProgress.automationRun;
@@ -228,20 +232,42 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
 
   useEffect(() => {
     let active = true;
+    if (session.status !== "authenticated" || !taskUid) return () => { active = false; };
+    void githubTaskBundle({
+        cache: "no-store",
+        credentials: "same-origin",
+        path: { task_uid: taskUid },
+      }).then((bundleResult) => {
+      if (!active) return;
+      const problem = bundleResult.error as GithubAutomationErrorResponse | undefined;
+      setBundleResource({
+        bundle: bundleResult.data && bundleResult.response?.ok ? bundleResult.data : null,
+        failure: bundleResult.data && bundleResult.response?.ok
+          ? null
+          : problem?.error === "steward_run_release_unsupported"
+            ? "The reviewed steward-run release is below 0.8.0. Copy the Task definition manually; workflow generation and detection require steward-run 0.8.0 or later."
+            : "Steward could not render the exact tested package and workflow.",
+        manualFiles: problem?.manualFiles ?? {},
+        taskUid,
+      });
+    }).catch(() => {
+      if (active) setBundleResource({ bundle: null, failure: "Steward could not render the exact tested package and workflow.", manualFiles: {}, taskUid });
+    });
+    return () => { active = false; };
+  }, [session.status, taskUid]);
+
+  useEffect(() => {
+    let active = true;
     void (async () => {
       await Promise.resolve();
       if (!active) return;
-      setBundle(null);
-      setManualFiles({});
-      setBundleFailure(null);
       setPublication(null);
       setWorkflow(null);
       setDispatch(null);
       setGithubStatus(null);
       if (session.status !== "authenticated" || !taskUid || !selectedRepository) return;
       setAutomationState("checking");
-      const [bundleResult, evidenceResult] = await Promise.all([
-        githubTaskBundle({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } }),
+      const [evidenceResult] = await Promise.all([
         selectedRepository.ready ? githubAutomationEvidence({
           cache: "no-store",
           credentials: "same-origin",
@@ -251,14 +277,6 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
         refreshWorkflow(),
       ]);
       if (!active) return;
-      if (bundleResult.data && bundleResult.response?.ok) setBundle(bundleResult.data);
-      else {
-        const problem = bundleResult.error as GithubAutomationErrorResponse | undefined;
-        if (problem?.manualFiles) setManualFiles(problem.manualFiles);
-        setBundleFailure(problem?.error === "steward_run_release_unsupported"
-          ? "The reviewed steward-run release is below 0.8.0. Copy the Task definition manually; workflow generation and detection require steward-run 0.8.0 or later."
-          : "Steward could not render the exact tested package and workflow.");
-      }
       if (evidenceResult?.data && evidenceResult.response?.ok) {
         const evidence: GithubAutomationEvidenceResponse = evidenceResult.data;
         setPublication(evidence.publication ?? null);
@@ -408,7 +426,7 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
   const stepRows: Array<{ title: string; status: string; body: ReactNode }> = [
     {
       title: "Connect GitHub",
-      status: done[0] ? `Connected as ${data.repositories.login || connectedConnection?.status.accountEmail || "GitHub user"}` : "Authorize repository access",
+      status: done[0] ? `Connected as ${repositoryData?.login || connectedConnection?.status.accountEmail || "GitHub user"}` : "Authorize repository access",
       body: <div className="space-y-3"><p className="text-sm text-muted-ink">HyperShell holds the GitHub credential on your behalf. Agents never see it.</p><div className="flex flex-wrap gap-3"><Link className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href="/connections">Connect GitHub</Link><Link className="self-center text-sm font-semibold" href="/connections">Manage connections</Link></div></div>,
     },
     {
@@ -422,7 +440,7 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
       body: <form className="space-y-4" onSubmit={(event) => void submitTestRun(event)}>
         <p className="text-sm text-muted-ink">Check the combination before wiring it into CI. This run is governed exactly like one started from GitHub.</p>
         <div className="grid gap-4 md:grid-cols-3">
-          <label className="grid gap-2 text-sm font-semibold">Repository<select className={fieldClass} onChange={(event) => setSelectedRepositoryId(event.target.value)} value={selectedRepository?.repositoryId ?? ""}>{data.repositories.repositories.map((repository) => <option key={repository.repositoryId} value={repository.repositoryId}>{repository.owner}/{repository.name}{repository.ready ? " · Ready" : " · Not ready"}</option>)}</select></label>
+          <div className="grid content-start gap-2 text-sm"><strong>Repository</strong><RepositoryResource onRetry={onRetryRepositories} state={repositories}>{({ repositories: available }) => available.length ? <label><span className="sr-only">Repository</span><select aria-label="Repository" className={fieldClass} onChange={(event) => setSelectedRepositoryId(event.target.value)} value={selectedRepository?.repositoryId ?? ""}>{available.map((repository) => <option key={repository.repositoryId} value={repository.repositoryId}>{repository.owner}/{repository.name}{repository.ready ? " · Ready" : " · Not ready"}</option>)}</select></label> : <p className="font-normal text-muted-ink">No GitHub repositories are visible to this connection.</p>}</RepositoryResource></div>
           <label className="grid gap-2 text-sm font-semibold">Coding agent<select className={fieldClass} onChange={(event) => setAgentRef(event.target.value)} value={agentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.agentRef}{agent.compatible ? "" : " · unavailable"}</option>)}</select></label>
           <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} onChange={(event) => setSelectedEnvelopeId(event.target.value)} value={selectedEnvelope?.id ?? ""}>{activeEnvelopes.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
         </div>
@@ -438,7 +456,7 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
     {
       title: "Publish the task definition",
       status: publication ? `Pull request #${publication.pullRequestNumber} opened` : workflow?.compatible ? "Published workflow found on the default branch" : "Publish the exact tested Task as a pull request",
-      body: successfulTestRun ? <div className="space-y-4"><p className="text-sm text-muted-ink">Review the exact <code>steward.task-definition/v2</code> document that ran at <code>{packagePath}</code>.</p>{packagePreview ? <Preview title={packagePath} value={packagePreview} copied={copied === "package"} onCopy={() => copyText(packagePreview, () => setCopied("package"))} /> : <p className="text-sm text-warn">{bundleFailure ?? "Rendering the tested package…"}</p>}{readinessFailure ? <p className="text-sm text-warn">{readinessFailure} Copy the generated files into the repository manually.</p> : null}{bundleFailure ? <p className="text-sm text-warn">{bundleFailure}</p> : null}<div className="flex flex-wrap gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!bundle || !selectedRepository?.ready || automationState === "publishing"} onClick={() => void openPublication()} type="button">{automationState === "publishing" ? "Opening…" : "Open pull request"}</button>{publication ? <a className="rounded-control border px-4 py-2 text-sm font-semibold" href={publication.pullRequestUrl} rel="noreferrer" target="_blank">View pull request ↗</a> : null}<button className="rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!workflowPreview} onClick={() => void refreshWorkflow()} type="button">I&apos;ve committed it</button></div><p className="text-xs text-muted-ink">Change the prompt or inputs in step 3 to regenerate it.</p></div> : <p className="text-sm text-muted-ink">Complete a successful test run first.</p>,
+      body: successfulTestRun ? <div className="space-y-4"><p className="text-sm text-muted-ink">Review the exact <code>steward.task-definition/v2</code> document that ran at <code>{packagePath}</code>.</p>{packagePreview ? <Preview title={packagePath} value={packagePreview} copied={copied === "package"} onCopy={() => copyText(packagePreview, () => setCopied("package"))} /> : bundleFailure ? null : <p className="text-sm text-warn">Rendering the tested package…</p>}{bundleFailure ? <p className="text-sm text-warn">{bundleFailure}</p> : null}<RepositoryResource onRetry={onRetryRepositories} state={repositories}>{({ repositories: available }) => available.length ? null : <p className="text-sm text-muted-ink">The tested package is ready, but no repository is available for publication.</p>}</RepositoryResource>{readinessFailure ? <p className="text-sm text-warn">{readinessFailure} Copy the generated files into the repository manually.</p> : null}<div className="flex flex-wrap gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!bundle || !selectedRepository?.ready || automationState === "publishing"} onClick={() => void openPublication()} type="button">{automationState === "publishing" ? "Opening…" : "Open pull request"}</button>{publication ? <a className="rounded-control border px-4 py-2 text-sm font-semibold" href={publication.pullRequestUrl} rel="noreferrer" target="_blank">View pull request ↗</a> : null}<button className="rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!workflowPreview} onClick={() => void refreshWorkflow()} type="button">I&apos;ve committed it</button></div><p className="text-xs text-muted-ink">Change the prompt or inputs in step 3 to regenerate it.</p></div> : <p className="text-sm text-muted-ink">Complete a successful test run first.</p>,
     },
     {
       title: "Add the workflow to your repository",

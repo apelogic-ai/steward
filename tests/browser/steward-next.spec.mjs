@@ -823,6 +823,8 @@ async function guardedPage(browser, {
   includeSampleWorkflow = false,
   githubBundleStatus = 200,
   githubRepositoriesStatus = 200,
+  githubRepositoryResponses = null,
+  holdGithubRepositories = false,
   inlineRun = false,
   publishedWorkflows = true,
   taskLibraryMutable = false,
@@ -853,6 +855,9 @@ async function guardedPage(browser, {
   const federatedSubjects = structuredClone(federatedSubjectFixtures);
   let githubWorkflowPublished = false;
   let githubRunStatusRequests = 0;
+  let githubRepositoryRequestCount = 0;
+  let releaseGithubRepositories;
+  const githubRepositoriesReleased = new Promise((resolve) => { releaseGithubRepositories = resolve; });
   let onboardingRunCreated = false;
   let laterFailedOnboardingRun = false;
   let githubAutomationCompleted = false;
@@ -1330,7 +1335,22 @@ async function guardedPage(browser, {
     taskUid: new URL(route.request().url()).pathname.split("/").at(-2),
     files: browserTaskFiles,
   }));
-  await context.route(`${origin}/app/api/v1/github/repositories*`, (route) => githubRepositoriesStatus === 200 ? json(route, {
+  await context.route(`${origin}/app/api/v1/github/repositories*`, async (route) => {
+    if (holdGithubRepositories) await githubRepositoriesReleased;
+    const configured = githubRepositoryResponses?.[
+      Math.min(githubRepositoryRequestCount, githubRepositoryResponses.length - 1)
+    ];
+    githubRepositoryRequestCount += 1;
+    const status = configured?.status ?? githubRepositoriesStatus;
+    if (status !== 200) {
+      await json(route, {
+        apiVersion: "steward.github-automation/v1",
+        error: configured?.error ?? "connection_unavailable",
+        reason: configured?.reason ?? null,
+      }, status);
+      return;
+    }
+    await json(route, {
     apiVersion: "steward.github-automation/v1",
     login: "alice",
     repositories: [
@@ -1358,7 +1378,8 @@ async function guardedPage(browser, {
     ],
     page: 1,
     hasNextPage: false,
-  }) : json(route, { apiVersion: "steward.github-automation/v1", error: "connection_unavailable" }, githubRepositoriesStatus));
+    });
+  });
   const onboardingWorkflowPath = `.github/workflows/hypershell-${starterTask.taskDefinition.name}.yml`;
   const onboardingPackage = JSON.stringify(starterTask.taskDefinition, null, 2);
   const onboardingWorkflow = [
@@ -1391,6 +1412,7 @@ async function guardedPage(browser, {
         apiVersion: "steward.github-automation/v1",
         files: {
           [starterTask.packagePath]: onboardingPackage,
+          [browserTaskDefinitionPath]: onboardingPackage,
           [onboardingWorkflowPath]: onboardingWorkflow,
         },
         workflowPath: onboardingWorkflowPath,
@@ -1804,6 +1826,7 @@ async function guardedPage(browser, {
     mutations,
     runEventRequests,
     setupStatusRequests,
+    releaseGithubRepositories,
     useAdminSetupStatus: (status) => { currentAdminSetupStatus = status; },
     useLaterFailedOnboardingRun: () => { laterFailedOnboardingRun = true; },
   };
@@ -2724,6 +2747,61 @@ test("onboarding loads without a published sample or GitHub repository metadata"
   }
 });
 
+test("Get started exposes repository failures with retry without hiding the tested package", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    expectedHttpStatuses: [503],
+    githubRepositoryResponses: [
+      { status: 503, error: "github_automation_unavailable", reason: "bridge_contract" },
+      { status: 200 },
+    ],
+    inlineRun: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Try a test run" })).toBeVisible();
+    await expect(developer.page.getByRole("alert").filter({ hasText: "github_automation_unavailable" })).toContainText("bridge_contract");
+
+    const publicationStep = developer.page.getByRole("listitem").filter({ hasText: "Publish the task definition" });
+    if (await publicationStep.getByRole("button").first().getAttribute("aria-expanded") !== "true") {
+      await publicationStep.getByRole("button").first().click();
+    }
+    await expect(publicationStep.locator("pre")).toContainText('"schemaVersion": "steward.task-definition/v2"');
+
+    await developer.page.getByRole("button", { name: "Retry repositories" }).first().click();
+    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
+    await runStep.getByRole("button").first().click();
+    await expect(runStep.getByLabel("Repository").locator("option")).toHaveCount(2);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Get started renders its checklist while the repository request remains pending", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    holdGithubRepositories: true,
+    inlineRun: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.getByRole("listitem").filter({ hasText: "Connect GitHub" })).toBeVisible();
+    await expect(developer.page.getByText("Loading GitHub repositories…", { exact: true })).toBeVisible();
+
+    const publicationStep = developer.page.getByRole("listitem").filter({ hasText: "Publish the task definition" });
+    if (await publicationStep.getByRole("button").first().getAttribute("aria-expanded") !== "true") {
+      await publicationStep.getByRole("button").first().click();
+    }
+    await expect(publicationStep.locator("pre")).toContainText('"schemaVersion": "steward.task-definition/v2"');
+
+    developer.releaseGithubRepositories();
+    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
+    await runStep.getByRole("button").first().click();
+    await expect(runStep.getByLabel("Repository")).toBeVisible();
+  } finally {
+    developer.releaseGithubRepositories();
+    await closeGuardedPage(developer);
+  }
+});
+
 test("the Task library creates immutable versions and runs inline, Git, and published Tasks through one UI", async ({ browser }) => {
   const developer = await guardedPage(browser, { taskLibraryMutable: true });
   const v1Digest = `steward:sha256:${"1".repeat(64)}`;
@@ -2925,6 +3003,27 @@ test("a successful inline run publishes and dispatches the exact governed GitHub
     expect(dispatch.body).toMatchObject({ owner: "example-org", repository: "agentic-ops", inputs: {} });
     await expect(developer.page.getByRole("link", { name: "GitHub run 12345" })).toBeVisible();
     await expect(developer.page.getByRole("link", { name: "Open governed Task · succeeded" })).toHaveAttribute("href", "/runs/00000000-0000-0000-0000-000000000007", { timeout: 10_000 });
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("the run publish panel exposes repository failures and retries them", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    expectedHttpStatuses: [503],
+    githubRepositoryResponses: [
+      { status: 503, error: "github_automation_unavailable", reason: "bridge_contract" },
+      { status: 200 },
+    ],
+    inlineRun: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/tasks/${encodeURIComponent(browserTaskDigest)}`);
+    const panel = developer.page.getByLabel("Publish this task to GitHub");
+    await expect(panel.getByRole("alert")).toContainText("github_automation_unavailable");
+    await expect(panel.getByRole("alert")).toContainText("bridge_contract");
+    await panel.getByRole("button", { name: "Retry repositories" }).click();
+    await expect(panel.getByLabel("Repository").locator("option")).toHaveCount(2);
   } finally {
     await closeGuardedPage(developer);
   }
