@@ -13,13 +13,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   earlier, whose tested package is a root `task-definition.json` with a path-backed
   `prompt.md`. Both files are published unchanged with the generated `package-path`
   caller, and the published package digest equals the tested closure digest. The
-  governed publication allowlist accepts a root `task-definition.json` and one
-  `prompt.md` beside the Task definition. Step 4 previews every package file.
+  governed publication allowlist accepts root paths only for that exact legacy pair;
+  every other package must be a Task definition under `.steward/tasks/`. Step 4 and the
+  run-detail publish panel preview every package file and show the refusal reason.
+- Before writing a legacy root file, publication reads the default branch and refuses
+  with `repository_root_conflict` when a different file already exists at that path.
+  Identical content is accepted. Resuming a publication branch no longer fails when a
+  published file is identical to the base branch.
+- Generated caller workflows now record the tested closure digest
+  (`# package-digest: ...`). Exact-content workflow detection and dispatch therefore
+  reject a caller generated for another Task at the same path. A caller published before
+  this change no longer matches detection; publish the Task again to enable **Run on
+  GitHub**.
 - Evidence that cannot be published now returns `409` with
   `error: tested_package_unpublishable` and a bounded `reason`
   (`evidence_unavailable`, `source_not_inline`, `package_files_invalid`,
-  `closure_mismatch`, `package_shape_unsupported`, `envelope_unavailable`, or
-  `workflow_unavailable`) instead of an empty `409`; Get started shows that reason.
+  `closure_mismatch`, `package_shape_unsupported`, `repository_root_conflict`,
+  `envelope_unavailable`, or `workflow_unavailable`) instead of an empty `409`. The
+  read-only GitHub evidence routes return `409` with `error: run_evidence_unavailable`.
 
 ## [0.3.11] - 2026-10-06
 

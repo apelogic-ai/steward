@@ -305,7 +305,7 @@ invoking repository needs no cross-repository binding. A package in another
 repository additionally needs its exact caller/source ID pair in
 `githubSource.bindings`. When protected-resource discovery is configured, it
 advertises the resulting capability as `steward_direct_packages_supported` and
-advertises same-repository two-file invocation as
+advertises same-repository `packagePath` invocation as
 `steward_package_path_supported`. steward-run 0.8.0 or later requires the
 second field before it submits `package-path`; when either underlying
 capability is false, a direct submission returns

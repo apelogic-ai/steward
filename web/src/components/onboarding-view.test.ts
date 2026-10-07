@@ -3,7 +3,9 @@ import { expect, test } from "bun:test";
 import type { BrowserRunView } from "@/api-client";
 import { automatedPackageRun } from "@/data/onboarding-progress";
 
-import { browserHelloWorldRun, bundleFailureMessage, governedJobOnly, packageFileEntries } from "./onboarding-view";
+import { automationProblemMessage, bundleFailureMessage } from "@/data/github-automation-problem";
+
+import { browserHelloWorldRun, governedJobOnly, packageFileEntries } from "./onboarding-view";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -136,9 +138,17 @@ test("bundle failures explain bounded unpublishable reasons instead of the gener
   expect(bundleFailureMessage(undefined)).toBe(generic);
   expect(bundleFailureMessage({ apiVersion: "steward.github-automation/v1", error: "github_automation_unavailable" })).toBe(generic);
   expect(bundleFailureMessage({ apiVersion: "steward.github-automation/v1", error: "steward_run_release_unsupported" })).toContain("steward-run 0.8.0");
-  for (const reason of ["evidence_unavailable", "source_not_inline", "package_files_invalid", "closure_mismatch", "package_shape_unsupported", "envelope_unavailable", "workflow_unavailable"]) {
+  for (const reason of ["evidence_unavailable", "source_not_inline", "package_files_invalid", "closure_mismatch", "package_shape_unsupported", "repository_root_conflict", "envelope_unavailable", "workflow_unavailable"]) {
     const message = bundleFailureMessage({ apiVersion: "steward.github-automation/v1", error: "tested_package_unpublishable", reason });
     expect(message).not.toBe(generic);
   }
   expect(bundleFailureMessage({ apiVersion: "steward.github-automation/v1", error: "tested_package_unpublishable", reason: "future_reason" })).toBe(generic);
+});
+
+test("publication failures surface the bounded reason and otherwise keep the action-specific message", () => {
+  const fallback = "Steward could not open the publication pull request.";
+  expect(automationProblemMessage({ apiVersion: "steward.github-automation/v1", error: "tested_package_unpublishable", reason: "repository_root_conflict" }, fallback))
+    .toContain("will not overwrite");
+  expect(automationProblemMessage({ apiVersion: "steward.github-automation/v1", error: "github_automation_unavailable", reason: "bridge_contract" }, fallback)).toBe(fallback);
+  expect(automationProblemMessage(undefined, fallback)).toBe(fallback);
 });

@@ -475,7 +475,7 @@ where
     };
     let package_digest = match run.browser_task_evidence {
         Some(evidence) if evidence.validate().is_ok() => evidence.closure_digest,
-        _ => return unpublishable(UnpublishableReason::EvidenceUnavailable),
+        _ => return run_evidence_unavailable(),
     };
     let subject = automation_subject(task_uid, &query.owner, &query.repository);
     let publication = match state
@@ -548,7 +548,7 @@ where
     };
     let package_digest = match run.browser_task_evidence {
         Some(evidence) if evidence.validate().is_ok() => evidence.closure_digest,
-        _ => return unpublishable(UnpublishableReason::EvidenceUnavailable),
+        _ => return run_evidence_unavailable(),
     };
     let publication = match state
         .broker
@@ -776,6 +776,9 @@ where
         Ok(bundle) => bundle,
         Err(response) => return response,
     };
+    if let Err(response) = refuse_root_conflicts(&state, &session, &repository, &bundle).await {
+        return response;
+    }
     let branch = format!("steward/task-{}", task_uid.simple());
     let files = bundle
         .files
@@ -978,6 +981,51 @@ where
     }
 }
 
+/// A legacy package publishes at the repository root. Refuse before any write when the base
+/// branch already holds a different file at one of those paths; identical content is fine.
+async fn refuse_root_conflicts<L, P>(
+    state: &GithubAutomationState<L, P>,
+    session: &ConnectionSession<BrowserSessionBinding>,
+    repository: &GithubRepositoryView,
+    bundle: &ExactRepositoryBundle,
+) -> Result<(), Response>
+where
+    L: AgentRunLedger,
+    P: GithubAutomationBroker<BrowserSessionBinding>,
+{
+    for (path, content) in bundle
+        .files
+        .iter()
+        .filter(|(path, _)| steward_adapter_mcp_gw::legacy_root_package_path(path))
+    {
+        let identity = fresh_operation_identity("package-file");
+        let result = state
+            .broker
+            .execute(
+                session,
+                ConnectionOperationKind::Workflow,
+                json!({
+                    "owner": repository.owner,
+                    "repo": repository.name,
+                    "path": path,
+                    "ref": repository.default_branch,
+                    "expectedContent": content,
+                }),
+                &identity,
+            )
+            .await
+            .map_err(automation_error)?;
+        let existing = workflow_response(result).map_err(|()| unavailable())?;
+        if existing.path != *path {
+            return Err(unavailable());
+        }
+        if existing.exists && !existing.compatible {
+            return Err(unpublishable(UnpublishableReason::RepositoryRootConflict));
+        }
+    }
+    Ok(())
+}
+
 async fn resolve_repository<L, P>(
     state: &GithubAutomationState<L, P>,
     session: &ConnectionSession<BrowserSessionBinding>,
@@ -1042,8 +1090,10 @@ pub(crate) enum UnpublishableReason {
     PackageFilesInvalid,
     /// The recorded inline files no longer reproduce the tested closure digest.
     ClosureMismatch,
-    /// The closure contains files beyond one Task definition and its optional sibling prompt.
+    /// The closure is not a package the governed publication allowlist accepts.
     PackageShapeUnsupported,
+    /// The repository's base branch already has a different file at a legacy root path.
+    RepositoryRootConflict,
     /// The run recorded no complete User Envelope selection.
     EnvelopeUnavailable,
     /// The caller workflow could not be rendered for the recorded package.
@@ -1058,6 +1108,7 @@ impl UnpublishableReason {
             Self::PackageFilesInvalid => "package_files_invalid",
             Self::ClosureMismatch => "closure_mismatch",
             Self::PackageShapeUnsupported => "package_shape_unsupported",
+            Self::RepositoryRootConflict => "repository_root_conflict",
             Self::EnvelopeUnavailable => "envelope_unavailable",
             Self::WorkflowUnavailable => "workflow_unavailable",
         }
@@ -1155,6 +1206,7 @@ pub(crate) fn tested_package_bundle(
             envelope,
             invocation_path: None,
             package_path: Some(evidence.path.as_str().to_owned()),
+            package_digest: Some(closure_digest.as_str().to_owned()),
             execution_log: ExecutionLogMode::Full,
             reviewed_release: config.steward_run_release.clone(),
             workflow_installation_mode: config.workflow_installation_mode,
@@ -1175,23 +1227,24 @@ pub(crate) fn tested_package_bundle(
     })
 }
 
-/// One Task definition plus at most one `prompt.md` beside it: the shapes browser releases
-/// have produced and the governed publication allowlist accepts.
+/// The closure must be exactly a package the governed publication allowlist accepts: a
+/// Task definition under `.steward/tasks/`, or the legacy root Task definition with its
+/// root `prompt.md`. Anything else is refused here instead of failing at publication.
 fn publishable_closure_shape(closure: &PackageClosure) -> bool {
-    let sibling_prompt = match closure.entry_point.as_str().rsplit_once('/') {
-        Some((directory, _)) => format!("{directory}/prompt.md"),
-        None => "prompt.md".to_owned(),
-    };
-    let mut definitions = 0_usize;
-    let mut prompts = 0_usize;
+    let mut definition = None;
+    let mut prompt = None;
     for entry in &closure.entries {
-        match entry.kind {
-            ClosureEntryKind::TaskDefinition => definitions += 1,
-            ClosureEntryKind::Prompt if entry.path.as_str() == sibling_prompt => prompts += 1,
+        let slot = match entry.kind {
+            ClosureEntryKind::TaskDefinition => &mut definition,
+            ClosureEntryKind::Prompt => &mut prompt,
             _ => return false,
+        };
+        if slot.replace(entry.path.as_str()).is_some() {
+            return false;
         }
     }
-    definitions == 1 && prompts <= 1
+    definition == Some(closure.entry_point.as_str())
+        && steward_adapter_mcp_gw::valid_publication_package(closure.entry_point.as_str(), prompt)
 }
 
 async fn owned_successful_browser_run<L>(
@@ -1515,6 +1568,20 @@ fn automation_problem(
         .into_response()
 }
 
+fn run_evidence_unavailable() -> Response {
+    (
+        StatusCode::CONFLICT,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(GithubAutomationErrorResponse {
+            api_version: GITHUB_AUTOMATION_API_VERSION,
+            error: "run_evidence_unavailable",
+            reason: None,
+            manual_files: None,
+        }),
+    )
+        .into_response()
+}
+
 fn unpublishable(reason: UnpublishableReason) -> Response {
     (
         StatusCode::CONFLICT,
@@ -1633,6 +1700,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeBroker {
         calls: Arc<Mutex<Vec<BrokerCall>>>,
+        /// Files already present on the base branch, by repository path.
+        base_files: Arc<Mutex<BTreeMap<String, String>>>,
     }
 
     impl GithubAutomationBroker<BrowserSessionBinding> for FakeBroker {
@@ -1649,9 +1718,26 @@ mod tests {
                     .map_err(|_| ConnectionBrokerError::Unavailable)?
                     .push(BrokerCall {
                         operation,
-                        request,
+                        request: request.clone(),
                         idempotency_identity: identity.idempotency_identity.clone(),
                     });
+                let path = request["path"].as_str().unwrap_or_default();
+                if operation == ConnectionOperationKind::Workflow
+                    && steward_adapter_mcp_gw::legacy_root_package_path(path)
+                {
+                    let existing = self
+                        .base_files
+                        .lock()
+                        .map_err(|_| ConnectionBrokerError::Unavailable)?
+                        .get(path)
+                        .cloned();
+                    return Ok(json!({
+                        "path": path,
+                        "exists": existing.is_some(),
+                        "compatible": existing.as_deref() == request["expectedContent"].as_str(),
+                        "sha": existing.map(|_| "b".repeat(40)),
+                    }));
+                }
                 match operation {
                     ConnectionOperationKind::Repositories => Ok(json!({
                         "login": "alice",
@@ -1822,24 +1908,54 @@ mod tests {
 
     const LEGACY_DEFINITION_PATH: &str = "task-definition.json";
     const LEGACY_PROMPT_PATH: &str = "prompt.md";
-    const LEGACY_PROMPT: &str = "Create out/hello.txt containing hello world.\n";
 
-    /// The two-file inline package earlier browser releases submitted: a path-backed prompt
-    /// beside the Task definition at the package root, both stored verbatim as run evidence.
+    /// The JSON Steward v0.3.8 stored for a successful inline run. Its closure digests were
+    /// computed outside this crate (SHA-256 over sorted, compact JSON and the exact prompt).
+    const V038_LEGACY_EVIDENCE: &str = r#"{
+  "source": "inline",
+  "revision": "steward:sha256:3304250fc7826c93a763d925cc6e5aac771c61fe775c9a3ad0f30d7e98b0c397",
+  "path": "task-definition.json",
+  "closure": {
+    "contractVersion": "steward.package-closure/v1",
+    "entryPoint": "task-definition.json",
+    "entries": [
+      {
+        "kind": "prompt",
+        "path": "prompt.md",
+        "digest": "steward:sha256:faead127f0d4393295e10acbf471bb784b833a422e8a9ba2a8fe13ce3455d111",
+        "sizeBytes": 134
+      },
+      {
+        "kind": "task_definition",
+        "path": "task-definition.json",
+        "digest": "steward:sha256:e6fde5453c4583c15f7b1320d65157df91366a9d7e5cb124fafee36ffbe48cd2",
+        "sizeBytes": 507
+      }
+    ]
+  },
+  "closureDigest": "steward:sha256:3304250fc7826c93a763d925cc6e5aac771c61fe775c9a3ad0f30d7e98b0c397",
+  "inlineFiles": {
+    "prompt.md": "Create $STEWARD_OUTPUT_DIR/out/hello.txt containing exactly the line: hello world. Use no tools and no network. Create no other files.",
+    "task-definition.json": "{\n  \"schemaVersion\": \"steward.task-definition/v2\",\n  \"name\": \"browser-task\",\n  \"version\": 1,\n  \"runtime\": {\n    \"agentRef\": \"example-agent@1.0.0\",\n    \"model\": {\n      \"provider\": \"provider-a\",\n      \"model\": \"model-a\"\n    }\n  },\n  \"prompt\": \"prompt.md\",\n  \"outputs\": [\n    {\n      \"path\": \"out\",\n      \"kind\": \"directory\",\n      \"required\": true\n    }\n  ],\n  \"requires\": {\n    \"authority\": {\n      \"llms\": [\n        {\n          \"provider\": \"provider-a\",\n          \"model\": \"model-a\"\n        }\n      ],\n      \"tools\": [],\n      \"budget\": {\n        \"monthlyLimit\": \"100.00\",\n        \"singleRunLimit\": null,\n        \"currency\": \"USD\"\n      },\n      \"ttl\": \"24h\",\n      \"runner\": {\n        \"platforms\": [],\n        \"memory\": null,\n        \"compute\": null,\n        \"storage\": null\n      }\n    }\n  }\n}"
+  },
+  "diagnostics": {}
+}"#;
+
+    /// Browser evidence exactly as Steward v0.3.8 persisted it for an inline run: a root Task
+    /// definition with a path-backed `prompt.md`, no `promptSource` field, and closure digests
+    /// computed independently of the resolver under test.
+    fn v038_legacy_evidence() -> Result<BrowserTaskEvidence, String> {
+        let evidence = serde_json::from_str::<BrowserTaskEvidence>(V038_LEGACY_EVIDENCE)
+            .map_err(|error| format!("v0.3.8 evidence fixture is invalid: {error}"))?;
+        evidence.validate()?;
+        assert_eq!(evidence.prompt_source, PromptSourceKind::Path);
+        Ok(evidence)
+    }
+
     fn legacy_package_files() -> Result<BTreeMap<String, String>, String> {
-        let definition = serde_json::to_string_pretty(&json!({
-            "schemaVersion": "steward.task-definition/v2",
-            "name": "browser-task",
-            "version": 1,
-            "runtime": {"agentRef": "example-agent@1.0.0"},
-            "prompt": LEGACY_PROMPT_PATH,
-            "outputs": [{"path": "out", "kind": "directory", "required": true}]
-        }))
-        .map_err(|error| error.to_string())?;
-        Ok(BTreeMap::from([
-            (LEGACY_DEFINITION_PATH.to_owned(), definition),
-            (LEGACY_PROMPT_PATH.to_owned(), LEGACY_PROMPT.to_owned()),
-        ]))
+        v038_legacy_evidence()?
+            .inline_files
+            .ok_or_else(|| "v0.3.8 evidence fixture omitted its inline files".to_owned())
     }
 
     fn inline_evidence(
@@ -1875,10 +1991,7 @@ mod tests {
 
     fn legacy_browser_run(task_uid: Uuid, owner_user_id: &str) -> Result<AgentRunRecord, String> {
         let mut record = browser_run(task_uid, owner_user_id)?;
-        record.browser_task_evidence = Some(inline_evidence(
-            LEGACY_DEFINITION_PATH,
-            legacy_package_files()?,
-        )?);
+        record.browser_task_evidence = Some(v038_legacy_evidence()?);
         Ok(record)
     }
 
@@ -2552,16 +2665,199 @@ mod tests {
             );
         }
         let calls = broker.calls.lock().map_err(|_| "lock broker calls")?;
-        for operation in [
-            ConnectionOperationKind::Workflow,
-            ConnectionOperationKind::Dispatch,
-        ] {
-            let request = calls
-                .iter()
-                .find(|call| call.operation == operation)
-                .map(|call| &call.request)
-                .ok_or("workflow operation was not captured")?;
+        let detection = calls
+            .iter()
+            .find(|call| {
+                call.operation == ConnectionOperationKind::Workflow
+                    && call.request["path"] == workflow_path.as_str()
+            })
+            .ok_or("workflow detection was not captured")?;
+        let dispatch = calls
+            .iter()
+            .find(|call| call.operation == ConnectionOperationKind::Dispatch)
+            .ok_or("dispatch was not captured")?;
+        for request in [&detection.request, &dispatch.request] {
             assert_eq!(request["expectedContent"].as_str(), Some(workflow));
+        }
+        let publish_index = calls
+            .iter()
+            .position(|call| call.operation == ConnectionOperationKind::Publish)
+            .ok_or("publication was not captured")?;
+        for (path, content) in inline_files {
+            let read = calls[..publish_index]
+                .iter()
+                .find(|call| {
+                    call.operation == ConnectionOperationKind::Workflow
+                        && call.request["path"] == path.as_str()
+                })
+                .ok_or_else(|| format!("{path} was not checked on the base branch"))?;
+            assert_eq!(read.request["ref"], "main");
+            assert_eq!(
+                read.request["expectedContent"].as_str(),
+                Some(content.as_str())
+            );
+            let mut bridge_read = read.request.clone();
+            bridge_read["path"] = Value::String(path.clone());
+            GithubBridgeRequest::parse(
+                GithubBridgeOperation::Workflow,
+                &serde_json::to_vec(&bridge_read).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| format!("{path} read violates the bridge contract: {error:?}"))?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_publication_refuses_different_root_files_and_accepts_identical_ones()
+    -> Result<(), String> {
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let legacy_files = legacy_package_files()?;
+        for (existing, conflict) in [
+            (
+                BTreeMap::from([(
+                    LEGACY_DEFINITION_PATH.to_owned(),
+                    "{\"family\":\"web\"}".to_owned(),
+                )]),
+                true,
+            ),
+            (
+                BTreeMap::from([(LEGACY_PROMPT_PATH.to_owned(), "Other notes.\n".to_owned())]),
+                true,
+            ),
+            (legacy_files.clone(), false),
+            (BTreeMap::new(), false),
+        ] {
+            let ledger = FakeLedger::default();
+            ledger
+                .records
+                .lock()
+                .map_err(|_| "lock records")?
+                .push(legacy_browser_run(task_uid, OWNER_USER_ID)?);
+            let broker = FakeBroker::default();
+            *broker.base_files.lock().map_err(|_| "lock base files")? = existing;
+            let (auth, session_cookie, csrf) = signed_in_cookie_and_csrf().await?;
+            let response = protected_router(ledger, broker.clone(), config()?, auth)
+                .oneshot(mutation_request(
+                    format!("/app/api/v1/runs/{task_uid}/github/publish"),
+                    &session_cookie,
+                    &csrf,
+                    json!({
+                        "owner": "example-org",
+                        "repository": "agentic-ops",
+                        "idempotencyKey": "legacy-root"
+                    }),
+                )?)
+                .await
+                .map_err(|error| error.to_string())?;
+            let published = broker
+                .calls
+                .lock()
+                .map_err(|_| "lock broker calls")?
+                .iter()
+                .any(|call| call.operation == ConnectionOperationKind::Publish);
+            if conflict {
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert_eq!(
+                    json_body(response).await?,
+                    json!({
+                        "apiVersion": GITHUB_AUTOMATION_API_VERSION,
+                        "error": "tested_package_unpublishable",
+                        "reason": "repository_root_conflict"
+                    })
+                );
+                assert!(
+                    !published,
+                    "a root conflict must be refused before any write"
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(published);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generated_workflows_bind_the_tested_closure_digest() -> Result<(), String> {
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let mut other_legacy = legacy_browser_run(task_uid, OWNER_USER_ID)?;
+        let mut other_files = legacy_package_files()?;
+        other_files.insert(
+            LEGACY_PROMPT_PATH.to_owned(),
+            "Summarize the repository in out/summary.md.\n".to_owned(),
+        );
+        other_legacy.browser_task_evidence =
+            Some(inline_evidence(LEGACY_DEFINITION_PATH, other_files)?);
+        let mut bundles = Vec::new();
+        for record in [
+            browser_run(task_uid, OWNER_USER_ID)?,
+            legacy_browser_run(task_uid, OWNER_USER_ID)?,
+            other_legacy,
+        ] {
+            let evidence = record
+                .browser_task_evidence
+                .clone()
+                .ok_or("run omitted browser evidence")?;
+            let bundle = tested_package_bundle(Some(&evidence), run_envelope(&record), &config()?)
+                .map_err(|error| format!("bundle: {error:?}"))?;
+            assert!(bundle.workflow_content.contains(&format!(
+                "\n# package-digest: {}\n",
+                evidence.closure_digest.as_str()
+            )));
+            bundles.push(bundle);
+        }
+        assert_eq!(
+            bundles[1].workflow_path, bundles[2].workflow_path,
+            "legacy packages share root paths and one caller path"
+        );
+        assert_ne!(
+            bundles[1].workflow_content, bundles[2].workflow_content,
+            "exact-content detection must reject another legacy Task's caller"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evidence_lookups_report_unavailable_run_evidence() -> Result<(), String> {
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let mut record = browser_run(task_uid, OWNER_USER_ID)?;
+        record.browser_task_evidence = None;
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .push(record);
+        let (auth, session_cookie, _) = signed_in_cookie_and_csrf().await?;
+        let app = protected_router(ledger, FakeBroker::default(), config()?, auth);
+        for uri in [
+            format!("/app/api/v1/runs/{task_uid}/github/onboarding"),
+            format!(
+                "/app/api/v1/runs/{task_uid}/github/evidence?owner=example-org&repository=agentic-ops"
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&uri)
+                        .header(header::COOKIE, &session_cookie)
+                        .body(Body::empty())
+                        .map_err(|error| error.to_string())?,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{uri}");
+            assert_eq!(
+                json_body(response).await?,
+                json!({
+                    "apiVersion": GITHUB_AUTOMATION_API_VERSION,
+                    "error": "run_evidence_unavailable"
+                })
+            );
         }
         Ok(())
     }
@@ -2719,6 +3015,28 @@ mod tests {
             ]),
         )?);
 
+        let root_prompt_text = |path: &str| -> Result<AgentRunRecord, String> {
+            let mut record = browser_run(task_uid, OWNER_USER_ID)?;
+            record.browser_task_evidence = Some(inline_evidence(
+                path,
+                BTreeMap::from([(
+                    path.to_owned(),
+                    json!({
+                        "schemaVersion": "steward.task-definition/v2",
+                        "name": "hello",
+                        "version": 1,
+                        "runtime": {"agentRef": "example-agent@1.0.0"},
+                        "promptText": "Say hello.",
+                        "outputs": [{"path": "out", "kind": "directory", "required": true}]
+                    })
+                    .to_string(),
+                )]),
+            )?);
+            Ok(record)
+        };
+        let root_single = root_prompt_text(LEGACY_DEFINITION_PATH)?;
+        let outside_tasks = root_prompt_text("catalog/hello/task-definition.json")?;
+
         let mut no_envelope = legacy_browser_run(task_uid, OWNER_USER_ID)?;
         no_envelope.user_envelope_digest = None;
 
@@ -2728,6 +3046,8 @@ mod tests {
             (unreferenced, "package_files_invalid"),
             (repository, "source_not_inline"),
             (skilled, "package_shape_unsupported"),
+            (root_single, "package_shape_unsupported"),
+            (outside_tasks, "package_shape_unsupported"),
             (no_envelope, "envelope_unavailable"),
         ] {
             let ledger = FakeLedger::default();

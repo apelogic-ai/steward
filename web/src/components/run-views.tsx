@@ -21,6 +21,7 @@ import {
   type BrowserRunTimelineResponse,
   type BrowserRunOutputsResponse,
   type BrowserRunView,
+  type GithubAutomationErrorResponse,
   type GithubRepositoryView,
   type GithubRunStatusResponse,
   type MyRunsResponse,
@@ -31,6 +32,7 @@ import { DataTable, FilterChips } from "@/components/hs";
 import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
 import { classifyConnectionMutationFailure, type ConnectionMutationState } from "@/components/connection-mutation-state";
 import { ExecutionLogPanel } from "@/components/run-log-view";
+import { automationProblemMessage } from "@/data/github-automation-problem";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import type { ExecutionLogStream } from "@/data/execution-log";
 import { RepositoryResource, useGithubRepositories } from "@/data/github-repositories";
@@ -246,7 +248,8 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
   const csrf = session.status === "authenticated" ? session.value.csrf : null;
 
   const checkWorkflow = useCallback(async (repository: GithubRepositoryView) => {
-    if (!csrf) return null;
+    const inspectFailure = "Steward could not inspect the generated workflow in this repository.";
+    if (!csrf) return { detected: null, failure: inspectFailure };
     const result = await detectWorkflow({
       body: { owner: repository.owner, repository: repository.name },
       cache: "no-store",
@@ -254,18 +257,25 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
       headers: { "X-Steward-CSRF": csrf },
       path: { task_uid: taskUid },
     });
-    return result.data && result.response?.ok ? result.data : null;
+    if (result.data && result.response?.ok) return { detected: result.data, failure: null };
+    return {
+      detected: null,
+      failure: automationProblemMessage(
+        result.error as GithubAutomationErrorResponse | undefined,
+        inspectFailure,
+      ),
+    };
   }, [csrf, taskUid]);
 
   useEffect(() => {
     if (!selected) return;
     let active = true;
-    void checkWorkflow(selected).then((detected) => {
+    void checkWorkflow(selected).then((checked) => {
       if (!active) return;
-      setWorkflow(detected);
+      setWorkflow(checked.detected);
       setWorkflowRepository(effectiveRepository);
-      setState(detected ? "idle" : "error");
-      if (!detected) setFailure("Steward could not inspect the generated workflow in this repository.");
+      setState(checked.detected ? "idle" : "error");
+      if (checked.failure) setFailure(checked.failure);
     });
     return () => { active = false; };
   }, [checkWorkflow, effectiveRepository, selected]);
@@ -273,9 +283,9 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
   useEffect(() => {
     if (!publication || !selected || selectedWorkflow?.compatible) return;
     const timer = window.setInterval(() => {
-      void checkWorkflow(selected).then((detected) => {
-        if (detected) {
-          setWorkflow(detected);
+      void checkWorkflow(selected).then((checked) => {
+        if (checked.detected) {
+          setWorkflow(checked.detected);
           setWorkflowRepository(effectiveRepository);
         }
       });
@@ -322,7 +332,7 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
       path: { task_uid: taskUid },
     });
     if (!result.data || !result.response?.ok) {
-      setFailure("Steward could not open the publication pull request.");
+      setFailure(automationProblemMessage(result.error as GithubAutomationErrorResponse | undefined, "Steward could not open the publication pull request."));
       setState("error");
       return;
     }
@@ -369,7 +379,7 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
           <button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!selectedWorkflow?.compatible || state === "dispatching"} onClick={() => void dispatch()} type="button">{state === "dispatching" ? "Starting…" : "Run on GitHub"}</button>
         </div>
       </> : <p className="mt-4 text-sm text-muted-ink">No GitHub repositories are visible to this connection.</p>}</RepositoryResource>
-      {publication ? <div className="mt-4 rounded-control border bg-subtle p-3 text-sm"><p>Branch: <code>{publication.branch}</code></p><p className="mt-1">Package digest: <code className="break-all">{publication.packageDigest}</code></p><a className="mt-2 inline-block font-semibold text-brand" href={`${publication.pullRequestUrl}/files`} rel="noreferrer" target="_blank">Review the two-file pull request diff</a></div> : null}
+      {publication ? <div className="mt-4 rounded-control border bg-subtle p-3 text-sm"><p>Branch: <code>{publication.branch}</code></p><p className="mt-1">Package digest: <code className="break-all">{publication.packageDigest}</code></p><a className="mt-2 inline-block font-semibold text-brand" href={`${publication.pullRequestUrl}/files`} rel="noreferrer" target="_blank">Review the pull request diff</a></div> : null}
       {githubRun ? <div className="mt-4 rounded-control border bg-subtle p-3 text-sm" aria-live="polite"><div className="flex flex-wrap items-center gap-3"><a className="font-semibold text-brand" href={githubRun.url} rel="noreferrer" target="_blank">GitHub run {githubRun.runId}</a><StatusBadge value={runStatus?.conclusion ?? runStatus?.phase ?? "queued"} /></div>{runStatus?.jobs.length ? <ul className="mt-3 space-y-2">{runStatus.jobs.map((job) => <li className="flex flex-wrap items-center justify-between gap-2" key={job.id}><a href={job.url} rel="noreferrer" target="_blank">{job.name}</a><span>{job.conclusion ?? job.status}</span></li>)}</ul> : null}{runStatus?.failureLog ? <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap rounded-control border bg-panel p-3 text-xs">{runStatus.failureLog}</pre> : null}{runStatus?.linkedTaskUid ? <Link className="mt-3 inline-block font-semibold text-brand" href={`/runs/${runStatus.linkedTaskUid}`}>Open governed Task · {runStatus.linkedTaskPhase}</Link> : null}</div> : null}
       {failure ? <p className="mt-3 text-sm text-err" role="alert">{failure}</p> : null}
     </section>

@@ -38,6 +38,7 @@ import {
 import { parseRunEventData } from "@/components/run-views";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { RepositoryResource, useGithubRepositories, type RepositoryResourceState } from "@/data/github-repositories";
+import { automationProblemMessage, bundleFailureMessage, genericBundleFailure } from "@/data/github-automation-problem";
 import { defaultOnboardingRepository, deriveOnboardingProgress, loadOnboardingEvidence, ONBOARDING_PROGRESS_EVENT, type OnboardingEvidence } from "@/data/onboarding-progress";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
@@ -89,28 +90,6 @@ export function governedJobOnly(workflow: string): string {
 
 function copyText(value: string, onCopied: () => void) {
   void navigator.clipboard.writeText(value).then(onCopied);
-}
-
-const genericBundleFailure = "Steward could not render the exact tested package and workflow.";
-
-const unpublishableReasons: Record<string, string> = {
-  evidence_unavailable: "The test run recorded no package evidence that Steward can publish. Run the test again.",
-  source_not_inline: "This test run used a package that already lives in a repository or the Workflow registry. Run the inline test from step 3 to publish it here.",
-  package_files_invalid: "The test run's recorded package files are incomplete or invalid, so Steward cannot publish them. Run the test again.",
-  closure_mismatch: "The test run's recorded package files no longer match its tested digest, so Steward will not publish them. Run the test again.",
-  package_shape_unsupported: "This tested package has files that governed publication does not support. Only a Task definition and an optional prompt.md beside it can be published.",
-  envelope_unavailable: "The test run recorded no complete envelope selection, so Steward cannot generate its workflow. Run the test again.",
-  workflow_unavailable: "Steward could not generate the caller workflow for this package. Ask an administrator to check the configured steward-run release.",
-};
-
-export function bundleFailureMessage(problem: GithubAutomationErrorResponse | undefined): string {
-  if (problem?.error === "steward_run_release_unsupported") {
-    return "The reviewed steward-run release is below 0.8.0. Copy the package files manually; workflow generation and detection require steward-run 0.8.0 or later.";
-  }
-  if (problem?.error === "tested_package_unpublishable" && problem.reason) {
-    return unpublishableReasons[problem.reason] ?? genericBundleFailure;
-  }
-  return genericBundleFailure;
 }
 
 /** Every file of the exact tested package, Task definition first. */
@@ -412,7 +391,7 @@ function OnboardingChecklist({ data, onRefresh, onRetryRepositories, repositorie
       setAutomationState("idle");
       return;
     }
-    setAutomationFailure("Steward could not open the publication pull request.");
+    setAutomationFailure(automationProblemMessage(result.error as GithubAutomationErrorResponse | undefined, "Steward could not open the publication pull request."));
     setAutomationState("error");
   }
 
