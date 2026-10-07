@@ -1,9 +1,7 @@
 import {
-  detectWorkflow,
   getBrowserPreferences,
-  githubAutomationEvidence,
+  githubOnboardingEvidence,
   listProviderConnections,
-  listRepositories,
   type BrowserPreferencesView,
   type ConnectionsCollectionResponse,
   type EnvelopeRequestsResponse,
@@ -102,7 +100,7 @@ export async function loadOnboardingEvidence() {
   };
 }
 
-export async function loadOnboardingProgress(csrf: string) {
+export async function loadOnboardingProgress() {
   const evidence = await loadOnboardingEvidence();
   if (!evidence.data || !evidence.response?.ok) {
     return { ...evidence, progress: undefined };
@@ -110,38 +108,22 @@ export async function loadOnboardingProgress(csrf: string) {
 
   const baseProgress = deriveOnboardingProgress(evidence.data);
   const taskUid = baseProgress.helloWorldRun?.taskUid;
-  if (!taskUid) return { ...evidence, progress: baseProgress };
+  if (!taskUid || evidence.data.preferences.onboardingDismissed || baseProgress.completed === 7) {
+    return { ...evidence, progress: baseProgress };
+  }
 
-  const repositories = await listRepositories({
+  const automation = await githubOnboardingEvidence({
     cache: "no-store",
     credentials: "same-origin",
-    query: { query: "", page: 1, perPage: 100 },
+    path: { task_uid: taskUid },
   });
-  const repository = defaultOnboardingRepository(repositories.data?.repositories ?? []);
-  if (!repository?.ready) return { ...evidence, progress: baseProgress };
-
-  const [automation, workflow] = await Promise.all([
-    githubAutomationEvidence({
-      cache: "no-store",
-      credentials: "same-origin",
-      path: { task_uid: taskUid },
-      query: { owner: repository.owner, repository: repository.name },
-    }),
-    detectWorkflow({
-      body: { owner: repository.owner, repository: repository.name },
-      cache: "no-store",
-      credentials: "same-origin",
-      headers: { "X-Steward-CSRF": csrf },
-      path: { task_uid: taskUid },
-    }),
-  ]);
-  const workflowObserved = Boolean(workflow.data && workflow.response?.ok && workflow.data.compatible);
+  if (!automation.data || !automation.response?.ok) return { ...evidence, progress: baseProgress };
   return {
     ...evidence,
     progress: deriveOnboardingProgress(evidence.data, {
-      dispatchObserved: Boolean(automation.data && automation.response?.ok && automation.data.dispatch),
-      publicationObserved: Boolean(automation.data && automation.response?.ok && automation.data.publication) || workflowObserved,
-      workflowObserved,
+      dispatchObserved: automation.data.dispatchObserved,
+      publicationObserved: automation.data.publicationObserved || automation.data.workflowObserved,
+      workflowObserved: automation.data.workflowObserved,
     }),
   };
 }

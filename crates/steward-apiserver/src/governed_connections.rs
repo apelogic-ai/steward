@@ -898,7 +898,9 @@ impl<B> GovernedConnectionsBroker<B> {
     ) -> Result<Option<Value>, ConnectionBrokerError> {
         if !matches!(
             operation,
-            ConnectionOperationKind::Publish | ConnectionOperationKind::Dispatch
+            ConnectionOperationKind::Workflow
+                | ConnectionOperationKind::Publish
+                | ConnectionOperationKind::Dispatch
         ) {
             return Err(ConnectionBrokerError::Unavailable);
         }

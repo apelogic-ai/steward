@@ -1182,6 +1182,13 @@ export type GithubJobView = {
     url: string;
 };
 
+export type GithubOnboardingEvidenceResponse = {
+    apiVersion: string;
+    dispatchObserved: boolean;
+    publicationObserved: boolean;
+    workflowObserved: boolean;
+};
+
 export type GithubRepositoriesResponse = {
     apiVersion: string;
     hasNextPage: boolean;
@@ -4498,6 +4505,39 @@ export type GithubAutomationEvidenceResponses = {
 };
 
 export type GithubAutomationEvidenceResponse2 = GithubAutomationEvidenceResponses[keyof GithubAutomationEvidenceResponses];
+
+export type GithubOnboardingEvidenceData = {
+    body?: never;
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/github/onboarding';
+};
+
+export type GithubOnboardingEvidenceErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Run is unavailable
+     */
+    404: unknown;
+    /**
+     * Run evidence is unavailable or invalid
+     */
+    409: unknown;
+    503: GithubAutomationErrorResponse;
+};
+
+export type GithubOnboardingEvidenceError = GithubOnboardingEvidenceErrors[keyof GithubOnboardingEvidenceErrors];
+
+export type GithubOnboardingEvidenceResponses = {
+    200: GithubOnboardingEvidenceResponse;
+};
+
+export type GithubOnboardingEvidenceResponse2 = GithubOnboardingEvidenceResponses[keyof GithubOnboardingEvidenceResponses];
 
 export type PublishTaskData = {
     body: PublishTaskRequest;

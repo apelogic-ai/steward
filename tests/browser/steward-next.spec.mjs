@@ -845,6 +845,7 @@ async function guardedPage(browser, {
 } = {}) {
   const context = await browser.newContext({ colorScheme, viewport });
   const executionLogRequests = [];
+  const governedGithubRequests = [];
   const runEventRequests = [];
   const mutations = [];
   const setupStatusRequests = [];
@@ -1408,6 +1409,12 @@ async function guardedPage(browser, {
     publication: publicationEvidence,
     dispatch: dispatchEvidence,
   }));
+  await context.route(`${origin}/app/api/v1/runs/*/github/onboarding`, (route) => json(route, {
+    apiVersion: "steward.github-automation/v1",
+    publicationObserved: Boolean(publicationEvidence),
+    workflowObserved: githubWorkflowPublished,
+    dispatchObserved: Boolean(dispatchEvidence),
+  }));
   await context.route(`${origin}/app/api/v1/runs/*/github/workflow`, async (route) => {
     const request = route.request();
     mutations.push({ path: new URL(request.url()).pathname, headers: await request.allHeaders(), body: request.postDataJSON() });
@@ -1778,7 +1785,13 @@ async function guardedPage(browser, {
     if (response.status() >= 400 && !expectedUnauthorizedProbe && !expectedMutationFailure) httpErrors.push(`${response.status()} ${response.url()}`);
   });
   page.on("request", (request) => {
-    if (new URL(request.url()).origin !== origin) crossOriginRequests.push(request.url());
+    const requestUrl = new URL(request.url());
+    if (requestUrl.origin !== origin) crossOriginRequests.push(request.url());
+    if (requestUrl.pathname === "/app/api/v1/github/repositories"
+      || requestUrl.pathname.endsWith("/github/evidence")
+      || requestUrl.pathname.endsWith("/github/workflow")) {
+      governedGithubRequests.push(request.url());
+    }
   });
   return {
     context,
@@ -1786,6 +1799,7 @@ async function guardedPage(browser, {
     consoleErrors,
     crossOriginRequests,
     executionLogRequests,
+    governedGithubRequests,
     httpErrors,
     mutations,
     runEventRequests,
@@ -2557,9 +2571,11 @@ test("Get started completes the governed test-to-GitHub journey from server evid
     await expect(step("Add the workflow to your repository").getByText("Done", { exact: true })).toBeVisible({ timeout: 10_000 });
     await expect(developer.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: /Get started/ })).toContainText("5/7");
 
+    const governedRequestCount = developer.governedGithubRequests.length;
     await developer.page.goto(`${origin}/envelopes`);
     await developer.page.reload();
     await expect(developer.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: /Get started/ })).toContainText("5/7");
+    expect(developer.governedGithubRequests).toHaveLength(governedRequestCount);
     await developer.page.goto(`${origin}/get-started`);
 
     const workflowStep = await openStep("Add the workflow to your repository");

@@ -458,7 +458,7 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
   useEffect(() => {
     if (adminMode || !workspaceAuthorized || session.status !== "authenticated") return;
     let active = true;
-    const refreshProgress = () => void loadOnboardingProgress(session.value.csrf).then((result) => {
+    const refreshProgress = () => void loadOnboardingProgress().then((result) => {
       if (active && result.data && result.response?.ok && result.progress) {
         const progress = result.progress;
         if (!onboardingDismissedRef.current) {
@@ -490,7 +490,7 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
       window.removeEventListener("hypershell:preferences-updated", preferencesUpdated);
       window.removeEventListener(ONBOARDING_PROGRESS_EVENT, progressUpdated);
     };
-  }, [adminMode, session, workspaceAuthorized]);
+  }, [adminMode, session.status, workspaceAuthorized]);
 
   return (
     <TooltipProvider>

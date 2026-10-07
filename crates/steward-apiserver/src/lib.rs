@@ -399,6 +399,7 @@ pub struct GrantRevocationRequest {
         github_automation::detect_workflow,
         github_automation::github_task_bundle,
         github_automation::github_automation_evidence,
+        github_automation::github_onboarding_evidence,
         github_automation::publish_task,
         github_automation::dispatch_task,
         github_automation::github_run_status,
@@ -546,6 +547,7 @@ pub struct GrantRevocationRequest {
         github_automation::DispatchTaskResponse,
         github_automation::GithubTaskBundleResponse,
         github_automation::GithubAutomationEvidenceResponse,
+        github_automation::GithubOnboardingEvidenceResponse,
         github_automation::GithubJobView,
         github_automation::GithubRunStatusResponse,
         github_automation::GithubAutomationErrorResponse

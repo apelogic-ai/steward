@@ -289,6 +289,15 @@ pub(crate) struct GithubAutomationEvidenceResponse {
     dispatch: Option<DispatchTaskResponse>,
 }
 
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GithubOnboardingEvidenceResponse {
+    api_version: &'static str,
+    publication_observed: bool,
+    workflow_observed: bool,
+    dispatch_observed: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GithubJobView {
@@ -360,6 +369,10 @@ where
         .route(
             "/app/api/v1/runs/{task_uid}/github/evidence",
             get(github_automation_evidence::<L, P>),
+        )
+        .route(
+            "/app/api/v1/runs/{task_uid}/github/onboarding",
+            get(github_onboarding_evidence::<L, P>),
         )
         .route(
             "/app/api/v1/runs/{task_uid}/github/publish",
@@ -500,6 +513,95 @@ where
 
 #[utoipa::path(
     get,
+    path = "/app/api/v1/runs/{task_uid}/github/onboarding",
+    params(("task_uid" = String, Path, format = "uuid")),
+    responses(
+        (status = 200, body = GithubOnboardingEvidenceResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, description = "Run is unavailable"),
+        (status = 409, description = "Run evidence is unavailable or invalid"),
+        (status = 503, body = GithubAutomationErrorResponse)
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn github_onboarding_evidence<L, P>(
+    session: Option<Extension<ConnectionSession<BrowserSessionBinding>>>,
+    State(state): State<GithubAutomationState<L, P>>,
+    Path(task_uid): Path<Uuid>,
+) -> Response
+where
+    L: AgentRunLedger,
+    P: GithubAutomationBroker<BrowserSessionBinding>,
+{
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let run = match owned_successful_browser_run(&state.ledger, &session, task_uid).await {
+        Ok(run) => run,
+        Err(response) => return response,
+    };
+    let package_digest = match run.browser_task_evidence {
+        Some(evidence) if evidence.validate().is_ok() => evidence.closure_digest,
+        _ => return StatusCode::CONFLICT.into_response(),
+    };
+    let publication = match state
+        .broker
+        .evidence(
+            &session.subject.canonical_user_id,
+            ConnectionOperationKind::Publish,
+            &task_operation_prefix("publish", task_uid),
+        )
+        .await
+    {
+        Ok(Some(value)) => match publish_response(value, package_digest.as_str().to_owned()) {
+            Ok(_) => true,
+            Err(()) => return unavailable(),
+        },
+        Ok(None) => false,
+        Err(error) => return automation_error(error),
+    };
+    let workflow = match state
+        .broker
+        .evidence(
+            &session.subject.canonical_user_id,
+            ConnectionOperationKind::Workflow,
+            &task_operation_prefix("workflow", task_uid),
+        )
+        .await
+    {
+        Ok(Some(value)) => match workflow_response(value) {
+            Ok(response) => response.compatible,
+            Err(()) => return unavailable(),
+        },
+        Ok(None) => false,
+        Err(error) => return automation_error(error),
+    };
+    let dispatch = match state
+        .broker
+        .evidence(
+            &session.subject.canonical_user_id,
+            ConnectionOperationKind::Dispatch,
+            &task_operation_prefix("dispatch", task_uid),
+        )
+        .await
+    {
+        Ok(Some(value)) => match dispatch_response(value) {
+            Ok(_) => true,
+            Err(()) => return unavailable(),
+        },
+        Ok(None) => false,
+        Err(error) => return automation_error(error),
+    };
+    no_store_json(GithubOnboardingEvidenceResponse {
+        api_version: GITHUB_AUTOMATION_API_VERSION,
+        publication_observed: publication,
+        workflow_observed: workflow,
+        dispatch_observed: dispatch,
+    })
+}
+
+#[utoipa::path(
+    get,
     path = "/app/api/v1/github/repositories",
     params(RepositoryQuery),
     responses(
@@ -595,7 +697,8 @@ where
         Ok(bundle) => bundle,
         Err(response) => return response,
     };
-    let identity = fresh_operation_identity("workflow");
+    let subject = automation_subject(task_uid, &repository.owner, &repository.name);
+    let identity = scoped_read_operation_identity("workflow", &subject);
     let result = match state
         .broker
         .execute(
@@ -1183,6 +1286,18 @@ fn fresh_operation_identity(operation: &str) -> GithubAutomationIdentity {
     }
 }
 
+fn scoped_read_operation_identity(operation: &str, subject: &str) -> GithubAutomationIdentity {
+    GithubAutomationIdentity {
+        idempotency_identity: format!(
+            "{}:read:{}",
+            operation_subject(operation, subject),
+            Uuid::new_v4()
+        ),
+        idempotency_scope: None,
+        publication_subject: None,
+    }
+}
+
 fn write_operation_identity(
     operation: &str,
     client_key: &str,
@@ -1216,10 +1331,16 @@ fn automation_subject(task_uid: Uuid, owner: &str, repository: &str) -> String {
 }
 
 fn operation_subject(operation: &str, subject: &str) -> String {
+    let (task_uid, repository) = subject.split_once(':').unwrap_or((subject, subject));
     format!(
-        "github-{operation}:subject:sha256:{:x}",
-        Sha256::digest(subject.as_bytes())
+        "{}:subject:sha256:{:x}",
+        task_operation_prefix(operation, task_uid),
+        Sha256::digest(repository.as_bytes())
     )
+}
+
+fn task_operation_prefix(operation: &str, task_uid: impl std::fmt::Display) -> String {
+    format!("github-{operation}:task:{task_uid}")
 }
 
 fn no_store_json<T: Serialize>(value: T) -> Response {
@@ -1466,6 +1587,12 @@ mod tests {
                     return Ok(None);
                 }
                 match operation {
+                    ConnectionOperationKind::Workflow => Ok(Some(json!({
+                        "path": ".github/workflows/hypershell-hello.yml",
+                        "exists": true,
+                        "compatible": true,
+                        "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }))),
                     ConnectionOperationKind::Publish => Ok(Some(json!({
                         "pullRequestUrl": "https://github.com/example-org/agentic-ops/pull/42",
                         "pullRequestNumber": 42,
@@ -1944,6 +2071,48 @@ mod tests {
         let evidence: Value =
             serde_json::from_slice(&evidence).map_err(|error| error.to_string())?;
         assert_eq!(evidence["dispatch"]["runId"], 12345);
+
+        let workflow = app
+            .clone()
+            .oneshot(mutation_request(
+                format!("/app/api/v1/runs/{task_uid}/github/workflow"),
+                &session_cookie,
+                &csrf,
+                json!({
+                    "owner": "example-org",
+                    "repository": "agentic-ops"
+                }),
+            )?)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(workflow.status(), StatusCode::OK);
+
+        let call_count = broker.calls.lock().map_err(|_| "lock broker calls")?.len();
+        let onboarding = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{task_uid}/github/onboarding"))
+                    .header(header::COOKIE, &session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(onboarding.status(), StatusCode::OK);
+        let onboarding = to_bytes(onboarding.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let onboarding: Value =
+            serde_json::from_slice(&onboarding).map_err(|error| error.to_string())?;
+        assert_eq!(onboarding["publicationObserved"], true);
+        assert_eq!(onboarding["workflowObserved"], true);
+        assert_eq!(onboarding["dispatchObserved"], true);
+        assert_eq!(
+            broker.calls.lock().map_err(|_| "lock broker calls")?.len(),
+            call_count,
+            "persisted onboarding evidence must not execute a governed GitHub operation"
+        );
 
         {
             let calls = broker.calls.lock().map_err(|_| "lock broker calls")?;
