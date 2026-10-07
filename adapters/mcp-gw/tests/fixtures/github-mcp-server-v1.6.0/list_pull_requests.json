@@ -1,0 +1,8 @@
+{
+ "content": [
+  {
+   "text": "[{\"number\":7,\"title\":\"Add example feature\",\"body\":\"Adds an example feature.\\n\",\"state\":\"closed\",\"draft\":false,\"merged\":false,\"html_url\":\"https://github.com/alice/example-repo/pull/7\",\"user\":{\"login\":\"alice\",\"id\":1000001,\"profile_url\":\"https://github.com/alice\",\"avatar_url\":\"https://avatars.example.com/u/1000001?v=4\"},\"head\":{\"ref\":\"feature/example\",\"sha\":\"1111111111111111111111111111111111111111\",\"repo\":{\"full_name\":\"alice/example-repo\"}},\"base\":{\"ref\":\"main\",\"sha\":\"2222222222222222222222222222222222222222\",\"repo\":{\"full_name\":\"alice/example-repo\"}},\"created_at\":\"2026-01-15T19:31:07Z\",\"updated_at\":\"2026-01-15T20:02:22Z\",\"closed_at\":\"2026-01-15T20:02:21Z\",\"merged_at\":\"2026-01-15T20:02:21Z\"}]",
+   "type": "text"
+  }
+ ]
+}

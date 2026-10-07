@@ -234,6 +234,7 @@ pub enum ConnectionBrokerError {
     ProviderAuthorizationFailed,
     TokenGrantFailed,
     ProviderResponseInvalid,
+    BridgeResultTooLarge,
     GatewayTransportFailed,
     GatewayStatusInvalid,
     GatewayBodyUnavailable,
@@ -812,6 +813,9 @@ fn connection_broker_problem(error: ConnectionBrokerError) -> ConnectionOperatio
         ConnectionBrokerError::TokenGrantFailed => ("token_grant_failed", None, None, None),
         ConnectionBrokerError::ProviderResponseInvalid => {
             ("provider_response_invalid", None, None, None)
+        }
+        ConnectionBrokerError::BridgeResultTooLarge => {
+            ("bridge_result_too_large", None, None, None)
         }
         ConnectionBrokerError::GatewayTransportFailed => {
             ("gateway_transport_failed", None, None, None)
@@ -1586,6 +1590,10 @@ mod tests {
             (
                 ConnectionBrokerError::ProviderResponseInvalid,
                 "provider_response_invalid",
+            ),
+            (
+                ConnectionBrokerError::BridgeResultTooLarge,
+                "bridge_result_too_large",
             ),
             (
                 ConnectionBrokerError::GatewayTransportFailed,

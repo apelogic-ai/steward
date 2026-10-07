@@ -61,6 +61,8 @@ describe("governed provider connection controls", () => {
     expect(source).toContain("inspect the AgentRuntime and OpenShell sandbox status");
     expect(source).toContain("connection_deadline_exceeded");
     expect(source).toContain("inspect runtime health");
+    expect(source).toContain("bridge_result_too_large");
+    expect(source).toContain("larger than Steward accepts for this operation");
     expect(source).toContain("oauth_redirect_target_not_allowed");
     expect(source).toContain("githubWrapper.oauth.redirectAfterAllowedOrigins");
     expect(source).toContain("code: operation.data.code");
