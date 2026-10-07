@@ -44,6 +44,33 @@ test("browser hello world progress accepts only an inline browser run under a pr
   })], envelopes)?.package?.source).toBe("inline");
 });
 
+test("browser hello world progress keeps the newest succeeded finalized run", () => {
+  const envelopes = new Set(["sample-envelope"]);
+  const succeeded = run({
+    taskUid: "successful-task",
+    updatedAt: "2026-10-02T00:01:00Z",
+    package: { source: "inline", revision: `steward:sha256:${"a".repeat(64)}`, path: "task-definition.json", promptSource: "inline" },
+    userEnvelopeInstanceId: "sample-envelope",
+  });
+  const laterFailure = run({
+    taskUid: "failed-task",
+    phase: "failed",
+    updatedAt: "2026-10-02T00:02:00Z",
+    package: { source: "inline", revision: `steward:sha256:${"b".repeat(64)}`, path: "task-definition.json", promptSource: "inline" },
+    userEnvelopeInstanceId: "sample-envelope",
+  });
+  const laterRunning = run({
+    taskUid: "running-task",
+    finalized: false,
+    phase: "running",
+    updatedAt: "2026-10-02T00:03:00Z",
+    package: { source: "inline", revision: `steward:sha256:${"c".repeat(64)}`, path: "task-definition.json", promptSource: "inline" },
+    userEnvelopeInstanceId: "sample-envelope",
+  });
+
+  expect(browserHelloWorldRun([succeeded, laterFailure, laterRunning], envelopes)?.taskUid).toBe("successful-task");
+});
+
 test("GitHub automation completes only for the exact successful browser package", () => {
   const envelopeIds = new Set(["sample-envelope"]);
   const browser = run({
@@ -60,7 +87,7 @@ test("GitHub automation completes only for the exact successful browser package"
   expect(automatedPackageRun([{ ...unrelated, package: { ...unrelated.package!, contentDigest: browser.package!.contentDigest } }], browser, envelopeIds)?.trigger?.provider).toBe("github");
 });
 
-test("governed job preview keeps the reusable workflow job and omits sibling jobs", () => {
+test("governed job preview keeps the input preparation and reusable workflow jobs", () => {
   const workflow = [
     "jobs:",
     "  prepare:",
@@ -77,9 +104,9 @@ test("governed job preview keeps the reusable workflow job and omits sibling job
     "",
   ].join("\n");
   const preview = governedJobOnly(workflow);
-  expect(preview).toContain("jobs:\n  governed:");
+  expect(preview).toContain("jobs:\n  prepare:");
+  expect(preview).toContain("\n  governed:");
   expect(preview).toContain("id-token: write");
   expect(preview).toContain("package-path: .steward/tasks/hello/task-definition.json");
-  expect(preview).not.toContain("prepare:");
   expect(preview).not.toContain("verify:");
 });

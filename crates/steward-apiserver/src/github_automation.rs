@@ -323,6 +323,8 @@ pub(crate) struct GithubRunStatusResponse {
 pub(crate) struct GithubAutomationErrorResponse {
     api_version: &'static str,
     error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manual_files: Option<BTreeMap<String, String>>,
 }
 
 struct ExactRepositoryBundle {
@@ -924,7 +926,10 @@ where
         return Err(StatusCode::CONFLICT.into_response());
     }
     if !steward_run_supports_package_path_invocation(&state.config.steward_run_release) {
-        return Err(unavailable());
+        return Err(automation_problem(
+            "steward_run_release_unsupported",
+            Some(files),
+        ));
     }
     let envelope = GithubActionsEnvelopeSelection {
         id: run
@@ -1241,6 +1246,23 @@ fn automation_error(error: ConnectionBrokerError) -> Response {
         Json(GithubAutomationErrorResponse {
             api_version: GITHUB_AUTOMATION_API_VERSION,
             error: "github_automation_unavailable",
+            manual_files: None,
+        }),
+    )
+        .into_response()
+}
+
+fn automation_problem(
+    error: &'static str,
+    manual_files: Option<BTreeMap<String, String>>,
+) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(GithubAutomationErrorResponse {
+            api_version: GITHUB_AUTOMATION_API_VERSION,
+            error,
+            manual_files,
         }),
     )
         .into_response()
@@ -1572,6 +1594,46 @@ mod tests {
             StewardRunWorkflowInstallationMode::Remote,
             true,
         ))
+    }
+
+    #[tokio::test]
+    async fn unsupported_steward_run_release_returns_specific_reason_and_manual_package()
+    -> Result<(), String> {
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .push(browser_run(task_uid, OWNER_USER_ID)?);
+        let mut unsupported = config()?;
+        unsupported.steward_run_release.version = "0.7.9".to_owned();
+        let (auth, session_cookie, _) = signed_in_cookie_and_csrf().await?;
+        let app = protected_router(ledger, FakeBroker::default(), unsupported, auth);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{task_uid}/github/bundle"))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let body: Value = serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+        assert_eq!(body["error"], "steward_run_release_unsupported");
+        assert!(
+            body["manualFiles"][".steward/tasks/hello/task-definition.json"]
+                .as_str()
+                .is_some()
+        );
+        Ok(())
     }
 
     fn cookie(response: &Response, name: &str) -> Result<String, String> {

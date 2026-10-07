@@ -21,6 +21,7 @@ import {
   type DispatchTaskResponse,
   type EnvelopeTemplatesResponse,
   type GithubAutomationEvidenceResponse,
+  type GithubAutomationErrorResponse,
   type GithubRepositoriesResponse,
   type GithubRunStatusResponse,
   type GithubTaskBundleResponse,
@@ -38,7 +39,7 @@ import {
 } from "@/components/browser-run-now-view";
 import { parseRunEventData } from "@/components/run-views";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
-import { deriveOnboardingProgress, loadOnboardingEvidence, type OnboardingEvidence } from "@/data/onboarding-progress";
+import { deriveOnboardingProgress, loadOnboardingEvidence, ONBOARDING_PROGRESS_EVENT, type OnboardingEvidence } from "@/data/onboarding-progress";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
@@ -79,15 +80,22 @@ function inputObject(rows: InputRow[]): Record<string, string> {
 
 export function governedJobOnly(workflow: string): string {
   const lines = workflow.split("\n");
-  const start = lines.findIndex((line) => line === "  governed:");
+  const start = lines.findIndex((line) => line === "  prepare:");
   if (start === -1) return workflow;
-  const endOffset = lines.slice(start + 1).findIndex((line) => /^  [A-Za-z0-9_-]+:$/.test(line));
-  const end = endOffset === -1 ? lines.length : start + 1 + endOffset;
+  const governed = lines.findIndex((line, index) => index > start && line === "  governed:");
+  if (governed === -1) return workflow;
+  const endOffset = lines.slice(governed + 1).findIndex((line) => /^  [A-Za-z0-9_-]+:$/.test(line));
+  const end = endOffset === -1 ? lines.length : governed + 1 + endOffset;
   return ["jobs:", ...lines.slice(start, end)].join("\n").trimEnd() + "\n";
 }
 
 function copyText(value: string, onCopied: () => void) {
   void navigator.clipboard.writeText(value).then(onCopied);
+}
+
+function repositoryPrerequisite(reason: string | null | undefined): string {
+  if (reason === "source_repository_not_admitted") return "This repository is not admitted as a governed source.";
+  return reason ? `Repository prerequisite is missing: ${reason}.` : "This repository is not ready for governed automation.";
 }
 
 export { browserHelloWorldRun } from "@/data/onboarding-progress";
@@ -148,6 +156,7 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
   const [runState, setRunState] = useState<"idle" | "submitting" | "error">("idle");
   const [runFailure, setRunFailure] = useState<string | null>(null);
   const [bundle, setBundle] = useState<GithubTaskBundleResponse | null>(null);
+  const [manualFiles, setManualFiles] = useState<Record<string, string>>({});
   const [bundleFailure, setBundleFailure] = useState<string | null>(null);
   const [publication, setPublication] = useState<PublishTaskResponse | null>(null);
   const [workflow, setWorkflow] = useState<WorkflowDetectionResponse | null>(null);
@@ -181,7 +190,7 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
   const successfulTestRun = testRun?.phase === "succeeded" && testRun.finalized ? testRun : undefined;
   const taskUid = successfulTestRun?.taskUid ?? null;
   const packagePath = successfulTestRun?.package?.path ?? data.starterTask.packagePath;
-  const packagePreview = bundle?.files[packagePath] ?? null;
+  const packagePreview = bundle?.files[packagePath] ?? manualFiles[packagePath] ?? null;
   const workflowPreview = bundle ? bundle.files[bundle.workflowPath] ?? null : null;
   const automationRun = baseProgress.automationRun;
   const automationRunId = Number(automationRun?.trigger?.runId);
@@ -189,23 +198,22 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
     ?? (Number.isSafeInteger(automationRunId) && automationRunId > 0 ? automationRunId : null);
   const githubRunUrl = dispatch?.url ?? automationRun?.trigger?.runUrl ?? null;
   const resultPhase = automationRun?.phase ?? githubStatus?.linkedTaskPhase ?? githubStatus?.conclusion ?? githubStatus?.phase;
-  const resultTerminal = Boolean(automationRun?.finalized && ["succeeded", "failed", "cancelled"].includes(automationRun.phase))
-    || ["succeeded", "failed", "cancelled"].includes(githubStatus?.linkedTaskPhase ?? "");
-  const done = [
-    baseProgress.done[0],
-    baseProgress.done[1],
-    Boolean(successfulTestRun),
-    Boolean(publication || workflow?.compatible || automationRun),
-    Boolean(workflow?.compatible || automationRun),
-    Boolean(dispatch || automationRun),
-    resultTerminal,
-  ];
-  const completed = done.filter(Boolean).length;
+  const progress = deriveOnboardingProgress(data, {
+    dispatchObserved: Boolean(dispatch),
+    publicationObserved: Boolean(publication || workflow?.compatible),
+    workflowObserved: Boolean(workflow?.compatible),
+  });
+  const done = progress.done;
+  const completed = progress.completed;
   const firstIncomplete = done.findIndex((value) => !value);
   const [openStep, setOpenStep] = useState(firstIncomplete === -1 ? 6 : firstIncomplete);
 
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent(ONBOARDING_PROGRESS_EVENT, { detail: progress }));
+  }, [progress]);
+
   const refreshWorkflow = useCallback(async () => {
-    if (session.status !== "authenticated" || !taskUid || !selectedRepository?.ready) return null;
+    if (session.status !== "authenticated" || !taskUid || !selectedRepository) return null;
     const result = await detectWorkflow({
       body: { owner: selectedRepository.owner, repository: selectedRepository.name },
       cache: "no-store",
@@ -224,33 +232,34 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
       await Promise.resolve();
       if (!active) return;
       setBundle(null);
+      setManualFiles({});
       setBundleFailure(null);
       setPublication(null);
       setWorkflow(null);
       setDispatch(null);
       setGithubStatus(null);
       if (session.status !== "authenticated" || !taskUid || !selectedRepository) return;
-      if (!selectedRepository.ready) {
-        setBundleFailure("This repository is not admitted as a governed source.");
-        return;
-      }
       setAutomationState("checking");
       const [bundleResult, evidenceResult] = await Promise.all([
         githubTaskBundle({ cache: "no-store", credentials: "same-origin", path: { task_uid: taskUid } }),
-        githubAutomationEvidence({
+        selectedRepository.ready ? githubAutomationEvidence({
           cache: "no-store",
           credentials: "same-origin",
           path: { task_uid: taskUid },
           query: { owner: selectedRepository.owner, repository: selectedRepository.name },
-        }),
+        }) : Promise.resolve(null),
         refreshWorkflow(),
       ]);
       if (!active) return;
       if (bundleResult.data && bundleResult.response?.ok) setBundle(bundleResult.data);
-      else setBundleFailure(bundleResult.response?.status === 503
-        ? "Publishing this package requires steward-run 0.8.0 or later. Use the manual path until the reviewed release is upgraded."
-        : "Steward could not render the exact tested package and workflow.");
-      if (evidenceResult.data && evidenceResult.response?.ok) {
+      else {
+        const problem = bundleResult.error as GithubAutomationErrorResponse | undefined;
+        if (problem?.manualFiles) setManualFiles(problem.manualFiles);
+        setBundleFailure(problem?.error === "steward_run_release_unsupported"
+          ? "The reviewed steward-run release is below 0.8.0. Copy the Task definition manually; workflow generation and detection require steward-run 0.8.0 or later."
+          : "Steward could not render the exact tested package and workflow.");
+      }
+      if (evidenceResult?.data && evidenceResult.response?.ok) {
         const evidence: GithubAutomationEvidenceResponse = evidenceResult.data;
         setPublication(evidence.publication ?? null);
         setDispatch(evidence.dispatch ?? null);
@@ -259,6 +268,10 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
     })();
     return () => { active = false; };
   }, [refreshWorkflow, selectedRepository, session, taskUid]);
+
+  const readinessFailure = selectedRepository && !selectedRepository.ready
+    ? repositoryPrerequisite(selectedRepository.missingPrerequisite)
+    : null;
 
   useEffect(() => {
     if (!publication || workflow?.compatible || !selectedRepository?.ready) return;
@@ -413,7 +426,7 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
           <label className="grid gap-2 text-sm font-semibold">Coding agent<select className={fieldClass} onChange={(event) => setAgentRef(event.target.value)} value={agentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.agentRef}{agent.compatible ? "" : " · unavailable"}</option>)}</select></label>
           <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} onChange={(event) => setSelectedEnvelopeId(event.target.value)} value={selectedEnvelope?.id ?? ""}>{activeEnvelopes.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
         </div>
-        {selectedRepository && !selectedRepository.ready ? <p className="text-sm text-warn">Not ready: {selectedRepository.missingPrerequisite ?? "this repository is not admitted as a governed source"}.</p> : null}
+        {readinessFailure ? <p className="text-sm text-warn">Not ready: {readinessFailure}</p> : null}
         {agentWarning || modelWarning ? <p className="text-sm text-warn">{agentWarning ?? modelWarning}</p> : null}
         <label className="grid gap-2 text-sm font-semibold">Prompt<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-sm font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label>
         <div className="space-y-3"><div className="flex items-center justify-between gap-3"><strong className="text-sm">Inputs</strong><button className="rounded-control border px-3 py-1.5 text-sm font-semibold" onClick={() => setInputs((rows) => [...rows, { id: crypto.randomUUID(), name: "", value: "" }])} type="button">+ Add input</button></div>{inputs.map((row) => <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]" key={row.id}><input aria-label="Input name" className={fieldClass} onChange={(event) => setInputs((rows) => rows.map((candidate) => candidate.id === row.id ? { ...candidate, name: event.target.value } : candidate))} placeholder="name" value={row.name} /><input aria-label={`Input value for ${row.name || "new input"}`} className={fieldClass} onChange={(event) => setInputs((rows) => rows.map((candidate) => candidate.id === row.id ? { ...candidate, value: event.target.value } : candidate))} placeholder="value" value={row.value} /><button aria-label={`Remove input ${row.name || "row"}`} className="rounded-control border px-3 text-sm" onClick={() => setInputs((rows) => rows.filter((candidate) => candidate.id !== row.id))} type="button">Remove</button></div>)}<p className="text-xs text-muted-ink">Inputs are passed to the agent as <code>in/inputs.json</code>.</p></div>
@@ -425,17 +438,17 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
     {
       title: "Publish the task definition",
       status: publication ? `Pull request #${publication.pullRequestNumber} opened` : workflow?.compatible ? "Published workflow found on the default branch" : "Publish the exact tested Task as a pull request",
-      body: successfulTestRun ? <div className="space-y-4"><p className="text-sm text-muted-ink">Review the exact <code>steward.task-definition/v2</code> document that ran at <code>{packagePath}</code>.</p>{packagePreview ? <Preview title={packagePath} value={packagePreview} copied={copied === "package"} onCopy={() => copyText(packagePreview, () => setCopied("package"))} /> : <p className="text-sm text-warn">{bundleFailure ?? "Rendering the tested package…"}</p>}<div className="flex flex-wrap gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!bundle || !selectedRepository?.ready || automationState === "publishing"} onClick={() => void openPublication()} type="button">{automationState === "publishing" ? "Opening…" : "Open pull request"}</button>{publication ? <a className="rounded-control border px-4 py-2 text-sm font-semibold" href={publication.pullRequestUrl} rel="noreferrer" target="_blank">View pull request ↗</a> : null}<button className="rounded-control border px-4 py-2 text-sm font-semibold" onClick={() => void refreshWorkflow()} type="button">I&apos;ve committed it</button></div><p className="text-xs text-muted-ink">Change the prompt or inputs in step 3 to regenerate it.</p></div> : <p className="text-sm text-muted-ink">Complete a successful test run first.</p>,
+      body: successfulTestRun ? <div className="space-y-4"><p className="text-sm text-muted-ink">Review the exact <code>steward.task-definition/v2</code> document that ran at <code>{packagePath}</code>.</p>{packagePreview ? <Preview title={packagePath} value={packagePreview} copied={copied === "package"} onCopy={() => copyText(packagePreview, () => setCopied("package"))} /> : <p className="text-sm text-warn">{bundleFailure ?? "Rendering the tested package…"}</p>}{readinessFailure ? <p className="text-sm text-warn">{readinessFailure} Copy the generated files into the repository manually.</p> : null}{bundleFailure ? <p className="text-sm text-warn">{bundleFailure}</p> : null}<div className="flex flex-wrap gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!bundle || !selectedRepository?.ready || automationState === "publishing"} onClick={() => void openPublication()} type="button">{automationState === "publishing" ? "Opening…" : "Open pull request"}</button>{publication ? <a className="rounded-control border px-4 py-2 text-sm font-semibold" href={publication.pullRequestUrl} rel="noreferrer" target="_blank">View pull request ↗</a> : null}<button className="rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!workflowPreview} onClick={() => void refreshWorkflow()} type="button">I&apos;ve committed it</button></div><p className="text-xs text-muted-ink">Change the prompt or inputs in step 3 to regenerate it.</p></div> : <p className="text-sm text-muted-ink">Complete a successful test run first.</p>,
     },
     {
       title: "Add the workflow to your repository",
       status: workflow?.compatible ? `${workflow.path} verified on the default branch` : publication ? "Merge the publication pull request" : "Add the generated caller workflow",
-      body: successfulTestRun ? <div className="space-y-4"><div className="flex gap-2" role="tablist" aria-label="Workflow preview"><button aria-selected={workflowTab === "full"} className="rounded-control border px-3 py-2 text-sm font-semibold" onClick={() => setWorkflowTab("full")} role="tab" type="button">Full workflow</button><button aria-selected={workflowTab === "job"} className="rounded-control border px-3 py-2 text-sm font-semibold" onClick={() => setWorkflowTab("job")} role="tab" type="button">Governed job only</button></div>{workflowPreview ? <Preview title={bundle?.workflowPath ?? "Generated workflow"} value={workflowTab === "full" ? workflowPreview : governedJobOnly(workflowPreview)} copied={copied === "workflow"} onCopy={() => copyText(workflowTab === "full" ? workflowPreview : governedJobOnly(workflowPreview), () => setCopied("workflow"))} /> : <p className="text-sm text-warn">{bundleFailure ?? "Rendering the exact workflow…"}</p>}<p className="text-xs text-muted-ink"><code>package-path</code> points to the definition from step 4.</p><div className="flex flex-wrap gap-3">{publication ? <a className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href={publication.pullRequestUrl} rel="noreferrer" target="_blank">Merge the pull request ↗</a> : null}<button className="rounded-control border px-4 py-2 text-sm font-semibold" onClick={() => void refreshWorkflow()} type="button">I&apos;ve committed it</button></div></div> : <p className="text-sm text-muted-ink">Complete a successful test run first.</p>,
+      body: successfulTestRun ? <div className="space-y-4"><div className="flex gap-2" role="tablist" aria-label="Workflow preview"><button aria-selected={workflowTab === "full"} className="rounded-control border px-3 py-2 text-sm font-semibold" onClick={() => setWorkflowTab("full")} role="tab" type="button">Full workflow</button><button aria-selected={workflowTab === "job"} className="rounded-control border px-3 py-2 text-sm font-semibold" onClick={() => setWorkflowTab("job")} role="tab" type="button">Governed job only</button></div>{workflowPreview ? <Preview title={bundle?.workflowPath ?? "Generated workflow"} value={workflowTab === "full" ? workflowPreview : governedJobOnly(workflowPreview)} copied={copied === "workflow"} onCopy={() => copyText(workflowTab === "full" ? workflowPreview : governedJobOnly(workflowPreview), () => setCopied("workflow"))} /> : <p className="text-sm text-warn">{bundleFailure ?? "Rendering the exact workflow…"}</p>}<p className="text-xs text-muted-ink"><code>package-path</code> points to the definition from step 4.</p>{readinessFailure ? <p className="text-sm text-warn">{readinessFailure} Manual workflow detection remains available after you copy the files.</p> : null}<div className="flex flex-wrap gap-3">{publication ? <a className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href={publication.pullRequestUrl} rel="noreferrer" target="_blank">Merge the pull request ↗</a> : null}<button className="rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!workflowPreview} onClick={() => void refreshWorkflow()} type="button">I&apos;ve committed it</button></div></div> : <p className="text-sm text-muted-ink">Complete a successful test run first.</p>,
     },
     {
       title: "Trigger a test run",
       status: dispatch ? `GitHub run ${dispatch.runId} accepted` : automationRun ? `GitHub-origin Task ${automationRun.taskUid} observed` : "Dispatch the verified workflow on GitHub",
-      body: taskUid && selectedRepository ? <div className="space-y-4"><p className="text-sm text-muted-ink">Dispatch the workflow on GitHub through your connection, or start it yourself. HyperShell picks the run up at admission.</p><div className="flex flex-wrap gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!workflow?.compatible || automationState === "dispatching"} onClick={() => void dispatchWorkflow()} type="button">{automationState === "dispatching" ? "Starting…" : "Run on GitHub"}</button><a className="rounded-control border px-4 py-2 text-sm font-semibold" href={githubRunUrl ?? `${selectedRepository.url}/actions`} rel="noreferrer" target="_blank">Open in GitHub Actions ↗</a></div><pre className="overflow-auto rounded-control bg-code p-3 text-xs text-code-ink">gh workflow run {bundle?.workflowPath ?? "hypershell-task.yml"} -f task-inputs=&apos;{JSON.stringify(inputObject(inputs))}&apos;</pre>{statusRunId && !githubStatus ? <p className="text-sm text-muted-ink">Waiting for GitHub to start the job…</p> : null}</div> : <p className="text-sm text-muted-ink">Complete the tested package and workflow first.</p>,
+      body: taskUid && selectedRepository ? <div className="space-y-4"><p className="text-sm text-muted-ink">Dispatch the workflow on GitHub through your connection, or start it yourself. HyperShell picks the run up at admission.</p>{readinessFailure ? <p className="text-sm text-warn">{readinessFailure} Governed dispatch is unavailable until it is ready.</p> : null}{bundleFailure ? <p className="text-sm text-warn">{bundleFailure}</p> : null}<div className="flex flex-wrap gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!workflow?.compatible || !selectedRepository.ready || automationState === "dispatching"} onClick={() => void dispatchWorkflow()} type="button">{automationState === "dispatching" ? "Starting…" : "Run on GitHub"}</button><a className="rounded-control border px-4 py-2 text-sm font-semibold" href={githubRunUrl ?? `${selectedRepository.url}/actions`} rel="noreferrer" target="_blank">Open in GitHub Actions ↗</a></div>{bundle?.workflowPath ? <pre className="overflow-auto rounded-control bg-code p-3 text-xs text-code-ink">gh workflow run {bundle.workflowPath.split("/").at(-1)} -f task-inputs=&apos;{JSON.stringify(inputObject(inputs))}&apos;</pre> : null}{statusRunId && !githubStatus ? <p className="text-sm text-muted-ink">Waiting for GitHub to start the job…</p> : null}</div> : <p className="text-sm text-muted-ink">Complete the tested package and workflow first.</p>,
     },
     {
       title: "See the result",

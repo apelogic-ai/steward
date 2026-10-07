@@ -1163,6 +1163,9 @@ export type GithubActionsWorkflowResponse = {
 export type GithubAutomationErrorResponse = {
     apiVersion: string;
     error: string;
+    manualFiles?: {
+        [key: string]: string;
+    } | null;
 };
 
 export type GithubAutomationEvidenceResponse = {

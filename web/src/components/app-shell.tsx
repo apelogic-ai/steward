@@ -13,7 +13,7 @@ import {
 import { Breadcrumbs, type BreadcrumbItem } from "@/components/hs/breadcrumbs";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { authStartPath } from "@/session/auth-redirect";
-import { deriveOnboardingProgress, loadOnboardingEvidence } from "@/data/onboarding-progress";
+import { deriveOnboardingProgress, loadOnboardingEvidence, ONBOARDING_PROGRESS_EVENT } from "@/data/onboarding-progress";
 import { adminSetupDismissed, adminSetupVisibleOnServer, subscribeToAdminSetupPreference } from "@/data/admin-setup-preference";
 import { useSession, type SessionState } from "@/session/session-context";
 
@@ -477,10 +477,18 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
       }
       refreshProgress();
     };
+    const progressUpdated = (event: Event) => {
+      if (!(event instanceof CustomEvent) || !Array.isArray(event.detail?.done)) return;
+      const done = event.detail.done as boolean[];
+      setOnboardingCompleted(done.filter(Boolean).length);
+      setOnboardingNextTitle(onboardingStepTitles[done.findIndex((value) => !value)] ?? null);
+    };
     window.addEventListener("hypershell:preferences-updated", preferencesUpdated);
+    window.addEventListener(ONBOARDING_PROGRESS_EVENT, progressUpdated);
     return () => {
       active = false;
       window.removeEventListener("hypershell:preferences-updated", preferencesUpdated);
+      window.removeEventListener(ONBOARDING_PROGRESS_EVENT, progressUpdated);
     };
   }, [adminMode, workspaceAuthorized]);
 

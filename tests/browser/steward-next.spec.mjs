@@ -853,6 +853,7 @@ async function guardedPage(browser, {
   let githubWorkflowPublished = false;
   let githubRunStatusRequests = 0;
   let onboardingRunCreated = false;
+  let laterFailedOnboardingRun = false;
   let githubAutomationCompleted = false;
   let publicationEvidence = null;
   let dispatchEvidence = null;
@@ -1265,6 +1266,12 @@ async function guardedPage(browser, {
       };
       const runs = [];
       if (githubAutomationCompleted) runs.push(automated);
+      if (laterFailedOnboardingRun) runs.push({
+        ...inline,
+        taskUid: "00000000-0000-0000-0000-000000000008",
+        phase: "failed",
+        updatedAt: "2026-08-24T18:03:00Z",
+      });
       if (onboardingRunCreated) runs.push(inline);
       return json(route, { apiVersion: "steward.browser-runs/v1", runs, nextCursor: null, facets: { phase: { ...runFacets, succeeded: runs.length } } });
     }
@@ -1388,7 +1395,14 @@ async function guardedPage(browser, {
         workflowPath: onboardingWorkflowPath,
         packageDigest: browserTaskDigest,
       })
-    : json(route, { apiVersion: "steward.github-automation/v1", error: "steward_run_release_unsupported" }, githubBundleStatus));
+    : json(route, {
+        apiVersion: "steward.github-automation/v1",
+        error: "steward_run_release_unsupported",
+        manualFiles: {
+          [starterTask.packagePath]: onboardingPackage,
+          [browserTaskDefinitionPath]: onboardingPackage,
+        },
+      }, githubBundleStatus));
   await context.route(`${origin}/app/api/v1/runs/*/github/evidence*`, (route) => json(route, {
     apiVersion: "steward.github-automation/v1",
     publication: publicationEvidence,
@@ -1777,6 +1791,7 @@ async function guardedPage(browser, {
     runEventRequests,
     setupStatusRequests,
     useAdminSetupStatus: (status) => { currentAdminSetupStatus = status; },
+    useLaterFailedOnboardingRun: () => { laterFailedOnboardingRun = true; },
   };
 }
 
@@ -2540,13 +2555,14 @@ test("Get started completes the governed test-to-GitHub journey from server evid
     expect(publication.body).toMatchObject({ owner: "example-org", repository: "agentic-ops" });
     await publicationStep.getByRole("button", { name: "I've committed it" }).click();
     await expect(step("Add the workflow to your repository").getByText("Done", { exact: true })).toBeVisible({ timeout: 10_000 });
+    await expect(developer.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: /Get started/ })).toContainText("5/7");
 
     const workflowStep = await openStep("Add the workflow to your repository");
     await expect(workflowStep.getByText(`.github/workflows/hypershell-${starterTaskFixture.taskDefinition.name}.yml`, { exact: true })).toBeVisible();
     await expect(workflowStep.locator("pre")).toContainText(`package-path: ${starterTaskFixture.packagePath}`);
     await workflowStep.getByRole("tab", { name: "Governed job only" }).click();
-    await expect(workflowStep.locator("pre")).toContainText("jobs:\n  governed:");
-    await expect(workflowStep.locator("pre")).not.toContainText("  prepare:");
+    await expect(workflowStep.locator("pre")).toContainText("jobs:\n  prepare:");
+    await expect(workflowStep.locator("pre")).toContainText("  governed:");
 
     const triggerStep = await openStep("Trigger a test run");
     await triggerStep.getByRole("button", { name: "Run on GitHub" }).click();
@@ -2565,6 +2581,9 @@ test("Get started completes the governed test-to-GitHub journey from server evid
     for (const title of ["Connect GitHub", "Get your first envelope", "Try a test run", "Publish the task definition", "Add the workflow to your repository", "Trigger a test run", "See the result"]) {
       await expect(step(title).getByText("Done", { exact: true })).toBeVisible();
     }
+    developer.useLaterFailedOnboardingRun();
+    await developer.page.reload();
+    await expect(developer.page.getByText("7 of 7 done", { exact: true })).toBeVisible();
     await developer.page.getByRole("button", { name: "Hide Get started" }).click();
     await developer.page.goto(`${origin}/settings`);
     await developer.page.getByRole("button", { name: "Reopen Get started" }).click();
@@ -2584,11 +2603,17 @@ test("Get started explains unsupported releases and repository prerequisites", a
   });
   try {
     await developer.page.goto(`${origin}/get-started`);
-    await expect(developer.page.getByText("Publishing this package requires steward-run 0.8.0 or later. Use the manual path until the reviewed release is upgraded.")).toBeVisible();
+    await expect(developer.page.getByText("The reviewed steward-run release is below 0.8.0. Copy the Task definition manually; workflow generation and detection require steward-run 0.8.0 or later.").first()).toBeVisible();
+    const publicationStep = developer.page.getByRole("listitem").filter({ hasText: "Publish the task definition" });
+    if (await publicationStep.getByRole("button").first().getAttribute("aria-expanded") !== "true") {
+      await publicationStep.getByRole("button").first().click();
+    }
+    await expect(publicationStep.locator("pre")).toContainText('"schemaVersion": "steward.task-definition/v2"');
+    await expect(publicationStep.getByRole("button", { name: "I've committed it" })).toBeDisabled();
     const testRun = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
     await testRun.getByRole("button").first().click();
     await testRun.getByLabel("Repository").selectOption("repo_not_admitted");
-    await expect(testRun.getByText("Not ready: source_repository_not_admitted.", { exact: true })).toBeVisible();
+    await expect(testRun.getByText("Not ready: This repository is not admitted as a governed source.", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }

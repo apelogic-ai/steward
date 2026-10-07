@@ -15,6 +15,14 @@ export type OnboardingEvidence = {
   runs: MyRunsResponse;
 };
 
+export type OnboardingAutomationEvidence = {
+  dispatchObserved?: boolean;
+  publicationObserved?: boolean;
+  workflowObserved?: boolean;
+};
+
+export const ONBOARDING_PROGRESS_EVENT = "hypershell:onboarding-progress";
+
 export function browserHelloWorldRun(
   runs: MyRunsResponse["runs"],
   provisionedEnvelopeIds: ReadonlySet<string>,
@@ -22,6 +30,8 @@ export function browserHelloWorldRun(
   return runs
     .filter((run) => run.origin === "browser"
       && run.package?.source === "inline"
+      && run.phase === "succeeded"
+      && run.finalized
       && Boolean(run.userEnvelopeInstanceId)
       && provisionedEnvelopeIds.has(String(run.userEnvelopeInstanceId)))
     .sort((left, right) => new Date(right.updatedAt).valueOf() - new Date(left.updatedAt).valueOf())[0];
@@ -42,22 +52,27 @@ export function automatedPackageRun(
     .sort((left, right) => new Date(right.updatedAt).valueOf() - new Date(left.updatedAt).valueOf())[0];
 }
 
-export function deriveOnboardingProgress(data: OnboardingEvidence) {
+export function deriveOnboardingProgress(
+  data: OnboardingEvidence,
+  automationEvidence: OnboardingAutomationEvidence = {},
+) {
   const provisionedEnvelopeIds = new Set(data.envelopes.requests
     .filter((request) => request.status === "provisioned" && request.envelopeInstanceId)
     .map((request) => String(request.envelopeInstanceId)));
   const helloWorldRun = browserHelloWorldRun(data.runs.runs, provisionedEnvelopeIds);
   const automationRun = automatedPackageRun(data.runs.runs, helloWorldRun, provisionedEnvelopeIds);
   const testSucceeded = helloWorldRun?.phase === "succeeded" && helloWorldRun.finalized;
-  const automationObserved = Boolean(automationRun);
+  const publicationObserved = automationEvidence.publicationObserved || Boolean(automationRun);
+  const workflowObserved = automationEvidence.workflowObserved || Boolean(automationRun);
+  const dispatchObserved = automationEvidence.dispatchObserved || Boolean(automationRun);
   const automationTerminal = Boolean(automationRun?.finalized && ["succeeded", "failed", "cancelled"].includes(automationRun.phase));
   const done = [
     data.connections.connections.some((connection) => connection.status.phase === "connected"),
     provisionedEnvelopeIds.size > 0,
     testSucceeded,
-    automationObserved,
-    automationObserved,
-    automationObserved,
+    publicationObserved,
+    workflowObserved,
+    dispatchObserved,
     automationTerminal,
   ];
   return { completed: done.filter(Boolean).length, done, provisionedEnvelopeIds, helloWorldRun, automationRun };
