@@ -16,6 +16,9 @@ use steward_ports::PortError;
 pub const IMPLEMENTED_PORTS: [&str; 0] = [];
 const OPEN_SHELL_BEARER_PLACEHOLDER: &str = "openshell-token-grant-placeholder";
 const MAX_RESPONSE_BYTES: usize = 32 * 1024;
+// GitHub MCP tool results are full GitHub API objects; a page of workflow runs is
+// several hundred KiB, so tool calls get their own bound.
+const MAX_MCP_TOOL_RESPONSE_BYTES: usize = 1024 * 1024;
 const PROVIDER_TRANSPORT_READY_TIMEOUT: Duration = Duration::from_secs(12);
 const PROVIDER_TRANSPORT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const DIRECT_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
@@ -709,7 +712,11 @@ impl GithubStatusReader {
             .await
             .map_err(|_| unavailable("read direct GitHub connection status"))?;
         let status = response.status();
-        let body = bounded_body_or_status(status, StatusCode::OK, read_bounded(response).await?)?;
+        let body = bounded_body_or_status(
+            status,
+            StatusCode::OK,
+            read_bounded(response, MAX_RESPONSE_BYTES).await?,
+        )?;
         parse_response(self.contract, GithubBridgeOperation::Status, status, &body)
     }
 }
@@ -798,7 +805,7 @@ impl GithubMcpGateway {
             let body = bounded_body_or_status(
                 status,
                 operation.expected_status(),
-                read_bounded(response).await?,
+                read_bounded(response, MAX_RESPONSE_BYTES).await?,
             )?;
             if pre_dispatch_provider_failure(status, &body)
                 && started.elapsed() < PROVIDER_TRANSPORT_READY_TIMEOUT
@@ -833,7 +840,13 @@ impl GithubMcpGateway {
                 let me = self
                     .call_mcp("steward-github-me", "get_me", json!({}))
                     .await?;
-                let query = if query.is_empty() {
+                // The default listing searches only the user's own repositories, so the
+                // small minimal output suffices: its items omit the owner, whose stable ID
+                // is the profile's. An explicit query can match repositories of other
+                // owners, such as organizations, whose stable IDs only the full output
+                // carries (about 5 KiB per item, within the tool response bound).
+                let minimal_output = query.is_empty();
+                let query = if minimal_output {
                     format!("user:{}", github_profile_login(&me)?)
                 } else {
                     query
@@ -842,7 +855,12 @@ impl GithubMcpGateway {
                     .call_mcp(
                         "steward-github-repositories",
                         "search_repositories",
-                        json!({"query": query, "page": page, "perPage": per_page}),
+                        json!({
+                            "query": query,
+                            "page": page,
+                            "perPage": per_page,
+                            "minimal_output": minimal_output,
+                        }),
                     )
                     .await?;
                 normalize_repositories(&me, &repositories, page, per_page)
@@ -895,7 +913,7 @@ impl GithubMcpGateway {
                             "owner": owner,
                             "repo": repo,
                             "resource_id": run_id.to_string(),
-                            "perPage": 100,
+                            "per_page": 100,
                         }),
                     )
                     .await?;
@@ -963,7 +981,7 @@ impl GithubMcpGateway {
                             "repo": repo,
                             "resource_id": workflow_id,
                             "workflow_runs_filter": {"branch": git_ref},
-                            "perPage": 10,
+                            "per_page": 10,
                         }),
                     )
                     .await?;
@@ -993,7 +1011,7 @@ impl GithubMcpGateway {
                                 "repo": repo,
                                 "resource_id": workflow_id,
                                 "workflow_runs_filter": {"branch": git_ref},
-                                "perPage": 10,
+                                "per_page": 10,
                             }),
                         )
                         .await?;
@@ -1205,8 +1223,11 @@ impl GithubMcpGateway {
                 Err(_) => return Err(unavailable("call MCP-GW")),
             };
             let status = response.status();
-            let body =
-                bounded_body_or_status(status, StatusCode::OK, read_bounded(response).await?)?;
+            let body = bounded_body_or_status(
+                status,
+                StatusCode::OK,
+                read_bounded(response, MAX_MCP_TOOL_RESPONSE_BYTES).await?,
+            )?;
             if pre_dispatch_provider_failure(status, &body)
                 && started.elapsed() < PROVIDER_TRANSPORT_READY_TIMEOUT
             {
@@ -1403,7 +1424,13 @@ fn github_blob_sha(value: &str) -> Option<String> {
 fn payload_array<'a>(payload: &'a Value, fields: &[&str]) -> Option<&'a Vec<Value>> {
     fields
         .iter()
-        .find_map(|field| payload.get(*field).and_then(Value::as_array))
+        .find_map(|field| {
+            payload.get(*field).and_then(|value| {
+                value
+                    .as_array()
+                    .or_else(|| value.get(*field).and_then(Value::as_array))
+            })
+        })
         .or_else(|| payload.as_array())
 }
 
@@ -1414,19 +1441,61 @@ fn normalize_repositories(
     per_page: u32,
 ) -> Result<Value, PortError> {
     let login = github_profile_login(me)?;
+    let profile_id = numeric_provider_id(me.get("id"));
     let items = payload_array(payload, &["items", "repositories"])
         .filter(|items| items.len() <= usize::try_from(per_page).unwrap_or(100))
         .ok_or_else(|| rejected("GitHub repository search response is invalid"))?;
-    let repositories = items
-        .iter()
-        .map(normalize_repository)
-        .collect::<Result<Vec<_>, PortError>>()?;
+    let mut repositories = Vec::with_capacity(items.len());
+    for item in items {
+        match normalize_repository(item) {
+            Ok(repository) => repositories.push(repository),
+            // Minimal search results omit the owner object. Items owned by the
+            // authenticated user take their owner ID from its profile; other owners'
+            // repositories cannot be admitted without a stable owner ID and are omitted.
+            Err(_)
+                if item.get("owner").is_none()
+                    && repository_owner_id_missing(item)
+                    && minimal_repository_owner(item) == Some(login) =>
+            {
+                let owner_id = profile_id
+                    .as_deref()
+                    .ok_or_else(|| rejected("GitHub profile response omitted its stable ID"))?;
+                repositories.push(normalize_repository(&with_owner_id(item, owner_id))?);
+            }
+            Err(_) if repository_owner_id_missing(item) => {}
+            Err(error) => return Err(error),
+        }
+    }
     Ok(json!({
         "login": login,
         "repositories": repositories,
         "page": page,
         "hasNextPage": items.len() == usize::try_from(per_page).unwrap_or(100),
     }))
+}
+
+fn minimal_repository_owner(repository: &Value) -> Option<&str> {
+    repository
+        .get("full_name")
+        .and_then(Value::as_str)
+        .and_then(|full_name| full_name.split_once('/').map(|(owner, _)| owner))
+}
+
+fn repository_owner_id_missing(repository: &Value) -> bool {
+    repository
+        .get("owner")
+        .and_then(|owner| owner.get("id"))
+        .or_else(|| repository.get("owner_id"))
+        .or_else(|| repository.get("ownerId"))
+        .is_none()
+}
+
+fn with_owner_id(repository: &Value, owner_id: &str) -> Value {
+    let mut repository = repository.clone();
+    if let Some(object) = repository.as_object_mut() {
+        object.insert("owner_id".to_owned(), Value::String(owner_id.to_owned()));
+    }
+    repository
 }
 
 fn github_profile_login(me: &Value) -> Result<&str, PortError> {
@@ -2320,10 +2389,13 @@ fn validate_authorization_url(value: &str) -> Result<(), PortError> {
     Ok(())
 }
 
-async fn read_bounded(mut response: reqwest::Response) -> Result<Option<Vec<u8>>, PortError> {
+async fn read_bounded(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, PortError> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        .is_some_and(|length| length > limit as u64)
     {
         return Ok(None);
     }
@@ -2333,7 +2405,7 @@ async fn read_bounded(mut response: reqwest::Response) -> Result<Option<Vec<u8>>
         .await
         .map_err(|_| unavailable("read MCP-GW response"))?
     {
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+        if body.len().saturating_add(chunk.len()) > limit {
             return Ok(None);
         }
         body.extend_from_slice(&chunk);
@@ -2381,10 +2453,13 @@ mod tests {
     use super::{
         GatewayContract, GithubBridgeFailureDiagnostic, GithubBridgeOperation, GithubBridgeRequest,
         GithubMcpGateway, GithubPublishedFile, GithubStatusCredential, GithubStatusReader,
-        compatible_workflow, github_bridge_failure_diagnostic, mcp_tool_payload,
-        normalize_repository, normalize_run_status, parse_response, pre_dispatch_provider_failure,
+        MAX_MCP_TOOL_RESPONSE_BYTES, MAX_RESPONSE_BYTES, commit_sha, compatible_workflow,
+        github_bridge_failure_diagnostic, maximum_run_id, mcp_tool_payload, normalize_pull_request,
+        normalize_repositories, normalize_repository, normalize_run_status, parse_response,
+        payload_array, pre_dispatch_provider_failure, workflow_content,
     };
     use reqwest::StatusCode;
+    use serde_json::Value;
     use steward_ports::PortError;
 
     fn read_json_request(listener: &TcpListener) -> Result<(TcpStream, serde_json::Value), String> {
@@ -2594,7 +2669,12 @@ mod tests {
             );
             assert_eq!(
                 repositories_request["params"]["arguments"],
-                serde_json::json!({"query": "user:alice", "page": 1, "perPage": 100})
+                serde_json::json!({
+                    "query": "user:alice",
+                    "page": 1,
+                    "perPage": 100,
+                    "minimal_output": true
+                })
             );
             write_mcp_payload(
                 stream,
@@ -2702,6 +2782,201 @@ mod tests {
         Ok(())
     }
 
+    /// Tool results captured from the pinned GitHub MCP server image
+    /// (`github-mcp-server` v1.6.0) and sanitized. Hand-written shapes let the
+    /// bridge drift from the real server (#311), so every parser is exercised here.
+    fn captured_tool_payload(result: &str) -> Result<Value, String> {
+        let result: Value =
+            serde_json::from_str(result).map_err(|error| format!("parse fixture: {error}"))?;
+        let envelope = serde_json::json!({"jsonrpc": "2.0", "id": "fixture", "result": result});
+        let body = serde_json::to_vec(&envelope).map_err(|error| format!("encode: {error}"))?;
+        mcp_tool_payload(&body, "fixture").map_err(|error| format!("tool payload: {error:?}"))
+    }
+
+    macro_rules! captured {
+        ($name:literal) => {
+            captured_tool_payload(include_str!(concat!(
+                "../tests/fixtures/github-mcp-server-v1.6.0/",
+                $name,
+                ".json"
+            )))
+        };
+    }
+
+    #[test]
+    fn captured_minimal_repository_search_takes_owner_identity_from_the_profile()
+    -> Result<(), String> {
+        let me = captured!("get_me")?;
+        let search = captured!("search_repositories_minimal")?;
+        assert!(
+            search["items"][0].get("owner").is_none(),
+            "the pinned server's minimal output omits the owner object"
+        );
+        let listing = normalize_repositories(&me, &search, 1, 100)
+            .map_err(|error| format!("normalize minimal listing: {error:?}"))?;
+        assert_eq!(listing["login"], "alice");
+        assert_eq!(listing["repositories"][0]["owner"], "alice");
+        assert_eq!(listing["repositories"][0]["ownerId"], "583231");
+        assert_eq!(listing["repositories"][0]["name"], "example-repo");
+        Ok(())
+    }
+
+    #[test]
+    fn captured_minimal_items_of_other_owners_are_omitted_not_fatal() -> Result<(), String> {
+        let mut me = captured!("get_me")?;
+        me["login"] = Value::String("bob".to_owned());
+        let search = captured!("search_repositories_minimal")?;
+        let listing = normalize_repositories(&me, &search, 1, 100)
+            .map_err(|error| format!("normalize foreign listing: {error:?}"))?;
+        assert_eq!(listing["repositories"], serde_json::json!([]));
+        Ok(())
+    }
+
+    #[test]
+    fn captured_full_repository_search_keeps_organization_owned_repositories() -> Result<(), String>
+    {
+        let me = captured!("get_me")?;
+        let search = captured!("search_repositories_full")?;
+        assert_eq!(search["items"][0]["owner"]["type"], "Organization");
+        let listing = normalize_repositories(&me, &search, 1, 100)
+            .map_err(|error| format!("normalize full listing: {error:?}"))?;
+        assert_eq!(listing["login"], "alice");
+        assert_eq!(listing["repositories"][0]["owner"], "example-org");
+        assert_eq!(listing["repositories"][0]["ownerId"], "1000001");
+        Ok(())
+    }
+
+    #[test]
+    fn profile_owner_identity_is_never_lent_to_an_item_that_names_another_owner()
+    -> Result<(), String> {
+        let me = captured!("get_me")?;
+        let search = serde_json::json!({"items": [{
+            "id": 1296269,
+            "name": "example-repo",
+            "full_name": "alice/example-repo",
+            "owner": {"login": "bob"},
+            "html_url": "https://github.com/alice/example-repo",
+            "private": false,
+            "default_branch": "main"
+        }]});
+        let listing = normalize_repositories(&me, &search, 1, 100)
+            .map_err(|error| format!("normalize conflicting owner: {error:?}"))?;
+        assert_eq!(
+            listing["repositories"],
+            serde_json::json!([]),
+            "only a minimal item without any owner object may take the profile ID"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_repository_query_requests_full_output_with_owner_identity()
+    -> Result<(), String> {
+        let me = captured!("get_me")?;
+        let search = captured!("search_repositories_full")?;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind repository fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read repository fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (stream, me_request) = read_json_request(&listener)?;
+            assert_eq!(me_request["params"]["name"], "get_me");
+            write_mcp_payload(stream, "steward-github-me", me)?;
+            let (stream, repositories_request) = read_json_request(&listener)?;
+            assert_eq!(
+                repositories_request["params"]["arguments"],
+                serde_json::json!({
+                    "query": "repo:example-org/example-repo",
+                    "page": 1,
+                    "perPage": 10,
+                    "minimal_output": false
+                }),
+                "only full output carries the owner identity of repositories the user does not own"
+            );
+            write_mcp_payload(stream, "steward-github-repositories", search)
+        });
+        let gateway = GithubMcpGateway::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build repository gateway: {error:?}"))?;
+        let response = gateway
+            .execute(
+                GithubBridgeOperation::Repositories,
+                GithubBridgeRequest::Repositories {
+                    query: "repo:example-org/example-repo".to_owned(),
+                    page: 1,
+                    per_page: 10,
+                },
+            )
+            .await
+            .map_err(|error| format!("execute repository query: {error:?}"))?;
+        server
+            .join()
+            .map_err(|_| "repository fixture panicked".to_owned())??;
+        assert_eq!(response["repositories"][0]["owner"], "example-org");
+        assert_eq!(response["repositories"][0]["ownerId"], "1000001");
+        Ok(())
+    }
+
+    #[test]
+    fn captured_workflow_run_and_nested_jobs_normalize() -> Result<(), String> {
+        let run = captured!("actions_get_workflow_run")?;
+        let jobs = captured!("actions_list_workflow_jobs")?;
+        assert!(
+            jobs["jobs"].is_object(),
+            "the pinned server nests jobs as {{\"jobs\":{{\"total_count\":N,\"jobs\":[...]}}}}"
+        );
+        let run_id = run["id"].as_u64().ok_or("captured run has an ID")?;
+        let status = normalize_run_status(&run, &jobs, run_id, None)
+            .map_err(|error| format!("normalize run status: {error:?}"))?;
+        assert_eq!(
+            status["jobs"].as_array().map(Vec::len),
+            Some(2),
+            "both captured jobs are normalized"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn captured_workflow_runs_page_is_read_and_fits_the_tool_bound() -> Result<(), String> {
+        let runs = captured!("actions_list_workflow_runs")?;
+        assert!(maximum_run_id(&runs) > 0);
+        let one_run = serde_json::to_vec(&runs["workflow_runs"][0])
+            .map_err(|error| format!("encode run: {error}"))?;
+        assert!(
+            one_run.len() * 30 < MAX_MCP_TOOL_RESPONSE_BYTES,
+            "a default 30-run page from the pinned server must fit the tool response bound"
+        );
+        assert!(
+            one_run.len() * 3 > MAX_RESPONSE_BYTES,
+            "the lifecycle bound is too small for tool results, which is why they have their own"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn captured_file_commit_and_pull_request_results_parse() -> Result<(), String> {
+        let file = captured!("get_file_contents")?;
+        assert!(
+            workflow_content(&file).is_some(),
+            "resource text is returned as content"
+        );
+        assert!(file["sha"].as_str().is_some_and(|sha| sha.len() == 40));
+        let commit = captured!("get_commit")?;
+        assert!(commit_sha(&commit).is_some());
+        assert!(
+            commit["commit"]["message"].is_string() && commit["files"][0]["filename"].is_string(),
+            "publication ownership reads the commit message and changed file names"
+        );
+        let pulls = captured!("list_pull_requests")?;
+        let first = payload_array(&pulls, &["pull_requests", "items"])
+            .and_then(|items| items.first())
+            .ok_or("captured pull request list has an item")?;
+        let branch = first["head"]["ref"].as_str().ok_or("captured head ref")?;
+        normalize_pull_request(first, branch)
+            .map_err(|error| format!("normalize pull request: {error:?}"))?;
+        Ok(())
+    }
+
     #[test]
     fn pinned_repository_search_accepts_flat_owner_identity() -> Result<(), String> {
         let repository = normalize_repository(&serde_json::json!({
@@ -2785,7 +3060,7 @@ mod tests {
                     "repo": "example-repo",
                     "resource_id": ".github/workflows/steward-browser-task.yml",
                     "workflow_runs_filter": {"branch": "main"},
-                    "perPage": 10
+                    "per_page": 10
                 })
             );
             write_mcp_payload(
@@ -3589,6 +3864,92 @@ mod tests {
                 reason: "MCP-GW returned HTTP 429".to_owned(),
             }),
             "discarding an oversized body must not discard the upstream status"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_results_above_the_lifecycle_bound_are_read() -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind tool bound fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read tool bound fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (stream, _) = read_json_request(&listener)?;
+            write_mcp_payload(
+                stream,
+                "steward-github-me",
+                serde_json::json!({
+                    "login": "alice",
+                    "id": 583231,
+                    "bio": "x".repeat(2 * MAX_RESPONSE_BYTES),
+                }),
+            )?;
+            let (stream, _) = read_json_request(&listener)?;
+            write_mcp_payload(
+                stream,
+                "steward-github-repositories",
+                serde_json::json!({"items": []}),
+            )
+        });
+        let gateway = GithubMcpGateway::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build tool bound gateway: {error:?}"))?;
+        let response = gateway
+            .execute(
+                GithubBridgeOperation::Repositories,
+                GithubBridgeRequest::Repositories {
+                    query: String::new(),
+                    page: 1,
+                    per_page: 100,
+                },
+            )
+            .await
+            .map_err(|error| format!("a tool result above 32 KiB must be read: {error:?}"))?;
+        server
+            .join()
+            .map_err(|_| "tool bound fixture panicked".to_owned())??;
+        assert_eq!(response["login"], "alice");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_results_above_the_tool_bound_are_not_read() -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind tool bound fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read tool bound fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = read_json_request(&listener)?;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_MCP_TOOL_RESPONSE_BYTES + 1
+            )
+            .map_err(|error| format!("write oversized tool response: {error}"))
+        });
+        let gateway = GithubMcpGateway::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build tool bound gateway: {error:?}"))?;
+        let result = gateway
+            .execute(
+                GithubBridgeOperation::Repositories,
+                GithubBridgeRequest::Repositories {
+                    query: String::new(),
+                    page: 1,
+                    per_page: 100,
+                },
+            )
+            .await;
+        server
+            .join()
+            .map_err(|_| "tool bound fixture panicked".to_owned())??;
+        assert_eq!(
+            result,
+            Err(PortError::Failed {
+                reason: "MCP-GW unavailable while attempting to read bounded MCP-GW response"
+                    .to_owned(),
+            })
         );
         Ok(())
     }

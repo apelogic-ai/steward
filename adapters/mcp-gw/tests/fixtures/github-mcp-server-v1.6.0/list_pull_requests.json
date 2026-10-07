@@ -1,0 +1,8 @@
+{
+ "content": [
+  {
+   "text": "[{\"number\":309,\"title\":\"fix(ui): make repository loading recoverable\",\"body\":\"## Summary\\n\\n- load GitHub repositories independently so the Get started checklist and tested package preview do not wait on repository discovery\\n- show repository API errors and reasons with an explicit retry action in onboarding and the run publication panel\\n- keep repository-dependent publication and dispatch controls gated while preserving repository-independent task rendering\\n\\n## Verification\\n\\n- `bun run web:check`\\n- `bun run web:build`\\n- focused Playwright coverage for repository failure/retry, held repository loading, package preview, and run publication retry\\n- `cargo xtask browser-e2e` (73 passed)\\n- `cargo xtask ci`\\n- pre-push full quality gate\\n\\nFixes #306\\n\",\"state\":\"closed\",\"draft\":false,\"merged\":false,\"html_url\":\"https://github.com/alice/example-repo/pull/309\",\"user\":{\"login\":\"alice\",\"id\":583231,\"profile_url\":\"https://github.com/alice\",\"avatar_url\":\"https://avatars.example.com/u/583231?v=4\"},\"head\":{\"ref\":\"fix/github-repository-loading\",\"sha\":\"ec7bc0f160bd6c0fbd12d94ee4b1e146b37f67d3\",\"repo\":{\"full_name\":\"alice/example-repo\"}},\"base\":{\"ref\":\"main\",\"sha\":\"ec616cd3a2354fe2f406fb5e3ab93ecb2962b7cd\",\"repo\":{\"full_name\":\"alice/example-repo\"}},\"created_at\":\"2026-10-07T19:31:07Z\",\"updated_at\":\"2026-10-07T20:02:22Z\",\"closed_at\":\"2026-10-07T20:02:21Z\",\"merged_at\":\"2026-10-07T20:02:21Z\"}]",
+   "type": "text"
+  }
+ ]
+}

@@ -1365,6 +1365,10 @@ fn automation_error(error: ConnectionBrokerError) -> Response {
         ConnectionBrokerError::BridgeContractInvalid => {
             (StatusCode::SERVICE_UNAVAILABLE, Some("bridge_contract"))
         }
+        ConnectionBrokerError::ProviderResponseInvalid => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("bridge_response_contract"),
+        ),
         _ => (StatusCode::SERVICE_UNAVAILABLE, None),
     };
     (
@@ -1889,6 +1893,26 @@ mod tests {
                 "apiVersion": GITHUB_AUTOMATION_API_VERSION,
                 "error": "github_automation_unavailable",
                 "reason": "bridge_contract"
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_response_contract_failure_has_a_bounded_automation_reason() -> Result<(), String>
+    {
+        let response = automation_error(ConnectionBrokerError::ProviderResponseInvalid);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read automation failure body: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body)
+                .map_err(|error| format!("parse automation failure body: {error}"))?,
+            json!({
+                "apiVersion": GITHUB_AUTOMATION_API_VERSION,
+                "error": "github_automation_unavailable",
+                "reason": "bridge_response_contract"
             })
         );
         Ok(())

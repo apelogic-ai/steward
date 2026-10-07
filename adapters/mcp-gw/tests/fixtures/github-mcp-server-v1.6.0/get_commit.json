@@ -1,0 +1,8 @@
+{
+ "content": [
+  {
+   "text": "{\"sha\":\"7be8b0a1b913ddee3e0836658caec598192a1161\",\"html_url\":\"https://github.com/alice/example-repo/commit/7be8b0a1b913ddee3e0836658caec598192a1161\",\"commit\":{\"message\":\"fix(ui): make repository loading recoverable (#309)\",\"author\":{\"name\":\"Alice\",\"email\":\"alice@example.com\",\"date\":\"2026-10-07T20:02:21Z\"},\"committer\":{\"name\":\"GitHub\",\"email\":\"alice@example.com\",\"date\":\"2026-10-07T20:02:21Z\"}},\"author\":{\"login\":\"alice\",\"id\":583231,\"profile_url\":\"https://github.com/alice\",\"avatar_url\":\"https://avatars.example.com/u/583231?v=4\"},\"committer\":{\"login\":\"web-flow\",\"id\":19864447,\"profile_url\":\"https://github.com/web-flow\",\"avatar_url\":\"https://avatars.example.com/u/19864447?v=4\"},\"stats\":{\"additions\":222,\"deletions\":50,\"total\":272},\"files\":[{\"filename\":\"docs/guide.md\",\"status\":\"modified\",\"additions\":101,\"deletions\":2,\"changes\":103}]}",
+   "type": "text"
+  }
+ ]
+}

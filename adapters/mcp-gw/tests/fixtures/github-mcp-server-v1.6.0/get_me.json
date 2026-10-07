@@ -1,0 +1,8 @@
+{
+ "content": [
+  {
+   "text": "{\"login\":\"alice\",\"id\":583231,\"profile_url\":\"https://github.com/alice\",\"avatar_url\":\"https://avatars.example.com/u/583231?v=4\",\"details\":{}}",
+   "type": "text"
+  }
+ ]
+}
