@@ -432,6 +432,13 @@ mod tests {
     #[test]
     fn gateway_failures_preserve_only_actionable_non_secret_categories() {
         assert_eq!(
+            gateway_failure(&PortError::Rejected {
+                reason: "GitHub rejected the workflow dispatch".to_owned(),
+            }),
+            "bridge MCP-GW response violated its bounded contract",
+            "a rejected dispatch is definite, not an MCP-GW outage to retry"
+        );
+        assert_eq!(
             gateway_failure(&PortError::Failed {
                 reason: "MCP-GW unavailable while attempting to call MCP-GW".to_owned(),
             }),

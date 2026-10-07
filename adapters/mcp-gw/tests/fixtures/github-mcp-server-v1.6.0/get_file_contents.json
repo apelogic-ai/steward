@@ -1,0 +1,16 @@
+{
+ "content": [
+  {
+   "text": "successfully downloaded text file (SHA: 3333333333333333333333333333333333333333)",
+   "type": "text"
+  },
+  {
+   "resource": {
+    "mimeType": "text/plain; charset=utf-8",
+    "text": "# example-repo\n\nAn example repository.\n",
+    "uri": "repo://alice/example-repo/sha/0123456789abcdef0123456789abcdef01234567/contents/README.md"
+   },
+   "type": "resource"
+  }
+ ]
+}
