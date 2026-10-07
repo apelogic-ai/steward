@@ -2275,6 +2275,7 @@ where
                 )
                     .into_response(),
                 ConnectionBrokerError::RuntimeAuthenticationFailed
+                | ConnectionBrokerError::BridgeContractInvalid
                 | ConnectionBrokerError::IdempotencyConflict
                 | ConnectionBrokerError::ProxyPolicyDenied
                 | ConnectionBrokerError::ProviderAuthorizationFailed

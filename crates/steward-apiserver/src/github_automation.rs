@@ -167,6 +167,7 @@ pub(crate) struct GithubAutomationState<L, P> {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RepositoryQuery {
+    /// Empty lists repositories owned by the authenticated GitHub user.
     #[serde(default)]
     query: String,
     #[serde(default = "first_page")]
@@ -332,6 +333,8 @@ pub(crate) struct GithubRunStatusResponse {
 pub(crate) struct GithubAutomationErrorResponse {
     api_version: &'static str,
     error: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     manual_files: Option<BTreeMap<String, String>>,
 }
@@ -1353,13 +1356,16 @@ fn no_store_json<T: Serialize>(value: T) -> Response {
 }
 
 fn automation_error(error: ConnectionBrokerError) -> Response {
-    let status = match error {
-        ConnectionBrokerError::OAuthFlowPending => StatusCode::CONFLICT,
-        ConnectionBrokerError::IdempotencyConflict => StatusCode::UNPROCESSABLE_ENTITY,
+    let (status, reason) = match error {
+        ConnectionBrokerError::OAuthFlowPending => (StatusCode::CONFLICT, None),
+        ConnectionBrokerError::IdempotencyConflict => (StatusCode::UNPROCESSABLE_ENTITY, None),
         ConnectionBrokerError::RuntimeAuthenticationFailed
         | ConnectionBrokerError::ProxyPolicyDenied
-        | ConnectionBrokerError::ProviderAuthorizationFailed => StatusCode::FORBIDDEN,
-        _ => StatusCode::SERVICE_UNAVAILABLE,
+        | ConnectionBrokerError::ProviderAuthorizationFailed => (StatusCode::FORBIDDEN, None),
+        ConnectionBrokerError::BridgeContractInvalid => {
+            (StatusCode::SERVICE_UNAVAILABLE, Some("bridge_contract"))
+        }
+        _ => (StatusCode::SERVICE_UNAVAILABLE, None),
     };
     (
         status,
@@ -1367,6 +1373,7 @@ fn automation_error(error: ConnectionBrokerError) -> Response {
         Json(GithubAutomationErrorResponse {
             api_version: GITHUB_AUTOMATION_API_VERSION,
             error: "github_automation_unavailable",
+            reason,
             manual_files: None,
         }),
     )
@@ -1383,6 +1390,7 @@ fn automation_problem(
         Json(GithubAutomationErrorResponse {
             api_version: GITHUB_AUTOMATION_API_VERSION,
             error,
+            reason: None,
             manual_files,
         }),
     )
@@ -1402,6 +1410,7 @@ mod tests {
     use axum::http::{Request, StatusCode, header};
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
+    use steward_adapter_mcp_gw::{GithubBridgeOperation, GithubBridgeRequest};
     use steward_store::{
         AgentRunExecutionLog, AgentRunLogStream, AgentRunPage, AgentRunQuery, AgentRunRecord,
         AgentRunTimelineEvent, StoreError,
@@ -1866,6 +1875,25 @@ mod tests {
         assert!(!valid_idempotency_key("publish/123"));
     }
 
+    #[tokio::test]
+    async fn bridge_contract_failure_has_a_bounded_automation_reason() -> Result<(), String> {
+        let response = automation_error(ConnectionBrokerError::BridgeContractInvalid);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read automation failure body: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body)
+                .map_err(|error| format!("parse automation failure body: {error}"))?,
+            json!({
+                "apiVersion": GITHUB_AUTOMATION_API_VERSION,
+                "error": "github_automation_unavailable",
+                "reason": "bridge_contract"
+            })
+        );
+        Ok(())
+    }
+
     #[test]
     fn write_idempotency_binds_one_client_key_to_one_semantic_payload() {
         let first_read = fresh_operation_identity("repositories");
@@ -1988,6 +2016,23 @@ mod tests {
             repositories["repositories"][1]["missingPrerequisite"],
             "source_repository_not_admitted"
         );
+        let default_repository_request = broker
+            .calls
+            .lock()
+            .map_err(|_| "lock broker calls")?
+            .iter()
+            .find(|call| call.operation == ConnectionOperationKind::Repositories)
+            .map(|call| call.request.clone())
+            .ok_or("default repository request was not captured")?;
+        assert_eq!(default_repository_request["query"], "");
+        GithubBridgeRequest::parse(
+            GithubBridgeOperation::Repositories,
+            &serde_json::to_vec(&default_repository_request)
+                .map_err(|error| format!("encode repository request: {error}"))?,
+        )
+        .map_err(|error| {
+            format!("apiserver repository payload violates bridge contract: {error:?}")
+        })?;
 
         for retry_key in ["first", "second"] {
             let response = app

@@ -1166,6 +1166,7 @@ export type GithubAutomationErrorResponse = {
     manualFiles?: {
         [key: string]: string;
     } | null;
+    reason?: string | null;
 };
 
 export type GithubAutomationEvidenceResponse = {
@@ -4100,6 +4101,9 @@ export type ListRepositoriesData = {
     body?: never;
     path?: never;
     query?: {
+        /**
+         * Empty lists repositories owned by the authenticated GitHub user.
+         */
         query?: string;
         page?: number;
         perPage?: number;

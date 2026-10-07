@@ -1432,6 +1432,7 @@ fn connection_operation_failure(
         Some("bridge-proxy-policy") => "bridge-proxy-policy",
         Some("bridge-runtime-authorization") => "bridge-runtime-authorization",
         Some("bridge-token-grant") => "bridge-token-grant",
+        Some("bridge-contract") => "bridge-contract",
         Some("bridge-response-contract") => "bridge-response-contract",
         Some("bridge-gateway-transport") => "bridge-gateway-transport",
         Some("bridge-gateway-status") => "bridge-gateway-status",
@@ -1487,6 +1488,7 @@ fn connection_broker_error(
         Some("bridge-proxy-policy") => ConnectionBrokerError::ProxyPolicyDenied,
         Some("bridge-runtime-authorization") => ConnectionBrokerError::ProviderAuthorizationFailed,
         Some("bridge-token-grant") => ConnectionBrokerError::TokenGrantFailed,
+        Some("bridge-contract") => ConnectionBrokerError::BridgeContractInvalid,
         Some("bridge-response-contract") => ConnectionBrokerError::ProviderResponseInvalid,
         Some("bridge-gateway-transport") => ConnectionBrokerError::GatewayTransportFailed,
         Some("bridge-gateway-status") => ConnectionBrokerError::GatewayStatusInvalid,
@@ -1598,6 +1600,11 @@ mod finalized_connection_operation_tests {
                 "bridge-token-grant",
                 "bridge-token-grant",
                 crate::connections::ConnectionBrokerError::TokenGrantFailed,
+            ),
+            (
+                "bridge-contract",
+                "bridge-contract",
+                crate::connections::ConnectionBrokerError::BridgeContractInvalid,
             ),
             (
                 "runtime_create_admission_rejected",
