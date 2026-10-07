@@ -11,7 +11,6 @@ import {
   detectWorkflow,
   dispatchTask,
   githubRunStatus,
-  listRepositories,
   myRun,
   myRunOutputs,
   myRunTimeline,
@@ -22,7 +21,6 @@ import {
   type BrowserRunTimelineResponse,
   type BrowserRunOutputsResponse,
   type BrowserRunView,
-  type GithubRepositoriesResponse,
   type GithubRepositoryView,
   type GithubRunStatusResponse,
   type MyRunsResponse,
@@ -35,6 +33,7 @@ import { classifyConnectionMutationFailure, type ConnectionMutationState } from 
 import { ExecutionLogPanel } from "@/components/run-log-view";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import type { ExecutionLogStream } from "@/data/execution-log";
+import { RepositoryResource, useGithubRepositories } from "@/data/github-repositories";
 import { useApiResource } from "@/data/use-api-resource";
 import { loadAllMyRuns, loadAllRuns } from "@/data/paginated-api";
 import { useSession } from "@/session/session-context";
@@ -231,15 +230,10 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
   const [githubRun, setGithubRun] = useState<{ runId: number; url: string } | null>(null);
   const [state, setState] = useState<"idle" | "checking" | "publishing" | "dispatching" | "error">("idle");
   const [failure, setFailure] = useState<string | null>(null);
-  const loadRepositories = useCallback(() => listRepositories({
-    cache: "no-store",
-    credentials: "same-origin",
-    query: { query: "", page: 1, perPage: 100 },
-  }), []);
-  const repositories = useApiResource<GithubRepositoriesResponse>(loadRepositories);
+  const repositories = useGithubRepositories();
   const repositoryList = useMemo(
-    () => repositories.status === "ready" ? repositories.value.repositories : [],
-    [repositories],
+    () => repositories.state.status === "ready" ? repositories.state.value.repositories : [],
+    [repositories.state],
   );
   const defaultRepository = repositoryList.find((repository) => repository.ready) ?? repositoryList[0];
   const effectiveRepository = selectedRepository || (defaultRepository
@@ -366,7 +360,7 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
     <section className="mt-5 rounded-card border p-4" aria-labelledby="publish-task-title">
       <h3 className="text-sm font-semibold" id="publish-task-title">Publish this task to GitHub</h3>
       <p className="mt-2 text-sm text-muted-ink">Steward publishes the exact tested package and its pinned caller workflow on a new branch, then opens a pull request. It never writes to the default branch.</p>
-      <ResourceBoundary state={repositories}>{({ repositories: available }) => available.length ? <>
+      <RepositoryResource onRetry={repositories.retry} state={repositories.state}>{({ repositories: available }) => available.length ? <>
         <label className="mt-4 grid gap-2 text-sm font-semibold">Repository<select className="min-h-11 w-full rounded-control border bg-panel px-3 font-mono font-normal" onChange={(event) => { setSelectedRepository(event.target.value); setPublication(null); setGithubRun(null); setRunStatus(null); setState("checking"); setFailure(null); }} value={effectiveRepository}>{available.map((repository) => <option key={repository.repositoryId} value={`${repository.owner}/${repository.name}`}>{repository.owner}/{repository.name}{repository.ready ? " · Ready" : " · Not ready"}</option>)}</select></label>
         {selected && !selected.ready ? <p className="mt-3 text-sm text-warn" role="status">This repository is visible through GitHub but is not admitted as a governed source. Ask an administrator to add its stable owner and repository IDs.</p> : null}
         {selected?.ready ? <p className="mt-3 text-sm text-muted-ink" role="status">{workflowRepository !== effectiveRepository || state === "checking" ? "Checking the default branch…" : selectedWorkflow?.compatible ? "The exact generated workflow is present on the default branch." : publication ? "Pull request opened. Merge it to enable Run on GitHub; Steward will detect the merge automatically." : "No matching generated workflow is present yet."}</p> : null}
@@ -374,7 +368,7 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
           <button className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!selected?.ready || state === "publishing" || state === "checking"} onClick={() => void publish()} type="button">{state === "publishing" ? "Publishing…" : publication ? "Reopen publication" : "Publish as pull request"}</button>
           <button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!selectedWorkflow?.compatible || state === "dispatching"} onClick={() => void dispatch()} type="button">{state === "dispatching" ? "Starting…" : "Run on GitHub"}</button>
         </div>
-      </> : <p className="mt-4 text-sm text-muted-ink">No GitHub repositories are visible to this connection.</p>}</ResourceBoundary>
+      </> : <p className="mt-4 text-sm text-muted-ink">No GitHub repositories are visible to this connection.</p>}</RepositoryResource>
       {publication ? <div className="mt-4 rounded-control border bg-subtle p-3 text-sm"><p>Branch: <code>{publication.branch}</code></p><p className="mt-1">Package digest: <code className="break-all">{publication.packageDigest}</code></p><a className="mt-2 inline-block font-semibold text-brand" href={`${publication.pullRequestUrl}/files`} rel="noreferrer" target="_blank">Review the two-file pull request diff</a></div> : null}
       {githubRun ? <div className="mt-4 rounded-control border bg-subtle p-3 text-sm" aria-live="polite"><div className="flex flex-wrap items-center gap-3"><a className="font-semibold text-brand" href={githubRun.url} rel="noreferrer" target="_blank">GitHub run {githubRun.runId}</a><StatusBadge value={runStatus?.conclusion ?? runStatus?.phase ?? "queued"} /></div>{runStatus?.jobs.length ? <ul className="mt-3 space-y-2">{runStatus.jobs.map((job) => <li className="flex flex-wrap items-center justify-between gap-2" key={job.id}><a href={job.url} rel="noreferrer" target="_blank">{job.name}</a><span>{job.conclusion ?? job.status}</span></li>)}</ul> : null}{runStatus?.failureLog ? <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap rounded-control border bg-panel p-3 text-xs">{runStatus.failureLog}</pre> : null}{runStatus?.linkedTaskUid ? <Link className="mt-3 inline-block font-semibold text-brand" href={`/runs/${runStatus.linkedTaskUid}`}>Open governed Task · {runStatus.linkedTaskPhase}</Link> : null}</div> : null}
       {failure ? <p className="mt-3 text-sm text-err" role="alert">{failure}</p> : null}
