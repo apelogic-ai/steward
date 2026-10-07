@@ -125,26 +125,30 @@ pub fn render_direct_package_github_actions_workflow(
 ) -> Result<GeneratedGithubActionsWorkflow, GithubActionsRenderError> {
     validate_envelope(&context.envelope)?;
     validate_release(&context.reviewed_release)?;
-    let (source_comment, source_input) = match (&context.invocation_path, &context.package_path) {
-        (Some(invocation_path), None)
-            if valid_path(invocation_path) && context.execution_log == ExecutionLogMode::Off =>
-        {
-            (
-                format!("# invocation-path: {invocation_path}"),
-                format!("      invocation-path: {invocation_path}"),
-            )
-        }
-        (None, Some(package_path)) if valid_path(package_path) => (
-            format!("# package-path: {package_path}"),
-            match context.execution_log {
-                ExecutionLogMode::Off => format!("      package-path: {package_path}"),
-                ExecutionLogMode::Full => {
-                    format!("      package-path: {package_path}\n      execution-log: full")
-                }
-            },
-        ),
-        _ => return Err(GithubActionsRenderError::InvalidPath),
-    };
+    let (source_comment, source_input, suggested_path) =
+        match (&context.invocation_path, &context.package_path) {
+            (Some(invocation_path), None)
+                if valid_path(invocation_path)
+                    && context.execution_log == ExecutionLogMode::Off =>
+            {
+                (
+                    format!("# invocation-path: {invocation_path}"),
+                    format!("      invocation-path: {invocation_path}"),
+                    ".github/workflows/steward-browser-task.yml".to_owned(),
+                )
+            }
+            (None, Some(package_path)) if valid_path(package_path) => (
+                format!("# package-path: {package_path}"),
+                match context.execution_log {
+                    ExecutionLogMode::Off => format!("      package-path: {package_path}"),
+                    ExecutionLogMode::Full => {
+                        format!("      package-path: {package_path}\n      execution-log: full")
+                    }
+                },
+                direct_package_workflow_path(package_path),
+            ),
+            _ => return Err(GithubActionsRenderError::InvalidPath),
+        };
     validate_steward_run_workflow_installation(
         context.workflow_installation_mode,
         &context.reviewed_release,
@@ -254,10 +258,31 @@ pub fn render_direct_package_github_actions_workflow(
     Ok(GeneratedGithubActionsWorkflow {
         schema_version: DIRECT_PACKAGE_GITHUB_ACTIONS_RENDER_OUTPUT_SCHEMA.to_owned(),
         content_type: "application/yaml".to_owned(),
-        suggested_path: ".github/workflows/steward-browser-task.yml".to_owned(),
+        suggested_path,
         sha256,
         yaml,
     })
+}
+
+fn direct_package_workflow_path(package_path: &str) -> String {
+    let task_name = package_path
+        .strip_prefix(".steward/tasks/")
+        .and_then(|path| path.strip_suffix("/task-definition.json"))
+        .filter(|name| {
+            !name.is_empty()
+                && !name.contains('/')
+                && name.len() <= 80
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        });
+    match task_name {
+        Some(task_name) => format!(".github/workflows/hypershell-{task_name}.yml"),
+        None => {
+            let digest = format!("{:x}", Sha256::digest(package_path.as_bytes()));
+            format!(".github/workflows/hypershell-task-{digest}.yml")
+        }
+    }
 }
 
 pub fn render_versioned_github_actions_workflow(
@@ -950,6 +975,81 @@ mod tests {
         );
         assert!(generated.yaml.contains("      execution-log: full"));
         assert!(!generated.yaml.contains("invocation-path:"));
+        assert_eq!(
+            generated.suggested_path,
+            ".github/workflows/hypershell-browser-task.yml"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_package_generator_uses_a_distinct_workflow_path_for_each_task()
+    -> Result<(), GithubActionsRenderError> {
+        let first = render_direct_package_github_actions_workflow(
+            &DirectPackageGithubActionsWorkflowContext {
+                envelope: envelope(),
+                invocation_path: None,
+                package_path: Some(
+                    ".steward/tasks/release-summary/task-definition.json".to_owned(),
+                ),
+                execution_log: ExecutionLogMode::Off,
+                reviewed_release: versioned_release(),
+                workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
+                task_identity_discovery_enabled: true,
+            },
+        )?;
+        let second = render_direct_package_github_actions_workflow(
+            &DirectPackageGithubActionsWorkflowContext {
+                envelope: envelope(),
+                invocation_path: None,
+                package_path: Some(
+                    ".steward/tasks/security-review/task-definition.json".to_owned(),
+                ),
+                execution_log: ExecutionLogMode::Off,
+                reviewed_release: versioned_release(),
+                workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
+                task_identity_discovery_enabled: true,
+            },
+        )?;
+
+        assert_eq!(
+            first.suggested_path,
+            ".github/workflows/hypershell-release-summary.yml"
+        );
+        assert_eq!(
+            second.suggested_path,
+            ".github/workflows/hypershell-security-review.yml"
+        );
+        assert_ne!(first.suggested_path, second.suggested_path);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_package_generator_hashes_nonstandard_paths_without_leaf_collisions()
+    -> Result<(), GithubActionsRenderError> {
+        let render = |package_path: &str| {
+            render_direct_package_github_actions_workflow(
+                &DirectPackageGithubActionsWorkflowContext {
+                    envelope: envelope(),
+                    invocation_path: None,
+                    package_path: Some(package_path.to_owned()),
+                    execution_log: ExecutionLogMode::Off,
+                    reviewed_release: versioned_release(),
+                    workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
+                    task_identity_discovery_enabled: true,
+                },
+            )
+        };
+        let first = render(".steward/tasks/team-a/review/task-definition.json")?;
+        let second = render(".steward/tasks/team-b/review/task-definition.json")?;
+
+        assert!(
+            first
+                .suggested_path
+                .starts_with(".github/workflows/hypershell-task-")
+        );
+        assert!(first.suggested_path.ends_with(".yml"));
+        assert_ne!(first.suggested_path, second.suggested_path);
         Ok(())
     }
 

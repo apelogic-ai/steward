@@ -5,18 +5,20 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useState, type FormEvent } from "react";
 
 import {
+  getStarterTask,
   listRequests,
   listTemplates,
   myTask,
   myTasks,
   submitBrowserRun,
   type BrowserPackageLocator,
-  type BrowserEnvelope,
   type BrowserTaskView,
   type BrowserTasksResponse,
+  type DirectTaskDefinition,
   type ExecutionBindingAdvertisement,
   type EnvelopeRequestsResponse,
   type EnvelopeTemplatesResponse,
+  type StarterTaskSetting,
 } from "@/api-client";
 import { PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { useApiResource } from "@/data/use-api-resource";
@@ -29,6 +31,7 @@ type RunNowData = {
   workflows: PublishedWorkflowListResponse;
   tasks: BrowserTasksResponse;
   task: BrowserTaskView | null;
+  starterTask: StarterTaskSetting;
 };
 
 type SourceKind = "inline" | "repository" | "registry";
@@ -45,6 +48,13 @@ type CompatibleAgent = {
 
 type EffectiveAgentSelection = {
   selected: CompatibleAgent | undefined;
+  warning: string | null;
+};
+
+type Model = { provider: string; model: string };
+
+type EffectiveModelSelection = {
+  selected: Model | null;
   warning: string | null;
 };
 
@@ -88,7 +98,34 @@ export function effectiveAgentSelection(
     : agentOptions.find((agent) => agent.compatible);
   return {
     selected,
-    warning: selected ? null : requested?.reason ?? "No compatible coding agent is available for this Envelope.",
+    warning: selected && selected.agentRef !== requestedAgentRef
+      ? `${requestedAgentRef} is not allowed by this Envelope. Using ${selected.agentRef} instead.`
+      : selected
+        ? null
+        : requested?.reason ?? "No compatible coding agent is available for this Envelope.",
+  };
+}
+
+export function effectiveModelSelection(
+  configuredModel: Model | null,
+  configuredAgentRef: string,
+  selectedAgent: CompatibleAgent | undefined,
+  allowedModels: Model[],
+): EffectiveModelSelection {
+  if (!selectedAgent?.compatible) return { selected: null, warning: null };
+  if (!configuredModel || selectedAgent.agentRef !== configuredAgentRef) {
+    return { selected: selectedAgent.model, warning: null };
+  }
+  const exact = allowedModels.find(
+    (model) => model.provider === configuredModel.provider && model.model === configuredModel.model,
+  );
+  if (exact) return { selected: exact, warning: null };
+  const fallback = selectedAgent.model;
+  return {
+    selected: fallback,
+    warning: fallback
+      ? `${configuredModel.provider}/${configuredModel.model} is not allowed by this Envelope. Using ${fallback.provider}/${fallback.model} instead.`
+      : null,
   };
 }
 
@@ -118,38 +155,27 @@ export function runNowFailureMessage(error: unknown): string {
 }
 
 export function inlineFiles(
+  starterTask: StarterTaskSetting,
   agentRef: string,
-  prompt: string,
-  envelope: BrowserEnvelope,
   model: { provider: string; model: string },
 ): Record<string, string> {
+  const taskDefinition: DirectTaskDefinition = {
+    ...starterTask.taskDefinition,
+    runtime: { ...starterTask.taskDefinition.runtime, agentRef, model },
+    ...(starterTask.taskDefinition.requires
+      ? {
+          requires: {
+            ...starterTask.taskDefinition.requires,
+            authority: {
+              ...starterTask.taskDefinition.requires.authority,
+              llms: [model],
+            },
+          },
+        }
+      : {}),
+  };
   return {
-    "task-definition.json": JSON.stringify({
-      schemaVersion: "steward.task-definition/v2",
-      name: "browser-task",
-      version: 1,
-      runtime: { agentRef, model },
-      promptText: prompt,
-      outputs: [{ path: "out", kind: "directory", required: true }],
-      requires: {
-        authority: {
-          llms: [model],
-          tools: envelope.spec.tools,
-          budget: {
-            monthlyLimit: envelope.spec.budget.monthlyLimit,
-            singleRunLimit: envelope.spec.budget.singleRunLimit ?? null,
-            currency: envelope.spec.budget.currency,
-          },
-          ttl: envelope.spec.ttl,
-          runner: {
-            platforms: envelope.spec.runner?.platforms ?? [],
-            memory: envelope.spec.runner?.memory ?? null,
-            compute: envelope.spec.runner?.compute ?? null,
-            storage: envelope.spec.runner?.storage ?? null,
-          },
-        },
-      },
-    }, null, 2),
+    [starterTask.packagePath]: JSON.stringify(taskDefinition, null, 2),
   };
 }
 
@@ -159,12 +185,13 @@ export function BrowserRunNowView() {
   const taskDigest = search.get("task");
   const session = useSession();
   const load = useCallback(async () => {
-    const [envelopes, templates, workflows, tasks, task] = await Promise.all([
+    const [envelopes, templates, workflows, tasks, task, starterTask] = await Promise.all([
       listRequests({ cache: "no-store", credentials: "same-origin" }),
       listTemplates({ cache: "no-store", credentials: "same-origin" }),
       listPublishedWorkflows(),
       myTasks({ cache: "no-store", credentials: "same-origin" }),
       taskDigest ? myTask({ cache: "no-store", credentials: "same-origin", path: { content_digest: taskDigest } }) : Promise.resolve(null),
+      getStarterTask({ cache: "no-store", credentials: "same-origin" }),
     ]);
     const response = !envelopes.response?.ok
       ? envelopes.response
@@ -173,13 +200,15 @@ export function BrowserRunNowView() {
         : !workflows.response?.ok
           ? workflows.response
           : !tasks.response?.ok
-            ? tasks.response
+          ? tasks.response
           : task && !task.response?.ok
             ? task.response
-            : workflows.response;
+            : !starterTask.response?.ok
+              ? starterTask.response
+              : workflows.response;
     return {
-      data: envelopes.data && templates.data && workflows.data && tasks.data && (!taskDigest || task?.data)
-        ? { envelopes: envelopes.data, templates: templates.data, workflows: workflows.data, tasks: tasks.data, task: task?.data?.task ?? null }
+      data: envelopes.data && templates.data && workflows.data && tasks.data && starterTask.data && (!taskDigest || task?.data)
+        ? { envelopes: envelopes.data, templates: templates.data, workflows: workflows.data, tasks: tasks.data, task: task?.data?.task ?? null, starterTask: starterTask.data.starterTask }
         : undefined,
       response,
     };
@@ -188,9 +217,9 @@ export function BrowserRunNowView() {
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader description="Run an immutable inline, repository, or published package under one of your active Envelopes." title="Run now" />
-      <ResourceBoundary state={state}>{(data) => data.task
-        ? <RunNowForm data={data} initialWorkflow={search.get("workflow")} onCreated={(taskUid) => router.push(`/runs/${taskUid}`)} session={session} />
-        : <TaskPicker data={data} initialWorkflow={search.get("workflow")} onSelect={(digest) => router.replace(`/runs/new?task=${encodeURIComponent(digest)}`)} />}</ResourceBoundary>
+      <ResourceBoundary state={state}>{(data) => !data.task && search.get("choose") === "task"
+        ? <TaskPicker data={data} initialWorkflow={search.get("workflow")} onSelect={(digest) => router.replace(`/runs/new?task=${encodeURIComponent(digest)}`)} />
+        : <RunNowForm data={data} initialWorkflow={search.get("workflow")} key={data.task?.contentDigest ?? "starter"} onCreated={(taskUid) => router.push(`/runs/${taskUid}`)} session={session} />}</ResourceBoundary>
     </section>
   );
 }
@@ -226,18 +255,22 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
 }>) {
   const active = data.envelopes.requests.filter((request) => request.status === "provisioned" && request.envelopeDigest);
   const exactTask = data.task;
+  const starterTask = data.starterTask;
   const initialKind: SourceKind = exactTask ? "inline" : initialWorkflow ? "registry" : "inline";
   const [sourceKind, setSourceKind] = useState<SourceKind>(initialKind);
   const [envelopeId, setEnvelopeId] = useState(active[0]?.id ?? "");
-  const [agentRef, setAgentRef] = useState(data.workflows.agents[0]?.agentRef ?? "");
-  const [prompt, setPrompt] = useState("Create $STEWARD_OUTPUT_DIR/out/hello.txt containing exactly the line: hello world. Use no tools and no network. Create no other files.");
-  const [repository, setRepository] = useState("https://github.com/example-org/agentic-ops.git");
-  const [revision, setRevision] = useState("git:ref:main");
-  const [path, setPath] = useState("catalog/hello/task-definition.json");
-  const defaultWorkflow = data.workflows.workflows.find((workflow) => `${workflow.name}@${workflow.version}` === initialWorkflow) ?? data.workflows.workflows[0];
+  const [agentRef, setAgentRef] = useState(starterTask.taskDefinition.runtime.agentRef);
+  const [prompt, setPrompt] = useState(starterTask.taskDefinition.promptText ?? "");
+  const [repository, setRepository] = useState(starterTask.git?.repository ?? "");
+  const [revision, setRevision] = useState(starterTask.git?.revision ?? "");
+  const [path, setPath] = useState(starterTask.git?.path ?? "");
+  const configuredWorkflow = starterTask.publishedWorkflow ?? null;
+  const defaultWorkflow = data.workflows.workflows.find((workflow) => `${workflow.name}@${workflow.version}` === initialWorkflow)
+    ?? data.workflows.workflows.find((workflow) => `${workflow.name}@${workflow.version}` === configuredWorkflow)
+    ?? data.workflows.workflows[0];
   const [workflowRef, setWorkflowRef] = useState(defaultWorkflow ? `${defaultWorkflow.name}@${defaultWorkflow.version}` : "");
-  const [inputs, setInputs] = useState("{}");
-  const [captureExecutionLog, setCaptureExecutionLog] = useState(false);
+  const [inputs, setInputs] = useState(exactTask ? "{}" : JSON.stringify(starterTask.inputs, null, 2));
+  const [captureExecutionLog, setCaptureExecutionLog] = useState(!exactTask && starterTask.executionLog === "full");
   const [status, setStatus] = useState<"idle" | "submitting" | "error">("idle");
   const [failure, setFailure] = useState<string | null>(null);
   const selectedEnvelope = active.find((request) => request.id === envelopeId);
@@ -250,9 +283,15 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
   );
   const { selected: selectedAgent, warning: agentWarning } = effectiveAgentSelection(agentOptions, agentRef);
   const effectiveAgentRef = selectedAgent?.agentRef ?? "";
-  const selectedModel = selectedAgent?.compatible ? selectedAgent.model : null;
-  const files = envelope && selectedModel
-    ? inlineFiles(effectiveAgentRef, prompt, envelope, selectedModel)
+  const configuredModel = starterTask.taskDefinition.runtime.model ?? null;
+  const { selected: selectedModel, warning: modelWarning } = effectiveModelSelection(
+    configuredModel,
+    starterTask.taskDefinition.runtime.agentRef,
+    selectedAgent,
+    envelope?.spec.llms ?? [],
+  );
+  const files = selectedModel
+    ? inlineFiles({ ...starterTask, taskDefinition: { ...starterTask.taskDefinition, promptText: prompt } }, effectiveAgentRef, selectedModel)
     : null;
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -280,7 +319,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
         setStatus("error");
         return;
       }
-      packageLocator = { source: "inline", path: "task-definition.json", files };
+      packageLocator = { source: "inline", path: starterTask.packagePath, files };
     } else if (sourceKind === "repository") {
       packageLocator = { source: repository.trim(), revision: revision.trim(), path: path.trim() };
     } else {
@@ -313,12 +352,13 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
 
   if (active.length === 0) return <p className="rounded-card border bg-panel p-5 text-sm text-muted-ink">Provision an Envelope before starting a browser run.</p>;
   return <form className="space-y-6 rounded-card border bg-panel p-6" onSubmit={(event) => void submit(event)}>
+    {!exactTask ? <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="font-semibold">{starterTask.title ?? starterTask.taskDefinition.name}</h2>{starterTask.description ? <p className="mt-1 text-sm text-muted-ink">{starterTask.description}</p> : null}</div><Link className="rounded-control border px-4 py-2 text-sm font-semibold" href="/runs/new?choose=task">Choose saved Task</Link></div> : null}
     <div className="grid gap-4 md:grid-cols-2">
       <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} onChange={(event) => setEnvelopeId(event.target.value)} value={envelopeId}>{active.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
       {exactTask ? <div className="grid gap-2 text-sm font-semibold">Task<div className={`${fieldClass} flex items-center font-mono text-xs`}>{exactTask.name}@{exactTask.version} · {exactTask.contentDigest}</div></div> : <label className="grid gap-2 text-sm font-semibold">Package source<select className={fieldClass} onChange={(event) => setSourceKind(event.target.value as SourceKind)} value={sourceKind}><option disabled={!inlineAllowed} value="inline">Inline package{inlineAllowed ? "" : " (disabled by template)"}</option><option value="repository">Git repository</option><option value="registry">Published workflow</option></select></label>}
     </div>
     {exactTask ? <p className="text-sm text-muted-ink">The exact immutable package is locked. Choose an Envelope and optional inputs for this run.</p> : null}
-    {!exactTask && sourceKind === "inline" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Coding agent<select className={`${fieldClass} font-mono`} onChange={(event) => setAgentRef(event.target.value)} value={effectiveAgentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.agentRef}{agent.compatible ? ` · ${agent.model?.provider}/${agent.model?.model}` : ` · ${agent.reason}`}</option>)}</select></label>{agentWarning ? <p className="text-sm text-warn" role="status">{agentWarning}</p> : null}<label className="grid gap-2 text-sm font-semibold">Prompt<span className="text-xs font-normal text-muted-ink">Write results under <code>$STEWARD_OUTPUT_DIR/out/</code>. Only those files are collected; a run with no <code>out/</code> file fails.</span><textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label><p className="text-xs text-muted-ink">This inline task uses one compatible model and inherits the selected Envelope&apos;s approved tools, budget, TTL, and runner limits. Open the Task from the completed Run to reuse or publish the exact package.</p></div> : null}
+    {!exactTask && sourceKind === "inline" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Coding agent<select className={`${fieldClass} font-mono`} onChange={(event) => setAgentRef(event.target.value)} value={effectiveAgentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.agentRef}{agent.compatible ? ` · ${agent.model?.provider}/${agent.model?.model}` : ` · ${agent.reason}`}</option>)}</select></label>{agentWarning ?? modelWarning ? <p className="text-sm text-warn" role="status">{agentWarning ?? modelWarning}</p> : null}<label className="grid gap-2 text-sm font-semibold">Prompt<span className="text-xs font-normal text-muted-ink">Write results under <code>$STEWARD_OUTPUT_DIR/out/</code>. Only those files are collected; a run with no <code>out/</code> file fails.</span><textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label><p className="text-xs text-muted-ink">This inline task uses one compatible model and {starterTask.taskDefinition.requires ? "requests its declared authority" : "inherits the selected Envelope's approved tools, budget, TTL, and runner limits"}. Open the Task from the completed Run to reuse or publish the exact package.</p></div> : null}
     {!exactTask && sourceKind === "repository" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Repository<input className={`${fieldClass} font-mono`} onChange={(event) => setRepository(event.target.value)} value={repository} /></label><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Ref or immutable commit<input className={`${fieldClass} font-mono`} onChange={(event) => setRevision(event.target.value)} value={revision} /></label><label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} value={path} /></label></div><p className="text-xs text-muted-ink">The repository must be in the operator&apos;s allowed source list. Steward resolves a ref to an exact commit and validates the package&apos;s declared requirements before execution.</p></div> : null}
     {!exactTask && sourceKind === "registry" ? <label className="grid gap-2 text-sm font-semibold">Published workflow<select className={fieldClass} onChange={(event) => setWorkflowRef(event.target.value)} value={workflowRef}>{data.workflows.workflows.map((workflow) => <option key={`${workflow.name}@${workflow.version}`} value={`${workflow.name}@${workflow.version}`}>{workflow.displayName} · {workflow.name}@{workflow.version}</option>)}</select></label> : null}
     <label className="grid gap-2 text-sm font-semibold">Inputs (JSON object)<span className="text-xs font-normal text-muted-ink">Optional JSON (up to 16 KiB), available to the agent as <code>in/inputs.json</code>. Reference it in your prompt; it cannot change the agent, model, tools, or Envelope. Example: <code>{'{"release":"v1.2.3"}'}</code>.</span><textarea className="min-h-28 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setInputs(event.target.value)} spellCheck={false} value={inputs} /></label>

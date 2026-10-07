@@ -537,6 +537,50 @@ Steward release namespace also creates `steward-workflows`.
   The chart validates it, renders it into an immutable content-addressed ConfigMap,
   mounts it read-only in the apiserver, and rolls the apiserver when its checksum
   changes. See [Execution bindings](../../docs/installation/execution-bindings.md).
+- `config.apiserver.starterTask` is the optional deployment-owned default shown by
+  **Get started** and **Run now**. It is a complete inline TaskDefinition plus its
+  default inputs, execution-log choice, repository package path, and optional Git and
+  published-Workflow examples. The configured `agentRef` must be advertised by
+  `executionBindings`. Omitting `requires` keeps the existing behavior of deriving
+  authority from the selected User Envelope. The default `null` value uses Steward's
+  built-in Hello World task.
+
+  ```yaml
+  config:
+    apiserver:
+      starterTask:
+        taskDefinition:
+          schemaVersion: steward.task-definition/v2
+          name: hello-world
+          version: 1
+          runtime:
+            agentRef: codex@0.140.0
+          promptText: >-
+            Write the single line hello world to $STEWARD_OUTPUT_DIR/out/hello.txt
+            using your shell, for example mkdir -p "$STEWARD_OUTPUT_DIR/out" &&
+            printf 'hello world\n' > "$STEWARD_OUTPUT_DIR/out/hello.txt". Do not
+            create any other files, do not use the network, and do not call any MCP
+            or GitHub tools.
+          outputs:
+            - {path: out/hello.txt, kind: file, required: true}
+        inputs: {}
+        executionLog: "off"
+        packagePath: .steward/tasks/hello-world/task-definition.json
+        title: Hello world
+        description: Run a governed coding agent and collect its exact output.
+        git:
+          repository: https://github.com/example-org/agentic-ops.git
+          revision: git:ref:main
+          path: catalog/hello/task-definition.json
+        publishedWorkflow: hello-world@1
+  ```
+
+  `packagePath` is the canonical path used when the inline package is saved or
+  published. Steward validates this setting at apiserver startup using the ordinary
+  package and browser-input limits; invalid configuration fails startup. The browser
+  reads the effective value from its authenticated, no-store onboarding endpoint, so
+  a reviewed GitOps values change updates the pod template and rolls the apiserver;
+  no Steward image rebuild is required.
 - `config.apiserver.inferenceEndpoint` is the OpenAI-compatible Responses endpoint for
   `codex-v1`; `config.apiserver.anthropicInferenceEndpoint` is the Anthropic-compatible API
   base URL for `claude-code-v1`. Agent images, packages, and bindings cannot override them.

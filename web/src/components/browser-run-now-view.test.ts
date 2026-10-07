@@ -3,30 +3,80 @@ import { describe, expect, test } from "bun:test";
 import {
   compatibleAgents,
   effectiveAgentSelection,
+  effectiveModelSelection,
   inlineFiles,
   packageLocatorForTask,
   runNowFailureMessage,
 } from "./browser-run-now-view";
 
+const starterTask = {
+  taskDefinition: {
+    schemaVersion: "steward.task-definition/v2" as const,
+    name: "hello-world",
+    version: 2,
+    runtime: { agentRef: "codex@0.140.0" },
+    promptText: "Write hello to out/hello.txt.",
+    skills: [],
+    outputs: [{ path: "out/hello.txt", kind: "file" as const, required: true }],
+  },
+  inputs: { greeting: "hello" },
+  executionLog: "full" as const,
+  packagePath: ".steward/tasks/hello-world/task-definition.json",
+};
+
 test("inline Run now packages keep the prompt in the single TaskDefinition file", () => {
   const files = inlineFiles(
+    starterTask,
     "codex@0.140.0",
-    "Write hello to out/hello.txt.",
-    {
-      revision: 1,
-      spec: {
-        budget: { monthlyLimit: "10.00", currency: "USD" },
-        llms: [{ provider: "openai", model: "gpt-5.4" }],
-        tools: [],
-        ttl: "1h",
-      },
-    },
     { provider: "openai", model: "gpt-5.4" },
   );
 
-  expect(Object.keys(files)).toEqual(["task-definition.json"]);
-  expect(JSON.parse(files["task-definition.json"] ?? "{}")).toMatchObject({
+  expect(Object.keys(files)).toEqual([starterTask.packagePath]);
+  expect(JSON.parse(files[starterTask.packagePath] ?? "{}")).toMatchObject({
+    name: "hello-world",
+    version: 2,
     promptText: "Write hello to out/hello.txt.",
+    outputs: [{ path: "out/hello.txt", kind: "file", required: true }],
+    runtime: { agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } },
+  });
+});
+
+test("inline Run now keeps declared authority but follows a compatible model fallback", () => {
+  const configured = {
+    ...starterTask,
+    taskDefinition: {
+      ...starterTask.taskDefinition,
+      runtime: {
+        agentRef: "claude-code@2.1.222",
+        model: { provider: "anthropic", model: "claude-sonnet-4-5" },
+      },
+      requires: {
+        authority: {
+          llms: [{ provider: "anthropic", model: "claude-sonnet-4-5" }],
+          tools: [],
+          budget: { monthlyLimit: "10.00", singleRunLimit: "1.00", currency: "USD" },
+          ttl: "1h",
+          runner: { platforms: ["linux" as const] },
+        },
+      },
+    },
+  };
+  const files = inlineFiles(
+    configured,
+    "codex@0.140.0",
+    { provider: "openai", model: "gpt-5.4" },
+  );
+  const definition = JSON.parse(files[configured.packagePath] ?? "{}");
+
+  expect(definition.runtime).toEqual({
+    agentRef: "codex@0.140.0",
+    model: { provider: "openai", model: "gpt-5.4" },
+  });
+  expect(definition.requires.authority).toMatchObject({
+    llms: [{ provider: "openai", model: "gpt-5.4" }],
+    budget: { monthlyLimit: "10.00", singleRunLimit: "1.00", currency: "USD" },
+    ttl: "1h",
+    runner: { platforms: ["linux"] },
   });
 });
 
@@ -95,7 +145,27 @@ describe("inline agent compatibility", () => {
     ]);
     expect(effectiveAgentSelection(agents, "claude-code@2.1.222")).toEqual({
       selected: agents[0],
-      warning: null,
+      warning: "claude-code@2.1.222 is not allowed by this Envelope. Using codex@0.140.0 instead.",
+    });
+  });
+
+  test("uses the configured model when allowed and warns on a compatible model fallback", () => {
+    const selectedAgent = {
+      agentRef: "codex@0.140.0",
+      model: { provider: "openai", model: "gpt-5.4" },
+      compatible: true,
+      reason: null,
+    };
+    const configured = { provider: "openai", model: "gpt-5.5" };
+    expect(effectiveModelSelection(configured, selectedAgent.agentRef, selectedAgent, [
+      selectedAgent.model,
+      configured,
+    ])).toEqual({ selected: configured, warning: null });
+    expect(effectiveModelSelection(configured, selectedAgent.agentRef, selectedAgent, [
+      selectedAgent.model,
+    ])).toEqual({
+      selected: selectedAgent.model,
+      warning: "openai/gpt-5.5 is not allowed by this Envelope. Using openai/gpt-5.4 instead.",
     });
   });
 });

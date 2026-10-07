@@ -147,6 +147,55 @@ into Helm values. The deployment capability catalog advertises model and tool ch
 grants no authority. Before external Task submission, provision the authenticated user's
 exact User Envelope through Steward's ordinary request and approval lifecycle.
 
+### Deployment-owned starter task
+
+The optional `config.apiserver.starterTask` value controls the task displayed by
+**Get started** and the initial **Run now** form. It is presentation and package
+source, not authority: every run still goes through normal admission under the
+selected User Envelope. The task's exact `runtime.agentRef` must exist in the
+deployment execution catalog; if the selected Envelope does not allow its agent or
+model, the browser shows the compatible fallback warning.
+
+```yaml
+config:
+  apiserver:
+    starterTask:
+      taskDefinition:
+        schemaVersion: steward.task-definition/v2
+        name: hello-world
+        version: 1
+        runtime: {agentRef: codex@0.140.0}
+        promptText: >-
+          Write the single line hello world to $STEWARD_OUTPUT_DIR/out/hello.txt
+          using your shell, for example mkdir -p "$STEWARD_OUTPUT_DIR/out" &&
+          printf 'hello world\n' > "$STEWARD_OUTPUT_DIR/out/hello.txt". Do not
+          create any other files, do not use the network, and do not call any MCP
+          or GitHub tools.
+        outputs:
+          - {path: out/hello.txt, kind: file, required: true}
+      inputs: {}
+      executionLog: "off"
+      packagePath: .steward/tasks/hello-world/task-definition.json
+      title: Hello world
+      description: Run a governed coding agent and collect its exact output.
+      git:
+        repository: https://github.com/example-org/agentic-ops.git
+        revision: git:ref:main
+        path: catalog/hello/task-definition.json
+      publishedWorkflow: hello-world@1
+```
+
+`requires` remains optional. When omitted, the task derives its effective authority
+from the selected User Envelope. `packagePath` must be a canonical
+`.steward/tasks/**/task-definition.json` path and is retained when the successful
+inline task is saved or published. Steward validates the complete value at apiserver
+startup. With the value unset, the corrected built-in Hello World task applies.
+
+Change this value through the ordinary reviewed GitOps values source. Because the
+rendered value is part of the apiserver pod template, Helm rolls the apiserver and the
+browser reads the new value at runtime from an authenticated no-store endpoint. No
+web or apiserver image rebuild is needed.
+
 ## Secret and integration inventory
 
 The chart references existing names and keys; it never puts secret bytes in

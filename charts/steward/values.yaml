@@ -170,6 +170,9 @@ config:
     # Use the immutable remote reusable workflow by default. Select vendored only after installing
     # the verified steward-task-vendored.yml release asset in every caller repository.
     stewardRunWorkflowInstallationMode: remote
+    # Optional deployment-owned browser starter task. Null uses Steward's built-in Hello World
+    # task. A values change updates the apiserver pod template and rolls the Deployment.
+    starterTask: null
     # Optional ordinary catalog entry for an operator-selected LLM smoke test. Disabled by
     # default; every authority field is explicit and no model is inferred from the catalog.
     defaultLlmTemplate:

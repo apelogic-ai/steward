@@ -12,6 +12,7 @@ mod github_actions;
 pub mod github_automation;
 pub mod google_oidc;
 pub mod governed_connections;
+pub mod onboarding;
 pub mod operator_admin;
 pub mod preferences;
 pub mod stable_runtime_bridge;
@@ -396,6 +397,9 @@ pub struct GrantRevocationRequest {
         connections::disconnect_provider_connection,
         github_automation::list_repositories,
         github_automation::detect_workflow,
+        github_automation::github_task_bundle,
+        github_automation::github_automation_evidence,
+        github_automation::github_onboarding_evidence,
         github_automation::publish_task,
         github_automation::dispatch_task,
         github_automation::github_run_status,
@@ -439,6 +443,7 @@ pub struct GrantRevocationRequest {
         operator_admin::latest_template,
         operator_admin::apply_template,
         operator_admin::provision,
+        onboarding::get_starter_task,
         agent_runs_contract,
         agent_run_contract,
         agent_run_timeline_contract
@@ -514,6 +519,9 @@ pub struct GrantRevocationRequest {
         operator_admin::OperatorTemplateResponse,
         operator_admin::OperatorProvisionRequest,
         operator_admin::OperatorProvisionResponse,
+        onboarding::StarterTaskGitExample,
+        onboarding::StarterTaskSetting,
+        onboarding::StarterTaskResponse,
         AgentRunAvailability,
         AgentRunDataStatus,
         AgentRunSpendView,
@@ -537,6 +545,9 @@ pub struct GrantRevocationRequest {
         github_automation::WorkflowDetectionResponse,
         github_automation::PublishTaskResponse,
         github_automation::DispatchTaskResponse,
+        github_automation::GithubTaskBundleResponse,
+        github_automation::GithubAutomationEvidenceResponse,
+        github_automation::GithubOnboardingEvidenceResponse,
         github_automation::GithubJobView,
         github_automation::GithubRunStatusResponse,
         github_automation::GithubAutomationErrorResponse

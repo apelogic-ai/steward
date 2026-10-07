@@ -393,6 +393,9 @@ spec:
             - { name: STEWARD_RUN_RELEASE_JSON, value: {{ . | toJson | quote }} }
 {{- end }}
             - { name: STEWARD_RUN_WORKFLOW_INSTALLATION_MODE, value: {{ .Values.config.apiserver.stewardRunWorkflowInstallationMode | quote }} }
+{{- with .Values.config.apiserver.starterTask }}
+            - { name: STEWARD_STARTER_TASK_JSON, value: {{ . | toJson | quote }} }
+{{- end }}
 {{- if .Values.config.apiserver.defaultLlmTemplate.enabled }}
             - name: STEWARD_DEFAULT_LLM_TEMPLATE_JSON
               value: {{ omit .Values.config.apiserver.defaultLlmTemplate "enabled" | toJson | quote }}
