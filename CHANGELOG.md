@@ -7,6 +7,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Restored the reserved execution transcript in the runner output archive. Steward
+  0.3.11 delivered an `out/`-only archive from `GET /v1/tasks/{taskUid}/outputs` even
+  when the Task requested `diagnostics.executionLog: full`, so steward-run 0.8.1, which
+  requires `.steward/diagnostics/stdout.log` and `stderr.log` in that archive, failed every
+  `execution-log: full` run with `failure-category=input-output` after the Task had
+  succeeded. The `package-path` workflows Steward generates set `execution-log: full`, so
+  **Steward 0.3.11 breaks those callers; upgrade to this release.** For `full` Tasks the runner
+  download now appends both streams from the successful attempt's durable logs (at most
+  4 MiB each, 8 MiB combined) after the `out/` tree; every other Task still receives an
+  `out/`-only archive. The stored archive, the controller's `out/`-only validation, and the
+  browser output listings and downloads are unchanged, agent output still cannot create or
+  replace `.steward/diagnostics`, and a `full` Task whose transcript is missing or over its
+  bounds now returns `503` instead of an archive the runner would reject. The execution-log
+  endpoints are unchanged. No migration or caller change is required.
+- Made Task output-archive validation decode tar headers exactly as the runner's tar
+  parser does, so agent output cannot hide entries from Steward that the runner would
+  read, including a forged transcript. Archives using a PAX `size` record, a path prefix
+  under GNU magic, a header with neither ustar nor GNU magic, or a numeric field outside
+  `spaces, octal digits, NUL/space padding` are now rejected as violating the `out/`-only
+  contract. GNU and POSIX tar archives that the sandbox writes are unaffected.
+
 ## [0.3.11] - 2026-10-06
 
 ### Added

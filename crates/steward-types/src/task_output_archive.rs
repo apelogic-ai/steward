@@ -3,11 +3,16 @@
 //! New archives contain only the declared `out/` tree. A bounded compatibility mode keeps
 //! historical archives readable when they also contain the two formerly embedded execution-log
 //! transcripts. Transcript bytes are never returned as Task outputs.
+//!
+//! The stored archive stays `out/`-only. Only the authenticated runner delivery of a Task whose
+//! snapshotted diagnostics requested `executionLog: full` appends the server-owned transcript,
+//! see [`task_output_archive_with_execution_transcript`].
 
 use std::collections::BTreeSet;
 
 use crate::direct_package::{
-    EXECUTION_STDERR_ARCHIVE_PATH, EXECUTION_STDOUT_ARCHIVE_PATH, RelativePath,
+    EXECUTION_STDERR_ARCHIVE_PATH, EXECUTION_STDOUT_ARCHIVE_PATH, MAX_EXECUTION_STREAM_BYTES,
+    MAX_EXECUTION_TRANSCRIPT_BYTES, RelativePath,
 };
 
 const TAR_BLOCK_BYTES: usize = 512;
@@ -43,6 +48,14 @@ pub fn task_output_archive_entries(
     archive: &[u8],
     compatibility: TaskOutputArchiveCompatibility,
 ) -> Result<Vec<TaskOutputArchiveEntry>, InvalidTaskOutputArchive> {
+    walk_task_output_archive(archive, compatibility).map(|(entries, _)| entries)
+}
+
+/// Validate the archive and also return the offset of its end-of-archive marker.
+fn walk_task_output_archive(
+    archive: &[u8],
+    compatibility: TaskOutputArchiveCompatibility,
+) -> Result<(Vec<TaskOutputArchiveEntry>, usize), InvalidTaskOutputArchive> {
     if archive.len() < TAR_BLOCK_BYTES * 3 || !archive.len().is_multiple_of(TAR_BLOCK_BYTES) {
         return Err(InvalidTaskOutputArchive::Malformed);
     }
@@ -64,7 +77,7 @@ pub fn task_output_archive_entries(
             return archive[offset..]
                 .iter()
                 .all(|byte| *byte == 0)
-                .then_some(entries)
+                .then_some((entries, offset))
                 .ok_or(InvalidTaskOutputArchive::Malformed);
         }
         validate_checksum(header)?;
@@ -150,6 +163,80 @@ pub fn task_output_archive_entries(
     Err(InvalidTaskOutputArchive::Malformed)
 }
 
+/// Bounded failures while delivering a runner-facing archive with its execution transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskOutputTranscriptError {
+    /// The stored archive is not a valid `out/`-only `steward.task-output/v1` archive.
+    Archive(InvalidTaskOutputArchive),
+    /// A stream exceeds 4 MiB or the transcript exceeds 8 MiB.
+    TranscriptTooLarge,
+}
+
+/// Deliver a stored `steward.task-output/v1` archive with the reserved execution transcript.
+///
+/// steward-run 0.8.1, which generated callers pin, requires
+/// `.steward/diagnostics/stdout.log` and `.steward/diagnostics/stderr.log` inside the output
+/// archive whenever the authenticated Task status reports `executionLog: full`. The stored
+/// archive must validate strictly as `out/`-only, so agent output can never create or replace
+/// the reserved namespace; Steward then appends exactly two regular-file entries, in the layout
+/// the pre-0.3.11 adapter produced with `tar -rf`, before a fresh end-of-archive marker. Each
+/// stream is bounded to 4 MiB and the transcript to 8 MiB; an oversized stream fails closed
+/// rather than being truncated.
+pub fn task_output_archive_with_execution_transcript(
+    archive: &[u8],
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<Vec<u8>, TaskOutputTranscriptError> {
+    let stream_bytes = |stream: &[u8]| u64::try_from(stream.len()).unwrap_or(u64::MAX);
+    let (stdout_bytes, stderr_bytes) = (stream_bytes(stdout), stream_bytes(stderr));
+    if stdout_bytes > MAX_EXECUTION_STREAM_BYTES
+        || stderr_bytes > MAX_EXECUTION_STREAM_BYTES
+        || stdout_bytes.saturating_add(stderr_bytes) > MAX_EXECUTION_TRANSCRIPT_BYTES
+    {
+        return Err(TaskOutputTranscriptError::TranscriptTooLarge);
+    }
+    let (_, end) = walk_task_output_archive(archive, TaskOutputArchiveCompatibility::Strict)
+        .map_err(TaskOutputTranscriptError::Archive)?;
+    let mut delivered = Vec::with_capacity(
+        end + 4 * TAR_BLOCK_BYTES + padded_tar_bytes(stdout.len()) + padded_tar_bytes(stderr.len()),
+    );
+    delivered.extend_from_slice(&archive[..end]);
+    append_transcript_entry(&mut delivered, EXECUTION_STDOUT_ARCHIVE_PATH, stdout);
+    append_transcript_entry(&mut delivered, EXECUTION_STDERR_ARCHIVE_PATH, stderr);
+    delivered.resize(delivered.len() + 2 * TAR_BLOCK_BYTES, 0);
+    Ok(delivered)
+}
+
+fn padded_tar_bytes(size: usize) -> usize {
+    size.div_ceil(TAR_BLOCK_BYTES) * TAR_BLOCK_BYTES
+}
+
+/// Append one POSIX ustar regular file with a fixed, metadata-free header.
+fn append_transcript_entry(archive: &mut Vec<u8>, path: &str, content: &[u8]) {
+    let header = archive.len();
+    archive.resize(header + TAR_BLOCK_BYTES, 0);
+    let block = &mut archive[header..header + TAR_BLOCK_BYTES];
+    block[..path.len()].copy_from_slice(path.as_bytes());
+    block[100..108].copy_from_slice(b"0000644\0");
+    block[108..116].copy_from_slice(b"0000000\0");
+    block[116..124].copy_from_slice(b"0000000\0");
+    block[124..136].copy_from_slice(format!("{:011o}\0", content.len()).as_bytes());
+    block[136..148].copy_from_slice(b"00000000000\0");
+    block[148..156].fill(b' ');
+    block[156] = b'0';
+    block[257..263].copy_from_slice(b"ustar\0");
+    block[263..265].copy_from_slice(b"00");
+    block[329..337].copy_from_slice(b"0000000\0");
+    block[337..345].copy_from_slice(b"0000000\0");
+    let checksum = block.iter().map(|byte| usize::from(*byte)).sum::<usize>();
+    block[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+    archive.extend_from_slice(content);
+    archive.resize(
+        header + TAR_BLOCK_BYTES + padded_tar_bytes(content.len()),
+        0,
+    );
+}
+
 fn gnu_long_name(data: &[u8]) -> Result<String, InvalidTaskOutputArchive> {
     let end = data
         .iter()
@@ -208,6 +295,9 @@ fn pax_attributes(data: &[u8]) -> Result<PaxAttributes, InvalidTaskOutputArchive
                 }
             }
             "linkpath" => attributes.link_path = true,
+            // tar-stream applies a PAX size to the entry; rejecting it keeps both parsers on
+            // the header's own size field.
+            "size" => return Err(InvalidTaskOutputArchive::Malformed),
             _ => {}
         }
         offset = end;
@@ -251,7 +341,15 @@ fn tar_path(header: &[u8]) -> Result<String, InvalidTaskOutputArchive> {
     }
 
     let name = field(&header[..100])?;
-    let prefix = field(&header[345..500])?;
+    // Match tar-stream 3.1.7: only POSIX ustar magic carries a path prefix, GNU magic ignores
+    // that region, and any other format is rejected.
+    let prefix = if &header[257..263] == b"ustar\0" {
+        field(&header[345..500])?
+    } else if &header[257..263] == b"ustar " && &header[263..265] == b" \0" {
+        ""
+    } else {
+        return Err(InvalidTaskOutputArchive::Malformed);
+    };
     if name.is_empty() {
         return Err(InvalidTaskOutputArchive::Malformed);
     }
@@ -262,12 +360,31 @@ fn tar_path(header: &[u8]) -> Result<String, InvalidTaskOutputArchive> {
     })
 }
 
+/// Parse a numeric header field exactly as tar-stream 3.1.7 would, or reject it.
+///
+/// Only `spaces* octal-digits (NUL|space)*` is accepted; tar-stream's lenient decoding of any
+/// other spelling (for example a leading NUL before the digits) could disagree with the value
+/// used here and desynchronize the runner's entry boundaries from Steward's.
 fn tar_octal(bytes: &[u8]) -> Result<usize, InvalidTaskOutputArchive> {
-    let text = std::str::from_utf8(bytes).map_err(|_| InvalidTaskOutputArchive::Malformed)?;
-    let text = text.trim_matches(['\0', ' ']);
-    if text.is_empty() {
+    let start = bytes
+        .iter()
+        .position(|byte| *byte != b' ')
+        .unwrap_or(bytes.len());
+    let digits = bytes[start..]
+        .iter()
+        .take_while(|byte| (b'0'..=b'7').contains(*byte))
+        .count();
+    if bytes[start + digits..]
+        .iter()
+        .any(|byte| *byte != 0 && *byte != b' ')
+    {
+        return Err(InvalidTaskOutputArchive::Malformed);
+    }
+    if digits == 0 {
         return Ok(0);
     }
+    let text = std::str::from_utf8(&bytes[start..start + digits])
+        .map_err(|_| InvalidTaskOutputArchive::Malformed)?;
     usize::from_str_radix(text, 8).map_err(|_| InvalidTaskOutputArchive::Malformed)
 }
 
@@ -292,7 +409,9 @@ fn validate_checksum(header: &[u8]) -> Result<(), InvalidTaskOutputArchive> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InvalidTaskOutputArchive, TaskOutputArchiveCompatibility, task_output_archive_entries,
+        InvalidTaskOutputArchive, TaskOutputArchiveCompatibility, TaskOutputTranscriptError,
+        task_output_archive_entries, task_output_archive_with_execution_transcript,
+        walk_task_output_archive,
     };
 
     fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -337,6 +456,91 @@ mod tests {
         archive.resize(header_offset + 512 + content.len().div_ceil(512) * 512, 0);
     }
 
+    /// Rewrite one header of a single-entry fixture and refresh its checksum.
+    fn patch_header(archive: &mut [u8], header_offset: usize, patch: impl Fn(&mut [u8])) {
+        let header = &mut archive[header_offset..header_offset + 512];
+        patch(header);
+        header[148..156].fill(b' ');
+        let checksum = header.iter().map(|byte| usize::from(*byte)).sum::<usize>();
+        header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+    }
+
+    #[test]
+    fn headers_the_runner_reads_differently_are_rejected() {
+        let regular = || archive(&[("out/result.txt", b"complete\n")]);
+        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+
+        // tar-stream reads "\0 11" as size 0 and would parse the data blocks as headers.
+        let mut fixture = regular();
+        patch_header(&mut fixture, 0, |header| {
+            header[124..136].copy_from_slice(b"\0\0\0\0\0\0\0\0 11\0");
+        });
+        cases.push(("size with a leading NUL", fixture));
+
+        // tar-stream ignores the ustar prefix under GNU magic.
+        let mut fixture = archive(&[(".steward/diagnostics/stdout.log", b"forged")]);
+        patch_header(&mut fixture, 0, |header| {
+            header[345..348].copy_from_slice(b"out");
+            header[257..265].copy_from_slice(b"ustar  \0");
+        });
+        cases.push(("prefix under GNU magic", fixture));
+
+        // tar-stream rejects headers with neither ustar nor GNU magic.
+        let mut fixture = regular();
+        patch_header(&mut fixture, 0, |header| header[257..265].fill(0));
+        cases.push(("missing magic", fixture));
+
+        // tar-stream honours a PAX size, which would desynchronize the entry boundary.
+        for kind in [b'x', b'g'] {
+            let size = pax_record("size", "0");
+            cases.push((
+                "PAX size",
+                archive_with_kinds(&[
+                    ("PaxHeader", size.as_bytes(), kind),
+                    ("out/result.txt", b"complete\n", b'0'),
+                ]),
+            ));
+        }
+
+        for (name, fixture) in cases {
+            // Under GNU magic the forged path resolves, for both parsers, to the legacy
+            // transcript, which only historical mode may skip.
+            let modes: &[TaskOutputArchiveCompatibility] = if name == "prefix under GNU magic" {
+                &[TaskOutputArchiveCompatibility::Strict]
+            } else {
+                &[
+                    TaskOutputArchiveCompatibility::Strict,
+                    TaskOutputArchiveCompatibility::HistoricalMixedDiagnostics,
+                ]
+            };
+            for compatibility in modes.iter().copied() {
+                assert!(
+                    task_output_archive_entries(&fixture, compatibility).is_err(),
+                    "{name} must be rejected in {compatibility:?}"
+                );
+            }
+            assert!(
+                task_output_archive_with_execution_transcript(&fixture, b"stdout", b"stderr")
+                    .is_err(),
+                "{name} must never be delivered with a transcript"
+            );
+        }
+    }
+
+    #[test]
+    fn gnu_and_ustar_headers_without_ambiguity_remain_valid() -> Result<(), String> {
+        let mut fixture = archive(&[("out/result.txt", b"complete\n")]);
+        patch_header(&mut fixture, 0, |header| {
+            header[257..265].copy_from_slice(b"ustar  \0");
+            header[124..136].copy_from_slice(b" 0000000011 ");
+        });
+        let entries = task_output_archive_entries(&fixture, TaskOutputArchiveCompatibility::Strict)
+            .map_err(|error| format!("GNU header was rejected: {error:?}"))?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, 9);
+        Ok(())
+    }
+
     fn pax_record(key: &str, value: &str) -> String {
         let payload = format!("{key}={value}\n");
         let mut length = payload.len() + 2;
@@ -376,6 +580,79 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn runner_delivery_appends_exactly_the_two_reserved_transcript_files() -> Result<(), String> {
+        let stored =
+            archive_with_kinds(&[("out/", b"", b'5'), ("out/report.md", b"complete\n", b'0')]);
+        let (_, end) = walk_task_output_archive(&stored, TaskOutputArchiveCompatibility::Strict)
+            .map_err(|error| format!("stored archive must validate: {error:?}"))?;
+        let stdout = b"stdout line\n".repeat(100);
+        let delivered = task_output_archive_with_execution_transcript(&stored, &stdout, b"")
+            .map_err(|error| format!("runner archive was not produced: {error:?}"))?;
+
+        assert_eq!(
+            &delivered[..end],
+            &stored[..end],
+            "stored entries stay byte-identical"
+        );
+        let stdout_header = &delivered[end..end + 512];
+        let stderr_offset = end + 512 + stdout.len().div_ceil(512) * 512;
+        let stderr_header = &delivered[stderr_offset..stderr_offset + 512];
+        for (header, path, size) in [
+            (
+                stdout_header,
+                ".steward/diagnostics/stdout.log",
+                stdout.len(),
+            ),
+            (stderr_header, ".steward/diagnostics/stderr.log", 0),
+        ] {
+            assert_eq!(&header[..path.len()], path.as_bytes());
+            assert!(header[path.len()..100].iter().all(|byte| *byte == 0));
+            assert_eq!(header[156], b'0', "transcripts are regular files");
+            assert_eq!(&header[257..265], b"ustar\x0000");
+            assert_eq!(&header[124..136], format!("{size:011o}\0").as_bytes());
+        }
+        assert_eq!(&delivered[end + 512..end + 512 + stdout.len()], &stdout[..]);
+        assert_eq!(delivered.len(), stderr_offset + 512 + 1024);
+        assert!(
+            delivered[stderr_offset + 512..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+
+        let listed = task_output_archive_entries(
+            &delivered,
+            TaskOutputArchiveCompatibility::HistoricalMixedDiagnostics,
+        )
+        .map_err(|error| format!("delivered archive must stay listable: {error:?}"))?;
+        assert_eq!(listed.len(), 1, "transcripts are never Task output files");
+        assert_eq!(listed[0].path, "report.md");
+        assert!(
+            task_output_archive_entries(&delivered, TaskOutputArchiveCompatibility::Strict)
+                .is_err(),
+            "a delivered archive must never be accepted back as a stored out/-only archive"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runner_delivery_requires_a_strict_stored_archive() {
+        for stored in [
+            archive(&[
+                ("out/report.md", b"complete\n"),
+                (".steward/diagnostics/stdout.log", b"forged"),
+                (".steward/diagnostics/stderr.log", b"forged"),
+            ]),
+            archive_with_kinds(&[(".steward/diagnostics/", b"", b'5')]),
+            archive_with_kinds(&[("out/link", b"", b'2')]),
+        ] {
+            assert!(matches!(
+                task_output_archive_with_execution_transcript(&stored, b"stdout", b"stderr"),
+                Err(TaskOutputTranscriptError::Archive(_))
+            ));
+        }
     }
 
     #[test]

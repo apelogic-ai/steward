@@ -712,12 +712,12 @@ pub async fn task_status_contract() {}
     params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
     security(("taskBearer" = [])),
     responses(
-        (status = 200, description = "Opaque workspace-relative output tar archive; maximum 64 MiB", body = TaskArchive, content_type = "application/x-tar"),
+        (status = 200, description = "Opaque workspace-relative output tar archive; maximum 64 MiB. When the Task's snapshotted diagnostics.executionLog is full, the archive also carries the reserved .steward/diagnostics/stdout.log and stderr.log transcript (at most 4 MiB each)", body = TaskArchive, content_type = "application/x-tar"),
         (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
         (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
         (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
         (status = 409, description = "Task has not succeeded or output is not available", body = TaskErrorResponse, content_type = "application/json"),
-        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
+        (status = 503, description = "Identity or persistence dependency unavailable, or a requested execution transcript cannot be delivered within its bounded contract", body = TaskErrorResponse, content_type = "application/json")
     )
 )]
 #[doc(hidden)]
@@ -6909,6 +6909,7 @@ mod tests {
         application_committed_during_park: Arc<Mutex<Option<GrantReversion>>>,
         application_revoked_during_retirement: Arc<Mutex<bool>>,
         tasks: Arc<Mutex<Vec<TaskRecord>>>,
+        task_output_transcripts: Arc<Mutex<Vec<(Uuid, steward_store::TaskOutputTranscript)>>>,
         miss_next_task_lookup: Arc<Mutex<bool>>,
         task_operations: Arc<Mutex<Vec<TaskRuntimeOperationRecord>>>,
         task_approval_state: Arc<Mutex<FakeApprovalState>>,
@@ -8572,6 +8573,43 @@ mod tests {
             })
         }
 
+        fn task_output_transcript<'a>(
+            &'a self,
+            task_uid: Uuid,
+            submitter_service: &'a str,
+            owner_user_id: &'a str,
+        ) -> BoxFuture<'a, Result<Option<steward_store::TaskOutputTranscript>, StoreError>>
+        {
+            Box::pin(async move {
+                let in_scope = TaskSubmissionLedger::task_for_submitter(
+                    self,
+                    task_uid,
+                    submitter_service,
+                    owner_user_id,
+                )
+                .await?
+                .is_some_and(|task| {
+                    task.phase == TaskPhase::Succeeded && task.output_archive.is_some()
+                });
+                if !in_scope {
+                    return Ok(None);
+                }
+                self.task_output_transcripts
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake Task transcript ledger lock was poisoned".to_owned(),
+                        )
+                    })
+                    .map(|transcripts| {
+                        transcripts
+                            .iter()
+                            .find(|(candidate, _)| *candidate == task_uid)
+                            .map(|(_, transcript)| transcript.clone())
+                    })
+            })
+        }
+
         fn request_task_finalization<'a>(
             &'a self,
             task_uid: Uuid,
@@ -8721,6 +8759,7 @@ mod tests {
             application_committed_during_park: Arc::new(Mutex::new(None)),
             application_revoked_during_retirement: Arc::new(Mutex::new(false)),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            task_output_transcripts: Arc::new(Mutex::new(Vec::new())),
             miss_next_task_lookup: Arc::new(Mutex::new(false)),
             task_operations: Arc::new(Mutex::new(Vec::new())),
             task_approval_state: Arc::new(Mutex::new(FakeApprovalState::Pending)),
@@ -11688,6 +11727,260 @@ mod tests {
                 .iter()
                 .all(|(_, _, path)| !path.contains("invocations")),
             "an implicit same-repository invocation must not read an invocation manifest"
+        );
+        Ok(())
+    }
+
+    async fn submit_package_path_task(
+        app: &axum::Router,
+        idempotency_key: &str,
+        diagnostics: Option<serde_json::Value>,
+    ) -> Result<Uuid, String> {
+        let mut request = serde_json::json!({
+            "contractVersion": "steward.task/v2",
+            "packagePath": "task-definition.json",
+        });
+        if let Some(diagnostics) = diagnostics {
+            request["diagnostics"] = diagnostics;
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", idempotency_key)
+                    .header("content-type", "application/json")
+                    .body(Body::from(request.to_string()))
+                    .map_err(|error| format!("build package-path request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit package-path request: {error}"))?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read package-path response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode package-path response: {error}"))?;
+        assert_eq!(status, StatusCode::ACCEPTED, "unexpected response: {body}");
+        body.get("taskUid")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|uid| Uuid::parse_str(uid).ok())
+            .ok_or_else(|| format!("package-path response omitted taskUid: {body}"))
+    }
+
+    fn complete_fake_task(
+        ledger: &FakeLedger,
+        task_uid: Uuid,
+        archive: &[u8],
+        transcript: Option<steward_store::TaskOutputTranscript>,
+    ) -> Result<(), String> {
+        let mut tasks = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake Task ledger lock was poisoned")?;
+        let task = tasks
+            .iter_mut()
+            .find(|task| task.task_uid == task_uid)
+            .ok_or_else(|| "fake Task is absent".to_owned())?;
+        task.phase = TaskPhase::Succeeded;
+        task.output_archive = Some(archive.to_vec());
+        drop(tasks);
+        if let Some(transcript) = transcript {
+            ledger
+                .task_output_transcripts
+                .lock()
+                .map_err(|_| "fake Task transcript ledger lock was poisoned")?
+                .push((task_uid, transcript));
+        }
+        Ok(())
+    }
+
+    async fn runner_outputs(
+        app: &axum::Router,
+        task_uid: Uuid,
+    ) -> Result<(StatusCode, Option<String>, Vec<u8>), String> {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/tasks/{task_uid}/outputs"))
+                    .header("authorization", "Bearer github-assertion")
+                    .header("accept", "application/x-tar")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build outputs request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request outputs: {error}"))?;
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = to_bytes(response.into_body(), 64 * 1024 * 1024)
+            .await
+            .map_err(|error| format!("read outputs response: {error}"))?;
+        Ok((status, content_type, body.to_vec()))
+    }
+
+    fn stored_output_archive(entries: &[(&str, &[u8], u8)]) -> Vec<u8> {
+        let mut archive = Vec::new();
+        for (path, content, kind) in entries {
+            let header = archive.len();
+            archive.resize(header + 512, 0);
+            archive[header..header + path.len()].copy_from_slice(path.as_bytes());
+            archive[header + 100..header + 108].copy_from_slice(b"0000644\0");
+            archive[header + 108..header + 116].copy_from_slice(b"0000000\0");
+            archive[header + 116..header + 124].copy_from_slice(b"0000000\0");
+            archive[header + 124..header + 136]
+                .copy_from_slice(format!("{:011o}\0", content.len()).as_bytes());
+            archive[header + 136..header + 148].copy_from_slice(b"00000000000\0");
+            archive[header + 148..header + 156].fill(b' ');
+            archive[header + 156] = *kind;
+            archive[header + 257..header + 265].copy_from_slice(b"ustar  \0");
+            let checksum = archive[header..header + 512]
+                .iter()
+                .map(|byte| usize::from(*byte))
+                .sum::<usize>();
+            archive[header + 148..header + 156]
+                .copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            archive.extend_from_slice(content);
+            archive.resize(header + 512 + content.len().div_ceil(512) * 512, 0);
+        }
+        archive.resize(archive.len() + 1024, 0);
+        archive
+    }
+
+    fn strict_transcript(stdout: &[u8], stderr: &[u8]) -> steward_store::TaskOutputTranscript {
+        steward_store::TaskOutputTranscript {
+            output_archive_contract: Some(
+                steward_types::task_output_archive::TASK_OUTPUT_ARCHIVE_CONTRACT.to_owned(),
+            ),
+            execution_stdout: Some(stdout.to_vec()),
+            execution_stderr: Some(stderr.to_vec()),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_execution_log_runner_outputs_carry_the_reserved_transcript() -> Result<(), String>
+    {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        let app = direct_test_app(ledger.clone(), same_repository_direct_git_fixture()?)?;
+        let stored =
+            stored_output_archive(&[("out/", b"", b'5'), ("out/result.txt", b"complete\n", b'0')]);
+
+        let full = submit_package_path_task(
+            &app,
+            "runner-outputs-full",
+            Some(serde_json::json!({ "executionLog": "full" })),
+        )
+        .await?;
+        complete_fake_task(
+            &ledger,
+            full,
+            &stored,
+            Some(strict_transcript(b"agent stdout\n", b"agent stderr\n")),
+        )?;
+        let (status, content_type, body) = runner_outputs(&app, full).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("application/x-tar"));
+        let expected =
+            steward_types::task_output_archive::task_output_archive_with_execution_transcript(
+                &stored,
+                b"agent stdout\n",
+                b"agent stderr\n",
+            )
+            .map_err(|error| format!("expected runner archive: {error:?}"))?;
+        assert!(
+            body == expected,
+            "execution-log: full callers receive out/ plus the reserved transcript"
+        );
+
+        for diagnostics in [None, Some(serde_json::json!({ "executionLog": "off" }))] {
+            let key = format!("runner-outputs-off-{}", diagnostics.is_some());
+            let off = submit_package_path_task(&app, &key, diagnostics).await?;
+            complete_fake_task(
+                &ledger,
+                off,
+                &stored,
+                Some(strict_transcript(b"must not leak", b"must not leak")),
+            )?;
+            let (status, _, body) = runner_outputs(&app, off).await?;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                body == stored,
+                "every other run keeps the out/-only archive"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_execution_log_runner_outputs_fail_closed_without_a_valid_transcript()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        let app = direct_test_app(ledger.clone(), same_repository_direct_git_fixture()?)?;
+        let stored = stored_output_archive(&[("out/result.txt", b"complete\n", b'0')]);
+        let full = Some(serde_json::json!({ "executionLog": "full" }));
+        let oversized = vec![b'x'; 4 * 1024 * 1024 + 1];
+        let forged = stored_output_archive(&[
+            ("out/result.txt", b"complete\n", b'0'),
+            (".steward/diagnostics/stdout.log", b"forged", b'0'),
+        ]);
+        let cases = [
+            (
+                "missing",
+                stored.clone(),
+                steward_store::TaskOutputTranscript {
+                    execution_stdout: None,
+                    execution_stderr: None,
+                    ..strict_transcript(b"", b"")
+                },
+            ),
+            (
+                "oversized",
+                stored.clone(),
+                strict_transcript(&oversized, b""),
+            ),
+            ("forged", forged, strict_transcript(b"stdout", b"stderr")),
+        ];
+        for (name, archive, transcript) in cases {
+            let task_uid =
+                submit_package_path_task(&app, &format!("runner-outputs-{name}"), full.clone())
+                    .await?;
+            complete_fake_task(&ledger, task_uid, &archive, Some(transcript))?;
+            let (status, _, _) = runner_outputs(&app, task_uid).await?;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{name} transcript must fail closed instead of serving a partial archive"
+            );
+        }
+
+        // A historical (pre-contract) archive already embeds its transcript and is served as-is.
+        let historical = stored_output_archive(&[
+            ("out/result.txt", b"complete\n", b'0'),
+            (".steward/diagnostics/stdout.log", b"stdout", b'0'),
+            (".steward/diagnostics/stderr.log", b"stderr", b'0'),
+        ]);
+        let task_uid = submit_package_path_task(&app, "runner-outputs-historical", full).await?;
+        complete_fake_task(
+            &ledger,
+            task_uid,
+            &historical,
+            Some(steward_store::TaskOutputTranscript {
+                output_archive_contract: None,
+                ..strict_transcript(b"stdout", b"stderr")
+            }),
+        )?;
+        let (status, _, body) = runner_outputs(&app, task_uid).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body == historical,
+            "historical archives are served unchanged"
         );
         Ok(())
     }

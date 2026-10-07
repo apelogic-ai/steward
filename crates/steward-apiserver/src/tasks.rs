@@ -30,18 +30,22 @@ use steward_ports::{
 };
 use steward_store::{
     EnvelopeRequestRecord, FederatedSubjectObservation, FederatedSubjectRecord, PgStore,
-    StoreError, TaskOrchestrationMode, TaskRecord, TaskReservationRequest,
+    StoreError, TaskOrchestrationMode, TaskOutputTranscript, TaskRecord, TaskReservationRequest,
     TaskRuntimeOperationRecord, TaskRuntimeOwnership, WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
     BoundedText, BrowserTaskEvidence, BrowserTaskSubmission, ClosureEntry, ClosureEntryKind,
     ContentDigest, DirectAdmissionDelta, DirectRequirements, DirectRuntimeOwnership,
     DirectTaskBindingEvidence, DirectTaskDefinition, DirectTaskPhase, DirectTaskStatusResponse,
-    DirectTaskSubmission, EnvelopeDigest, EnvelopeEvidence, InstructionSkill, InvocationKind,
-    InvocationManifest, PACKAGE_CLOSURE_CONTRACT_VERSION, PackageClosure, PackageCommit,
-    PromptSourceKind, RelativePath, RepositoryUrl, ResolvedSource, SourceProvenance,
+    DirectTaskSubmission, EnvelopeDigest, EnvelopeEvidence, ExecutionLogMode, InstructionSkill,
+    InvocationKind, InvocationManifest, PACKAGE_CLOSURE_CONTRACT_VERSION, PackageClosure,
+    PackageCommit, PromptSourceKind, RelativePath, RepositoryUrl, ResolvedSource, SourceProvenance,
     StableProviderId, TASK_BINDING_EVIDENCE_SCHEMA, TaskOrigin, TriggerRepository,
     canonical_json_bytes,
+};
+use steward_types::task_output_archive::{
+    TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputTranscriptError,
+    task_output_archive_with_execution_transcript,
 };
 use steward_types::{
     AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, Email,
@@ -1378,6 +1382,14 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
         owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>>;
 
+    /// Contract marker and successful-attempt transcript for runner output delivery.
+    fn task_output_transcript<'a>(
+        &'a self,
+        task_uid: Uuid,
+        submitter_service: &'a str,
+        owner_user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<TaskOutputTranscript>, StoreError>>;
+
     fn request_task_finalization<'a>(
         &'a self,
         task_uid: Uuid,
@@ -1488,6 +1500,23 @@ impl TaskSubmissionLedger for PgStore {
     ) -> BoxFuture<'a, Result<Option<TaskRecord>, StoreError>> {
         Box::pin(async move {
             PgStore::task_for_submitter(self, task_uid, submitter_service, owner_user_id).await
+        })
+    }
+
+    fn task_output_transcript<'a>(
+        &'a self,
+        task_uid: Uuid,
+        submitter_service: &'a str,
+        owner_user_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<TaskOutputTranscript>, StoreError>> {
+        Box::pin(async move {
+            PgStore::task_output_transcript_for_submitter(
+                self,
+                task_uid,
+                submitter_service,
+                owner_user_id,
+            )
+            .await
         })
     }
 
@@ -1822,15 +1851,75 @@ where
     if record.phase != TaskPhase::Succeeded {
         return ApiError::TaskOutputNotReady.into_response();
     }
-    match record.output_archive {
-        Some(archive) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/x-tar")],
-            archive,
-        )
-            .into_response(),
-        None => ApiError::TaskOutputNotReady.into_response(),
+    let Some(archive) = record.output_archive else {
+        return ApiError::TaskOutputNotReady.into_response();
+    };
+    let execution_log = record
+        .direct_task_evidence
+        .as_ref()
+        .map(|evidence| evidence.diagnostics.execution_log);
+    let archive = if execution_log == Some(ExecutionLogMode::Full) {
+        let transcript = match state
+            .application
+            .ledger
+            .task_output_transcript(
+                task_uid,
+                &identity.service,
+                identity.canonical_user_id.as_str(),
+            )
+            .await
+        {
+            Ok(Some(transcript)) => transcript,
+            Ok(None) => return ApiError::TaskOutputNotReady.into_response(),
+            Err(error) => return ApiError::Store(error).into_response(),
+        };
+        match runner_output_archive_with_transcript(archive, transcript) {
+            Ok(archive) => archive,
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        archive
+    };
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/x-tar")],
+        archive,
+    )
+        .into_response()
+}
+
+/// Deliver the runner-facing archive for a Task whose snapshotted diagnostics requested
+/// `executionLog: full`.
+///
+/// The authenticated runner download is the only place the reserved transcript re-enters an
+/// output archive: storage, the controller's `out/`-only validation, and the browser output
+/// views keep seeing the stored archive. A `steward.task-output/v1` archive gains the successful
+/// attempt's transcript; a historical archive without that marker already embeds its transcript
+/// and is delivered unchanged. A missing, oversized, or contract-violating transcript fails
+/// closed instead of serving an archive that the runner would reject after a successful Task.
+fn runner_output_archive_with_transcript(
+    archive: Vec<u8>,
+    transcript: TaskOutputTranscript,
+) -> Result<Vec<u8>, ApiError> {
+    if transcript.output_archive_contract.as_deref() != Some(TASK_OUTPUT_ARCHIVE_CONTRACT) {
+        return Ok(archive);
     }
+    let (Some(stdout), Some(stderr)) = (transcript.execution_stdout, transcript.execution_stderr)
+    else {
+        return Err(ApiError::TaskRuntimeContractUnavailable(
+            "the Task execution transcript is unavailable".to_owned(),
+        ));
+    };
+    task_output_archive_with_execution_transcript(&archive, &stdout, &stderr).map_err(|error| {
+        ApiError::TaskRuntimeContractUnavailable(match error {
+            TaskOutputTranscriptError::TranscriptTooLarge => {
+                "the Task execution transcript exceeds its bounded contract".to_owned()
+            }
+            TaskOutputTranscriptError::Archive(_) => {
+                "the Task output archive violates the out/-only contract".to_owned()
+            }
+        })
+    })
 }
 
 async fn delete_task<L, I>(

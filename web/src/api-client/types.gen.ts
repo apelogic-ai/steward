@@ -5380,7 +5380,7 @@ export type TaskOutputsContractErrors = {
      */
     409: TaskErrorResponse;
     /**
-     * Identity or persistence dependency unavailable
+     * Identity or persistence dependency unavailable, or a requested execution transcript cannot be delivered within its bounded contract
      */
     503: TaskErrorResponse;
 };
@@ -5389,7 +5389,7 @@ export type TaskOutputsContractError = TaskOutputsContractErrors[keyof TaskOutpu
 
 export type TaskOutputsContractResponses = {
     /**
-     * Opaque workspace-relative output tar archive; maximum 64 MiB
+     * Opaque workspace-relative output tar archive; maximum 64 MiB. When the Task's snapshotted diagnostics.executionLog is full, the archive also carries the reserved .steward/diagnostics/stdout.log and stderr.log transcript (at most 4 MiB each)
      */
     200: TaskArchive;
 };
