@@ -3474,6 +3474,35 @@ mod tests {
     }
 
     #[test]
+    fn conformance_jobs_install_the_bun_version_required_by_xtask() -> Result<(), String> {
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        for (job_name, next_job) in [
+            ("conformance-pinned", "openshell-adapter"),
+            ("latest-nightly", ""),
+        ] {
+            let after = ci
+                .split_once(&format!("  {job_name}:\n"))
+                .map(|(_before, after)| after)
+                .ok_or_else(|| format!("{job_name} job could not be isolated"))?;
+            let job = if next_job.is_empty() {
+                after
+            } else {
+                after
+                    .split_once(&format!("\n  {next_job}:"))
+                    .map(|(job, _after)| job)
+                    .ok_or_else(|| format!("{job_name} job could not be isolated"))?
+            };
+            assert!(
+                job.contains("uses: oven-sh/setup-bun@ecf28ddc73e819eb6fa29df6b34ef8921c743461")
+                    && job.contains("bun-version-file: .bun-version"),
+                "{job_name} must install the Bun version required by cargo xtask conformance"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn every_xtask_process_is_created_after_a_version_check() -> Result<(), String> {
         let sources = [
             "lib.rs",
