@@ -1163,6 +1163,15 @@ export type GithubActionsWorkflowResponse = {
 export type GithubAutomationErrorResponse = {
     apiVersion: string;
     error: string;
+    manualFiles?: {
+        [key: string]: string;
+    } | null;
+};
+
+export type GithubAutomationEvidenceResponse = {
+    apiVersion: string;
+    dispatch?: null | DispatchTaskResponse;
+    publication?: null | PublishTaskResponse;
 };
 
 export type GithubJobView = {
@@ -1171,6 +1180,13 @@ export type GithubJobView = {
     name: string;
     status: string;
     url: string;
+};
+
+export type GithubOnboardingEvidenceResponse = {
+    apiVersion: string;
+    dispatchObserved: boolean;
+    publicationObserved: boolean;
+    workflowObserved: boolean;
 };
 
 export type GithubRepositoriesResponse = {
@@ -1204,6 +1220,15 @@ export type GithubRunStatusResponse = {
     runAttempt: number;
     runId: number;
     url: string;
+};
+
+export type GithubTaskBundleResponse = {
+    apiVersion: string;
+    files: {
+        [key: string]: string;
+    };
+    packageDigest: string;
+    workflowPath: string;
 };
 
 export type InvocationKind = 'manifest' | 'implicit';
@@ -4364,6 +4389,39 @@ export type MyRunEventsResponses = {
 
 export type MyRunEventsResponse = MyRunEventsResponses[keyof MyRunEventsResponses];
 
+export type GithubTaskBundleData = {
+    body?: never;
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/github/bundle';
+};
+
+export type GithubTaskBundleErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Run is unavailable
+     */
+    404: unknown;
+    /**
+     * Run is not publishable
+     */
+    409: unknown;
+    503: GithubAutomationErrorResponse;
+};
+
+export type GithubTaskBundleError = GithubTaskBundleErrors[keyof GithubTaskBundleErrors];
+
+export type GithubTaskBundleResponses = {
+    200: GithubTaskBundleResponse;
+};
+
+export type GithubTaskBundleResponse2 = GithubTaskBundleResponses[keyof GithubTaskBundleResponses];
+
 export type DispatchTaskData = {
     body: DispatchTaskRequest;
     headers: {
@@ -4407,6 +4465,79 @@ export type DispatchTaskResponses = {
 };
 
 export type DispatchTaskResponse2 = DispatchTaskResponses[keyof DispatchTaskResponses];
+
+export type GithubAutomationEvidenceData = {
+    body?: never;
+    path: {
+        task_uid: string;
+    };
+    query: {
+        owner: string;
+        repository: string;
+    };
+    url: '/app/api/v1/runs/{task_uid}/github/evidence';
+};
+
+export type GithubAutomationEvidenceErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Repository is not admitted
+     */
+    403: unknown;
+    /**
+     * Run or repository is unavailable
+     */
+    404: unknown;
+    /**
+     * Run evidence is unavailable or invalid
+     */
+    409: unknown;
+    503: GithubAutomationErrorResponse;
+};
+
+export type GithubAutomationEvidenceError = GithubAutomationEvidenceErrors[keyof GithubAutomationEvidenceErrors];
+
+export type GithubAutomationEvidenceResponses = {
+    200: GithubAutomationEvidenceResponse;
+};
+
+export type GithubAutomationEvidenceResponse2 = GithubAutomationEvidenceResponses[keyof GithubAutomationEvidenceResponses];
+
+export type GithubOnboardingEvidenceData = {
+    body?: never;
+    path: {
+        task_uid: string;
+    };
+    query?: never;
+    url: '/app/api/v1/runs/{task_uid}/github/onboarding';
+};
+
+export type GithubOnboardingEvidenceErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+    /**
+     * Run is unavailable
+     */
+    404: unknown;
+    /**
+     * Run evidence is unavailable or invalid
+     */
+    409: unknown;
+    503: GithubAutomationErrorResponse;
+};
+
+export type GithubOnboardingEvidenceError = GithubOnboardingEvidenceErrors[keyof GithubOnboardingEvidenceErrors];
+
+export type GithubOnboardingEvidenceResponses = {
+    200: GithubOnboardingEvidenceResponse;
+};
+
+export type GithubOnboardingEvidenceResponse2 = GithubOnboardingEvidenceResponses[keyof GithubOnboardingEvidenceResponses];
 
 export type PublishTaskData = {
     body: PublishTaskRequest;

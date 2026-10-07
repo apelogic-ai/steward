@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import type { BrowserRunView } from "@/api-client";
 import { automatedPackageRun } from "@/data/onboarding-progress";
 
-import { browserHelloWorldRun } from "./onboarding-view";
+import { browserHelloWorldRun, governedJobOnly } from "./onboarding-view";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -44,7 +44,34 @@ test("browser hello world progress accepts only an inline browser run under a pr
   })], envelopes)?.package?.source).toBe("inline");
 });
 
-test("optional automation completes only for the exact successful browser package", () => {
+test("browser hello world progress keeps the newest succeeded finalized run", () => {
+  const envelopes = new Set(["sample-envelope"]);
+  const succeeded = run({
+    taskUid: "successful-task",
+    updatedAt: "2026-10-02T00:01:00Z",
+    package: { source: "inline", revision: `steward:sha256:${"a".repeat(64)}`, path: "task-definition.json", promptSource: "inline" },
+    userEnvelopeInstanceId: "sample-envelope",
+  });
+  const laterFailure = run({
+    taskUid: "failed-task",
+    phase: "failed",
+    updatedAt: "2026-10-02T00:02:00Z",
+    package: { source: "inline", revision: `steward:sha256:${"b".repeat(64)}`, path: "task-definition.json", promptSource: "inline" },
+    userEnvelopeInstanceId: "sample-envelope",
+  });
+  const laterRunning = run({
+    taskUid: "running-task",
+    finalized: false,
+    phase: "running",
+    updatedAt: "2026-10-02T00:03:00Z",
+    package: { source: "inline", revision: `steward:sha256:${"c".repeat(64)}`, path: "task-definition.json", promptSource: "inline" },
+    userEnvelopeInstanceId: "sample-envelope",
+  });
+
+  expect(browserHelloWorldRun([succeeded, laterFailure, laterRunning], envelopes)?.taskUid).toBe("successful-task");
+});
+
+test("GitHub automation completes only for the exact successful browser package", () => {
   const envelopeIds = new Set(["sample-envelope"]);
   const browser = run({
     package: { source: "inline", revision: `steward:sha256:${"a".repeat(64)}`, path: "task-definition.json", contentDigest: `steward:sha256:${"a".repeat(64)}`, promptSource: "inline" },
@@ -58,4 +85,28 @@ test("optional automation completes only for the exact successful browser packag
   });
   expect(automatedPackageRun([unrelated], browser, envelopeIds)).toBeUndefined();
   expect(automatedPackageRun([{ ...unrelated, package: { ...unrelated.package!, contentDigest: browser.package!.contentDigest } }], browser, envelopeIds)?.trigger?.provider).toBe("github");
+});
+
+test("governed job preview keeps the input preparation and reusable workflow jobs", () => {
+  const workflow = [
+    "jobs:",
+    "  prepare:",
+    "    runs-on: ubuntu-latest",
+    "  governed:",
+    "    needs: prepare",
+    "    permissions:",
+    "      id-token: write",
+    "    uses: example-org/steward-run/.github/workflows/steward-task.yml@1111111111111111111111111111111111111111",
+    "    with:",
+    "      package-path: .steward/tasks/hello/task-definition.json",
+    "  verify:",
+    "    runs-on: ubuntu-latest",
+    "",
+  ].join("\n");
+  const preview = governedJobOnly(workflow);
+  expect(preview).toContain("jobs:\n  prepare:");
+  expect(preview).toContain("\n  governed:");
+  expect(preview).toContain("id-token: write");
+  expect(preview).toContain("package-path: .steward/tasks/hello/task-definition.json");
+  expect(preview).not.toContain("verify:");
 });

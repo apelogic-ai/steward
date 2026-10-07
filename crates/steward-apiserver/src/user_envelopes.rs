@@ -2180,7 +2180,7 @@ mod tests {
             value["files"].as_object().map(serde_json::Map::len),
             Some(1)
         );
-        let workflow = value["files"][".github/workflows/steward-browser-task.yml"]
+        let workflow = value["files"][".github/workflows/hypershell-browser-task.yml"]
             .as_str()
             .ok_or_else(|| "bundle omitted caller workflow".to_owned())?;
         assert!(
