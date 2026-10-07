@@ -91,6 +91,40 @@ function copyText(value: string, onCopied: () => void) {
   void navigator.clipboard.writeText(value).then(onCopied);
 }
 
+const genericBundleFailure = "Steward could not render the exact tested package and workflow.";
+
+const unpublishableReasons: Record<string, string> = {
+  evidence_unavailable: "The test run recorded no package evidence that Steward can publish. Run the test again.",
+  source_not_inline: "This test run used a package that already lives in a repository or the Workflow registry. Run the inline test from step 3 to publish it here.",
+  package_files_invalid: "The test run's recorded package files are incomplete or invalid, so Steward cannot publish them. Run the test again.",
+  closure_mismatch: "The test run's recorded package files no longer match its tested digest, so Steward will not publish them. Run the test again.",
+  package_shape_unsupported: "This tested package has files that governed publication does not support. Only a Task definition and an optional prompt.md beside it can be published.",
+  envelope_unavailable: "The test run recorded no complete envelope selection, so Steward cannot generate its workflow. Run the test again.",
+  workflow_unavailable: "Steward could not generate the caller workflow for this package. Ask an administrator to check the configured steward-run release.",
+};
+
+export function bundleFailureMessage(problem: GithubAutomationErrorResponse | undefined): string {
+  if (problem?.error === "steward_run_release_unsupported") {
+    return "The reviewed steward-run release is below 0.8.0. Copy the package files manually; workflow generation and detection require steward-run 0.8.0 or later.";
+  }
+  if (problem?.error === "tested_package_unpublishable" && problem.reason) {
+    return unpublishableReasons[problem.reason] ?? genericBundleFailure;
+  }
+  return genericBundleFailure;
+}
+
+/** Every file of the exact tested package, Task definition first. */
+export function packageFileEntries(
+  bundle: GithubTaskBundleResponse | null,
+  manualFiles: Record<string, string>,
+  packagePath: string,
+): Array<[string, string]> {
+  const files = bundle
+    ? Object.entries(bundle.files).filter(([path]) => path !== bundle.workflowPath)
+    : Object.entries(manualFiles);
+  return files.sort(([left], [right]) => (left === packagePath ? -1 : right === packagePath ? 1 : left.localeCompare(right)));
+}
+
 function repositoryPrerequisite(reason: string | null | undefined): string {
   if (reason === "source_repository_not_admitted") return "This repository is not admitted as a governed source.";
   return reason ? `Repository prerequisite is missing: ${reason}.` : "This repository is not ready for governed automation.";
@@ -194,7 +228,7 @@ function OnboardingChecklist({ data, onRefresh, onRetryRepositories, repositorie
   const bundle = currentBundleResource?.bundle ?? null;
   const manualFiles = currentBundleResource?.manualFiles ?? {};
   const bundleFailure = currentBundleResource?.failure ?? null;
-  const packagePreview = bundle?.files[packagePath] ?? manualFiles[packagePath] ?? null;
+  const packageFiles = packageFileEntries(bundle, manualFiles, packagePath);
   const workflowPreview = bundle ? bundle.files[bundle.workflowPath] ?? null : null;
   const automationRun = baseProgress.automationRun;
   const automationRunId = Number(automationRun?.trigger?.runId);
@@ -242,16 +276,12 @@ function OnboardingChecklist({ data, onRefresh, onRetryRepositories, repositorie
       const problem = bundleResult.error as GithubAutomationErrorResponse | undefined;
       setBundleResource({
         bundle: bundleResult.data && bundleResult.response?.ok ? bundleResult.data : null,
-        failure: bundleResult.data && bundleResult.response?.ok
-          ? null
-          : problem?.error === "steward_run_release_unsupported"
-            ? "The reviewed steward-run release is below 0.8.0. Copy the Task definition manually; workflow generation and detection require steward-run 0.8.0 or later."
-            : "Steward could not render the exact tested package and workflow.",
+        failure: bundleResult.data && bundleResult.response?.ok ? null : bundleFailureMessage(problem),
         manualFiles: problem?.manualFiles ?? {},
         taskUid,
       });
     }).catch(() => {
-      if (active) setBundleResource({ bundle: null, failure: "Steward could not render the exact tested package and workflow.", manualFiles: {}, taskUid });
+      if (active) setBundleResource({ bundle: null, failure: genericBundleFailure, manualFiles: {}, taskUid });
     });
     return () => { active = false; };
   }, [session.status, taskUid]);
@@ -456,7 +486,7 @@ function OnboardingChecklist({ data, onRefresh, onRetryRepositories, repositorie
     {
       title: "Publish the task definition",
       status: publication ? `Pull request #${publication.pullRequestNumber} opened` : workflow?.compatible ? "Published workflow found on the default branch" : "Publish the exact tested Task as a pull request",
-      body: successfulTestRun ? <div className="space-y-4"><p className="text-sm text-muted-ink">Review the exact <code>steward.task-definition/v2</code> document that ran at <code>{packagePath}</code>.</p>{packagePreview ? <Preview title={packagePath} value={packagePreview} copied={copied === "package"} onCopy={() => copyText(packagePreview, () => setCopied("package"))} /> : bundleFailure ? null : <p className="text-sm text-warn">Rendering the tested package…</p>}{bundleFailure ? <p className="text-sm text-warn">{bundleFailure}</p> : null}<RepositoryResource onRetry={onRetryRepositories} state={repositories}>{({ repositories: available }) => available.length ? null : <p className="text-sm text-muted-ink">The tested package is ready, but no repository is available for publication.</p>}</RepositoryResource>{readinessFailure ? <p className="text-sm text-warn">{readinessFailure} Copy the generated files into the repository manually.</p> : null}<div className="flex flex-wrap gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!bundle || !selectedRepository?.ready || automationState === "publishing"} onClick={() => void openPublication()} type="button">{automationState === "publishing" ? "Opening…" : "Open pull request"}</button>{publication ? <a className="rounded-control border px-4 py-2 text-sm font-semibold" href={publication.pullRequestUrl} rel="noreferrer" target="_blank">View pull request ↗</a> : null}<button className="rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!workflowPreview} onClick={() => void refreshWorkflow()} type="button">I&apos;ve committed it</button></div><p className="text-xs text-muted-ink">Change the prompt or inputs in step 3 to regenerate it.</p></div> : <p className="text-sm text-muted-ink">Complete a successful test run first.</p>,
+      body: successfulTestRun ? <div className="space-y-4"><p className="text-sm text-muted-ink">Review the exact tested package: the <code>steward.task-definition/v2</code> document that ran at <code>{packagePath}</code>{packageFiles.length > 1 ? ` and ${packageFiles.length - 1 === 1 ? "the file" : "the files"} it references` : ""}.</p>{packageFiles.length ? <div className="space-y-3">{packageFiles.map(([path, contents]) => <Preview copied={copied === `package:${path}`} key={path} onCopy={() => copyText(contents, () => setCopied(`package:${path}`))} title={path} value={contents} />)}</div> : bundleFailure ? null : <p className="text-sm text-warn">Rendering the tested package…</p>}{bundleFailure ? <p className="text-sm text-warn">{bundleFailure}</p> : null}<RepositoryResource onRetry={onRetryRepositories} state={repositories}>{({ repositories: available }) => available.length ? null : <p className="text-sm text-muted-ink">The tested package is ready, but no repository is available for publication.</p>}</RepositoryResource>{readinessFailure ? <p className="text-sm text-warn">{readinessFailure} Copy the generated files into the repository manually.</p> : null}<div className="flex flex-wrap gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!bundle || !selectedRepository?.ready || automationState === "publishing"} onClick={() => void openPublication()} type="button">{automationState === "publishing" ? "Opening…" : "Open pull request"}</button>{publication ? <a className="rounded-control border px-4 py-2 text-sm font-semibold" href={publication.pullRequestUrl} rel="noreferrer" target="_blank">View pull request ↗</a> : null}<button className="rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!workflowPreview} onClick={() => void refreshWorkflow()} type="button">I&apos;ve committed it</button></div><p className="text-xs text-muted-ink">Change the prompt or inputs in step 3 to regenerate it.</p></div> : <p className="text-sm text-muted-ink">Complete a successful test run first.</p>,
     },
     {
       title: "Add the workflow to your repository",

@@ -11692,6 +11692,171 @@ mod tests {
         Ok(())
     }
 
+    /// Earlier browser releases submitted a path-backed prompt beside the Task definition at
+    /// the package root. Publishing that evidence must reproduce its tested closure digest
+    /// when the generated `package-path` caller runs against the published commit.
+    #[tokio::test]
+    async fn legacy_path_backed_browser_package_publishes_and_resolves_to_its_tested_digest()
+    -> Result<(), String> {
+        let definition = serde_json::to_string_pretty(&serde_json::json!({
+            "schemaVersion": "steward.task-definition/v2",
+            "name": "browser-task",
+            "version": 1,
+            "runtime": { "agentRef": TEST_VERSIONED_AGENT },
+            "prompt": "prompt.md",
+            "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+        }))
+        .map_err(|error| error.to_string())?;
+        let legacy_files = BTreeMap::from([
+            ("task-definition.json".to_owned(), definition),
+            (
+                "prompt.md".to_owned(),
+                "Write hello to out/hello.txt.\n".to_owned(),
+            ),
+        ]);
+
+        let browser_ledger = versioned_task_ledger_with_runtime_minutes()?;
+        enable_inline_for_versioned_task_fixture(&browser_ledger, true)?;
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let response = browser_task_router(browser_ledger.clone(), task_api_config()?, auth)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/runs")
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", csrf)
+                    .header("idempotency-key", "browser-legacy-package")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "package": {
+                                "source": "inline",
+                                "path": "task-definition.json",
+                                "files": legacy_files
+                            },
+                            "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64)),
+                            "inputs": {}
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build legacy browser request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit legacy browser request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let tested = browser_ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake browser Task ledger lock was poisoned")?
+            .first()
+            .and_then(|task| task.browser_task_evidence.clone())
+            .ok_or_else(|| "legacy browser Task omitted closure evidence".to_owned())?;
+        assert_eq!(tested.prompt_source, PromptSourceKind::Path);
+        assert_eq!(tested.inline_files.as_ref(), Some(&legacy_files));
+
+        let automation = crate::github_automation::GithubAutomationConfig::new(
+            task_api_config()?,
+            crate::StewardRunRelease {
+                manifest_schema_version: 3,
+                version: "0.8.0".to_owned(),
+                workflow_repository: "example-org/steward-run".to_owned(),
+                workflow_commit: "a".repeat(40),
+                action_commit: "b".repeat(40),
+                governed_job_container_image: None,
+            },
+            crate::StewardRunWorkflowInstallationMode::Remote,
+            true,
+        );
+        let bundle = crate::github_automation::tested_package_bundle(
+            Some(&tested),
+            Some(crate::GithubActionsEnvelopeSelection {
+                id: "envelope-instance-1".to_owned(),
+                revision: 1,
+                digest: format!("sha256:{}", "b".repeat(64)),
+            }),
+            &automation,
+        )
+        .map_err(|error| format!("legacy package must bundle: {error:?}"))?;
+        assert_eq!(bundle.package_digest, tested.closure_digest.as_str());
+        assert_eq!(bundle.files.len(), 3);
+        for (path, content) in &legacy_files {
+            assert_eq!(bundle.files.get(path), Some(content));
+        }
+        let package_path = bundle
+            .workflow_content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("package-path: "))
+            .ok_or_else(|| "the generated caller must use package-path".to_owned())?
+            .to_owned();
+        assert!(!bundle.workflow_content.contains("invocation-path"));
+
+        // GitHub Actions runs the published commit: every bundled file at its published path.
+        let repository = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
+        let commit = format!("git:sha1:{}", "c".repeat(40));
+        let git = FakeDirectGit {
+            repositories: Arc::new(BTreeMap::from([(
+                repository.as_str().to_owned(),
+                GitRepositoryIdentity {
+                    repository: repository.clone(),
+                    repository_id: StableProviderId::parse("123456")?,
+                    repository_owner_id: StableProviderId::parse("7890")?,
+                },
+            )])),
+            files: Arc::new(
+                bundle
+                    .files
+                    .iter()
+                    .map(|(path, content)| {
+                        (
+                            (repository.as_str().to_owned(), commit.clone(), path.clone()),
+                            content.clone().into_bytes(),
+                        )
+                    })
+                    .collect(),
+            ),
+            wrong_object_path: None,
+            reads: Arc::new(Mutex::new(Vec::new())),
+        };
+        let github_ledger = versioned_task_ledger_with_runtime_minutes()?;
+        let response = direct_test_app(github_ledger.clone(), git)?
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "github-actions-legacy-package")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "packagePath": package_path,
+                            "diagnostics": { "executionLog": "full" }
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build published package request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit published package request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let evidence = github_ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake GitHub Actions Task ledger lock was poisoned")?
+            .first()
+            .and_then(|task| task.direct_task_evidence.clone())
+            .ok_or_else(|| "published package Task omitted binding evidence".to_owned())?;
+        assert_eq!(evidence.invocation_kind, InvocationKind::Implicit);
+        assert_eq!(evidence.prompt_source, PromptSourceKind::Path);
+        assert_eq!(evidence.closure_digest, tested.closure_digest);
+        assert_eq!(Some(&evidence.closure), tested.closure.as_ref());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn invalid_or_missing_package_path_requests_fail_before_reservation() -> Result<(), String>
     {

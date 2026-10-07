@@ -328,7 +328,7 @@ verifies the same snapshot before creating or executing the short-lived
 
 Steward automatically selects internal authority v4 for browser GitHub repository
 automation. It adds only the operation-specific grants needed to list repositories,
-read the generated caller workflow, publish the exact two-file package on a new branch,
+read the generated caller workflow, publish the exact tested package and caller on a new branch,
 dispatch that caller, and observe its run. Operators do not select v4 in product
 configuration. Repository publication additionally requires the target repository's
 stable IDs to appear as a source in `githubSource.bindings`, a reviewed `steward-run`

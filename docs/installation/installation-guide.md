@@ -462,7 +462,7 @@ User Envelope failure.
 To enable browser publication after a successful inline run, the same repository must
 also be visible through the user's governed GitHub connection and admitted by stable
 owner and repository IDs in `githubSource.bindings`. Deploy a reviewed `steward-run`
-release at v0.8.0 or later. Steward then owns the branch, two-file commit, pull request,
+release at v0.8.0 or later. Steward then owns the branch, exact tested package commit, pull request,
 exact-workflow verification, dispatch, and run-status operations; no GitHub token or
 workflow content belongs in Helm values. If a repository is visible but marked **Not
 ready**, add its stable source IDs. If it is absent, first check organization OAuth App

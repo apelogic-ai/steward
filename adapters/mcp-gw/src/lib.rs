@@ -597,14 +597,33 @@ fn valid_package_path(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-'))
 }
 
+/// Earlier browser releases tested Task definitions at the repository root; the package
+/// closure digest binds that exact path, so publication keeps it.
+const ROOT_TASK_DEFINITION_PATH: &str = "task-definition.json";
+
+fn valid_task_definition_path(value: &str) -> bool {
+    valid_package_path(value) || value == ROOT_TASK_DEFINITION_PATH
+}
+
+/// The path-backed `prompt.md` earlier browser releases tested beside the Task definition,
+/// published unchanged in that definition's directory.
+fn valid_sibling_prompt_path(value: &str, definition: &str) -> bool {
+    match definition.rsplit_once('/') {
+        Some((directory, _)) => value
+            .strip_prefix(directory)
+            .is_some_and(|name| name == "/prompt.md"),
+        None => value == "prompt.md",
+    }
+}
+
 fn published_files_field(
     object: &Map<String, Value>,
 ) -> Result<Vec<GithubPublishedFile>, PortError> {
     let files = object
         .get("files")
         .and_then(Value::as_array)
-        .filter(|files| files.len() == 2)
-        .ok_or_else(|| rejected("GitHub publication must contain exactly two generated files"))?;
+        .filter(|files| (2..=3).contains(&files.len()))
+        .ok_or_else(|| rejected("GitHub publication must contain two or three generated files"))?;
     let mut parsed = Vec::with_capacity(files.len());
     for file in files {
         let file = file
@@ -615,17 +634,27 @@ fn published_files_field(
         let content = bounded_string_field(file, "content", MAX_PUBLISHED_FILE_BYTES)?;
         parsed.push(GithubPublishedFile { path, content });
     }
-    if parsed[0].path == parsed[1].path
+    let definitions = parsed
+        .iter()
+        .map(|file| file.path.as_str())
+        .filter(|path| valid_task_definition_path(path))
+        .collect::<Vec<_>>();
+    let distinct = parsed
+        .iter()
+        .enumerate()
+        .all(|(index, file)| parsed[..index].iter().all(|other| other.path != file.path));
+    if !distinct
         || parsed
             .iter()
             .filter(|file| valid_workflow_path(&file.path))
             .count()
             != 1
-        || parsed
-            .iter()
-            .filter(|file| valid_package_path(&file.path))
-            .count()
-            != 1
+        || definitions.len() != 1
+        || !parsed.iter().all(|file| {
+            valid_workflow_path(&file.path)
+                || file.path == definitions[0]
+                || valid_sibling_prompt_path(&file.path, definitions[0])
+        })
     {
         return Err(rejected(
             "GitHub publication paths are outside the generated workflow and package allowlist",
@@ -2647,6 +2676,77 @@ mod tests {
             ),
             "an arbitrary workflow_dispatch caller is not a Steward caller"
         );
+    }
+
+    #[test]
+    fn publication_accepts_only_the_tested_package_closure_shapes() {
+        let parse = |files: serde_json::Value| {
+            GithubBridgeRequest::parse(
+                GithubBridgeOperation::Publish,
+                serde_json::json!({
+                    "owner": "example-org",
+                    "repo": "example-repo",
+                    "baseBranch": "main",
+                    "branch": "steward/task-0123",
+                    "title": "title",
+                    "body": "body",
+                    "files": files,
+                    "resumeOwnedBranch": false
+                })
+                .to_string()
+                .as_bytes(),
+            )
+        };
+        let file = |path: &str| serde_json::json!({"path": path, "content": "content"});
+        let workflow = ".github/workflows/hypershell-task.yml";
+        for accepted in [
+            vec![workflow, ".steward/tasks/hello/task-definition.json"],
+            vec![workflow, "task-definition.json"],
+            vec![workflow, "task-definition.json", "prompt.md"],
+            vec![
+                workflow,
+                ".steward/tasks/hello/task-definition.json",
+                ".steward/tasks/hello/prompt.md",
+            ],
+        ] {
+            let files = accepted.iter().map(|path| file(path)).collect::<Vec<_>>();
+            assert!(
+                parse(serde_json::Value::Array(files)).is_ok(),
+                "{accepted:?} is a tested package shape"
+            );
+        }
+        for rejected in [
+            vec![workflow],
+            vec![workflow, "task-definition.json", "README.md"],
+            vec![
+                workflow,
+                "task-definition.json",
+                ".steward/tasks/hello/prompt.md",
+            ],
+            vec![
+                workflow,
+                ".steward/tasks/hello/task-definition.json",
+                "prompt.md",
+            ],
+            vec![workflow, "prompt.md", "notes/prompt.md"],
+            vec![workflow, "task-definition.json", "prompt.md", "prompt.md"],
+            vec![
+                workflow,
+                ".github/workflows/other.yml",
+                "task-definition.json",
+            ],
+            vec![
+                workflow,
+                "task-definition.json",
+                "nested/task-definition.json",
+            ],
+        ] {
+            let files = rejected.iter().map(|path| file(path)).collect::<Vec<_>>();
+            assert!(
+                parse(serde_json::Value::Array(files)).is_err(),
+                "{rejected:?} is outside the publication allowlist"
+            );
+        }
     }
 
     #[test]

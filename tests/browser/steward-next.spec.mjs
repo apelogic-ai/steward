@@ -30,6 +30,18 @@ const browserTaskFiles = {
     outputs: [{ path: "out", kind: "directory", required: true }],
   }, null, 2),
 };
+const legacyBrowserPromptPath = "prompt.md";
+const legacyBrowserTaskFiles = {
+  [browserTaskDefinitionPath]: JSON.stringify({
+    schemaVersion: "steward.task-definition/v2",
+    name: "browser-task",
+    version: 1,
+    runtime: { agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } },
+    prompt: legacyBrowserPromptPath,
+    outputs: [{ path: "out", kind: "directory", required: true }],
+  }, null, 2),
+  [legacyBrowserPromptPath]: "Create the legacy hello-world output.\n",
+};
 const starterTaskFixture = {
   taskDefinition: {
     schemaVersion: "steward.task-definition/v2",
@@ -822,10 +834,12 @@ async function guardedPage(browser, {
   },
   includeSampleWorkflow = false,
   githubBundleStatus = 200,
+  githubBundleProblem = null,
   githubRepositoriesStatus = 200,
   githubRepositoryResponses = null,
   holdGithubRepositories = false,
   inlineRun = false,
+  legacyInlineRun = false,
   publishedWorkflows = true,
   taskLibraryMutable = false,
   initialOnboardingDismissed = false,
@@ -872,7 +886,7 @@ async function guardedPage(browser, {
     hangPoll: connectionStartHangPoll,
   });
   web.useRerunFixtures(rerunResponses);
-  const fixtureRun = inlineRun ? {
+  const fixtureRun = inlineRun || legacyInlineRun ? {
     ...run,
     origin: "browser",
     workflow: "browser-task@1",
@@ -883,7 +897,7 @@ async function guardedPage(browser, {
       revision: browserTaskDigest,
       path: browserTaskDefinitionPath,
       contentDigest: browserTaskDigest,
-      promptSource: "inline",
+      promptSource: legacyInlineRun ? "path" : "inline",
     },
   } : run;
   await context.addInitScript(() => {
@@ -1382,6 +1396,8 @@ async function guardedPage(browser, {
   });
   const onboardingWorkflowPath = `.github/workflows/hypershell-${starterTask.taskDefinition.name}.yml`;
   const onboardingPackage = JSON.stringify(starterTask.taskDefinition, null, 2);
+  const bundlePackagePath = inlineRun || legacyInlineRun ? browserTaskDefinitionPath : starterTask.packagePath;
+  const bundlePackageFiles = legacyInlineRun ? legacyBrowserTaskFiles : { [bundlePackagePath]: onboardingPackage };
   const onboardingWorkflow = [
     "name: HyperShell governed task",
     "on:",
@@ -1404,15 +1420,20 @@ async function guardedPage(browser, {
     "      id-token: write",
     `    uses: example-org/steward-run/.github/workflows/steward-task-self-hosted.yml${workflowVersionSeparator}1111111111111111111111111111111111111111`,
     "    with:",
-    `      package-path: ${starterTask.packagePath}`,
+    `      package-path: ${bundlePackagePath}`,
     "",
   ].join("\n");
-  await context.route(`${origin}/app/api/v1/runs/*/github/bundle`, (route) => githubBundleStatus === 200
+  await context.route(`${origin}/app/api/v1/runs/*/github/bundle`, (route) => githubBundleProblem
+    ? json(route, {
+        apiVersion: "steward.github-automation/v1",
+        error: "tested_package_unpublishable",
+        reason: githubBundleProblem,
+      }, 409)
+    : githubBundleStatus === 200
     ? json(route, {
         apiVersion: "steward.github-automation/v1",
         files: {
-          [starterTask.packagePath]: onboardingPackage,
-          [browserTaskDefinitionPath]: onboardingPackage,
+          ...bundlePackageFiles,
           [onboardingWorkflowPath]: onboardingWorkflow,
         },
         workflowPath: onboardingWorkflowPath,
@@ -1421,10 +1442,7 @@ async function guardedPage(browser, {
     : json(route, {
         apiVersion: "steward.github-automation/v1",
         error: "steward_run_release_unsupported",
-        manualFiles: {
-          [starterTask.packagePath]: onboardingPackage,
-          [browserTaskDefinitionPath]: onboardingPackage,
-        },
+        manualFiles: bundlePackageFiles,
       }, githubBundleStatus));
   await context.route(`${origin}/app/api/v1/runs/*/github/evidence*`, (route) => json(route, {
     apiVersion: "steward.github-automation/v1",
@@ -2647,7 +2665,7 @@ test("Get started explains unsupported releases and repository prerequisites", a
   });
   try {
     await developer.page.goto(`${origin}/get-started`);
-    await expect(developer.page.getByText("The reviewed steward-run release is below 0.8.0. Copy the Task definition manually; workflow generation and detection require steward-run 0.8.0 or later.").first()).toBeVisible();
+    await expect(developer.page.getByText("The reviewed steward-run release is below 0.8.0. Copy the package files manually; workflow generation and detection require steward-run 0.8.0 or later.").first()).toBeVisible();
     const publicationStep = developer.page.getByRole("listitem").filter({ hasText: "Publish the task definition" });
     if (await publicationStep.getByRole("button").first().getAttribute("aria-expanded") !== "true") {
       await publicationStep.getByRole("button").first().click();
@@ -2658,6 +2676,63 @@ test("Get started explains unsupported releases and repository prerequisites", a
     await testRun.getByRole("button").first().click();
     await testRun.getByLabel("Repository").selectOption("repo_not_admitted");
     await expect(testRun.getByText("Not ready: This repository is not admitted as a governed source.", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Get started publishes a legacy two-file test run with its exact tested package", async ({ browser }) => {
+  const developer = await guardedPage(browser, { legacyInlineRun: true });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    const step = (title) => developer.page.getByRole("listitem").filter({ hasText: title });
+    const openStep = async (title) => {
+      const row = step(title);
+      const toggle = row.getByRole("button").first();
+      if (await toggle.getAttribute("aria-expanded") !== "true") await toggle.click();
+      return row;
+    };
+    await expect(step("Try a test run").getByText("Done", { exact: true })).toBeVisible();
+
+    const publicationStep = await openStep("Publish the task definition");
+    const previews = publicationStep.locator("pre");
+    await expect(previews).toHaveCount(2);
+    await expect(publicationStep.locator("strong").filter({ hasText: browserTaskDefinitionPath })).toBeVisible();
+    await expect(publicationStep.locator("strong").filter({ hasText: legacyBrowserPromptPath })).toBeVisible();
+    await expect(previews.nth(0)).toContainText(`"prompt": "${legacyBrowserPromptPath}"`);
+    await expect(previews.nth(1)).toContainText(legacyBrowserTaskFiles[legacyBrowserPromptPath].trim());
+    await expect(publicationStep.getByText("Steward could not render the exact tested package and workflow.")).toHaveCount(0);
+    await publicationStep.getByRole("button", { name: "Copy" }).nth(1).click();
+    expect(await developer.page.evaluate(() => window.__stewardClipboardText)).toBe(legacyBrowserTaskFiles[legacyBrowserPromptPath]);
+
+    await publicationStep.getByRole("button", { name: "Open pull request" }).click();
+    await expect(publicationStep.getByRole("link", { name: "View pull request ↗" })).toHaveAttribute("href", "https://github.com/example-org/agentic-ops/pull/42");
+    const publication = developer.mutations.find((mutation) => mutation.path.endsWith("/github/publish"));
+    expectMutationProof(publication);
+    expect(publication.body).toMatchObject({ owner: "example-org", repository: "agentic-ops" });
+
+    const workflowStep = await openStep("Add the workflow to your repository");
+    await expect(workflowStep.locator("pre")).toContainText(`package-path: ${browserTaskDefinitionPath}`);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Get started explains why a tested package cannot be published", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    expectedHttpStatuses: [409],
+    githubBundleProblem: "closure_mismatch",
+    inlineRun: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    const publicationStep = developer.page.getByRole("listitem").filter({ hasText: "Publish the task definition" });
+    if (await publicationStep.getByRole("button").first().getAttribute("aria-expanded") !== "true") {
+      await publicationStep.getByRole("button").first().click();
+    }
+    await expect(publicationStep.getByText("The test run's recorded package files no longer match its tested digest, so Steward will not publish them. Run the test again.")).toBeVisible();
+    await expect(publicationStep.getByText("Steward could not render the exact tested package and workflow.")).toHaveCount(0);
+    await expect(publicationStep.getByRole("button", { name: "Open pull request" })).toBeDisabled();
   } finally {
     await closeGuardedPage(developer);
   }

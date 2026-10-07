@@ -44,6 +44,11 @@ Two-file repository generation through `package-path` requires `steward-run`
 v0.8.0 or later. When the reviewed release projected into Steward is older, the
 browser generator emits the compatible three-file `invocation-path` bundle.
 
+Inline test runs submitted by Steward v0.3.8 or earlier recorded a path-backed
+`prompt.md` beside a root `task-definition.json`. Get started publishes both files
+unchanged at those tested paths with the same `package-path` caller, so the GitHub
+run resolves the tested closure digest without a new test run.
+
 Download and verify it from the Steward release:
 
 ```sh

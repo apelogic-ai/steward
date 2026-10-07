@@ -7,6 +7,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Get started step 4 now publishes inline test runs submitted by Steward v0.3.8 or
+  earlier, whose tested package is a root `task-definition.json` with a path-backed
+  `prompt.md`. Both files are published unchanged with the generated `package-path`
+  caller, and the published package digest equals the tested closure digest. The
+  governed publication allowlist accepts a root `task-definition.json` and one
+  `prompt.md` beside the Task definition. Step 4 previews every package file.
+- Evidence that cannot be published now returns `409` with
+  `error: tested_package_unpublishable` and a bounded `reason`
+  (`evidence_unavailable`, `source_not_inline`, `package_files_invalid`,
+  `closure_mismatch`, `package_shape_unsupported`, `envelope_unavailable`, or
+  `workflow_unavailable`) instead of an empty `409`; Get started shows that reason.
+
 ## [0.3.11] - 2026-10-06
 
 ### Added
