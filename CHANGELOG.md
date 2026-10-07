@@ -20,11 +20,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   with `repository_root_conflict` when a different file already exists at that path.
   Identical content is accepted. Resuming a publication branch no longer fails when a
   published file is identical to the base branch.
-- Generated caller workflows now record the tested closure digest
-  (`# package-digest: ...`). Exact-content workflow detection and dispatch therefore
-  reject a caller generated for another Task at the same path. A caller published before
-  this change no longer matches detection; publish the Task again to enable **Run on
-  GitHub**.
+- Workflow detection and dispatch now verify the published package itself: the Task
+  definition and, for a legacy package, its `prompt.md` must be byte-identical on the
+  default branch to the tested closure, so another Task's package at the same path is
+  never dispatched. New caller workflows also record the tested closure digest
+  (`# package-digest: ...`). Callers published earlier, without that line, remain valid
+  when the package check passes. A mismatch is reported as `mismatch: caller_mismatch` or
+  `package_mismatch` on detection, and dispatch returns `409` with
+  `error: published_workflow_mismatch` and the same reason (or `caller_missing`).
 - Evidence that cannot be published now returns `409` with
   `error: tested_package_unpublishable` and a bounded `reason`
   (`evidence_unavailable`, `source_not_inline`, `package_files_invalid`,

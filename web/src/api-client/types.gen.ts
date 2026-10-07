@@ -1731,6 +1731,12 @@ export type WorkflowDetectionResponse = {
     apiVersion: string;
     compatible: boolean;
     exists: boolean;
+    /**
+     * Why an existing caller is not compatible: `caller_mismatch` when it is neither the
+     * generated caller for this Task nor its earlier digest-less rendering, or
+     * `package_mismatch` when the published package files differ from the tested closure.
+     */
+    mismatch?: string | null;
     path: string;
     sha?: string | null;
 };

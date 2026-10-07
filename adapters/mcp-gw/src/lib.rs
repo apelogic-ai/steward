@@ -342,12 +342,13 @@ impl GithubBridgeRequest {
                     &["owner", "repo", "path", "ref", "expectedContent"],
                 )?;
                 let (owner, repo) = repository_fields(&object)?;
-                // The same read also checks a legacy root package file on the base branch
-                // before publication, so it never overwrites different existing content.
+                // The same read also checks a published package file on the base branch:
+                // before publication, so a legacy root file is never overwritten, and before
+                // detection and dispatch, so only the tested package is ever run.
                 let path = object
                     .get("path")
                     .and_then(Value::as_str)
-                    .filter(|value| legacy_root_package_path(value))
+                    .filter(|value| package_read_path(value))
                     .map_or_else(
                         || workflow_path_field(&object, "path"),
                         |value| Ok(value.to_owned()),
@@ -632,6 +633,11 @@ pub fn legacy_root_package_path(value: &str) -> bool {
     )
 }
 
+/// Package files a governed publication can write, which the read operation may compare.
+fn package_read_path(value: &str) -> bool {
+    legacy_root_package_path(value) || valid_package_path(value)
+}
+
 fn published_files_field(
     object: &Map<String, Value>,
 ) -> Result<Vec<GithubPublishedFile>, PortError> {
@@ -902,7 +908,7 @@ impl GithubMcpGateway {
                         json!({"owner": owner, "repo": repo, "path": path, "ref": git_ref}),
                     )
                     .await?;
-                if legacy_root_package_path(&path) {
+                if package_read_path(&path) {
                     normalize_package_file(&file, &path, &expected_content)
                 } else {
                     normalize_workflow(&file, &path, &expected_content)
@@ -2798,7 +2804,11 @@ mod tests {
     #[test]
     fn legacy_root_package_reads_report_only_byte_identical_content_as_compatible()
     -> Result<(), String> {
-        for path in ["task-definition.json", "prompt.md"] {
+        for path in [
+            "task-definition.json",
+            "prompt.md",
+            ".steward/tasks/hello/task-definition.json",
+        ] {
             GithubBridgeRequest::parse(
                 GithubBridgeOperation::Workflow,
                 serde_json::json!({
@@ -2820,6 +2830,14 @@ mod tests {
             )
             .is_err(),
             "other root files stay unreadable through the workflow operation"
+        );
+        assert!(
+            GithubBridgeRequest::parse(
+                GithubBridgeOperation::Workflow,
+                br#"{"owner":"example-org","repo":"example-repo","path":".steward/tasks/hello/prompt.md","ref":"main","expectedContent":"content"}"#,
+            )
+            .is_err(),
+            "only publishable package paths are readable"
         );
         let sha = "0123456789abcdef0123456789abcdef01234567";
         let read = |payload: serde_json::Value| {

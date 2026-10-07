@@ -128,9 +128,11 @@ Retries for the same Task and repository reuse the same durable operation identi
 a changed browser retry key cannot create a second pull request.
 
 After the pull request is merged, Steward verifies the exact generated workflow on the
-default branch before enabling **Run on GitHub**. Because the workflow records the
-tested closure digest, a caller generated for another Task at the same path does not
-match, and Steward does not dispatch it. Dispatch is limited to that one
+default branch before enabling **Run on GitHub**. Detection and dispatch also require the
+published package files at their paths to be byte-identical to the tested closure, so a
+package another Task wrote to the same path is never dispatched. New callers record the
+tested closure digest; a caller published by an earlier release, without that line, is
+still accepted when the package files match. Dispatch is limited to that one
 generated workflow, its declared `workflow_dispatch` inputs, and the default branch.
 The run detail then shows the GitHub run, jobs, bounded failed-job log content, and the
 owner-scoped governed Task correlated by repository, run ID, and attempt.
