@@ -7,6 +7,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-10-06
+
+### Added
+
+- This complete replacement includes every Added and Fixed item recorded under
+  the incomplete v0.3.9 entry below.
+
+### Fixed
+
+- Kept the deployment-configurable starter Task optional in the Helm schema so
+  the core installation profile can use the apiserver's built-in default. The
+  release gate now lints this exact unset profile before publication.
+- The v0.3.9 chart and component images were published, but mandatory clean-
+  cluster acceptance failed before the GitHub release handoff was created;
+  those incomplete artifacts must not be used.
+
 ## [0.3.9] - 2026-10-06
 
 ### Added
@@ -603,7 +619,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.9...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.10...HEAD
+[0.3.10]: https://github.com/apelogic-ai/steward/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/apelogic-ai/steward/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/apelogic-ai/steward/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/apelogic-ai/steward/compare/v0.3.6...v0.3.7
