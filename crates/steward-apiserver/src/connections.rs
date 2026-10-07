@@ -228,6 +228,7 @@ pub enum ConnectionBrokerError {
     OAuthFlowPending,
     IdempotencyConflict,
     OrchestrationNotActive,
+    BridgeContractInvalid,
     RuntimeAuthenticationFailed,
     ProxyPolicyDenied,
     ProviderAuthorizationFailed,
@@ -798,6 +799,9 @@ fn connection_broker_error_response(error: ConnectionBrokerError) -> Response {
 
 fn connection_broker_problem(error: ConnectionBrokerError) -> ConnectionOperationErrorResponse {
     let (error, code, upstream_status, detail) = match error {
+        ConnectionBrokerError::BridgeContractInvalid => {
+            ("bridge_contract_invalid", None, None, None)
+        }
         ConnectionBrokerError::RuntimeAuthenticationFailed => {
             ("runtime_authentication_failed", None, None, None)
         }
@@ -1559,6 +1563,10 @@ mod tests {
     #[tokio::test]
     async fn connection_failures_have_distinct_bounded_problem_codes() -> Result<(), String> {
         for (error, expected) in [
+            (
+                ConnectionBrokerError::BridgeContractInvalid,
+                "bridge_contract_invalid",
+            ),
             (
                 ConnectionBrokerError::RuntimeAuthenticationFailed,
                 "runtime_authentication_failed",

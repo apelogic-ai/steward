@@ -319,7 +319,12 @@ impl GithubBridgeRequest {
             }
             GithubBridgeOperation::Repositories => {
                 require_exact_fields(&object, &["query", "page", "perPage"])?;
-                let query = bounded_string_field(&object, "query", 200)?;
+                let query = object
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .filter(|value| value.len() <= 200)
+                    .map(str::to_owned)
+                    .ok_or_else(|| rejected("GitHub repository query is invalid"))?;
                 if query.bytes().any(|byte| byte.is_ascii_control()) {
                     return Err(rejected("GitHub repository query is invalid"));
                 }
@@ -828,6 +833,11 @@ impl GithubMcpGateway {
                 let me = self
                     .call_mcp("steward-github-me", "get_me", json!({}))
                     .await?;
+                let query = if query.is_empty() {
+                    format!("user:{}", github_profile_login(&me)?)
+                } else {
+                    query
+                };
                 let repositories = self
                     .call_mcp(
                         "steward-github-repositories",
@@ -1403,11 +1413,7 @@ fn normalize_repositories(
     page: u32,
     per_page: u32,
 ) -> Result<Value, PortError> {
-    let login = me
-        .get("login")
-        .and_then(Value::as_str)
-        .filter(|login| valid_repository_component(login, 39))
-        .ok_or_else(|| rejected("GitHub profile response omitted its login"))?;
+    let login = github_profile_login(me)?;
     let items = payload_array(payload, &["items", "repositories"])
         .filter(|items| items.len() <= usize::try_from(per_page).unwrap_or(100))
         .ok_or_else(|| rejected("GitHub repository search response is invalid"))?;
@@ -1421,6 +1427,13 @@ fn normalize_repositories(
         "page": page,
         "hasNextPage": items.len() == usize::try_from(per_page).unwrap_or(100),
     }))
+}
+
+fn github_profile_login(me: &Value) -> Result<&str, PortError> {
+    me.get("login")
+        .and_then(Value::as_str)
+        .filter(|login| valid_repository_component(login, 39))
+        .ok_or_else(|| rejected("GitHub profile response omitted its login"))
 }
 
 fn normalize_repository(repository: &Value) -> Result<Value, PortError> {
@@ -2521,6 +2534,92 @@ mod tests {
                 "v4 operation {operation} must be explicitly allowlisted"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn repository_request_accepts_an_empty_query_for_the_authenticated_user_default()
+    -> Result<(), String> {
+        assert_eq!(
+            GithubBridgeRequest::parse(
+                GithubBridgeOperation::Repositories,
+                br#"{"query":"","page":1,"perPage":100}"#,
+            )
+            .map_err(|error| format!("parse repository request: {error:?}"))?,
+            GithubBridgeRequest::Repositories {
+                query: String::new(),
+                page: 1,
+                per_page: 100,
+            }
+        );
+        for invalid in [
+            serde_json::json!({"query": "\n", "page": 1, "perPage": 100}),
+            serde_json::json!({"query": "x".repeat(201), "page": 1, "perPage": 100}),
+        ] {
+            assert!(
+                GithubBridgeRequest::parse(
+                    GithubBridgeOperation::Repositories,
+                    &serde_json::to_vec(&invalid)
+                        .map_err(|error| format!("encode invalid repository request: {error}"))?,
+                )
+                .is_err(),
+                "the empty default must not widen the bounded query contract"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_repository_query_searches_only_the_authenticated_users_repositories()
+    -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind repository fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read repository fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (stream, me_request) = read_json_request(&listener)?;
+            assert_eq!(me_request["params"]["name"], "get_me");
+            assert_eq!(me_request["params"]["arguments"], serde_json::json!({}));
+            write_mcp_payload(
+                stream,
+                "steward-github-me",
+                serde_json::json!({"login": "alice"}),
+            )?;
+
+            let (stream, repositories_request) = read_json_request(&listener)?;
+            assert_eq!(
+                repositories_request["params"]["name"],
+                "search_repositories"
+            );
+            assert_eq!(
+                repositories_request["params"]["arguments"],
+                serde_json::json!({"query": "user:alice", "page": 1, "perPage": 100})
+            );
+            write_mcp_payload(
+                stream,
+                "steward-github-repositories",
+                serde_json::json!({"items": []}),
+            )
+        });
+        let gateway = GithubMcpGateway::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build repository gateway: {error:?}"))?;
+        let response = gateway
+            .execute(
+                GithubBridgeOperation::Repositories,
+                GithubBridgeRequest::Repositories {
+                    query: String::new(),
+                    page: 1,
+                    per_page: 100,
+                },
+            )
+            .await
+            .map_err(|error| format!("execute repository query: {error:?}"))?;
+        server
+            .join()
+            .map_err(|_| "repository fixture panicked".to_owned())??;
+        assert_eq!(response["login"], "alice");
+        assert_eq!(response["repositories"], serde_json::json!([]));
         Ok(())
     }
 
