@@ -2557,6 +2557,11 @@ test("Get started completes the governed test-to-GitHub journey from server evid
     await expect(step("Add the workflow to your repository").getByText("Done", { exact: true })).toBeVisible({ timeout: 10_000 });
     await expect(developer.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: /Get started/ })).toContainText("5/7");
 
+    await developer.page.goto(`${origin}/envelopes`);
+    await developer.page.reload();
+    await expect(developer.page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: /Get started/ })).toContainText("5/7");
+    await developer.page.goto(`${origin}/get-started`);
+
     const workflowStep = await openStep("Add the workflow to your repository");
     await expect(workflowStep.getByText(`.github/workflows/hypershell-${starterTaskFixture.taskDefinition.name}.yml`, { exact: true })).toBeVisible();
     await expect(workflowStep.locator("pre")).toContainText(`package-path: ${starterTaskFixture.packagePath}`);

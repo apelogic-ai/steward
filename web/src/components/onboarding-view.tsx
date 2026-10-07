@@ -39,7 +39,7 @@ import {
 } from "@/components/browser-run-now-view";
 import { parseRunEventData } from "@/components/run-views";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
-import { deriveOnboardingProgress, loadOnboardingEvidence, ONBOARDING_PROGRESS_EVENT, type OnboardingEvidence } from "@/data/onboarding-progress";
+import { defaultOnboardingRepository, deriveOnboardingProgress, loadOnboardingEvidence, ONBOARDING_PROGRESS_EVENT, type OnboardingEvidence } from "@/data/onboarding-progress";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
@@ -145,7 +145,7 @@ function OnboardingChecklist({ data, onRefresh }: Readonly<{ data: OnboardingDat
   const activeEnvelopes = data.envelopes.requests.filter((request) => request.status === "provisioned" && request.envelopeDigest);
   const connectedConnection = data.connections.connections.find((connection) => connection.status.phase === "connected");
   const provisionedRequest = activeEnvelopes[0];
-  const readyRepository = data.repositories.repositories.find((repository) => repository.ready) ?? data.repositories.repositories[0];
+  const readyRepository = defaultOnboardingRepository(data.repositories.repositories);
   const [selectedTemplateId, setSelectedTemplateId] = useState(data.templates.templates[0]?.id ?? "");
   const [selectedEnvelopeId, setSelectedEnvelopeId] = useState(provisionedRequest?.id ?? "");
   const [selectedRepositoryId, setSelectedRepositoryId] = useState(readyRepository?.repositoryId ?? "");
