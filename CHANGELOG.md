@@ -7,15 +7,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-10-06
+
 ### Added
 
 - Added same-repository direct Task submission by `packagePath`, with request-level
-  execution-log diagnostics and immutable implicit-invocation evidence. Existing
-  invocation manifests remain the cross-repository mechanism.
+  execution-log diagnostics and immutable implicit-invocation evidence. The
+  protected-resource metadata now advertises `steward_package_path_supported` so
+  steward-run 0.8.0 or later can gate this path. Existing invocation manifests
+  remain the cross-repository mechanism.
 - Added `promptText` as a bounded inline alternative to a prompt file in
   `steward.task-definition/v2`. Save this task now produces the two-file repository
   path with `steward-run` 0.8.0 or later and falls back to the compatible invocation
-  manifest for older reviewed releases. These fields require Steward 0.3.9 or later.
+  manifest for older reviewed releases. These fields require Steward 0.3.9 or later;
+  earlier Steward releases reject them.
+- Added a deployment-configurable starter Task, served at runtime to the browser with
+  configurable package path, inputs, execution-log default, presentation fields and
+  source examples. The built-in Hello World prompt now explicitly permits the shell
+  write it requires while prohibiting network and MCP access.
+- Added the seven-step Get started journey from GitHub connection and first Envelope
+  through a governed browser test, exact package publication, workflow verification,
+  GitHub dispatch and linked result. Progress and navigation are restored from
+  persisted server evidence without running governed GitHub probes on page load.
+- Added governed GitHub repository automation that discovers an owner-scoped target,
+  publishes an exact Task package and pinned caller workflow through a pull request,
+  observes merge readiness, dispatches the workflow, and reports the resulting run.
+- Added an immutable Task detail page addressed by exact package digest, with package
+  files, metadata, run history, repeat execution, and GitHub publication controls.
+- Added an owner-scoped Task library with immutable content-addressed versions, role
+  sharing, exact historical links, and one Tasks/Run now UI for authored, exact Git,
+  and published Workflow sources. Additive migration 0067 stores drafts and versions.
+
+### Fixed
+
+- Kept new Task output archives limited to declared `out/` files while retaining
+  stdout and stderr only in the existing execution-log transcript fields. Additive
+  migration 0066 records the archive contract without rewriting historical rows.
+- Bounded terminal run-event history by reconnect grace and inactive-task LRU capacity
+  while preserving `Last-Event-ID` resume for active streams.
+- Preserved published Workflow Tasks after a browser run, mapped duplicate owner Task
+  names to HTTP 409, and aligned Task sharing with Steward's canonical role grammar.
 
 ## [0.3.8] - 2026-10-05
 
@@ -572,7 +603,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.8...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.9...HEAD
+[0.3.9]: https://github.com/apelogic-ai/steward/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/apelogic-ai/steward/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/apelogic-ai/steward/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/apelogic-ai/steward/compare/v0.3.5...v0.3.6
