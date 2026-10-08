@@ -3,7 +3,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use steward_types::direct_package::ExecutionLogMode;
+use steward_types::direct_package::{ContentDigest, ExecutionLogMode};
 
 use crate::WorkflowReference;
 
@@ -114,6 +114,10 @@ pub struct DirectPackageGithubActionsWorkflowContext {
     pub envelope: GithubActionsEnvelopeSelection,
     pub invocation_path: Option<String>,
     pub package_path: Option<String>,
+    /// The tested package closure digest. When present it is recorded in the generated
+    /// workflow, so exact-content detection and dispatch fail for a workflow generated for
+    /// any other package at the same path.
+    pub package_digest: Option<String>,
     pub execution_log: ExecutionLogMode,
     pub reviewed_release: StewardRunRelease,
     pub workflow_installation_mode: StewardRunWorkflowInstallationMode,
@@ -125,6 +129,13 @@ pub fn render_direct_package_github_actions_workflow(
 ) -> Result<GeneratedGithubActionsWorkflow, GithubActionsRenderError> {
     validate_envelope(&context.envelope)?;
     validate_release(&context.reviewed_release)?;
+    if context
+        .package_digest
+        .as_deref()
+        .is_some_and(|digest| ContentDigest::parse(digest.to_owned()).is_err())
+    {
+        return Err(GithubActionsRenderError::InvalidRequest);
+    }
     let (source_comment, source_input, suggested_path) =
         match (&context.invocation_path, &context.package_path) {
             (Some(invocation_path), None)
@@ -163,6 +174,15 @@ pub fn render_direct_package_github_actions_workflow(
         format!("# envelope-revision: {}", context.envelope.revision),
         format!("# envelope-digest: {}", context.envelope.digest),
         source_comment,
+    ]
+    .into_iter()
+    .chain(
+        context
+            .package_digest
+            .as_ref()
+            .map(|digest| format!("# package-digest: {digest}")),
+    )
+    .chain([
         format!("# steward-run-version: {}", release.version),
         format!(
             "# steward-run-workflow-installation-mode: {}",
@@ -250,7 +270,8 @@ pub fn render_direct_package_github_actions_workflow(
         "      - name: Require a non-empty result".to_owned(),
         "        shell: bash".to_owned(),
         "        run: test -n \"$(find output -type f -size +0c -print -quit)\"".to_owned(),
-    ]
+    ])
+    .collect::<Vec<_>>()
     .join("\n")
         + "\n";
     let yaml = omit_legacy_identity_inputs(yaml, context.task_identity_discovery_enabled);
@@ -921,6 +942,7 @@ mod tests {
     -> Result<(), GithubActionsRenderError> {
         let generated = render_direct_package_github_actions_workflow(
             &DirectPackageGithubActionsWorkflowContext {
+                package_digest: None,
                 envelope: envelope(),
                 invocation_path: Some(".steward/invocations/browser-task.json".to_owned()),
                 package_path: None,
@@ -954,10 +976,41 @@ mod tests {
     }
 
     #[test]
+    fn direct_package_generator_records_only_a_valid_package_digest()
+    -> Result<(), GithubActionsRenderError> {
+        let context = |package_digest: Option<&str>| DirectPackageGithubActionsWorkflowContext {
+            package_digest: package_digest.map(str::to_owned),
+            envelope: envelope(),
+            invocation_path: None,
+            package_path: Some("task-definition.json".to_owned()),
+            execution_log: ExecutionLogMode::Full,
+            reviewed_release: versioned_release(),
+            workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
+            task_identity_discovery_enabled: true,
+        };
+        let digest = format!("steward:sha256:{}", "c".repeat(64));
+        let generated = render_direct_package_github_actions_workflow(&context(Some(&digest)))?;
+        assert!(generated.yaml.contains(&format!(
+            "# package-path: task-definition.json\n# package-digest: {digest}\n# steward-run-version:"
+        )));
+        assert!(
+            !render_direct_package_github_actions_workflow(&context(None))?
+                .yaml
+                .contains("package-digest")
+        );
+        assert_eq!(
+            render_direct_package_github_actions_workflow(&context(Some("sha256:not-a-digest"))),
+            Err(GithubActionsRenderError::InvalidRequest)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn direct_package_generator_prefers_a_package_path_and_request_diagnostics()
     -> Result<(), GithubActionsRenderError> {
         let generated = render_direct_package_github_actions_workflow(
             &DirectPackageGithubActionsWorkflowContext {
+                package_digest: None,
                 envelope: envelope(),
                 invocation_path: None,
                 package_path: Some(".steward/tasks/browser-task/task-definition.json".to_owned()),
@@ -987,6 +1040,7 @@ mod tests {
     -> Result<(), GithubActionsRenderError> {
         let first = render_direct_package_github_actions_workflow(
             &DirectPackageGithubActionsWorkflowContext {
+                package_digest: None,
                 envelope: envelope(),
                 invocation_path: None,
                 package_path: Some(
@@ -1000,6 +1054,7 @@ mod tests {
         )?;
         let second = render_direct_package_github_actions_workflow(
             &DirectPackageGithubActionsWorkflowContext {
+                package_digest: None,
                 envelope: envelope(),
                 invocation_path: None,
                 package_path: Some(
@@ -1030,6 +1085,7 @@ mod tests {
         let render = |package_path: &str| {
             render_direct_package_github_actions_workflow(
                 &DirectPackageGithubActionsWorkflowContext {
+                    package_digest: None,
                     envelope: envelope(),
                     invocation_path: None,
                     package_path: Some(package_path.to_owned()),
@@ -1057,6 +1113,7 @@ mod tests {
     fn direct_package_generator_rejects_unsafe_invocation_paths() {
         let result = render_direct_package_github_actions_workflow(
             &DirectPackageGithubActionsWorkflowContext {
+                package_digest: None,
                 envelope: envelope(),
                 invocation_path: Some("../task.json".to_owned()),
                 package_path: None,

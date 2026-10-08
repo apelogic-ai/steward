@@ -351,7 +351,17 @@ impl GithubBridgeRequest {
                     &["owner", "repo", "path", "ref", "expectedContent"],
                 )?;
                 let (owner, repo) = repository_fields(&object)?;
-                let path = workflow_path_field(&object, "path")?;
+                // The same read also checks a published package file on the base branch:
+                // before publication, so a legacy root file is never overwritten, and before
+                // detection and dispatch, so only the tested package is ever run.
+                let path = object
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .filter(|value| package_read_path(value))
+                    .map_or_else(
+                        || workflow_path_field(&object, "path"),
+                        |value| Ok(value.to_owned()),
+                    )?;
                 let git_ref = git_ref_field(&object, "ref")?;
                 let expected_content =
                     bounded_string_field(&object, "expectedContent", MAX_WORKFLOW_BYTES)?;
@@ -612,14 +622,45 @@ fn valid_package_path(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'/' | b'-'))
 }
 
+/// Browser releases up to v0.3.8 tested a root Task definition with a path-backed prompt
+/// beside it; the package closure digest binds those exact paths.
+const LEGACY_ROOT_TASK_DEFINITION_PATH: &str = "task-definition.json";
+const LEGACY_ROOT_PROMPT_PATH: &str = "prompt.md";
+
+/// Whether a governed publication may write this package: a `promptText` Task definition
+/// under `.steward/tasks/`, or exactly the legacy root Task definition with its root
+/// `prompt.md`. Root paths are never accepted for any other package shape.
+pub fn valid_publication_package(definition: &str, prompt: Option<&str>) -> bool {
+    match prompt {
+        None => valid_package_path(definition),
+        Some(prompt) => {
+            definition == LEGACY_ROOT_TASK_DEFINITION_PATH && prompt == LEGACY_ROOT_PROMPT_PATH
+        }
+    }
+}
+
+/// Repository-root files a legacy publication writes. The base-branch read for these paths
+/// lets Steward refuse to overwrite different existing content.
+pub fn legacy_root_package_path(value: &str) -> bool {
+    matches!(
+        value,
+        LEGACY_ROOT_TASK_DEFINITION_PATH | LEGACY_ROOT_PROMPT_PATH
+    )
+}
+
+/// Package files a governed publication can write, which the read operation may compare.
+fn package_read_path(value: &str) -> bool {
+    legacy_root_package_path(value) || valid_package_path(value)
+}
+
 fn published_files_field(
     object: &Map<String, Value>,
 ) -> Result<Vec<GithubPublishedFile>, PortError> {
     let files = object
         .get("files")
         .and_then(Value::as_array)
-        .filter(|files| files.len() == 2)
-        .ok_or_else(|| rejected("GitHub publication must contain exactly two generated files"))?;
+        .filter(|files| (2..=3).contains(&files.len()))
+        .ok_or_else(|| rejected("GitHub publication must contain two or three generated files"))?;
     let mut parsed = Vec::with_capacity(files.len());
     for file in files {
         let file = file
@@ -630,18 +671,21 @@ fn published_files_field(
         let content = bounded_string_field(file, "content", MAX_PUBLISHED_FILE_BYTES)?;
         parsed.push(GithubPublishedFile { path, content });
     }
-    if parsed[0].path == parsed[1].path
-        || parsed
-            .iter()
-            .filter(|file| valid_workflow_path(&file.path))
-            .count()
-            != 1
-        || parsed
-            .iter()
-            .filter(|file| valid_package_path(&file.path))
-            .count()
-            != 1
-    {
+    let package = parsed
+        .iter()
+        .map(|file| file.path.as_str())
+        .filter(|path| !valid_workflow_path(path))
+        .collect::<Vec<_>>();
+    let allowed = parsed.len() - package.len() == 1
+        && match package.as_slice() {
+            [definition] => valid_publication_package(definition, None),
+            [first, second] => {
+                valid_publication_package(first, Some(second))
+                    || valid_publication_package(second, Some(first))
+            }
+            _ => false,
+        };
+    if !allowed {
         return Err(rejected(
             "GitHub publication paths are outside the generated workflow and package allowlist",
         ));
@@ -894,7 +938,11 @@ impl GithubMcpGateway {
                         json!({"owner": owner, "repo": repo, "path": path, "ref": git_ref}),
                     )
                     .await?;
-                normalize_workflow(&file, &path, &expected_content)
+                if package_read_path(&path) {
+                    normalize_package_file(&file, &path, &expected_content)
+                } else {
+                    normalize_workflow(&file, &path, &expected_content)
+                }
             }
             (
                 GithubBridgeOperation::RunStatus,
@@ -1641,6 +1689,29 @@ fn normalize_workflow(
     }))
 }
 
+/// A package file read reports `compatible` only for byte-identical content; an existing
+/// file whose content is unreadable or different is incompatible.
+fn normalize_package_file(
+    payload: &Value,
+    path: &str,
+    expected_content: &str,
+) -> Result<Value, PortError> {
+    if mcp_not_found(payload) {
+        return Ok(json!({"exists": false, "compatible": false, "path": path, "sha": Value::Null}));
+    }
+    let sha = payload
+        .get("sha")
+        .or_else(|| payload.get("data").and_then(|data| data.get("sha")))
+        .and_then(Value::as_str)
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    Ok(json!({
+        "exists": true,
+        "compatible": workflow_content(payload).as_deref() == Some(expected_content),
+        "path": path,
+        "sha": sha,
+    }))
+}
+
 fn workflow_content(payload: &Value) -> Option<String> {
     payload
         .get("content")
@@ -1879,21 +1950,24 @@ fn steward_publication_head(
     let Some(files) = payload.get("files").and_then(Value::as_array) else {
         return false;
     };
-    let mut actual = files
+    let actual = files
         .iter()
-        .filter_map(|file| {
+        .map(|file| {
             file.get("filename")
                 .or_else(|| file.get("path"))
                 .and_then(Value::as_str)
         })
-        .collect::<Vec<_>>();
-    let mut expected = expected_files
-        .iter()
-        .map(|file| file.path.as_str())
-        .collect::<Vec<_>>();
-    actual.sort_unstable();
-    expected.sort_unstable();
-    message == Some(publication_commit_message(branch).as_str()) && actual == expected
+        .collect::<Option<Vec<_>>>();
+    // GitHub lists only files the commit changed: a published file identical to the base
+    // branch is absent. Steward's commit owns the branch when it changed at least one file
+    // and only publication files; the caller then verifies every file's content.
+    message == Some(publication_commit_message(branch).as_str())
+        && actual.is_some_and(|actual| {
+            !actual.is_empty()
+                && actual
+                    .iter()
+                    .all(|path| expected_files.iter().any(|file| file.path == *path))
+        })
 }
 
 fn exact_open_pull_request(
@@ -2832,6 +2906,202 @@ mod tests {
             ),
             "an arbitrary workflow_dispatch caller is not a Steward caller"
         );
+    }
+
+    #[test]
+    fn publication_accepts_only_the_tested_package_closure_shapes() {
+        let parse = |files: serde_json::Value| {
+            GithubBridgeRequest::parse(
+                GithubBridgeOperation::Publish,
+                serde_json::json!({
+                    "owner": "example-org",
+                    "repo": "example-repo",
+                    "baseBranch": "main",
+                    "branch": "steward/task-0123",
+                    "title": "title",
+                    "body": "body",
+                    "files": files,
+                    "resumeOwnedBranch": false
+                })
+                .to_string()
+                .as_bytes(),
+            )
+        };
+        let file = |path: &str| serde_json::json!({"path": path, "content": "content"});
+        let workflow = ".github/workflows/hypershell-task.yml";
+        for accepted in [
+            vec![workflow, ".steward/tasks/hello/task-definition.json"],
+            vec![workflow, "task-definition.json", "prompt.md"],
+            vec!["prompt.md", workflow, "task-definition.json"],
+        ] {
+            let files = accepted.iter().map(|path| file(path)).collect::<Vec<_>>();
+            assert!(
+                parse(serde_json::Value::Array(files)).is_ok(),
+                "{accepted:?} is a tested package shape"
+            );
+        }
+        for rejected in [
+            vec![workflow],
+            vec![workflow, "task-definition.json"],
+            vec![workflow, "prompt.md"],
+            vec![workflow, "task-definition.json", "README.md"],
+            vec![
+                workflow,
+                "task-definition.json",
+                ".steward/tasks/hello/prompt.md",
+            ],
+            vec![
+                workflow,
+                ".steward/tasks/hello/task-definition.json",
+                ".steward/tasks/hello/prompt.md",
+            ],
+            vec![
+                workflow,
+                ".steward/tasks/hello/task-definition.json",
+                "prompt.md",
+            ],
+            vec![workflow, "prompt.md", "notes/prompt.md"],
+            vec![workflow, "task-definition.json", "prompt.md", "prompt.md"],
+            vec![
+                workflow,
+                ".github/workflows/other.yml",
+                "task-definition.json",
+            ],
+            vec![
+                workflow,
+                workflow,
+                ".steward/tasks/hello/task-definition.json",
+            ],
+            vec![
+                workflow,
+                "task-definition.json",
+                "nested/task-definition.json",
+            ],
+        ] {
+            let files = rejected.iter().map(|path| file(path)).collect::<Vec<_>>();
+            assert!(
+                parse(serde_json::Value::Array(files)).is_err(),
+                "{rejected:?} is outside the publication allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_root_package_reads_report_only_byte_identical_content_as_compatible()
+    -> Result<(), String> {
+        for path in [
+            "task-definition.json",
+            "prompt.md",
+            ".steward/tasks/hello/task-definition.json",
+        ] {
+            GithubBridgeRequest::parse(
+                GithubBridgeOperation::Workflow,
+                serde_json::json!({
+                    "owner": "example-org",
+                    "repo": "example-repo",
+                    "path": path,
+                    "ref": "main",
+                    "expectedContent": "content"
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .map_err(|error| format!("{path} base-branch read must parse: {error:?}"))?;
+        }
+        assert!(
+            GithubBridgeRequest::parse(
+                GithubBridgeOperation::Workflow,
+                br#"{"owner":"example-org","repo":"example-repo","path":"README.md","ref":"main","expectedContent":"content"}"#,
+            )
+            .is_err(),
+            "other root files stay unreadable through the workflow operation"
+        );
+        assert!(
+            GithubBridgeRequest::parse(
+                GithubBridgeOperation::Workflow,
+                br#"{"owner":"example-org","repo":"example-repo","path":".steward/tasks/hello/prompt.md","ref":"main","expectedContent":"content"}"#,
+            )
+            .is_err(),
+            "only publishable package paths are readable"
+        );
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let read = |payload: serde_json::Value| {
+            super::normalize_package_file(&payload, "task-definition.json", "tested\n")
+                .map_err(|error| format!("normalize package read: {error:?}"))
+        };
+        let absent = read(serde_json::json!({"__stewardNotFound": true}))?;
+        assert_eq!(
+            (absent["exists"].clone(), absent["compatible"].clone()),
+            (false.into(), false.into())
+        );
+        let same = read(serde_json::json!({"content": "tested\n", "sha": sha}))?;
+        assert_eq!(
+            (same["exists"].clone(), same["compatible"].clone()),
+            (true.into(), true.into())
+        );
+        let different = read(serde_json::json!({"content": "{\"family\":\"web\"}", "sha": sha}))?;
+        assert_eq!(
+            (different["exists"].clone(), different["compatible"].clone()),
+            (true.into(), false.into())
+        );
+        let unreadable = read(serde_json::json!({"sha": sha}))?;
+        assert_eq!(
+            (
+                unreadable["exists"].clone(),
+                unreadable["compatible"].clone()
+            ),
+            (true.into(), false.into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn publication_ownership_accepts_a_steward_commit_that_omits_unchanged_files() {
+        let branch = "steward/task-0123";
+        let expected = [
+            "task-definition.json",
+            "prompt.md",
+            ".github/workflows/hypershell-task.yml",
+        ]
+        .map(|path| GithubPublishedFile {
+            path: path.to_owned(),
+            content: "content".to_owned(),
+        });
+        let commit = |files: &[&str]| {
+            serde_json::json!({
+                "commit": {"message": super::publication_commit_message(branch)},
+                "files": files.iter().map(|path| serde_json::json!({"filename": path})).collect::<Vec<_>>(),
+            })
+        };
+        assert!(super::steward_publication_head(
+            &commit(&["prompt.md", ".github/workflows/hypershell-task.yml"]),
+            branch,
+            &expected
+        ));
+        assert!(super::steward_publication_head(
+            &commit(&[
+                "task-definition.json",
+                "prompt.md",
+                ".github/workflows/hypershell-task.yml"
+            ]),
+            branch,
+            &expected
+        ));
+        assert!(!super::steward_publication_head(
+            &commit(&[]),
+            branch,
+            &expected
+        ));
+        assert!(!super::steward_publication_head(
+            &commit(&["prompt.md", "README.md"]),
+            branch,
+            &expected
+        ));
+        let mut foreign = commit(&["prompt.md"]);
+        foreign["commit"]["message"] = serde_json::Value::String("chore: other".to_owned());
+        assert!(!super::steward_publication_head(
+            &foreign, branch, &expected
+        ));
     }
 
     #[test]

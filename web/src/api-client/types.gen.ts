@@ -1731,6 +1731,12 @@ export type WorkflowDetectionResponse = {
     apiVersion: string;
     compatible: boolean;
     exists: boolean;
+    /**
+     * Why an existing caller is not compatible: `caller_mismatch` when it is neither the
+     * generated caller for this Task nor its earlier digest-less rendering, or
+     * `package_mismatch` when the published package files differ from the tested closure.
+     */
+    mismatch?: string | null;
     path: string;
     sha?: string | null;
 };
@@ -4412,9 +4418,9 @@ export type GithubTaskBundleErrors = {
      */
     404: unknown;
     /**
-     * Run is not publishable
+     * Tested package is not publishable
      */
-    409: unknown;
+    409: GithubAutomationErrorResponse;
     503: GithubAutomationErrorResponse;
 };
 
@@ -4452,9 +4458,9 @@ export type DispatchTaskErrors = {
      */
     404: unknown;
     /**
-     * Published workflow does not match the tested task
+     * Tested package is not publishable or the published workflow does not match it
      */
-    409: unknown;
+    409: GithubAutomationErrorResponse;
     /**
      * Dispatch inputs are invalid
      */
@@ -4498,7 +4504,7 @@ export type GithubAutomationEvidenceErrors = {
     /**
      * Run evidence is unavailable or invalid
      */
-    409: unknown;
+    409: GithubAutomationErrorResponse;
     503: GithubAutomationErrorResponse;
 };
 
@@ -4531,7 +4537,7 @@ export type GithubOnboardingEvidenceErrors = {
     /**
      * Run evidence is unavailable or invalid
      */
-    409: unknown;
+    409: GithubAutomationErrorResponse;
     503: GithubAutomationErrorResponse;
 };
 
@@ -4569,9 +4575,9 @@ export type PublishTaskErrors = {
      */
     404: unknown;
     /**
-     * Run is not publishable
+     * Tested package is not publishable
      */
-    409: unknown;
+    409: GithubAutomationErrorResponse;
     /**
      * Publication request is invalid
      */
@@ -4646,9 +4652,9 @@ export type DetectWorkflowErrors = {
      */
     404: unknown;
     /**
-     * Run is not publishable
+     * Tested package is not publishable
      */
-    409: unknown;
+    409: GithubAutomationErrorResponse;
     503: GithubAutomationErrorResponse;
 };
 

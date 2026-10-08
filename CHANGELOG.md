@@ -7,6 +7,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Get started step 4 now publishes inline test runs submitted by Steward v0.3.8 or
+  earlier, whose tested package is a root `task-definition.json` with a path-backed
+  `prompt.md`. Both files are published unchanged with the generated `package-path`
+  caller, and the published package digest equals the tested closure digest. The
+  governed publication allowlist accepts root paths only for that exact legacy pair;
+  every other package must be a Task definition under `.steward/tasks/`. Step 4 and the
+  run-detail publish panel preview every package file and show the refusal reason.
+- Before writing a legacy root file, publication reads the default branch and refuses
+  with `repository_root_conflict` when a different file already exists at that path.
+  Identical content is accepted. Resuming a publication branch no longer fails when a
+  published file is identical to the base branch.
+- Workflow detection and dispatch now verify the published package itself: the Task
+  definition and, for a legacy package, its `prompt.md` must be byte-identical on the
+  default branch to the tested closure, so another Task's package at the same path is
+  never dispatched. New caller workflows also record the tested closure digest
+  (`# package-digest: ...`). Callers published earlier, without that line, remain valid
+  when the package check passes. A mismatch is reported as `mismatch: caller_mismatch` or
+  `package_mismatch` on detection, and dispatch returns `409` with
+  `error: published_workflow_mismatch` and the same reason (or `caller_missing`).
+- Evidence that cannot be published now returns `409` with
+  `error: tested_package_unpublishable` and a bounded `reason`
+  (`evidence_unavailable`, `source_not_inline`, `package_files_invalid`,
+  `closure_mismatch`, `package_shape_unsupported`, `repository_root_conflict`,
+  `envelope_unavailable`, or `workflow_unavailable`) instead of an empty `409`. The
+  read-only GitHub evidence routes return `409` with `error: run_evidence_unavailable`.
+
 ## [0.3.12] - 2026-10-07
 
 This patch fixes governed GitHub repository listing, run status, and workflow

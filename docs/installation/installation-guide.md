@@ -464,8 +464,8 @@ also be owned by the GitHub user of the governed connection and admitted by stab
 owner and repository IDs in `githubSource.bindings`. In 0.3.12 the browser lists only
 the user's own repositories; organization-owned repositories are not listed by default
 and are reachable only through an explicit `query` to
-`GET /app/api/v1/github/repositories`. Deploy a reviewed `steward-run`
-release at v0.8.0 or later. Steward then owns the branch, two-file commit, pull request,
+`GET /app/api/v1/github/repositories`. Deploy a reviewed `steward-run` release at v0.8.0
+or later. Steward then owns the branch, exact tested package commit, pull request,
 exact-workflow verification, dispatch, and run-status operations; no GitHub token or
 workflow content belongs in Helm values. If a repository is visible but marked **Not
 ready**, add its stable source IDs. If a repository the user owns is absent, first

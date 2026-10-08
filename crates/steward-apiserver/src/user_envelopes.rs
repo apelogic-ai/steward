@@ -1339,6 +1339,7 @@ where
     }
     let workflow = match render_direct_package_github_actions_workflow(
         &DirectPackageGithubActionsWorkflowContext {
+            package_digest: None,
             envelope,
             invocation_path: invocation_path
                 .as_ref()

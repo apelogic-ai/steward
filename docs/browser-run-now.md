@@ -115,15 +115,29 @@ policy may also have to allow the Steward OAuth App to access the repository bef
 becomes visible.
 
 Publication is a server-owned operation. Steward reconstructs the successful run's
-exact one-file inline package, renders the pinned `steward-run` v0.8.0-or-later caller,
-creates a `steward/task-<taskUid>` branch from the repository's default branch, pushes
-exactly those two files, and opens a pull request. It never writes to the default
-branch. The response reports the package closure digest proven by the browser run.
+exact inline package and refuses it unless its files reproduce the tested closure
+digest. It renders the pinned `steward-run` v0.8.0-or-later caller, which records that
+digest, creates a `steward/task-<taskUid>` branch from the repository's default branch,
+pushes the package files and the caller unchanged, and opens a pull request. It never
+writes to the default branch. The response reports the package closure digest proven by
+the browser run.
+
+A current inline package is one Task definition under `.steward/tasks/`, so the pull
+request contains two files. Inline runs submitted by Steward v0.3.8 or earlier recorded a
+root `task-definition.json` with a path-backed `prompt.md`; their pull request contains
+those two root files and the caller. Before writing either root file, Steward reads the
+default branch and refuses with `repository_root_conflict` when a different file already
+exists at that path. Identical content is accepted. Any other package shape is refused
+with `package_shape_unsupported`.
 Retries for the same Task and repository reuse the same durable operation identity, so
 a changed browser retry key cannot create a second pull request.
 
 After the pull request is merged, Steward verifies the exact generated workflow on the
-default branch before enabling **Run on GitHub**. Dispatch is limited to that one
+default branch before enabling **Run on GitHub**. Detection and dispatch also require the
+published package files at their paths to be byte-identical to the tested closure, so a
+package another Task wrote to the same path is never dispatched. New callers record the
+tested closure digest; a caller published by an earlier release, without that line, is
+still accepted when the package files match. Dispatch is limited to that one
 generated workflow, its declared `workflow_dispatch` inputs, and the default branch.
 The run detail then shows the GitHub run, jobs, bounded failed-job log content, and the
 owner-scoped governed Task correlated by repository, run ID, and attempt.
