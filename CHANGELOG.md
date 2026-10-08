@@ -116,6 +116,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Repository readiness messages changed. A repository that is not ready for
   another reason now reads `owner/name is not ready for governed automation:
   <reason>.`, and step 3 no longer adds a `Not ready:` prefix.
+- Restored the reserved execution transcript in the runner output archive. Steward
+  0.3.11 and 0.3.12 delivered an `out/`-only archive from `GET
+  /v1/tasks/{taskUid}/outputs` even when the Task requested `diagnostics.executionLog:
+  full`, so steward-run 0.8.1, which requires `.steward/diagnostics/stdout.log` and
+  `stderr.log` in that archive, failed every `execution-log: full` run with
+  `failure-category=input-output` after the Task had succeeded. The `package-path`
+  workflows Steward generates set `execution-log: full`, so **Steward 0.3.11 and 0.3.12
+  break those callers; upgrade to 0.3.13.** For `full` Tasks the runner download is now
+  rebuilt from the validated `out/` entries with Steward-written tar headers, so no
+  agent-authored header reaches the runner, followed by both streams from the successful
+  attempt's durable logs (at most 4 MiB each). The download can therefore reach the 64
+  MiB stored maximum plus 8 MiB plus headers. Every other Task still receives its stored
+  `out/`-only archive unchanged. The stored archive and its validation rules, the
+  browser output listings and downloads, and the execution-log endpoints are unchanged,
+  and agent output still cannot create or replace `.steward/diagnostics`. A `full` Task
+  whose transcript is missing or over its bounds, or whose stored archive violates its
+  contract, now gets a non-retryable `500` with error `task_output_delivery_failed` and
+  a bounded `failureReason` instead of an archive the runner would reject. No migration
+  or caller change is required.
 
 ## [0.3.12] - 2026-10-07
 

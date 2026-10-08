@@ -9741,6 +9741,45 @@ impl PgStore {
         row.map(task_record).transpose()
     }
 
+    /// Return the output-archive contract marker and the successful attempt's final
+    /// transcript for one succeeded Task, in exactly the submitter scope of
+    /// [`Self::task_for_submitter`]. Live transcripts are never returned.
+    pub async fn task_output_transcript_for_submitter(
+        &self,
+        task_uid: Uuid,
+        submitter_service: &str,
+        owner_user_id: &str,
+    ) -> Result<Option<TaskOutputTranscript>, StoreError> {
+        sqlx::query(
+            "SELECT tasks.output_archive_contract, \
+                    attempts.execution_stdout, attempts.execution_stderr \
+             FROM task_submissions tasks \
+             LEFT JOIN task_execution_attempts attempts \
+               ON attempts.task_uid = tasks.task_uid AND attempts.state = 'succeeded' \
+             WHERE tasks.task_uid = $1 AND tasks.submitter_service = $2 \
+               AND tasks.owner_user_id = $3 AND tasks.identity_binding_state = 'bound' \
+               AND tasks.phase = 'succeeded' AND tasks.output_archive IS NOT NULL \
+               AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
+                   WHERE operations.task_uid = tasks.task_uid)",
+        )
+        .bind(task_uid)
+        .bind(submitter_service)
+        .bind(owner_user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .map(|row| {
+            Ok(TaskOutputTranscript {
+                output_archive_contract: row
+                    .try_get("output_archive_contract")
+                    .map_err(database_error)?,
+                execution_stdout: row.try_get("execution_stdout").map_err(database_error)?,
+                execution_stderr: row.try_get("execution_stderr").map_err(database_error)?,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn request_task_finalization(
         &self,
         task_uid: Uuid,
@@ -10323,6 +10362,15 @@ pub struct AgentRunExecutionLog {
 pub struct AgentRunOutputArchive {
     pub content: Vec<u8>,
     pub contract: Option<String>,
+}
+
+/// Runner-delivery facts for one succeeded Task that are not part of [`TaskRecord`]: the
+/// stored output-archive contract marker and the successful attempt's final transcript.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskOutputTranscript {
+    pub output_archive_contract: Option<String>,
+    pub execution_stdout: Option<Vec<u8>>,
+    pub execution_stderr: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

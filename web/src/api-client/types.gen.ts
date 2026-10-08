@@ -5394,6 +5394,10 @@ export type TaskOutputsContractErrors = {
      */
     409: TaskErrorResponse;
     /**
+     * task_output_delivery_failed: the output cannot be delivered within its contract (failureReason execution_transcript_unavailable, execution_transcript_too_large, or output_archive_contract_violation); not retryable
+     */
+    500: TaskErrorResponse;
+    /**
      * Identity or persistence dependency unavailable
      */
     503: TaskErrorResponse;
@@ -5403,7 +5407,7 @@ export type TaskOutputsContractError = TaskOutputsContractErrors[keyof TaskOutpu
 
 export type TaskOutputsContractResponses = {
     /**
-     * Opaque workspace-relative output tar archive; maximum 64 MiB
+     * Opaque workspace-relative output tar archive. The stored archive is at most 64 MiB. When the Task's snapshotted diagnostics.executionLog is full, the archive is rebuilt with Steward-written headers and also carries the reserved .steward/diagnostics/stdout.log and stderr.log transcript (at most 4 MiB each), so the download is at most 64 MiB plus 8 MiB plus tar headers
      */
     200: TaskArchive;
 };

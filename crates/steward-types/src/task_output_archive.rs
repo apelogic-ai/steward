@@ -3,11 +3,17 @@
 //! New archives contain only the declared `out/` tree. A bounded compatibility mode keeps
 //! historical archives readable when they also contain the two formerly embedded execution-log
 //! transcripts. Transcript bytes are never returned as Task outputs.
+//!
+//! The stored archive stays `out/`-only. The authenticated runner download of a Task whose
+//! snapshotted diagnostics requested `executionLog: full` is rebuilt from the validated entries
+//! with Steward-written headers and gains the server-owned transcript, see
+//! [`task_output_archive_with_execution_transcript`].
 
 use std::collections::BTreeSet;
 
 use crate::direct_package::{
-    EXECUTION_STDERR_ARCHIVE_PATH, EXECUTION_STDOUT_ARCHIVE_PATH, RelativePath,
+    EXECUTION_STDERR_ARCHIVE_PATH, EXECUTION_STDOUT_ARCHIVE_PATH, MAX_EXECUTION_STREAM_BYTES,
+    RelativePath,
 };
 
 const TAR_BLOCK_BYTES: usize = 512;
@@ -43,6 +49,31 @@ pub fn task_output_archive_entries(
     archive: &[u8],
     compatibility: TaskOutputArchiveCompatibility,
 ) -> Result<Vec<TaskOutputArchiveEntry>, InvalidTaskOutputArchive> {
+    walk_task_output_archive(archive, compatibility).map(|walked| {
+        walked
+            .into_iter()
+            .filter_map(|entry| match entry {
+                WalkedEntry::File { entry, .. } => Some(entry),
+                WalkedEntry::Directory(_) => None,
+            })
+            .collect()
+    })
+}
+
+/// One validated `out/` entry in archive order; directory paths are relative to `out/`, with
+/// the empty string naming `out/` itself.
+enum WalkedEntry {
+    Directory(String),
+    File {
+        entry: TaskOutputArchiveEntry,
+        executable: bool,
+    },
+}
+
+fn walk_task_output_archive(
+    archive: &[u8],
+    compatibility: TaskOutputArchiveCompatibility,
+) -> Result<Vec<WalkedEntry>, InvalidTaskOutputArchive> {
     if archive.len() < TAR_BLOCK_BYTES * 3 || !archive.len().is_multiple_of(TAR_BLOCK_BYTES) {
         return Err(InvalidTaskOutputArchive::Malformed);
     }
@@ -122,16 +153,20 @@ pub fn task_output_archive_entries(
                     if !seen.insert(relative.as_str().to_owned()) {
                         return Err(InvalidTaskOutputArchive::Malformed);
                     }
-                    entries.push(TaskOutputArchiveEntry {
-                        path: relative.as_str().to_owned(),
-                        offset: data_offset,
-                        size,
+                    entries.push(WalkedEntry::File {
+                        entry: TaskOutputArchiveEntry {
+                            path: relative.as_str().to_owned(),
+                            offset: data_offset,
+                            size,
+                        },
+                        executable: tar_octal(&header[100..108])
+                            .is_ok_and(|mode| mode & 0o111 != 0),
                     });
                 }
             }
             b'5' => {
                 let path = next_path.take().unwrap_or(header_path);
-                validate_directory(&path, size)?;
+                entries.push(WalkedEntry::Directory(validate_directory(&path, size)?));
             }
             b'1' | b'2' | b'K' => return Err(InvalidTaskOutputArchive::UnsupportedLink),
             _ => return Err(InvalidTaskOutputArchive::Malformed),
@@ -148,6 +183,178 @@ pub fn task_output_archive_entries(
             .ok_or(InvalidTaskOutputArchive::Malformed)?;
     }
     Err(InvalidTaskOutputArchive::Malformed)
+}
+
+/// Bounded failures while delivering a runner-facing archive with its execution transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskOutputTranscriptError {
+    /// The stored archive is not a valid `out/`-only `steward.task-output/v1` archive.
+    Archive(InvalidTaskOutputArchive),
+    /// A stream exceeds 4 MiB.
+    TranscriptTooLarge,
+}
+
+/// Build the runner-facing archive of a Task that requested `executionLog: full`.
+///
+/// steward-run 0.8.1, which generated callers pin, requires
+/// `.steward/diagnostics/stdout.log` and `.steward/diagnostics/stderr.log` inside the output
+/// archive whenever the authenticated Task status reports `executionLog: full`. No byte of an
+/// agent-authored tar header reaches the runner: the stored archive is validated strictly as
+/// `out/`-only, and every validated directory and regular file is re-emitted in archive order
+/// with a header written by [`append_tar_entry`]. Steward then appends the two transcript files
+/// and an end-of-archive marker. Two tar parsers can therefore never disagree about where an
+/// agent entry ends, and agent output can never create or replace the reserved namespace.
+///
+/// Each stream is bounded to 4 MiB (8 MiB combined); an oversized stream fails closed rather
+/// than being truncated. The delivered archive is at most the stored archive's size plus the
+/// transcript plus Steward's fixed per-entry headers.
+pub fn task_output_archive_with_execution_transcript(
+    archive: Vec<u8>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<Vec<u8>, TaskOutputTranscriptError> {
+    let within_bound = |stream: &[u8]| {
+        u64::try_from(stream.len()).is_ok_and(|len| len <= MAX_EXECUTION_STREAM_BYTES)
+    };
+    if !within_bound(stdout) || !within_bound(stderr) {
+        return Err(TaskOutputTranscriptError::TranscriptTooLarge);
+    }
+    let walked = walk_task_output_archive(&archive, TaskOutputArchiveCompatibility::Strict)
+        .map_err(TaskOutputTranscriptError::Archive)?;
+    let mut delivered = Vec::with_capacity(
+        archive.len()
+            + 4 * TAR_BLOCK_BYTES
+            + padded_tar_bytes(stdout.len())
+            + padded_tar_bytes(stderr.len()),
+    );
+    let mut directories = BTreeSet::new();
+    for entry in walked {
+        match entry {
+            WalkedEntry::Directory(relative) => {
+                if directories.insert(relative.clone()) {
+                    let path = if relative.is_empty() {
+                        "out/".to_owned()
+                    } else {
+                        format!("out/{relative}/")
+                    };
+                    append_tar_entry(&mut delivered, &path, TarEntryKind::Directory, &[]);
+                }
+            }
+            WalkedEntry::File { entry, executable } => {
+                let kind = if executable {
+                    TarEntryKind::ExecutableFile
+                } else {
+                    TarEntryKind::File
+                };
+                append_tar_entry(
+                    &mut delivered,
+                    &format!("out/{}", entry.path),
+                    kind,
+                    &archive[entry.offset..entry.offset + entry.size],
+                );
+            }
+        }
+    }
+    drop(archive);
+    append_tar_entry(
+        &mut delivered,
+        EXECUTION_STDOUT_ARCHIVE_PATH,
+        TarEntryKind::File,
+        stdout,
+    );
+    append_tar_entry(
+        &mut delivered,
+        EXECUTION_STDERR_ARCHIVE_PATH,
+        TarEntryKind::File,
+        stderr,
+    );
+    finish_tar_archive(&mut delivered);
+    Ok(delivered)
+}
+
+/// The entry types Steward writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TarEntryKind {
+    /// A regular file, mode 0644.
+    File,
+    /// A regular file, mode 0755.
+    ExecutableFile,
+    /// A directory, mode 0755; its path should end in `/`.
+    Directory,
+}
+
+/// Append one Steward-written POSIX ustar entry with fixed metadata (uid/gid 0, mtime 0, no
+/// user or group names, no prefix). A path longer than the 100-byte name field is carried by a
+/// preceding PAX `path` record that Steward writes, with a truncated name in the ustar header.
+pub fn append_tar_entry(archive: &mut Vec<u8>, path: &str, kind: TarEntryKind, content: &[u8]) {
+    let name = if path.len() <= 100 {
+        path
+    } else {
+        let record = pax_record("path", path);
+        append_tar_header(archive, "PaxHeader", b'x', 0o644, record.len());
+        archive.extend_from_slice(record.as_bytes());
+        pad_tar_data(archive, record.len());
+        let mut end = 100;
+        while !path.is_char_boundary(end) {
+            end -= 1;
+        }
+        &path[..end]
+    };
+    let (typeflag, mode, content) = match kind {
+        TarEntryKind::File => (b'0', 0o644, content),
+        TarEntryKind::ExecutableFile => (b'0', 0o755, content),
+        TarEntryKind::Directory => (b'5', 0o755, &[][..]),
+    };
+    append_tar_header(archive, name, typeflag, mode, content.len());
+    archive.extend_from_slice(content);
+    pad_tar_data(archive, content.len());
+}
+
+/// Append the two zero blocks that end a tar archive.
+pub fn finish_tar_archive(archive: &mut Vec<u8>) {
+    archive.resize(archive.len() + 2 * TAR_BLOCK_BYTES, 0);
+}
+
+fn append_tar_header(archive: &mut Vec<u8>, name: &str, typeflag: u8, mode: u32, size: usize) {
+    let header = archive.len();
+    archive.resize(header + TAR_BLOCK_BYTES, 0);
+    let block = &mut archive[header..header + TAR_BLOCK_BYTES];
+    block[..name.len()].copy_from_slice(name.as_bytes());
+    block[100..108].copy_from_slice(format!("{mode:07o}\0").as_bytes());
+    block[108..116].copy_from_slice(b"0000000\0");
+    block[116..124].copy_from_slice(b"0000000\0");
+    block[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+    block[136..148].copy_from_slice(b"00000000000\0");
+    block[148..156].fill(b' ');
+    block[156] = typeflag;
+    block[257..263].copy_from_slice(b"ustar\0");
+    block[263..265].copy_from_slice(b"00");
+    block[329..337].copy_from_slice(b"0000000\0");
+    block[337..345].copy_from_slice(b"0000000\0");
+    let checksum = block.iter().map(|byte| usize::from(*byte)).sum::<usize>();
+    block[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+}
+
+fn pad_tar_data(archive: &mut Vec<u8>, size: usize) {
+    archive.resize(archive.len() + padded_tar_bytes(size) - size, 0);
+}
+
+fn padded_tar_bytes(size: usize) -> usize {
+    size.div_ceil(TAR_BLOCK_BYTES) * TAR_BLOCK_BYTES
+}
+
+/// One PAX extended-header record: `<length> <key>=<value>\n`, where the length counts itself.
+fn pax_record(key: &str, value: &str) -> String {
+    let payload = format!(" {key}={value}\n");
+    let mut digits = 1;
+    loop {
+        let length = digits + payload.len();
+        let text = length.to_string();
+        if text.len() == digits {
+            return format!("{text}{payload}");
+        }
+        digits = text.len();
+    }
 }
 
 fn gnu_long_name(data: &[u8]) -> Result<String, InvalidTaskOutputArchive> {
@@ -222,19 +429,19 @@ fn is_historical_diagnostic(path: &str) -> bool {
     )
 }
 
-fn validate_directory(path: &str, size: usize) -> Result<(), InvalidTaskOutputArchive> {
+fn validate_directory(path: &str, size: usize) -> Result<String, InvalidTaskOutputArchive> {
     if size != 0 {
         return Err(InvalidTaskOutputArchive::Malformed);
     }
     let path = path.strip_suffix('/').unwrap_or(path);
     if path == "out" {
-        return Ok(());
+        return Ok(String::new());
     }
     let relative = path
         .strip_prefix("out/")
         .ok_or(InvalidTaskOutputArchive::Malformed)?;
     RelativePath::parse(relative.to_owned())
-        .map(|_| ())
+        .map(|relative| relative.as_str().to_owned())
         .map_err(|_| InvalidTaskOutputArchive::Malformed)
 }
 
@@ -292,15 +499,17 @@ fn validate_checksum(header: &[u8]) -> Result<(), InvalidTaskOutputArchive> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InvalidTaskOutputArchive, TaskOutputArchiveCompatibility, task_output_archive_entries,
+        InvalidTaskOutputArchive, TarEntryKind, TaskOutputArchiveCompatibility,
+        TaskOutputTranscriptError, append_tar_entry, finish_tar_archive,
+        task_output_archive_entries, task_output_archive_with_execution_transcript,
     };
 
     fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut archive = Vec::new();
         for (path, content) in entries {
-            append_entry(&mut archive, path, content, b'0');
+            append_tar_entry(&mut archive, path, TarEntryKind::File, content);
         }
-        archive.resize(archive.len() + 1024, 0);
+        finish_tar_archive(&mut archive);
         archive
     }
 
@@ -347,6 +556,202 @@ mod tests {
             }
             length = candidate.len();
         }
+    }
+
+    /// Rewrite one header in place and refresh its checksum.
+    fn patch_header(archive: &mut [u8], header_offset: usize, patch: impl Fn(&mut [u8])) {
+        let header = &mut archive[header_offset..header_offset + 512];
+        patch(header);
+        header[148..156].fill(b' ');
+        let checksum = header.iter().map(|byte| usize::from(*byte)).sum::<usize>();
+        header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+    }
+
+    /// Agent-style headers: GNU magic, a user name, a timestamp, and an executable mode.
+    fn agent_archive() -> Vec<u8> {
+        let mut stored = archive_with_kinds(&[
+            ("out/", b"", b'5'),
+            ("out/report.md", b"complete\n", b'0'),
+            ("out/run.sh", b"#!/bin/sh\n", b'0'),
+        ]);
+        for (offset, mode) in [(0, b"0000775\0"), (512, b"0000664\0"), (1536, b"0000775\0")] {
+            patch_header(&mut stored, offset, |header| {
+                header[100..108].copy_from_slice(mode);
+                header[108..116].copy_from_slice(b"0001750\0");
+                header[136..148].copy_from_slice(b"15073551234\0");
+                header[257..265].copy_from_slice(b"ustar  \0");
+                header[265..270].copy_from_slice(b"agent");
+            });
+        }
+        stored
+    }
+
+    #[test]
+    fn runner_delivery_rewrites_every_header_and_appends_the_transcript() -> Result<(), String> {
+        let stdout = b"stdout line\n".repeat(100);
+        let delivered =
+            task_output_archive_with_execution_transcript(agent_archive(), &stdout, b"")
+                .map_err(|error| format!("runner archive was not produced: {error:?}"))?;
+
+        let mut expected = Vec::new();
+        append_tar_entry(&mut expected, "out/", TarEntryKind::Directory, b"");
+        append_tar_entry(
+            &mut expected,
+            "out/report.md",
+            TarEntryKind::File,
+            b"complete\n",
+        );
+        append_tar_entry(
+            &mut expected,
+            "out/run.sh",
+            TarEntryKind::ExecutableFile,
+            b"#!/bin/sh\n",
+        );
+        append_tar_entry(
+            &mut expected,
+            ".steward/diagnostics/stdout.log",
+            TarEntryKind::File,
+            &stdout,
+        );
+        append_tar_entry(
+            &mut expected,
+            ".steward/diagnostics/stderr.log",
+            TarEntryKind::File,
+            b"",
+        );
+        finish_tar_archive(&mut expected);
+        assert!(
+            delivered == expected,
+            "every delivered header is Steward-written; no agent header byte is forwarded"
+        );
+        assert!(!delivered.windows(5).any(|window| window == b"agent"));
+
+        let listed = task_output_archive_entries(
+            &delivered,
+            TaskOutputArchiveCompatibility::HistoricalMixedDiagnostics,
+        )
+        .map_err(|error| format!("delivered archive must stay listable: {error:?}"))?;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["report.md", "run.sh"],
+            "transcripts are never Task output files"
+        );
+        assert!(
+            task_output_archive_entries(&delivered, TaskOutputArchiveCompatibility::Strict)
+                .is_err(),
+            "a delivered archive must never be accepted back as a stored out/-only archive"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn long_output_paths_are_delivered_through_a_steward_written_pax_record() -> Result<(), String>
+    {
+        let relative = format!("reports/{}.md", "a".repeat(120));
+        let mut stored = Vec::new();
+        append_tar_entry(
+            &mut stored,
+            &format!("out/{relative}"),
+            TarEntryKind::File,
+            b"long\n",
+        );
+        finish_tar_archive(&mut stored);
+        assert_eq!(&stored[156..157], b"x", "the long path needs a PAX record");
+
+        let delivered = task_output_archive_with_execution_transcript(stored, b"o", b"e")
+            .map_err(|error| format!("runner archive was not produced: {error:?}"))?;
+        let listed = task_output_archive_entries(
+            &delivered,
+            TaskOutputArchiveCompatibility::HistoricalMixedDiagnostics,
+        )
+        .map_err(|error| format!("delivered long path was rejected: {error:?}"))?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, relative);
+        Ok(())
+    }
+
+    #[test]
+    fn archives_stored_by_earlier_releases_still_list_and_deliver() -> Result<(), String> {
+        // Shapes 0.3.11 and 0.3.12 accepted: a pre-POSIX header without magic, a ustar prefix
+        // under GNU magic, and a size field padded with leading NULs.
+        let mut stored = archive_with_kinds(&[
+            ("legacy.txt", b"legacy\n", b'0'),
+            ("prefixed.txt", b"prefixed\n", b'0'),
+            ("out/padded.txt", b"padded\n", b'0'),
+        ]);
+        patch_header(&mut stored, 0, |header| {
+            header[..14].copy_from_slice(b"out/legacy.txt");
+            header[257..265].fill(0);
+        });
+        patch_header(&mut stored, 1024, |header| {
+            header[345..348].copy_from_slice(b"out");
+            header[257..265].copy_from_slice(b"ustar  \0");
+        });
+        patch_header(&mut stored, 2048, |header| {
+            header[124..136].copy_from_slice(b"\0\0\0\0 000007\0");
+        });
+
+        let listed = task_output_archive_entries(&stored, TaskOutputArchiveCompatibility::Strict)
+            .map_err(|error| {
+            format!("an archive stored by 0.3.11 must still list: {error:?}")
+        })?;
+        let paths = ["legacy.txt", "prefixed.txt", "padded.txt"];
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            paths
+        );
+
+        let delivered = task_output_archive_with_execution_transcript(stored, b"o", b"e")
+            .map_err(|error| format!("an archive stored by 0.3.11 must deliver: {error:?}"))?;
+        let mut expected = Vec::new();
+        for (path, content) in [
+            ("out/legacy.txt", &b"legacy\n"[..]),
+            ("out/prefixed.txt", b"prefixed\n"),
+            ("out/padded.txt", b"padded\n"),
+            (".steward/diagnostics/stdout.log", b"o"),
+            (".steward/diagnostics/stderr.log", b"e"),
+        ] {
+            append_tar_entry(&mut expected, path, TarEntryKind::File, content);
+        }
+        finish_tar_archive(&mut expected);
+        assert!(
+            delivered == expected,
+            "earlier archives are re-emitted canonically"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runner_delivery_requires_a_strict_stored_archive_and_bounded_streams() {
+        for stored in [
+            archive(&[
+                ("out/report.md", b"complete\n"),
+                (".steward/diagnostics/stdout.log", b"forged"),
+                (".steward/diagnostics/stderr.log", b"forged"),
+            ]),
+            archive_with_kinds(&[(".steward/diagnostics/", b"", b'5')]),
+            archive_with_kinds(&[("out/link", b"", b'2')]),
+        ] {
+            assert!(matches!(
+                task_output_archive_with_execution_transcript(stored, b"stdout", b"stderr"),
+                Err(TaskOutputTranscriptError::Archive(_))
+            ));
+        }
+        let oversized = vec![b'x'; 4 * 1024 * 1024 + 1];
+        assert_eq!(
+            task_output_archive_with_execution_transcript(
+                archive(&[("out/report.md", b"complete\n")]),
+                &oversized,
+                b"",
+            ),
+            Err(TaskOutputTranscriptError::TranscriptTooLarge)
+        );
     }
 
     #[test]

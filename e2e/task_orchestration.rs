@@ -56,6 +56,7 @@ use steward_types::direct_package::{
 };
 use steward_types::task_output_archive::{
     TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputArchiveCompatibility, task_output_archive_entries,
+    task_output_archive_with_execution_transcript,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
@@ -3464,6 +3465,66 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .ok_or_else(|| io::Error::other("successful execution transcript is absent"))?;
         assert_eq!(log.content, expected);
         assert!(log.complete);
+    }
+    let runner_transcript = store
+        .task_output_transcript_for_submitter(
+            successful_task_uid,
+            &service,
+            identity.user_id.as_str(),
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("runner output transcript is absent"))?;
+    assert_eq!(
+        runner_transcript.output_archive_contract.as_deref(),
+        Some(TASK_OUTPUT_ARCHIVE_CONTRACT)
+    );
+    assert_eq!(
+        runner_transcript.execution_stdout.as_deref(),
+        Some(b"successful task stdout".as_slice())
+    );
+    assert_eq!(
+        runner_transcript.execution_stderr.as_deref(),
+        Some(b"successful task stderr".as_slice())
+    );
+    let runner_archive = task_output_archive_with_execution_transcript(
+        successful_archive.content.clone(),
+        b"successful task stdout",
+        b"successful task stderr",
+    )
+    .map_err(|error| io::Error::other(format!("runner archive was not produced: {error:?}")))?;
+    let runner_entries = task_output_archive_entries(
+        &runner_archive,
+        TaskOutputArchiveCompatibility::HistoricalMixedDiagnostics,
+    )
+    .map_err(|_| io::Error::other("runner archive violated its contract"))?;
+    assert_eq!(
+        runner_entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        ["result.txt"],
+        "the reserved transcript is never listed as a Task output"
+    );
+    for (task_uid, submitter, owner) in [
+        (
+            successful_task_uid,
+            "another-service",
+            identity.user_id.as_str(),
+        ),
+        (successful_task_uid, service.as_str(), "another-owner"),
+        (
+            failed_start_task_uid,
+            service.as_str(),
+            identity.user_id.as_str(),
+        ),
+    ] {
+        assert!(
+            store
+                .task_output_transcript_for_submitter(task_uid, submitter, owner)
+                .await?
+                .is_none(),
+            "runner transcripts stay in the exact submitter scope of a succeeded Task"
+        );
     }
     assert!(
         kubernetes
