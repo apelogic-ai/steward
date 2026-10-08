@@ -436,6 +436,7 @@ mod tests {
                 acting_user: Email("alice@example.com".to_owned()),
             },
             canonical_authority: None,
+            llms: Vec::new(),
             tools: Vec::new(),
             state: AuthorityState::Active,
         }
