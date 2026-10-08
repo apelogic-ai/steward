@@ -7,6 +7,81 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- With `githubSource` enabled and at least one source in `githubSource.bindings`,
+  `GET /app/api/v1/github/repositories` with a blank `query` (the browser
+  default in Get started and on the Runs page) now lists the **admitted source
+  repositories** directly from the apiserver instead of running a governed
+  per-user operation in a bridge sandbox. Organization-owned admitted
+  repositories therefore appear by default, and a warm listing no longer waits
+  for a sandbox. The apiserver resolves each distinct bound source repository
+  ID through the source GitHub App: it lists the App's installations, mints a
+  token scoped to that one repository with only `metadata: read`, reads
+  `GET /repositories/{id}`, and then revokes that token. Every entry passes the
+  governed listing's per-field validation and bounds, must match its bound
+  owner and repository IDs, and is marked `ready: true`. The `login` field is empty for this listing, because it
+  does not consult the user's GitHub connection.
+- Consumers of the default listing must not treat its success as proof of a
+  GitHub connection: a user without one now sees admitted repositories marked
+  ready, and publication or dispatch can still fail on the connection or on
+  OAuth App access. The user's own repositories that are not admitted, which
+  0.3.12 listed as not ready, no longer appear in the default listing; an
+  explicit `query` still finds them. The admitted listing runs no governed
+  operation, so it writes no governed-operation record; workflow detection,
+  publication, dispatch and run status still do.
+- The admitted listing is cached in process for 10 minutes per binding
+  configuration. After that, requests are still served the cached listing at
+  once while one detached background refresh revalidates it
+  (stale-while-revalidate); a cancelled request never cancels a refresh. A
+  request waits only while no listing has ever resolved: at startup, and
+  again after each 5-second failure window while the App keeps failing.
+  Concurrent waiting requests share one resolution, and a wait is bounded at
+  35 seconds. Each full resolution lists the App's installations once (up
+  to 10 pages of 100; more installations fail with a distinct error) and then
+  makes three GitHub API calls per admitted repository: mint, read, and revoke.
+  A minted token whose scope does not validate is revoked too. Revocation is
+  best effort with a 2-second timeout; a failure logs one line beginning
+  `github source: metadata token revocation failed:` with no token material,
+  and the token still expires on its own.
+- If the App resolves some admitted repositories but not others, the response
+  lists those it resolved and carries their count in the
+  `x-steward-unresolved-repositories` header. Only the unresolved repositories
+  are retried, at most every 30 seconds. A definitive rejection (for example
+  the App no longer installed on the repository, or metadata that no longer
+  matches the binding) removes the repository from the listing at once. Any
+  other failure keeps the previously resolved entry for up to 20 minutes since
+  it last resolved, and that entry counts as unresolved in the header. A
+  wholly failed refresh is retried after 30 seconds. Only when no listing has ever resolved does the
+  request fail with HTTP 503, `error: "github_automation_unavailable"` and
+  `reason: "source_app_unavailable"`, rather than falling back to the slower
+  per-user listing; requests in the following 5 seconds share that failure
+  instead of repeating it. One resolution has a 30-second deadline, and every
+  repository that finished before it is kept; only those still pending count
+  as unresolved. Each resolution with unresolved repositories logs one
+  apiserver line beginning `admitted repository listing:` with the count and
+  up to five repository IDs with their fixed reasons; no token is logged.
+- A Git hosting plane that cannot describe repositories (the port's default)
+  keeps the governed per-user listing for a blank query, as before. Only a
+  full resolution with no listing yet can switch to that fallback; an
+  Unsupported answer during a retry never discards a resolved listing.
+- The governed per-user listing is unchanged for an explicit search `query`,
+  and for a blank query when `githubSource` is disabled or has no bindings.
+- `GithubRepositoriesResponse` gains an optional `source` field:
+  `"admitted"` for the App-resolved listing and `"connection"` for the governed
+  listing. The regenerated web client types include it; the browser does not
+  use it yet. With the admitted listing, every repository in the Get started
+  picker is **Ready**.
+- Authority: listing admitted repositories to any authenticated browser user
+  reveals only names, default branches, visibility and URLs that the operator
+  configured as governed sources. Workflow detection, publication, dispatch and
+  run status still run as governed connection operations, unchanged.
+- Operations: the source GitHub App installation must include each admitted
+  source repository. The App needs no new permission; the listing
+  token requests only `metadata: read`. With NetworkPolicy enabled, the
+  existing `networkPolicy.githubApiCidrs` egress already covers these calls.
+  No migration or Helm value changes.
+
 ### Fixed
 
 - Get started step 4 ("Publish the task definition") now shows the GitHub

@@ -1193,10 +1193,20 @@ export type GithubOnboardingEvidenceResponse = {
 export type GithubRepositoriesResponse = {
     apiVersion: string;
     hasNextPage: boolean;
+    /**
+     * GitHub login of the governed connection. Empty for an admitted listing, which
+     * does not consult the user's connection.
+     */
     login: string;
     page: number;
     repositories: Array<GithubRepositoryView>;
+    source?: null | GithubRepositoriesSource;
 };
+
+/**
+ * Where a repository listing came from.
+ */
+export type GithubRepositoriesSource = 'admitted' | 'connection';
 
 export type GithubRepositoryView = {
     defaultBranch: string;
@@ -4102,7 +4112,8 @@ export type ListRepositoriesData = {
     path?: never;
     query?: {
         /**
-         * Empty lists repositories owned by the authenticated GitHub user.
+         * Empty lists the admitted source repositories when the source GitHub App is
+         * configured, and otherwise the repositories owned by the authenticated GitHub user.
          */
         query?: string;
         page?: number;
@@ -4126,6 +4137,9 @@ export type ListRepositoriesErrors = {
 export type ListRepositoriesError = ListRepositoriesErrors[keyof ListRepositoriesErrors];
 
 export type ListRepositoriesResponses = {
+    /**
+     * Repositories. An admitted listing that the source GitHub App resolved only partly carries an x-steward-unresolved-repositories count header.
+     */
     200: GithubRepositoriesResponse;
 };
 

@@ -8,6 +8,7 @@ version.workspace = true
 
 [dependencies]
 base64.workspace = true
+futures.workspace = true
 jsonwebtoken = { workspace = true, features = ["use_pem"] }
 reqwest.workspace = true
 serde.workspace = true

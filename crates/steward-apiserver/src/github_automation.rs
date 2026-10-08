@@ -1,7 +1,12 @@
-//! Owner-scoped GitHub repository automation backed only by governed Connections operations.
+//! Owner-scoped GitHub repository automation backed by governed Connections operations.
+//!
+//! The one exception is the default repository listing. With the source GitHub App
+//! configured, it lists the operator-admitted source repositories directly.
 
 use std::collections::BTreeMap;
 use std::hash::Hash;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
@@ -9,9 +14,11 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use steward_ports::{GitRepositoryDescription, GitRepositoryReference};
 use steward_store::AgentRunRecord;
 use steward_types::direct_package::{ExecutionLogMode, TaskOrigin};
 use steward_types::{CanonicalUserId, TaskPhase};
@@ -28,7 +35,7 @@ use crate::github_actions::{
 };
 use crate::governed_connections::{
     ConnectionOperationKind, GovernedConnectionsBroker, ProviderConnectionStatusSource,
-    SplitConnectionsBroker,
+    SplitConnectionsBroker, valid_repository_listing_entry,
 };
 use crate::tasks::TaskApiConfig;
 use crate::{AgentRunLedger, BoxFuture};
@@ -36,6 +43,26 @@ use crate::{AgentRunLedger, BoxFuture};
 pub const GITHUB_AUTOMATION_API_VERSION: &str = "steward.github-automation/v1";
 const DEFAULT_PAGE_SIZE: u32 = 30;
 const MAX_PAGE_SIZE: u32 = 100;
+/// How long a fully resolved admitted repository listing is served from memory.
+const ADMITTED_REPOSITORIES_TTL: Duration = Duration::from_secs(10 * 60);
+/// How long before the App is asked again for only the repositories it did not resolve,
+/// and before a failed full refresh of a usable listing is retried.
+const ADMITTED_REPOSITORIES_PARTIAL_TTL: Duration = Duration::from_secs(30);
+/// How long a cold-start failure is shared with later requests before a new attempt.
+const ADMITTED_REPOSITORIES_FAILURE_TTL: Duration = Duration::from_secs(5);
+/// Deadline for one resolution. Repositories still pending at the deadline count as
+/// unresolved; every repository that finished before it is kept.
+const ADMITTED_REPOSITORIES_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Unresolved repositories named in one diagnostic line.
+const ADMITTED_REPOSITORIES_REPORTED_FAILURES: usize = 5;
+/// Longest a repository stays listed without a successful resolution. A definitive
+/// rejection removes it at once.
+const ADMITTED_REPOSITORIES_MAX_AGE: Duration = Duration::from_secs(20 * 60);
+/// Longest a request waits for a first listing, even if a refresh never reports back.
+const ADMITTED_REPOSITORIES_COLD_WAIT: Duration =
+    ADMITTED_REPOSITORIES_RESOLUTION_TIMEOUT.saturating_add(Duration::from_secs(5));
+/// Count of admitted repositories the source GitHub App could not resolve.
+pub(crate) const UNRESOLVED_REPOSITORIES_HEADER: &str = "x-steward-unresolved-repositories";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GithubAutomationIdentity {
@@ -132,12 +159,230 @@ where
     }
 }
 
+type AdmittedRepositoryClock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// In-process cache of the admitted source repositories.
+///
+/// A detached, single-flight refresher resolves repositories and writes the cache whatever
+/// happens to the request that started it. Requests are served the current listing at once,
+/// even while it is being revalidated; only a request with no usable listing waits.
+#[derive(Clone)]
+struct AdmittedRepositoryCache {
+    /// The distinct admitted source repositories. Bindings are fixed for the process.
+    key: Arc<Vec<GitRepositoryReference>>,
+    state: Arc<std::sync::Mutex<AdmittedRepositoryState>>,
+    refreshed: Arc<tokio::sync::watch::Sender<u64>>,
+    clock: AdmittedRepositoryClock,
+}
+
+#[derive(Default)]
+struct AdmittedRepositoryState {
+    /// Each listed repository with the time it last resolved successfully.
+    resolved: BTreeMap<GitRepositoryReference, (GithubRepositoryView, Instant)>,
+    /// The listed repositories, sorted once per refresh.
+    listing: Arc<Vec<GithubRepositoryView>>,
+    /// Repositories that did not resolve in their latest attempt, listed or not.
+    unresolved: Vec<GitRepositoryReference>,
+    /// The hosting plane cannot describe repositories; use the governed listing.
+    unsupported: bool,
+    refreshing: bool,
+    /// When every repository is resolved again.
+    expires_at: Option<Instant>,
+    /// When only the unresolved repositories are retried.
+    retry_at: Option<Instant>,
+    /// Until when a cold-start failure is shared instead of retried.
+    failed_until: Option<Instant>,
+}
+
+/// What a refresh resolves: every admitted repository, or only the unresolved ones.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AdmittedRefresh {
+    Full,
+    Unresolved,
+}
+
+impl AdmittedRepositoryState {
+    fn refresh_due(&self, now: Instant) -> Option<AdmittedRefresh> {
+        if self.resolved.is_empty() {
+            return self
+                .failed_until
+                .is_none_or(|until| now >= until)
+                .then_some(AdmittedRefresh::Full);
+        }
+        if self.expires_at.is_none_or(|expires_at| now >= expires_at) {
+            return Some(AdmittedRefresh::Full);
+        }
+        (!self.unresolved.is_empty() && self.retry_at.is_none_or(|retry_at| now >= retry_at))
+            .then_some(AdmittedRefresh::Unresolved)
+    }
+
+    fn listing(&self) -> AdmittedRepositories {
+        if self.unsupported {
+            return AdmittedRepositories::NotConfigured;
+        }
+        if self.listing.is_empty() {
+            return AdmittedRepositories::Unavailable;
+        }
+        AdmittedRepositories::Listed {
+            repositories: Arc::clone(&self.listing),
+            unresolved: self.unresolved.len(),
+        }
+    }
+
+    fn rebuild_listing(&mut self) {
+        let mut repositories = self
+            .resolved
+            .values()
+            .map(|(view, _)| view.clone())
+            .collect::<Vec<_>>();
+        repositories.sort_by(|left, right| {
+            (
+                left.owner.to_ascii_lowercase(),
+                left.name.to_ascii_lowercase(),
+            )
+                .cmp(&(
+                    right.owner.to_ascii_lowercase(),
+                    right.name.to_ascii_lowercase(),
+                ))
+        });
+        self.listing = Arc::new(repositories);
+    }
+}
+
+impl AdmittedRepositoryCache {
+    fn new(clock: AdmittedRepositoryClock, key: Vec<GitRepositoryReference>) -> Self {
+        Self {
+            key: Arc::new(key),
+            state: Arc::new(std::sync::Mutex::new(AdmittedRepositoryState::default())),
+            refreshed: Arc::new(tokio::sync::watch::channel(0).0),
+            clock,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, AdmittedRepositoryState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Merges a refresh outcome; `None` means the refresh ended without one.
+    ///
+    /// A successful resolution updates an entry, a definitive rejection removes it, and any
+    /// other failure keeps it until it is older than the maximum age. A kept entry that
+    /// failed still counts as unresolved.
+    fn complete_refresh(
+        &self,
+        refresh: AdmittedRefresh,
+        targets: &[GitRepositoryReference],
+        outcome: Option<ResolutionOutcome>,
+    ) {
+        let now = (self.clock)();
+        let outcome = outcome.unwrap_or_default();
+        {
+            let mut state = self.lock();
+            state.refreshing = false;
+            if outcome.unsupported && refresh == AdmittedRefresh::Full && state.resolved.is_empty()
+            {
+                state.unsupported = true;
+            } else {
+                let fresh = outcome
+                    .resolved
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                for (reference, view) in outcome.resolved {
+                    state.resolved.insert(reference, (view, now));
+                }
+                for reference in &outcome.rejected {
+                    state.resolved.remove(reference);
+                }
+                state.resolved.retain(|_, (_, resolved_at)| {
+                    now.saturating_duration_since(*resolved_at) <= ADMITTED_REPOSITORIES_MAX_AGE
+                });
+                let targets = targets.iter().collect::<std::collections::BTreeSet<_>>();
+                let unresolved = self
+                    .key
+                    .iter()
+                    .filter(|reference| {
+                        !state.resolved.contains_key(*reference)
+                            || (targets.contains(reference) && !fresh.contains(*reference))
+                    })
+                    .cloned()
+                    .collect();
+                state.unresolved = unresolved;
+                if state.resolved.is_empty() {
+                    state.failed_until = Some(now + ADMITTED_REPOSITORIES_FAILURE_TTL);
+                } else {
+                    state.failed_until = None;
+                    state.retry_at = Some(now + ADMITTED_REPOSITORIES_PARTIAL_TTL);
+                    if refresh == AdmittedRefresh::Full {
+                        state.expires_at = Some(
+                            now + if fresh.is_empty() {
+                                ADMITTED_REPOSITORIES_PARTIAL_TTL
+                            } else {
+                                ADMITTED_REPOSITORIES_TTL
+                            },
+                        );
+                    }
+                }
+                state.rebuild_listing();
+            }
+        }
+        self.refreshed.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+}
+
+/// Completes a refresh exactly once, including when its task is dropped before it runs.
+struct AdmittedRefreshCompletion {
+    pending: Option<(
+        AdmittedRepositoryCache,
+        AdmittedRefresh,
+        Vec<GitRepositoryReference>,
+    )>,
+}
+
+impl AdmittedRefreshCompletion {
+    fn new(
+        cache: AdmittedRepositoryCache,
+        refresh: AdmittedRefresh,
+        targets: Vec<GitRepositoryReference>,
+    ) -> Self {
+        Self {
+            pending: Some((cache, refresh, targets)),
+        }
+    }
+
+    fn targets(&self) -> Vec<GitRepositoryReference> {
+        self.pending
+            .as_ref()
+            .map(|(_, _, targets)| targets.clone())
+            .unwrap_or_default()
+    }
+
+    fn finish(mut self, outcome: ResolutionOutcome) {
+        if let Some((cache, refresh, targets)) = self.pending.take() {
+            cache.complete_refresh(refresh, &targets, Some(outcome));
+        }
+    }
+}
+
+impl Drop for AdmittedRefreshCompletion {
+    fn drop(&mut self) {
+        if let Some((cache, refresh, targets)) = self.pending.take() {
+            cache.complete_refresh(refresh, &targets, None);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct GithubAutomationConfig {
     task_api: TaskApiConfig,
     steward_run_release: StewardRunRelease,
     workflow_installation_mode: StewardRunWorkflowInstallationMode,
     task_identity_discovery_enabled: bool,
+    admitted_repositories: AdmittedRepositoryCache,
 }
 
 impl GithubAutomationConfig {
@@ -147,12 +392,34 @@ impl GithubAutomationConfig {
         workflow_installation_mode: StewardRunWorkflowInstallationMode,
         task_identity_discovery_enabled: bool,
     ) -> Self {
+        let admitted_key = task_api.admitted_source_repository_references();
         Self {
             task_api,
             steward_run_release,
             workflow_installation_mode,
             task_identity_discovery_enabled,
+            admitted_repositories: AdmittedRepositoryCache::new(
+                Arc::new(Instant::now),
+                admitted_key,
+            ),
         }
+    }
+
+    #[cfg(test)]
+    fn with_admitted_repository_clock(mut self, clock: AdmittedRepositoryClock) -> Self {
+        self.admitted_repositories =
+            AdmittedRepositoryCache::new(clock, self.admitted_repositories.key.to_vec());
+        self
+    }
+
+    #[cfg(test)]
+    fn with_task_api(mut self, task_api: TaskApiConfig) -> Self {
+        self.admitted_repositories = AdmittedRepositoryCache::new(
+            Arc::clone(&self.admitted_repositories.clock),
+            task_api.admitted_source_repository_references(),
+        );
+        self.task_api = task_api;
+        self
     }
 }
 
@@ -167,7 +434,8 @@ pub(crate) struct GithubAutomationState<L, P> {
 #[into_params(parameter_in = Query)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RepositoryQuery {
-    /// Empty lists repositories owned by the authenticated GitHub user.
+    /// Empty lists the admitted source repositories when the source GitHub App is
+    /// configured, and otherwise the repositories owned by the authenticated GitHub user.
     #[serde(default)]
     query: String,
     #[serde(default = "first_page")]
@@ -199,14 +467,28 @@ pub struct GithubRepositoryView {
     missing_prerequisite: Option<&'static str>,
 }
 
+/// Where a repository listing came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum GithubRepositoriesSource {
+    /// Operator-admitted source repositories resolved through the source GitHub App.
+    Admitted,
+    /// Repositories visible to the user's governed GitHub connection.
+    Connection,
+}
+
 #[derive(Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GithubRepositoriesResponse {
     api_version: &'static str,
+    /// GitHub login of the governed connection. Empty for an admitted listing, which
+    /// does not consult the user's connection.
     login: String,
     repositories: Vec<GithubRepositoryView>,
     page: u32,
     has_next_page: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<GithubRepositoriesSource>,
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -608,7 +890,7 @@ where
     path = "/app/api/v1/github/repositories",
     params(RepositoryQuery),
     responses(
-        (status = 200, body = GithubRepositoriesResponse),
+        (status = 200, body = GithubRepositoriesResponse, description = "Repositories. An admitted listing that the source GitHub App resolved only partly carries an x-steward-unresolved-repositories count header."),
         (status = 400, description = "Repository query is invalid"),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 503, body = GithubAutomationErrorResponse)
@@ -634,6 +916,16 @@ where
         || query.query.chars().any(char::is_control)
     {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if query.query.is_empty() {
+        match admitted_repositories(&state.config).await {
+            AdmittedRepositories::NotConfigured => {}
+            AdmittedRepositories::Unavailable => return source_app_unavailable(),
+            AdmittedRepositories::Listed {
+                repositories,
+                unresolved,
+            } => return admitted_page(repositories, unresolved, query.page, query.per_page),
+        }
     }
     let identity = fresh_operation_identity("repositories");
     let result = match state
@@ -1126,7 +1418,256 @@ fn repository_response(
         repositories,
         page,
         has_next_page,
+        source: Some(GithubRepositoriesSource::Connection),
     })
+}
+
+enum AdmittedRepositories {
+    /// The source GitHub App or the source bindings are absent: use the governed listing.
+    NotConfigured,
+    /// The App resolved no admitted repository.
+    Unavailable,
+    Listed {
+        repositories: Arc<Vec<GithubRepositoryView>>,
+        unresolved: usize,
+    },
+}
+
+async fn admitted_repositories(config: &GithubAutomationConfig) -> AdmittedRepositories {
+    let cache = &config.admitted_repositories;
+    if cache.key.is_empty() {
+        return AdmittedRepositories::NotConfigured;
+    }
+    let mut refreshed = cache.refreshed.subscribe();
+    let mut started = None;
+    {
+        let mut state = cache.lock();
+        if state.unsupported {
+            return AdmittedRepositories::NotConfigured;
+        }
+        if !state.refreshing
+            && let Some(refresh) = state.refresh_due((cache.clock)())
+        {
+            let targets = match refresh {
+                AdmittedRefresh::Full => cache.key.to_vec(),
+                AdmittedRefresh::Unresolved => state.unresolved.clone(),
+            };
+            state.refreshing = true;
+            // The guard exists before the task does, so the refresh completes even if the
+            // task is dropped before it first runs.
+            started = Some(AdmittedRefreshCompletion::new(
+                cache.clone(),
+                refresh,
+                targets,
+            ));
+        }
+        if started.is_none() && (!state.listing.is_empty() || !state.refreshing) {
+            return state.listing();
+        }
+    }
+    let usable = {
+        if let Some(completion) = started {
+            spawn_admitted_refresh(completion, config.task_api.clone());
+        }
+        let state = cache.lock();
+        (!state.listing.is_empty() || !state.refreshing).then(|| state.listing())
+    };
+    if let Some(listing) = usable {
+        return listing;
+    }
+    // No usable listing yet: wait, within a bound, for the in-flight refresh. Cancelling
+    // this wait does not cancel the refresh, which still fills the cache.
+    tokio::time::timeout(ADMITTED_REPOSITORIES_COLD_WAIT, async {
+        loop {
+            if refreshed.changed().await.is_err() {
+                return AdmittedRepositories::Unavailable;
+            }
+            let state = cache.lock();
+            if !state.refreshing {
+                return state.listing();
+            }
+        }
+    })
+    .await
+    .unwrap_or(AdmittedRepositories::Unavailable)
+}
+
+fn spawn_admitted_refresh(completion: AdmittedRefreshCompletion, task_api: TaskApiConfig) {
+    tokio::spawn(async move {
+        let targets = completion.targets();
+        let outcome = resolve_admitted(&task_api, &targets).await;
+        completion.finish(outcome);
+    });
+}
+
+#[derive(Default)]
+struct ResolutionOutcome {
+    resolved: BTreeMap<GitRepositoryReference, GithubRepositoryView>,
+    /// Repositories the App definitively rejected, or whose metadata failed validation.
+    rejected: std::collections::BTreeSet<GitRepositoryReference>,
+    /// Every requested repository was answered with `Unsupported`.
+    unsupported: bool,
+}
+
+/// Resolves references through the source GitHub App, keeping each result as it completes
+/// until one deadline.
+async fn resolve_admitted(
+    config: &TaskApiConfig,
+    references: &[GitRepositoryReference],
+) -> ResolutionOutcome {
+    let deadline = tokio::time::Instant::now() + ADMITTED_REPOSITORIES_RESOLUTION_TIMEOUT;
+    let mut resolved = BTreeMap::new();
+    let mut rejected = std::collections::BTreeSet::new();
+    let mut answered = vec![false; references.len()];
+    let mut failures = Vec::new();
+    let mut unsupported = 0_usize;
+    if let Some(mut described) = config.describe_admitted_source_repositories(references) {
+        while let Ok(Some((index, result))) =
+            tokio::time::timeout_at(deadline, described.next()).await
+        {
+            let Some(reference) = references.get(index) else {
+                continue;
+            };
+            if std::mem::replace(&mut answered[index], true) {
+                continue;
+            }
+            let failure = match result {
+                Ok(description) => match admitted_view(config, reference, &description) {
+                    Some(view) => {
+                        resolved.insert(reference.clone(), view);
+                        continue;
+                    }
+                    None => {
+                        rejected.insert(reference.clone());
+                        "repository metadata failed listing validation".to_owned()
+                    }
+                },
+                Err(steward_ports::PortError::Unsupported { operation }) => {
+                    unsupported += 1;
+                    operation.to_owned()
+                }
+                Err(steward_ports::PortError::Rejected { reason }) => {
+                    rejected.insert(reference.clone());
+                    reason
+                }
+                Err(error) => port_error_reason(&error).to_owned(),
+            };
+            failures.push((reference, failure));
+        }
+    }
+    for (reference, answered) in references.iter().zip(&answered) {
+        if !answered {
+            failures.push((reference, "resolution timed out".to_owned()));
+        }
+    }
+    let unsupported = !references.is_empty() && unsupported == references.len();
+    if !failures.is_empty() && !unsupported {
+        let examples = failures
+            .iter()
+            .take(ADMITTED_REPOSITORIES_REPORTED_FAILURES)
+            .map(|(reference, reason)| {
+                format!(
+                    "ownerId={} repositoryId={} reason={reason}",
+                    reference.repository_owner_id.as_str(),
+                    reference.repository_id.as_str()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        eprintln!(
+            "admitted repository listing: {} of {} source repositories unresolved: {examples}",
+            failures.len(),
+            references.len()
+        );
+    }
+    ResolutionOutcome {
+        resolved,
+        rejected,
+        unsupported,
+    }
+}
+
+fn port_error_reason(error: &steward_ports::PortError) -> &str {
+    match error {
+        steward_ports::PortError::Rejected { reason }
+        | steward_ports::PortError::Failed { reason } => reason,
+        steward_ports::PortError::Unsupported { operation } => operation,
+        _ => "source GitHub App resolution failed",
+    }
+}
+
+/// Applies the governed listing's per-field validation to one App-resolved repository.
+fn admitted_view(
+    config: &TaskApiConfig,
+    reference: &GitRepositoryReference,
+    description: &GitRepositoryDescription,
+) -> Option<GithubRepositoryView> {
+    if description.repository_owner_id != reference.repository_owner_id
+        || description.repository_id != reference.repository_id
+    {
+        return None;
+    }
+    let value = json!({
+        "owner": description.owner,
+        "ownerId": description.repository_owner_id.as_str(),
+        "name": description.name,
+        "repositoryId": description.repository_id.as_str(),
+        "defaultBranch": description.default_branch,
+        "private": description.private,
+        "url": description.web_url,
+    });
+    if !valid_repository_listing_entry(&value) {
+        return None;
+    }
+    repository_view(config, &value)
+        .ok()
+        .filter(|view| view.ready)
+}
+
+fn admitted_page(
+    repositories: Arc<Vec<GithubRepositoryView>>,
+    unresolved: usize,
+    page: u32,
+    per_page: u32,
+) -> Response {
+    let per_page = per_page as usize;
+    let start = (page as usize - 1).saturating_mul(per_page);
+    let has_next_page = start.saturating_add(per_page) < repositories.len();
+    let repositories = repositories
+        .iter()
+        .skip(start)
+        .take(per_page)
+        .cloned()
+        .collect();
+    let mut response = no_store_json(GithubRepositoriesResponse {
+        api_version: GITHUB_AUTOMATION_API_VERSION,
+        login: String::new(),
+        repositories,
+        page,
+        has_next_page,
+        source: Some(GithubRepositoriesSource::Admitted),
+    });
+    if unresolved > 0 {
+        response.headers_mut().insert(
+            UNRESOLVED_REPOSITORIES_HEADER,
+            header::HeaderValue::from(unresolved),
+        );
+    }
+    response
+}
+
+fn source_app_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(GithubAutomationErrorResponse {
+            api_version: GITHUB_AUTOMATION_API_VERSION,
+            error: "github_automation_unavailable",
+            reason: Some("source_app_unavailable"),
+            manual_files: None,
+        }),
+    )
+        .into_response()
 }
 
 fn repository_view(config: &TaskApiConfig, value: &Value) -> Result<GithubRepositoryView, ()> {
@@ -1419,13 +1960,14 @@ mod tests {
     use serde_json::{Value, json};
     use sha2::{Digest, Sha256};
     use steward_adapter_mcp_gw::{GithubBridgeOperation, GithubBridgeRequest};
+    use steward_ports::PortError;
     use steward_store::{
         AgentRunExecutionLog, AgentRunLogStream, AgentRunPage, AgentRunQuery, AgentRunRecord,
         AgentRunTimelineEvent, StoreError,
     };
     use steward_types::direct_package::{
         BrowserTaskEvidence, ClosureEntry, ClosureEntryKind, ContentDigest, PackageClosure,
-        PromptSourceKind, RelativePath, TaskOrigin, canonical_json_bytes,
+        PromptSourceKind, RelativePath, StableProviderId, TaskOrigin, canonical_json_bytes,
     };
     use steward_types::{
         AgentRuntimeSpec, AgentType, Budget, Duration as TaskDuration, Email, ModelRef, Principal,
@@ -2302,6 +2844,970 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    type FakeResult = Result<GitRepositoryDescription, PortError>;
+
+    #[derive(Clone, Default)]
+    struct FakeSourceApp {
+        calls: Arc<Mutex<Vec<Vec<GitRepositoryReference>>>>,
+        results: Arc<Mutex<BTreeMap<String, FakeResult>>>,
+        /// When set, each call waits for one permit before answering.
+        gate: Arc<Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
+        /// Repository IDs whose resolution never completes.
+        stalled: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    }
+
+    impl FakeSourceApp {
+        fn resolving(descriptions: Vec<GitRepositoryDescription>) -> Self {
+            let app = Self::default();
+            if let Ok(mut results) = app.results.lock() {
+                for description in descriptions {
+                    results.insert(
+                        description.repository_id.as_str().to_owned(),
+                        Ok(description),
+                    );
+                }
+            }
+            app
+        }
+
+        fn set(&self, repository_id: &str, result: FakeResult) -> Result<(), String> {
+            self.results
+                .lock()
+                .map_err(|_| "lock source App results")?
+                .insert(repository_id.to_owned(), result);
+            Ok(())
+        }
+
+        fn fail(&self, repository_id: &str) -> Result<(), String> {
+            self.set(
+                repository_id,
+                Err(PortError::Failed {
+                    reason: "fixture source App failure".to_owned(),
+                }),
+            )
+        }
+
+        fn close_gate(&self) -> Result<Arc<tokio::sync::Semaphore>, String> {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            *self.gate.lock().map_err(|_| "lock source App gate")? = Some(Arc::clone(&gate));
+            Ok(gate)
+        }
+
+        fn call_count(&self) -> Result<usize, String> {
+            Ok(self
+                .calls
+                .lock()
+                .map_err(|_| "lock source App calls")?
+                .len())
+        }
+
+        fn call(&self, index: usize) -> Result<Vec<String>, String> {
+            Ok(self
+                .calls
+                .lock()
+                .map_err(|_| "lock source App calls")?
+                .get(index)
+                .ok_or("source App call is absent")?
+                .iter()
+                .map(|reference| reference.repository_id.as_str().to_owned())
+                .collect())
+        }
+    }
+
+    impl steward_ports::GitHostingPlane for FakeSourceApp {
+        fn describe_repositories<'a>(
+            &'a self,
+            repositories: &'a [GitRepositoryReference],
+        ) -> impl futures::Stream<Item = (usize, FakeResult)> + Send + 'a {
+            futures::stream::once(async move {
+                if let Ok(mut calls) = self.calls.lock() {
+                    calls.push(repositories.to_vec());
+                }
+                let gate = self.gate.lock().ok().and_then(|gate| gate.clone());
+                if let Some(gate) = gate
+                    && let Ok(permit) = gate.acquire().await
+                {
+                    permit.forget();
+                }
+                let results = self
+                    .results
+                    .lock()
+                    .map(|results| results.clone())
+                    .unwrap_or_default();
+                let stalled = self
+                    .stalled
+                    .lock()
+                    .map(|stalled| stalled.clone())
+                    .unwrap_or_default();
+                let answers = repositories
+                    .iter()
+                    .enumerate()
+                    .map(|(index, reference)| {
+                        let id = reference.repository_id.as_str();
+                        let result = results.get(id).cloned().unwrap_or(Err(PortError::Rejected {
+                            reason: "fixture repository is unknown".to_owned(),
+                        }));
+                        let stall = stalled.contains(id);
+                        async move {
+                            if stall {
+                                std::future::pending::<()>().await;
+                            }
+                            (index, result)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                futures::stream::iter(answers).buffer_unordered(64)
+            })
+            .flatten()
+        }
+
+        async fn resolve_repository(
+            &self,
+            _repository: &steward_types::direct_package::RepositoryUrl,
+        ) -> Result<steward_ports::GitRepositoryIdentity, PortError> {
+            Err(PortError::Unsupported {
+                operation: "resolve_repository",
+            })
+        }
+
+        async fn read_file(
+            &self,
+            _request: &steward_ports::GitFileRequest,
+        ) -> Result<steward_ports::GitFile, PortError> {
+            Err(PortError::Unsupported {
+                operation: "read_file",
+            })
+        }
+
+        async fn resolve_revision(
+            &self,
+            _request: &steward_ports::GitRevisionRequest,
+        ) -> Result<steward_types::direct_package::ExactGitCommit, PortError> {
+            Err(PortError::Unsupported {
+                operation: "resolve_revision",
+            })
+        }
+    }
+
+    /// A hosting plane that keeps the port's default, unsupported repository description.
+    struct DescriptionlessPlane;
+
+    impl steward_ports::GitHostingPlane for DescriptionlessPlane {
+        async fn resolve_repository(
+            &self,
+            _repository: &steward_types::direct_package::RepositoryUrl,
+        ) -> Result<steward_ports::GitRepositoryIdentity, PortError> {
+            Err(PortError::Unsupported {
+                operation: "resolve_repository",
+            })
+        }
+
+        async fn read_file(
+            &self,
+            _request: &steward_ports::GitFileRequest,
+        ) -> Result<steward_ports::GitFile, PortError> {
+            Err(PortError::Unsupported {
+                operation: "read_file",
+            })
+        }
+
+        async fn resolve_revision(
+            &self,
+            _request: &steward_ports::GitRevisionRequest,
+        ) -> Result<steward_types::direct_package::ExactGitCommit, PortError> {
+            Err(PortError::Unsupported {
+                operation: "resolve_revision",
+            })
+        }
+    }
+
+    /// Waits until no admitted-repository refresh is in flight.
+    async fn refresh_idle(cache: &AdmittedRepositoryCache) -> Result<(), String> {
+        for _ in 0..10_000 {
+            if !cache.lock().refreshing {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+        Err("admitted repository refresh did not finish".to_owned())
+    }
+
+    /// Waits until the source App has received `count` calls.
+    async fn app_calls(source_app: &FakeSourceApp, count: usize) -> Result<(), String> {
+        for _ in 0..10_000 {
+            if source_app.call_count()? >= count {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(format!("source App did not receive {count} calls"))
+    }
+
+    fn set_clock(
+        offset: &Mutex<std::time::Duration>,
+        value: std::time::Duration,
+    ) -> Result<(), String> {
+        *offset.lock().map_err(|_| "lock clock")? = value;
+        Ok(())
+    }
+
+    fn listed_names(body: &Value) -> Vec<String> {
+        body["repositories"]
+            .as_array()
+            .map(|repositories| {
+                repositories
+                    .iter()
+                    .filter_map(|repository| repository["name"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn description(
+        owner: &str,
+        owner_id: &str,
+        name: &str,
+        repository_id: &str,
+    ) -> Result<GitRepositoryDescription, String> {
+        Ok(GitRepositoryDescription {
+            owner: owner.to_owned(),
+            repository_owner_id: StableProviderId::parse(owner_id)?,
+            name: name.to_owned(),
+            repository_id: StableProviderId::parse(repository_id)?,
+            default_branch: "main".to_owned(),
+            private: true,
+            web_url: format!("https://github.com/{owner}/{name}"),
+        })
+    }
+
+    /// Source bindings (ownerId, repositoryId) admitted for two callers each, so the
+    /// listing must deduplicate them.
+    fn admitted_config(
+        app: FakeSourceApp,
+        sources: &[(&str, &str)],
+        clock: AdmittedRepositoryClock,
+    ) -> Result<GithubAutomationConfig, String> {
+        let bindings = sources
+            .iter()
+            .flat_map(|(owner_id, repository_id)| {
+                ["400", "401"].map(|caller| {
+                    json!({
+                        "caller": {"ownerId": "300", "repositoryId": caller},
+                        "source": {"ownerId": owner_id, "repositoryId": repository_id}
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let bindings = json!({
+            "contractVersion": "steward.source-repository-bindings/v1",
+            "bindings": bindings
+        })
+        .to_string();
+        let config = config()?;
+        let config = config.with_task_api(
+            TaskApiConfig::default()
+                .with_source_repository_bindings_json(Some(&bindings))?
+                .with_git_hosting_plane(app),
+        );
+        Ok(config.with_admitted_repository_clock(clock))
+    }
+
+    fn fixed_clock() -> (AdmittedRepositoryClock, Arc<Mutex<std::time::Duration>>) {
+        let base = Instant::now();
+        let offset = Arc::new(Mutex::new(std::time::Duration::ZERO));
+        let shared = Arc::clone(&offset);
+        let clock: AdmittedRepositoryClock =
+            Arc::new(move || base + shared.lock().map(|offset| *offset).unwrap_or_default());
+        (clock, offset)
+    }
+
+    async fn list(
+        app: &Router,
+        session_cookie: &str,
+        query: &str,
+    ) -> Result<(StatusCode, Option<String>, Value), String> {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/github/repositories{query}"))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| error.to_string())?,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let unresolved = response
+            .headers()
+            .get(UNRESOLVED_REPOSITORIES_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        Ok((status, unresolved, body))
+    }
+
+    fn governed_calls(broker: &FakeBroker) -> Result<usize, String> {
+        Ok(broker.calls.lock().map_err(|_| "lock broker calls")?.len())
+    }
+
+    async fn admitted_app(
+        source_app: &FakeSourceApp,
+        sources: &[(&str, &str)],
+    ) -> Result<
+        (
+            Router,
+            String,
+            AdmittedRepositoryCache,
+            Arc<Mutex<std::time::Duration>>,
+            FakeBroker,
+        ),
+        String,
+    > {
+        let (clock, offset) = fixed_clock();
+        let config = admitted_config(source_app.clone(), sources, clock)?;
+        let cache = config.admitted_repositories.clone();
+        let broker = FakeBroker::default();
+        let (auth, session_cookie, _) = signed_in_cookie_and_csrf().await?;
+        let app = protected_router(FakeLedger::default(), broker.clone(), config, auth);
+        Ok((app, session_cookie, cache, offset, broker))
+    }
+
+    #[tokio::test]
+    async fn blank_listing_returns_admitted_repositories_without_a_governed_operation()
+    -> Result<(), String> {
+        let source_app = FakeSourceApp::resolving(vec![
+            description("example-org", "100", "zeta-service", "200")?,
+            description("acme", "500", "service-a", "600")?,
+        ]);
+        let (app, cookie, _, _, broker) =
+            admitted_app(&source_app, &[("100", "200"), ("500", "600")]).await?;
+
+        let (status, unresolved, body) = list(&app, &cookie, "?perPage=100").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(unresolved, None);
+        assert_eq!(body["source"], "admitted");
+        assert_eq!(body["login"], "");
+        assert_eq!(body["page"], 1);
+        assert_eq!(body["hasNextPage"], false);
+        assert_eq!(
+            body["repositories"],
+            json!([
+                {
+                    "owner": "acme",
+                    "ownerId": "500",
+                    "name": "service-a",
+                    "repositoryId": "600",
+                    "defaultBranch": "main",
+                    "private": true,
+                    "url": "https://github.com/acme/service-a",
+                    "ready": true
+                },
+                {
+                    "owner": "example-org",
+                    "ownerId": "100",
+                    "name": "zeta-service",
+                    "repositoryId": "200",
+                    "defaultBranch": "main",
+                    "private": true,
+                    "url": "https://github.com/example-org/zeta-service",
+                    "ready": true
+                }
+            ])
+        );
+        assert_eq!(governed_calls(&broker)?, 0, "no governed operation runs");
+        assert_eq!(
+            source_app.call(0)?,
+            ["200", "600"],
+            "each distinct admitted source is resolved once"
+        );
+        assert_eq!(source_app.call_count()?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_listing_is_served_stale_while_one_refresh_runs() -> Result<(), String> {
+        let source_app =
+            FakeSourceApp::resolving(vec![description("example-org", "100", "service-a", "200")?]);
+        let (app, cookie, cache, offset, _) = admitted_app(&source_app, &[("100", "200")]).await?;
+
+        for _ in 0..3 {
+            let (status, _, body) = list(&app, &cookie, "").await?;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(listed_names(&body), ["service-a"]);
+        }
+        assert_eq!(
+            source_app.call_count()?,
+            1,
+            "a warm cache makes no App call"
+        );
+        set_clock(
+            &offset,
+            ADMITTED_REPOSITORIES_TTL - std::time::Duration::from_secs(1),
+        )?;
+        list(&app, &cookie, "").await?;
+        assert_eq!(source_app.call_count()?, 1, "the entry is still fresh");
+
+        let gate = source_app.close_gate()?;
+        source_app.set(
+            "200",
+            Ok(description("example-org", "100", "service-renamed", "200")?),
+        )?;
+        set_clock(&offset, ADMITTED_REPOSITORIES_TTL)?;
+        for _ in 0..2 {
+            let (status, _, body) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), list(&app, &cookie, ""))
+                    .await
+                    .map_err(|_| "a stale listing must not wait for the refresh")??;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(listed_names(&body), ["service-a"], "served stale");
+        }
+        app_calls(&source_app, 2).await?;
+        list(&app, &cookie, "").await?;
+        assert_eq!(
+            source_app.call_count()?,
+            2,
+            "exactly one refresh is in flight"
+        );
+
+        gate.add_permits(1);
+        refresh_idle(&cache).await?;
+        let (_, _, body) = list(&app, &cookie, "").await?;
+        assert_eq!(
+            listed_names(&body),
+            ["service-renamed"],
+            "the refresh landed"
+        );
+        assert_eq!(source_app.call_count()?, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_cold_request_still_fills_the_cache() -> Result<(), String> {
+        let source_app =
+            FakeSourceApp::resolving(vec![description("example-org", "100", "service-a", "200")?]);
+        let gate = source_app.close_gate()?;
+        let (app, cookie, cache, _, _) = admitted_app(&source_app, &[("100", "200")]).await?;
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            list(&app, &cookie, ""),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the cold request waits and is then cancelled"
+        );
+        assert_eq!(source_app.call_count()?, 1);
+
+        gate.add_permits(1);
+        refresh_idle(&cache).await?;
+        let (status, _, body) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed_names(&body), ["service-a"]);
+        assert_eq!(
+            source_app.call_count()?,
+            1,
+            "the detached refresh filled the cache"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partial_resolution_lists_resolved_repositories_with_a_bounded_count()
+    -> Result<(), String> {
+        let mut oversized = description("example-org", "100", "oversized", "203")?;
+        oversized.name = "a".repeat(101);
+        let mut foreign_url = description("example-org", "100", "foreign", "204")?;
+        foreign_url.web_url = "https://elsewhere.example.com/example-org/foreign".to_owned();
+        let mismatched = description("example-org", "999", "mismatched", "205")?;
+        let source_app = FakeSourceApp::resolving(vec![
+            description("example-org", "100", "service-a", "200")?,
+            oversized,
+            foreign_url,
+            mismatched,
+        ]);
+        source_app.fail("201")?;
+        let (app, cookie, cache, offset, broker) = admitted_app(
+            &source_app,
+            &[
+                ("100", "200"),
+                ("100", "201"),
+                ("100", "202"),
+                ("100", "203"),
+                ("100", "204"),
+                ("100", "205"),
+            ],
+        )
+        .await?;
+
+        let (status, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "admitted");
+        assert_eq!(listed_names(&body), ["service-a"]);
+        assert_eq!(
+            unresolved.as_deref(),
+            Some("5"),
+            "failed, unknown, oversized, foreign-URL and mismatched entries are unresolved"
+        );
+        assert_eq!(governed_calls(&broker)?, 0);
+
+        set_clock(
+            &offset,
+            ADMITTED_REPOSITORIES_PARTIAL_TTL - std::time::Duration::from_secs(1),
+        )?;
+        list(&app, &cookie, "").await?;
+        assert_eq!(
+            source_app.call_count()?,
+            1,
+            "the partial listing is still served"
+        );
+
+        // The retry is in flight while a request is cancelled; nothing unresolved is lost.
+        let gate = source_app.close_gate()?;
+        source_app.set(
+            "201",
+            Ok(description("example-org", "100", "recovered", "201")?),
+        )?;
+        set_clock(&offset, ADMITTED_REPOSITORIES_PARTIAL_TTL)?;
+        let (status, unresolved, _) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            unresolved.as_deref(),
+            Some("5"),
+            "the unresolved set is kept during a retry"
+        );
+        assert_eq!(cache.lock().unresolved.len(), 5);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            list(&app, &cookie, ""),
+        )
+        .await;
+        app_calls(&source_app, 2).await?;
+        assert_eq!(
+            cache.lock().unresolved.len(),
+            5,
+            "an in-flight retry keeps them"
+        );
+        assert_eq!(source_app.call(1)?, ["201", "202", "203", "204", "205"]);
+
+        gate.add_permits(1);
+        refresh_idle(&cache).await?;
+        let (_, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(unresolved.as_deref(), Some("4"));
+        assert_eq!(listed_names(&body), ["recovered", "service-a"]);
+        assert_eq!(
+            source_app.call_count()?,
+            2,
+            "only the unresolved ones were retried"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_keeps_the_previous_listing_and_counts_it_unresolved()
+    -> Result<(), String> {
+        let source_app = FakeSourceApp::resolving(vec![
+            description("example-org", "100", "repo-a", "200")?,
+            description("example-org", "100", "repo-b", "201")?,
+        ]);
+        let (app, cookie, cache, offset, _) =
+            admitted_app(&source_app, &[("100", "200"), ("100", "201")]).await?;
+        let (_, _, body) = list(&app, &cookie, "").await?;
+        assert_eq!(listed_names(&body), ["repo-a", "repo-b"]);
+
+        source_app.fail("200")?;
+        source_app.fail("201")?;
+        set_clock(&offset, ADMITTED_REPOSITORIES_TTL)?;
+        list(&app, &cookie, "").await?;
+        app_calls(&source_app, 2).await?;
+        refresh_idle(&cache).await?;
+        let (status, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a failed refresh never becomes a 503"
+        );
+        assert_eq!(listed_names(&body), ["repo-a", "repo-b"]);
+        assert_eq!(
+            unresolved.as_deref(),
+            Some("2"),
+            "retained entries that failed count as unresolved"
+        );
+
+        source_app.set(
+            "200",
+            Ok(description("example-org", "100", "repo-a-renamed", "200")?),
+        )?;
+        set_clock(
+            &offset,
+            ADMITTED_REPOSITORIES_TTL + ADMITTED_REPOSITORIES_PARTIAL_TTL,
+        )?;
+        list(&app, &cookie, "").await?;
+        app_calls(&source_app, 3).await?;
+        refresh_idle(&cache).await?;
+        let (_, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(
+            listed_names(&body),
+            ["repo-a-renamed", "repo-b"],
+            "a later refresh merges into the retained listing"
+        );
+        assert_eq!(unresolved.as_deref(), Some("1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_entries_expire_after_the_maximum_age() -> Result<(), String> {
+        let source_app = FakeSourceApp::resolving(vec![
+            description("example-org", "100", "repo-a", "200")?,
+            description("example-org", "100", "repo-b", "201")?,
+        ]);
+        let (app, cookie, cache, offset, _) =
+            admitted_app(&source_app, &[("100", "200"), ("100", "201")]).await?;
+        list(&app, &cookie, "").await?;
+
+        source_app.fail("201")?;
+        set_clock(&offset, ADMITTED_REPOSITORIES_TTL)?;
+        list(&app, &cookie, "").await?;
+        app_calls(&source_app, 2).await?;
+        refresh_idle(&cache).await?;
+        let (_, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(
+            listed_names(&body),
+            ["repo-a", "repo-b"],
+            "repo-b is retained"
+        );
+        assert_eq!(unresolved.as_deref(), Some("1"));
+
+        set_clock(
+            &offset,
+            ADMITTED_REPOSITORIES_MAX_AGE + std::time::Duration::from_secs(1),
+        )?;
+        list(&app, &cookie, "").await?;
+        app_calls(&source_app, 3).await?;
+        refresh_idle(&cache).await?;
+        let (status, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed_names(&body),
+            ["repo-a"],
+            "an entry failing past the maximum age is no longer listed"
+        );
+        assert_eq!(unresolved.as_deref(), Some("1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn definitive_rejection_evicts_a_listed_repository() -> Result<(), String> {
+        let source_app = FakeSourceApp::resolving(vec![
+            description("example-org", "100", "repo-a", "200")?,
+            description("example-org", "100", "repo-b", "201")?,
+        ]);
+        let (app, cookie, cache, offset, _) =
+            admitted_app(&source_app, &[("100", "200"), ("100", "201")]).await?;
+        list(&app, &cookie, "").await?;
+
+        source_app.set(
+            "201",
+            Err(PortError::Rejected {
+                reason: "GitHub App is not installed for the repository owner".to_owned(),
+            }),
+        )?;
+        set_clock(&offset, ADMITTED_REPOSITORIES_TTL)?;
+        list(&app, &cookie, "").await?;
+        app_calls(&source_app, 2).await?;
+        refresh_idle(&cache).await?;
+        let (_, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(
+            listed_names(&body),
+            ["repo-a"],
+            "a rejected repository is evicted"
+        );
+        assert_eq!(unresolved.as_deref(), Some("1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsupported_retry_never_discards_a_resolved_listing() -> Result<(), String> {
+        let source_app =
+            FakeSourceApp::resolving(vec![description("example-org", "100", "repo-a", "200")?]);
+        source_app.fail("201")?;
+        let (app, cookie, cache, offset, broker) =
+            admitted_app(&source_app, &[("100", "200"), ("100", "201")]).await?;
+        list(&app, &cookie, "").await?;
+
+        source_app.set(
+            "201",
+            Err(PortError::Unsupported {
+                operation: "describe_repositories",
+            }),
+        )?;
+        set_clock(&offset, ADMITTED_REPOSITORIES_PARTIAL_TTL)?;
+        list(&app, &cookie, "").await?;
+        app_calls(&source_app, 2).await?;
+        refresh_idle(&cache).await?;
+        assert_eq!(source_app.call(1)?, ["201"], "an unresolved-only retry");
+        let (status, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "admitted");
+        assert_eq!(listed_names(&body), ["repo-a"]);
+        assert_eq!(unresolved.as_deref(), Some("1"));
+        assert_eq!(governed_calls(&broker)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_wait_is_bounded_when_a_refresh_never_reports() -> Result<(), String> {
+        let source_app =
+            FakeSourceApp::resolving(vec![description("example-org", "100", "repo-a", "200")?]);
+        let (app, cookie, cache, _, _) = admitted_app(&source_app, &[("100", "200")]).await?;
+        // A refresh that is marked in flight but never completes.
+        cache.lock().refreshing = true;
+
+        let (status, _, body) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["reason"], "source_app_unavailable");
+        assert_eq!(source_app.call_count()?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_dropped_before_running_still_completes() -> Result<(), String> {
+        let source_app =
+            FakeSourceApp::resolving(vec![description("example-org", "100", "repo-a", "200")?]);
+        let (clock, _) = fixed_clock();
+        let config = admitted_config(source_app, &[("100", "200")], clock)?;
+        let cache = config.admitted_repositories.clone();
+        cache.lock().refreshing = true;
+        let refreshed = cache.refreshed.subscribe();
+
+        drop(AdmittedRefreshCompletion::new(
+            cache.clone(),
+            AdmittedRefresh::Full,
+            cache.key.to_vec(),
+        ));
+        let state = cache.lock();
+        assert!(!state.refreshing, "the guard cleared the in-flight flag");
+        assert!(
+            state.failed_until.is_some(),
+            "a cold drop is a shared failure"
+        );
+        drop(state);
+        assert!(
+            refreshed.has_changed().map_err(|error| error.to_string())?,
+            "waiters are woken"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cold_total_failure_is_a_bounded_source_app_reason() -> Result<(), String> {
+        let source_app = FakeSourceApp::default();
+        source_app.fail("200")?;
+        let (app, cookie, _, offset, broker) = admitted_app(&source_app, &[("100", "200")]).await?;
+
+        let expected = json!({
+            "apiVersion": GITHUB_AUTOMATION_API_VERSION,
+            "error": "github_automation_unavailable",
+            "reason": "source_app_unavailable"
+        });
+        for _ in 0..2 {
+            let (status, _, body) = list(&app, &cookie, "").await?;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body, expected);
+        }
+        assert_eq!(
+            source_app.call_count()?,
+            1,
+            "a cold failure is shared briefly"
+        );
+
+        set_clock(&offset, ADMITTED_REPOSITORIES_FAILURE_TTL)?;
+        let (status, _, _) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(source_app.call_count()?, 2, "and retried after its TTL");
+        assert_eq!(governed_calls(&broker)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_listings_share_one_resolution() -> Result<(), String> {
+        let source_app = FakeSourceApp::default();
+        source_app.fail("200")?;
+        let gate = source_app.close_gate()?;
+        let (app, cookie, _, _, _) = admitted_app(&source_app, &[("100", "200")]).await?;
+
+        let release = async {
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            gate.add_permits(1);
+        };
+        let (first, second, third, ()) = tokio::join!(
+            list(&app, &cookie, ""),
+            list(&app, &cookie, ""),
+            list(&app, &cookie, ""),
+            release,
+        );
+        for result in [first?, second?, third?] {
+            assert_eq!(result.0, StatusCode::SERVICE_UNAVAILABLE);
+        }
+        assert_eq!(source_app.call_count()?, 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_keeps_every_repository_that_finished() -> Result<(), String> {
+        let source_app = FakeSourceApp::resolving(
+            (200..205)
+                .map(|id| description("example-org", "100", &format!("repo-{id}"), &id.to_string()))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        source_app
+            .stalled
+            .lock()
+            .map_err(|_| "lock stalled")?
+            .insert("202".to_owned());
+        let (app, cookie, _, _, _) = admitted_app(
+            &source_app,
+            &[
+                ("100", "200"),
+                ("100", "201"),
+                ("100", "202"),
+                ("100", "203"),
+                ("100", "204"),
+            ],
+        )
+        .await?;
+
+        let (status, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed_names(&body),
+            ["repo-200", "repo-201", "repo-203", "repo-204"],
+            "one slow repository does not discard the others"
+        );
+        assert_eq!(unresolved.as_deref(), Some("1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plane_without_repository_description_keeps_the_governed_listing() -> Result<(), String>
+    {
+        let bindings = json!({
+            "contractVersion": "steward.source-repository-bindings/v1",
+            "bindings": [{
+                "caller": {"ownerId": "300", "repositoryId": "400"},
+                "source": {"ownerId": "100", "repositoryId": "200"}
+            }]
+        })
+        .to_string();
+        let mut config = config()?;
+        config = config.with_task_api(
+            TaskApiConfig::default()
+                .with_source_repository_bindings_json(Some(&bindings))?
+                .with_git_hosting_plane(DescriptionlessPlane),
+        );
+        let broker = FakeBroker::default();
+        let (auth, cookie, _) = signed_in_cookie_and_csrf().await?;
+        let app = protected_router(FakeLedger::default(), broker.clone(), config, auth);
+
+        for expected_calls in 1..=2 {
+            let (status, _, body) = list(&app, &cookie, "").await?;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["source"], "connection");
+            assert_eq!(body["login"], "alice");
+            assert_eq!(governed_calls(&broker)?, expected_calls);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_query_keeps_the_governed_listing() -> Result<(), String> {
+        let source_app =
+            FakeSourceApp::resolving(vec![description("example-org", "100", "service-a", "200")?]);
+        let (app, cookie, _, _, broker) = admitted_app(&source_app, &[("100", "200")]).await?;
+
+        let (status, _, body) = list(&app, &cookie, "?query=org%3Aexample-org").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "connection");
+        assert_eq!(body["login"], "alice");
+        assert_eq!(source_app.call_count()?, 0);
+        let calls = broker.calls.lock().map_err(|_| "lock broker calls")?;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request["query"], "org:example-org");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blank_listing_without_github_source_keeps_the_governed_listing() -> Result<(), String>
+    {
+        let broker = FakeBroker::default();
+        let (auth, cookie, _) = signed_in_cookie_and_csrf().await?;
+        let app = protected_router(FakeLedger::default(), broker.clone(), config()?, auth);
+
+        let (status, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(unresolved, None);
+        assert_eq!(body["source"], "connection");
+        assert_eq!(body["login"], "alice");
+        assert_eq!(body["repositories"][1]["ready"], false);
+        assert_eq!(governed_calls(&broker)?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_app_without_bindings_keeps_the_governed_listing() -> Result<(), String> {
+        let source_app = FakeSourceApp::default();
+        let mut config = config()?;
+        config = config
+            .with_task_api(TaskApiConfig::default().with_git_hosting_plane(source_app.clone()));
+        let broker = FakeBroker::default();
+        let (auth, cookie, _) = signed_in_cookie_and_csrf().await?;
+        let app = protected_router(FakeLedger::default(), broker.clone(), config, auth);
+
+        let (status, _, body) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "connection");
+        assert_eq!(source_app.call_count()?, 0);
+        assert_eq!(governed_calls(&broker)?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admitted_listing_is_paged_and_keeps_request_bounds() -> Result<(), String> {
+        let source_app = FakeSourceApp::resolving(vec![
+            description("example-org", "100", "repo-a", "200")?,
+            description("example-org", "100", "repo-b", "201")?,
+            description("example-org", "100", "repo-c", "202")?,
+        ]);
+        let (app, cookie, _, _, _) = admitted_app(
+            &source_app,
+            &[("100", "200"), ("100", "201"), ("100", "202")],
+        )
+        .await?;
+
+        let (_, _, first) = list(&app, &cookie, "?page=1&perPage=2").await?;
+        assert_eq!(listed_names(&first), ["repo-a", "repo-b"]);
+        assert_eq!(first["hasNextPage"], true);
+        let (_, _, second) = list(&app, &cookie, "?page=2&perPage=2").await?;
+        assert_eq!(second["page"], 2);
+        assert_eq!(listed_names(&second), ["repo-c"]);
+        assert_eq!(second["hasNextPage"], false);
+        let (_, _, beyond) = list(&app, &cookie, "?page=9&perPage=2").await?;
+        assert_eq!(beyond["repositories"], json!([]));
+        assert_eq!(beyond["hasNextPage"], false);
+        for invalid in ["?perPage=101", "?perPage=0", "?page=0"] {
+            let (status, _, _) = list(&app, &cookie, invalid).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+        }
+        assert_eq!(source_app.call_count()?, 1);
         Ok(())
     }
 }
