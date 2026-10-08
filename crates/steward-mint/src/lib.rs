@@ -23,7 +23,7 @@ pub use steward_ports::{
     SvidAssertion, SvidValidationError, ValidatedWorkload, WorkloadIdentity as SvidValidator,
 };
 use steward_types::{
-    AgentRuntime, CanonicalAuthorityBinding, Phase, Principal, RuntimeId, ToolGrant,
+    AgentRuntime, CanonicalAuthorityBinding, ModelRef, Phase, Principal, RuntimeId, ToolGrant,
 };
 use uuid::Uuid;
 
@@ -81,6 +81,7 @@ pub struct AuthorityBinding {
     pub runtime_namespace: String,
     pub principal: Principal,
     pub canonical_authority: Option<CanonicalAuthorityBinding>,
+    pub llms: Vec<ModelRef>,
     pub tools: Vec<ToolGrant>,
     pub state: AuthorityState,
 }
@@ -129,6 +130,7 @@ pub fn authority_from_runtime_refs(
         runtime_namespace,
         principal: runtime.spec.principal.clone(),
         canonical_authority: runtime.spec.canonical_authority.clone(),
+        llms: runtime.spec.llms.clone(),
         tools: runtime.spec.tools.clone(),
         state: authority_state(runtime.metadata.deletion_timestamp.is_some(), phase),
     })
@@ -188,6 +190,58 @@ pub trait CredentialGrantResolver: Send + Sync + 'static {
         scope: &[String],
         authority: &AuthorityBinding,
     ) -> impl Future<Output = Result<CredentialGrant, MintError>> + Send;
+}
+
+/// Retrieves a managed inference credential for one verified canonical owner.
+///
+/// Implementations must fail closed when the stored credential is absent, disabled, or belongs
+/// to a different canonical owner. The returned token deliberately cannot be logged or formatted.
+pub trait ManagedInferenceCredentialSource: Send + Sync + 'static {
+    fn resolve(
+        &self,
+        owner_user_id: &steward_types::CanonicalUserId,
+    ) -> impl Future<Output = Result<Option<OpaqueAccessToken>, MintError>> + Send;
+}
+
+#[derive(Clone)]
+pub struct ManagedCredentialGrantResolver<S> {
+    source: S,
+}
+
+impl<S> ManagedCredentialGrantResolver<S> {
+    pub fn new(source: S) -> Self {
+        Self { source }
+    }
+}
+
+impl<S> CredentialGrantResolver for ManagedCredentialGrantResolver<S>
+where
+    S: ManagedInferenceCredentialSource,
+{
+    async fn resolve(
+        &self,
+        scope: &[String],
+        authority: &AuthorityBinding,
+    ) -> Result<CredentialGrant, MintError> {
+        if scope != ["inference"] {
+            return Ok(CredentialGrant::NotHandled);
+        }
+        if authority.llms.is_empty() {
+            return Err(MintError::CredentialUnavailable);
+        }
+        let canonical_authority = authority
+            .canonical_authority
+            .as_ref()
+            .ok_or(MintError::CredentialUnavailable)?;
+        if canonical_authority.acting_user_id.as_ref() != Some(&canonical_authority.owner_user_id) {
+            return Err(MintError::CredentialUnavailable);
+        }
+        self.source
+            .resolve(&canonical_authority.owner_user_id)
+            .await?
+            .map(CredentialGrant::AccessToken)
+            .ok_or(MintError::CredentialUnavailable)
+    }
 }
 
 pub struct NoCredentialGrantResolver;

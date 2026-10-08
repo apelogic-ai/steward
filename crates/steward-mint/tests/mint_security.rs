@@ -12,12 +12,13 @@ use serde::Deserialize;
 use steward_mint::{
     AuthenticatedControlPlaneWorkload, AuthorityBinding, AuthorityResolver, AuthorityState,
     ControlPlaneMintConfig, ControlPlaneTokenRequest, CredentialGrant, CredentialGrantResolver,
-    DEFAULT_AUTHORITY_TTL, Hop1Token, IntrospectionClientCredential, Mint, MintConfig,
+    DEFAULT_AUTHORITY_TTL, Hop1Token, IntrospectionClientCredential,
+    ManagedCredentialGrantResolver, ManagedInferenceCredentialSource, Mint, MintConfig,
     MintConfigError, MintError, MintSigningKey, OpaqueAccessToken, SPIFFE_CLIENT_ASSERTION_TYPE,
     SvidAssertion, SvidValidationError, SvidValidator, TokenGrantRequest, ValidatedWorkload,
 };
 use steward_types::{
-    CanonicalAuthorityBinding, CanonicalUserId, Email, Principal, RuntimeId, ToolGrant,
+    CanonicalAuthorityBinding, CanonicalUserId, Email, ModelRef, Principal, RuntimeId, ToolGrant,
 };
 
 const EXPECTED_WORKLOAD: &str = "spiffe://example.org/agent/runtime-a";
@@ -101,9 +102,155 @@ fn active_binding() -> Result<AuthorityBinding, String> {
             acting_user: Email("alice@example.com".to_owned()),
         },
         canonical_authority: Some(person_authority()?),
+        llms: vec![ModelRef {
+            provider: "openai".to_owned(),
+            model: "gpt-test".to_owned(),
+        }],
         tools: Vec::new(),
         state: AuthorityState::Active,
     })
+}
+
+#[derive(Clone)]
+struct FixedManagedCredentialSource {
+    calls: Arc<AtomicUsize>,
+    expected_owner: CanonicalUserId,
+    outcome: Result<Option<&'static str>, MintError>,
+}
+
+impl ManagedInferenceCredentialSource for FixedManagedCredentialSource {
+    async fn resolve(
+        &self,
+        owner_user_id: &CanonicalUserId,
+    ) -> Result<Option<OpaqueAccessToken>, MintError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if owner_user_id != &self.expected_owner {
+            return Err(MintError::WorkloadMismatch);
+        }
+        match self.outcome.clone()? {
+            Some(token) => OpaqueAccessToken::new(token.to_owned())
+                .map(Some)
+                .map_err(|_| MintError::CredentialUnavailable),
+            None => Ok(None),
+        }
+    }
+}
+
+fn managed_resolver(
+    expected_owner: CanonicalUserId,
+    outcome: Result<Option<&'static str>, MintError>,
+) -> (
+    ManagedCredentialGrantResolver<FixedManagedCredentialSource>,
+    Arc<AtomicUsize>,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    (
+        ManagedCredentialGrantResolver::new(FixedManagedCredentialSource {
+            calls: calls.clone(),
+            expected_owner,
+            outcome,
+        }),
+        calls,
+    )
+}
+
+#[tokio::test]
+async fn managed_inference_rejects_authority_without_a_canonical_owner() -> Result<(), String> {
+    let (resolver, calls) = managed_resolver(
+        canonical_user_id()?,
+        Ok(Some("sk-steward-test-managed-key")),
+    );
+    let mut binding = active_binding()?;
+    binding.canonical_authority = None;
+
+    let result = resolver.resolve(&["inference".to_owned()], &binding).await;
+
+    assert!(matches!(result, Err(MintError::CredentialUnavailable)));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_inference_rejects_a_missing_owner_credential() -> Result<(), String> {
+    let (resolver, calls) = managed_resolver(canonical_user_id()?, Ok(None));
+
+    let result = resolver
+        .resolve(&["inference".to_owned()], &active_binding()?)
+        .await;
+
+    assert!(matches!(result, Err(MintError::CredentialUnavailable)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_inference_does_not_handle_non_inference_scopes() -> Result<(), String> {
+    let (resolver, calls) = managed_resolver(
+        canonical_user_id()?,
+        Ok(Some("sk-steward-test-managed-key")),
+    );
+
+    let result = resolver
+        .resolve(&["tools".to_owned()], &active_binding()?)
+        .await
+        .map_err(|error| format!("non-inference scope must not fail: {error:?}"))?;
+
+    assert!(matches!(result, CredentialGrant::NotHandled));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_inference_propagates_owner_mismatch() -> Result<(), String> {
+    let other_owner = CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789")
+        .map_err(|_| "alternate canonical-user fixture must be valid".to_owned())?;
+    let (resolver, calls) = managed_resolver(other_owner, Ok(Some("sk-steward-test-managed-key")));
+
+    let result = resolver
+        .resolve(&["inference".to_owned()], &active_binding()?)
+        .await;
+
+    assert!(matches!(result, Err(MintError::WorkloadMismatch)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_inference_rejects_runtime_without_model_authority() -> Result<(), String> {
+    let (resolver, calls) = managed_resolver(
+        canonical_user_id()?,
+        Ok(Some("sk-steward-test-managed-key")),
+    );
+    let mut binding = active_binding()?;
+    binding.llms.clear();
+
+    let result = resolver.resolve(&["inference".to_owned()], &binding).await;
+
+    assert!(matches!(result, Err(MintError::CredentialUnavailable)));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "model-less authority must fail before credential lookup"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_inference_returns_credential_for_verified_owner_and_model_authority()
+-> Result<(), String> {
+    let (resolver, calls) = managed_resolver(
+        canonical_user_id()?,
+        Ok(Some("sk-steward-test-managed-key")),
+    );
+
+    let result = resolver
+        .resolve(&["inference".to_owned()], &active_binding()?)
+        .await
+        .map_err(|error| format!("managed credential must resolve: {error:?}"))?;
+
+    assert!(matches!(result, CredentialGrant::AccessToken(_)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    Ok(())
 }
 
 fn binding_with_tool() -> Result<AuthorityBinding, String> {

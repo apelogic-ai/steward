@@ -43,6 +43,7 @@ fn active_user_binding() -> Result<AuthorityBinding, String> {
             acting_user: Email("alice@example.com".to_owned()),
         },
         canonical_authority: Some(person_authority()?),
+        llms: Vec::new(),
         tools: Vec::new(),
         state: AuthorityState::Active,
     })
@@ -108,6 +109,7 @@ impl AuthorityResolver for FixedResolver {
                         acting_user: Email("alice@example.com".to_owned()),
                     },
                     canonical_authority: Some(canonical_authority),
+                    llms: Vec::new(),
                     tools: Vec::new(),
                     state: AuthorityState::Active,
                 }),
@@ -507,6 +509,7 @@ impl AuthorityResolver for RevocableResolver {
                         acting_user: Email("alice@example.com".to_owned()),
                     },
                     canonical_authority: Some(canonical_authority),
+                    llms: Vec::new(),
                     tools: Vec::new(),
                     state,
                 }),

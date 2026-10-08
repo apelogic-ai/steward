@@ -65,6 +65,10 @@ fn authority() -> Result<AuthorityBinding, String> {
             acting_user: Some(Email::parse(EMAIL)?),
         },
         canonical_authority: Some(CanonicalAuthorityBinding::new(user.clone(), Some(user))?),
+        llms: vec![steward_types::ModelRef {
+            provider: "openai".to_owned(),
+            model: "gpt-test".to_owned(),
+        }],
         tools: vec![ToolGrant {
             provider: "github".to_owned(),
             resource: "get_file_contents".to_owned(),
