@@ -152,11 +152,24 @@ struct BrowserTaskPreAdmission {
     execution_binding: TaskExecutionBinding,
 }
 
+/// `(index, result)` pairs in completion order, at most one per requested repository.
+pub(crate) type DescribedRepositories<'a> = std::pin::Pin<
+    Box<
+        dyn futures::Stream<
+                Item = (
+                    usize,
+                    Result<GitRepositoryDescription, steward_ports::PortError>,
+                ),
+            > + Send
+            + 'a,
+    >,
+>;
+
 trait DirectGitResolver: Send + Sync {
     fn describe_repositories<'a>(
         &'a self,
         repositories: &'a [GitRepositoryReference],
-    ) -> BoxFuture<'a, Vec<Result<GitRepositoryDescription, steward_ports::PortError>>>;
+    ) -> DescribedRepositories<'a>;
 
     fn resolve_repository<'a>(
         &'a self,
@@ -184,7 +197,7 @@ where
     fn describe_repositories<'a>(
         &'a self,
         repositories: &'a [GitRepositoryReference],
-    ) -> BoxFuture<'a, Vec<Result<GitRepositoryDescription, steward_ports::PortError>>> {
+    ) -> DescribedRepositories<'a> {
         Box::pin(GitHostingPlane::describe_repositories(self, repositories))
     }
 
@@ -404,8 +417,7 @@ impl TaskApiConfig {
     pub(crate) fn describe_admitted_source_repositories<'a>(
         &'a self,
         repositories: &'a [GitRepositoryReference],
-    ) -> Option<BoxFuture<'a, Vec<Result<GitRepositoryDescription, steward_ports::PortError>>>>
-    {
+    ) -> Option<DescribedRepositories<'a>> {
         self.direct_git_resolver
             .as_ref()
             .map(|resolver| resolver.describe_repositories(repositories))

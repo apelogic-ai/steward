@@ -112,13 +112,15 @@ What that lists depends on the deployment (unreleased; after 0.3.12):
   source GitHub App, with a token scoped to that repository and only `metadata: read`.
   No governed operation or sandbox runs, and the response has `source: "admitted"` and
   an empty `login`. Every entry is `ready: true`. The result is cached in process for
-  10 minutes and refreshed by the first request after that. If the App resolves only
-  some repositories, the response lists those, and the
+  10 minutes. After that the cached listing is still served at once while one
+  background refresh revalidates it; a refresh that fails keeps the previous entries.
+  If the App resolves only some repositories, the response lists those, and the
   `x-steward-unresolved-repositories` header counts the rest; only the unresolved ones
-  are retried, at most every 30 seconds. If it resolves none, the request fails with
-  HTTP 503 and `reason: "source_app_unavailable"`, and requests in the next 5 seconds
-  share that result. It does not fall back to the per-user listing. The source App
-  installation must include each admitted repository.
+  are retried, at most every 30 seconds. Only when no listing has ever resolved does
+  the request fail, with HTTP 503 and `reason: "source_app_unavailable"`; requests in
+  the next 5 seconds share that result. It does not fall back to the per-user listing,
+  except when the configured hosting plane cannot describe repositories at all. The
+  source App installation must include each admitted repository.
   This listing does not need or reflect the user's GitHub connection, and the user's own
   repositories that are not admitted no longer appear in it.
 - **`githubSource` disabled, or no bindings.** Steward lists the repositories owned by

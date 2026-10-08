@@ -292,11 +292,13 @@ accept caller-uploaded package bytes. After 0.3.12 (unreleased), the apiserver
 also uses it to list the admitted source repositories for the browser: with
 at least one binding, a blank `GET /app/api/v1/github/repositories` query
 resolves each distinct bound source repository ID through the App, using a
-token scoped to that repository with only `metadata: read`, and caches the
-result in process for 10 minutes. The App installation must include each
+token scoped to that repository with only `metadata: read` and revoked after
+its one read, and caches the result in process for 10 minutes, revalidating it
+in the background. The App installation must include each
 admitted repository; it needs no additional permission. A repository it cannot
 resolve is omitted and counted in the `x-steward-unresolved-repositories`
-response header; if none resolves, the listing returns HTTP 503 with reason
+response header; a failed refresh keeps the previously resolved entries. Only
+when none has ever resolved does the listing return HTTP 503 with reason
 `source_app_unavailable`. This lists only operator-configured repositories to
 authenticated users and grants nothing; publication and dispatch still use the
 governed connection.

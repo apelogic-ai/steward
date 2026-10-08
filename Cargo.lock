@@ -4007,6 +4007,7 @@ dependencies = [
  "async-stream",
  "axum",
  "base64",
+ "futures",
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
@@ -4123,6 +4124,7 @@ dependencies = [
 name = "steward-ports"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "serde",
  "steward-types",
 ]

@@ -475,9 +475,9 @@ ready**, add its stable source IDs. If a repository the user owns is absent from
 per-user listing, first check OAuth App access rather than widening Steward authority.
 If an admitted repository is absent from the default admitted listing, check that its
 IDs are in `githubSource.bindings` and that the source App installation includes it;
-the apiserver log line beginning `admitted repository listing:` names each unresolved
-repository ID and the reason, and the response header
-`x-steward-unresolved-repositories` counts them.
+the apiserver log line beginning `admitted repository listing:` counts the unresolved
+repositories and names up to five of their IDs with the reason, and the response
+header `x-steward-unresolved-repositories` counts them.
 
 This path binds the generated Helm values and execution binding to the verified
 destination artifacts. Manual values assembly remains possible, but it must

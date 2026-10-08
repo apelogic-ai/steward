@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures::{StreamExt as _, stream};
+use futures::{Stream, StreamExt as _, stream};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::{Client, Response, StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -471,10 +471,24 @@ impl GitHubSourceAdapter {
                 owners.insert(account.id, installation.id);
             }
             if count < INSTALLATIONS_PER_PAGE {
-                break;
+                return Ok(owners);
             }
         }
-        Ok(owners)
+        Err(rejected(
+            "GitHub App installation listing exceeds the supported bound",
+        ))
+    }
+
+    /// Best-effort revocation of a short-lived token once its single read is done.
+    async fn revoke_installation_token(&self, token: &SecretValue) {
+        let _ = self
+            .client
+            .delete(format!("{}/installation/token", self.api_origin))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .bearer_auth(token.expose())
+            .send()
+            .await;
     }
 
     async fn describe_repository(
@@ -516,7 +530,7 @@ impl GitHubSourceAdapter {
             )
             .await?;
         let token = validate_metadata_token(token_response, repository_id)?;
-        let metadata: RepositoryListingMetadata = self
+        let metadata: Result<RepositoryListingMetadata, PortError> = self
             .get_json(
                 &format!("{}/repositories/{repository_id}", self.api_origin),
                 &token,
@@ -524,37 +538,47 @@ impl GitHubSourceAdapter {
                 METADATA_RESPONSE_BYTES,
                 "read GitHub repository metadata",
             )
-            .await?;
-        repository_description(metadata, owner_id, repository_id, &self.clone_origin)
+            .await;
+        self.revoke_installation_token(&token).await;
+        repository_description(metadata?, owner_id, repository_id, &self.clone_origin)
     }
 }
 
 impl GitHostingPlane for GitHubSourceAdapter {
-    async fn describe_repositories(
-        &self,
-        repositories: &[GitRepositoryReference],
-    ) -> Vec<Result<GitRepositoryDescription, PortError>> {
-        if repositories.is_empty() {
-            return Vec::new();
-        }
-        let prepared = async {
-            let assertion = self.assertion_issuer.issue()?;
-            let installations = self.installations_by_owner(&assertion).await?;
-            Ok::<_, PortError>((assertion, installations))
-        }
-        .await;
-        let (assertion, installations) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => return repositories.iter().map(|_| Err(error.clone())).collect(),
-        };
-        let descriptions: Vec<_> = repositories
-            .iter()
-            .map(|reference| self.describe_repository(reference, &installations, &assertion))
-            .collect();
-        stream::iter(descriptions)
-            .buffered(DESCRIBE_CONCURRENCY)
-            .collect()
-            .await
+    fn describe_repositories<'a>(
+        &'a self,
+        repositories: &'a [GitRepositoryReference],
+    ) -> impl Stream<Item = (usize, Result<GitRepositoryDescription, PortError>)> + Send + 'a {
+        stream::once(async move {
+            // Installations are listed once per resolution, not once per repository.
+            let prepared = async {
+                let assertion = self.assertion_issuer.issue()?;
+                let installations = self.installations_by_owner(&assertion).await?;
+                Ok::<_, PortError>(Arc::new((assertion, installations)))
+            }
+            .await;
+            match prepared {
+                Err(error) => stream::iter(
+                    (0..repositories.len()).map(move |index| (index, Err(error.clone()))),
+                )
+                .left_stream(),
+                Ok(prepared) => stream::iter(repositories.iter().enumerate())
+                    .map(move |(index, reference)| {
+                        let prepared = Arc::clone(&prepared);
+                        async move {
+                            let (assertion, installations) = prepared.as_ref();
+                            (
+                                index,
+                                self.describe_repository(reference, installations, assertion)
+                                    .await,
+                            )
+                        }
+                    })
+                    .buffer_unordered(DESCRIBE_CONCURRENCY)
+                    .right_stream(),
+            }
+        })
+        .flatten()
     }
 
     async fn resolve_repository(
@@ -1061,6 +1085,7 @@ mod tests {
         thread,
     };
 
+    use futures::StreamExt as _;
     use serde_json::json;
     use steward_ports::{
         GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRepositoryReference,
@@ -1681,6 +1706,47 @@ mod tests {
         }))
     }
 
+    async fn describe(
+        adapter: &GitHubSourceAdapter,
+        references: &[GitRepositoryReference],
+    ) -> Vec<Result<steward_ports::GitRepositoryDescription, PortError>> {
+        let mut described = adapter
+            .describe_repositories(references)
+            .collect::<Vec<_>>()
+            .await;
+        described.sort_by_key(|(index, _)| *index);
+        assert_eq!(
+            described
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            (0..references.len()).collect::<Vec<_>>(),
+            "every reference yields exactly one result"
+        );
+        described.into_iter().map(|(_, result)| result).collect()
+    }
+
+    #[tokio::test]
+    async fn installation_listing_beyond_its_bound_is_a_distinct_failure() -> Result<(), String> {
+        let full_page = |page: u64| {
+            ResponseSpec::json(serde_json::Value::Array(
+                (0..100)
+                    .map(|index| {
+                        json!({"id": page * 1000 + index + 1, "account": {"id": page * 1000 + index + 1}})
+                    })
+                    .collect(),
+            ))
+        };
+        let mock = MockGitHub::start((1..=10).map(full_page).collect())?;
+        let described = describe(&adapter(&mock)?, &[reference("1000", "1001")?]).await;
+        assert_rejected(
+            described[0].clone(),
+            "GitHub App installation listing exceeds the supported bound",
+        );
+        assert_eq!(mock.finish()?.len(), 10);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn describes_admitted_repositories_by_stable_identity() -> Result<(), String> {
         let mock = MockGitHub::start(vec![
@@ -1690,10 +1756,13 @@ mod tests {
             ])),
             metadata_token(1001),
             listing_metadata(1001, 1000, &format!("{CLONE_ORIGIN}/example-org/source-a")),
+            ResponseSpec::status(204, ""),
         ])?;
-        let described = adapter(&mock)?
-            .describe_repositories(&[reference("1000", "1001")?, reference("3000", "3001")?])
-            .await;
+        let described = describe(
+            &adapter(&mock)?,
+            &[reference("1000", "1001")?, reference("3000", "3001")?],
+        )
+        .await;
         assert_eq!(described.len(), 2);
         let first = port(described[0].clone())?;
         assert_eq!(first.owner, "example-org");
@@ -1712,7 +1781,7 @@ mod tests {
         );
 
         let requests = mock.finish()?;
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
         assert!(requests[0].starts_with("GET /app/installations?per_page=100&page=1 "));
         assert!(requests[0].contains("authorization: Bearer fixture-app-assertion"));
         assert!(requests[1].starts_with("POST /app/installations/7001/access_tokens "));
@@ -1721,6 +1790,8 @@ mod tests {
         assert!(!requests[1].contains("contents"));
         assert!(requests[2].starts_with("GET /repositories/1001 "));
         assert!(requests[2].contains("authorization: Bearer fixture-metadata-value"));
+        assert!(requests[3].starts_with("DELETE /installation/token "));
+        assert!(requests[3].contains("authorization: Bearer fixture-metadata-value"));
         Ok(())
     }
 
@@ -1737,10 +1808,9 @@ mod tests {
                 ResponseSpec::json(json!([{"id": 7001, "account": {"id": 1000}}])),
                 metadata_token(1001),
                 listing_metadata(1001, owner_id, &url),
+                ResponseSpec::status(204, ""),
             ])?;
-            let described = adapter(&mock)?
-                .describe_repositories(&[reference("1000", "1001")?])
-                .await;
+            let described = describe(&adapter(&mock)?, &[reference("1000", "1001")?]).await;
             assert_eq!(described.len(), 1);
             assert!(matches!(described[0], Err(PortError::Rejected { .. })));
             mock.finish()?;
@@ -1754,9 +1824,7 @@ mod tests {
             ResponseSpec::json(json!([{"id": 7001, "account": {"id": 1000}}])),
             metadata_token(1002),
         ])?;
-        let described = adapter(&mock)?
-            .describe_repositories(&[reference("1000", "1001")?])
-            .await;
+        let described = describe(&adapter(&mock)?, &[reference("1000", "1001")?]).await;
         assert_rejected(
             described[0].clone(),
             "GitHub returned an invalid repository-scoped metadata token",
@@ -1768,9 +1836,11 @@ mod tests {
     #[tokio::test]
     async fn installation_listing_failure_fails_every_description() -> Result<(), String> {
         let mock = MockGitHub::start(vec![ResponseSpec::status(500, "fixture-provider-body")])?;
-        let described = adapter(&mock)?
-            .describe_repositories(&[reference("1000", "1001")?, reference("1000", "1002")?])
-            .await;
+        let described = describe(
+            &adapter(&mock)?,
+            &[reference("1000", "1001")?, reference("1000", "1002")?],
+        )
+        .await;
         assert_eq!(described.len(), 2);
         assert!(described.iter().all(|result| matches!(
             result,
@@ -1792,10 +1862,9 @@ mod tests {
             ResponseSpec::json(json!([{"id": 7001, "account": {"id": 1000}}])),
             metadata_token(1001),
             listing_metadata(1001, 1000, &format!("{CLONE_ORIGIN}/example-org/source-a")),
+            ResponseSpec::status(204, ""),
         ])?;
-        let described = adapter(&mock)?
-            .describe_repositories(&[reference("1000", "1001")?])
-            .await;
+        let described = describe(&adapter(&mock)?, &[reference("1000", "1001")?]).await;
         assert_eq!(port(described[0].clone())?.repository_id.as_str(), "1001");
         let requests = mock.finish()?;
         assert!(requests[0].starts_with("GET /app/installations?per_page=100&page=1 "));

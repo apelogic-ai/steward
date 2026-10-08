@@ -10,6 +10,7 @@ version.workspace = true
 async-stream.workspace = true
 axum.workspace = true
 base64.workspace = true
+futures.workspace = true
 jsonwebtoken.workspace = true
 k8s-openapi.workspace = true
 kube = { workspace = true, features = ["client", "ring", "rustls-tls"] }

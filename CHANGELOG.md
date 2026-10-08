@@ -18,7 +18,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   for a sandbox. The apiserver resolves each distinct bound source repository
   ID through the source GitHub App: it lists the App's installations, mints a
   token scoped to that one repository with only `metadata: read`, and reads
-  `GET /repositories/{id}`. Every entry passes the governed listing's per-field
+  `GET /repositories/{id}`, then revokes that token. Every entry passes the governed listing's per-field
   validation and bounds, must match its bound owner and repository IDs, and is
   marked `ready: true`. The `login` field is empty for this listing, because it
   does not consult the user's GitHub connection.
@@ -31,22 +31,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   operation, so it writes no governed-operation record; workflow detection,
   publication, dispatch and run status still do.
 - The admitted listing is cached in process for 10 minutes per binding
-  configuration and refreshed lazily by the first request after expiry; one
-  request resolves while concurrent requests wait for its result. Each full
-  resolution costs at least one installation-list call per 50 admitted
-  repositories plus two GitHub API calls per admitted repository.
+  configuration. After that, requests are still served the cached listing at
+  once while one detached background refresh revalidates it
+  (stale-while-revalidate); a cancelled request never cancels a refresh. Only
+  the first listing after startup waits, and concurrent requests share that
+  one resolution. Each full resolution lists the App's installations once (up
+  to 10 pages of 100; more installations fail with a distinct error) and then
+  makes three GitHub API calls per admitted repository: mint, read, and revoke.
 - If the App resolves some admitted repositories but not others, the response
   lists those it resolved and carries their count in the
   `x-steward-unresolved-repositories` header. Only the unresolved repositories
-  are retried, at most every 30 seconds. If it resolves none, the request fails
-  with HTTP 503, `error: "github_automation_unavailable"` and
+  are retried, at most every 30 seconds. A refresh that fails, wholly or in
+  part, keeps every previously resolved entry; a wholly failed refresh is
+  retried after 30 seconds. Only when no listing has ever resolved does the
+  request fail with HTTP 503, `error: "github_automation_unavailable"` and
   `reason: "source_app_unavailable"`, rather than falling back to the slower
   per-user listing; requests in the following 5 seconds share that failure
-  instead of repeating it. Resolution runs in chunks of 50 under a 30-second
-  deadline; chunks still pending at the deadline count as unresolved. Each
-  resolution with unresolved repositories logs one apiserver line beginning
-  `admitted repository listing:` with up to five repository IDs and their
-  fixed reasons; no token is logged.
+  instead of repeating it. One resolution has a 30-second deadline, and every
+  repository that finished before it is kept; only those still pending count
+  as unresolved. Each resolution with unresolved repositories logs one
+  apiserver line beginning `admitted repository listing:` with the count and
+  up to five repository IDs with their fixed reasons; no token is logged.
+- A Git hosting plane that cannot describe repositories (the port's default)
+  keeps the governed per-user listing for a blank query, as before.
 - The governed per-user listing is unchanged for an explicit search `query`,
   and for a blank query when `githubSource` is disabled or has no bindings.
 - `GithubRepositoriesResponse` gains an optional `source` field:

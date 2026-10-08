@@ -2,6 +2,8 @@
 
 use std::future::Future;
 
+use futures::Stream;
+
 use steward_types::direct_package::{
     DiagnosticsRequest, ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
 };
@@ -555,22 +557,22 @@ pub struct GitRepositoryDescription {
 pub trait GitHostingPlane: Send + Sync + 'static {
     /// Resolves display metadata for each stable repository reference.
     ///
-    /// The result has one entry per request entry, in request order, so one unresolvable
-    /// repository does not hide the others. The default implementation supports nothing.
-    fn describe_repositories(
-        &self,
-        repositories: &[GitRepositoryReference],
-    ) -> impl Future<Output = Vec<Result<GitRepositoryDescription, PortError>>> + Send {
-        let count = repositories.len();
-        async move {
-            (0..count)
-                .map(|_| {
-                    Err(PortError::Unsupported {
-                        operation: "describe_repositories",
-                    })
-                })
-                .collect()
-        }
+    /// Yields `(index, result)` pairs in completion order, at most one per request entry,
+    /// so a caller can keep finished results when a deadline cuts the stream short and one
+    /// unresolvable repository does not hide the others. The default implementation
+    /// supports nothing and yields `Unsupported` for every entry.
+    fn describe_repositories<'a>(
+        &'a self,
+        repositories: &'a [GitRepositoryReference],
+    ) -> impl Stream<Item = (usize, Result<GitRepositoryDescription, PortError>)> + Send + 'a {
+        futures::stream::iter((0..repositories.len()).map(|index| {
+            (
+                index,
+                Err(PortError::Unsupported {
+                    operation: "describe_repositories",
+                }),
+            )
+        }))
     }
 
     fn resolve_repository(
