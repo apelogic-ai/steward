@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.12` and application `0.3.12`.
+Current release contract: chart `0.3.13` and application `0.3.13`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -288,7 +288,7 @@ name and key containing its PEM private key, and at least one
 `networkPolicy.githubApiCidrs` entry while NetworkPolicy is enabled. The private
 key is mounted read-only and its bytes never enter Helm values or an environment
 variable. Steward uses the App to resolve exact Git objects; it does not
-accept caller-uploaded package bytes. After 0.3.12 (unreleased), the apiserver
+accept caller-uploaded package bytes. Starting in 0.3.13, the apiserver
 also uses it to list the admitted source repositories for the browser: with
 at least one binding, a blank `GET /app/api/v1/github/repositories` query
 resolves each distinct bound source repository ID through the App, using a

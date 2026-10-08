@@ -104,7 +104,7 @@ and records that exact model in the package requirements.
 
 After an inline run succeeds, its detail page offers **Publish this task to GitHub**.
 The browser sends a blank repository query to `GET /app/api/v1/github/repositories`.
-What that lists depends on the deployment (unreleased; after 0.3.12):
+Starting in 0.3.13, what that lists depends on the deployment:
 
 - **`githubSource` enabled with at least one binding.** Steward lists the admitted
   source repositories, the distinct sources in `githubSource.bindings`, including
@@ -183,7 +183,7 @@ Steward has a metrics mechanism.
 
 ## First-run prerequisite failures
 
-The 0.3.12 first-run path fails before creating a Task or runtime when a required
+The 0.3.13 first-run path fails before creating a Task or runtime when a required
 deployment or identity prerequisite is absent. Use the following exact signals; do
 not diagnose these cases as generic database, Kubernetes, or credential failures.
 

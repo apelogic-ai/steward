@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.3.12`. The release workflow pulls the published OCI
+Release contract: chart `0.3.13`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -461,11 +461,10 @@ User Envelope failure.
 
 To enable browser publication after a successful inline run, the same repository must
 also be admitted by stable owner and repository IDs in `githubSource.bindings`, and
-the governed connection must be able to reach it. In 0.3.12 the browser lists only
-the user's own repositories; organization-owned repositories are not listed by default
-and are reachable only through an explicit `query` to
-`GET /app/api/v1/github/repositories`. After 0.3.12 (unreleased), with `githubSource`
-enabled and bound, the browser's default listing shows the admitted source
+the governed connection must be able to reach it. In 0.3.12 the browser listed only
+the user's own repositories by default; organization-owned repositories required an
+explicit `query` to `GET /app/api/v1/github/repositories`. Starting in 0.3.13, with
+`githubSource` enabled and bound, the browser's default listing shows the admitted source
 repositories, including organization-owned ones, resolved through the source GitHub
 App; keep that App installed with access to each admitted repository. Deploy a reviewed `steward-run`
 release at v0.8.0 or later. Steward then owns the branch, two-file commit, pull request,
