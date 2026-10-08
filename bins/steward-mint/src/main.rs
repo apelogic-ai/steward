@@ -15,8 +15,7 @@ use steward_mint::{
     AuthenticatedControlPlaneWorkload, AuthorityBinding, AuthorityResolver,
     ControlPlaneClientCredential, ControlPlaneMintConfig, ControlPlaneWorkloadAuthenticator,
     CredentialGrant, CredentialGrantResolver, DEFAULT_AUTHORITY_TTL, IntrospectionClientCredential,
-    MAX_CONTROL_PLANE_AUTHORITY_TTL, ManagedCredentialGrantResolver,
-    ManagedInferenceCredentialSource, Mint, MintConfig, MintError, MintSigningKey,
+    MAX_CONTROL_PLANE_AUTHORITY_TTL, Mint, MintConfig, MintError, MintSigningKey,
     OpaqueAccessToken, ValidatedWorkload, authority_from_runtime_refs, control_plane_router,
     router,
 };
@@ -92,34 +91,41 @@ struct KubernetesCredentialGrantResolver {
 }
 
 #[derive(Clone)]
-struct PostgresManagedInferenceCredentialSource {
+struct ManagedCredentialGrantResolver {
     store: PgStore,
     cipher: ManagedInferenceKeyCipher,
 }
 
-impl ManagedInferenceCredentialSource for PostgresManagedInferenceCredentialSource {
+impl CredentialGrantResolver for ManagedCredentialGrantResolver {
     async fn resolve(
         &self,
-        owner_user_id: &steward_types::CanonicalUserId,
-    ) -> Result<Option<OpaqueAccessToken>, MintError> {
+        scope: &[String],
+        authority: &AuthorityBinding,
+    ) -> Result<CredentialGrant, MintError> {
+        if scope != ["inference"] {
+            return Ok(CredentialGrant::NotHandled);
+        }
+        let owner = authority
+            .canonical_authority
+            .as_ref()
+            .map(|binding| &binding.owner_user_id)
+            .ok_or(MintError::CredentialUnavailable)?;
         let credential = self
             .store
-            .resolve_managed_inference_credential(owner_user_id, &self.cipher)
+            .resolve_managed_inference_credential(owner, &self.cipher)
             .await
-            .map_err(|_| MintError::AuthorityUnavailable)?;
-        credential
-            .map(|credential| {
-                OpaqueAccessToken::new(credential.expose_secret().to_owned())
-                    .map_err(|_| MintError::CredentialUnavailable)
-            })
-            .transpose()
+            .map_err(|_| MintError::AuthorityUnavailable)?
+            .ok_or(MintError::CredentialUnavailable)?;
+        OpaqueAccessToken::new(credential.expose_secret().to_owned())
+            .map(CredentialGrant::AccessToken)
+            .map_err(|_| MintError::CredentialUnavailable)
     }
 }
 
 #[derive(Clone)]
 enum DeploymentCredentialGrantResolver {
     Stock(KubernetesCredentialGrantResolver),
-    Managed(ManagedCredentialGrantResolver<PostgresManagedInferenceCredentialSource>),
+    Managed(ManagedCredentialGrantResolver),
 }
 
 impl CredentialGrantResolver for DeploymentCredentialGrantResolver {
@@ -249,12 +255,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 client: client.clone(),
             })
         }
-        InferenceMode::Managed => DeploymentCredentialGrantResolver::Managed(
-            ManagedCredentialGrantResolver::new(PostgresManagedInferenceCredentialSource {
+        InferenceMode::Managed => {
+            DeploymentCredentialGrantResolver::Managed(ManagedCredentialGrantResolver {
                 store: PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?,
                 cipher: managed_inference_cipher()?,
-            }),
-        ),
+            })
+        }
     };
     let validator = SpireSvidValidator::connect_env()
         .await

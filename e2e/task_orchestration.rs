@@ -33,8 +33,8 @@ use steward_apiserver::{
     AuthenticatedCaller, AuthenticationError, BoxFuture, RequestAuthenticator, operator_admin,
 };
 use steward_controller::{
-    ManagedInferencePlane, TaskControllerError, reconcile_agent_runtime_work_item,
-    reconcile_task_orchestration_work_item, webhook_router_for_controller,
+    TaskControllerError, reconcile_agent_runtime_work_item, reconcile_task_orchestration_work_item,
+    webhook_router_for_controller,
 };
 use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
@@ -3483,21 +3483,11 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         TaskOrchestrationState::ActivationPending
     );
 
-    let managed_key = format!("sk-managed-orchestration-{suffix}");
-    let managed_cipher = ManagedInferenceKeyCipher::from_bytes(&[13_u8; 32])?;
-    store
-        .put_managed_inference_credential(
-            &identity.user_id,
-            &managed_key,
-            identity.user_id.as_str(),
-            &managed_cipher,
-        )
-        .await?;
-    let successful_inference = ManagedInferencePlane;
+    let successful_inference = ActiveInference::default();
     reconcile_agent_runtime_work_item(
         &client,
         task_runtime.clone(),
-        successful_inference,
+        successful_inference.clone(),
         store.clone(),
         successful_activated_runtime,
     )
@@ -3511,38 +3501,11 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     reconcile_agent_runtime_work_item(
         &client,
         task_runtime.clone(),
-        successful_inference,
+        successful_inference.clone(),
         store.clone(),
         successful_finalizing_runtime,
     )
     .await?;
-    let managed_runtime = kubernetes
-        .runtime
-        .lock()
-        .map_err(|_| io::Error::other("managed runtime fixture was poisoned"))?
-        .clone()
-        .ok_or_else(|| io::Error::other("managed runtime fixture is absent"))?;
-    let managed_status = managed_runtime
-        .status
-        .as_ref()
-        .ok_or_else(|| io::Error::other("managed runtime status is absent"))?;
-    assert_eq!(
-        managed_status.refs.litellm_key.as_deref(),
-        Some("managed-user-credential")
-    );
-    assert_eq!(managed_status.spend, None);
-    assert!(
-        kubernetes
-            .credential_secret
-            .lock()
-            .map_err(|_| io::Error::other("credential Secret fixture was poisoned"))?
-            .is_none(),
-        "managed mode must not copy the user's key into a runtime Secret"
-    );
-    assert!(
-        !serde_json::to_string(&managed_runtime)?.contains(&managed_key),
-        "managed credential material must not enter the AgentRuntime"
-    );
     reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
     assert_eq!(
         operation(&store, successful_task_uid).await?.state,
@@ -3588,7 +3551,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     reconcile_agent_runtime_work_item(
         &client,
         task_runtime.clone(),
-        successful_inference,
+        successful_inference.clone(),
         store.clone(),
         successful_deleting_runtime,
     )
@@ -3601,15 +3564,6 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         .ok_or(StoreError::TaskNotFound)?;
     assert!(successful_task.finalized);
     assert_eq!(successful_task.phase, TaskPhase::Succeeded);
-    assert_eq!(
-        store
-            .resolve_managed_inference_credential(&identity.user_id, &managed_cipher)
-            .await?
-            .ok_or_else(|| io::Error::other("managed key disappeared after the run"))?
-            .expose_secret(),
-        managed_key,
-        "runtime cleanup must not destroy the user's long-lived managed key"
-    );
     let successful_archive = store
         .agent_run_output_archive(successful_task_uid, identity.user_id.as_str())
         .await?

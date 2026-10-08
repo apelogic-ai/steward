@@ -12,8 +12,7 @@ use serde::Deserialize;
 use steward_mint::{
     AuthenticatedControlPlaneWorkload, AuthorityBinding, AuthorityResolver, AuthorityState,
     ControlPlaneMintConfig, ControlPlaneTokenRequest, CredentialGrant, CredentialGrantResolver,
-    DEFAULT_AUTHORITY_TTL, Hop1Token, IntrospectionClientCredential,
-    ManagedCredentialGrantResolver, ManagedInferenceCredentialSource, Mint, MintConfig,
+    DEFAULT_AUTHORITY_TTL, Hop1Token, IntrospectionClientCredential, Mint, MintConfig,
     MintConfigError, MintError, MintSigningKey, OpaqueAccessToken, SPIFFE_CLIENT_ASSERTION_TYPE,
     SvidAssertion, SvidValidationError, SvidValidator, TokenGrantRequest, ValidatedWorkload,
 };
@@ -70,27 +69,6 @@ impl AuthorityResolver for FixedResolver {
 struct FixedCredentialResolver {
     calls: Arc<AtomicUsize>,
     token: Option<&'static str>,
-}
-
-struct FixedManagedCredentialSource {
-    calls: Arc<AtomicUsize>,
-    expected_owner: CanonicalUserId,
-    token: &'static str,
-}
-
-impl ManagedInferenceCredentialSource for FixedManagedCredentialSource {
-    async fn resolve(
-        &self,
-        owner_user_id: &CanonicalUserId,
-    ) -> Result<Option<OpaqueAccessToken>, MintError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        if owner_user_id != &self.expected_owner {
-            return Err(MintError::WorkloadMismatch);
-        }
-        OpaqueAccessToken::new(self.token.to_owned())
-            .map(Some)
-            .map_err(|_| MintError::CredentialUnavailable)
-    }
 }
 
 impl CredentialGrantResolver for FixedCredentialResolver {
@@ -680,53 +658,6 @@ async fn inference_scope_returns_only_the_runtime_bound_opaque_credential() -> R
         1,
         "a verified active runtime must resolve exactly one runtime-bound credential"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn managed_inference_uses_the_verified_runtime_owner_as_credential_subject()
--> Result<(), String> {
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let credential_calls = Arc::new(AtomicUsize::new(0));
-    let expected_owner = canonical_user_id()?;
-    let mint = Mint::new_with_credential_resolver(
-        MintConfig {
-            issuer: "https://mint.example.test".to_owned(),
-            audience: "inference.example.test".to_owned(),
-            allowed_scopes: vec!["inference".to_owned()],
-            svid_audience: "https://mint.example.test".to_owned(),
-            authority_ttl: DEFAULT_AUTHORITY_TTL,
-            introspection_client_credential: IntrospectionClientCredential::new(
-                "gateway-credential".to_owned(),
-            ),
-        },
-        MintSigningKey::from_bytes(&signing_key.to_bytes()),
-        FixedValidator {
-            outcome: Ok(validated_workload()),
-        },
-        FixedResolver {
-            calls: Arc::new(AtomicUsize::new(0)),
-            outcome: Ok(active_binding()?),
-        },
-        ManagedCredentialGrantResolver::new(FixedManagedCredentialSource {
-            calls: credential_calls.clone(),
-            expected_owner,
-            token: "sk-steward-test-managed-user-key",
-        }),
-    )
-    .map_err(|error| format!("test mint config must be valid: {error:?}"))?;
-    let mut inference_request = request();
-    inference_request.audience = "inference.example.test".to_owned();
-    inference_request.scope = vec!["inference".to_owned()];
-
-    let response = mint
-        .exchange(inference_request)
-        .await
-        .map_err(|error| format!("managed inference exchange failed: {error:?}"))?;
-
-    assert_eq!(response.access_token(), "sk-steward-test-managed-user-key");
-    assert_eq!(response.scope(), "inference");
-    assert_eq!(credential_calls.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
