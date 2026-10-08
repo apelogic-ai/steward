@@ -2412,8 +2412,7 @@ mod tests {
 
     #[test]
     fn timing_query_failure_is_reported_without_becoming_a_reconcile_error() {
-        let operation_id =
-            Uuid::parse_str("00000000-0000-4000-8000-000000000305").expect("fixed operation UUID");
+        let operation_id = Uuid::from_u128(0x00000000_0000_4000_8000_000000000305);
         assert_eq!(
             connection_operation_timing_report::<()>(
                 operation_id,
