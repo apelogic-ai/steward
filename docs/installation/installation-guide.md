@@ -468,7 +468,9 @@ and are reachable only through an explicit `query` to
 release at v0.8.0 or later. Steward then owns the branch, two-file commit, pull request,
 exact-workflow verification, dispatch, and run-status operations; no GitHub token or
 workflow content belongs in Helm values. If a repository is visible but marked **Not
-ready**, add its stable source IDs. If a repository the user owns is absent, first
+admitted** (Get started) or **Not ready** (the task page's publish panel), add its stable
+source IDs; the browser caches the repository list, so the user then selects **Refresh
+repositories** in Get started or reloads the page to see the change. If a repository the user owns is absent, first
 check OAuth App access rather than widening Steward authority.
 
 This path binds the generated Helm values and execution binding to the verified

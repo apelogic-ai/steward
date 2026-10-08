@@ -16,6 +16,7 @@ import { classifyConnectionMutationFailure, type ConnectionMutationState } from 
 import { boundedConnectionPollDeadline } from "@/components/connection-poll-deadline";
 import { ConfirmationDialog, SectionCard } from "@/components/hs";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
+import { useInvalidateGithubRepositories } from "@/data/github-repositories";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
@@ -45,6 +46,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
   refresh: () => void;
 }>) {
   const session = useSession();
+  const invalidateRepositories = useInvalidateGithubRepositories();
   const startController = useRef<AbortController | null>(null);
   const [disconnectOpen, setDisconnectOpen] = useState(false);
   const [action, setAction] = useState<"idle" | "working" | "poll-expired" | ConnectionMutationState>("idle");
@@ -151,6 +153,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
         if (operation.data?.state === "succeeded" && !operation.data.authorizationUrl) {
           setDisconnectOpen(false);
           setAction("idle");
+          invalidateRepositories();
           refresh();
           return;
         }
