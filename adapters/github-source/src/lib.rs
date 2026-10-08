@@ -3,11 +3,13 @@
 use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures::{StreamExt as _, stream};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::{Client, Response, StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use steward_ports::{
-    GitFile, GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRevisionRequest, PortError,
+    GitFile, GitFileRequest, GitHostingPlane, GitRepositoryDescription, GitRepositoryIdentity,
+    GitRepositoryReference, GitRevisionRequest, PortError,
 };
 use steward_types::direct_package::{
     ExactGitCommit, MAX_PACKAGE_FILE_BYTES, RepositoryUrl, StableProviderId,
@@ -21,6 +23,9 @@ const METADATA_RESPONSE_BYTES: u64 = 1024 * 1024;
 const TREE_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const TOKEN_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_INSTALLATION_TOKEN_BYTES: usize = 4096;
+const INSTALLATIONS_PER_PAGE: usize = 100;
+const MAX_INSTALLATION_PAGES: usize = 10;
+const DESCRIBE_CONCURRENCY: usize = 8;
 
 /// GitHub App credentials. Deliberately implements neither `Debug` nor `Display`.
 pub struct GitHubAppCredentials {
@@ -431,7 +436,127 @@ impl GitHubSourceAdapter {
     }
 }
 
+impl GitHubSourceAdapter {
+    /// Maps each installation account ID to its installation ID, bounded to a fixed page count.
+    async fn installations_by_owner(
+        &self,
+        assertion: &SecretValue,
+    ) -> Result<BTreeMap<u64, u64>, PortError> {
+        let mut owners = BTreeMap::new();
+        for page in 1..=MAX_INSTALLATION_PAGES {
+            let installations: Vec<ListedInstallation> = self
+                .get_json(
+                    &format!(
+                        "{}/app/installations?per_page={INSTALLATIONS_PER_PAGE}&page={page}",
+                        self.api_origin
+                    ),
+                    assertion,
+                    Authentication::App,
+                    METADATA_RESPONSE_BYTES,
+                    "list GitHub App installations",
+                )
+                .await?;
+            let count = installations.len();
+            if count > INSTALLATIONS_PER_PAGE {
+                return Err(rejected("GitHub returned an oversized installation page"));
+            }
+            for installation in installations {
+                // GitHub documents a nullable account; such an installation owns nothing.
+                let Some(account) = installation.account else {
+                    continue;
+                };
+                if installation.id == 0 || account.id == 0 {
+                    return Err(rejected("GitHub installation identity is invalid"));
+                }
+                owners.insert(account.id, installation.id);
+            }
+            if count < INSTALLATIONS_PER_PAGE {
+                break;
+            }
+        }
+        Ok(owners)
+    }
+
+    async fn describe_repository(
+        &self,
+        reference: &GitRepositoryReference,
+        installations: &BTreeMap<u64, u64>,
+        assertion: &SecretValue,
+    ) -> Result<GitRepositoryDescription, PortError> {
+        let owner_id = reference
+            .repository_owner_id
+            .as_str()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or_else(|| rejected("GitHub repository owner identity is invalid"))?;
+        let repository_id = reference
+            .repository_id
+            .as_str()
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or_else(|| rejected("GitHub repository stable identity is invalid"))?;
+        let installation_id = installations
+            .get(&owner_id)
+            .ok_or_else(|| rejected("GitHub App is not installed for the repository owner"))?;
+        let token_response: InstallationTokenResponse = self
+            .post_json(
+                &format!(
+                    "{}/app/installations/{installation_id}/access_tokens",
+                    self.api_origin
+                ),
+                assertion,
+                &MetadataTokenRequest {
+                    repository_ids: [repository_id],
+                    permissions: MetadataPermissions { metadata: "read" },
+                },
+                TOKEN_RESPONSE_BYTES,
+                "mint repository-scoped GitHub metadata token",
+            )
+            .await?;
+        let token = validate_metadata_token(token_response, repository_id)?;
+        let metadata: RepositoryListingMetadata = self
+            .get_json(
+                &format!("{}/repositories/{repository_id}", self.api_origin),
+                &token,
+                Authentication::Installation,
+                METADATA_RESPONSE_BYTES,
+                "read GitHub repository metadata",
+            )
+            .await?;
+        repository_description(metadata, owner_id, repository_id, &self.clone_origin)
+    }
+}
+
 impl GitHostingPlane for GitHubSourceAdapter {
+    async fn describe_repositories(
+        &self,
+        repositories: &[GitRepositoryReference],
+    ) -> Vec<Result<GitRepositoryDescription, PortError>> {
+        if repositories.is_empty() {
+            return Vec::new();
+        }
+        let prepared = async {
+            let assertion = self.assertion_issuer.issue()?;
+            let installations = self.installations_by_owner(&assertion).await?;
+            Ok::<_, PortError>((assertion, installations))
+        }
+        .await;
+        let (assertion, installations) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return repositories.iter().map(|_| Err(error.clone())).collect(),
+        };
+        let descriptions: Vec<_> = repositories
+            .iter()
+            .map(|reference| self.describe_repository(reference, &installations, &assertion))
+            .collect();
+        stream::iter(descriptions)
+            .buffered(DESCRIBE_CONCURRENCY)
+            .collect()
+            .await
+    }
+
     async fn resolve_repository(
         &self,
         repository: &RepositoryUrl,
@@ -599,6 +724,40 @@ struct InstallationPermissions<'a> {
 }
 
 #[derive(Deserialize)]
+struct ListedInstallation {
+    id: u64,
+    account: Option<ProviderIdentity>,
+}
+
+#[derive(Serialize)]
+struct MetadataTokenRequest<'a> {
+    repository_ids: [u64; 1],
+    permissions: MetadataPermissions<'a>,
+}
+
+#[derive(Serialize)]
+struct MetadataPermissions<'a> {
+    metadata: &'a str,
+}
+
+#[derive(Deserialize)]
+struct RepositoryListingMetadata {
+    id: u64,
+    name: String,
+    full_name: String,
+    private: bool,
+    html_url: String,
+    default_branch: String,
+    owner: RepositoryOwner,
+}
+
+#[derive(Deserialize)]
+struct RepositoryOwner {
+    id: u64,
+    login: String,
+}
+
+#[derive(Deserialize)]
 struct InstallationTokenResponse {
     token: String,
     expires_at: String,
@@ -685,6 +844,59 @@ fn validate_installation_token(
     Ok(ScopedToken {
         value: SecretValue(response.token),
         repository_id: repository.id,
+    })
+}
+
+fn validate_metadata_token(
+    response: InstallationTokenResponse,
+    repository_id: u64,
+) -> Result<SecretValue, PortError> {
+    if response.token.is_empty()
+        || response.token.len() > MAX_INSTALLATION_TOKEN_BYTES
+        || !valid_expiration(&response.expires_at)
+        || response.permissions.len() != 1
+        || response.permissions.get("metadata").map(String::as_str) != Some("read")
+        || response.repositories.len() != 1
+        || response.repositories[0].id != repository_id
+    {
+        return Err(rejected(
+            "GitHub returned an invalid repository-scoped metadata token",
+        ));
+    }
+    Ok(SecretValue(response.token))
+}
+
+fn repository_description(
+    metadata: RepositoryListingMetadata,
+    owner_id: u64,
+    repository_id: u64,
+    clone_origin: &str,
+) -> Result<GitRepositoryDescription, PortError> {
+    if metadata.id != repository_id || metadata.owner.id != owner_id {
+        return Err(rejected("GitHub repository identity is inconsistent"));
+    }
+    if !valid_repository_component(&metadata.owner.login)
+        || metadata.owner.login.len() > 39
+        || !valid_repository_component(&metadata.name)
+        || metadata.name.len() > 100
+        || metadata.full_name != format!("{}/{}", metadata.owner.login, metadata.name)
+        || metadata.html_url != format!("{clone_origin}/{}", metadata.full_name)
+        || metadata.default_branch.is_empty()
+        || metadata.default_branch.len() > 255
+        || metadata.default_branch.chars().any(char::is_control)
+    {
+        return Err(rejected("GitHub repository metadata is invalid"));
+    }
+    Ok(GitRepositoryDescription {
+        owner: metadata.owner.login,
+        repository_owner_id: StableProviderId::parse(owner_id.to_string())
+            .map_err(|_| rejected("GitHub repository owner identity is invalid"))?,
+        name: metadata.name,
+        repository_id: StableProviderId::parse(repository_id.to_string())
+            .map_err(|_| rejected("GitHub repository stable identity is invalid"))?,
+        default_branch: metadata.default_branch,
+        private: metadata.private,
+        web_url: metadata.html_url,
     })
 }
 
@@ -851,7 +1063,8 @@ mod tests {
 
     use serde_json::json;
     use steward_ports::{
-        GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRevisionRequest, PortError,
+        GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRepositoryReference,
+        GitRevisionRequest, PortError,
     };
     use steward_types::direct_package::{
         ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
@@ -1437,6 +1650,157 @@ mod tests {
         assert!(!rendered.contains("fixture-app-assertion"));
         assert!(!rendered.contains("fixture-installation-value"));
         mock.finish()?;
+        Ok(())
+    }
+
+    fn reference(owner_id: &str, repository_id: &str) -> Result<GitRepositoryReference, String> {
+        Ok(GitRepositoryReference {
+            repository_owner_id: StableProviderId::parse(owner_id)?,
+            repository_id: StableProviderId::parse(repository_id)?,
+        })
+    }
+
+    fn metadata_token(repository_id: u64) -> ResponseSpec {
+        ResponseSpec::json(json!({
+            "token": "fixture-metadata-value",
+            "expires_at": "2030-01-01T00:00:00Z",
+            "permissions": {"metadata": "read"},
+            "repositories": [{"id": repository_id, "full_name": "example-org/source-a"}]
+        }))
+    }
+
+    fn listing_metadata(repository_id: u64, owner_id: u64, url: &str) -> ResponseSpec {
+        ResponseSpec::json(json!({
+            "id": repository_id,
+            "name": "source-a",
+            "full_name": "example-org/source-a",
+            "private": true,
+            "html_url": url,
+            "default_branch": "main",
+            "owner": {"id": owner_id, "login": "example-org"}
+        }))
+    }
+
+    #[tokio::test]
+    async fn describes_admitted_repositories_by_stable_identity() -> Result<(), String> {
+        let mock = MockGitHub::start(vec![
+            ResponseSpec::json(json!([
+                {"id": 7001, "account": {"id": 1000}},
+                {"id": 7002, "account": {"id": 2000}}
+            ])),
+            metadata_token(1001),
+            listing_metadata(1001, 1000, &format!("{CLONE_ORIGIN}/example-org/source-a")),
+        ])?;
+        let described = adapter(&mock)?
+            .describe_repositories(&[reference("1000", "1001")?, reference("3000", "3001")?])
+            .await;
+        assert_eq!(described.len(), 2);
+        let first = port(described[0].clone())?;
+        assert_eq!(first.owner, "example-org");
+        assert_eq!(first.repository_owner_id.as_str(), "1000");
+        assert_eq!(first.name, "source-a");
+        assert_eq!(first.repository_id.as_str(), "1001");
+        assert_eq!(first.default_branch, "main");
+        assert!(first.private);
+        assert_eq!(
+            first.web_url,
+            format!("{CLONE_ORIGIN}/example-org/source-a")
+        );
+        assert_rejected(
+            described[1].clone(),
+            "GitHub App is not installed for the repository owner",
+        );
+
+        let requests = mock.finish()?;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("GET /app/installations?per_page=100&page=1 "));
+        assert!(requests[0].contains("authorization: Bearer fixture-app-assertion"));
+        assert!(requests[1].starts_with("POST /app/installations/7001/access_tokens "));
+        assert!(requests[1].contains(r#""repository_ids":[1001]"#));
+        assert!(requests[1].contains(r#""permissions":{"metadata":"read"}"#));
+        assert!(!requests[1].contains("contents"));
+        assert!(requests[2].starts_with("GET /repositories/1001 "));
+        assert!(requests[2].contains("authorization: Bearer fixture-metadata-value"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_inconsistent_repository_descriptions() -> Result<(), String> {
+        for (owner_id, url) in [
+            (1999, format!("{CLONE_ORIGIN}/example-org/source-a")),
+            (
+                1000,
+                "https://elsewhere.example.com/example-org/source-a".to_owned(),
+            ),
+        ] {
+            let mock = MockGitHub::start(vec![
+                ResponseSpec::json(json!([{"id": 7001, "account": {"id": 1000}}])),
+                metadata_token(1001),
+                listing_metadata(1001, owner_id, &url),
+            ])?;
+            let described = adapter(&mock)?
+                .describe_repositories(&[reference("1000", "1001")?])
+                .await;
+            assert_eq!(described.len(), 1);
+            assert!(matches!(described[0], Err(PortError::Rejected { .. })));
+            mock.finish()?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_metadata_token_scoped_to_another_repository() -> Result<(), String> {
+        let mock = MockGitHub::start(vec![
+            ResponseSpec::json(json!([{"id": 7001, "account": {"id": 1000}}])),
+            metadata_token(1002),
+        ])?;
+        let described = adapter(&mock)?
+            .describe_repositories(&[reference("1000", "1001")?])
+            .await;
+        assert_rejected(
+            described[0].clone(),
+            "GitHub returned an invalid repository-scoped metadata token",
+        );
+        mock.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installation_listing_failure_fails_every_description() -> Result<(), String> {
+        let mock = MockGitHub::start(vec![ResponseSpec::status(500, "fixture-provider-body")])?;
+        let described = adapter(&mock)?
+            .describe_repositories(&[reference("1000", "1001")?, reference("1000", "1002")?])
+            .await;
+        assert_eq!(described.len(), 2);
+        assert!(described.iter().all(|result| matches!(
+            result,
+            Err(PortError::Failed { reason }) if reason == "list GitHub App installations"
+        )));
+        mock.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installation_listing_pages_and_skips_accountless_installations() -> Result<(), String>
+    {
+        let mut first_page = (0..100)
+            .map(|index| json!({"id": 8000 + index, "account": {"id": 5000 + index}}))
+            .collect::<Vec<_>>();
+        first_page[0] = json!({"id": 8000, "account": null});
+        let mock = MockGitHub::start(vec![
+            ResponseSpec::json(serde_json::Value::Array(first_page)),
+            ResponseSpec::json(json!([{"id": 7001, "account": {"id": 1000}}])),
+            metadata_token(1001),
+            listing_metadata(1001, 1000, &format!("{CLONE_ORIGIN}/example-org/source-a")),
+        ])?;
+        let described = adapter(&mock)?
+            .describe_repositories(&[reference("1000", "1001")?])
+            .await;
+        assert_eq!(port(described[0].clone())?.repository_id.as_str(), "1001");
+        let requests = mock.finish()?;
+        assert!(requests[0].starts_with("GET /app/installations?per_page=100&page=1 "));
+        assert!(requests[1].starts_with("GET /app/installations?per_page=100&page=2 "));
+        assert!(requests[2].starts_with("POST /app/installations/7001/access_tokens "));
         Ok(())
     }
 }

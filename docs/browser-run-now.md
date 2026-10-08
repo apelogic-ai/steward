@@ -103,16 +103,39 @@ It selects only a coding agent whose model family is allowed by the selected Env
 and records that exact model in the package requirements.
 
 After an inline run succeeds, its detail page offers **Publish this task to GitHub**.
-Steward lists the repositories owned by the GitHub user of the governed connection and
-marks each repository as ready or not ready. In 0.3.12 the browser sends a blank
-repository query, which lists only that user's own repositories; repositories owned by
-an organization are not listed by default. A caller of
-`GET /app/api/v1/github/repositories` can pass an explicit search `query`, such as
-`org:<organization>` or `repo:<owner>/<name>`, to reach them. Readiness requires the
-repository's stable owner and repository IDs to be admitted as a source in
-`githubSource.bindings`; a mutable repository name is not authority. Organization
-policy may also have to allow the Steward OAuth App to access the repository before it
-becomes visible.
+The browser sends a blank repository query to `GET /app/api/v1/github/repositories`.
+What that lists depends on the deployment (unreleased; after 0.3.12):
+
+- **`githubSource` enabled with at least one binding.** Steward lists the admitted
+  source repositories, the distinct sources in `githubSource.bindings`, including
+  organization-owned ones. The apiserver resolves each bound repository ID through the
+  source GitHub App, with a token scoped to that repository and only `metadata: read`.
+  No governed operation or sandbox runs, and the response has `source: "admitted"` and
+  an empty `login`. Every entry is `ready: true`. The result is cached in process for
+  10 minutes and refreshed by the first request after that. If the App resolves only
+  some repositories, the response lists those, and the
+  `x-steward-unresolved-repositories` header counts the rest; only the unresolved ones
+  are retried, at most every 30 seconds. If it resolves none, the request fails with
+  HTTP 503 and `reason: "source_app_unavailable"`, and requests in the next 5 seconds
+  share that result. It does not fall back to the per-user listing. The source App
+  installation must include each admitted repository.
+  This listing does not need or reflect the user's GitHub connection, and the user's own
+  repositories that are not admitted no longer appear in it.
+- **`githubSource` disabled, or no bindings.** Steward lists the repositories owned by
+  the GitHub user of the governed connection (`source: "connection"`), as in 0.3.12.
+  Repositories owned by an organization are not listed by default.
+
+An explicit search `query`, such as `org:<organization>` or `repo:<owner>/<name>`,
+always uses the governed per-user listing, which marks each repository as ready or not
+ready. Readiness requires the repository's stable owner and repository IDs to be
+admitted as a source in `githubSource.bindings`; a mutable repository name is not
+authority. Organization policy may also have to allow the Steward OAuth App to access
+the repository before the governed listing or publication can see it.
+
+The admitted listing shows any authenticated browser user the names, default branches,
+visibility and URLs of the repositories the operator configured as governed sources.
+It grants nothing: publication, workflow detection, dispatch and run status below still
+run through the user's governed connection.
 
 Publication is a server-owned operation. Steward reconstructs the successful run's
 exact one-file inline package, renders the pinned `steward-run` v0.8.0-or-later caller,
@@ -129,9 +152,10 @@ The run detail then shows the GitHub run, jobs, bounded failed-job log content, 
 owner-scoped governed Task correlated by repository, run ID, and attempt.
 
 The browser routes are under `/app/api/v1` and remain bound to the authenticated
-canonical owner. Repository reads, publication writes, dispatch, and run observation
-execute as audited governed Connections operations. No provider token or repository
-file content is logged. Migration 0064 adds those operation kinds and internal
+canonical owner. Per-user repository listings and lookups, workflow detection,
+publication writes, dispatch, and run observation execute as audited governed
+Connections operations; only the admitted repository listing above uses the source
+GitHub App instead. No provider token or repository file content is logged. Migration 0064 adds those operation kinds and internal
 authority v4 while preserving the exact v1, v2, and v3 authority tuples for historical
 rows.
 

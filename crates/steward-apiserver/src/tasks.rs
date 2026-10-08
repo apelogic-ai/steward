@@ -25,8 +25,9 @@ use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec, evaluate_with_grants,
 };
 use steward_ports::{
-    GitFile, GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRevisionRequest,
-    MAX_TASK_INPUT_ARCHIVE_BYTES, TaskExecutionAdapter, TaskExecutionPlanRequest,
+    GitFile, GitFileRequest, GitHostingPlane, GitRepositoryDescription, GitRepositoryIdentity,
+    GitRepositoryReference, GitRevisionRequest, MAX_TASK_INPUT_ARCHIVE_BYTES, TaskExecutionAdapter,
+    TaskExecutionPlanRequest,
 };
 use steward_store::{
     EnvelopeRequestRecord, FederatedSubjectObservation, FederatedSubjectRecord, PgStore,
@@ -152,6 +153,11 @@ struct BrowserTaskPreAdmission {
 }
 
 trait DirectGitResolver: Send + Sync {
+    fn describe_repositories<'a>(
+        &'a self,
+        repositories: &'a [GitRepositoryReference],
+    ) -> BoxFuture<'a, Vec<Result<GitRepositoryDescription, steward_ports::PortError>>>;
+
     fn resolve_repository<'a>(
         &'a self,
         repository: &'a steward_types::direct_package::RepositoryUrl,
@@ -175,6 +181,13 @@ impl<G> DirectGitResolver for G
 where
     G: GitHostingPlane,
 {
+    fn describe_repositories<'a>(
+        &'a self,
+        repositories: &'a [GitRepositoryReference],
+    ) -> BoxFuture<'a, Vec<Result<GitRepositoryDescription, steward_ports::PortError>>> {
+        Box::pin(GitHostingPlane::describe_repositories(self, repositories))
+    }
+
     fn resolve_repository<'a>(
         &'a self,
         repository: &'a steward_types::direct_package::RepositoryUrl,
@@ -367,6 +380,35 @@ impl TaskApiConfig {
                     && source_repository_id == source.repository_id.as_str()
             },
         )
+    }
+
+    /// Distinct admitted source repositories in stable-ID order. Empty unless the source
+    /// GitHub App is configured, because only that App can resolve them for display.
+    pub(crate) fn admitted_source_repository_references(&self) -> Vec<GitRepositoryReference> {
+        if self.direct_git_resolver.is_none() {
+            return Vec::new();
+        }
+        self.source_repository_bindings
+            .iter()
+            .filter_map(|(_, _, source_owner_id, source_repository_id)| {
+                Some(GitRepositoryReference {
+                    repository_owner_id: StableProviderId::parse(source_owner_id.as_str()).ok()?,
+                    repository_id: StableProviderId::parse(source_repository_id.as_str()).ok()?,
+                })
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn describe_admitted_source_repositories<'a>(
+        &'a self,
+        repositories: &'a [GitRepositoryReference],
+    ) -> Option<BoxFuture<'a, Vec<Result<GitRepositoryDescription, steward_ports::PortError>>>>
+    {
+        self.direct_git_resolver
+            .as_ref()
+            .map(|resolver| resolver.describe_repositories(repositories))
     }
 
     pub(crate) fn browser_source_repository_ids_are_authorized(

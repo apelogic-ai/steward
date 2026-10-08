@@ -7,6 +7,62 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- With `githubSource` enabled and at least one source in `githubSource.bindings`,
+  `GET /app/api/v1/github/repositories` with a blank `query` (the browser
+  default in Get started and on the Runs page) now lists the **admitted source
+  repositories** directly from the apiserver instead of running a governed
+  per-user operation in a bridge sandbox. Organization-owned admitted
+  repositories therefore appear by default, and a warm listing no longer waits
+  for a sandbox. The apiserver resolves each distinct bound source repository
+  ID through the source GitHub App: it lists the App's installations, mints a
+  token scoped to that one repository with only `metadata: read`, and reads
+  `GET /repositories/{id}`. Every entry passes the governed listing's per-field
+  validation and bounds, must match its bound owner and repository IDs, and is
+  marked `ready: true`. The `login` field is empty for this listing, because it
+  does not consult the user's GitHub connection.
+- Consumers of the default listing must not treat its success as proof of a
+  GitHub connection: a user without one now sees admitted repositories marked
+  ready, and publication or dispatch can still fail on the connection or on
+  OAuth App access. The user's own repositories that are not admitted, which
+  0.3.12 listed as not ready, no longer appear in the default listing; an
+  explicit `query` still finds them. The admitted listing runs no governed
+  operation, so it writes no governed-operation record; workflow detection,
+  publication, dispatch and run status still do.
+- The admitted listing is cached in process for 10 minutes per binding
+  configuration and refreshed lazily by the first request after expiry; one
+  request resolves while concurrent requests wait for its result. Each full
+  resolution costs at least one installation-list call per 50 admitted
+  repositories plus two GitHub API calls per admitted repository.
+- If the App resolves some admitted repositories but not others, the response
+  lists those it resolved and carries their count in the
+  `x-steward-unresolved-repositories` header. Only the unresolved repositories
+  are retried, at most every 30 seconds. If it resolves none, the request fails
+  with HTTP 503, `error: "github_automation_unavailable"` and
+  `reason: "source_app_unavailable"`, rather than falling back to the slower
+  per-user listing; requests in the following 5 seconds share that failure
+  instead of repeating it. Resolution runs in chunks of 50 under a 30-second
+  deadline; chunks still pending at the deadline count as unresolved. Each
+  resolution with unresolved repositories logs one apiserver line beginning
+  `admitted repository listing:` with up to five repository IDs and their
+  fixed reasons; no token is logged.
+- The governed per-user listing is unchanged for an explicit search `query`,
+  and for a blank query when `githubSource` is disabled or has no bindings.
+- `GithubRepositoriesResponse` gains an optional `source` field:
+  `"admitted"` for the App-resolved listing and `"connection"` for the governed
+  listing. The regenerated web client types include it; the browser does not
+  use it yet.
+- Authority: listing admitted repositories to any authenticated browser user
+  reveals only names, default branches, visibility and URLs that the operator
+  configured as governed sources. Workflow detection, publication, dispatch and
+  run status still run as governed connection operations, unchanged.
+- Operations: the source GitHub App installation must include each admitted
+  source repository. The App needs no new permission; the listing
+  token requests only `metadata: read`. With NetworkPolicy enabled, the
+  existing `networkPolicy.githubApiCidrs` egress already covers these calls.
+  No migration or Helm value changes.
+
 ## [0.3.12] - 2026-10-07
 
 This patch fixes governed GitHub repository listing, run status, and workflow

@@ -266,7 +266,7 @@ BOM selects a steward-run release whose notes require a new vendored workflow.
 | `workloadExchangeTrust.name` (`steward-workload-exchange-ca`) in release namespace | Public `ConfigMap` by default (or explicitly selected `Secret`); `workloadExchangeTrust.caCertificate` (`ca.crt`) | Workload-exchange PKI creates; controller mounts. | Governed mode only; rotate with exchange TLS and reprove trust. |
 | `taskIdentity.publicJwksConfigMap.name` in release namespace | Public `ConfigMap`; configured JWKS key | External Identity operator creates; API reads. | Only `taskIdentity.enabled=true`; rotate with issuer overlap and reprove issuer/audience/signature. `federatedSubjects.enabled=true` additionally requires the exact public Steward origin in `taskIdentity.resource`. |
 | `browserAuth.google.clientSecret.name` in release namespace | `Opaque`; configured `clientSecret.key` | Identity-provider operator creates; API reads. | Only `browserAuth.enabled=true`; rotate with provider, restart API, and retest the exact HTTPS callback/origin. |
-| `githubSource.privateKeySecret.name` in release namespace | `Opaque`; configured private-key key containing the GitHub App PEM | GitHub App owner creates; API mounts read-only. | Only `githubSource.enabled=true`; App needs read-only Contents and installation only on approved repositories. Rotate the App key and retest exact Git-object resolution. |
+| `githubSource.privateKeySecret.name` in release namespace | `Opaque`; configured private-key key containing the GitHub App PEM | GitHub App owner creates; API mounts read-only. | Only `githubSource.enabled=true`; App needs read-only Contents and installation only on approved repositories. Rotate the App key and retest exact Git-object resolution and, with bindings, the default repository listing (it caches results for up to 10 minutes, so restart the apiserver to retest at once). |
 | `web.ingress.tlsSecretName` in release namespace | `kubernetes.io/tls`; `tls.crt`, `tls.key` | Customer edge PKI creates; Ingress controller reads. | Only legacy `web.ingress.enabled=true`; gateway-owned TLS stays outside this chart. |
 | `web.httpRoute.backendTls.caConfigMap.name` in release namespace | Public `ConfigMap`; exactly `ca.crt` | Trust-distribution controller creates; Gateway reads as the apiserver trust anchor. | Required for `web.httpRoute.enabled=true`; overlap CA rotation in the ConfigMap and verify the BackendTLSPolicy before removing an old issuer. Never copy `tls.key` or the apiserver TLS Secret. |
 | Each `imagePullSecrets` reference in release namespace | Normally `kubernetes.io/dockerconfigjson`; `.dockerconfigjson` | Registry operator creates; kubelet reads. | Only private registries; rotate before expiry and verify pulls without printing the Secret. |
@@ -460,16 +460,24 @@ prove one exact-commit read before activating the workflow. When
 User Envelope failure.
 
 To enable browser publication after a successful inline run, the same repository must
-also be owned by the GitHub user of the governed connection and admitted by stable
-owner and repository IDs in `githubSource.bindings`. In 0.3.12 the browser lists only
+also be admitted by stable owner and repository IDs in `githubSource.bindings`, and
+the governed connection must be able to reach it. In 0.3.12 the browser lists only
 the user's own repositories; organization-owned repositories are not listed by default
 and are reachable only through an explicit `query` to
-`GET /app/api/v1/github/repositories`. Deploy a reviewed `steward-run`
+`GET /app/api/v1/github/repositories`. After 0.3.12 (unreleased), with `githubSource`
+enabled and bound, the browser's default listing shows the admitted source
+repositories, including organization-owned ones, resolved through the source GitHub
+App; keep that App installed with access to each admitted repository. Deploy a reviewed `steward-run`
 release at v0.8.0 or later. Steward then owns the branch, two-file commit, pull request,
 exact-workflow verification, dispatch, and run-status operations; no GitHub token or
 workflow content belongs in Helm values. If a repository is visible but marked **Not
-ready**, add its stable source IDs. If a repository the user owns is absent, first
-check OAuth App access rather than widening Steward authority.
+ready**, add its stable source IDs. If a repository the user owns is absent from the
+per-user listing, first check OAuth App access rather than widening Steward authority.
+If an admitted repository is absent from the default admitted listing, check that its
+IDs are in `githubSource.bindings` and that the source App installation includes it;
+the apiserver log line beginning `admitted repository listing:` names each unresolved
+repository ID and the reason, and the response header
+`x-steward-unresolved-repositories` counts them.
 
 This path binds the generated Helm values and execution binding to the verified
 destination artifacts. Manual values assembly remains possible, but it must

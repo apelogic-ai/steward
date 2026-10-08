@@ -25,13 +25,13 @@ steward-adapter-mcp-gw = { path = "../../adapters/mcp-gw", version = "=0.0.0" }
 steward-ports = { path = "../steward-ports", version = "=0.0.0" }
 steward-store = { path = "../steward-store", version = "=0.0.0" }
 steward-types = { path = "../steward-types", version = "=0.0.0" }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 utoipa.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 rand_core.workspace = true
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["signal", "test-util"] }
 tower.workspace = true
 
 [lints]

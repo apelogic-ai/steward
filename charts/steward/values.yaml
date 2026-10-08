@@ -126,6 +126,7 @@ taskIdentity:
     key: ""
 githubSource:
   # Enables exact Git object retrieval for direct Task packages through a read-only GitHub App.
+  # With bindings, the apiserver also lists the admitted source repositories through this App.
   enabled: false
   appId: ""
   privateKeySecret:

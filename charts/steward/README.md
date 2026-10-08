@@ -287,8 +287,19 @@ configuration: the chart requires a positive GitHub App ID, an existing Secret
 name and key containing its PEM private key, and at least one
 `networkPolicy.githubApiCidrs` entry while NetworkPolicy is enabled. The private
 key is mounted read-only and its bytes never enter Helm values or an environment
-variable. Steward uses the App only to resolve exact Git objects; it does not
-accept caller-uploaded package bytes.
+variable. Steward uses the App to resolve exact Git objects; it does not
+accept caller-uploaded package bytes. After 0.3.12 (unreleased), the apiserver
+also uses it to list the admitted source repositories for the browser: with
+at least one binding, a blank `GET /app/api/v1/github/repositories` query
+resolves each distinct bound source repository ID through the App, using a
+token scoped to that repository with only `metadata: read`, and caches the
+result in process for 10 minutes. The App installation must include each
+admitted repository; it needs no additional permission. A repository it cannot
+resolve is omitted and counted in the `x-steward-unresolved-repositories`
+response header; if none resolves, the listing returns HTTP 503 with reason
+`source_app_unavailable`. This lists only operator-configured repositories to
+authenticated users and grants nothing; publication and dispatch still use the
+governed connection.
 
 `githubSource.bindings` authorizes exact caller-to-source repository pairs by
 stable GitHub owner and repository IDs. The chart renders that non-secret

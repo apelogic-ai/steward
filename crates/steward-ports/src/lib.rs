@@ -531,7 +531,48 @@ pub struct GitFile {
     pub bytes: Vec<u8>,
 }
 
+/// Stable provider identifiers of one repository, without a mutable name.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GitRepositoryReference {
+    pub repository_owner_id: StableProviderId,
+    pub repository_id: StableProviderId,
+}
+
+/// Display metadata for one repository, resolved from its stable identifiers.
+///
+/// The mutable fields are presentation only. Authority stays with the stable identifiers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitRepositoryDescription {
+    pub owner: String,
+    pub repository_owner_id: StableProviderId,
+    pub name: String,
+    pub repository_id: StableProviderId,
+    pub default_branch: String,
+    pub private: bool,
+    pub web_url: String,
+}
+
 pub trait GitHostingPlane: Send + Sync + 'static {
+    /// Resolves display metadata for each stable repository reference.
+    ///
+    /// The result has one entry per request entry, in request order, so one unresolvable
+    /// repository does not hide the others. The default implementation supports nothing.
+    fn describe_repositories(
+        &self,
+        repositories: &[GitRepositoryReference],
+    ) -> impl Future<Output = Vec<Result<GitRepositoryDescription, PortError>>> + Send {
+        let count = repositories.len();
+        async move {
+            (0..count)
+                .map(|_| {
+                    Err(PortError::Unsupported {
+                        operation: "describe_repositories",
+                    })
+                })
+                .collect()
+        }
+    }
+
     fn resolve_repository(
         &self,
         repository: &RepositoryUrl,

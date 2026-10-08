@@ -1867,33 +1867,37 @@ fn validate_repositories_result(value: &Value) -> Result<(), StoreError> {
         .and_then(Value::as_array)
         .filter(|repositories| repositories.len() <= 100)
         .ok_or(StoreError::InvalidConnectionOperation)?;
-    if repositories.iter().any(|repository| {
-        let Some(repository) = repository.as_object() else {
-            return true;
-        };
-        !exact_object_keys(
-            repository,
-            &[
-                "owner",
-                "ownerId",
-                "name",
-                "repositoryId",
-                "defaultBranch",
-                "private",
-                "url",
-            ],
-        ) || !bounded_str(repository.get("owner"), 39)
-            || !bounded_str(repository.get("ownerId"), 20)
-            || !bounded_str(repository.get("name"), 100)
-            || !bounded_str(repository.get("repositoryId"), 20)
-            || !bounded_str(repository.get("defaultBranch"), 255)
-            || repository.get("private").and_then(Value::as_bool).is_none()
-            || !bounded_str(repository.get("url"), 255)
-            || !repository.get("url").is_some_and(valid_https_github_url)
-    }) {
+    if !repositories.iter().all(valid_repository_listing_entry) {
         return Err(StoreError::InvalidConnectionOperation);
     }
     Ok(())
+}
+
+/// Per-field shape and bounds of one repository listing entry. Every listing source,
+/// governed or admitted, applies this same check.
+pub(crate) fn valid_repository_listing_entry(repository: &Value) -> bool {
+    let Some(repository) = repository.as_object() else {
+        return false;
+    };
+    exact_object_keys(
+        repository,
+        &[
+            "owner",
+            "ownerId",
+            "name",
+            "repositoryId",
+            "defaultBranch",
+            "private",
+            "url",
+        ],
+    ) && bounded_str(repository.get("owner"), 39)
+        && bounded_str(repository.get("ownerId"), 20)
+        && bounded_str(repository.get("name"), 100)
+        && bounded_str(repository.get("repositoryId"), 20)
+        && bounded_str(repository.get("defaultBranch"), 255)
+        && repository.get("private").and_then(Value::as_bool).is_some()
+        && bounded_str(repository.get("url"), 255)
+        && repository.get("url").is_some_and(valid_https_github_url)
 }
 
 fn validate_workflow_result(value: &Value) -> Result<(), StoreError> {

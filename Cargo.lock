@@ -3915,6 +3915,7 @@ name = "steward-adapter-github-source"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "futures",
  "jsonwebtoken",
  "reqwest 0.12.28",
  "serde",
