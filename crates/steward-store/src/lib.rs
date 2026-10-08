@@ -9935,6 +9935,38 @@ impl PgStore {
         transaction.commit().await.map_err(database_error)
     }
 
+    pub async fn connection_operation_timing(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<Option<ConnectionOperationTiming>, StoreError> {
+        let row = sqlx::query(
+            "SELECT \
+               GREATEST(0, (EXTRACT(EPOCH FROM (attempt.start_invoked_at - operation.created_at)) * 1000)::bigint) AS queue_wait_ms, \
+               GREATEST(0, (EXTRACT(EPOCH FROM (attempt.finished_at - attempt.start_invoked_at)) * 1000)::bigint) AS attempt_duration_ms, \
+               GREATEST(0, (EXTRACT(EPOCH FROM (operation.updated_at - operation.created_at)) * 1000)::bigint) AS total_latency_ms \
+             FROM connection_operations operation \
+             JOIN LATERAL ( \
+               SELECT start_invoked_at, finished_at FROM task_execution_attempts \
+               WHERE task_uid = operation.task_uid \
+                 AND start_invoked_at IS NOT NULL AND finished_at IS NOT NULL \
+               ORDER BY created_at DESC LIMIT 1 \
+             ) attempt ON true \
+             WHERE operation.operation_id = $1",
+        )
+        .bind(operation_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        row.map(|row| {
+            Ok(ConnectionOperationTiming {
+                queue_wait_ms: row.try_get("queue_wait_ms").map_err(database_error)?,
+                attempt_duration_ms: row.try_get("attempt_duration_ms").map_err(database_error)?,
+                total_latency_ms: row.try_get("total_latency_ms").map_err(database_error)?,
+            })
+        })
+        .transpose()
+    }
+
     pub async fn fail_connection_operation(
         &self,
         operation_id: Uuid,
@@ -11748,6 +11780,13 @@ pub struct ConnectionOperationRetention {
     pub cache_ttl_seconds: i64,
     pub result_ttl_seconds: i64,
     pub oauth_lifetime_seconds: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectionOperationTiming {
+    pub queue_wait_ms: i64,
+    pub attempt_duration_ms: i64,
+    pub total_latency_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]

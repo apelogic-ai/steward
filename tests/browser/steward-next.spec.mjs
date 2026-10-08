@@ -2904,6 +2904,21 @@ test("Get started exposes repository failures with retry without hiding the test
   }
 });
 
+test("Get started can explicitly refresh the shared repository listing", async ({ browser }) => {
+  const developer = await guardedPage(browser, { inlineRun: true });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
+    await runStep.getByRole("button").first().click();
+    await expect(runStep.getByLabel("Repository")).toBeVisible();
+
+    await runStep.getByRole("button", { name: "Refresh repositories" }).click();
+    await expect.poll(() => developer.governedGithubRequests.filter((url) => new URL(url).pathname === "/app/api/v1/github/repositories").length).toBe(2);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("Get started renders its checklist while the repository request remains pending", async ({ browser }) => {
   const developer = await guardedPage(browser, {
     holdGithubRepositories: true,
