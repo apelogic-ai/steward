@@ -4,6 +4,7 @@ import { cookies, headers } from "next/headers";
 import type { ReactNode } from "react";
 
 import { AppShell } from "@/components/app-shell";
+import { GithubRepositoriesProvider } from "@/data/github-repositories";
 import { SessionProvider } from "@/session/session-context";
 
 import "./globals.css";
@@ -37,7 +38,9 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
     <html className={`${spaceGrotesk.variable} ${inconsolata.variable}`} data-theme={initialTheme} lang="en">
       <body>
         <SessionProvider>
-          <AppShell>{children}</AppShell>
+          <GithubRepositoriesProvider>
+            <AppShell>{children}</AppShell>
+          </GithubRepositoriesProvider>
         </SessionProvider>
       </body>
     </html>
