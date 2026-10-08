@@ -2968,14 +2968,7 @@ mod tests {
     }
 
     fn read_http_request(listener: &TcpListener) -> Result<HttpRequest, String> {
-        read_http_request_within(listener, Duration::from_secs(5))
-    }
-
-    fn read_http_request_within(
-        listener: &TcpListener,
-        deadline: Duration,
-    ) -> Result<HttpRequest, String> {
-        let mut stream = accept_within(listener, deadline)?;
+        let mut stream = accept_within(listener, Duration::from_secs(5))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .map_err(|error| format!("bound MCP fixture read: {error}"))?;
@@ -3039,7 +3032,6 @@ mod tests {
         sessions_issued: usize,
         /// The number of upcoming tool calls answered as an expired session.
         expirations: usize,
-        accept_deadline: Duration,
     }
 
     impl McpFixture {
@@ -3057,7 +3049,6 @@ mod tests {
                     initialized: false,
                     sessions_issued: 0,
                     expirations: 0,
-                    accept_deadline: Duration::from_secs(5),
                 },
                 address,
             ))
@@ -3070,7 +3061,7 @@ mod tests {
         /// Serves the session handshake and returns the next `tools/call` request.
         fn tool_call(&mut self) -> Result<(TcpStream, serde_json::Value), String> {
             loop {
-                let request = read_http_request_within(&self.listener, self.accept_deadline)?;
+                let request = read_http_request(&self.listener)?;
                 if request.request_line != "POST /mcp HTTP/1.1" {
                     return Err(format!(
                         "{:?} fixture expected an MCP POST, got {:?}",
@@ -4422,17 +4413,15 @@ mod tests {
         let (fixture, address) = McpFixture::bind(SessionMode::Enforced)?;
         let mut fixture = McpFixture {
             expirations: 2,
-            accept_deadline: Duration::from_millis(500),
             ..fixture
         };
         let server = thread::spawn(move || -> Result<usize, String> {
             match fixture.tool_call() {
                 Ok(_) => Err("the bridge re-initialized more than once".to_owned()),
                 // The bridge gives up without another request, not even a close of
-                // the session that already ended, so the next accept times out.
-                Err(error) if error.starts_with("accept MCP request") => {
-                    Ok(fixture.sessions_issued)
-                }
+                // the session that already ended: the next connection is the
+                // test's sentinel.
+                Err(error) if error == SENTINEL_END => Ok(fixture.sessions_issued),
                 Err(error) => Err(error),
             }
         });
@@ -4441,6 +4430,7 @@ mod tests {
         let result = gateway
             .execute(GithubBridgeOperation::RunStatus, run_status_request())
             .await;
+        drop(TcpStream::connect(address));
         let sessions = server
             .join()
             .map_err(|_| "expiring fixture panicked".to_owned())??;
@@ -4499,6 +4489,10 @@ mod tests {
         Ok(())
     }
 
+    /// What the fixture reads from the empty sentinel connection a test opens after
+    /// the operation has returned.
+    const SENTINEL_END: &str = "MCP request ended before its headers";
+
     const INITIALIZE_RESULT: &str = r#"{"jsonrpc":"2.0","id":"steward-mcp-initialize","result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"mcp-fixture","version":"1.0.0"}}}"#;
 
     /// Serves scripted replies to consecutive requests, then reports every request
@@ -4531,21 +4525,29 @@ mod tests {
                 )
                 .map_err(|error| format!("write scripted reply: {error}"))?;
             }
-            if let Ok(request) = read_http_request_within(&listener, Duration::from_millis(500)) {
-                seen.push(format!(
-                    "{} {}",
-                    request.request_line,
-                    request.header("mcp-session-id").unwrap_or_default()
-                ));
-                write_http_status(request.stream, "200 OK", "")?;
+            // The test connects an empty sentinel after the operation returns, so
+            // every request the bridge sent, such as a close, is accepted before it.
+            loop {
+                match read_http_request(&listener) {
+                    Ok(request) => {
+                        seen.push(format!(
+                            "{} {}",
+                            request.request_line,
+                            request.header("mcp-session-id").unwrap_or_default()
+                        ));
+                        write_http_status(request.stream, "200 OK", "")?;
+                    }
+                    Err(error) if error == SENTINEL_END => return Ok(seen),
+                    Err(error) => return Err(error),
+                }
             }
-            Ok(seen)
         });
         let gateway = GithubMcpGateway::new(&McpFixture::origin(address), "0.4.9")
             .map_err(|error| format!("build scripted gateway: {error:?}"))?;
         let result = gateway
             .execute(GithubBridgeOperation::RunStatus, run_status_request())
             .await;
+        drop(TcpStream::connect(address));
         let seen = server
             .join()
             .map_err(|_| "scripted fixture panicked".to_owned())??;
