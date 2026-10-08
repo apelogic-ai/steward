@@ -1,6 +1,6 @@
 # Steward installation guide
 
-Release contract: chart `0.3.11`. The release workflow pulls the published OCI
+Release contract: chart `0.3.12`. The release workflow pulls the published OCI
 chart and every published component image by digest, renders the complete chart,
 and installs the core profile into a clean disposable cluster before creating
 the GitHub release. Use chart and image digests from the same release handoff.
@@ -460,13 +460,16 @@ prove one exact-commit read before activating the workflow. When
 User Envelope failure.
 
 To enable browser publication after a successful inline run, the same repository must
-also be visible through the user's governed GitHub connection and admitted by stable
-owner and repository IDs in `githubSource.bindings`. Deploy a reviewed `steward-run`
+also be owned by the GitHub user of the governed connection and admitted by stable
+owner and repository IDs in `githubSource.bindings`. In 0.3.12 the browser lists only
+the user's own repositories; organization-owned repositories are not listed by default
+and are reachable only through an explicit `query` to
+`GET /app/api/v1/github/repositories`. Deploy a reviewed `steward-run`
 release at v0.8.0 or later. Steward then owns the branch, two-file commit, pull request,
 exact-workflow verification, dispatch, and run-status operations; no GitHub token or
 workflow content belongs in Helm values. If a repository is visible but marked **Not
-ready**, add its stable source IDs. If it is absent, first check organization OAuth App
-access rather than widening Steward authority.
+ready**, add its stable source IDs. If a repository the user owns is absent, first
+check OAuth App access rather than widening Steward authority.
 
 This path binds the generated Helm values and execution binding to the verified
 destination artifacts. Manual values assembly remains possible, but it must
