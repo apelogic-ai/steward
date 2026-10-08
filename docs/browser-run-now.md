@@ -104,7 +104,11 @@ and records that exact model in the package requirements.
 
 After an inline run succeeds, its detail page offers **Publish this task to GitHub**.
 Steward lists the repositories owned by the GitHub user of the governed connection and
-marks each repository as ready or not ready. In 0.3.12 the browser sends a blank
+marks each repository as ready or not ready. Get started step 4 offers the same list,
+labelling repositories that are not admitted as a governed source **Not admitted**. The
+browser loads the list once per page load and shares it between Get started and this
+panel; **Refresh repositories** in Get started, **Retry repositories** after a failure,
+or a page reload fetches it again. In 0.3.12 the browser sends a blank
 repository query, which lists only that user's own repositories; repositories owned by
 an organization are not listed by default. A caller of
 `GET /app/api/v1/github/repositories` can pass an explicit search `query`, such as

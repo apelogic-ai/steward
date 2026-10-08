@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 
-import type { BrowserRunView } from "@/api-client";
+import type { BrowserRunView, GithubRepositoryView } from "@/api-client";
 import { automatedPackageRun } from "@/data/onboarding-progress";
 
-import { browserHelloWorldRun, governedJobOnly } from "./onboarding-view";
+import { browserHelloWorldRun, governedJobOnly, repositoryOptionLabel, repositoryReadinessMessage } from "./onboarding-view";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -109,4 +109,44 @@ test("governed job preview keeps the input preparation and reusable workflow job
   expect(preview).toContain("id-token: write");
   expect(preview).toContain("package-path: .steward/tasks/hello/task-definition.json");
   expect(preview).not.toContain("verify:");
+});
+
+function repository(overrides: Partial<GithubRepositoryView>): GithubRepositoryView {
+  return {
+    defaultBranch: "main",
+    name: "agentic-ops",
+    owner: "example-org",
+    ownerId: "org_example",
+    private: true,
+    ready: true,
+    repositoryId: "repo_agentic_ops",
+    url: "https://github.com/example-org/agentic-ops",
+    ...overrides,
+  };
+}
+
+test("repository options name each repository and its admission state", () => {
+  expect(repositoryOptionLabel(repository({}))).toBe("example-org/agentic-ops · Ready");
+  expect(repositoryOptionLabel(repository({ name: "not-admitted", ready: false, missingPrerequisite: "source_repository_not_admitted" })))
+    .toBe("example-org/not-admitted · Not admitted");
+  expect(repositoryOptionLabel(repository({ name: "other", ready: false, missingPrerequisite: "workflow_scope_missing" })))
+    .toBe("example-org/other · Not ready");
+});
+
+test("repository readiness names the selected repository or states that none is admitted", () => {
+  const ready = repository({});
+  const notAdmitted = repository({ name: "not-admitted", repositoryId: "repo_not_admitted", ready: false, missingPrerequisite: "source_repository_not_admitted" });
+  const otherNotAdmitted = repository({ name: "legacy", repositoryId: "repo_legacy", ready: false, missingPrerequisite: "source_repository_not_admitted" });
+  const missingScope = repository({ name: "scoped", repositoryId: "repo_scoped", ready: false, missingPrerequisite: "workflow_scope_missing" });
+
+  expect(repositoryReadinessMessage([ready, notAdmitted], ready)).toBeNull();
+  expect(repositoryReadinessMessage([ready, notAdmitted], undefined)).toBeNull();
+  expect(repositoryReadinessMessage([ready, notAdmitted], notAdmitted))
+    .toBe("example-org/not-admitted is not admitted as a governed source on this deployment; ask an administrator to add it.");
+  expect(repositoryReadinessMessage([ready, missingScope], missingScope))
+    .toBe("example-org/scoped is not ready for governed automation: workflow_scope_missing.");
+  expect(repositoryReadinessMessage([notAdmitted, otherNotAdmitted], otherNotAdmitted))
+    .toBe("None of your repositories is admitted as a governed source on this deployment; ask an administrator to add it.");
+  expect(repositoryReadinessMessage([notAdmitted, missingScope], missingScope))
+    .toBe("example-org/scoped is not ready for governed automation: workflow_scope_missing.");
 });
