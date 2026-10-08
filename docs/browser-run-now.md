@@ -113,7 +113,9 @@ What that lists depends on the deployment (unreleased; after 0.3.12):
   No governed operation or sandbox runs, and the response has `source: "admitted"` and
   an empty `login`. Every entry is `ready: true`. The result is cached in process for
   10 minutes. After that the cached listing is still served at once while one
-  background refresh revalidates it; a refresh that fails keeps the previous entries.
+  background refresh revalidates it. A refresh that fails keeps a previous entry for
+  up to 20 minutes since it last resolved, counting it as unresolved; a definitive
+  rejection, such as the App no longer being installed on it, removes it at once.
   If the App resolves only some repositories, the response lists those, and the
   `x-steward-unresolved-repositories` header counts the rest; only the unresolved ones
   are retried, at most every 30 seconds. Only when no listing has ever resolved does

@@ -26,6 +26,8 @@ const MAX_INSTALLATION_TOKEN_BYTES: usize = 4096;
 const INSTALLATIONS_PER_PAGE: usize = 100;
 const MAX_INSTALLATION_PAGES: usize = 10;
 const DESCRIBE_CONCURRENCY: usize = 8;
+/// Revocation is best effort and must not hold a result back for long.
+const REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// GitHub App credentials. Deliberately implements neither `Debug` nor `Display`.
 pub struct GitHubAppCredentials {
@@ -443,7 +445,8 @@ impl GitHubSourceAdapter {
         assertion: &SecretValue,
     ) -> Result<BTreeMap<u64, u64>, PortError> {
         let mut owners = BTreeMap::new();
-        for page in 1..=MAX_INSTALLATION_PAGES {
+        // One page past the bound distinguishes exactly the bound from more than it.
+        for page in 1..=MAX_INSTALLATION_PAGES + 1 {
             let installations: Vec<ListedInstallation> = self
                 .get_json(
                     &format!(
@@ -459,6 +462,15 @@ impl GitHubSourceAdapter {
             let count = installations.len();
             if count > INSTALLATIONS_PER_PAGE {
                 return Err(rejected("GitHub returned an oversized installation page"));
+            }
+            if page > MAX_INSTALLATION_PAGES {
+                return if count == 0 {
+                    Ok(owners)
+                } else {
+                    Err(rejected(
+                        "GitHub App installation listing exceeds the supported bound",
+                    ))
+                };
             }
             for installation in installations {
                 // GitHub documents a nullable account; such an installation owns nothing.
@@ -479,16 +491,25 @@ impl GitHubSourceAdapter {
         ))
     }
 
-    /// Best-effort revocation of a short-lived token once its single read is done.
+    /// Best-effort revocation of a short-lived token, bounded by a short timeout. A failure
+    /// is reported in one token-free line; the token still expires on its own.
     async fn revoke_installation_token(&self, token: &SecretValue) {
-        let _ = self
+        let outcome = self
             .client
             .delete(format!("{}/installation/token", self.api_origin))
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .bearer_auth(token.expose())
+            .timeout(REVOKE_TIMEOUT)
             .send()
             .await;
+        let failure = match outcome {
+            Ok(response) if response.status().is_success() => return,
+            Ok(response) => format!("status {}", response.status().as_u16()),
+            Err(error) if error.is_timeout() => "timed out".to_owned(),
+            Err(_) => "request failed".to_owned(),
+        };
+        eprintln!("github source: metadata token revocation failed: {failure}");
     }
 
     async fn describe_repository(
@@ -529,7 +550,19 @@ impl GitHubSourceAdapter {
                 "mint repository-scoped GitHub metadata token",
             )
             .await?;
-        let token = validate_metadata_token(token_response, repository_id)?;
+        let minted = (!token_response.token.is_empty()
+            && token_response.token.len() <= MAX_INSTALLATION_TOKEN_BYTES)
+            .then(|| SecretValue(token_response.token.clone()));
+        let token = match validate_metadata_token(token_response, repository_id) {
+            Ok(token) => token,
+            Err(error) => {
+                // A token minted with an unexpected scope is revoked, not left alive.
+                if let Some(minted) = minted {
+                    self.revoke_installation_token(&minted).await;
+                }
+                return Err(error);
+            }
+        };
         let metadata: Result<RepositoryListingMetadata, PortError> = self
             .get_json(
                 &format!("{}/repositories/{repository_id}", self.api_origin),
@@ -1737,13 +1770,24 @@ mod tests {
                     .collect(),
             ))
         };
-        let mock = MockGitHub::start((1..=10).map(full_page).collect())?;
+        let mock = MockGitHub::start((1..=11).map(full_page).collect())?;
         let described = describe(&adapter(&mock)?, &[reference("1000", "1001")?]).await;
         assert_rejected(
             described[0].clone(),
             "GitHub App installation listing exceeds the supported bound",
         );
-        assert_eq!(mock.finish()?.len(), 10);
+        assert_eq!(mock.finish()?.len(), 11);
+
+        // Exactly the bound is accepted: the page past it is empty.
+        let mut responses = (1..=10).map(full_page).collect::<Vec<_>>();
+        responses.push(ResponseSpec::json(json!([])));
+        let mock = MockGitHub::start(responses)?;
+        let described = describe(&adapter(&mock)?, &[reference("1000", "1001")?]).await;
+        assert_rejected(
+            described[0].clone(),
+            "GitHub App is not installed for the repository owner",
+        );
+        assert_eq!(mock.finish()?.len(), 11);
         Ok(())
     }
 
@@ -1823,13 +1867,26 @@ mod tests {
         let mock = MockGitHub::start(vec![
             ResponseSpec::json(json!([{"id": 7001, "account": {"id": 1000}}])),
             metadata_token(1002),
+            ResponseSpec::status(204, ""),
         ])?;
         let described = describe(&adapter(&mock)?, &[reference("1000", "1001")?]).await;
         assert_rejected(
             described[0].clone(),
             "GitHub returned an invalid repository-scoped metadata token",
         );
-        mock.finish()?;
+        let requests = mock.finish()?;
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[2].starts_with("DELETE /installation/token "),
+            "a token with an unexpected scope is revoked"
+        );
+        assert!(requests[2].contains("authorization: Bearer fixture-metadata-value"));
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.starts_with("GET /repositories/")),
+            "the invalid token is never used"
+        );
         Ok(())
     }
 

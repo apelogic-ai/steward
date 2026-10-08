@@ -33,17 +33,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The admitted listing is cached in process for 10 minutes per binding
   configuration. After that, requests are still served the cached listing at
   once while one detached background refresh revalidates it
-  (stale-while-revalidate); a cancelled request never cancels a refresh. Only
-  the first listing after startup waits, and concurrent requests share that
-  one resolution. Each full resolution lists the App's installations once (up
+  (stale-while-revalidate); a cancelled request never cancels a refresh. A
+  request waits only while no listing has ever resolved: at startup, and
+  again after each 5-second failure window while the App keeps failing.
+  Concurrent waiting requests share one resolution, and a wait is bounded at
+  35 seconds. Each full resolution lists the App's installations once (up
   to 10 pages of 100; more installations fail with a distinct error) and then
   makes three GitHub API calls per admitted repository: mint, read, and revoke.
+  A minted token whose scope does not validate is revoked too. Revocation is
+  best effort with a 2-second timeout; a failure logs one line beginning
+  `github source: metadata token revocation failed:` with no token material,
+  and the token still expires on its own.
 - If the App resolves some admitted repositories but not others, the response
   lists those it resolved and carries their count in the
   `x-steward-unresolved-repositories` header. Only the unresolved repositories
-  are retried, at most every 30 seconds. A refresh that fails, wholly or in
-  part, keeps every previously resolved entry; a wholly failed refresh is
-  retried after 30 seconds. Only when no listing has ever resolved does the
+  are retried, at most every 30 seconds. A definitive rejection (for example
+  the App no longer installed on the repository, or metadata that no longer
+  matches the binding) removes the repository from the listing at once. Any
+  other failure keeps the previously resolved entry for up to 20 minutes since
+  it last resolved, and that entry counts as unresolved in the header. A
+  wholly failed refresh is retried after 30 seconds. Only when no listing has ever resolved does the
   request fail with HTTP 503, `error: "github_automation_unavailable"` and
   `reason: "source_app_unavailable"`, rather than falling back to the slower
   per-user listing; requests in the following 5 seconds share that failure
@@ -53,7 +62,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   apiserver line beginning `admitted repository listing:` with the count and
   up to five repository IDs with their fixed reasons; no token is logged.
 - A Git hosting plane that cannot describe repositories (the port's default)
-  keeps the governed per-user listing for a blank query, as before.
+  keeps the governed per-user listing for a blank query, as before. Only a
+  full resolution with no listing yet can switch to that fallback; an
+  Unsupported answer during a retry never discards a resolved listing.
 - The governed per-user listing is unchanged for an explicit search `query`,
   and for a blank query when `githubSource` is disabled or has no bindings.
 - `GithubRepositoriesResponse` gains an optional `source` field:

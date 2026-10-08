@@ -55,6 +55,12 @@ const ADMITTED_REPOSITORIES_FAILURE_TTL: Duration = Duration::from_secs(5);
 const ADMITTED_REPOSITORIES_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Unresolved repositories named in one diagnostic line.
 const ADMITTED_REPOSITORIES_REPORTED_FAILURES: usize = 5;
+/// Longest a repository stays listed without a successful resolution. A definitive
+/// rejection removes it at once.
+const ADMITTED_REPOSITORIES_MAX_AGE: Duration = Duration::from_secs(20 * 60);
+/// Longest a request waits for a first listing, even if a refresh never reports back.
+const ADMITTED_REPOSITORIES_COLD_WAIT: Duration =
+    ADMITTED_REPOSITORIES_RESOLUTION_TIMEOUT.saturating_add(Duration::from_secs(5));
 /// Count of admitted repositories the source GitHub App could not resolve.
 pub(crate) const UNRESOLVED_REPOSITORIES_HEADER: &str = "x-steward-unresolved-repositories";
 
@@ -162,6 +168,8 @@ type AdmittedRepositoryClock = Arc<dyn Fn() -> Instant + Send + Sync>;
 /// even while it is being revalidated; only a request with no usable listing waits.
 #[derive(Clone)]
 struct AdmittedRepositoryCache {
+    /// The distinct admitted source repositories. Bindings are fixed for the process.
+    key: Arc<Vec<GitRepositoryReference>>,
     state: Arc<std::sync::Mutex<AdmittedRepositoryState>>,
     refreshed: Arc<tokio::sync::watch::Sender<u64>>,
     clock: AdmittedRepositoryClock,
@@ -169,9 +177,11 @@ struct AdmittedRepositoryCache {
 
 #[derive(Default)]
 struct AdmittedRepositoryState {
-    /// The binding configuration the state was resolved for.
-    key: Vec<GitRepositoryReference>,
-    resolved: BTreeMap<GitRepositoryReference, GithubRepositoryView>,
+    /// Each listed repository with the time it last resolved successfully.
+    resolved: BTreeMap<GitRepositoryReference, (GithubRepositoryView, Instant)>,
+    /// The listed repositories, sorted once per refresh.
+    listing: Arc<Vec<GithubRepositoryView>>,
+    /// Repositories that did not resolve in their latest attempt, listed or not.
     unresolved: Vec<GitRepositoryReference>,
     /// The hosting plane cannot describe repositories; use the governed listing.
     unsupported: bool,
@@ -210,10 +220,21 @@ impl AdmittedRepositoryState {
         if self.unsupported {
             return AdmittedRepositories::NotConfigured;
         }
-        if self.resolved.is_empty() {
+        if self.listing.is_empty() {
             return AdmittedRepositories::Unavailable;
         }
-        let mut repositories = self.resolved.values().cloned().collect::<Vec<_>>();
+        AdmittedRepositories::Listed {
+            repositories: Arc::clone(&self.listing),
+            unresolved: self.unresolved.len(),
+        }
+    }
+
+    fn rebuild_listing(&mut self) {
+        let mut repositories = self
+            .resolved
+            .values()
+            .map(|(view, _)| view.clone())
+            .collect::<Vec<_>>();
         repositories.sort_by(|left, right| {
             (
                 left.owner.to_ascii_lowercase(),
@@ -224,16 +245,14 @@ impl AdmittedRepositoryState {
                     right.name.to_ascii_lowercase(),
                 ))
         });
-        AdmittedRepositories::Listed {
-            repositories,
-            unresolved: self.unresolved.len(),
-        }
+        self.listing = Arc::new(repositories);
     }
 }
 
 impl AdmittedRepositoryCache {
-    fn new(clock: AdmittedRepositoryClock) -> Self {
+    fn new(clock: AdmittedRepositoryClock, key: Vec<GitRepositoryReference>) -> Self {
         Self {
+            key: Arc::new(key),
             state: Arc::new(std::sync::Mutex::new(AdmittedRepositoryState::default())),
             refreshed: Arc::new(tokio::sync::watch::channel(0).0),
             clock,
@@ -246,45 +265,67 @@ impl AdmittedRepositoryCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Merges a refresh outcome. A failed or partial refresh never removes a repository
-    /// that resolved before; `None` means the refresh ended without an outcome.
-    fn complete_refresh(&self, refresh: AdmittedRefresh, outcome: Option<ResolutionOutcome>) {
+    /// Merges a refresh outcome; `None` means the refresh ended without one.
+    ///
+    /// A successful resolution updates an entry, a definitive rejection removes it, and any
+    /// other failure keeps it until it is older than the maximum age. A kept entry that
+    /// failed still counts as unresolved.
+    fn complete_refresh(
+        &self,
+        refresh: AdmittedRefresh,
+        targets: &[GitRepositoryReference],
+        outcome: Option<ResolutionOutcome>,
+    ) {
         let now = (self.clock)();
+        let outcome = outcome.unwrap_or_default();
         {
             let mut state = self.lock();
             state.refreshing = false;
-            match outcome {
-                Some(outcome) if outcome.unsupported => state.unsupported = true,
-                Some(outcome) => {
-                    let resolved_any = !outcome.resolved.is_empty();
-                    state.resolved.extend(outcome.resolved);
-                    let unresolved = state
-                        .key
-                        .iter()
-                        .filter(|reference| !state.resolved.contains_key(*reference))
-                        .cloned()
-                        .collect();
-                    state.unresolved = unresolved;
-                    if state.resolved.is_empty() {
-                        state.failed_until = Some(now + ADMITTED_REPOSITORIES_FAILURE_TTL);
-                    } else {
-                        state.failed_until = None;
-                        state.retry_at = Some(now + ADMITTED_REPOSITORIES_PARTIAL_TTL);
-                        if refresh == AdmittedRefresh::Full {
-                            state.expires_at = Some(
-                                now + if resolved_any {
-                                    ADMITTED_REPOSITORIES_TTL
-                                } else {
-                                    ADMITTED_REPOSITORIES_PARTIAL_TTL
-                                },
-                            );
-                        }
+            if outcome.unsupported && refresh == AdmittedRefresh::Full && state.resolved.is_empty()
+            {
+                state.unsupported = true;
+            } else {
+                let fresh = outcome
+                    .resolved
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                for (reference, view) in outcome.resolved {
+                    state.resolved.insert(reference, (view, now));
+                }
+                for reference in &outcome.rejected {
+                    state.resolved.remove(reference);
+                }
+                state.resolved.retain(|_, (_, resolved_at)| {
+                    now.saturating_duration_since(*resolved_at) <= ADMITTED_REPOSITORIES_MAX_AGE
+                });
+                let targets = targets.iter().collect::<std::collections::BTreeSet<_>>();
+                let unresolved = self
+                    .key
+                    .iter()
+                    .filter(|reference| {
+                        !state.resolved.contains_key(*reference)
+                            || (targets.contains(reference) && !fresh.contains(*reference))
+                    })
+                    .cloned()
+                    .collect();
+                state.unresolved = unresolved;
+                if state.resolved.is_empty() {
+                    state.failed_until = Some(now + ADMITTED_REPOSITORIES_FAILURE_TTL);
+                } else {
+                    state.failed_until = None;
+                    state.retry_at = Some(now + ADMITTED_REPOSITORIES_PARTIAL_TTL);
+                    if refresh == AdmittedRefresh::Full {
+                        state.expires_at = Some(
+                            now + if fresh.is_empty() {
+                                ADMITTED_REPOSITORIES_PARTIAL_TTL
+                            } else {
+                                ADMITTED_REPOSITORIES_TTL
+                            },
+                        );
                     }
                 }
-                None if state.resolved.is_empty() => {
-                    state.failed_until = Some(now + ADMITTED_REPOSITORIES_FAILURE_TTL);
-                }
-                None => {}
+                state.rebuild_listing();
             }
         }
         self.refreshed.send_modify(|generation| {
@@ -293,17 +334,45 @@ impl AdmittedRepositoryCache {
     }
 }
 
-/// Completes a refresh even if its task ends without an outcome.
+/// Completes a refresh exactly once, including when its task is dropped before it runs.
 struct AdmittedRefreshCompletion {
-    cache: AdmittedRepositoryCache,
-    refresh: AdmittedRefresh,
-    outcome: Option<ResolutionOutcome>,
+    pending: Option<(
+        AdmittedRepositoryCache,
+        AdmittedRefresh,
+        Vec<GitRepositoryReference>,
+    )>,
+}
+
+impl AdmittedRefreshCompletion {
+    fn new(
+        cache: AdmittedRepositoryCache,
+        refresh: AdmittedRefresh,
+        targets: Vec<GitRepositoryReference>,
+    ) -> Self {
+        Self {
+            pending: Some((cache, refresh, targets)),
+        }
+    }
+
+    fn targets(&self) -> Vec<GitRepositoryReference> {
+        self.pending
+            .as_ref()
+            .map(|(_, _, targets)| targets.clone())
+            .unwrap_or_default()
+    }
+
+    fn finish(mut self, outcome: ResolutionOutcome) {
+        if let Some((cache, refresh, targets)) = self.pending.take() {
+            cache.complete_refresh(refresh, &targets, Some(outcome));
+        }
+    }
 }
 
 impl Drop for AdmittedRefreshCompletion {
     fn drop(&mut self) {
-        self.cache
-            .complete_refresh(self.refresh, self.outcome.take());
+        if let Some((cache, refresh, targets)) = self.pending.take() {
+            cache.complete_refresh(refresh, &targets, None);
+        }
     }
 }
 
@@ -323,18 +392,33 @@ impl GithubAutomationConfig {
         workflow_installation_mode: StewardRunWorkflowInstallationMode,
         task_identity_discovery_enabled: bool,
     ) -> Self {
+        let admitted_key = task_api.admitted_source_repository_references();
         Self {
             task_api,
             steward_run_release,
             workflow_installation_mode,
             task_identity_discovery_enabled,
-            admitted_repositories: AdmittedRepositoryCache::new(Arc::new(Instant::now)),
+            admitted_repositories: AdmittedRepositoryCache::new(
+                Arc::new(Instant::now),
+                admitted_key,
+            ),
         }
     }
 
     #[cfg(test)]
     fn with_admitted_repository_clock(mut self, clock: AdmittedRepositoryClock) -> Self {
-        self.admitted_repositories = AdmittedRepositoryCache::new(clock);
+        self.admitted_repositories =
+            AdmittedRepositoryCache::new(clock, self.admitted_repositories.key.to_vec());
+        self
+    }
+
+    #[cfg(test)]
+    fn with_task_api(mut self, task_api: TaskApiConfig) -> Self {
+        self.admitted_repositories = AdmittedRepositoryCache::new(
+            Arc::clone(&self.admitted_repositories.clock),
+            task_api.admitted_source_repository_references(),
+        );
+        self.task_api = task_api;
         self
     }
 }
@@ -1344,26 +1428,20 @@ enum AdmittedRepositories {
     /// The App resolved no admitted repository.
     Unavailable,
     Listed {
-        repositories: Vec<GithubRepositoryView>,
+        repositories: Arc<Vec<GithubRepositoryView>>,
         unresolved: usize,
     },
 }
 
 async fn admitted_repositories(config: &GithubAutomationConfig) -> AdmittedRepositories {
-    let references = config.task_api.admitted_source_repository_references();
-    if references.is_empty() {
+    let cache = &config.admitted_repositories;
+    if cache.key.is_empty() {
         return AdmittedRepositories::NotConfigured;
     }
-    let cache = &config.admitted_repositories;
     let mut refreshed = cache.refreshed.subscribe();
+    let mut started = None;
     {
         let mut state = cache.lock();
-        if state.key != references {
-            *state = AdmittedRepositoryState {
-                key: references,
-                ..AdmittedRepositoryState::default()
-            };
-        }
         if state.unsupported {
             return AdmittedRepositories::NotConfigured;
         }
@@ -1371,47 +1449,62 @@ async fn admitted_repositories(config: &GithubAutomationConfig) -> AdmittedRepos
             && let Some(refresh) = state.refresh_due((cache.clock)())
         {
             let targets = match refresh {
-                AdmittedRefresh::Full => state.key.clone(),
+                AdmittedRefresh::Full => cache.key.to_vec(),
                 AdmittedRefresh::Unresolved => state.unresolved.clone(),
             };
             state.refreshing = true;
-            spawn_admitted_refresh(cache.clone(), config.task_api.clone(), targets, refresh);
+            // The guard exists before the task does, so the refresh completes even if the
+            // task is dropped before it first runs.
+            started = Some(AdmittedRefreshCompletion::new(
+                cache.clone(),
+                refresh,
+                targets,
+            ));
         }
-        if !state.resolved.is_empty() || !state.refreshing {
+        if started.is_none() && (!state.listing.is_empty() || !state.refreshing) {
             return state.listing();
         }
     }
-    // No usable listing yet: wait for the in-flight refresh. Cancelling this wait does not
-    // cancel the refresh, which still fills the cache.
-    loop {
-        if refreshed.changed().await.is_err() {
-            return AdmittedRepositories::Unavailable;
+    let usable = {
+        if let Some(completion) = started {
+            spawn_admitted_refresh(completion, config.task_api.clone());
         }
         let state = cache.lock();
-        if !state.refreshing {
-            return state.listing();
-        }
+        (!state.listing.is_empty() || !state.refreshing).then(|| state.listing())
+    };
+    if let Some(listing) = usable {
+        return listing;
     }
+    // No usable listing yet: wait, within a bound, for the in-flight refresh. Cancelling
+    // this wait does not cancel the refresh, which still fills the cache.
+    tokio::time::timeout(ADMITTED_REPOSITORIES_COLD_WAIT, async {
+        loop {
+            if refreshed.changed().await.is_err() {
+                return AdmittedRepositories::Unavailable;
+            }
+            let state = cache.lock();
+            if !state.refreshing {
+                return state.listing();
+            }
+        }
+    })
+    .await
+    .unwrap_or(AdmittedRepositories::Unavailable)
 }
 
-fn spawn_admitted_refresh(
-    cache: AdmittedRepositoryCache,
-    task_api: TaskApiConfig,
-    targets: Vec<GitRepositoryReference>,
-    refresh: AdmittedRefresh,
-) {
+fn spawn_admitted_refresh(completion: AdmittedRefreshCompletion, task_api: TaskApiConfig) {
     tokio::spawn(async move {
-        let mut completion = AdmittedRefreshCompletion {
-            cache,
-            refresh,
-            outcome: None,
-        };
-        completion.outcome = Some(resolve_admitted(&task_api, &targets).await);
+        let targets = completion.targets();
+        let outcome = resolve_admitted(&task_api, &targets).await;
+        completion.finish(outcome);
     });
 }
 
+#[derive(Default)]
 struct ResolutionOutcome {
     resolved: BTreeMap<GitRepositoryReference, GithubRepositoryView>,
+    /// Repositories the App definitively rejected, or whose metadata failed validation.
+    rejected: std::collections::BTreeSet<GitRepositoryReference>,
     /// Every requested repository was answered with `Unsupported`.
     unsupported: bool,
 }
@@ -1424,6 +1517,7 @@ async fn resolve_admitted(
 ) -> ResolutionOutcome {
     let deadline = tokio::time::Instant::now() + ADMITTED_REPOSITORIES_RESOLUTION_TIMEOUT;
     let mut resolved = BTreeMap::new();
+    let mut rejected = std::collections::BTreeSet::new();
     let mut answered = vec![false; references.len()];
     let mut failures = Vec::new();
     let mut unsupported = 0_usize;
@@ -1443,11 +1537,18 @@ async fn resolve_admitted(
                         resolved.insert(reference.clone(), view);
                         continue;
                     }
-                    None => "repository metadata failed listing validation".to_owned(),
+                    None => {
+                        rejected.insert(reference.clone());
+                        "repository metadata failed listing validation".to_owned()
+                    }
                 },
                 Err(steward_ports::PortError::Unsupported { operation }) => {
                     unsupported += 1;
                     operation.to_owned()
+                }
+                Err(steward_ports::PortError::Rejected { reason }) => {
+                    rejected.insert(reference.clone());
+                    reason
                 }
                 Err(error) => port_error_reason(&error).to_owned(),
             };
@@ -1481,6 +1582,7 @@ async fn resolve_admitted(
     }
     ResolutionOutcome {
         resolved,
+        rejected,
         unsupported,
     }
 }
@@ -1523,7 +1625,7 @@ fn admitted_view(
 }
 
 fn admitted_page(
-    repositories: Vec<GithubRepositoryView>,
+    repositories: Arc<Vec<GithubRepositoryView>>,
     unresolved: usize,
     page: u32,
     per_page: u32,
@@ -1532,9 +1634,10 @@ fn admitted_page(
     let start = (page as usize - 1).saturating_mul(per_page);
     let has_next_page = start.saturating_add(per_page) < repositories.len();
     let repositories = repositories
-        .into_iter()
+        .iter()
         .skip(start)
         .take(per_page)
+        .cloned()
         .collect();
     let mut response = no_store_json(GithubRepositoriesResponse {
         api_version: GITHUB_AUTOMATION_API_VERSION,
@@ -3003,10 +3106,12 @@ mod tests {
             "bindings": bindings
         })
         .to_string();
-        let mut config = config()?;
-        config.task_api = TaskApiConfig::default()
-            .with_source_repository_bindings_json(Some(&bindings))?
-            .with_git_hosting_plane(app);
+        let config = config()?;
+        let config = config.with_task_api(
+            TaskApiConfig::default()
+                .with_source_repository_bindings_json(Some(&bindings))?
+                .with_git_hosting_plane(app),
+        );
         Ok(config.with_admitted_repository_clock(clock))
     }
 
@@ -3306,7 +3411,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_refresh_keeps_the_previous_listing() -> Result<(), String> {
+    async fn failed_refresh_keeps_the_previous_listing_and_counts_it_unresolved()
+    -> Result<(), String> {
         let source_app = FakeSourceApp::resolving(vec![
             description("example-org", "100", "repo-a", "200")?,
             description("example-org", "100", "repo-b", "201")?,
@@ -3320,20 +3426,19 @@ mod tests {
         source_app.fail("201")?;
         set_clock(&offset, ADMITTED_REPOSITORIES_TTL)?;
         list(&app, &cookie, "").await?;
+        app_calls(&source_app, 2).await?;
         refresh_idle(&cache).await?;
-        assert_eq!(source_app.call_count()?, 2);
         let (status, unresolved, body) = list(&app, &cookie, "").await?;
         assert_eq!(
             status,
             StatusCode::OK,
             "a failed refresh never becomes a 503"
         );
-        assert_eq!(unresolved, None);
         assert_eq!(listed_names(&body), ["repo-a", "repo-b"]);
         assert_eq!(
-            source_app.call_count()?,
-            2,
-            "the failed refresh is not retried at once"
+            unresolved.as_deref(),
+            Some("2"),
+            "retained entries that failed count as unresolved"
         );
 
         source_app.set(
@@ -3345,12 +3450,158 @@ mod tests {
             ADMITTED_REPOSITORIES_TTL + ADMITTED_REPOSITORIES_PARTIAL_TTL,
         )?;
         list(&app, &cookie, "").await?;
+        app_calls(&source_app, 3).await?;
         refresh_idle(&cache).await?;
-        let (_, _, body) = list(&app, &cookie, "").await?;
+        let (_, unresolved, body) = list(&app, &cookie, "").await?;
         assert_eq!(
             listed_names(&body),
             ["repo-a-renamed", "repo-b"],
-            "a partial refresh merges into the previous listing"
+            "a later refresh merges into the retained listing"
+        );
+        assert_eq!(unresolved.as_deref(), Some("1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_entries_expire_after_the_maximum_age() -> Result<(), String> {
+        let source_app = FakeSourceApp::resolving(vec![
+            description("example-org", "100", "repo-a", "200")?,
+            description("example-org", "100", "repo-b", "201")?,
+        ]);
+        let (app, cookie, cache, offset, _) =
+            admitted_app(&source_app, &[("100", "200"), ("100", "201")]).await?;
+        list(&app, &cookie, "").await?;
+
+        source_app.fail("201")?;
+        set_clock(&offset, ADMITTED_REPOSITORIES_TTL)?;
+        list(&app, &cookie, "").await?;
+        app_calls(&source_app, 2).await?;
+        refresh_idle(&cache).await?;
+        let (_, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(
+            listed_names(&body),
+            ["repo-a", "repo-b"],
+            "repo-b is retained"
+        );
+        assert_eq!(unresolved.as_deref(), Some("1"));
+
+        set_clock(
+            &offset,
+            ADMITTED_REPOSITORIES_MAX_AGE + std::time::Duration::from_secs(1),
+        )?;
+        list(&app, &cookie, "").await?;
+        app_calls(&source_app, 3).await?;
+        refresh_idle(&cache).await?;
+        let (status, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed_names(&body),
+            ["repo-a"],
+            "an entry failing past the maximum age is no longer listed"
+        );
+        assert_eq!(unresolved.as_deref(), Some("1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn definitive_rejection_evicts_a_listed_repository() -> Result<(), String> {
+        let source_app = FakeSourceApp::resolving(vec![
+            description("example-org", "100", "repo-a", "200")?,
+            description("example-org", "100", "repo-b", "201")?,
+        ]);
+        let (app, cookie, cache, offset, _) =
+            admitted_app(&source_app, &[("100", "200"), ("100", "201")]).await?;
+        list(&app, &cookie, "").await?;
+
+        source_app.set(
+            "201",
+            Err(PortError::Rejected {
+                reason: "GitHub App is not installed for the repository owner".to_owned(),
+            }),
+        )?;
+        set_clock(&offset, ADMITTED_REPOSITORIES_TTL)?;
+        list(&app, &cookie, "").await?;
+        app_calls(&source_app, 2).await?;
+        refresh_idle(&cache).await?;
+        let (_, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(
+            listed_names(&body),
+            ["repo-a"],
+            "a rejected repository is evicted"
+        );
+        assert_eq!(unresolved.as_deref(), Some("1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsupported_retry_never_discards_a_resolved_listing() -> Result<(), String> {
+        let source_app =
+            FakeSourceApp::resolving(vec![description("example-org", "100", "repo-a", "200")?]);
+        source_app.fail("201")?;
+        let (app, cookie, cache, offset, broker) =
+            admitted_app(&source_app, &[("100", "200"), ("100", "201")]).await?;
+        list(&app, &cookie, "").await?;
+
+        source_app.set(
+            "201",
+            Err(PortError::Unsupported {
+                operation: "describe_repositories",
+            }),
+        )?;
+        set_clock(&offset, ADMITTED_REPOSITORIES_PARTIAL_TTL)?;
+        list(&app, &cookie, "").await?;
+        app_calls(&source_app, 2).await?;
+        refresh_idle(&cache).await?;
+        assert_eq!(source_app.call(1)?, ["201"], "an unresolved-only retry");
+        let (status, unresolved, body) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["source"], "admitted");
+        assert_eq!(listed_names(&body), ["repo-a"]);
+        assert_eq!(unresolved.as_deref(), Some("1"));
+        assert_eq!(governed_calls(&broker)?, 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_wait_is_bounded_when_a_refresh_never_reports() -> Result<(), String> {
+        let source_app =
+            FakeSourceApp::resolving(vec![description("example-org", "100", "repo-a", "200")?]);
+        let (app, cookie, cache, _, _) = admitted_app(&source_app, &[("100", "200")]).await?;
+        // A refresh that is marked in flight but never completes.
+        cache.lock().refreshing = true;
+
+        let (status, _, body) = list(&app, &cookie, "").await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["reason"], "source_app_unavailable");
+        assert_eq!(source_app.call_count()?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_dropped_before_running_still_completes() -> Result<(), String> {
+        let source_app =
+            FakeSourceApp::resolving(vec![description("example-org", "100", "repo-a", "200")?]);
+        let (clock, _) = fixed_clock();
+        let config = admitted_config(source_app, &[("100", "200")], clock)?;
+        let cache = config.admitted_repositories.clone();
+        cache.lock().refreshing = true;
+        let refreshed = cache.refreshed.subscribe();
+
+        drop(AdmittedRefreshCompletion::new(
+            cache.clone(),
+            AdmittedRefresh::Full,
+            cache.key.to_vec(),
+        ));
+        let state = cache.lock();
+        assert!(!state.refreshing, "the guard cleared the in-flight flag");
+        assert!(
+            state.failed_until.is_some(),
+            "a cold drop is a shared failure"
+        );
+        drop(state);
+        assert!(
+            refreshed.has_changed().map_err(|error| error.to_string())?,
+            "waiters are woken"
         );
         Ok(())
     }
@@ -3458,9 +3709,11 @@ mod tests {
         })
         .to_string();
         let mut config = config()?;
-        config.task_api = TaskApiConfig::default()
-            .with_source_repository_bindings_json(Some(&bindings))?
-            .with_git_hosting_plane(DescriptionlessPlane);
+        config = config.with_task_api(
+            TaskApiConfig::default()
+                .with_source_repository_bindings_json(Some(&bindings))?
+                .with_git_hosting_plane(DescriptionlessPlane),
+        );
         let broker = FakeBroker::default();
         let (auth, cookie, _) = signed_in_cookie_and_csrf().await?;
         let app = protected_router(FakeLedger::default(), broker.clone(), config, auth);
@@ -3513,7 +3766,8 @@ mod tests {
     async fn source_app_without_bindings_keeps_the_governed_listing() -> Result<(), String> {
         let source_app = FakeSourceApp::default();
         let mut config = config()?;
-        config.task_api = TaskApiConfig::default().with_git_hosting_plane(source_app.clone());
+        config = config
+            .with_task_api(TaskApiConfig::default().with_git_hosting_plane(source_app.clone()));
         let broker = FakeBroker::default();
         let (auth, cookie, _) = signed_in_cookie_and_csrf().await?;
         let app = protected_router(FakeLedger::default(), broker.clone(), config, auth);

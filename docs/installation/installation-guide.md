@@ -475,7 +475,9 @@ admitted** (Get started) or **Not ready** (the task page's publish panel), add i
 source IDs; the browser caches the repository list, so the user then selects **Refresh
 repositories** in Get started or reloads the page to see the change (the apiserver's
 admitted listing itself refreshes within 10 minutes, or at once after an apiserver
-restart). If a repository the user owns is absent from the per-user listing, first
+restart). An admitted repository the App definitively rejects disappears from the
+admitted listing at the next refresh; one that only fails transiently stays listed for
+up to 20 minutes. If a repository the user owns is absent from the per-user listing, first
 check OAuth App access rather than widening Steward authority. If an admitted
 repository is absent from the default admitted listing, check that its IDs are in
 `githubSource.bindings` and that the source App installation includes it; the

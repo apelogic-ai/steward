@@ -297,7 +297,8 @@ its one read, and caches the result in process for 10 minutes, revalidating it
 in the background. The App installation must include each
 admitted repository; it needs no additional permission. A repository it cannot
 resolve is omitted and counted in the `x-steward-unresolved-repositories`
-response header; a failed refresh keeps the previously resolved entries. Only
+response header; a failed refresh keeps a previously resolved entry for up to
+20 minutes (counted as unresolved), and a definitive rejection removes it. Only
 when none has ever resolved does the listing return HTTP 503 with reason
 `source_app_unavailable`. This lists only operator-configured repositories to
 authenticated users and grants nothing; publication and dispatch still use the
