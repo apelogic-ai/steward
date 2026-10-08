@@ -139,6 +139,12 @@ visibility and URLs of the repositories the operator configured as governed sour
 It grants nothing: publication, workflow detection, dispatch and run status below still
 run through the user's governed connection.
 
+Get started step 4 offers the same list as the task page's publish panel, labelling a
+repository that is not admitted as a governed source **Not admitted** (only the
+per-user listing can contain one). The browser loads the list once per page load and
+shares it between Get started and this panel; **Refresh repositories** in Get started,
+**Retry repositories** after a failure, or a page reload fetches it again.
+
 Publication is a server-owned operation. Steward reconstructs the successful run's
 exact one-file inline package, renders the pinned `steward-run` v0.8.0-or-later caller,
 creates a `steward/task-<taskUid>` branch from the repository's default branch, pushes

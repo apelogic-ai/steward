@@ -17,10 +17,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   repositories therefore appear by default, and a warm listing no longer waits
   for a sandbox. The apiserver resolves each distinct bound source repository
   ID through the source GitHub App: it lists the App's installations, mints a
-  token scoped to that one repository with only `metadata: read`, and reads
-  `GET /repositories/{id}`, then revokes that token. Every entry passes the governed listing's per-field
-  validation and bounds, must match its bound owner and repository IDs, and is
-  marked `ready: true`. The `login` field is empty for this listing, because it
+  token scoped to that one repository with only `metadata: read`, reads
+  `GET /repositories/{id}`, and then revokes that token. Every entry passes the
+  governed listing's per-field validation and bounds, must match its bound
+  owner and repository IDs, and is marked `ready: true`. The `login` field is empty for this listing, because it
   does not consult the user's GitHub connection.
 - Consumers of the default listing must not treat its success as proof of a
   GitHub connection: a user without one now sees admitted repositories marked
@@ -59,7 +59,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - `GithubRepositoriesResponse` gains an optional `source` field:
   `"admitted"` for the App-resolved listing and `"connection"` for the governed
   listing. The regenerated web client types include it; the browser does not
-  use it yet.
+  use it yet. With the admitted listing, every repository in the Get started
+  picker is **Ready**.
 - Authority: listing admitted repositories to any authenticated browser user
   reveals only names, default branches, visibility and URLs that the operator
   configured as governed sources. Workflow detection, publication, dispatch and
@@ -69,6 +70,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   token requests only `metadata: read`. With NetworkPolicy enabled, the
   existing `networkPolicy.githubApiCidrs` egress already covers these calls.
   No migration or Helm value changes.
+
+### Fixed
+
+- Get started step 4 ("Publish the task definition") now shows the GitHub
+  repository picker. Before, the only selector was inside step 3, which
+  collapses once the test run succeeds. Step 4 then used an automatically
+  chosen repository without showing it, and showed readiness messages about a
+  repository the user never saw. Each entry shows `owner/name` and whether it
+  is Ready, Not admitted, or Not ready. The first ready repository is still
+  pre-selected. Steps 3 and 4 change the same selection. Steps 5 and 6
+  (workflow detection and dispatch) name the selected repository, and their
+  **Change repository** action returns to step 4. The selection is kept when
+  onboarding evidence reloads. The not-admitted message names the repository.
+  When no listed repository is admitted, the page says so: "None of your
+  repositories is admitted as a governed source on this deployment; ask an
+  administrator to add it."
+- The GitHub repository list is now cached and shared. It uses the `swr`
+  package (MIT, pinned at 2.5.1). Before, each page or component fetched the
+  list again every time it mounted. Now the list loads once per page load and
+  is shared by every Get started step and the task page's **Publish this task
+  to GitHub** panel. Moving between them inside the app makes no new listing
+  request. The list is fetched again only:
+  - by **Refresh repositories** (Get started) or **Retry repositories** (after
+    a failed listing);
+  - by a full page load;
+  - on the next visit after a failed listing or a GitHub disconnect.
+
+  It does not refetch on window focus or reconnect, does not poll, and does not
+  retry a failure automatically. As a result, after an administrator admits a
+  repository, it shows as **Ready** only after **Refresh repositories** or a
+  page reload. If a refresh fails, the failure and **Retry repositories**
+  replace the list until a retry succeeds. API calls are unchanged.
+- Repository readiness messages changed. A repository that is not ready for
+  another reason now reads `owner/name is not ready for governed automation:
+  <reason>.`, and step 3 no longer adds a `Not ready:` prefix.
 
 ## [0.3.12] - 2026-10-07
 
