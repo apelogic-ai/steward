@@ -184,8 +184,8 @@ server-owned regular-file entries after the `out/` tree:
 ```
 
 steward-run 0.8.1 requires both entries for a `full` Task and rejects them for any other
-Task. Steward 0.3.11 omitted them, so every `execution-log: full` caller failed after its
-Task succeeded; Steward 0.3.12 restores them. When diagnostics is missing or `off`, the
+Task. Steward 0.3.11 and 0.3.12 omitted them, so every `execution-log: full` caller failed
+after its Task succeeded; Steward 0.3.13 restores them. When diagnostics is missing or `off`, the
 delivered archive is `out/`-only.
 
 Each original process stream is retained verbatim up to 4 MiB; the combined bound is
@@ -193,7 +193,7 @@ Each original process stream is retained verbatim up to 4 MiB; the combined boun
 bounded `execution_transcript_too_large` failure category rather than truncating
 silently. The `.steward/diagnostics` namespace is reserved: agent output cannot create
 or replace these entries. Since Steward 0.3.11 the stored archive is validated as
-`out/`-only (`steward.task-output/v1`); Steward 0.3.12 appends the transcript from the
+`out/`-only (`steward.task-output/v1`); Steward 0.3.13 appends the transcript from the
 successful attempt's durable logs only when serving the runner download, and fails that
 download closed if the transcript is missing or exceeds its bounds. Browser output
 listings and downloads never show the reserved entries. The runner replays them only

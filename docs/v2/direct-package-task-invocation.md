@@ -219,8 +219,8 @@ transcript. The coding-agent process's original stdout and stderr are captured a
 separate, durable server-owned streams. After successful execution, `steward-run`
 downloads them as `.steward/diagnostics/stdout.log` and `stderr.log` inside the
 authenticated output archive and replays them verbatim into clearly labelled GitHub
-Actions log groups. Steward 0.3.11 omitted these entries, which failed every
-`execution-log: full` run after its Task succeeded; Steward 0.3.12 restores them.
+Actions log groups. Steward 0.3.11 and 0.3.12 omitted these entries, which failed every
+`execution-log: full` run after its Task succeeded; Steward 0.3.13 restores them.
 
 Before replay, `steward-run` emits the documented sensitive-output warning. The
 transcript may reproduce prompts, repository data, model output, and MCP results. It

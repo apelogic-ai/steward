@@ -103,11 +103,49 @@ It selects only a coding agent whose model family is allowed by the selected Env
 and records that exact model in the package requirements.
 
 After an inline run succeeds, its detail page offers **Publish this task to GitHub**.
-Steward lists repositories visible through the user's governed GitHub connection and
-marks each repository as ready or not ready. Readiness requires the repository's stable
-owner and repository IDs to be admitted as a source in `githubSource.bindings`; a
-mutable repository name is not authority. Organization policy may also have to allow
-the Steward OAuth App to access the repository before it becomes visible.
+The browser sends a blank repository query to `GET /app/api/v1/github/repositories`.
+What that lists depends on the deployment (unreleased; after 0.3.12):
+
+- **`githubSource` enabled with at least one binding.** Steward lists the admitted
+  source repositories, the distinct sources in `githubSource.bindings`, including
+  organization-owned ones. The apiserver resolves each bound repository ID through the
+  source GitHub App, with a token scoped to that repository and only `metadata: read`.
+  No governed operation or sandbox runs, and the response has `source: "admitted"` and
+  an empty `login`. Every entry is `ready: true`. The result is cached in process for
+  10 minutes. After that the cached listing is still served at once while one
+  background refresh revalidates it. A refresh that fails keeps a previous entry for
+  up to 20 minutes since it last resolved, counting it as unresolved; a definitive
+  rejection, such as the App no longer being installed on it, removes it at once.
+  If the App resolves only some repositories, the response lists those, and the
+  `x-steward-unresolved-repositories` header counts the rest; only the unresolved ones
+  are retried, at most every 30 seconds. Only when no listing has ever resolved does
+  the request fail, with HTTP 503 and `reason: "source_app_unavailable"`; requests in
+  the next 5 seconds share that result. It does not fall back to the per-user listing,
+  except when the configured hosting plane cannot describe repositories at all. The
+  source App installation must include each admitted repository.
+  This listing does not need or reflect the user's GitHub connection, and the user's own
+  repositories that are not admitted no longer appear in it.
+- **`githubSource` disabled, or no bindings.** Steward lists the repositories owned by
+  the GitHub user of the governed connection (`source: "connection"`), as in 0.3.12.
+  Repositories owned by an organization are not listed by default.
+
+An explicit search `query`, such as `org:<organization>` or `repo:<owner>/<name>`,
+always uses the governed per-user listing, which marks each repository as ready or not
+ready. Readiness requires the repository's stable owner and repository IDs to be
+admitted as a source in `githubSource.bindings`; a mutable repository name is not
+authority. Organization policy may also have to allow the Steward OAuth App to access
+the repository before the governed listing or publication can see it.
+
+The admitted listing shows any authenticated browser user the names, default branches,
+visibility and URLs of the repositories the operator configured as governed sources.
+It grants nothing: publication, workflow detection, dispatch and run status below still
+run through the user's governed connection.
+
+Get started step 4 offers the same list as the task page's publish panel, labelling a
+repository that is not admitted as a governed source **Not admitted** (only the
+per-user listing can contain one). The browser loads the list once per page load and
+shares it between Get started and this panel; **Refresh repositories** in Get started,
+**Retry repositories** after a failure, or a page reload fetches it again.
 
 Publication is a server-owned operation. Steward reconstructs the successful run's
 exact one-file inline package, renders the pinned `steward-run` v0.8.0-or-later caller,
@@ -124,15 +162,28 @@ The run detail then shows the GitHub run, jobs, bounded failed-job log content, 
 owner-scoped governed Task correlated by repository, run ID, and attempt.
 
 The browser routes are under `/app/api/v1` and remain bound to the authenticated
-canonical owner. Repository reads, publication writes, dispatch, and run observation
-execute as audited governed Connections operations. No provider token or repository
-file content is logged. Migration 0064 adds those operation kinds and internal
+canonical owner. Per-user repository listings and lookups, workflow detection,
+publication writes, dispatch, and run observation execute as audited governed
+Connections operations; only the admitted repository listing above uses the source
+GitHub App instead. No provider token or repository file content is logged. Migration 0064 adds those operation kinds and internal
 authority v4 while preserving the exact v1, v2, and v3 authority tuples for historical
 rows.
 
+When a governed operation has a recorded execution-attempt start and finish, its
+reconciler emits one structured latency line with `operation_kind`, `queue_wait_ms`,
+`attempt_duration_ms`, and `total_latency_ms`. Operations that fail before an attempt
+starts do not emit this line; a timing-query failure emits a bounded
+`connection operation latency unavailable` line and never stops reconciliation. The
+issue #305 local-main sample measured repository operations at
+22.945–24.066 seconds total: 13.437–15.497 seconds before bridge execution and
+5.274–7.314 seconds in the bridge attempt. Image pull accounted for only 353 ms in the
+sample that pulled an image. Deployments can use the same fields to diagnose runtime
+activation separately from bridge execution. Prometheus export remains deferred until
+Steward has a metrics mechanism.
+
 ## First-run prerequisite failures
 
-The 0.3.11 first-run path fails before creating a Task or runtime when a required
+The 0.3.12 first-run path fails before creating a Task or runtime when a required
 deployment or identity prerequisite is absent. Use the following exact signals; do
 not diagnose these cases as generic database, Kubernetes, or credential failures.
 

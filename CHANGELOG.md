@@ -7,28 +7,250 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- With `githubSource` enabled and at least one source in `githubSource.bindings`,
+  `GET /app/api/v1/github/repositories` with a blank `query` (the browser
+  default in Get started and on the Runs page) now lists the **admitted source
+  repositories** directly from the apiserver instead of running a governed
+  per-user operation in a bridge sandbox. Organization-owned admitted
+  repositories therefore appear by default, and a warm listing no longer waits
+  for a sandbox. The apiserver resolves each distinct bound source repository
+  ID through the source GitHub App: it lists the App's installations, mints a
+  token scoped to that one repository with only `metadata: read`, reads
+  `GET /repositories/{id}`, and then revokes that token. Every entry passes the
+  governed listing's per-field validation and bounds, must match its bound
+  owner and repository IDs, and is marked `ready: true`. The `login` field is empty for this listing, because it
+  does not consult the user's GitHub connection.
+- Consumers of the default listing must not treat its success as proof of a
+  GitHub connection: a user without one now sees admitted repositories marked
+  ready, and publication or dispatch can still fail on the connection or on
+  OAuth App access. The user's own repositories that are not admitted, which
+  0.3.12 listed as not ready, no longer appear in the default listing; an
+  explicit `query` still finds them. The admitted listing runs no governed
+  operation, so it writes no governed-operation record; workflow detection,
+  publication, dispatch and run status still do.
+- The admitted listing is cached in process for 10 minutes per binding
+  configuration. After that, requests are still served the cached listing at
+  once while one detached background refresh revalidates it
+  (stale-while-revalidate); a cancelled request never cancels a refresh. A
+  request waits only while no listing has ever resolved: at startup, and
+  again after each 5-second failure window while the App keeps failing.
+  Concurrent waiting requests share one resolution, and a wait is bounded at
+  35 seconds. Each full resolution lists the App's installations once (up
+  to 10 pages of 100; more installations fail with a distinct error) and then
+  makes three GitHub API calls per admitted repository: mint, read, and revoke.
+  A minted token whose scope does not validate is revoked too. Revocation is
+  best effort with a 2-second timeout; a failure logs one line beginning
+  `github source: metadata token revocation failed:` with no token material,
+  and the token still expires on its own.
+- If the App resolves some admitted repositories but not others, the response
+  lists those it resolved and carries their count in the
+  `x-steward-unresolved-repositories` header. Only the unresolved repositories
+  are retried, at most every 30 seconds. A definitive rejection (for example
+  the App no longer installed on the repository, or metadata that no longer
+  matches the binding) removes the repository from the listing at once. Any
+  other failure keeps the previously resolved entry for up to 20 minutes since
+  it last resolved, and that entry counts as unresolved in the header. A
+  wholly failed refresh is retried after 30 seconds. Only when no listing has ever resolved does the
+  request fail with HTTP 503, `error: "github_automation_unavailable"` and
+  `reason: "source_app_unavailable"`, rather than falling back to the slower
+  per-user listing; requests in the following 5 seconds share that failure
+  instead of repeating it. One resolution has a 30-second deadline, and every
+  repository that finished before it is kept; only those still pending count
+  as unresolved. Each resolution with unresolved repositories logs one
+  apiserver line beginning `admitted repository listing:` with the count and
+  up to five repository IDs with their fixed reasons; no token is logged.
+- A Git hosting plane that cannot describe repositories (the port's default)
+  keeps the governed per-user listing for a blank query, as before. Only a
+  full resolution with no listing yet can switch to that fallback; an
+  Unsupported answer during a retry never discards a resolved listing.
+- The governed per-user listing is unchanged for an explicit search `query`,
+  and for a blank query when `githubSource` is disabled or has no bindings.
+- `GithubRepositoriesResponse` gains an optional `source` field:
+  `"admitted"` for the App-resolved listing and `"connection"` for the governed
+  listing. The regenerated web client types include it; the browser does not
+  use it yet. With the admitted listing, every repository in the Get started
+  picker is **Ready**.
+- Authority: listing admitted repositories to any authenticated browser user
+  reveals only names, default branches, visibility and URLs that the operator
+  configured as governed sources. Workflow detection, publication, dispatch and
+  run status still run as governed connection operations, unchanged.
+- Operations: the source GitHub App installation must include each admitted
+  source repository. The App needs no new permission; the listing
+  token requests only `metadata: read`. With NetworkPolicy enabled, the
+  existing `networkPolicy.githubApiCidrs` egress already covers these calls.
+  No migration or Helm value changes.
+
 ### Fixed
 
+- Get started step 4 ("Publish the task definition") now shows the GitHub
+  repository picker. Before, the only selector was inside step 3, which
+  collapses once the test run succeeds. Step 4 then used an automatically
+  chosen repository without showing it, and showed readiness messages about a
+  repository the user never saw. Each entry shows `owner/name` and whether it
+  is Ready, Not admitted, or Not ready. The first ready repository is still
+  pre-selected. Steps 3 and 4 change the same selection. Steps 5 and 6
+  (workflow detection and dispatch) name the selected repository, and their
+  **Change repository** action returns to step 4. The selection is kept when
+  onboarding evidence reloads. The not-admitted message names the repository.
+  When no listed repository is admitted, the page says so: "None of your
+  repositories is admitted as a governed source on this deployment; ask an
+  administrator to add it."
+- The GitHub repository list is now cached and shared. It uses the `swr`
+  package (MIT, pinned at 2.5.1). Before, each page or component fetched the
+  list again every time it mounted. Now the list loads once per page load and
+  is shared by every Get started step and the task page's **Publish this task
+  to GitHub** panel. Moving between them inside the app makes no new listing
+  request. The list is fetched again only:
+  - by **Refresh repositories** (Get started) or **Retry repositories** (after
+    a failed listing);
+  - by a full page load;
+  - on the next visit after a failed listing or a GitHub disconnect.
+
+  It does not refetch on window focus or reconnect, does not poll, and does not
+  retry a failure automatically. As a result, after an administrator admits a
+  repository, it shows as **Ready** only after **Refresh repositories** or a
+  page reload. If a refresh fails, the failure and **Retry repositories**
+  replace the list until a retry succeeds. API calls are unchanged.
+- Repository readiness messages changed. A repository that is not ready for
+  another reason now reads `owner/name is not ready for governed automation:
+  <reason>.`, and step 3 no longer adds a `Not ready:` prefix.
 - Restored the reserved execution transcript in the runner output archive. Steward
-  0.3.11 delivered an `out/`-only archive from `GET /v1/tasks/{taskUid}/outputs` even
-  when the Task requested `diagnostics.executionLog: full`, so steward-run 0.8.1, which
-  requires `.steward/diagnostics/stdout.log` and `stderr.log` in that archive, failed every
-  `execution-log: full` run with `failure-category=input-output` after the Task had
-  succeeded. The `package-path` workflows Steward generates set `execution-log: full`, so
-  **Steward 0.3.11 breaks those callers; upgrade to this release.** For `full` Tasks the runner
-  download now appends both streams from the successful attempt's durable logs (at most
-  4 MiB each, 8 MiB combined) after the `out/` tree; every other Task still receives an
-  `out/`-only archive. The stored archive, the controller's `out/`-only validation, and the
-  browser output listings and downloads are unchanged, agent output still cannot create or
-  replace `.steward/diagnostics`, and a `full` Task whose transcript is missing or over its
-  bounds now returns `503` instead of an archive the runner would reject. The execution-log
-  endpoints are unchanged. No migration or caller change is required.
+  0.3.11 and 0.3.12 delivered an `out/`-only archive from `GET
+  /v1/tasks/{taskUid}/outputs` even when the Task requested `diagnostics.executionLog:
+  full`, so steward-run 0.8.1, which requires `.steward/diagnostics/stdout.log` and
+  `stderr.log` in that archive, failed every `execution-log: full` run with
+  `failure-category=input-output` after the Task had succeeded. The `package-path`
+  workflows Steward generates set `execution-log: full`, so **Steward 0.3.11 and 0.3.12
+  break those callers; upgrade to 0.3.13.** For `full` Tasks the runner download now
+  appends both streams from the successful attempt's durable logs (at most 4 MiB each, 8
+  MiB combined) after the `out/` tree; every other Task still receives an `out/`-only
+  archive. The stored archive, the controller's `out/`-only validation, and the browser
+  output listings and downloads are unchanged, agent output still cannot create or
+  replace `.steward/diagnostics`, and a `full` Task whose transcript is missing or over
+  its bounds now returns `503` instead of an archive the runner would reject. The
+  execution-log endpoints are unchanged. No migration or caller change is required.
 - Made Task output-archive validation decode tar headers exactly as the runner's tar
   parser does, so agent output cannot hide entries from Steward that the runner would
   read, including a forged transcript. Archives using a PAX `size` record, a path prefix
   under GNU magic, a header with neither ustar nor GNU magic, or a numeric field outside
   `spaces, octal digits, NUL/space padding` are now rejected as violating the `out/`-only
   contract. GNU and POSIX tar archives that the sandbox writes are unaffected.
+
+## [0.3.12] - 2026-10-07
+
+This patch fixes governed GitHub repository listing, run status, and workflow
+dispatch against the pinned GitHub MCP server (`github-mcp-server` v1.6.0). It
+adds no migrations and changes no Helm values.
+
+### Changed
+
+- A blank repository query now has a defined meaning. `GET
+  /app/api/v1/github/repositories` with an empty `query` (the browser default)
+  lists only repositories **owned by the authenticated GitHub user**; the bridge
+  searches `user:<login>` using the login from the governed connection's
+  profile. Repositories owned by an organization are not listed by default, even
+  when the user can access them. Pass an explicit search query (for example
+  `org:<organization>` or `repo:<owner>/<name>`) to the API to find them; the
+  browser has no query field in 0.3.12. The search follows GitHub repository
+  search semantics, which exclude forks by default. Earlier releases rejected the
+  blank query at the bridge, so the default listing failed.
+- Repository loading in Get started and on the Runs page is now independent of
+  the rest of the page. The checklist and the tested package preview render
+  while repositories are loading or after the listing fails. A failure shows its
+  error code and bounded reason with a **Retry repositories** action.
+  Publication and dispatch controls that need a repository are disabled in Get
+  started, and are not shown on the Runs page, until a listing succeeds.
+
+### Fixed
+
+- Repository listing matches the pinned server's replies. The default
+  (`user:<login>`) listing requests minimal output, whose items carry no owner
+  object, so the owner's stable numeric ID comes from the `get_me` profile `id`.
+  That profile ID is used only for an item with no owner object or owner ID whose
+  `full_name` names the authenticated user; any other item without an owner ID is
+  left out, and an item that is otherwise malformed fails the listing. Explicit
+  queries, including `repo:<owner>/<name>` resolution, request full output, so
+  organization-owned repositories keep their own owner ID.
+- An empty search reply (`{"total_count":0}` with no `items`) is an empty list.
+  Resolving a named repository that the search does not return answers HTTP 404
+  instead of a provider failure.
+- Run status accepts jobs nested as `{"jobs":{"total_count":N,"jobs":[...]}}` and
+  treats `{"jobs":{"total_count":0}}` as no jobs. The `requested`, `waiting`, and
+  `pending` run and job statuses report as `queued`. The bridge requests at most
+  30 jobs (previously 100) so a run status stays within its result bound; only
+  the first 30 jobs of a larger matrix run are shown.
+- Workflow dispatch and run lookup pass the workflow file name (`<file>.yml`)
+  rather than its full path, after checking that the workflow is directly under
+  `.github/workflows/`. The `run_workflow` result is now checked: a tool error
+  reporting the workflow or ref as not found (or as already existing) is a
+  definite rejection reported in the `bridge-response-contract` failure category.
+  It is no longer treated as a queued run, and it is not reported as an MCP-GW
+  outage to retry. Other tool errors remain reported as MCP-GW unavailable.
+- Bridge tests use reply envelopes captured from the pinned server for the read
+  tools it parses (`get_me`, minimal and full `search_repositories`,
+  `get_file_contents`, `actions_get`, `actions_list` for runs and jobs,
+  `get_commit`, and `list_pull_requests`); every identifier, SHA, timestamp,
+  title, body, and job name in those fixtures is synthetic.
+
+### Failure categories, reasons, and bounds
+
+- New connection-operation failure category `bridge-contract`: the bridge
+  rejected the request Steward sent it (the invocation, the operation allowlist,
+  or the `request.json` operation contract). It indicates an apiserver and bridge
+  mismatch or defect, not a provider failure. The Connections API reports it as
+  `bridge_contract_invalid`. An apiserver-to-bridge contract test now covers the
+  default repository request.
+- New connection-operation failure category `bridge_result_too_large`: the
+  bridge exited successfully but its result exceeded Steward's own bound for that
+  operation. It is no longer reported as `invalid_bridge_result` or as a provider
+  contract failure. The Connections API reports it as `bridge_result_too_large`,
+  and the Connections page explains it.
+- The GitHub automation error body (`GithubAutomationErrorResponse`) has a new
+  optional `reason` field. HTTP 503 `github_automation_unavailable` now carries
+  `reason: "bridge_contract"`, `"bridge_response_contract"` (the provider reply
+  did not satisfy the pinned contract, or the apiserver rejected the bridge
+  result as `invalid_bridge_result`, including a per-field limit below), or
+  `"bridge_result_too_large"`. Other 503 responses omit `reason`.
+- Bridge result bounds are per operation: 128 KiB for a repository listing and
+  for a run status, 32 KiB for every other operation (unchanged). These bounds
+  rely on per-field limits that both the bridge and the apiserver enforce, and a
+  result outside them is `invalid_bridge_result`: login and owner 39 bytes,
+  repository name 100, owner and repository IDs 20 digits, default branch 255,
+  URLs 255, at most 100 repositories per page; for a run status, at most 30 jobs,
+  job names 500 bytes, job URLs 255, and a failure log of at most 8 KiB.
+- GitHub MCP tool replies read by the bridge have their own 1 MiB bound,
+  verified for replies without `Content-Length`. MCP-GW lifecycle and status
+  replies, including the workflow re-run call, keep the 32 KiB bound.
+
+### Upgrade and rollback
+
+- No migrations since v0.3.11; the newest migration remains 0067. No Helm value,
+  schema default, or provider-profile change is required.
+- Deploy the v0.3.12 chart and all component images as one release unit. The
+  apiserver and the Connections bridge must match: an earlier bridge rejects the
+  blank repository query that the v0.3.12 apiserver and browser send. When
+  `connectionsBridge.enabled=true`, update `connectionsBridge.image`,
+  `connectionsBridge.sourceCommit`, `connectionsBridge.signerIdentity`, and
+  `connectionsBridge.attestationBundle` to the values under "Stable bridge
+  provenance inputs" in the v0.3.12 release notes.
+- Rollback to v0.3.11 needs no database restore because v0.3.12 adds no schema
+  or durable state; restore the v0.3.11 chart and its full component-image set,
+  including the bridge coordinates, together. Operations already recorded with
+  the new failure categories read as a generic unavailable failure on v0.3.11.
+
+### Known issue
+
+- With steward-run 0.8.1, a GitHub Actions caller that sets
+  `execution-log: full` reports `failure-category=input-output` after the
+  governed Task has succeeded. This includes the callers that Steward generates
+  from Get started, the Task page, and the Runs page. steward-run 0.8.1 expects
+  the reserved stdout and stderr transcript inside the output archive, and
+  Steward 0.3.11 and later no longer put it there. The fix is tracked in #317 and
+  planned for 0.3.13. Workaround: remove `execution-log: full` from the caller
+  workflow. Execution logs remain available in the Steward UI and its
+  owner-scoped execution-log endpoints.
 
 ## [0.3.11] - 2026-10-06
 
@@ -662,7 +884,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.11...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.12...HEAD
+[0.3.12]: https://github.com/apelogic-ai/steward/compare/v0.3.11...v0.3.12
 [0.3.11]: https://github.com/apelogic-ai/steward/compare/v0.3.10...v0.3.11
 [0.3.10]: https://github.com/apelogic-ai/steward/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/apelogic-ai/steward/compare/v0.3.8...v0.3.9

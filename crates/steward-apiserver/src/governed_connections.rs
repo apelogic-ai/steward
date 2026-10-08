@@ -24,8 +24,8 @@ use steward_store::{
     ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase,
     ConnectionOperationKind as StoredOperationKind, ConnectionOperationRecord,
     ConnectionOperationReservationRequest, ConnectionOperationRetention, ConnectionOperationState,
-    FederatedSubjectObservation, PgStore, StoreError, TaskOrchestrationMode,
-    TaskReservationRequest,
+    ConnectionOperationTiming, FederatedSubjectObservation, PgStore, StoreError,
+    TaskOrchestrationMode, TaskReservationRequest,
 };
 use steward_types::{
     AgentRuntimeSpec, AgentType, CanonicalAuthorityBinding, CanonicalUserId, Email, Principal,
@@ -1206,6 +1206,7 @@ where
 pub struct ConnectionOperationReconciler {
     store: PgStore,
     failure_reporter: Arc<dyn Fn(String) + Send + Sync>,
+    latency_reporter: Arc<dyn Fn(String) + Send + Sync>,
 }
 
 impl ConnectionOperationReconciler {
@@ -1213,6 +1214,7 @@ impl ConnectionOperationReconciler {
         Self {
             store,
             failure_reporter: Arc::new(|line| eprintln!("{line}")),
+            latency_reporter: Arc::new(|line| eprintln!("{line}")),
         }
     }
 
@@ -1222,6 +1224,28 @@ impl ConnectionOperationReconciler {
     ) -> Self {
         self.failure_reporter = Arc::new(reporter);
         self
+    }
+
+    pub fn with_latency_reporter(
+        mut self,
+        reporter: impl Fn(String) + Send + Sync + 'static,
+    ) -> Self {
+        self.latency_reporter = Arc::new(reporter);
+        self
+    }
+
+    async fn report_operation_timing(
+        &self,
+        operation_id: Uuid,
+        operation_kind: StoredOperationKind,
+    ) {
+        if let Some(line) = connection_operation_timing_report(
+            operation_id,
+            operation_kind,
+            self.store.connection_operation_timing(operation_id).await,
+        ) {
+            (self.latency_reporter)(line);
+        }
     }
 
     pub async fn run(self) {
@@ -1236,6 +1260,7 @@ impl ConnectionOperationReconciler {
     async fn fail_operation(
         &self,
         operation_id: Uuid,
+        operation_kind: StoredOperationKind,
         failure: &ConnectionOperationFailure,
     ) -> Result<(), StoreError> {
         let detail = failure
@@ -1246,6 +1271,8 @@ impl ConnectionOperationReconciler {
             .fail_connection_operation(operation_id, failure.category, detail.as_ref())
             .await?;
         (self.failure_reporter)(connection_operation_failure_log_line(operation_id, failure));
+        self.report_operation_timing(operation_id, operation_kind)
+            .await;
         Ok(())
     }
 
@@ -1295,7 +1322,7 @@ impl ConnectionOperationReconciler {
                         detail: None,
                     }
                 };
-                self.fail_operation(operation.operation_id, &failure)
+                self.fail_operation(operation.operation_id, operation.operation_kind, &failure)
                     .await?;
                 continue;
             }
@@ -1328,8 +1355,12 @@ impl ConnectionOperationReconciler {
                 operation.task_phase,
                 steward_types::TaskPhase::Failed | steward_types::TaskPhase::Cancelled
             ) {
-                self.fail_operation(operation.operation_id, &task_failure)
-                    .await?;
+                self.fail_operation(
+                    operation.operation_id,
+                    operation.operation_kind,
+                    &task_failure,
+                )
+                .await?;
                 continue;
             }
             if self
@@ -1339,6 +1370,7 @@ impl ConnectionOperationReconciler {
             {
                 self.fail_operation(
                     operation.operation_id,
+                    operation.operation_kind,
                     &ConnectionOperationFailure {
                         category: "deadline_exceeded",
                         detail: None,
@@ -1379,10 +1411,16 @@ impl ConnectionOperationReconciler {
                                     },
                                 )
                                 .await?;
+                            self.report_operation_timing(
+                                operation.operation_id,
+                                operation.operation_kind,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.fail_operation(
                                 operation.operation_id,
+                                operation.operation_kind,
                                 &ConnectionOperationFailure {
                                     category: error.category(),
                                     detail: None,
@@ -1489,6 +1527,34 @@ fn connection_operation_failure_log_line(
 
 fn connection_operation_category_log_line(operation_id: Uuid, category: &str) -> String {
     format!("connection operation failed: operation_id={operation_id} category={category}")
+}
+
+fn connection_operation_latency_log_line(
+    operation: StoredOperationKind,
+    timing: ConnectionOperationTiming,
+) -> String {
+    format!(
+        "connection operation latency: operation_kind={} queue_wait_ms={} attempt_duration_ms={} total_latency_ms={}",
+        operation.as_str(),
+        timing.queue_wait_ms,
+        timing.attempt_duration_ms,
+        timing.total_latency_ms,
+    )
+}
+
+fn connection_operation_timing_report<E>(
+    operation_id: Uuid,
+    operation: StoredOperationKind,
+    timing: Result<Option<ConnectionOperationTiming>, E>,
+) -> Option<String> {
+    match timing {
+        Ok(Some(timing)) => Some(connection_operation_latency_log_line(operation, timing)),
+        Ok(None) => None,
+        Err(_) => Some(format!(
+            "connection operation latency unavailable: operation_id={operation_id} operation_kind={}",
+            operation.as_str()
+        )),
+    }
 }
 
 fn connection_broker_error(
@@ -1867,33 +1933,37 @@ fn validate_repositories_result(value: &Value) -> Result<(), StoreError> {
         .and_then(Value::as_array)
         .filter(|repositories| repositories.len() <= 100)
         .ok_or(StoreError::InvalidConnectionOperation)?;
-    if repositories.iter().any(|repository| {
-        let Some(repository) = repository.as_object() else {
-            return true;
-        };
-        !exact_object_keys(
-            repository,
-            &[
-                "owner",
-                "ownerId",
-                "name",
-                "repositoryId",
-                "defaultBranch",
-                "private",
-                "url",
-            ],
-        ) || !bounded_str(repository.get("owner"), 39)
-            || !bounded_str(repository.get("ownerId"), 20)
-            || !bounded_str(repository.get("name"), 100)
-            || !bounded_str(repository.get("repositoryId"), 20)
-            || !bounded_str(repository.get("defaultBranch"), 255)
-            || repository.get("private").and_then(Value::as_bool).is_none()
-            || !bounded_str(repository.get("url"), 255)
-            || !repository.get("url").is_some_and(valid_https_github_url)
-    }) {
+    if !repositories.iter().all(valid_repository_listing_entry) {
         return Err(StoreError::InvalidConnectionOperation);
     }
     Ok(())
+}
+
+/// Per-field shape and bounds of one repository listing entry. Every listing source,
+/// governed or admitted, applies this same check.
+pub(crate) fn valid_repository_listing_entry(repository: &Value) -> bool {
+    let Some(repository) = repository.as_object() else {
+        return false;
+    };
+    exact_object_keys(
+        repository,
+        &[
+            "owner",
+            "ownerId",
+            "name",
+            "repositoryId",
+            "defaultBranch",
+            "private",
+            "url",
+        ],
+    ) && bounded_str(repository.get("owner"), 39)
+        && bounded_str(repository.get("ownerId"), 20)
+        && bounded_str(repository.get("name"), 100)
+        && bounded_str(repository.get("repositoryId"), 20)
+        && bounded_str(repository.get("defaultBranch"), 255)
+        && repository.get("private").and_then(Value::as_bool).is_some()
+        && bounded_str(repository.get("url"), 255)
+        && repository.get("url").is_some_and(valid_https_github_url)
 }
 
 fn validate_workflow_result(value: &Value) -> Result<(), StoreError> {
@@ -2318,15 +2388,45 @@ mod tests {
         MCP_GW_CONTRACT_VERSION, MCP_GW_OAUTH_CLOCK_SKEW_SECONDS,
         MCP_GW_OAUTH_STATE_LIFETIME_SECONDS, OPERATOR_PINNED_TRUST_MODE,
         ProviderConnectionStatusSource, SplitConnectionsBroker, bounded_single_file_archive,
-        bridge_result, connection_orchestration_error, connections_startup_warning,
-        plan_connection_operation, provider_status, single_file_archive, start_poll_deadline,
-        valid_operator_pinned_image,
+        bridge_result, connection_operation_latency_log_line, connection_operation_timing_report,
+        connection_orchestration_error, connections_startup_warning, plan_connection_operation,
+        provider_status, single_file_archive, start_poll_deadline, valid_operator_pinned_image,
     };
     use steward_store::{ConnectionOAuthPhase, ConnectionOperationState};
 
     #[derive(Clone)]
     struct RejectingMutations {
         status_calls: Arc<AtomicUsize>,
+    }
+
+    #[test]
+    fn operation_latency_log_is_labelled_and_machine_readable() {
+        assert_eq!(
+            connection_operation_latency_log_line(
+                steward_store::ConnectionOperationKind::Repositories,
+                steward_store::ConnectionOperationTiming {
+                    queue_wait_ms: 1700,
+                    attempt_duration_ms: 7000,
+                    total_latency_ms: 8900,
+                },
+            ),
+            "connection operation latency: operation_kind=repositories queue_wait_ms=1700 attempt_duration_ms=7000 total_latency_ms=8900"
+        );
+    }
+
+    #[test]
+    fn timing_query_failure_is_reported_without_becoming_a_reconcile_error() {
+        let operation_id = Uuid::from_u128(0x00000000_0000_4000_8000_000000000305);
+        assert_eq!(
+            connection_operation_timing_report::<()>(
+                operation_id,
+                steward_store::ConnectionOperationKind::Repositories,
+                Err(()),
+            ),
+            Some(format!(
+                "connection operation latency unavailable: operation_id={operation_id} operation_kind=repositories"
+            ))
+        );
     }
 
     impl ProviderConnectionBroker<String> for RejectingMutations {

@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.11` and application `0.3.11`.
+Current release contract: chart `0.3.12` and application `0.3.12`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -287,8 +287,22 @@ configuration: the chart requires a positive GitHub App ID, an existing Secret
 name and key containing its PEM private key, and at least one
 `networkPolicy.githubApiCidrs` entry while NetworkPolicy is enabled. The private
 key is mounted read-only and its bytes never enter Helm values or an environment
-variable. Steward uses the App only to resolve exact Git objects; it does not
-accept caller-uploaded package bytes.
+variable. Steward uses the App to resolve exact Git objects; it does not
+accept caller-uploaded package bytes. After 0.3.12 (unreleased), the apiserver
+also uses it to list the admitted source repositories for the browser: with
+at least one binding, a blank `GET /app/api/v1/github/repositories` query
+resolves each distinct bound source repository ID through the App, using a
+token scoped to that repository with only `metadata: read` and revoked after
+its one read, and caches the result in process for 10 minutes, revalidating it
+in the background. The App installation must include each
+admitted repository; it needs no additional permission. A repository it cannot
+resolve is omitted and counted in the `x-steward-unresolved-repositories`
+response header; a failed refresh keeps a previously resolved entry for up to
+20 minutes (counted as unresolved), and a definitive rejection removes it. Only
+when none has ever resolved does the listing return HTTP 503 with reason
+`source_app_unavailable`. This lists only operator-configured repositories to
+authenticated users and grants nothing; publication and dispatch still use the
+governed connection.
 
 `githubSource.bindings` authorizes exact caller-to-source repository pairs by
 stable GitHub owner and repository IDs. The chart renders that non-secret
@@ -406,7 +420,8 @@ bounded diagnostic.
 | `bridge-proxy-policy` | OpenShell denied the provider request before MCP-GW handled it. |
 | `bridge-runtime-authorization` | MCP-GW rejected the runtime's authority. |
 | `bridge-token-grant` | OpenShell could not exchange the placeholder for the runtime-bound GitHub credential. Retry once, then inspect MCP-GW token-grant health. |
-| `bridge-response-contract` | MCP-GW returned a response that did not satisfy Steward's pinned provider contract. |
+| `bridge-contract` | The bridge rejected the request Steward sent it: the invocation, the operation allowlist, or the operation's `request.json` contract. This indicates mismatched apiserver and bridge versions or a Steward defect, not a provider failure. Deploy the apiserver and Connections bridge from the same release. |
+| `bridge-response-contract` | MCP-GW returned a response that did not satisfy Steward's pinned provider contract. A dispatch tool error reporting the workflow or ref as not found (or already existing) is also reported here: it is a definite rejection, not a queued run or an outage to retry. |
 | `bridge-gateway-transport` | The governed runtime could not complete the transport request to MCP-GW. |
 | `bridge-gateway-status` | Historical category from older bridges for an unexpected successful disconnect response. New invalid response bodies use `bridge-response-contract`. |
 | `bridge-gateway-body` | The governed runtime could not read the bounded MCP-GW response body. |

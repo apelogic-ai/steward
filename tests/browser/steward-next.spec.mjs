@@ -789,6 +789,30 @@ async function stopWeb(instance) {
   }
 }
 
+const defaultGithubRepositories = [
+  {
+    owner: "example-org",
+    ownerId: "org_example",
+    name: "agentic-ops",
+    repositoryId: "repo_agentic_ops",
+    defaultBranch: "main",
+    private: true,
+    url: "https://github.com/example-org/agentic-ops",
+    ready: true,
+  },
+  {
+    owner: "example-org",
+    ownerId: "org_example",
+    name: "not-admitted",
+    repositoryId: "repo_not_admitted",
+    defaultBranch: "main",
+    private: true,
+    url: "https://github.com/example-org/not-admitted",
+    ready: false,
+    missingPrerequisite: "source_repository_not_admitted",
+  },
+];
+
 async function guardedPage(browser, {
   adminSetupStatus = {
     apiVersion: "steward.admin-setup/v1",
@@ -1353,29 +1377,7 @@ async function guardedPage(browser, {
     await json(route, {
     apiVersion: "steward.github-automation/v1",
     login: "alice",
-    repositories: [
-      {
-        owner: "example-org",
-        ownerId: "org_example",
-        name: "agentic-ops",
-        repositoryId: "repo_agentic_ops",
-        defaultBranch: "main",
-        private: true,
-        url: "https://github.com/example-org/agentic-ops",
-        ready: true,
-      },
-      {
-        owner: "example-org",
-        ownerId: "org_example",
-        name: "not-admitted",
-        repositoryId: "repo_not_admitted",
-        defaultBranch: "main",
-        private: true,
-        url: "https://github.com/example-org/not-admitted",
-        ready: false,
-        missingPrerequisite: "source_repository_not_admitted",
-      },
-    ],
+    repositories: configured?.repositories ?? defaultGithubRepositories,
     page: 1,
     hasNextPage: false,
     });
@@ -2522,7 +2524,7 @@ test("onboarding starts with configured server defaults and preserves dismissal"
     const runStep = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
     await expect(runStep.getByLabel("Repository").locator("option")).toHaveText([
       "example-org/agentic-ops · Ready",
-      "example-org/not-admitted · Not ready",
+      "example-org/not-admitted · Not admitted",
     ]);
     await expect(runStep.getByLabel("Coding agent")).toHaveValue(starterTaskFixture.taskDefinition.runtime.agentRef);
     await expect(runStep.getByLabel("Prompt")).toHaveValue(starterTaskFixture.taskDefinition.promptText);
@@ -2657,7 +2659,133 @@ test("Get started explains unsupported releases and repository prerequisites", a
     const testRun = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
     await testRun.getByRole("button").first().click();
     await testRun.getByLabel("Repository").selectOption("repo_not_admitted");
-    await expect(testRun.getByText("Not ready: This repository is not admitted as a governed source.", { exact: true })).toBeVisible();
+    await expect(testRun.getByText("example-org/not-admitted is not admitted as a governed source on this deployment; ask an administrator to add it.", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+const secondReadyRepository = {
+  ...defaultGithubRepositories[0],
+  name: "second-ops",
+  repositoryId: "repo_second_ops",
+  url: "https://github.com/example-org/second-ops",
+};
+
+test("Get started step 4 chooses the repository that publication, detection, and dispatch use", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    githubRepositoryResponses: [{ status: 200, repositories: [defaultGithubRepositories[0], secondReadyRepository, defaultGithubRepositories[1]] }],
+    inlineRun: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    const step = (title) => developer.page.getByRole("listitem").filter({ hasText: title });
+    const openStep = async (title) => {
+      const row = step(title);
+      const toggle = row.getByRole("button").first();
+      if (await toggle.getAttribute("aria-expanded") !== "true") await toggle.click();
+      return row;
+    };
+    const testRun = step("Try a test run");
+    await expect(testRun.getByText("Done", { exact: true })).toBeVisible();
+    await expect(testRun.getByRole("button").first()).toHaveAttribute("aria-expanded", "false");
+    await expect(testRun.getByLabel("Repository")).toHaveCount(0);
+
+    const publicationStep = await openStep("Publish the task definition");
+    const picker = publicationStep.getByLabel("Repository");
+    await expect(picker.locator("option")).toHaveText([
+      "example-org/agentic-ops · Ready",
+      "example-org/second-ops · Ready",
+      "example-org/not-admitted · Not admitted",
+    ]);
+    await expect(picker).toHaveValue("repo_agentic_ops");
+
+    await picker.selectOption("repo_not_admitted");
+    await expect(publicationStep.getByText("example-org/not-admitted is not admitted as a governed source on this deployment; ask an administrator to add it. Copy the generated files into the repository manually.", { exact: true })).toBeVisible();
+    await expect(publicationStep.getByRole("button", { name: "Open pull request" })).toBeDisabled();
+
+    await picker.selectOption("repo_second_ops");
+    await expect(publicationStep.getByText(/is not admitted as a governed source/)).toHaveCount(0);
+    await publicationStep.getByRole("button", { name: "Open pull request" }).click();
+    await expect(publicationStep.getByRole("link", { name: "View pull request ↗" })).toBeVisible();
+    const publication = developer.mutations.find((mutation) => mutation.path.endsWith("/github/publish"));
+    expect(publication.body).toMatchObject({ owner: "example-org", repository: "second-ops" });
+    await publicationStep.getByRole("button", { name: "I've committed it" }).click();
+    await expect(step("Add the workflow to your repository").getByText("Done", { exact: true })).toBeVisible({ timeout: 10_000 });
+    const detection = developer.mutations.filter((mutation) => mutation.path.endsWith("/github/workflow")).at(-1);
+    expect(detection.body).toEqual({ owner: "example-org", repository: "second-ops" });
+
+    const workflowStep = await openStep("Add the workflow to your repository");
+    await expect(workflowStep.getByText("example-org/second-ops", { exact: true })).toBeVisible();
+
+    let triggerStep = await openStep("Trigger a test run");
+    await expect(triggerStep.getByText("example-org/second-ops", { exact: true })).toBeVisible();
+    await triggerStep.getByRole("button", { name: "Change repository" }).click();
+    await expect(step("Publish the task definition").getByLabel("Repository")).toHaveValue("repo_second_ops");
+
+    triggerStep = await openStep("Trigger a test run");
+    await triggerStep.getByRole("button", { name: "Run on GitHub" }).click();
+    await expect.poll(() => developer.mutations.filter((mutation) => mutation.path.endsWith("/github/dispatch")).length).toBe(1);
+    const dispatch = developer.mutations.find((mutation) => mutation.path.endsWith("/github/dispatch"));
+    expect(dispatch.body).toMatchObject({ owner: "example-org", repository: "second-ops" });
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Get started and the task publish panel share one cached repository listing", async ({ browser }) => {
+  const developer = await guardedPage(browser, { inlineRun: true });
+  const repositoryRequests = () => developer.governedGithubRequests
+    .filter((url) => new URL(url).pathname === "/app/api/v1/github/repositories").length;
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    const step = (title) => developer.page.getByRole("listitem").filter({ hasText: title });
+    const publicationStep = step("Publish the task definition");
+    if (await publicationStep.getByRole("button").first().getAttribute("aria-expanded") !== "true") {
+      await publicationStep.getByRole("button").first().click();
+    }
+    await expect(publicationStep.getByLabel("Repository").locator("option")).toHaveCount(2);
+    expect(repositoryRequests(), "every Get started consumer shares one listing request").toBe(1);
+
+    await publicationStep.getByRole("button", { name: "Refresh repositories" }).click();
+    await expect.poll(repositoryRequests).toBe(2);
+    await expect(publicationStep.getByLabel("Repository").locator("option")).toHaveCount(2);
+
+    const testRun = step("Try a test run");
+    await testRun.getByRole("button").first().click();
+    await testRun.getByRole("link", { name: "Open run details" }).click();
+    await developer.page.getByRole("link", { name: "Open Task" }).click();
+    const panel = developer.page.getByLabel("Publish this task to GitHub");
+    await expect(panel.getByLabel("Repository").locator("option")).toHaveCount(2);
+    expect(repositoryRequests(), "client-side navigation reuses the cached listing").toBe(2);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Get started states plainly when no repository is admitted", async ({ browser }) => {
+  const otherNotAdmitted = {
+    ...defaultGithubRepositories[1],
+    name: "legacy",
+    repositoryId: "repo_legacy",
+    url: "https://github.com/example-org/legacy",
+  };
+  const developer = await guardedPage(browser, {
+    githubRepositoryResponses: [{ status: 200, repositories: [defaultGithubRepositories[1], otherNotAdmitted] }],
+    inlineRun: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    const publicationStep = developer.page.getByRole("listitem").filter({ hasText: "Publish the task definition" });
+    if (await publicationStep.getByRole("button").first().getAttribute("aria-expanded") !== "true") {
+      await publicationStep.getByRole("button").first().click();
+    }
+    await expect(publicationStep.getByLabel("Repository").locator("option")).toHaveText([
+      "example-org/not-admitted · Not admitted",
+      "example-org/legacy · Not admitted",
+    ]);
+    await expect(publicationStep.getByText("None of your repositories is admitted as a governed source on this deployment; ask an administrator to add it. Copy the generated files into the repository manually.", { exact: true })).toBeVisible();
+    await expect(publicationStep.getByRole("button", { name: "Open pull request" })).toBeDisabled();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -2771,6 +2899,21 @@ test("Get started exposes repository failures with retry without hiding the test
     const runStep = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
     await runStep.getByRole("button").first().click();
     await expect(runStep.getByLabel("Repository").locator("option")).toHaveCount(2);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Get started can explicitly refresh the shared repository listing", async ({ browser }) => {
+  const developer = await guardedPage(browser, { inlineRun: true });
+  try {
+    await developer.page.goto(`${origin}/get-started`);
+    const runStep = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
+    await runStep.getByRole("button").first().click();
+    await expect(runStep.getByLabel("Repository")).toBeVisible();
+
+    await runStep.getByRole("button", { name: "Refresh repositories" }).click();
+    await expect.poll(() => developer.governedGithubRequests.filter((url) => new URL(url).pathname === "/app/api/v1/github/repositories").length).toBe(2);
   } finally {
     await closeGuardedPage(developer);
   }

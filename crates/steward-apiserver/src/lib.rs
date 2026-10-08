@@ -539,6 +539,7 @@ pub struct GrantRevocationRequest {
         agent_runs_ui::BrowserTaskResponse,
         github_automation::GithubRepositoryView,
         github_automation::GithubRepositoriesResponse,
+        github_automation::GithubRepositoriesSource,
         github_automation::RepositoryTargetRequest,
         github_automation::PublishTaskRequest,
         github_automation::DispatchTaskRequest,
