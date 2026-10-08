@@ -43,8 +43,9 @@ use steward_ports::{
     SandboxTaskRequest, SandboxTaskRuntime, SandboxTaskTranscript, TaskAttemptId,
 };
 use steward_store::{
-    AgentRunLogStream, EnvelopeRequestReservationRequest, EnvelopeRequestStatus,
-    EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, MAX_ACTIVE_BROWSER_TASKS_PER_USER,
+    AgentRunLogStream, BrowserMemberStateAction, BrowserMemberStateChange,
+    EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
+    EnvelopeTemplatePublication, MAX_ACTIVE_BROWSER_TASKS_PER_USER, ManagedInferenceKeyCipher,
     PgStore, StoreError, TaskActivationObservation, TaskExecutionObservation,
     TaskExecutionTransition, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
     WorkflowPublication,
@@ -184,6 +185,140 @@ impl Drop for ServerGuard {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+#[tokio::test]
+async fn managed_inference_credentials_are_encrypted_replaceable_and_destroyed_on_deprovision()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool.clone());
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let policy = OrganizationIdentityPolicy::new(
+        "https://accounts.google.com",
+        "example.com",
+        OrganizationId::parse("org_example")?,
+    )?;
+    let actor = store
+        .register_canonical_identity(
+            &policy.validate(
+                "https://accounts.google.com",
+                &format!("managed-inference-actor-{suffix}"),
+                "example.com",
+                &format!("alice-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let target = store
+        .register_canonical_identity(
+            &policy.validate(
+                "https://accounts.google.com",
+                &format!("managed-inference-target-{suffix}"),
+                "example.com",
+                &format!("bob-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let cipher = ManagedInferenceKeyCipher::from_bytes(&[9_u8; 32])?;
+    let first = "fixture-managed-credential-wxyz";
+    let replacement = "fixture-managed-replacement-abcd";
+
+    let added = store
+        .put_managed_inference_credential(&target.user_id, first, actor.user_id.as_str(), &cipher)
+        .await?;
+    assert_eq!(added.last_four, "wxyz");
+    let stored_ciphertext = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT ciphertext FROM managed_inference_credentials WHERE user_id = $1",
+    )
+    .bind(target.user_id.as_str())
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        !stored_ciphertext
+            .windows(first.len())
+            .any(|window| window == first.as_bytes()),
+        "the database must not contain the plaintext credential"
+    );
+    assert_eq!(
+        store
+            .resolve_managed_inference_credential(&target.user_id, &cipher)
+            .await?
+            .ok_or("managed inference credential was not stored")?
+            .expose_secret(),
+        first
+    );
+
+    let replaced = store
+        .put_managed_inference_credential(
+            &target.user_id,
+            replacement,
+            actor.user_id.as_str(),
+            &cipher,
+        )
+        .await?;
+    assert_eq!(replaced.last_four, "abcd");
+    assert_eq!(
+        store
+            .resolve_managed_inference_credential(&target.user_id, &cipher)
+            .await?
+            .ok_or("managed inference replacement was not stored")?
+            .expose_secret(),
+        replacement
+    );
+    assert!(
+        store
+            .remove_managed_inference_credential(&target.user_id, actor.user_id.as_str())
+            .await?
+    );
+    assert!(
+        store
+            .resolve_managed_inference_credential(&target.user_id, &cipher)
+            .await?
+            .is_none()
+    );
+
+    store
+        .put_managed_inference_credential(
+            &target.user_id,
+            replacement,
+            actor.user_id.as_str(),
+            &cipher,
+        )
+        .await?;
+    store
+        .change_browser_member_state(BrowserMemberStateChange {
+            user_id: &target.user_id,
+            action: BrowserMemberStateAction::Disable,
+            actor: &actor.user_id,
+        })
+        .await?;
+    assert!(
+        store
+            .resolve_managed_inference_credential(&target.user_id, &cipher)
+            .await?
+            .is_none(),
+        "deprovisioning must destroy Steward's managed inference credential"
+    );
+    let audit_counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        "SELECT count(*), \
+                count(*) FILTER (WHERE action = 'added'), \
+                count(*) FILTER (WHERE action = 'replaced'), \
+                count(*) FILTER (WHERE action = 'removed') \
+         FROM managed_inference_credential_audit WHERE user_id = $1",
+    )
+    .bind(target.user_id.as_str())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(audit_counts, (5, 2, 1, 2));
+    Ok(())
 }
 
 #[tokio::test]

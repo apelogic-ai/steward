@@ -12,6 +12,7 @@ mod github_actions;
 pub mod github_automation;
 pub mod google_oidc;
 pub mod governed_connections;
+pub mod inference_connections;
 pub mod onboarding;
 pub mod operator_admin;
 pub mod preferences;
@@ -395,6 +396,9 @@ pub struct GrantRevocationRequest {
         connections::start_provider_connection,
         connections::provider_connection_start_operation,
         connections::disconnect_provider_connection,
+        inference_connections::get_inference_connection,
+        inference_connections::save_inference_credential,
+        inference_connections::remove_inference_credential,
         github_automation::list_repositories,
         github_automation::detect_workflow,
         github_automation::github_task_bundle,
@@ -551,7 +555,11 @@ pub struct GrantRevocationRequest {
         github_automation::GithubOnboardingEvidenceResponse,
         github_automation::GithubJobView,
         github_automation::GithubRunStatusResponse,
-        github_automation::GithubAutomationErrorResponse
+        github_automation::GithubAutomationErrorResponse,
+        inference_connections::InferenceConnectionResponse,
+        inference_connections::InferenceCredentialView,
+        inference_connections::SaveInferenceCredentialRequest,
+        steward_types::InferenceMode
     )),
     modifiers(&TaskSecurity)
 )]
@@ -984,6 +992,7 @@ pub enum ApiError {
     TaskWorkflowNotFound,
     TaskNotReady,
     TaskOutputNotReady,
+    InferenceKeyMissing,
     TaskPersistenceFailed,
     DirectPackageSourceDisabled,
     TaskRuntimeContractUnavailable(String),
@@ -2350,6 +2359,10 @@ pub(crate) fn bounded_task_error_category(reason: Option<&str>) -> Option<&'stat
             "unsupported-operation"
         } else if reason == "sandbox task execution failed" {
             "sandbox-execution"
+        } else if reason == "inference_key_rejected" {
+            "inference-key-rejected"
+        } else if reason == "inference_budget_exhausted" {
+            "inference-budget-exhausted"
         } else {
             "execution-failed"
         }
@@ -2722,6 +2735,19 @@ impl IntoResponse for ApiError {
                 )
                     .into_response();
             }
+            Self::InferenceKeyMissing => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(TaskErrorResponse {
+                        error: "inference_key_missing".to_owned(),
+                        failure_reason: Some(
+                            "Add an inference key under Connections > Inference / LLMs, then retry the run."
+                                .to_owned(),
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
             Self::TaskOutputDeliveryFailed(reason) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2789,7 +2815,9 @@ impl IntoResponse for ApiError {
             Self::TaskOutputNotReady => StatusCode::CONFLICT,
             Self::TaskOutputDeliveryFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Store(StoreError::BrowserTaskConcurrencyLimit) => StatusCode::TOO_MANY_REQUESTS,
-            Self::MissingEnvelope | Self::MissingRuntimeUid => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::MissingEnvelope | Self::MissingRuntimeUid | Self::InferenceKeyMissing => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             Self::InvalidBudgetIncrease { .. } | Self::Admission(_) => {
                 StatusCode::UNPROCESSABLE_ENTITY
@@ -2837,6 +2865,7 @@ impl IntoResponse for ApiError {
                 | StoreError::InvalidEnvelopeTemplate
                 | StoreError::InvalidEnvelopeRequest
                 | StoreError::InvalidBrowserPreferences
+                | StoreError::InvalidManagedInferenceCredential
                 | StoreError::InvalidCumulativeEscalation
                 | StoreError::InvalidWorkflow
                 | StoreError::InvalidConnectionOperation,
@@ -2849,6 +2878,8 @@ impl IntoResponse for ApiError {
             | Self::Store(
                 StoreError::Database(_)
                 | StoreError::DecisionFilingClaimLost
+                | StoreError::InvalidManagedInferenceEncryptionKey
+                | StoreError::ManagedInferenceCredentialUnavailable
                 | StoreError::InvalidFederatedSubjectRecord,
             )
             | Self::DecisionChannel(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -3765,8 +3796,8 @@ mod tests {
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
-        CanonicalUserId, Duration, Email, ModelRef, PENDING_APPROVAL_ANNOTATION, Principal,
-        RuntimeOwnership, TaskPhase, ToolGrant,
+        CanonicalUserId, Duration, Email, InferenceMode, ModelRef, PENDING_APPROVAL_ANNOTATION,
+        Principal, RuntimeOwnership, TaskPhase, ToolGrant,
     };
     use tower::{ServiceExt, service_fn};
     use utoipa::OpenApi;
@@ -6945,6 +6976,7 @@ mod tests {
         source_repository_bindings: SourceRepositoryBindings,
         cumulative_escalations: Arc<Mutex<Vec<CumulativeEscalationRecord>>>,
         envelope_instance_grants: Arc<Mutex<Vec<(Uuid, EnvelopeInstanceGrantRecord)>>>,
+        managed_inference_credential_present: Arc<Mutex<bool>>,
     }
 
     #[derive(Clone)]
@@ -8238,6 +8270,22 @@ mod tests {
     }
 
     impl TaskSubmissionLedger for FakeLedger {
+        fn has_managed_inference_credential<'a>(
+            &'a self,
+            _owner_user_id: &'a CanonicalUserId,
+        ) -> BoxFuture<'a, Result<bool, StoreError>> {
+            Box::pin(async move {
+                self.managed_inference_credential_present
+                    .lock()
+                    .map(|present| *present)
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake managed-inference credential lock was poisoned".to_owned(),
+                        )
+                    })
+            })
+        }
+
         fn active_source_repository_binding<'a>(
             &'a self,
             caller: &'a steward_types::direct_package::TriggerRepository,
@@ -8795,6 +8843,7 @@ mod tests {
             source_repository_bindings: Arc::new(Mutex::new(Vec::new())),
             cumulative_escalations: Arc::new(Mutex::new(Vec::new())),
             envelope_instance_grants: Arc::new(Mutex::new(Vec::new())),
+            managed_inference_credential_present: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -13091,6 +13140,142 @@ mod tests {
                 .len(),
             1
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_inference_rejects_model_tasks_until_the_user_has_a_key() -> Result<(), String>
+    {
+        let ledger = versioned_task_ledger()?;
+        let tasks = ledger.tasks.clone();
+        let key_present = ledger.managed_inference_credential_present.clone();
+        let config = task_api_config()?.with_inference_mode(InferenceMode::Managed);
+        let app = task_router(ledger, FakeTaskIdentityResolver, config);
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "managed-key-missing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"workflow":"repository-review@1"}"#))
+                    .map_err(|error| format!("build managed Task request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit managed Task without key: {error}"))?;
+        assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(missing.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read managed-key error response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("decode managed-key error response: {error}"))?,
+            serde_json::json!({
+                "error": "inference_key_missing",
+                "failureReason": "Add an inference key under Connections > Inference / LLMs, then retry the run.",
+            })
+        );
+        assert!(
+            tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .is_empty(),
+            "a missing managed inference key must reject before Task reservation"
+        );
+
+        let direct_ledger = versioned_task_ledger()?;
+        authorize_direct_source(&direct_ledger)?;
+        let direct_tasks = direct_ledger.tasks.clone();
+        let direct_app = task_router(
+            direct_ledger,
+            FakeTaskIdentityResolver,
+            task_api_config()?
+                .with_inference_mode(InferenceMode::Managed)
+                .with_git_hosting_plane(same_repository_direct_git_fixture()?),
+        );
+        let direct_missing = direct_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "managed-direct-key-missing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/invocations/browser-task.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build managed direct-package request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit managed direct package without key: {error}"))?;
+        assert_eq!(direct_missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            direct_tasks
+                .lock()
+                .map_err(|_| "fake direct Task ledger lock was poisoned")?
+                .is_empty(),
+            "a headless direct-package Task must reject before reservation"
+        );
+
+        let browser_ledger = versioned_task_ledger_with_runtime_minutes()?;
+        enable_inline_for_versioned_task_fixture(&browser_ledger, true)?;
+        let browser_tasks = browser_ledger.tasks.clone();
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let browser_missing = browser_task_router(
+            browser_ledger,
+            task_api_config()?.with_inference_mode(InferenceMode::Managed),
+            auth,
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/runs")
+                .header(header::COOKIE, session_cookie)
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", csrf)
+                .header("idempotency-key", "managed-browser-key-missing")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(inline_browser_task_body().to_string()))
+                .map_err(|error| format!("build managed browser Task request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("submit managed browser Task without key: {error}"))?;
+        assert_eq!(browser_missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            browser_tasks
+                .lock()
+                .map_err(|_| "fake browser Task ledger lock was poisoned")?
+                .is_empty(),
+            "a browser model Task must reject before reservation"
+        );
+
+        *key_present
+            .lock()
+            .map_err(|_| "fake managed-inference credential lock was poisoned")? = true;
+        let accepted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "managed-key-present")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"workflow":"repository-review@1"}"#))
+                    .map_err(|error| format!("build managed Task request with key: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit managed Task with key: {error}"))?;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
         Ok(())
     }
 

@@ -556,11 +556,29 @@ fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
         "bridge-output"
     } else if stderr.contains("policy_denied") || stderr.contains("policy denied") {
         "policy"
+    } else if stderr.contains("budget exceeded")
+        || stderr.contains("budget_exceeded")
+        || stderr.contains("spend limit exceeded")
+        || stderr.contains("quota exceeded")
+        || stderr.contains("insufficient_quota")
+    {
+        "inference_budget_exhausted"
+    } else if stderr.contains("invalid api key")
+        || stderr.contains("invalid_api_key")
+        || stderr.contains("incorrect api key")
+        || ((stderr.contains("inference")
+            || stderr.contains("litellm")
+            || stderr.contains("openai"))
+            && (stderr.contains("unauthorized")
+                || stderr.contains("forbidden")
+                || stderr.contains("status 401")
+                || stderr.contains("status 403")))
+    {
+        "inference_key_rejected"
     } else if stderr.contains("unauthorized")
         || stderr.contains("forbidden")
         || stderr.contains("status 401")
         || stderr.contains("status 403")
-        || stderr.contains("invalid api key")
     {
         "authentication"
     } else if stderr.contains("config.toml")
@@ -3376,7 +3394,9 @@ mod tests {
     async fn streamed_nonzero_exit_retains_stderr_failure_classification() -> Result<(), String> {
         let mut stream = QueuedTaskProcessEventStream {
             events: VecDeque::from([
-                Ok(stderr_event(b"provider returned unauthorized status 401")),
+                Ok(stderr_event(
+                    b"inference provider returned unauthorized status 401",
+                )),
                 Ok(exit_event(17)),
             ]),
         };
@@ -3397,7 +3417,7 @@ mod tests {
         assert_eq!(result.exit_code, 17);
         assert_eq!(
             task_agent_failure_category(&result.stderr),
-            "authentication"
+            "inference_key_rejected"
         );
         assert_eq!(log_sink.records.len(), 1);
         Ok(())
@@ -4911,8 +4931,24 @@ mod tests {
             "cli-usage"
         );
         assert_eq!(
-            task_agent_failure_category(b"provider returned unauthorized status 401"),
+            task_agent_failure_category(b"inference provider returned unauthorized status 401"),
+            "inference_key_rejected"
+        );
+        assert_eq!(
+            task_agent_failure_category(b"tool provider returned unauthorized status 401"),
             "authentication"
+        );
+        assert_eq!(
+            task_agent_failure_category(b"inference provider: budget exceeded"),
+            "inference_budget_exhausted"
+        );
+        assert_eq!(
+            task_agent_failure_category(b"openai error code: insufficient_quota"),
+            "inference_budget_exhausted"
+        );
+        assert_eq!(
+            task_agent_failure_category(b"openai error: incorrect api key provided"),
+            "inference_key_rejected"
         );
         assert_eq!(task_agent_failure_category(b"opaque failure"), "agent");
     }

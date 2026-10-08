@@ -95,4 +95,22 @@ describe("governed provider connection controls", () => {
     expect(source).toContain('GitHub Actions runs as you: linked.');
     expect(source).toContain('status?.githubActionsIdentityLinked === false');
   });
+
+  test("separates tool connections from deployment-mode-aware inference custody", () => {
+    expect(source).toContain("Tools / MCP servers");
+    expect(source).toContain("Inference / LLMs");
+    expect(source).toContain("getInferenceConnection");
+    expect(source).toContain('value?.mode === "stock"');
+    expect(source).toContain("Inference credentials are managed by your Steward administrator");
+    expect(source).toContain('type="password"');
+    expect(source).toContain("Add key");
+    expect(source).toContain("Replace key");
+    expect(source).toContain("Remove key…");
+    expect(source).toContain("It does not revoke or delete the key at the upstream inference service.");
+  });
+
+  test("never renders the submitted inference credential", () => {
+    expect(source).toContain("setKey(\"\")");
+    expect(source).not.toContain("credential.apiKey");
+  });
 });

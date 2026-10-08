@@ -16,6 +16,26 @@ pub const TASK_EXECUTION_BINDING_ANNOTATION: &str = "agents.apelogic.ai/task-exe
 pub const TASK_EXECUTION_BINDING_SCHEMA_VERSION: &str = "steward/task-execution-binding/v1";
 pub const TASK_EXECUTION_BINDING_DIGEST_DOMAIN: &[u8] = b"steward.execution-bindings/v1\0";
 
+#[derive(
+    Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceMode {
+    #[default]
+    Stock,
+    Managed,
+}
+
+impl InferenceMode {
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "stock" => Ok(Self::Stock),
+            "managed" => Ok(Self::Managed),
+            _ => Err("inference mode must be stock or managed"),
+        }
+    }
+}
+
 pub fn runtime_activated_condition(observed_generation: i64) -> Condition {
     Condition {
         type_: "Activated".to_owned(),

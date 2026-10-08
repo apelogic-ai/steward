@@ -13,6 +13,7 @@ kube = { workspace = true, features = ["client", "ring", "rustls-tls"] } # Resol
 steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.0.0", features = ["identity"] } # Resolves vendor sandbox UUIDs without leaking OpenShell labels into the mint.
 steward-adapter-spire = { path = "../../adapters/spire", version = "=0.0.0" } # Connects the workload-identity port to the mounted SPIRE socket.
 steward-mint = { path = "../../crates/steward-mint", version = "=0.0.0" } # Owns the reviewed SVID-to-HOP-1 exchange and signing-key boundary.
+steward-store = { path = "../../crates/steward-store", version = "=0.0.0" } # Resolves encrypted user-custodied inference keys in managed mode.
 steward-types = { path = "../../crates/steward-types", version = "=0.0.0" } # Reads AgentRuntime principal, tool authority, and lifecycle state.
 tokio.workspace = true # Runs Kubernetes, SPIRE, and HTTP I/O.
 tokio-rustls.workspace = true # Selects the process-wide Rustls Ring provider before constructing the Kubernetes client in the combined release build.

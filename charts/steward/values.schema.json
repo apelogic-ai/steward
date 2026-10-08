@@ -5,6 +5,7 @@
   "required": [
     "images",
     "execution",
+    "inference",
     "web",
     "secrets",
     "databaseTls",
@@ -34,6 +35,39 @@
       "additionalProperties": false,
       "required": ["enabled"],
       "properties": {"enabled": {"type": "boolean"}}
+    },
+    "inference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "managed"],
+      "properties": {
+        "mode": {"enum": ["stock", "managed"]},
+        "managed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["databaseSecret", "encryptionKeySecret"],
+          "properties": {
+            "databaseSecret": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "key"],
+              "properties": {
+                "name": {"type": "string"},
+                "key": {"$ref": "#/definitions/nonempty"}
+              }
+            },
+            "encryptionKeySecret": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "key"],
+              "properties": {
+                "name": {"type": "string"},
+                "key": {"$ref": "#/definitions/nonempty"}
+              }
+            }
+          }
+        }
+      }
     },
     "images": {
       "type": "object",
@@ -1227,8 +1261,49 @@
                   "openshellEndpoint": {"type": "string", "pattern": "^https://", "minLength": 9},
                   "openshellServerName": {"$ref": "#/definitions/nonempty"},
                   "workloadExchangeEndpoint": {"type": "string", "pattern": "^https://[^/?#]+(?::[0-9]+)?/v1/workload/exchange$", "minLength": 38},
-                  "workloadExchangeServerName": {"$ref": "#/definitions/nonempty"},
+                  "workloadExchangeServerName": {"$ref": "#/definitions/nonempty"}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "execution": {"properties": {"enabled": {"const": true}}},
+          "inference": {"properties": {"mode": {"const": "stock"}}}
+        }
+      },
+      "then": {
+        "properties": {
+          "config": {
+            "properties": {
+              "controller": {
+                "properties": {
                   "litellmUrl": {"type": "string", "pattern": "^https?://", "minLength": 9}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"inference": {"properties": {"mode": {"const": "managed"}}}}},
+      "then": {
+        "properties": {
+          "inference": {
+            "properties": {
+              "managed": {
+                "properties": {
+                  "databaseSecret": {
+                    "properties": {"name": {"$ref": "#/definitions/nonempty"}}
+                  },
+                  "encryptionKeySecret": {
+                    "properties": {"name": {"$ref": "#/definitions/nonempty"}}
+                  }
                 }
               }
             }
