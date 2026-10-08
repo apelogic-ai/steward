@@ -141,6 +141,8 @@ const MCP_CLIENT_NAME: &str = "steward-connections-bridge";
 const MAX_MCP_SESSION_ID_BYTES: usize = 4096;
 const MCP_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const MCP_SESSION_FAILURE: &str = "MCP-GW session could not be established";
+// The MCP-GW 0.5.7 agentgateway's 400 for a session ID it cannot use.
+const MCP_SESSION_REJECTIONS: [&str; 1] = ["mcp: invalid session ID header"];
 const RERUN_REQUEST_ID: &str = "steward-github-rerun";
 const MAX_WORKFLOW_BYTES: usize = 256 * 1024;
 // `https://github.com/` plus a 39-byte owner and a 100-byte name is 159 bytes; run
@@ -1233,8 +1235,9 @@ impl GithubMcpGateway {
         }
     }
 
-    /// One bounded MCP Streamable HTTP POST, retried only across the OpenShell
-    /// provider-readiness race, exactly as tool calls were before sessions.
+    /// One bounded MCP POST, retried only across the OpenShell provider-readiness
+    /// race. `started` is the session's first POST: one readiness window covers
+    /// the whole session, so a real authentication fault is not retried per step.
     async fn post_mcp(
         &self,
         message: &Value,
@@ -1242,9 +1245,9 @@ impl GithubMcpGateway {
         protocol_version: &str,
         expected: StatusCode,
         limit: usize,
+        started: Instant,
     ) -> Result<McpReply, PortError> {
         let target = endpoint(&self.origin, MCP_PATH)?;
-        let started = Instant::now();
         loop {
             let mut http = self
                 .client
@@ -1289,20 +1292,32 @@ impl GithubMcpGateway {
     }
 }
 
-/// The bridge's MCP Streamable HTTP client state for one operation run.
+/// The bridge's MCP Streamable HTTP client for one operation run.
 ///
-/// A gateway such as the MCP-GW agentgateway issues an `Mcp-Session-Id` from
-/// `initialize` and rejects every later request without it. A direct GitHub
-/// wrapper issues none, so the bridge then sends none. Every tool call of one
-/// operation reuses the one session, which is closed best-effort at the end.
+/// With the lifecycle gateway contract, the first request opens a session:
+/// `initialize`, then `notifications/initialized`, after which every request
+/// carries the `Mcp-Session-Id` the server issued. A gateway such as the MCP-GW
+/// agentgateway issues one and rejects requests without it; a direct GitHub
+/// wrapper issues none, so none is sent. The legacy contract keeps the bare
+/// requests it has always accepted. An issued session is closed when the
+/// operation ends.
 struct McpSession<'a> {
     gateway: &'a GithubMcpGateway,
-    established: Option<EstablishedMcpSession>,
+    handshake: bool,
+    /// The session the server issued and has not ended, which `close` ends.
+    issued: Option<String>,
+    /// Set only once the whole handshake has succeeded.
+    ready: Option<ReadyMcpSession>,
+    /// A failed handshake or a lost session is final for the operation, so a
+    /// half-established session is never reused.
+    failure: Option<PortError>,
     reinitialized: bool,
+    /// The first POST of the session opens the one provider-readiness window.
+    readiness_started: Option<Instant>,
 }
 
 #[derive(Clone)]
-struct EstablishedMcpSession {
+struct ReadyMcpSession {
     id: Option<String>,
     protocol_version: &'static str,
 }
@@ -1317,15 +1332,64 @@ impl<'a> McpSession<'a> {
     fn new(gateway: &'a GithubMcpGateway) -> Self {
         Self {
             gateway,
-            established: None,
+            handshake: gateway.contract == GatewayContract::LifecycleV049,
+            issued: None,
+            ready: None,
+            failure: None,
             reinitialized: false,
+            readiness_started: None,
         }
     }
 
-    async fn establish(&mut self) -> Result<EstablishedMcpSession, PortError> {
-        if let Some(session) = &self.established {
+    async fn post(
+        &mut self,
+        message: &Value,
+        session_id: Option<&str>,
+        protocol_version: &str,
+        expected: StatusCode,
+        limit: usize,
+    ) -> Result<McpReply, PortError> {
+        let started = *self.readiness_started.get_or_insert_with(Instant::now);
+        self.gateway
+            .post_mcp(
+                message,
+                session_id,
+                protocol_version,
+                expected,
+                limit,
+                started,
+            )
+            .await
+    }
+
+    async fn establish(&mut self) -> Result<ReadyMcpSession, PortError> {
+        if let Some(session) = &self.ready {
             return Ok(session.clone());
         }
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        if !self.handshake {
+            let session = ReadyMcpSession {
+                id: None,
+                protocol_version: MCP_PROTOCOL_VERSION,
+            };
+            self.ready = Some(session.clone());
+            return Ok(session);
+        }
+        match self.handshake().await {
+            Ok(session) => {
+                self.ready = Some(session.clone());
+                Ok(session)
+            }
+            Err(error) => {
+                self.failure = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    async fn handshake(&mut self) -> Result<ReadyMcpSession, PortError> {
         let initialize = json!({
             "jsonrpc": "2.0",
             "id": MCP_INITIALIZE_REQUEST_ID,
@@ -1342,8 +1406,7 @@ impl<'a> McpSession<'a> {
         // An initialize result can carry server instructions, so it shares the tool
         // result bound rather than the lifecycle bound.
         let reply = self
-            .gateway
-            .post_mcp(
+            .post(
                 &initialize,
                 None,
                 MCP_PROTOCOL_VERSION,
@@ -1351,53 +1414,48 @@ impl<'a> McpSession<'a> {
                 MAX_MCP_TOOL_RESPONSE_BYTES,
             )
             .await?;
+        // `initialize` carries no session, so no status of it is a session
+        // rejection: it keeps the mapping a tool call would get.
         if reply.status != StatusCode::OK {
-            return Err(session_establishment_failure(
-                reply.status,
-                &reply.body,
-                "initialize",
-            ));
+            return Err(status_failure(reply.status, &reply.body));
         }
-        let id = reply
+        // Record an issued session before validating the rest of the handshake, so
+        // that any later failure still closes it.
+        self.issued = reply
             .session_id
             .as_ref()
             .map(valid_mcp_session_id)
             .transpose()?;
-        // Record an issued session before validating the rest of the handshake, so
-        // that any later failure still closes it.
-        self.established = Some(EstablishedMcpSession {
-            id: id.clone(),
-            protocol_version: MCP_PROTOCOL_VERSION,
-        });
         let protocol_version = negotiated_protocol_version(&reply.body)?;
-        let session = EstablishedMcpSession {
-            id,
-            protocol_version,
-        };
-        self.established = Some(session.clone());
+        let id = self.issued.clone();
         let initialized = json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
             "params": {},
         });
         let reply = self
-            .gateway
-            .post_mcp(
+            .post(
                 &initialized,
-                session.id.as_deref(),
+                id.as_deref(),
                 protocol_version,
                 StatusCode::ACCEPTED,
                 MAX_RESPONSE_BYTES,
             )
             .await?;
         if !reply.status.is_success() {
-            return Err(session_establishment_failure(
-                reply.status,
-                &reply.body,
-                "initialized notification",
-            ));
+            if id.is_some() && reply.status == StatusCode::NOT_FOUND {
+                self.issued = None;
+                return Err(mcp_session_failure("initialized notification was rejected"));
+            }
+            if id.is_some() && mcp_session_rejection(reply.status, &reply.body) {
+                return Err(mcp_session_failure("initialized notification was rejected"));
+            }
+            return Err(status_failure(reply.status, &reply.body));
         }
-        Ok(session)
+        Ok(ReadyMcpSession {
+            id,
+            protocol_version,
+        })
     }
 
     /// Sends one JSON-RPC request in the session and returns its bounded reply.
@@ -1409,8 +1467,7 @@ impl<'a> McpSession<'a> {
         loop {
             let session = self.establish().await?;
             let reply = self
-                .gateway
-                .post_mcp(
+                .post(
                     message,
                     session.id.as_deref(),
                     session.protocol_version,
@@ -1418,22 +1475,26 @@ impl<'a> McpSession<'a> {
                     limit,
                 )
                 .await?;
-            if session.id.is_some()
-                && reply.status == StatusCode::NOT_FOUND
-                && mcp_session_rejection(&reply.body)
-            {
-                // Streamable HTTP answers 404 to a session the server has ended, before
-                // it dispatches the request, so resending in a new session cannot
-                // repeat a mutation. Re-initialize once per operation, never in a loop.
-                self.established = None;
+            if session.id.is_some() && reply.status == StatusCode::NOT_FOUND {
+                // A 404 to a request that carried a session means the server ended
+                // the session, whatever the body says, and did not process the
+                // request. Re-initialize and resend once per operation, never in a
+                // loop. The ended session is not closed again.
+                self.issued = None;
+                self.ready = None;
                 if self.reinitialized {
-                    return Err(mcp_session_failure("session expired"));
+                    let error = mcp_session_failure("session expired");
+                    self.failure = Some(error.clone());
+                    return Err(error);
                 }
                 self.reinitialized = true;
                 continue;
             }
-            if reply.status == StatusCode::BAD_REQUEST && mcp_session_rejection(&reply.body) {
-                return Err(mcp_session_failure("session rejected"));
+            if session.id.is_some() && mcp_session_rejection(reply.status, &reply.body) {
+                let error = mcp_session_failure("session rejected");
+                self.ready = None;
+                self.failure = Some(error.clone());
+                return Err(error);
             }
             return Ok((reply.status, reply.body));
         }
@@ -1456,16 +1517,16 @@ impl<'a> McpSession<'a> {
         mcp_tool_payload(&body, request_id)
     }
 
-    /// Ends an issued session. Best effort: the operation's outcome is already
+    /// Ends an issued session. The `DELETE` is always sent when the server issued a
+    /// session and its result is ignored: the operation's outcome is already
     /// decided, and an idle session also expires on the gateway.
     async fn close(self) {
-        let Some(EstablishedMcpSession {
-            id: Some(id),
-            protocol_version,
-        }) = self.established
-        else {
+        let Some(id) = self.issued else {
             return;
         };
+        let protocol_version = self
+            .ready
+            .map_or(MCP_PROTOCOL_VERSION, |session| session.protocol_version);
         let Ok(target) = endpoint(&self.gateway.origin, MCP_PATH) else {
             return;
         };
@@ -1485,51 +1546,30 @@ impl<'a> McpSession<'a> {
     }
 }
 
-/// Rejects a session establishment step. Credential and authority rejections keep
-/// their own categories; anything else means no usable session exists.
-/// Rejects a handshake step. Only a gateway's explicit session rejection is a
-/// session failure; every other status keeps the mapping a tool call would get,
-/// so an outage still reports `MCP-GW returned HTTP <status>` with its detail.
-fn session_establishment_failure(status: StatusCode, body: &[u8], step: &str) -> PortError {
-    if status == StatusCode::BAD_REQUEST && mcp_session_rejection(body) {
-        return mcp_session_failure(&format!("{step} was rejected"));
-    }
-    match require_status(status, StatusCode::OK, body) {
-        Err(error) => error,
-        Ok(()) => mcp_session_failure(&format!("{step} returned HTTP {}", status.as_u16())),
-    }
-}
-
 /// The fixed, non-secret session failure. `detail` is always a bridge-authored
 /// constant phrase, never gateway-supplied text.
 fn mcp_session_failure(detail: &str) -> PortError {
     failed(&format!("{MCP_SESSION_FAILURE} ({detail})"))
 }
 
-/// A gateway's rejection of a missing, invalid or ended session, such as
-/// agentgateway's "session header is required for non-initialize requests" (400)
-/// or "session not found" (404).
-fn mcp_session_rejection(body: &[u8]) -> bool {
-    let body = String::from_utf8_lossy(body).to_ascii_lowercase();
-    [
-        "session header",
-        "session id",
-        "session not found",
-        "mcp-session-id",
-    ]
-    .iter()
-    .any(|phrase| body.contains(phrase))
+/// The gateway's exact rejection of a session ID that a request carried. Only
+/// called for a request that sent a session; any other 400 keeps the generic
+/// gateway HTTP failure and its detail.
+fn mcp_session_rejection(status: StatusCode, body: &[u8]) -> bool {
+    status == StatusCode::BAD_REQUEST
+        && MCP_SESSION_REJECTIONS
+            .iter()
+            .any(|rejection| body.trim_ascii() == rejection.as_bytes())
 }
 
 fn negotiated_protocol_version(body: &[u8]) -> Result<&'static str, PortError> {
-    let object = mcp_json_object(body, "MCP initialize response")
+    let object = mcp_jsonrpc_response(body, MCP_INITIALIZE_REQUEST_ID, "MCP initialize response")
         .map_err(|_| mcp_session_failure("invalid initialize response"))?;
     let result = object
         .get("result")
         .and_then(Value::as_object)
         .filter(|_| {
             object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
-                && object.get("id").and_then(Value::as_str) == Some(MCP_INITIALIZE_REQUEST_ID)
                 && !object.contains_key("error")
         })
         .ok_or_else(|| mcp_session_failure("invalid initialize response"))?;
@@ -1618,7 +1658,7 @@ fn parse_response(
         }
         GithubBridgeOperation::Rerun => {
             require_status(status, StatusCode::OK, body)?;
-            let object = mcp_json_object(body, "GitHub rerun MCP response")?;
+            let object = mcp_jsonrpc_response(body, RERUN_REQUEST_ID, "GitHub rerun MCP response")?;
             if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
                 || object.get("id").and_then(Value::as_str) != Some(RERUN_REQUEST_ID)
                 || object.contains_key("error")
@@ -1652,7 +1692,7 @@ fn parse_response(
 }
 
 fn mcp_tool_payload(body: &[u8], request_id: &str) -> Result<Value, PortError> {
-    let object = mcp_json_object(body, "GitHub MCP response")?;
+    let object = mcp_jsonrpc_response(body, request_id, "GitHub MCP response")?;
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         || object.get("id").and_then(Value::as_str) != Some(request_id)
         || object.contains_key("error")
@@ -2238,10 +2278,17 @@ fn valid_github_url(value: &str) -> bool {
 fn require_status(actual: StatusCode, expected: StatusCode, body: &[u8]) -> Result<(), PortError> {
     if actual == expected {
         Ok(())
-    } else if actual == StatusCode::UNAUTHORIZED {
-        Err(failed("MCP-GW rejected runtime authentication"))
+    } else {
+        Err(status_failure(actual, body))
+    }
+}
+
+/// The failure for a status other than the one a request expected.
+fn status_failure(actual: StatusCode, body: &[u8]) -> PortError {
+    if actual == StatusCode::UNAUTHORIZED {
+        failed("MCP-GW rejected runtime authentication")
     } else if token_grant_failure(actual, body) {
-        Err(PortError::CredentialGrantFailed)
+        PortError::CredentialGrantFailed
     } else if actual == StatusCode::FORBIDDEN {
         let proxy_denial = serde_json::from_slice::<Value>(body)
             .ok()
@@ -2253,9 +2300,9 @@ fn require_status(actual: StatusCode, expected: StatusCode, body: &[u8]) -> Resu
             })
             .is_some_and(|error| matches!(error.as_str(), "policy_denied" | "ssrf_denied"));
         if proxy_denial {
-            Err(failed("OpenShell proxy denied the provider request"))
+            failed("OpenShell proxy denied the provider request")
         } else {
-            Err(failed("MCP-GW rejected runtime authorization"))
+            failed("MCP-GW rejected runtime authorization")
         }
     } else {
         let diagnostic = sanitized_gateway_failure_detail(actual.as_u16(), body);
@@ -2267,10 +2314,10 @@ fn require_status(actual: StatusCode, expected: StatusCode, body: &[u8]) -> Resu
             .reason
             .map(|detail| format!(" ({detail})"))
             .unwrap_or_default();
-        Err(failed(&format!(
+        failed(&format!(
             "MCP-GW returned HTTP {}{code}{detail}",
             actual.as_u16()
-        )))
+        ))
     }
 }
 
@@ -2632,7 +2679,17 @@ fn json_object(body: &[u8], description: &str) -> Result<Map<String, Value>, Por
         .ok_or_else(|| rejected(&format!("{description} must be one JSON object")))
 }
 
-fn mcp_json_object(body: &[u8], description: &str) -> Result<Map<String, Value>, PortError> {
+/// The one JSON-RPC response to `request_id` in an MCP Streamable HTTP reply.
+///
+/// A JSON reply is that response. An SSE reply may carry `id`, `retry`, `event`
+/// and comment lines, priming events without data, and server notifications or
+/// requests before the response; only `data` is read, and exactly one message
+/// must be the response to this request.
+fn mcp_jsonrpc_response(
+    body: &[u8],
+    request_id: &str,
+    description: &str,
+) -> Result<Map<String, Value>, PortError> {
     if let Ok(value) = serde_json::from_slice::<Value>(body) {
         return value
             .as_object()
@@ -2640,27 +2697,49 @@ fn mcp_json_object(body: &[u8], description: &str) -> Result<Map<String, Value>,
             .ok_or_else(|| rejected(&format!("{description} must be one JSON object")));
     }
     let text = std::str::from_utf8(body)
-        .map_err(|_| rejected(&format!("{description} must be JSON or one SSE event")))?;
-    let mut data = None;
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() || line.starts_with(':') {
+        .map_err(|_| rejected(&format!("{description} must be JSON or SSE")))?;
+    let mut events = Vec::new();
+    let mut data: Option<String> = None;
+    for line in text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+    {
+        if line.is_empty() {
+            events.extend(data.take());
             continue;
         }
-        if let Some(value) = line.strip_prefix("data:") {
-            if data.replace(value.trim_start()).is_some() {
-                return Err(rejected(&format!(
-                    "{description} must contain exactly one SSE data event"
-                )));
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        if field == "data" {
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match &mut data {
+                Some(data) => {
+                    data.push('\n');
+                    data.push_str(value);
+                }
+                None => data = Some(value.to_owned()),
             }
-        } else if line.strip_prefix("event:").map(str::trim) != Some("message") {
-            return Err(rejected(&format!(
-                "{description} contains an unsupported SSE field"
-            )));
         }
+        // Comments, `event`, `id`, `retry` and unknown fields carry no message.
     }
-    let data = data.ok_or_else(|| rejected(&format!("{description} omitted SSE data")))?;
-    json_object(data.as_bytes(), description)
+    events.extend(data);
+    let mut responses = events
+        .iter()
+        .filter(|data| !data.trim().is_empty())
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .filter_map(|value| value.as_object().cloned())
+        .filter(|message| {
+            message.get("id").and_then(Value::as_str) == Some(request_id)
+                && (message.contains_key("result") || message.contains_key("error"))
+        });
+    let response = responses
+        .next()
+        .ok_or_else(|| rejected(&format!("{description} omitted the response")))?;
+    if responses.next().is_some() {
+        return Err(rejected(&format!(
+            "{description} contains more than one response"
+        )));
+    }
+    Ok(response)
 }
 
 fn exact_string_field(object: &Map<String, Value>, expected: &str) -> Result<String, PortError> {
@@ -2801,7 +2880,8 @@ mod tests {
     use super::{
         GatewayContract, GithubBridgeFailureDiagnostic, GithubBridgeOperation, GithubBridgeRequest,
         GithubMcpGateway, GithubPublishedFile, GithubStatusCredential, GithubStatusReader,
-        MAX_MCP_TOOL_RESPONSE_BYTES, MAX_RESPONSE_BYTES, commit_sha, compatible_workflow,
+        MAX_MCP_TOOL_RESPONSE_BYTES, MAX_RESPONSE_BYTES, McpSession,
+        PROVIDER_TRANSPORT_READY_TIMEOUT, commit_sha, compatible_workflow,
         github_bridge_failure_diagnostic, maximum_run_id, mcp_tool_payload, normalize_pull_request,
         normalize_repositories, normalize_repository, normalize_run_status, parse_response,
         payload_items, pre_dispatch_provider_failure, workflow_content, workflow_file_name,
@@ -3175,11 +3255,9 @@ mod tests {
                             self.expirations -= 1;
                             self.session = None;
                             self.initialized = false;
-                            write_http_status(
-                                request.stream,
-                                "404 Not Found",
-                                "session not found",
-                            )?;
+                            // Any 404 to a request that carried a session ends it,
+                            // whatever the body says.
+                            write_http_status(request.stream, "404 Not Found", "")?;
                             continue;
                         }
                         return Ok((request.stream, body));
@@ -4447,44 +4525,458 @@ mod tests {
         Ok(())
     }
 
-    /// A gateway that requires a session but issued none must not surface as a
-    /// generic HTTP 400.
+    /// A gateway that requires a session but issued none answers the session-less
+    /// call with its captured 400. No session was sent, so this is not a session
+    /// rejection: it keeps the generic gateway HTTP category.
     #[tokio::test]
-    async fn a_required_but_unissued_session_is_a_session_failure() -> Result<(), String> {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .map_err(|error| format!("bind session fixture: {error}"))?;
-        let address = listener
-            .local_addr()
-            .map_err(|error| format!("read session fixture address: {error}"))?;
-        let server = thread::spawn(move || -> Result<(), String> {
-            let initialize = read_http_request(&listener)?;
-            write_mcp_result(
-                initialize.stream,
-                "steward-mcp-initialize",
-                serde_json::json!({
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "mcp-fixture", "version": "1.0.0"}
-                }),
-            )?;
-            let notification = read_http_request(&listener)?;
-            write_http_status(notification.stream, "202 Accepted", "")?;
-            let call = read_http_request(&listener)?;
-            write_http_status(call.stream, "400 Bad Request", MISSING_SESSION_REJECTION)
-        });
-        let gateway = GithubMcpGateway::new(&McpFixture::origin(address), "0.4.9")
-            .map_err(|error| format!("build session gateway: {error:?}"))?;
-        let result = gateway
-            .execute(GithubBridgeOperation::RunStatus, run_status_request())
-            .await;
-        server
-            .join()
-            .map_err(|_| "session fixture panicked".to_owned())??;
+    async fn a_required_but_unissued_session_keeps_the_gateway_http_failure() -> Result<(), String>
+    {
+        let (result, seen) = scripted_run_status(vec![
+            ("200 OK", "", INITIALIZE_RESULT),
+            ("202 Accepted", "", ""),
+            captured_reply(AGENTGATEWAY_MISSING_SESSION)?,
+        ])
+        .await?;
         assert_eq!(
             result,
             Err(PortError::Failed {
-                reason: "MCP-GW session could not be established (session rejected)".to_owned(),
+                reason: "MCP-GW returned HTTP 400".to_owned(),
             })
+        );
+        assert_eq!(seen.len(), 3, "no session was issued, so none is closed");
+        Ok(())
+    }
+
+    // Replies of the agentgateway image pinned by MCP-GW 0.5.7
+    // (`ghcr.io/apelogic-ai/mcp-gw-agentgateway@sha256:051e1c979b98561cfb833c8f44a55caac715d231c14bb0060371101fc9465c4a`),
+    // captured with a no-authentication route to one stateless fake MCP upstream.
+    // Only the `date` header was removed.
+    const AGENTGATEWAY_INITIALIZE: &str =
+        include_str!("../tests/fixtures/agentgateway-mcp-gw-0.5.7/initialize.json");
+    const AGENTGATEWAY_INITIALIZED: &str =
+        include_str!("../tests/fixtures/agentgateway-mcp-gw-0.5.7/initialized.json");
+    const AGENTGATEWAY_TOOLS_CALL: &str =
+        include_str!("../tests/fixtures/agentgateway-mcp-gw-0.5.7/tools-call.json");
+    const AGENTGATEWAY_DELETE: &str =
+        include_str!("../tests/fixtures/agentgateway-mcp-gw-0.5.7/delete.json");
+    const AGENTGATEWAY_MISSING_SESSION: &str =
+        include_str!("../tests/fixtures/agentgateway-mcp-gw-0.5.7/missing-session.json");
+    const AGENTGATEWAY_INVALID_SESSION: &str =
+        include_str!("../tests/fixtures/agentgateway-mcp-gw-0.5.7/invalid-session.json");
+    const AGENTGATEWAY_SESSION_NOT_FOUND: &str =
+        include_str!("../tests/fixtures/agentgateway-mcp-gw-0.5.7/session-not-found.json");
+
+    /// One captured reply: its status, header lines and exact body.
+    fn split_captured(raw: &str) -> Result<(String, Vec<String>, String), String> {
+        let capture: Value =
+            serde_json::from_str(raw).map_err(|error| format!("parse capture: {error}"))?;
+        let text = |value: &Value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "capture field is not a string".to_owned())
+        };
+        let headers = capture["headers"]
+            .as_array()
+            .ok_or_else(|| "capture omitted its headers".to_owned())?
+            .iter()
+            .map(text)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((text(&capture["status"])?, headers, text(&capture["body"])?))
+    }
+
+    /// A captured content-length reply as a scripted `(status, headers, body)`.
+    fn captured_reply(raw: &str) -> Result<(&'static str, &'static str, &'static str), String> {
+        let (status, headers, body) = split_captured(raw)?;
+        let headers = headers
+            .into_iter()
+            .filter(|line| !line.to_ascii_lowercase().starts_with("content-length:"))
+            .map(|line| format!("{line}\r\n"))
+            .collect::<String>();
+        Ok((
+            Box::leak(status.into_boxed_str()),
+            Box::leak(headers.into_boxed_str()),
+            Box::leak(body.into_boxed_str()),
+        ))
+    }
+
+    fn captured_session_id(raw: &str) -> Result<String, String> {
+        let (_, headers, _) = split_captured(raw)?;
+        headers
+            .into_iter()
+            .find_map(|line| line.strip_prefix("mcp-session-id: ").map(str::to_owned))
+            .ok_or_else(|| "captured initialize issued no session".to_owned())
+    }
+
+    /// Replays a captured reply with its own framing. A chunked body is re-chunked
+    /// mid-event, so a reader must reassemble SSE across chunk boundaries.
+    fn write_captured(mut stream: TcpStream, raw: &str) -> Result<(), String> {
+        let (status, headers, body) = split_captured(raw)?;
+        let chunked = headers
+            .iter()
+            .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"));
+        let mut reply = format!("HTTP/1.1 {status}\r\n");
+        for line in &headers {
+            reply.push_str(line);
+            reply.push_str("\r\n");
+        }
+        reply.push_str("connection: close\r\n\r\n");
+        if chunked {
+            let (first, second) = body.split_at(body.len() / 2);
+            for chunk in [first, second] {
+                reply.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+            }
+            reply.push_str("0\r\n\r\n");
+        } else {
+            reply.push_str(&body);
+        }
+        stream
+            .write_all(reply.as_bytes())
+            .map_err(|error| format!("write captured reply: {error}"))
+    }
+
+    /// The bridge against the replies the pinned agentgateway really sends: an SSE
+    /// `initialize` with a session ID, a bare-`data:` SSE tool result, 202s for the
+    /// notification and the close.
+    #[tokio::test]
+    async fn captured_agentgateway_replies_complete_a_governed_operation() -> Result<(), String> {
+        let session = captured_session_id(AGENTGATEWAY_INITIALIZE)?;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind agentgateway replay: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read agentgateway replay address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let request = read_http_request(&listener)?;
+            assert_eq!(
+                request.body.as_ref().map(|body| body["method"].clone()),
+                Some(serde_json::json!("initialize"))
+            );
+            assert_eq!(request.header("mcp-session-id"), None);
+            write_captured(request.stream, AGENTGATEWAY_INITIALIZE)?;
+
+            let request = read_http_request(&listener)?;
+            assert_eq!(
+                request.body.as_ref().map(|body| body["method"].clone()),
+                Some(serde_json::json!("notifications/initialized"))
+            );
+            assert_eq!(request.header("mcp-session-id"), Some(session.as_str()));
+            write_captured(request.stream, AGENTGATEWAY_INITIALIZED)?;
+
+            let request = read_http_request(&listener)?;
+            assert_eq!(
+                request
+                    .body
+                    .as_ref()
+                    .map(|body| body["params"]["name"].clone()),
+                Some(serde_json::json!("get_me"))
+            );
+            assert_eq!(request.header("mcp-session-id"), Some(session.as_str()));
+            assert_eq!(request.header("mcp-protocol-version"), Some("2025-06-18"));
+            write_captured(request.stream, AGENTGATEWAY_TOOLS_CALL)?;
+
+            let request = read_http_request(&listener)?;
+            assert_eq!(
+                request
+                    .body
+                    .as_ref()
+                    .map(|body| body["params"]["name"].clone()),
+                Some(serde_json::json!("search_repositories"))
+            );
+            assert_eq!(request.header("mcp-session-id"), Some(session.as_str()));
+            let (status, headers, _) = split_captured(AGENTGATEWAY_TOOLS_CALL)?;
+            let mut reply = format!("HTTP/1.1 {status}\r\n");
+            for line in headers {
+                reply.push_str(&line);
+                reply.push_str("\r\n");
+            }
+            let event = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "steward-github-repositories",
+                "result": {
+                    "content": [{"type": "text", "text": r#"{"total_count":0,"items":[]}"#}],
+                    "isError": false
+                }
+            });
+            let body = format!("data: {event}\n\n");
+            reply.push_str(&format!(
+                "connection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                body.len()
+            ));
+            let mut stream = request.stream;
+            stream
+                .write_all(reply.as_bytes())
+                .map_err(|error| format!("write repository reply: {error}"))?;
+
+            let request = read_http_request(&listener)?;
+            assert_eq!(request.request_line, "DELETE /mcp HTTP/1.1");
+            assert_eq!(request.header("mcp-session-id"), Some(session.as_str()));
+            write_captured(request.stream, AGENTGATEWAY_DELETE)
+        });
+        let gateway = GithubMcpGateway::new(&McpFixture::origin(address), "0.4.9")
+            .map_err(|error| format!("build agentgateway replay gateway: {error:?}"))?;
+        let listing = gateway
+            .execute(
+                GithubBridgeOperation::Repositories,
+                GithubBridgeRequest::Repositories {
+                    query: String::new(),
+                    page: 1,
+                    per_page: 100,
+                },
+            )
+            .await
+            .map_err(|error| format!("execute repository listing: {error:?}"))?;
+        server
+            .join()
+            .map_err(|_| "agentgateway replay panicked".to_owned())??;
+        assert_eq!(listing["login"], "alice");
+        assert_eq!(listing["repositories"], serde_json::json!([]));
+        Ok(())
+    }
+
+    /// Every SSE framing the Streamable HTTP transport allows yields the one
+    /// JSON-RPC response whose ID matches the request.
+    #[test]
+    fn streamable_http_sse_framing_selects_the_matching_response() {
+        let response = r#"{"jsonrpc":"2.0","id":"steward-github-me","result":{"structuredContent":{"login":"alice"},"isError":false}}"#;
+        let notification = r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"working"}}"#;
+        let other = r#"{"jsonrpc":"2.0","id":"other-request","result":{}}"#;
+        let (first_half, second_half) =
+            response.split_at(response.find(",\"id\"").unwrap_or(0) + 1);
+        for body in [
+            format!("data: {response}\n\n"),
+            format!("data:{response}\n\n"),
+            format!("event: message\ndata: {response}\n\n"),
+            format!(
+                ": keep-alive\nid: 1\nretry: 1000\ndata:\n\nid: 2\nevent: message\ndata: {response}\n\n"
+            ),
+            format!("data: {notification}\n\ndata: {response}\n\n"),
+            format!("data: {other}\n\ndata: {response}\n\n"),
+            format!("data: {first_half}\ndata: {second_half}\n\n"),
+            format!("id: 7\r\ndata: {response}\r\n\r\n"),
+            format!("data: {response}"),
+            response.to_owned(),
+        ] {
+            assert_eq!(
+                mcp_tool_payload(body.as_bytes(), "steward-github-me"),
+                Ok(serde_json::json!({"login": "alice"})),
+                "{body:?}"
+            );
+        }
+        for body in [
+            format!("data: {response}\n\ndata: {response}\n\n"),
+            format!("data: {notification}\n\n"),
+            format!("data: {other}\n\n"),
+            "data: not json\n\n".to_owned(),
+            ": only a comment\n\n".to_owned(),
+        ] {
+            assert!(
+                mcp_tool_payload(body.as_bytes(), "steward-github-me").is_err(),
+                "{body:?} has no single matching response"
+            );
+        }
+    }
+
+    /// MCP-GW 0.3.2 predates the lifecycle contract: its rerun keeps the bare
+    /// request it always accepted, with no handshake and no session.
+    #[tokio::test]
+    async fn legacy_gateway_rerun_sends_the_bare_request_without_a_handshake() -> Result<(), String>
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind legacy rerun fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read legacy rerun fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let request = read_http_request(&listener)?;
+            assert_eq!(request.request_line, "POST /mcp HTTP/1.1");
+            assert_eq!(request.header("mcp-session-id"), None);
+            assert_eq!(request.header("mcp-protocol-version"), Some("2025-06-18"));
+            assert_eq!(
+                request.header("authorization"),
+                Some("Bearer openshell-token-grant-placeholder")
+            );
+            let body = request
+                .body
+                .ok_or_else(|| "legacy rerun omitted its body".to_owned())?;
+            assert_eq!(body["method"], "tools/call", "no initialize precedes it");
+            assert_eq!(body["params"]["name"], "actions_run_trigger");
+            write_mcp_result(
+                request.stream,
+                "steward-github-rerun",
+                serde_json::json!({"content": [], "isError": false}),
+            )?;
+            match read_http_request(&listener) {
+                Err(error) if error == SENTINEL_END => Ok(()),
+                Err(error) => Err(error),
+                Ok(request) => Err(format!(
+                    "a legacy rerun sent another request: {}",
+                    request.request_line
+                )),
+            }
+        });
+        let gateway = GithubMcpGateway::new(&McpFixture::origin(address), "0.3.2")
+            .map_err(|error| format!("build legacy rerun gateway: {error:?}"))?;
+        let response = gateway
+            .execute(
+                GithubBridgeOperation::Rerun,
+                GithubBridgeRequest::Rerun {
+                    owner: "example-org".to_owned(),
+                    repo: "example-repo".to_owned(),
+                    run_id: 12345,
+                },
+            )
+            .await;
+        drop(TcpStream::connect(address));
+        server
+            .join()
+            .map_err(|_| "legacy rerun fixture panicked".to_owned())??;
+        assert_eq!(response, Ok(serde_json::json!({"dispatched": true})));
+        Ok(())
+    }
+
+    /// A scripted server thread, which returns every request line it received.
+    type ScriptedServer = thread::JoinHandle<Result<Vec<String>, String>>;
+
+    /// Answers each request with the next scripted reply, then records every
+    /// further request until the test's sentinel connection.
+    fn scripted_server(
+        replies: Vec<(&'static str, &'static str, &'static str)>,
+    ) -> Result<(std::net::SocketAddr, ScriptedServer), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind scripted server: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read scripted server address: {error}"))?;
+        let server = thread::spawn(move || -> Result<Vec<String>, String> {
+            let mut seen = Vec::new();
+            let mut replies = replies.into_iter();
+            loop {
+                let request = match read_http_request(&listener) {
+                    Ok(request) => request,
+                    Err(error) if error == SENTINEL_END => return Ok(seen),
+                    Err(error) => return Err(error),
+                };
+                seen.push(format!(
+                    "{} {}",
+                    request.request_line,
+                    request
+                        .body
+                        .as_ref()
+                        .and_then(|body| body["method"].as_str())
+                        .unwrap_or_default()
+                ));
+                let (status, headers, body) = replies.next().unwrap_or(("200 OK", "", ""));
+                let mut stream = request.stream;
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .map_err(|error| format!("write scripted reply: {error}"))?;
+            }
+        });
+        Ok((address, server))
+    }
+
+    const ME_RESULT: &str = r#"{"jsonrpc":"2.0","id":"steward-github-me","result":{"structuredContent":{"login":"alice"},"isError":false}}"#;
+
+    /// A handshake that failed after the server issued a session is never reused:
+    /// the next call reports the same failure without another request, and the
+    /// issued session is still closed.
+    #[tokio::test]
+    async fn a_half_established_session_is_never_reused() -> Result<(), String> {
+        let (address, server) = scripted_server(vec![
+            (
+                "200 OK",
+                "Mcp-Session-Id: fixture-session-1\r\n",
+                INITIALIZE_RESULT,
+            ),
+            ("503 Service Unavailable", "", ""),
+        ])?;
+        let gateway = GithubMcpGateway::new(&McpFixture::origin(address), "0.4.9")
+            .map_err(|error| format!("build gateway: {error:?}"))?;
+        let mut session = McpSession::new(&gateway);
+        let expected = Err(PortError::Failed {
+            reason: "MCP-GW returned HTTP 503".to_owned(),
+        });
+        assert_eq!(
+            session
+                .call_tool("steward-github-me", "get_me", serde_json::json!({}))
+                .await,
+            expected
+        );
+        assert_eq!(
+            session
+                .call_tool("steward-github-me", "get_me", serde_json::json!({}))
+                .await,
+            expected,
+            "a later call must not use the session whose handshake failed"
+        );
+        session.close().await;
+        drop(TcpStream::connect(address));
+        let seen = server
+            .join()
+            .map_err(|_| "scripted server panicked".to_owned())??;
+        assert_eq!(
+            seen,
+            vec![
+                "POST /mcp HTTP/1.1 initialize".to_owned(),
+                "POST /mcp HTTP/1.1 notifications/initialized".to_owned(),
+                "DELETE /mcp HTTP/1.1 ".to_owned(),
+            ]
+        );
+        Ok(())
+    }
+
+    /// The provider-readiness window opens at the session's first POST and covers
+    /// every later request, so a lasting authentication fault is not retried anew
+    /// at each step of the operation.
+    #[tokio::test]
+    async fn one_provider_readiness_window_covers_the_whole_session() -> Result<(), String> {
+        let (address, server) = scripted_server(vec![
+            ("200 OK", "", INITIALIZE_RESULT),
+            ("202 Accepted", "", ""),
+            ("200 OK", "", ME_RESULT),
+            ("401 Unauthorized", "", ""),
+        ])?;
+        let gateway = GithubMcpGateway::new(&McpFixture::origin(address), "0.4.9")
+            .map_err(|error| format!("build gateway: {error:?}"))?;
+        let mut session = McpSession::new(&gateway);
+        session
+            .call_tool("steward-github-me", "get_me", serde_json::json!({}))
+            .await
+            .map_err(|error| format!("first call: {error:?}"))?;
+        let opened = session
+            .readiness_started
+            .ok_or_else(|| "the first POST opens the readiness window".to_owned())?;
+        // Age the window past its bound, as if the session had run that long.
+        let aged = opened
+            .checked_sub(PROVIDER_TRANSPORT_READY_TIMEOUT)
+            .ok_or_else(|| "age the readiness window".to_owned())?;
+        session.readiness_started = Some(aged);
+        assert_eq!(
+            session
+                .call_tool("steward-github-me", "get_me", serde_json::json!({}))
+                .await,
+            Err(PortError::Failed {
+                reason: "MCP-GW rejected runtime authentication".to_owned(),
+            })
+        );
+        assert_eq!(
+            session.readiness_started,
+            Some(aged),
+            "a later request reuses the session's window"
+        );
+        session.close().await;
+        drop(TcpStream::connect(address));
+        let seen = server
+            .join()
+            .map_err(|_| "scripted server panicked".to_owned())??;
+        assert_eq!(
+            seen.len(),
+            4,
+            "an expired window does not retry the 401: {seen:?}"
         );
         Ok(())
     }
@@ -4517,10 +5009,15 @@ mod tests {
                         .as_ref()
                         .map_or("", |body| body["method"].as_str().unwrap_or_default())
                 ));
+                let content_type = if headers.to_ascii_lowercase().contains("content-type:") {
+                    ""
+                } else {
+                    "Content-Type: application/json\r\n"
+                };
                 let mut stream = request.stream;
                 write!(
                     stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\n{content_type}{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 )
                 .map_err(|error| format!("write scripted reply: {error}"))?;
@@ -4574,8 +5071,10 @@ mod tests {
                 },
             ),
             (
-                ("400 Bad Request", "", "session ID is required"),
-                session_failure("initialize was rejected"),
+                ("400 Bad Request", "", "mcp: invalid session ID header"),
+                PortError::Failed {
+                    reason: "MCP-GW returned HTTP 400".to_owned(),
+                },
             ),
             (
                 (
@@ -4620,7 +5119,7 @@ mod tests {
                 "Mcp-Session-Id: fixture-session-1\r\n",
                 INITIALIZE_RESULT,
             ),
-            ("400 Bad Request", "", "invalid session ID header"),
+            captured_reply(AGENTGATEWAY_INVALID_SESSION)?,
         ])
         .await?;
         assert_eq!(
@@ -4639,7 +5138,7 @@ mod tests {
                 INITIALIZE_RESULT,
             ),
             ("202 Accepted", "", ""),
-            ("400 Bad Request", "", "invalid session ID header"),
+            captured_reply(AGENTGATEWAY_INVALID_SESSION)?,
         ])
         .await?;
         assert_eq!(result, Err(session_failure("session rejected")));
@@ -4648,8 +5147,31 @@ mod tests {
             Some("DELETE /mcp HTTP/1.1 fixture-session-1")
         );
 
-        // A 404 that does not name the session is the tool route's answer, not an
-        // expiry: it is never resent.
+        // A 400 that is not the gateway's exact session rejection keeps its detail,
+        // even when it mentions a session and one was sent.
+        let (result, _) = scripted_run_status(vec![
+            (
+                "200 OK",
+                "Mcp-Session-Id: fixture-session-1\r\n",
+                INITIALIZE_RESULT,
+            ),
+            ("202 Accepted", "", ""),
+            (
+                "400 Bad Request",
+                "",
+                r#"{"error":"bad session id format in arguments"}"#,
+            ),
+        ])
+        .await?;
+        assert_eq!(
+            result,
+            Err(PortError::Failed {
+                reason: "MCP-GW returned HTTP 400 (bad session id format in arguments)".to_owned(),
+            })
+        );
+
+        // Any 404 to a request that carried a session means the session ended,
+        // whatever its body says: re-initialize once, then give up.
         let (result, seen) = scripted_run_status(vec![
             (
                 "200 OK",
@@ -4658,22 +5180,27 @@ mod tests {
             ),
             ("202 Accepted", "", ""),
             ("404 Not Found", "", r#"{"error":"not found"}"#),
+            (
+                "200 OK",
+                "Mcp-Session-Id: fixture-session-2\r\n",
+                INITIALIZE_RESULT,
+            ),
+            ("202 Accepted", "", ""),
+            captured_reply(AGENTGATEWAY_SESSION_NOT_FOUND)?,
         ])
         .await?;
-        assert_eq!(
-            result,
-            Err(PortError::Failed {
-                reason: "MCP-GW returned HTTP 404 (not found)".to_owned(),
-            })
-        );
+        assert_eq!(result, Err(session_failure("session expired")));
         assert_eq!(
             seen,
             vec![
                 "POST /mcp HTTP/1.1 initialize".to_owned(),
                 "POST /mcp HTTP/1.1 notifications/initialized".to_owned(),
                 "POST /mcp HTTP/1.1 tools/call".to_owned(),
-                "DELETE /mcp HTTP/1.1 fixture-session-1".to_owned(),
-            ]
+                "POST /mcp HTTP/1.1 initialize".to_owned(),
+                "POST /mcp HTTP/1.1 notifications/initialized".to_owned(),
+                "POST /mcp HTTP/1.1 tools/call".to_owned(),
+            ],
+            "an ended session is not closed again"
         );
         Ok(())
     }

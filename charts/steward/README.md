@@ -391,17 +391,20 @@ lifecycle. Changing a configured trust mode, image, endpoint, MCP-GW authority
 contract, namespace, or runtime class does not reinterpret an existing
 operation; it fails closed.
 
-For every MCP operation (repository search, workflow detection, publication,
-dispatch, run status and rerun) the bridge is an MCP Streamable HTTP client of
+Since Steward v0.3.14, for every MCP operation (repository search, workflow
+detection, publication, dispatch, run status and rerun) under the lifecycle
+gateway contract, the bridge is an MCP Streamable HTTP client of
 `<mcpGatewayOrigin>/mcp`. Each operation sends `initialize` with protocol
 `2025-06-18`, then `notifications/initialized`, and carries the issued
 `Mcp-Session-Id` and the negotiated `MCP-Protocol-Version` on every tool call of
-that operation; it ends the session with a best-effort `DELETE`. Both origin
-kinds are supported: a session-enforcing gateway, such as the MCP-GW
-agentgateway, and a direct GitHub wrapper that issues no session, in which case
-the bridge sends no session header. An expired session (HTTP 404) is
-re-initialized once per operation. Connect, status and disconnect use MCP-GW's
-REST routes and open no MCP session.
+that operation. It ends an issued session with a `DELETE` whose result is
+ignored. Both origin kinds are supported: a session-enforcing gateway, such as
+the MCP-GW agentgateway, and a direct GitHub wrapper that issues no session, in
+which case the bridge sends no session header and no `DELETE`. Any HTTP 404 to a
+request that carried a session re-initializes the session once per operation.
+JSON and Server-Sent Events replies are accepted. The legacy `0.3.2` contract
+keeps its bare rerun request. Connect, status and disconnect use MCP-GW's REST
+routes and open no MCP session.
 
 With MCP-GW 0.5.5+, Steward requests connection-status v2 and displays the
 GitHub login plus immutable numeric account ID. When federated Task identity is
@@ -438,7 +441,7 @@ bounded diagnostic.
 | `bridge-gateway-status` | Historical category from older bridges for an unexpected successful disconnect response. New invalid response bodies use `bridge-response-contract`. |
 | `bridge-gateway-body` | The governed runtime could not read the bounded MCP-GW response body. |
 | `bridge-gateway-unavailable` | MCP-GW was unavailable to the governed runtime. |
-| `bridge-gateway-session` | The bridge could not establish or keep an MCP session with MCP-GW: the gateway rejected `initialize`, `notifications/initialized`, or a tool call because of its session (an HTTP 400 naming the session); the `initialize` reply was not a valid result for protocol `2025-06-18` or `2025-03-26`; the issued session ID was not visible ASCII of at most 4096 bytes; or the session expired again after one re-initialization. Other HTTP statuses during the handshake keep the `bridge-gateway-http` and credential categories above. The bridge's fixed diagnostic in `task_execution_attempts.execution_stderr` names the failed step. Verify that `connectionsBridge.mcpGatewayOrigin` reaches MCP-GW's `/mcp` endpoint and that the gateway's MCP sessions are healthy. |
+| `bridge-gateway-session` | Since v0.3.14. The bridge could not establish or keep an MCP session with MCP-GW: the gateway answered a request that carried the session with its exact `mcp: invalid session ID header` rejection, or with HTTP 404 again after one re-initialization; the `initialize` reply was not a valid result for protocol `2025-06-18` or `2025-03-26`; or the issued session ID was not visible ASCII of at most 4096 bytes. Every other HTTP status, including a 400 to a request without a session, keeps the `bridge-gateway-http` and credential categories above. The bridge's fixed diagnostic in `task_execution_attempts.execution_stderr` names the failed step. Verify that `connectionsBridge.mcpGatewayOrigin` reaches MCP-GW's `/mcp` endpoint and that the gateway's MCP sessions are healthy. |
 | `runtime_create_admission_rejected` | Kubernetes admission rejected creation of the governed connection runtime. Inspect Steward admission and controller events. |
 | `runtime_start_failed` | The exact governed connection runtime entered its terminal failed phase before it became ready. Inspect the AgentRuntime and OpenShell sandbox. |
 | `bridge_failed` | The bridge failed without a recognized safe diagnostic. |

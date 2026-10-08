@@ -1,0 +1,8 @@
+{
+  "status": "404 Not Found",
+  "headers": [
+    "content-type: text/plain",
+    "content-length: 22"
+  ],
+  "body": "mcp: session not found"
+}
