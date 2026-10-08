@@ -1669,6 +1669,14 @@ fn automation_error(error: ConnectionBrokerError) -> Response {
         ConnectionBrokerError::BridgeContractInvalid => {
             (StatusCode::SERVICE_UNAVAILABLE, Some("bridge_contract"))
         }
+        ConnectionBrokerError::ProviderResponseInvalid => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("bridge_response_contract"),
+        ),
+        ConnectionBrokerError::BridgeResultTooLarge => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Some("bridge_result_too_large"),
+        ),
         _ => (StatusCode::SERVICE_UNAVAILABLE, None),
     };
     (
@@ -1850,6 +1858,7 @@ mod tests {
         /// Files on the default branch, by repository path. `None` models a repository whose
         /// every read matches the expected content.
         base_files: Arc<Mutex<Option<BTreeMap<String, String>>>>,
+        no_repository_hits: bool,
     }
 
     impl GithubAutomationBroker<BrowserSessionBinding> for FakeBroker {
@@ -1888,6 +1897,12 @@ mod tests {
                     }));
                 }
                 match operation {
+                    ConnectionOperationKind::Repositories if self.no_repository_hits => Ok(json!({
+                        "login": "alice",
+                        "repositories": [],
+                        "page": 1,
+                        "hasNextPage": false
+                    })),
                     ConnectionOperationKind::Repositories => Ok(json!({
                         "login": "alice",
                         "repositories": [
@@ -2332,6 +2347,80 @@ mod tests {
                 "apiVersion": GITHUB_AUTOMATION_API_VERSION,
                 "error": "github_automation_unavailable",
                 "reason": "bridge_contract"
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_result_bound_has_its_own_automation_reason() -> Result<(), String> {
+        let response = automation_error(ConnectionBrokerError::BridgeResultTooLarge);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read automation failure body: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body)
+                .map_err(|error| format!("parse automation failure body: {error}"))?["reason"],
+            "bridge_result_too_large",
+            "Steward's own result bound is not a provider response contract failure"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repository_lookup_without_search_hits_is_not_found() -> Result<(), String> {
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .push(browser_run(task_uid, OWNER_USER_ID)?);
+        let broker = FakeBroker {
+            no_repository_hits: true,
+            ..FakeBroker::default()
+        };
+        let (auth, session_cookie, csrf) = signed_in_cookie_and_csrf().await?;
+        let app = protected_router(ledger, broker.clone(), config()?, auth);
+        let response = app
+            .oneshot(mutation_request(
+                format!("/app/api/v1/runs/{task_uid}/github/workflow"),
+                &session_cookie,
+                &csrf,
+                json!({"owner": "example-org", "repository": "example-repo"}),
+            )?)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let lookup = broker
+            .calls
+            .lock()
+            .map_err(|_| "lock broker calls")?
+            .iter()
+            .find(|call| call.operation == ConnectionOperationKind::Repositories)
+            .map(|call| call.request.clone())
+            .ok_or("repository lookup was not captured")?;
+        assert_eq!(lookup["query"], "repo:example-org/example-repo");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_response_contract_failure_has_a_bounded_automation_reason() -> Result<(), String>
+    {
+        let response = automation_error(ConnectionBrokerError::ProviderResponseInvalid);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read automation failure body: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body)
+                .map_err(|error| format!("parse automation failure body: {error}"))?,
+            json!({
+                "apiVersion": GITHUB_AUTOMATION_API_VERSION,
+                "error": "github_automation_unavailable",
+                "reason": "bridge_response_contract"
             })
         );
         Ok(())
