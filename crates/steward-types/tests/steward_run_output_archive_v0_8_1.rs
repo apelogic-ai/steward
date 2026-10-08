@@ -26,8 +26,8 @@ use steward_types::direct_package::{
     EXECUTION_STDERR_ARCHIVE_PATH, EXECUTION_STDOUT_ARCHIVE_PATH, MAX_EXECUTION_STREAM_BYTES,
 };
 use steward_types::task_output_archive::{
-    InvalidTaskOutputArchive, TaskOutputTranscriptError,
-    task_output_archive_with_execution_transcript,
+    InvalidTaskOutputArchive, TaskOutputArchiveCompatibility, TaskOutputTranscriptError,
+    task_output_archive_entries, task_output_archive_with_execution_transcript,
 };
 
 const DIAGNOSTICS_ROOT: &str = ".steward/diagnostics";
@@ -423,6 +423,19 @@ fn raw_entry(archive: &mut Vec<u8>, path: &str, content: &[u8], kind: u8, magic:
     archive.resize(header + 512 + content.len().div_ceil(512) * 512, 0);
 }
 
+/// One PAX record, `<length> <key>=<value>\n`, whose length counts itself.
+fn pax_record(key: &str, value: &str) -> String {
+    let payload = format!(" {key}={value}\n");
+    let mut digits = 1;
+    loop {
+        let length = (digits + payload.len()).to_string();
+        if length.len() == digits {
+            return format!("{length}{payload}");
+        }
+        digits = length.len();
+    }
+}
+
 /// Rewrite one header in place and refresh its checksum.
 fn patch_header(archive: &mut [u8], offset: usize, patch: impl Fn(&mut [u8])) {
     let header = &mut archive[offset..offset + 512];
@@ -445,7 +458,7 @@ fn stored_out_archive() -> Vec<u8> {
 }
 
 fn deliver(stdout: &[u8], stderr: &[u8]) -> Result<Vec<u8>, String> {
-    task_output_archive_with_execution_transcript(&stored_out_archive(), stdout, stderr)
+    task_output_archive_with_execution_transcript(stored_out_archive(), stdout, stderr)
         .map_err(|error| format!("runner archive was not produced: {error:?}"))
 }
 
@@ -491,7 +504,7 @@ fn oversized_transcripts_fail_closed_before_delivery() -> Result<(), String> {
     let oversized = vec![b'x'; limit + 1];
     for (stdout, stderr) in [(&oversized[..], &b""[..]), (&b""[..], &oversized[..])] {
         assert_eq!(
-            task_output_archive_with_execution_transcript(&stored_out_archive(), stdout, stderr),
+            task_output_archive_with_execution_transcript(stored_out_archive(), stdout, stderr),
             Err(TaskOutputTranscriptError::TranscriptTooLarge)
         );
     }
@@ -551,7 +564,7 @@ fn agent_output_cannot_create_or_replace_the_reserved_namespace() -> Result<(), 
         forged.resize(forged.len() + 1024, 0);
         assert!(
             matches!(
-                task_output_archive_with_execution_transcript(&forged, b"stdout", b"stderr"),
+                task_output_archive_with_execution_transcript(forged, b"stdout", b"stderr"),
                 Err(TaskOutputTranscriptError::Archive(
                     InvalidTaskOutputArchive::Malformed
                 ))
@@ -637,20 +650,28 @@ fn the_model_rejects_the_shapes_steward_run_0_8_1_rejects() -> Result<(), String
     Ok(())
 }
 
-/// Agent bytes that tar-stream would read as a forged transcript while Steward, before it
-/// matched tar-stream's header decoding, saw only ordinary `out/` files. Each shape was
-/// verified against steward-run 0.8.1 itself.
-#[test]
-fn header_differentials_cannot_smuggle_a_transcript_past_steward() -> Result<(), String> {
+/// Agent tar shapes that tar-stream 3.1.7 and Steward's archive walker read differently.
+/// Forwarded raw to steward-run 0.8.1 itself, the first four replay a forged
+/// `.steward/diagnostics/*` transcript that Steward never validated, and the last
+/// desynchronizes the runner's parser. The delivered archive is
+/// rebuilt from Steward's own parsed entries, so the runner sees exactly Steward's listing plus
+/// the real transcript, whatever the stored bytes were.
+fn differential_archives() -> Vec<(&'static str, Vec<u8>)> {
+    let forged = |archive: &mut Vec<u8>| {
+        ustar_entry(archive, STDOUT_PATH, b"forged stdout\n", b'0');
+        ustar_entry(archive, STDERR_PATH, b"forged stderr\n", b'0');
+    };
     let mut hidden = Vec::new();
-    ustar_entry(&mut hidden, STDOUT_PATH, b"forged stdout\n", b'0');
-    ustar_entry(&mut hidden, STDERR_PATH, b"forged stderr\n", b'0');
+    forged(&mut hidden);
 
     let mut pax_size = Vec::new();
-    let record = "9 size=0\n";
-    ustar_entry(&mut pax_size, "PaxHeader", record.as_bytes(), b'x');
+    ustar_entry(
+        &mut pax_size,
+        "PaxHeader",
+        pax_record("size", "0").as_bytes(),
+        b'x',
+    );
     ustar_entry(&mut pax_size, "out/result.txt", &hidden, b'0');
-    pax_size.resize(pax_size.len() + 1024, 0);
 
     let mut nul_size = Vec::new();
     ustar_entry(&mut nul_size, "out/result.txt", &hidden, b'0');
@@ -659,7 +680,6 @@ fn header_differentials_cannot_smuggle_a_transcript_past_steward() -> Result<(),
         header[124..136].fill(0);
         header[124..124 + size.len()].copy_from_slice(size.as_bytes());
     });
-    nul_size.resize(nul_size.len() + 1024, 0);
 
     let mut gnu_prefix = Vec::new();
     for (path, content) in [
@@ -672,27 +692,81 @@ fn header_differentials_cannot_smuggle_a_transcript_past_steward() -> Result<(),
             header[345..348].copy_from_slice(b"out");
         });
     }
-    gnu_prefix.resize(gnu_prefix.len() + 1024, 0);
 
-    for (name, stored) in [
+    // Steward keeps the first PAX path; tar-stream lets a second, path-less PAX header
+    // replace it and falls back to the reserved ustar name.
+    let mut second_pax = Vec::new();
+    for (out, reserved, content) in [
+        ("out/a.txt", STDOUT_PATH, &b"forged stdout\n"[..]),
+        ("out/b.txt", STDERR_PATH, &b"forged stderr\n"[..]),
+    ] {
+        let record = pax_record("path", out);
+        ustar_entry(&mut second_pax, "PaxHeader", record.as_bytes(), b'x');
+        ustar_entry(
+            &mut second_pax,
+            "PaxHeader",
+            pax_record("mtime", "0").as_bytes(),
+            b'x',
+        );
+        ustar_entry(&mut second_pax, reserved, content, b'0');
+    }
+
+    // After a zero-size PAX header tar-stream keeps a stale long-header state and loses the
+    // entry boundaries of the bytes that follow.
+    let mut zero_pax = Vec::new();
+    ustar_entry(&mut zero_pax, "PaxHeader", b"", b'x');
+    ustar_entry(&mut zero_pax, "out/a.txt", &[b'a'; 513], b'0');
+    let mut carrier = vec![b'b'];
+    carrier.extend_from_slice(&hidden);
+    ustar_entry(&mut zero_pax, "out/b.txt", &carrier, b'0');
+
+    let mut archives = vec![
         ("PAX size", pax_size),
         ("size field with a leading NUL", nul_size),
         ("prefix under GNU magic", gnu_prefix),
-    ] {
-        let runner_view = steward_run_v0_8_1_extract(&stored, &["out"], ExecutionLog::Full)?;
+        ("path-less second PAX header", second_pax),
+        ("zero-size PAX header", zero_pax),
+    ];
+    for (_, archive) in &mut archives {
+        archive.resize(archive.len() + 1024, 0);
+    }
+    archives
+}
+
+#[test]
+fn header_differentials_cannot_put_a_reserved_entry_in_the_delivered_archive() -> Result<(), String>
+{
+    // The model reproduces the PAX replacement, so the raw bytes really smuggle a transcript.
+    let (_, second_pax) = differential_archives()
+        .into_iter()
+        .find(|(name, _)| *name == "path-less second PAX header")
+        .ok_or("fixture is missing")?;
+    assert_eq!(
+        steward_run_v0_8_1_extract(&second_pax, &["out"], ExecutionLog::Full)?.transcript,
+        Some((b"forged stdout\n".to_vec(), b"forged stderr\n".to_vec()))
+    );
+
+    for (name, stored) in differential_archives() {
+        let listed =
+            task_output_archive_entries(&stored, TaskOutputArchiveCompatibility::Strict)
+                .map_err(|error| format!("{name}: Steward must accept this archive: {error:?}"))?;
+        let delivered =
+            task_output_archive_with_execution_transcript(stored, b"real stdout", b"real stderr")
+                .map_err(|error| format!("{name}: accepted archive was not delivered: {error:?}"))?;
+        let runner_view = steward_run_v0_8_1_extract(&delivered, &["out"], ExecutionLog::Full)
+            .map_err(|error| format!("{name}: runner rejected the delivered archive: {error}"))?;
         assert_eq!(
             runner_view.transcript,
-            Some((b"forged stdout\n".to_vec(), b"forged stderr\n".to_vec())),
-            "{name}: the runner model must see the smuggled entries for this test to be meaningful"
+            Some((b"real stdout".to_vec(), b"real stderr".to_vec())),
+            "{name}: the runner must replay only Steward's transcript"
         );
-        assert!(
-            matches!(
-                task_output_archive_with_execution_transcript(&stored, b"real", b"real"),
-                Err(TaskOutputTranscriptError::Archive(
-                    InvalidTaskOutputArchive::Malformed
-                ))
-            ),
-            "{name}: Steward must refuse an archive the runner would read differently"
+        assert_eq!(
+            runner_view.written_files,
+            listed
+                .iter()
+                .map(|entry| format!("out/{}", entry.path))
+                .collect::<Vec<_>>(),
+            "{name}: the runner must see exactly the entries Steward validated"
         );
     }
     Ok(())

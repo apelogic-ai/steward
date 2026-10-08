@@ -1947,10 +1947,12 @@ where
 ///
 /// The authenticated runner download is the only place the reserved transcript re-enters an
 /// output archive: storage, the controller's `out/`-only validation, and the browser output
-/// views keep seeing the stored archive. A `steward.task-output/v1` archive gains the successful
-/// attempt's transcript; a historical archive without that marker already embeds its transcript
-/// and is delivered unchanged. A missing, oversized, or contract-violating transcript fails
-/// closed instead of serving an archive that the runner would reject after a successful Task.
+/// views keep seeing the stored archive. A `steward.task-output/v1` archive is rebuilt from its
+/// validated entries with Steward-written headers and gains the successful attempt's
+/// transcript; a historical archive without that marker already embeds its transcript and is
+/// delivered unchanged. A missing or oversized transcript, or a stored archive that violates
+/// its contract, is a permanent condition: it fails with a bounded, non-retryable error rather
+/// than an archive the runner would reject after a successful Task.
 fn runner_output_archive_with_transcript(
     archive: Vec<u8>,
     transcript: TaskOutputTranscript,
@@ -1960,18 +1962,14 @@ fn runner_output_archive_with_transcript(
     }
     let (Some(stdout), Some(stderr)) = (transcript.execution_stdout, transcript.execution_stderr)
     else {
-        return Err(ApiError::TaskRuntimeContractUnavailable(
-            "the Task execution transcript is unavailable".to_owned(),
+        return Err(ApiError::TaskOutputDeliveryFailed(
+            "execution_transcript_unavailable",
         ));
     };
-    task_output_archive_with_execution_transcript(&archive, &stdout, &stderr).map_err(|error| {
-        ApiError::TaskRuntimeContractUnavailable(match error {
-            TaskOutputTranscriptError::TranscriptTooLarge => {
-                "the Task execution transcript exceeds its bounded contract".to_owned()
-            }
-            TaskOutputTranscriptError::Archive(_) => {
-                "the Task output archive violates the out/-only contract".to_owned()
-            }
+    task_output_archive_with_execution_transcript(archive, &stdout, &stderr).map_err(|error| {
+        ApiError::TaskOutputDeliveryFailed(match error {
+            TaskOutputTranscriptError::TranscriptTooLarge => "execution_transcript_too_large",
+            TaskOutputTranscriptError::Archive(_) => "output_archive_contract_violation",
         })
     })
 }

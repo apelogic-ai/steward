@@ -3487,7 +3487,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         Some(b"successful task stderr".as_slice())
     );
     let runner_archive = task_output_archive_with_execution_transcript(
-        &successful_archive.content,
+        successful_archive.content.clone(),
         b"successful task stdout",
         b"successful task stderr",
     )

@@ -713,12 +713,13 @@ pub async fn task_status_contract() {}
     params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
     security(("taskBearer" = [])),
     responses(
-        (status = 200, description = "Opaque workspace-relative output tar archive; maximum 64 MiB. When the Task's snapshotted diagnostics.executionLog is full, the archive also carries the reserved .steward/diagnostics/stdout.log and stderr.log transcript (at most 4 MiB each)", body = TaskArchive, content_type = "application/x-tar"),
+        (status = 200, description = "Opaque workspace-relative output tar archive. The stored archive is at most 64 MiB. When the Task's snapshotted diagnostics.executionLog is full, the archive is rebuilt with Steward-written headers and also carries the reserved .steward/diagnostics/stdout.log and stderr.log transcript (at most 4 MiB each), so the download is at most 64 MiB plus 8 MiB plus tar headers", body = TaskArchive, content_type = "application/x-tar"),
         (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
         (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
         (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
         (status = 409, description = "Task has not succeeded or output is not available", body = TaskErrorResponse, content_type = "application/json"),
-        (status = 503, description = "Identity or persistence dependency unavailable, or a requested execution transcript cannot be delivered within its bounded contract", body = TaskErrorResponse, content_type = "application/json")
+        (status = 500, description = "task_output_delivery_failed: the output cannot be delivered within its contract (failureReason execution_transcript_unavailable, execution_transcript_too_large, or output_archive_contract_violation); not retryable", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
     )
 )]
 #[doc(hidden)]
@@ -960,15 +961,23 @@ pub enum ApiError {
     PrincipalMismatch,
     MissingEnvelope,
     InvalidRequest(String),
-    InvalidBudgetIncrease { value: String },
+    InvalidBudgetIncrease {
+        value: String,
+    },
     Admission(String),
     DecisionChannel(String),
     Conflict(String),
     NoActiveGrants,
     TaskAuthentication,
     TaskIdentityUnknownUser,
-    TaskIdentityUnassociated { issuer: String, subject: String },
-    TaskIdentityDisabled { issuer: String, subject: String },
+    TaskIdentityUnassociated {
+        issuer: String,
+        subject: String,
+    },
+    TaskIdentityDisabled {
+        issuer: String,
+        subject: String,
+    },
     TaskAuthenticationUnavailable,
     TaskSourceUnauthorized(String),
     BrowserTaskSourceUnauthorized,
@@ -978,6 +987,9 @@ pub enum ApiError {
     TaskPersistenceFailed,
     DirectPackageSourceDisabled,
     TaskRuntimeContractUnavailable(String),
+    /// A succeeded Task's output cannot be delivered within its contract; the bounded reason
+    /// is permanent, so the status is deliberately not retryable.
+    TaskOutputDeliveryFailed(&'static str),
 }
 
 impl fmt::Display for ApiError {
@@ -2710,6 +2722,16 @@ impl IntoResponse for ApiError {
                 )
                     .into_response();
             }
+            Self::TaskOutputDeliveryFailed(reason) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(TaskErrorResponse {
+                        error: "task_output_delivery_failed".to_owned(),
+                        failure_reason: Some((*reason).to_owned()),
+                    }),
+                )
+                    .into_response();
+            }
             Self::TaskPersistenceFailed => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2765,6 +2787,7 @@ impl IntoResponse for ApiError {
             | Self::TaskPersistenceFailed
             | Self::TaskRuntimeContractUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::TaskOutputNotReady => StatusCode::CONFLICT,
+            Self::TaskOutputDeliveryFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Store(StoreError::BrowserTaskConcurrencyLimit) => StatusCode::TOO_MANY_REQUESTS,
             Self::MissingEnvelope | Self::MissingRuntimeUid => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
@@ -11828,30 +11851,19 @@ mod tests {
     }
 
     fn stored_output_archive(entries: &[(&str, &[u8], u8)]) -> Vec<u8> {
+        use steward_types::task_output_archive::{
+            TarEntryKind, append_tar_entry, finish_tar_archive,
+        };
         let mut archive = Vec::new();
         for (path, content, kind) in entries {
-            let header = archive.len();
-            archive.resize(header + 512, 0);
-            archive[header..header + path.len()].copy_from_slice(path.as_bytes());
-            archive[header + 100..header + 108].copy_from_slice(b"0000644\0");
-            archive[header + 108..header + 116].copy_from_slice(b"0000000\0");
-            archive[header + 116..header + 124].copy_from_slice(b"0000000\0");
-            archive[header + 124..header + 136]
-                .copy_from_slice(format!("{:011o}\0", content.len()).as_bytes());
-            archive[header + 136..header + 148].copy_from_slice(b"00000000000\0");
-            archive[header + 148..header + 156].fill(b' ');
-            archive[header + 156] = *kind;
-            archive[header + 257..header + 265].copy_from_slice(b"ustar  \0");
-            let checksum = archive[header..header + 512]
-                .iter()
-                .map(|byte| usize::from(*byte))
-                .sum::<usize>();
-            archive[header + 148..header + 156]
-                .copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
-            archive.extend_from_slice(content);
-            archive.resize(header + 512 + content.len().div_ceil(512) * 512, 0);
+            let kind = if *kind == b'5' {
+                TarEntryKind::Directory
+            } else {
+                TarEntryKind::File
+            };
+            append_tar_entry(&mut archive, path, kind, content);
         }
-        archive.resize(archive.len() + 1024, 0);
+        finish_tar_archive(&mut archive);
         archive
     }
 
@@ -11890,7 +11902,7 @@ mod tests {
         assert_eq!(content_type.as_deref(), Some("application/x-tar"));
         let expected =
             steward_types::task_output_archive::task_output_archive_with_execution_transcript(
-                &stored,
+                stored.clone(),
                 b"agent stdout\n",
                 b"agent stderr\n",
             )
@@ -11934,6 +11946,7 @@ mod tests {
         let cases = [
             (
                 "missing",
+                "execution_transcript_unavailable",
                 stored.clone(),
                 steward_store::TaskOutputTranscript {
                     execution_stdout: None,
@@ -11943,21 +11956,36 @@ mod tests {
             ),
             (
                 "oversized",
+                "execution_transcript_too_large",
                 stored.clone(),
                 strict_transcript(&oversized, b""),
             ),
-            ("forged", forged, strict_transcript(b"stdout", b"stderr")),
+            (
+                "forged",
+                "output_archive_contract_violation",
+                forged,
+                strict_transcript(b"stdout", b"stderr"),
+            ),
         ];
-        for (name, archive, transcript) in cases {
+        for (name, reason, archive, transcript) in cases {
             let task_uid =
                 submit_package_path_task(&app, &format!("runner-outputs-{name}"), full.clone())
                     .await?;
             complete_fake_task(&ledger, task_uid, &archive, Some(transcript))?;
-            let (status, _, _) = runner_outputs(&app, task_uid).await?;
+            let (status, _, body) = runner_outputs(&app, task_uid).await?;
             assert_eq!(
                 status,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{name} transcript must fail closed instead of serving a partial archive"
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{name} transcript must fail closed with a non-retryable status"
+            );
+            let body: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|error| format!("decode {name} delivery failure: {error}"))?;
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "error": "task_output_delivery_failed",
+                    "failureReason": reason,
+                })
             );
         }
 

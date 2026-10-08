@@ -123,20 +123,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   `stderr.log` in that archive, failed every `execution-log: full` run with
   `failure-category=input-output` after the Task had succeeded. The `package-path`
   workflows Steward generates set `execution-log: full`, so **Steward 0.3.11 and 0.3.12
-  break those callers; upgrade to 0.3.13.** For `full` Tasks the runner download now
-  appends both streams from the successful attempt's durable logs (at most 4 MiB each, 8
-  MiB combined) after the `out/` tree; every other Task still receives an `out/`-only
-  archive. The stored archive, the controller's `out/`-only validation, and the browser
-  output listings and downloads are unchanged, agent output still cannot create or
-  replace `.steward/diagnostics`, and a `full` Task whose transcript is missing or over
-  its bounds now returns `503` instead of an archive the runner would reject. The
-  execution-log endpoints are unchanged. No migration or caller change is required.
-- Made Task output-archive validation decode tar headers exactly as the runner's tar
-  parser does, so agent output cannot hide entries from Steward that the runner would
-  read, including a forged transcript. Archives using a PAX `size` record, a path prefix
-  under GNU magic, a header with neither ustar nor GNU magic, or a numeric field outside
-  `spaces, octal digits, NUL/space padding` are now rejected as violating the `out/`-only
-  contract. GNU and POSIX tar archives that the sandbox writes are unaffected.
+  break those callers; upgrade to 0.3.13.** For `full` Tasks the runner download is now
+  rebuilt from the validated `out/` entries with Steward-written tar headers, so no
+  agent-authored header reaches the runner, followed by both streams from the successful
+  attempt's durable logs (at most 4 MiB each). The download can therefore reach the 64
+  MiB stored maximum plus 8 MiB plus headers. Every other Task still receives its stored
+  `out/`-only archive unchanged. The stored archive and its validation rules, the
+  browser output listings and downloads, and the execution-log endpoints are unchanged,
+  and agent output still cannot create or replace `.steward/diagnostics`. A `full` Task
+  whose transcript is missing or over its bounds, or whose stored archive violates its
+  contract, now gets a non-retryable `500` with error `task_output_delivery_failed` and
+  a bounded `failureReason` instead of an archive the runner would reject. No migration
+  or caller change is required.
 
 ## [0.3.12] - 2026-10-07
 

@@ -193,11 +193,22 @@ Each original process stream is retained verbatim up to 4 MiB; the combined boun
 bounded `execution_transcript_too_large` failure category rather than truncating
 silently. The `.steward/diagnostics` namespace is reserved: agent output cannot create
 or replace these entries. Since Steward 0.3.11 the stored archive is validated as
-`out/`-only (`steward.task-output/v1`); Steward 0.3.13 appends the transcript from the
-successful attempt's durable logs only when serving the runner download, and fails that
-download closed if the transcript is missing or exceeds its bounds. Browser output
-listings and downloads never show the reserved entries. The runner replays them only
-after authentication, path and size validation, and a sensitive-output warning.
+`out/`-only (`steward.task-output/v1`). Since Steward 0.3.13 the runner download of a
+`full` Task is rebuilt from the validated `out/` directories and regular files with
+Steward-written ustar headers (a Steward-written PAX `path` record only for paths longer
+than 100 bytes), followed by the two transcript files from the successful attempt's
+durable logs and an end-of-archive marker. No agent-authored tar header reaches the
+runner, so no difference between tar parsers can expose an entry Steward did not
+validate. The stored archive is at most 64 MiB, so this download is at most 64 MiB plus
+the 8 MiB transcript plus Steward's tar headers.
+
+If the transcript is missing or out of bounds, or the stored archive violates its
+contract, the download fails with a non-retryable `500` and
+`{"error": "task_output_delivery_failed", "failureReason": ...}`, where the reason is
+`execution_transcript_unavailable`, `execution_transcript_too_large`, or
+`output_archive_contract_violation`. Browser output listings and downloads never show the
+reserved entries. The runner replays them only after authentication, path and size
+validation, and a sensitive-output warning.
 
 The streams may reproduce prompts, model output, repository data, and tool results.
 Injected credentials, bearer tokens, private keys, provider-control material, and
