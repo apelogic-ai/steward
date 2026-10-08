@@ -48,7 +48,6 @@ p256 = { version = "0.13.2", features = ["ecdsa", "pkcs8"] }
 # Jira's adapter needs one rustls-backed HTTPS/JSON client for outbound REST calls.
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
-ring = "0.17.14"
 schemars = "1.2.1"
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = "0.0.29"
@@ -65,7 +64,6 @@ tonic = "0.14.6"
 tower = { version = "0.5", features = ["util"] }
 utoipa = "5"
 uuid = { version = "1", features = ["serde", "v4"] }
-zeroize = "1.9.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

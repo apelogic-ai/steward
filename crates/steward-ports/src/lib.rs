@@ -302,22 +302,11 @@ pub trait SandboxTaskRuntime: Send + Sync + 'static {
     ) -> impl Future<Output = Result<SandboxTaskObservation, PortError>> + Send;
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct InferenceCapabilities {
     pub model_allowlist: bool,
     pub spend_enforcement: bool,
-    pub runtime_credential_provisioning: bool,
-}
-
-impl Default for InferenceCapabilities {
-    fn default() -> Self {
-        Self {
-            model_allowlist: false,
-            spend_enforcement: false,
-            runtime_credential_provisioning: true,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

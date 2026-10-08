@@ -4,8 +4,6 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
-use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
@@ -23,13 +21,8 @@ use steward_types::{
     OrganizationIdentity, OrganizationIdentityMigration, TaskExecutionBinding,
 };
 use uuid::Uuid;
-use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_ACTIVE_BROWSER_TASKS_PER_USER: i64 = 4;
-const MANAGED_INFERENCE_KEY_BYTES: usize = 32;
-const MANAGED_INFERENCE_NONCE_BYTES: usize = 12;
-const MANAGED_INFERENCE_KEY_VERSION: i32 = 1;
-const MAX_MANAGED_INFERENCE_CREDENTIAL_BYTES: usize = 8192;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskOrchestrationMode {
@@ -54,154 +47,6 @@ impl TaskOrchestrationMode {
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
-}
-
-/// Deployment-owned envelope-encryption key for managed inference credentials.
-///
-/// This type deliberately implements neither `Debug` nor `Display`.
-#[derive(Clone)]
-pub struct ManagedInferenceKeyCipher([u8; MANAGED_INFERENCE_KEY_BYTES]);
-
-impl ManagedInferenceKeyCipher {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
-        let key = <[u8; MANAGED_INFERENCE_KEY_BYTES]>::try_from(bytes)
-            .map_err(|_| StoreError::InvalidManagedInferenceEncryptionKey)?;
-        Ok(Self(key))
-    }
-}
-
-impl Drop for ManagedInferenceKeyCipher {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
-
-/// Decrypted credential returned only to the Mint resolver.
-///
-/// This type deliberately implements neither `Debug` nor `Display`.
-pub struct ManagedInferenceCredential(String);
-
-impl ManagedInferenceCredential {
-    pub fn expose_secret(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Drop for ManagedInferenceCredential {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManagedInferenceCredentialStatus {
-    pub last_four: String,
-    pub saved_at: String,
-}
-
-struct EncryptedManagedInferenceCredential {
-    ciphertext: Vec<u8>,
-    credential_nonce: [u8; MANAGED_INFERENCE_NONCE_BYTES],
-    wrapped_data_key: Vec<u8>,
-    wrapping_nonce: [u8; MANAGED_INFERENCE_NONCE_BYTES],
-}
-
-fn managed_inference_last_four(credential: &str) -> Result<String, StoreError> {
-    if credential.len() < 4
-        || credential.len() > MAX_MANAGED_INFERENCE_CREDENTIAL_BYTES
-        || credential.trim() != credential
-        || !credential.bytes().all(|byte| byte.is_ascii_graphic())
-    {
-        return Err(StoreError::InvalidManagedInferenceCredential);
-    }
-    Ok(credential[credential.len() - 4..].to_owned())
-}
-
-fn aead_key(material: &[u8]) -> Result<LessSafeKey, StoreError> {
-    UnboundKey::new(&AES_256_GCM, material)
-        .map(LessSafeKey::new)
-        .map_err(|_| StoreError::ManagedInferenceCredentialUnavailable)
-}
-
-fn random_nonce(random: &SystemRandom) -> Result<[u8; MANAGED_INFERENCE_NONCE_BYTES], StoreError> {
-    let mut nonce = [0_u8; MANAGED_INFERENCE_NONCE_BYTES];
-    random
-        .fill(&mut nonce)
-        .map_err(|_| StoreError::ManagedInferenceCredentialUnavailable)?;
-    Ok(nonce)
-}
-
-fn encrypt_managed_inference_credential(
-    cipher: &ManagedInferenceKeyCipher,
-    user_id: &CanonicalUserId,
-    credential: &str,
-) -> Result<EncryptedManagedInferenceCredential, StoreError> {
-    managed_inference_last_four(credential)?;
-    let random = SystemRandom::new();
-    let mut data_key = Zeroizing::new([0_u8; MANAGED_INFERENCE_KEY_BYTES]);
-    random
-        .fill(&mut data_key[..])
-        .map_err(|_| StoreError::ManagedInferenceCredentialUnavailable)?;
-    let credential_nonce = random_nonce(&random)?;
-    let wrapping_nonce = random_nonce(&random)?;
-    let aad = user_id.as_str().as_bytes();
-
-    let mut ciphertext = credential.as_bytes().to_vec();
-    aead_key(&data_key[..])?
-        .seal_in_place_append_tag(
-            Nonce::assume_unique_for_key(credential_nonce),
-            Aad::from(aad),
-            &mut ciphertext,
-        )
-        .map_err(|_| StoreError::ManagedInferenceCredentialUnavailable)?;
-
-    let mut wrapped_data_key = data_key.to_vec();
-    let wrapped = aead_key(&cipher.0)?.seal_in_place_append_tag(
-        Nonce::assume_unique_for_key(wrapping_nonce),
-        Aad::from(aad),
-        &mut wrapped_data_key,
-    );
-    wrapped.map_err(|_| StoreError::ManagedInferenceCredentialUnavailable)?;
-
-    Ok(EncryptedManagedInferenceCredential {
-        ciphertext,
-        credential_nonce,
-        wrapped_data_key,
-        wrapping_nonce,
-    })
-}
-
-fn decrypt_managed_inference_credential(
-    cipher: &ManagedInferenceKeyCipher,
-    user_id: &CanonicalUserId,
-    encrypted: EncryptedManagedInferenceCredential,
-) -> Result<ManagedInferenceCredential, StoreError> {
-    let aad = user_id.as_str().as_bytes();
-    let mut wrapped_data_key = Zeroizing::new(encrypted.wrapped_data_key);
-    let unwrapped = aead_key(&cipher.0)?
-        .open_in_place(
-            Nonce::assume_unique_for_key(encrypted.wrapping_nonce),
-            Aad::from(aad),
-            &mut wrapped_data_key,
-        )
-        .map_err(|_| StoreError::ManagedInferenceCredentialUnavailable)?;
-    let data_key = Zeroizing::new(
-        <[u8; MANAGED_INFERENCE_KEY_BYTES]>::try_from(unwrapped)
-            .map_err(|_| StoreError::ManagedInferenceCredentialUnavailable)?,
-    );
-    let mut ciphertext = Zeroizing::new(encrypted.ciphertext);
-    let plaintext = aead_key(&data_key[..])?
-        .open_in_place(
-            Nonce::assume_unique_for_key(encrypted.credential_nonce),
-            Aad::from(aad),
-            &mut ciphertext,
-        )
-        .map_err(|_| StoreError::ManagedInferenceCredentialUnavailable)?;
-    let credential = std::str::from_utf8(plaintext)
-        .map_err(|_| StoreError::ManagedInferenceCredentialUnavailable)?
-        .to_owned();
-    managed_inference_last_four(&credential)?;
-    Ok(ManagedInferenceCredential(credential))
 }
 
 /// Bounded setup facts from Tasks whose persisted source-authority evidence was ratified as
@@ -804,60 +649,6 @@ mod migration_tests {
             "migration 67 must add owner-scoped drafts and immutable Task versions without rewriting historical runs"
         );
     }
-
-    #[test]
-    fn managed_inference_credentials_migration_is_embedded_additively() {
-        let migrations = sqlx::migrate!("../../migrations");
-        assert!(
-            migrations.migrations.iter().any(|migration| {
-                migration.version == 68
-                    && migration
-                        .description
-                        .contains("managed inference credentials")
-            }),
-            "migration 68 must add encrypted per-user inference credentials and append-only audit without rewriting existing rows"
-        );
-    }
-}
-
-#[cfg(test)]
-mod managed_inference_credential_tests {
-    use super::{
-        ManagedInferenceKeyCipher, decrypt_managed_inference_credential,
-        encrypt_managed_inference_credential,
-    };
-    use steward_types::CanonicalUserId;
-
-    fn user_id() -> Result<CanonicalUserId, String> {
-        CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
-    }
-
-    #[test]
-    fn credential_round_trips_only_for_the_bound_user_and_deployment_key() -> Result<(), String> {
-        let user = user_id()?;
-        let cipher = ManagedInferenceKeyCipher::from_bytes(&[7_u8; 32])
-            .map_err(|error| error.to_string())?;
-        let encrypted =
-            encrypt_managed_inference_credential(&cipher, &user, "sk-obviously-fake-managed-key")
-                .map_err(|error| error.to_string())?;
-        let decrypted = decrypt_managed_inference_credential(&cipher, &user, encrypted)
-            .map_err(|error| error.to_string())?;
-        assert_eq!(decrypted.expose_secret(), "sk-obviously-fake-managed-key");
-        Ok(())
-    }
-
-    #[test]
-    fn credential_tampering_fails_closed_without_exposing_plaintext() -> Result<(), String> {
-        let user = user_id()?;
-        let cipher = ManagedInferenceKeyCipher::from_bytes(&[7_u8; 32])
-            .map_err(|error| error.to_string())?;
-        let mut encrypted =
-            encrypt_managed_inference_credential(&cipher, &user, "sk-obviously-fake-managed-key")
-                .map_err(|error| error.to_string())?;
-        encrypted.ciphertext[0] ^= 1;
-        assert!(decrypt_managed_inference_credential(&cipher, &user, encrypted).is_err());
-        Ok(())
-    }
 }
 
 impl PgStore {
@@ -881,201 +672,6 @@ impl PgStore {
             .run(&self.pool)
             .await
             .map_err(|error| StoreError::Database(error.to_string()))
-    }
-
-    pub async fn managed_inference_credential_status(
-        &self,
-        user_id: &CanonicalUserId,
-    ) -> Result<Option<ManagedInferenceCredentialStatus>, StoreError> {
-        let row = sqlx::query(
-            "SELECT credentials.last_four, \
-                    to_char(credentials.updated_at AT TIME ZONE 'UTC', \
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS saved_at \
-             FROM managed_inference_credentials credentials \
-             JOIN canonical_users users ON users.user_id = credentials.user_id \
-             WHERE credentials.user_id = $1 AND users.state = 'active'",
-        )
-        .bind(user_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(database_error)?;
-        row.map(|row| {
-            Ok(ManagedInferenceCredentialStatus {
-                last_four: row.try_get("last_four").map_err(database_error)?,
-                saved_at: row.try_get("saved_at").map_err(database_error)?,
-            })
-        })
-        .transpose()
-    }
-
-    pub async fn has_managed_inference_credential(
-        &self,
-        user_id: &CanonicalUserId,
-    ) -> Result<bool, StoreError> {
-        self.managed_inference_credential_status(user_id)
-            .await
-            .map(|status| status.is_some())
-    }
-
-    pub async fn put_managed_inference_credential(
-        &self,
-        user_id: &CanonicalUserId,
-        credential: &str,
-        actor: &str,
-        cipher: &ManagedInferenceKeyCipher,
-    ) -> Result<ManagedInferenceCredentialStatus, StoreError> {
-        if actor.trim().is_empty() {
-            return Err(StoreError::InvalidManagedInferenceCredential);
-        }
-        let last_four = managed_inference_last_four(credential)?;
-        let encrypted = encrypt_managed_inference_credential(cipher, user_id, credential)?;
-        let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        let state = sqlx::query_scalar::<_, String>(
-            "SELECT state FROM canonical_users WHERE user_id = $1 FOR UPDATE",
-        )
-        .bind(user_id.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(database_error)?
-        .ok_or(StoreError::CanonicalIdentityNotFound)?;
-        if state != "active" {
-            return Err(StoreError::CanonicalIdentityInactive);
-        }
-        let existed = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM managed_inference_credentials WHERE user_id = $1)",
-        )
-        .bind(user_id.as_str())
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        sqlx::query(
-            "INSERT INTO managed_inference_credentials \
-                (user_id, ciphertext, credential_nonce, wrapped_data_key, wrapping_nonce, \
-                 key_version, last_four) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (user_id) DO UPDATE SET \
-                ciphertext = EXCLUDED.ciphertext, \
-                credential_nonce = EXCLUDED.credential_nonce, \
-                wrapped_data_key = EXCLUDED.wrapped_data_key, \
-                wrapping_nonce = EXCLUDED.wrapping_nonce, \
-                key_version = EXCLUDED.key_version, \
-                last_four = EXCLUDED.last_four, updated_at = now()",
-        )
-        .bind(user_id.as_str())
-        .bind(encrypted.ciphertext)
-        .bind(encrypted.credential_nonce.as_slice())
-        .bind(encrypted.wrapped_data_key)
-        .bind(encrypted.wrapping_nonce.as_slice())
-        .bind(MANAGED_INFERENCE_KEY_VERSION)
-        .bind(&last_four)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        sqlx::query(
-            "INSERT INTO managed_inference_credential_audit (id, user_id, action, actor) \
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(user_id.as_str())
-        .bind(if existed { "replaced" } else { "added" })
-        .bind(actor)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        transaction.commit().await.map_err(database_error)?;
-        self.managed_inference_credential_status(user_id)
-            .await?
-            .ok_or(StoreError::ManagedInferenceCredentialUnavailable)
-    }
-
-    pub async fn remove_managed_inference_credential(
-        &self,
-        user_id: &CanonicalUserId,
-        actor: &str,
-    ) -> Result<bool, StoreError> {
-        if actor.trim().is_empty() {
-            return Err(StoreError::InvalidManagedInferenceCredential);
-        }
-        let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        let state = sqlx::query_scalar::<_, String>(
-            "SELECT state FROM canonical_users WHERE user_id = $1 FOR UPDATE",
-        )
-        .bind(user_id.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(database_error)?
-        .ok_or(StoreError::CanonicalIdentityNotFound)?;
-        if state != "active" {
-            return Err(StoreError::CanonicalIdentityInactive);
-        }
-        let removed = sqlx::query("DELETE FROM managed_inference_credentials WHERE user_id = $1")
-            .bind(user_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?
-            .rows_affected()
-            == 1;
-        if removed {
-            sqlx::query(
-                "INSERT INTO managed_inference_credential_audit (id, user_id, action, actor) \
-                 VALUES ($1, $2, 'removed', $3)",
-            )
-            .bind(Uuid::new_v4())
-            .bind(user_id.as_str())
-            .bind(actor)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-        }
-        transaction.commit().await.map_err(database_error)?;
-        Ok(removed)
-    }
-
-    pub async fn resolve_managed_inference_credential(
-        &self,
-        user_id: &CanonicalUserId,
-        cipher: &ManagedInferenceKeyCipher,
-    ) -> Result<Option<ManagedInferenceCredential>, StoreError> {
-        let row = sqlx::query(
-            "SELECT credentials.ciphertext, credentials.credential_nonce, \
-                    credentials.wrapped_data_key, credentials.wrapping_nonce, \
-                    credentials.key_version \
-             FROM managed_inference_credentials credentials \
-             JOIN canonical_users users ON users.user_id = credentials.user_id \
-             WHERE credentials.user_id = $1 AND users.state = 'active'",
-        )
-        .bind(user_id.as_str())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(database_error)?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let key_version: i32 = row.try_get("key_version").map_err(database_error)?;
-        if key_version != MANAGED_INFERENCE_KEY_VERSION {
-            return Err(StoreError::ManagedInferenceCredentialUnavailable);
-        }
-        let credential_nonce = <[u8; MANAGED_INFERENCE_NONCE_BYTES]>::try_from(
-            row.try_get::<Vec<u8>, _>("credential_nonce")
-                .map_err(database_error)?,
-        )
-        .map_err(|_| StoreError::ManagedInferenceCredentialUnavailable)?;
-        let wrapping_nonce = <[u8; MANAGED_INFERENCE_NONCE_BYTES]>::try_from(
-            row.try_get::<Vec<u8>, _>("wrapping_nonce")
-                .map_err(database_error)?,
-        )
-        .map_err(|_| StoreError::ManagedInferenceCredentialUnavailable)?;
-        decrypt_managed_inference_credential(
-            cipher,
-            user_id,
-            EncryptedManagedInferenceCredential {
-                ciphertext: row.try_get("ciphertext").map_err(database_error)?,
-                credential_nonce,
-                wrapped_data_key: row.try_get("wrapped_data_key").map_err(database_error)?,
-                wrapping_nonce,
-            },
-        )
-        .map(Some)
     }
 
     pub async fn list_latest_workflows(&self) -> Result<Vec<WorkflowRevisionRecord>, StoreError> {
@@ -1884,28 +1480,6 @@ impl PgStore {
                     return Err(StoreError::LastBrowserAdministrator);
                 }
             }
-        }
-        if matches!(
-            change.action,
-            BrowserMemberStateAction::Disable | BrowserMemberStateAction::RevokeInvitation
-        ) && sqlx::query("DELETE FROM managed_inference_credentials WHERE user_id = $1")
-            .bind(change.user_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?
-            .rows_affected()
-            == 1
-        {
-            sqlx::query(
-                "INSERT INTO managed_inference_credential_audit (id, user_id, action, actor) \
-                 VALUES ($1, $2, 'removed', $3)",
-            )
-            .bind(Uuid::new_v4())
-            .bind(change.user_id.as_str())
-            .bind(change.actor.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
         }
         sqlx::query("UPDATE canonical_users SET state = $2, updated_at = now() WHERE user_id = $1")
             .bind(change.user_id.as_str())
@@ -12592,9 +12166,6 @@ pub enum StoreError {
     LastBrowserAdministrator,
     SelfBrowserMemberMutation,
     InvalidBrowserPreferences,
-    InvalidManagedInferenceCredential,
-    InvalidManagedInferenceEncryptionKey,
-    ManagedInferenceCredentialUnavailable,
     ApprovalNotFound,
     ApprovalNotPending,
     MissingDecisionReference,
@@ -12708,15 +12279,6 @@ impl fmt::Display for StoreError {
             }
             Self::InvalidBrowserPreferences => {
                 write!(formatter, "browser preferences are invalid")
-            }
-            Self::InvalidManagedInferenceCredential => {
-                write!(formatter, "managed inference credential is invalid")
-            }
-            Self::InvalidManagedInferenceEncryptionKey => {
-                write!(formatter, "managed inference encryption key is invalid")
-            }
-            Self::ManagedInferenceCredentialUnavailable => {
-                write!(formatter, "managed inference credential is unavailable")
             }
             Self::WorkflowNotFound => write!(formatter, "Workflow revision does not exist"),
             Self::WorkflowAlreadyExists => write!(formatter, "Workflow already exists"),

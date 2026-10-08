@@ -260,9 +260,7 @@ BOM selects a steward-run release whose notes require a new vendored workflow.
 | `databaseTls.ca.name` in release namespace | Existing `ConfigMap` or `Secret`; configured `databaseTls.ca.key` | Database/PKI operator creates; API and controller mount read-only at `/run/database-tls/ca.crt`. | Required when `databaseTls.mode=verify-full`; rotate with CA overlap, restart both consumers, and reprove hostname verification. |
 | `tls.api.secretName` and `tls.webhook.secretName` in release namespace | `kubernetes.io/tls`; both `tls.crt`, `tls.key` | Customer PKI or cert-manager creates; API and controller mount separately. | Always. Renew before expiry, verify service DNS SANs, CA chain, and webhook `caBundle`; roll the affected Deployment. |
 | `secrets.jira.name` (`steward-jira`) in release namespace | `Opaque`; `secrets.jira.key` (`token`) | Jira operator creates; API and controller read only if `jira.enabled=true`. | Optional. Use a Jira Cloud API token with a dedicated account allowed to browse/search, create Task issues, and add comments in the configured project. Rotate the token, restart consumers, and prove a decision; absent when disabled. |
-| `secrets.litellm.name` (`steward-litellm`) in release namespace | `Opaque`; `secrets.litellm.key` (`master-key`) | LiteLLM operator creates; controller reads. | Governed execution with `inference.mode=stock` only. Coordinate credential overlap/restart with LiteLLM. |
-| `inference.managed.encryptionKeySecret.name` in release namespace | `Opaque`; configured `inference.managed.encryptionKeySecret.key` containing exactly 32 random bytes | Secret operator creates; API and Mint mount read-only. | Required only with `inference.mode=managed`. Back up with the database; do not rotate until a supported rewrap procedure exists. |
-| `inference.managed.databaseSecret.name` in release namespace | `Opaque`; configured `inference.managed.databaseSecret.key` containing a PostgreSQL URL | Database operator creates; Mint reads. | Required only with `inference.mode=managed`. Use a dedicated role limited to `CONNECT`, schema `USAGE`, and `SELECT` on `managed_inference_credentials`; never reuse `secrets.database`. |
+| `secrets.litellm.name` (`steward-litellm`) in release namespace | `Opaque`; `secrets.litellm.key` (`master-key`) | LiteLLM operator creates; controller reads. | Governed execution only. Coordinate credential overlap/restart with LiteLLM. |
 | `secrets.openshellClient.name` (`steward-openshell-client`) in release namespace | `Opaque`; configured CA, client certificate, and private-key keys (`ca.crt`, `tls.crt`, `tls.key`) | OpenShell/customer PKI creates; controller mounts. | Governed mode only. Rotate as an mTLS bundle and reprove server-name/CA validation. |
 | `secrets.mint.name` (`steward-mint`) in release namespace | `Opaque`; configured `signing-key`, `introspection-credential` | Customer key authority creates; Mint mounts. The signing key is exactly 32 raw bytes; newline-terminated or hex text is invalid. | Governed mode only. Coordinate JWKS/key rollover and introspection credential overlap with consumers. |
 | `workloadExchangeTrust.name` (`steward-workload-exchange-ca`) in release namespace | Public `ConfigMap` by default (or explicitly selected `Secret`); `workloadExchangeTrust.caCertificate` (`ca.crt`) | Workload-exchange PKI creates; controller mounts. | Governed mode only; rotate with exchange TLS and reprove trust. |
@@ -272,7 +270,7 @@ BOM selects a steward-run release whose notes require a new vendored workflow.
 | `web.ingress.tlsSecretName` in release namespace | `kubernetes.io/tls`; `tls.crt`, `tls.key` | Customer edge PKI creates; Ingress controller reads. | Only legacy `web.ingress.enabled=true`; gateway-owned TLS stays outside this chart. |
 | `web.httpRoute.backendTls.caConfigMap.name` in release namespace | Public `ConfigMap`; exactly `ca.crt` | Trust-distribution controller creates; Gateway reads as the apiserver trust anchor. | Required for `web.httpRoute.enabled=true`; overlap CA rotation in the ConfigMap and verify the BackendTLSPolicy before removing an old issuer. Never copy `tls.key` or the apiserver TLS Secret. |
 | Each `imagePullSecrets` reference in release namespace | Normally `kubernetes.io/dockerconfigjson`; `.dockerconfigjson` | Registry operator creates; kubelet reads. | Only private registries; rotate before expiry and verify pulls without printing the Secret. |
-| Runtime-UID-named Secret in each allowed runtime namespace | `Opaque`; `access-token` | Controller creates from a runtime-scoped LiteLLM credential; Mint resolves it for the inference egress proxy. | Governed runtime with `inference.mode=stock` only. It is UID-bound and owner-referenced; controller deletes it on suspend/termination. Do not pre-create, back up as a reusable credential, or share across runtimes. |
+| Runtime-UID-named Secret in each allowed runtime namespace | `Opaque`; `access-token` | Controller creates from a runtime-scoped LiteLLM credential; sandbox consumes. | Governed runtime only. It is UID-bound and owner-referenced; controller deletes it on suspend/termination. Do not pre-create, back up as a reusable credential, or share across runtimes. |
 
 The optional task identity JWKS is a **public ConfigMap**, not a Secret.
 Bridge attestation bundles and the customer webhook CA are public material.
@@ -523,7 +521,6 @@ preserve the same immutable coordinates and cross-component relationships.
 
    ```yaml
    execution: {enabled: true}
-   inference: {mode: stock}
    jira: {enabled: false}
    images:
      repository: registry.example.test/customer/steward
@@ -616,10 +613,7 @@ preserve the same immutable coordinates and cross-component relationships.
 
    `config.controller.litellmUrl` is the LiteLLM management API base URL. The
    controller appends `/key/delete`, `/key/list`, `/key/generate`, and
-   `/v1/model/info`; do not add an operation path to that value. This setting
-   and the LiteLLM master-key Secret apply only to `inference.mode=stock`.
-   For a deployment where users bring gateway keys, use the
-   [managed inference procedure](managed-inference.md) instead.
+   `/v1/model/info`; do not add an operation path to that value.
 
    Every model admitted by the capability catalog must have pricing configured
    in LiteLLM. LiteLLM `model_name` must equal the exact catalog model string,

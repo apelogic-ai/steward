@@ -137,43 +137,4 @@ helm_template "${governed_inputs[@]}" \
 grep -qF 'kind: ClusterSPIFFEID' "${rendered}"
 grep -qF 'name: steward-mint' "${rendered}"
 
-managed_inputs=(
-  "${governed_inputs[@]}"
-  --set-string config.mint.issuer=https://mint.example.test
-  --set-string config.mint.spiffeTrustDomain=example.test
-  --set-string config.mint.openshellNamespace=example-openshell
-  --set-string inference.mode=managed
-  --set-string inference.managed.databaseSecret.name=managed-inference-database
-  --set-string inference.managed.encryptionKeySecret.name=managed-inference-key
-  --set-string config.controller.litellmUrl=
-)
-helm_template "${managed_inputs[@]}" > "${rendered}"
-grep -qF 'name: STEWARD_INFERENCE_MODE, value: "managed"' "${rendered}"
-grep -qF 'name: STEWARD_MANAGED_INFERENCE_ENCRYPTION_KEY_FILE' "${rendered}"
-grep -qF 'secretName: managed-inference-key' "${rendered}"
-grep -qF 'name: managed-inference-database' "${rendered}"
-if grep -qF 'STEWARD_LITELLM_MASTER_KEY' "${rendered}"; then
-  echo 'managed inference mode must not project the LiteLLM master key' >&2
-  exit 1
-fi
-if helm_template \
-  "${governed_inputs[@]}" \
-  --set-string config.mint.issuer=https://mint.example.test \
-  --set-string config.mint.spiffeTrustDomain=example.test \
-  --set-string config.mint.openshellNamespace=example-openshell \
-  --set-string inference.mode=managed > /dev/null 2>&1; then
-  echo 'managed inference mode must require its encryption-key Secret name' >&2
-  exit 1
-fi
-if helm_template \
-  "${governed_inputs[@]}" \
-  --set-string config.mint.issuer=https://mint.example.test \
-  --set-string config.mint.spiffeTrustDomain=example.test \
-  --set-string config.mint.openshellNamespace=example-openshell \
-  --set-string inference.mode=managed \
-  --set-string inference.managed.encryptionKeySecret.name=managed-inference-key > /dev/null 2>&1; then
-  echo 'managed inference mode must require its dedicated database Secret name' >&2
-  exit 1
-fi
-
 echo 'core-only chart dependency boundary passed'

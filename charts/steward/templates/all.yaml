@@ -377,10 +377,6 @@ spec:
 {{ toYaml .Values.probes.apiserver.liveness | nindent 12 }}
           env:
             - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.database.name }}, key: {{ .Values.secrets.database.key }} } } }
-            - { name: STEWARD_INFERENCE_MODE, value: {{ .Values.inference.mode | quote }} }
-{{- if eq .Values.inference.mode "managed" }}
-            - { name: STEWARD_MANAGED_INFERENCE_ENCRYPTION_KEY_FILE, value: /run/managed-inference/encryption-key }
-{{- end }}
             - { name: STEWARD_TASK_ORCHESTRATION_MODE, value: {{ .Values.config.taskOrchestrationMode | quote }} }
 {{- if .Values.jira.enabled }}
             - { name: STEWARD_JIRA_TOKEN, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.jira.name }}, key: {{ .Values.secrets.jira.key }} } } }
@@ -458,9 +454,6 @@ spec:
             - { name: STEWARD_TLS_KEY_DER, value: /run/tls/tls.key }
           volumeMounts:
             - { name: tls, mountPath: /run/tls, readOnly: true }
-{{- if eq .Values.inference.mode "managed" }}
-            - { name: managed-inference, mountPath: /run/managed-inference, readOnly: true }
-{{- end }}
 {{- if eq .Values.databaseTls.mode "verify-full" }}
             - { name: database-tls-ca, mountPath: /run/database-tls, readOnly: true }
 {{- end }}
@@ -483,12 +476,6 @@ spec:
 {{ toYaml .Values.resources.apiserver | nindent 12 }}
       volumes:
         - { name: tls, secret: { secretName: {{ .Values.tls.api.secretName }} } }
-{{- if eq .Values.inference.mode "managed" }}
-        - name: managed-inference
-          secret:
-            secretName: {{ .Values.inference.managed.encryptionKeySecret.name }}
-            items: [{ key: {{ .Values.inference.managed.encryptionKeySecret.key }}, path: encryption-key }]
-{{- end }}
 {{- if eq .Values.databaseTls.mode "verify-full" }}
         - name: database-tls-ca
 {{- if eq .Values.databaseTls.ca.kind "Secret" }}
@@ -574,7 +561,6 @@ spec:
 {{ toYaml .Values.probes.controller.liveness | nindent 12 }}
           env:
             - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.database.name }}, key: {{ .Values.secrets.database.key }} } } }
-            - { name: STEWARD_INFERENCE_MODE, value: {{ .Values.inference.mode | quote }} }
             - { name: STEWARD_TASK_ORCHESTRATION_MODE, value: {{ .Values.config.taskOrchestrationMode | quote }} }
             - { name: STEWARD_EXECUTION_ENABLED, value: {{ .Values.execution.enabled | quote }} }
 {{- if .Values.jira.enabled }}
@@ -584,10 +570,8 @@ spec:
             - { name: STEWARD_JIRA_ACCOUNT_EMAIL, value: {{ .Values.config.apiserver.jiraAccountEmail | quote }} }
 {{- end }}
 {{- if .Values.execution.enabled }}
-{{- if eq .Values.inference.mode "stock" }}
             - { name: STEWARD_LITELLM_MASTER_KEY, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.litellm.name }}, key: {{ .Values.secrets.litellm.key }} } } }
             - { name: STEWARD_LITELLM_URL, value: {{ .Values.config.controller.litellmUrl | quote }} }
-{{- end }}
             - { name: STEWARD_OPENSHELL_ENDPOINT, value: {{ .Values.config.controller.openshellEndpoint | quote }} }
             - { name: STEWARD_OPENSHELL_SERVER_NAME, value: {{ .Values.config.controller.openshellServerName | quote }} }
 {{- if .Values.config.controller.openshellRuntimeClassName }}
@@ -715,11 +699,6 @@ spec:
 {{ toYaml .Values.probes.mint.liveness | nindent 12 }}
           env:
             - { name: SPIFFE_ENDPOINT_SOCKET, value: {{ printf "unix://%s/spire-agent.sock" .Values.spire.socketPath | quote }} }
-            - { name: STEWARD_INFERENCE_MODE, value: {{ .Values.inference.mode | quote }} }
-{{- if eq .Values.inference.mode "managed" }}
-            - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.inference.managed.databaseSecret.name }}, key: {{ .Values.inference.managed.databaseSecret.key }} } } }
-            - { name: STEWARD_MANAGED_INFERENCE_ENCRYPTION_KEY_FILE, value: /run/managed-inference/encryption-key }
-{{- end }}
             - { name: STEWARD_MINT_SIGNING_KEY_FILE, value: /run/mint/signing-key }
             - { name: STEWARD_MINT_INTROSPECTION_CLIENT_CREDENTIAL_FILE, value: /run/mint/introspection-credential }
             - { name: STEWARD_MINT_ISSUER, value: {{ .Values.config.mint.issuer | quote }} }
@@ -734,12 +713,6 @@ spec:
             - { name: STEWARD_OPENSHELL_NAMESPACE, value: {{ .Values.config.mint.openshellNamespace | quote }} }
           volumeMounts:
             - { name: mint-secret, mountPath: /run/mint, readOnly: true }
-{{- if eq .Values.inference.mode "managed" }}
-            - { name: managed-inference, mountPath: /run/managed-inference, readOnly: true }
-{{- end }}
-{{- if and (eq .Values.inference.mode "managed") (eq .Values.databaseTls.mode "verify-full") }}
-            - { name: database-tls-ca, mountPath: /run/database-tls, readOnly: true }
-{{- end }}
             - { name: spiffe-workload-api, mountPath: {{ .Values.spire.socketPath }}, readOnly: true }
           resources:
 {{ toYaml .Values.resources.mint | nindent 12 }}
@@ -750,23 +723,6 @@ spec:
             items:
               - { key: {{ .Values.secrets.mint.signingKey }}, path: signing-key }
               - { key: {{ .Values.secrets.mint.introspectionCredential }}, path: introspection-credential }
-{{- if eq .Values.inference.mode "managed" }}
-        - name: managed-inference
-          secret:
-            secretName: {{ .Values.inference.managed.encryptionKeySecret.name }}
-            items: [{ key: {{ .Values.inference.managed.encryptionKeySecret.key }}, path: encryption-key }]
-{{- end }}
-{{- if and (eq .Values.inference.mode "managed") (eq .Values.databaseTls.mode "verify-full") }}
-        - name: database-tls-ca
-{{- if eq .Values.databaseTls.ca.kind "Secret" }}
-          secret:
-            secretName: {{ .Values.databaseTls.ca.name }}
-{{- else }}
-          configMap:
-            name: {{ .Values.databaseTls.ca.name }}
-{{- end }}
-            items: [{ key: {{ .Values.databaseTls.ca.key }}, path: ca.crt }]
-{{- end }}
         - name: spiffe-workload-api
           csi: { driver: {{ .Values.spire.csiDriver }}, readOnly: true }
 {{- end }}
@@ -1016,11 +972,9 @@ spec:
   policyTypes: [Egress]
 {{- if or .Values.execution.enabled .Values.networkPolicy.postgresCidrs (and .Values.jira.enabled .Values.networkPolicy.jiraCidrs) .Values.networkPolicy.kubeApiCidrs }}
   egress:
-{{- if and .Values.execution.enabled (eq .Values.inference.mode "stock") }}
+{{- if .Values.execution.enabled }}
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.litellmNamespace }} } } }]
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.litellm }} }]
-{{- end }}
-{{- if .Values.execution.enabled }}
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.openshellNamespace }} } } }]
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.openshell }} }]
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.identityExchangeNamespace }} } } }]
@@ -1111,22 +1065,13 @@ metadata: { name: steward-mint-egress }
 spec:
   podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: mint } }
   policyTypes: [Egress]
-{{- if or .Values.networkPolicy.kubeApiCidrs (and (eq .Values.inference.mode "managed") .Values.networkPolicy.postgresCidrs) }}
-  egress:
-{{- if and (eq .Values.inference.mode "managed") .Values.networkPolicy.postgresCidrs }}
-    - to:
-{{- range .Values.networkPolicy.postgresCidrs }}
-        - ipBlock: { cidr: {{ . }} }
-{{- end }}
-      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.postgres }} }]
-{{- end }}
 {{- if .Values.networkPolicy.kubeApiCidrs }}
+  egress:
     - to:
 {{- range .Values.networkPolicy.kubeApiCidrs }}
         - ipBlock: { cidr: {{ . }} }
 {{- end }}
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.kubernetesApi }} }]
-{{- end }}
 {{- else }}
   egress: []
 {{- end }}

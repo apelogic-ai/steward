@@ -94,16 +94,6 @@ function isTerminalPhase(phase: string): boolean {
   return phase === "failed" || phase === "succeeded" || phase === "cancelled";
 }
 
-export function inferenceFailureGuidance(errorCategory: string | null | undefined): string | null {
-  if (errorCategory === "inference-key-rejected") {
-    return "The inference gateway rejected your saved API key. Replace it in Connections, then retry the run.";
-  }
-  if (errorCategory === "inference-budget-exhausted") {
-    return "The saved inference key has exhausted its upstream budget. Replace it in Connections or ask the gateway administrator to increase its budget.";
-  }
-  return null;
-}
-
 type RunEventSnapshot = {
   eventId: number;
   run: BrowserRunView;
@@ -543,7 +533,6 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
         const timelineEvents = liveTimeline?.events ?? (timelineState.status === "ready" ? timelineState.value.events : []);
         const admitted = timelineEvents.find((event) => event.kind === "admitted");
         const runtimeBound = timelineEvents.find((event) => event.kind === "runtimeBound");
-        const inferenceGuidance = run.phase === "failed" ? inferenceFailureGuidance(run.errorCategory) : null;
         return (
           <article className="space-y-6">
             <header className="flex flex-wrap items-start justify-between gap-5">
@@ -564,7 +553,6 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
             </header>
             {rerunState !== "idle" && rerunState !== "working" ? <p className="text-sm text-err" role="alert">{rerunFailureMessage(rerunState)}</p> : null}
             {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="text-sm text-err" role="alert">The run could not be cancelled ({cancelState}).</p> : null}
-            {inferenceGuidance ? <p className="rounded-control border border-err/30 bg-err-soft px-4 py-3 text-sm text-err" role="alert">{inferenceGuidance} <Link className="font-semibold underline" href="/connections">Open Connections</Link></p> : null}
             <ConfirmationDialog cancelLabel="Keep running" confirmLabel="Cancel run" description="The agent will stop and its runtime credentials will be revoked. This cannot be undone." onConfirm={() => void cancelRun()} onOpenChange={setCancelOpen} open={cancelOpen} pending={cancelState === "working"} title="Cancel this run?" />
             <div className="grid min-h-[540px] overflow-hidden rounded-panel border bg-panel lg:grid-cols-[260px_minmax(0,1fr)]">
               <nav aria-label="Run jobs" className="border-b border-line lg:border-b-0 lg:border-r">

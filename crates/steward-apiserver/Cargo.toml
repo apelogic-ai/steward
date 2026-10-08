@@ -29,7 +29,6 @@ steward-types = { path = "../steward-types", version = "=0.0.0" }
 tokio = { workspace = true, features = ["sync", "time"] }
 utoipa.workspace = true
 uuid.workspace = true
-zeroize.workspace = true
 
 [dev-dependencies]
 rand_core.workspace = true

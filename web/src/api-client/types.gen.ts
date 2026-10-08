@@ -1242,19 +1242,6 @@ export type GithubTaskBundleResponse = {
     workflowPath: string;
 };
 
-export type InferenceConnectionResponse = {
-    apiVersion: string;
-    credential?: null | InferenceCredentialView;
-    mode: InferenceMode;
-};
-
-export type InferenceCredentialView = {
-    lastFour: string;
-    savedAt: string;
-};
-
-export type InferenceMode = 'stock' | 'managed';
-
 export type InvocationKind = 'manifest' | 'implicit';
 
 /**
@@ -1565,13 +1552,6 @@ export type SaveBrowserTaskRequest = {
 export type SaveBrowserTaskResponse = {
     apiVersion: string;
     task: BrowserTaskListItem;
-};
-
-/**
- * Secret-bearing request. It deliberately implements neither `Debug` nor `Serialize`.
- */
-export type SaveInferenceCredentialRequest = {
-    apiKey: string;
 };
 
 export type SessionPrincipalResponse = {
@@ -3791,107 +3771,6 @@ export type ListProviderConnectionsResponses = {
 };
 
 export type ListProviderConnectionsResponse = ListProviderConnectionsResponses[keyof ListProviderConnectionsResponses];
-
-export type RemoveInferenceCredentialData = {
-    body?: never;
-    headers: {
-        'X-Steward-CSRF': string;
-    };
-    path?: never;
-    query?: never;
-    url: '/app/api/v1/connections/inference';
-};
-
-export type RemoveInferenceCredentialErrors = {
-    /**
-     * Browser session is absent or invalid
-     */
-    401: unknown;
-    /**
-     * Origin, fetch metadata, or CSRF proof is invalid
-     */
-    403: unknown;
-    /**
-     * Managed inference mode is not enabled
-     */
-    409: unknown;
-    /**
-     * Credential storage is unavailable
-     */
-    503: unknown;
-};
-
-export type RemoveInferenceCredentialResponses = {
-    /**
-     * Steward's credential copy was removed
-     */
-    204: void;
-};
-
-export type RemoveInferenceCredentialResponse = RemoveInferenceCredentialResponses[keyof RemoveInferenceCredentialResponses];
-
-export type GetInferenceConnectionData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/app/api/v1/connections/inference';
-};
-
-export type GetInferenceConnectionErrors = {
-    /**
-     * Browser session is absent or invalid
-     */
-    401: unknown;
-    /**
-     * Credential metadata is unavailable
-     */
-    503: unknown;
-};
-
-export type GetInferenceConnectionResponses = {
-    200: InferenceConnectionResponse;
-};
-
-export type GetInferenceConnectionResponse = GetInferenceConnectionResponses[keyof GetInferenceConnectionResponses];
-
-export type SaveInferenceCredentialData = {
-    body: SaveInferenceCredentialRequest;
-    headers: {
-        'X-Steward-CSRF': string;
-    };
-    path?: never;
-    query?: never;
-    url: '/app/api/v1/connections/inference';
-};
-
-export type SaveInferenceCredentialErrors = {
-    /**
-     * Browser session is absent or invalid
-     */
-    401: unknown;
-    /**
-     * Origin, fetch metadata, or CSRF proof is invalid
-     */
-    403: unknown;
-    /**
-     * Managed inference mode is not enabled
-     */
-    409: unknown;
-    /**
-     * Credential is invalid
-     */
-    422: unknown;
-    /**
-     * Credential storage is unavailable
-     */
-    503: unknown;
-};
-
-export type SaveInferenceCredentialResponses = {
-    200: InferenceConnectionResponse;
-};
-
-export type SaveInferenceCredentialResponse = SaveInferenceCredentialResponses[keyof SaveInferenceCredentialResponses];
 
 export type DisconnectProviderConnectionData = {
     body: DisconnectConnectionRequest;

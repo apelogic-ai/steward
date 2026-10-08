@@ -4,15 +4,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   disconnectProviderConnection,
-  getInferenceConnection,
   getProviderConnectionStartOperation,
   listProviderConnections,
-  removeInferenceCredential,
-  saveInferenceCredential,
   startProviderConnection,
   type ConnectionOperationErrorResponse,
   type ConnectionsCollectionResponse,
-  type InferenceConnectionResponse,
   type ProviderConnectionView,
 } from "@/api-client";
 import { connectionHealth } from "@/components/connection-health";
@@ -21,7 +17,7 @@ import { boundedConnectionPollDeadline } from "@/components/connection-poll-dead
 import { ConfirmationDialog, SectionCard } from "@/components/hs";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { useInvalidateGithubRepositories } from "@/data/github-repositories";
-import { useApiResource, type ResourceState } from "@/data/use-api-resource";
+import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
 export function ConnectionsView() {
@@ -31,11 +27,6 @@ export function ConnectionsView() {
     return listProviderConnections({ cache: "no-store", credentials: "same-origin" });
   }, [generation]);
   const state = useApiResource<ConnectionsCollectionResponse>(load);
-  const loadInference = useCallback(() => {
-    void generation;
-    return getInferenceConnection({ cache: "no-store", credentials: "same-origin" });
-  }, [generation]);
-  const inferenceState = useApiResource<InferenceConnectionResponse>(loadInference);
   if (state.status === "forbidden" || state.status === "not-found") {
     return <section aria-labelledby="page-title" className="space-y-6"><PageHeader description="Accounts your agents act through. HyperShell holds the credentials; agents never see them." title="Connections" /><ResourceBoundary state={state}>{() => null}</ResourceBoundary></section>;
   }
@@ -43,90 +34,9 @@ export function ConnectionsView() {
     && !state.value.connections.some((connection) => connection.provider === candidate.provider));
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Accounts your agents act through. HyperShell holds the credentials; agents never see them." title="Connections" />
-      <div className="space-y-3">
-        <div className="flex items-center justify-between gap-4"><div><h2 className="text-lg font-semibold">Tools / MCP servers</h2><p className="text-sm text-muted-ink">Authorize tool providers used by governed agents.</p></div><button className="h-10 rounded-control bg-brand px-4 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-40" disabled={!canAdd} type="button">+ Add connection</button></div>
-        {state.status === "ready" ? state.value.connections.map((connection) => <ProviderConnection connection={connection} key={connection.provider} refresh={() => setGeneration((value) => value + 1)} />) : <ProviderConnection metadataState={state.status} refresh={() => setGeneration((value) => value + 1)} />}
-      </div>
-      <div className="space-y-3">
-        <div><h2 className="text-lg font-semibold">Inference / LLMs</h2><p className="text-sm text-muted-ink">Configure how governed agents authenticate to the inference gateway.</p></div>
-        <InferenceConnectionCard state={inferenceState} refresh={() => setGeneration((value) => value + 1)} />
-      </div>
+      <PageHeader actions={<button className="h-10 rounded-control bg-brand px-4 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-40" disabled={!canAdd} type="button">+ Add connection</button>} description="Accounts your agents act through. HyperShell holds the credentials; agents never see them." title="Connections" />
+      {state.status === "ready" ? state.value.connections.map((connection) => <ProviderConnection connection={connection} key={connection.provider} refresh={() => setGeneration((value) => value + 1)} />) : <ProviderConnection metadataState={state.status} refresh={() => setGeneration((value) => value + 1)} />}
     </section>
-  );
-}
-
-function InferenceConnectionCard({ state, refresh }: Readonly<{
-  state: ResourceState<InferenceConnectionResponse>;
-  refresh: () => void;
-}>) {
-  const session = useSession();
-  const [editing, setEditing] = useState(false);
-  const [removing, setRemoving] = useState(false);
-  const [key, setKey] = useState("");
-  const [action, setAction] = useState<"idle" | "working" | "error">("idle");
-  const value = state.status === "ready" ? state.value : undefined;
-
-  async function save() {
-    if (session.status !== "authenticated" || key.length < 4) return;
-    setAction("working");
-    try {
-      const result = await saveInferenceCredential({
-        body: { apiKey: key },
-        cache: "no-store",
-        credentials: "same-origin",
-        headers: { "X-Steward-CSRF": session.value.csrf },
-      });
-      if (result.response?.status !== 200) {
-        setAction("error");
-        return;
-      }
-      setKey("");
-      setEditing(false);
-      setAction("idle");
-      refresh();
-    } catch {
-      setAction("error");
-    }
-  }
-
-  async function remove() {
-    if (session.status !== "authenticated") return;
-    setAction("working");
-    try {
-      const result = await removeInferenceCredential({
-        cache: "no-store",
-        credentials: "same-origin",
-        headers: { "X-Steward-CSRF": session.value.csrf },
-      });
-      if (result.response?.status !== 204) {
-        setAction("error");
-        return;
-      }
-      setRemoving(false);
-      setAction("idle");
-      refresh();
-    } catch {
-      setAction("error");
-    }
-  }
-
-  if (state.status !== "ready") {
-    return <SectionCard actions={<StatusBadge value={state.status === "loading" ? "Checking" : "Unavailable"} />} title="Inference gateway"><p className="text-sm text-muted-ink">Inference connection metadata is not currently available.</p></SectionCard>;
-  }
-  if (value?.mode === "stock") {
-    return <SectionCard actions={<StatusBadge value="Administrator managed" />} title="Inference gateway"><p className="text-sm text-muted-ink">Inference credentials are managed by your Steward administrator. No personal API key is required.</p></SectionCard>;
-  }
-  const credential = value?.credential;
-  return (
-    <SectionCard actions={<StatusBadge value={credential ? "Configured" : "Key required"} />} title="Inference gateway">
-      <div className="space-y-4">
-        {credential ? <p className="text-sm">Saved {new Date(credential.savedAt).toLocaleString()} · key ending in <span className="font-mono">{credential.lastFour}</span></p> : <p className="text-sm text-muted-ink">Add your inference gateway API key before starting a task that uses a model.</p>}
-        {editing ? <div className="space-y-3"><label className="block text-sm font-semibold" htmlFor="inference-api-key">Inference API key</label><input autoComplete="off" className="h-10 w-full max-w-xl rounded-control border bg-panel px-3 font-mono text-sm" id="inference-api-key" onChange={(event) => setKey(event.target.value)} type="password" value={key} /><div className="flex gap-2"><button className="h-10 rounded-control bg-brand px-4 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working" || key.length < 4} onClick={() => void save()} type="button">Save key</button><button className="h-10 rounded-control border px-4 text-sm font-semibold" disabled={action === "working"} onClick={() => { setKey(""); setEditing(false); setAction("idle"); }} type="button">Cancel</button></div></div> : <div className="flex gap-2"><button className="h-10 rounded-control bg-brand px-4 text-sm font-semibold text-on-brand" onClick={() => setEditing(true)} type="button">{credential ? "Replace key" : "Add key"}</button>{credential ? <button className="h-10 rounded-control border border-err px-4 text-sm font-semibold text-err" onClick={() => setRemoving(true)} type="button">Remove key…</button> : null}</div>}
-        {action === "error" ? <p className="text-sm text-err" role="alert">The inference key could not be saved. Check the key and retry.</p> : null}
-        <ConfirmationDialog cancelLabel="Keep key" confirmLabel="Remove key" description="This removes Steward's encrypted copy and blocks new model tasks. It does not revoke or delete the key at the upstream inference service." onConfirm={() => void remove()} onOpenChange={setRemoving} open={removing} pending={action === "working"} title="Remove inference key?" />
-      </div>
-    </SectionCard>
   );
 }
 

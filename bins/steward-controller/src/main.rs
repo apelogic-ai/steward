@@ -15,12 +15,7 @@ use steward_adapter_openshell::{
     OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
     validate_connections_bridge_gateway_origin,
 };
-use steward_ports::{
-    InferenceCapabilities, InferenceObservation, InferencePlane, InferenceRequest, PortError,
-    ProvisionedInference,
-};
 use steward_store::{PgStore, TaskOrchestrationMode};
-use steward_types::InferenceMode;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{sleep, timeout};
@@ -43,63 +38,6 @@ struct VerifiedConnectionsBridgeArtifact {
     image_reference: String,
     trust_mode: String,
     digest: String,
-}
-
-#[derive(Clone)]
-enum DeploymentInferencePlane {
-    Stock(LiteLlmAdapter),
-    Managed(steward_controller::ManagedInferencePlane),
-}
-
-impl InferencePlane for DeploymentInferencePlane {
-    fn capabilities(&self) -> InferenceCapabilities {
-        match self {
-            Self::Stock(plane) => plane.capabilities(),
-            Self::Managed(plane) => plane.capabilities(),
-        }
-    }
-
-    async fn validate_configuration(
-        &self,
-        models: &[steward_types::ModelRef],
-        budget: &steward_types::Budget,
-    ) -> Result<(), PortError> {
-        match self {
-            Self::Stock(plane) => plane.validate_configuration(models, budget).await,
-            Self::Managed(plane) => plane.validate_configuration(models, budget).await,
-        }
-    }
-
-    async fn provision(
-        &self,
-        request: &InferenceRequest,
-    ) -> Result<ProvisionedInference, PortError> {
-        match self {
-            Self::Stock(plane) => plane.provision(request).await,
-            Self::Managed(plane) => plane.provision(request).await,
-        }
-    }
-
-    async fn reconcile_configuration(&self, request: &InferenceRequest) -> Result<(), PortError> {
-        match self {
-            Self::Stock(plane) => plane.reconcile_configuration(request).await,
-            Self::Managed(plane) => plane.reconcile_configuration(request).await,
-        }
-    }
-
-    async fn observe(&self, request: &InferenceRequest) -> Result<InferenceObservation, PortError> {
-        match self {
-            Self::Stock(plane) => plane.observe(request).await,
-            Self::Managed(plane) => plane.observe(request).await,
-        }
-    }
-
-    async fn revoke(&self, request: &InferenceRequest) -> Result<(), PortError> {
-        match self {
-            Self::Stock(plane) => plane.revoke(request).await,
-            Self::Managed(plane) => plane.revoke(request).await,
-        }
-    }
 }
 
 #[tokio::main]
@@ -130,20 +68,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let task_orchestration_mode = task_orchestration_mode()?;
     let store = PgStore::connect(&database_url).await?;
     store.migrate().await?;
-    let inference = match inference_mode()? {
-        InferenceMode::Stock => DeploymentInferencePlane::Stock(
-            LiteLlmAdapter::new(LiteLlmConfig {
-                base_url: required("STEWARD_LITELLM_URL")?,
-                master_key: required("STEWARD_LITELLM_MASTER_KEY")?,
-            })
-            .map_err(|error| {
-                io::Error::other(format!("inference plane configuration failed: {error:?}"))
-            })?,
-        ),
-        InferenceMode::Managed => {
-            DeploymentInferencePlane::Managed(steward_controller::ManagedInferencePlane)
-        }
-    };
+    let inference = LiteLlmAdapter::new(LiteLlmConfig {
+        base_url: required("STEWARD_LITELLM_URL")?,
+        master_key: required("STEWARD_LITELLM_MASTER_KEY")?,
+    })
+    .map_err(|error| {
+        io::Error::other(format!("inference plane configuration failed: {error:?}"))
+    })?;
     let listener = tls_listener(
         &env::var("STEWARD_WEBHOOK_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_owned()),
         &required("STEWARD_TLS_CERT_DER")?,
@@ -200,11 +131,6 @@ fn execution_enabled() -> Result<bool, io::Error> {
             "STEWARD_EXECUTION_ENABLED must be true or false",
         )),
     }
-}
-
-fn inference_mode() -> Result<InferenceMode, io::Error> {
-    let value = env::var("STEWARD_INFERENCE_MODE").unwrap_or_else(|_| "stock".to_owned());
-    InferenceMode::parse(&value).map_err(io::Error::other)
 }
 
 fn core_only_configuration() -> Result<(), io::Error> {

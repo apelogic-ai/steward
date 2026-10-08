@@ -200,10 +200,3 @@ retain a bounded compatibility path for historical archives that mixed the two
 reserved execution-log transcripts with `out/` files. No finalized Task or archive
 is rewritten; new transcripts remain in `task_execution_attempts` only. The archive
 validator resolves GNU and PAX long-path metadata but rejects symbolic and hard links.
-
-Migration 0068 adds one envelope-encrypted managed inference credential per
-canonical user and append-only add, replace, and remove audit history. Existing
-users and Tasks are not rewritten. Deprovisioning removes the credential while
-retaining its non-secret audit event. The deployment key remains outside the
-database; keep migration 0068 in place on rollback and restore that key with
-the database whenever managed credentials must remain usable.

@@ -7,20 +7,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-### Added
-
-- Added deployment-wide `stock` and `managed` inference credential modes.
-  Stock remains the default and retains per-runtime LiteLLM key provisioning.
-  Managed mode lets each user add, replace, or remove one encrypted inference
-  gateway key from the split Connections page; Mint resolves the key for the
-  runtime's verified owner without exposing it to the agent or returning it
-  through the API. Model Tasks without a managed key fail admission with
-  `inference_key_missing`, and rejected or exhausted keys have distinct bounded
-  run categories with a Connections recovery link.
-- Added additive migration 0068 for envelope-encrypted per-user inference
-  credentials and non-secret immutable audit history. The managed-mode guide
-  documents the deployment key, backup unit, upgrade, and rollback boundary.
-
 ## [0.3.13] - 2026-10-08
 
 This patch makes the browser's default repository picker use the deployment's

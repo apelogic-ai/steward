@@ -14,9 +14,7 @@ steward-adapter-github-artifact = { path = "../../adapters/github-artifact", ver
 steward-adapter-jira = { path = "../../adapters/jira", version = "=0.0.0" } # Delivers durable Task approval outbox rows through the decision-channel port.
 steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.0.0", features = ["runtime"] }
 steward-controller = { path = "../../crates/steward-controller", version = "=0.0.0" }
-steward-ports = { path = "../../crates/steward-ports", version = "=0.0.0" } # Selects the deployment inference plane without leaking adapter types into core.
 steward-store = { path = "../../crates/steward-store", version = "=0.0.0" } # Shares the migrated authority ledger with reconciliation and admission.
-steward-types = { path = "../../crates/steward-types", version = "=0.0.0" } # Parses the stock or managed deployment inference mode.
 tokio.workspace = true
 tokio-rustls.workspace = true # Terminates TLS required by Kubernetes admission webhooks.
 

@@ -19,8 +19,7 @@ use steward_mint::{
     OpaqueAccessToken, ValidatedWorkload, authority_from_runtime_refs, control_plane_router,
     router,
 };
-use steward_store::{ManagedInferenceKeyCipher, PgStore};
-use steward_types::{AgentRuntime, InferenceMode, RuntimeId};
+use steward_types::{AgentRuntime, RuntimeId};
 use tokio::net::TcpListener;
 
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
@@ -88,57 +87,6 @@ fn credential_from_secret(
 #[derive(Clone)]
 struct KubernetesCredentialGrantResolver {
     client: Client,
-}
-
-#[derive(Clone)]
-struct ManagedCredentialGrantResolver {
-    store: PgStore,
-    cipher: ManagedInferenceKeyCipher,
-}
-
-impl CredentialGrantResolver for ManagedCredentialGrantResolver {
-    async fn resolve(
-        &self,
-        scope: &[String],
-        authority: &AuthorityBinding,
-    ) -> Result<CredentialGrant, MintError> {
-        if scope != ["inference"] {
-            return Ok(CredentialGrant::NotHandled);
-        }
-        let owner = authority
-            .canonical_authority
-            .as_ref()
-            .map(|binding| &binding.owner_user_id)
-            .ok_or(MintError::CredentialUnavailable)?;
-        let credential = self
-            .store
-            .resolve_managed_inference_credential(owner, &self.cipher)
-            .await
-            .map_err(|_| MintError::AuthorityUnavailable)?
-            .ok_or(MintError::CredentialUnavailable)?;
-        OpaqueAccessToken::new(credential.expose_secret().to_owned())
-            .map(CredentialGrant::AccessToken)
-            .map_err(|_| MintError::CredentialUnavailable)
-    }
-}
-
-#[derive(Clone)]
-enum DeploymentCredentialGrantResolver {
-    Stock(KubernetesCredentialGrantResolver),
-    Managed(ManagedCredentialGrantResolver),
-}
-
-impl CredentialGrantResolver for DeploymentCredentialGrantResolver {
-    async fn resolve(
-        &self,
-        scope: &[String],
-        authority: &AuthorityBinding,
-    ) -> Result<CredentialGrant, MintError> {
-        match self {
-            Self::Stock(resolver) => resolver.resolve(scope, authority).await,
-            Self::Managed(resolver) => resolver.resolve(scope, authority).await,
-        }
-    }
 }
 
 impl CredentialGrantResolver for KubernetesCredentialGrantResolver {
@@ -249,18 +197,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         identity,
         runtimes: Api::all(client.clone()),
     };
-    let credential_resolver = match inference_mode()? {
-        InferenceMode::Stock => {
-            DeploymentCredentialGrantResolver::Stock(KubernetesCredentialGrantResolver {
-                client: client.clone(),
-            })
-        }
-        InferenceMode::Managed => {
-            DeploymentCredentialGrantResolver::Managed(ManagedCredentialGrantResolver {
-                store: PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?,
-                cipher: managed_inference_cipher()?,
-            })
-        }
+    let credential_resolver = KubernetesCredentialGrantResolver {
+        client: client.clone(),
     };
     let validator = SpireSvidValidator::connect_env()
         .await
@@ -369,23 +307,6 @@ fn install_rustls_crypto_provider() -> Result<(), io::Error> {
 
 fn required(name: &str) -> Result<String, io::Error> {
     env::var(name).map_err(|_| io::Error::other(format!("{name} is required")))
-}
-
-fn inference_mode() -> Result<InferenceMode, io::Error> {
-    let value = env::var("STEWARD_INFERENCE_MODE").unwrap_or_else(|_| "stock".to_owned());
-    InferenceMode::parse(&value).map_err(io::Error::other)
-}
-
-fn managed_inference_cipher() -> Result<ManagedInferenceKeyCipher, io::Error> {
-    let path = required("STEWARD_MANAGED_INFERENCE_ENCRYPTION_KEY_FILE")?;
-    let mut material = fs::read(path).map_err(|error| {
-        io::Error::other(format!(
-            "failed to read STEWARD_MANAGED_INFERENCE_ENCRYPTION_KEY_FILE: {error}"
-        ))
-    })?;
-    let cipher = ManagedInferenceKeyCipher::from_bytes(&material).map_err(io::Error::other);
-    material.fill(0);
-    cipher
 }
 
 fn load_signing_key(path: &str) -> Result<MintSigningKey, io::Error> {
