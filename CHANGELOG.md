@@ -7,6 +7,120 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.12] - 2026-10-07
+
+This patch fixes governed GitHub repository listing, run status, and workflow
+dispatch against the pinned GitHub MCP server (`github-mcp-server` v1.6.0). It
+adds no migrations and changes no Helm values.
+
+### Changed
+
+- A blank repository query now has a defined meaning. `GET
+  /app/api/v1/github/repositories` with an empty `query` (the browser default)
+  lists only repositories **owned by the authenticated GitHub user**; the bridge
+  searches `user:<login>` using the login from the governed connection's
+  profile. Repositories owned by an organization are not listed by default, even
+  when the user can access them. Pass an explicit search query (for example
+  `org:<organization>` or `repo:<owner>/<name>`) to the API to find them; the
+  browser has no query field in 0.3.12. The search follows GitHub repository
+  search semantics, which exclude forks by default. Earlier releases rejected the
+  blank query at the bridge, so the default listing failed.
+- Repository loading in Get started and on the Runs page is now independent of
+  the rest of the page. The checklist and the tested package preview render
+  while repositories are loading or after the listing fails. A failure shows its
+  error code and bounded reason with a **Retry repositories** action.
+  Publication and dispatch controls that need a repository are disabled in Get
+  started, and are not shown on the Runs page, until a listing succeeds.
+
+### Fixed
+
+- Repository listing matches the pinned server's replies. The default
+  (`user:<login>`) listing requests minimal output, whose items carry no owner
+  object, so the owner's stable numeric ID comes from the `get_me` profile `id`.
+  That profile ID is used only for an item with no owner object or owner ID whose
+  `full_name` names the authenticated user; any other item without an owner ID is
+  left out, and an item that is otherwise malformed fails the listing. Explicit
+  queries, including `repo:<owner>/<name>` resolution, request full output, so
+  organization-owned repositories keep their own owner ID.
+- An empty search reply (`{"total_count":0}` with no `items`) is an empty list.
+  Resolving a named repository that the search does not return answers HTTP 404
+  instead of a provider failure.
+- Run status accepts jobs nested as `{"jobs":{"total_count":N,"jobs":[...]}}` and
+  treats `{"jobs":{"total_count":0}}` as no jobs. The `requested`, `waiting`, and
+  `pending` run and job statuses report as `queued`. The bridge requests at most
+  30 jobs (previously 100) so a run status stays within its result bound; only
+  the first 30 jobs of a larger matrix run are shown.
+- Workflow dispatch and run lookup pass the workflow file name (`<file>.yml`)
+  rather than its full path, after checking that the workflow is directly under
+  `.github/workflows/`. The `run_workflow` result is now checked: a tool error
+  reporting the workflow or ref as not found (or as already existing) is a
+  definite rejection reported in the `bridge-response-contract` failure category.
+  It is no longer treated as a queued run, and it is not reported as an MCP-GW
+  outage to retry. Other tool errors remain reported as MCP-GW unavailable.
+- Bridge tests use reply envelopes captured from the pinned server for the read
+  tools it parses (`get_me`, minimal and full `search_repositories`,
+  `get_file_contents`, `actions_get`, `actions_list` for runs and jobs,
+  `get_commit`, and `list_pull_requests`); every identifier, SHA, timestamp,
+  title, body, and job name in those fixtures is synthetic.
+
+### Failure categories, reasons, and bounds
+
+- New connection-operation failure category `bridge-contract`: the bridge
+  rejected the request Steward sent it (the invocation, the operation allowlist,
+  or the `request.json` operation contract). It indicates an apiserver and bridge
+  mismatch or defect, not a provider failure. The Connections API reports it as
+  `bridge_contract_invalid`. An apiserver-to-bridge contract test now covers the
+  default repository request.
+- New connection-operation failure category `bridge_result_too_large`: the
+  bridge exited successfully but its result exceeded Steward's own bound for that
+  operation. It is no longer reported as `invalid_bridge_result` or as a provider
+  contract failure. The Connections API reports it as `bridge_result_too_large`,
+  and the Connections page explains it.
+- The GitHub automation error body (`GithubAutomationErrorResponse`) has a new
+  optional `reason` field. HTTP 503 `github_automation_unavailable` now carries
+  `reason: "bridge_contract"`, `"bridge_response_contract"` (the provider reply
+  did not satisfy the pinned contract, or the apiserver rejected the bridge
+  result as `invalid_bridge_result`, including a per-field limit below), or
+  `"bridge_result_too_large"`. Other 503 responses omit `reason`.
+- Bridge result bounds are per operation: 128 KiB for a repository listing and
+  for a run status, 32 KiB for every other operation (unchanged). These bounds
+  rely on per-field limits that both the bridge and the apiserver enforce, and a
+  result outside them is `invalid_bridge_result`: login and owner 39 bytes,
+  repository name 100, owner and repository IDs 20 digits, default branch 255,
+  URLs 255, at most 100 repositories per page; for a run status, at most 30 jobs,
+  job names 500 bytes, job URLs 255, and a failure log of at most 8 KiB.
+- GitHub MCP tool replies read by the bridge have their own 1 MiB bound,
+  verified for replies without `Content-Length`. MCP-GW lifecycle and status
+  replies, including the workflow re-run call, keep the 32 KiB bound.
+
+### Upgrade and rollback
+
+- No migrations since v0.3.11; the newest migration remains 0067. No Helm value,
+  schema default, or provider-profile change is required.
+- Deploy the v0.3.12 chart and all component images as one release unit. The
+  apiserver and the Connections bridge must match: an earlier bridge rejects the
+  blank repository query that the v0.3.12 apiserver and browser send. When
+  `connectionsBridge.enabled=true`, update `connectionsBridge.image`,
+  `connectionsBridge.sourceCommit`, `connectionsBridge.signerIdentity`, and
+  `connectionsBridge.attestationBundle` to the values under "Stable bridge
+  provenance inputs" in the v0.3.12 release notes.
+- Rollback to v0.3.11 needs no database restore because v0.3.12 adds no schema
+  or durable state; restore the v0.3.11 chart and its full component-image set,
+  including the bridge coordinates, together. Operations already recorded with
+  the new failure categories read as a generic unavailable failure on v0.3.11.
+
+### Known issue
+
+- With steward-run 0.8.1, a GitHub Actions caller that sets
+  `execution-log: full` reports `failure-category=input-output` after the
+  governed Task has succeeded. This includes the callers that Steward generates
+  from Get started, the Task page, and the Runs page. steward-run 0.8.1 expects
+  the reserved stdout and stderr transcript inside the output archive, and
+  Steward 0.3.11 and later no longer put it there. The fix is tracked in #317 and
+  planned for 0.3.13. Workaround: remove `execution-log: full` from the caller
+  workflow. Execution logs remain available in the Steward UI and its
+  owner-scoped execution-log endpoints.
+
 ## [0.3.11] - 2026-10-06
 
 ### Added
@@ -639,7 +753,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.11...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.12...HEAD
+[0.3.12]: https://github.com/apelogic-ai/steward/compare/v0.3.11...v0.3.12
 [0.3.11]: https://github.com/apelogic-ai/steward/compare/v0.3.10...v0.3.11
 [0.3.10]: https://github.com/apelogic-ai/steward/compare/v0.3.9...v0.3.10
 [0.3.9]: https://github.com/apelogic-ai/steward/compare/v0.3.8...v0.3.9

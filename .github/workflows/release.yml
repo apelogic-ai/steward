@@ -628,7 +628,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.11"
+          test "$version" = "0.3.12"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
@@ -753,15 +753,17 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.11 replaces the failed, unpublished v0.3.10 tag and incomplete v0.3.9 artifacts. It adds an owner-scoped Task library with immutable versions, exact digest links, role sharing, and one Tasks and Run now UI for authored, exact Git, and published Workflow sources.\n\n'
-            printf 'Same-repository automation can now publish the exact two-file Task package and pinned caller workflow through a governed pull request, observe its merge, dispatch it, and report the resulting GitHub run. The package-path caller requires steward-run 0.8.0 or later and the advertised steward_package_path_supported capability.\n\n'
-            printf 'Task output archives now contain only declared out/ files; stdout and stderr remain in the owner-scoped execution-log endpoints. Terminal event-stream history is bounded while Last-Event-ID reconnect remains available during its grace period.\n\n'
-            printf 'This release retains the browser Run now, member administration, onboarding, live Run detail, connection orchestration, and Next.js 16.3.6 security fixes completed in v0.3.8.\n\n'
+            printf 'Steward v0.3.12 fixes governed GitHub repository listing, run status, and workflow dispatch against the pinned GitHub MCP server v1.6.0. A blank repository query, the browser default, now lists only repositories owned by the authenticated GitHub user; organization-owned repositories are not listed by default and need an explicit API query such as org:ORGANIZATION or repo:OWNER/NAME.\n\n'
+            printf 'Get started and the Runs page load repositories independently: the checklist and tested package preview render without a repository, and a listing failure shows its error and reason with a Retry action.\n\n'
+            printf 'New connection-operation failure categories bridge-contract and bridge_result_too_large, and the GitHub automation 503 reasons bridge_contract, bridge_response_contract, and bridge_result_too_large, separate request-contract, provider-contract, and Steward size-bound failures. Bridge results are bounded at 128 KiB for repository listings and run status and 32 KiB otherwise; MCP tool replies are bounded at 1 MiB.\n\n'
+            printf 'This release retains everything shipped in v0.3.11, including the Task library, same-repository automation, the output-archive contract, and browser Run now.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
+            printf '## Known issue\n\n'
+            printf 'With steward-run 0.8.1, GitHub Actions callers that set execution-log: full, including the callers Steward generates, report failure-category=input-output after the governed Task has succeeded, because Steward 0.3.11 and later no longer place the reserved transcript in the output archive. The fix is tracked in issue 317 and planned for v0.3.13. Workaround: remove execution-log: full from the caller workflow; execution logs remain available in the Steward UI.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'This patch adds migrations 0064-0067. Installations upgrading from versions before v0.3.8 must also complete the earlier v0.3 prerequisites before rollout.\n\n'
-            printf 'Deploy the v0.3.11 chart and images as one release unit and allow the additive migrations to complete before serving traffic. Do not use the failed v0.3.10 tag or incomplete v0.3.9 artifacts. No provider-profile transition is required.\n\n'
-            printf 'Rollback from v0.3.11 requires restoring the matching pre-upgrade database together with the prior chart and component-image set because the release adds durable repository-operation, output-archive, and Task-library state.\n\n'
+            printf 'This patch adds no migrations; the newest migration remains 0067. No Helm value or provider-profile transition is required. Installations upgrading from versions before v0.3.11 must first follow the v0.3.11 upgrade notes.\n\n'
+            printf 'Deploy the v0.3.12 chart and images as one release unit. When connectionsBridge is enabled, update connectionsBridge.image, sourceCommit, signerIdentity, and attestationBundle to the values under Stable bridge provenance inputs below; an earlier bridge rejects the blank repository query that this apiserver sends.\n\n'
+            printf 'Rollback from v0.3.12 to v0.3.11 requires no database restore; restore the prior chart and the complete component-image set, including the bridge coordinates, together.\n\n'
             printf '## Required action\n\n'
             printf 'Before upgrading governed installations, set spire.className to the installed SPIRE controller class and choose exactly one owner for the OpenShell sandbox registration: keep the chart default, or disable spire.sandboxRegistration only when the platform retains the equivalent registration. Before enabling browser Run now, authorize each Git source through the operator-managed source-repository binding catalog and configure the intended Envelope templates.\n\n'
             printf '## Acceptance\n\n'
@@ -833,7 +835,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.11.json
+          subject-path: dist/steward-product-compatibility-0.3.12.json
 
       - name: Archive product compatibility verification material
         env:
@@ -843,7 +845,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.11.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.12.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 

@@ -103,11 +103,16 @@ It selects only a coding agent whose model family is allowed by the selected Env
 and records that exact model in the package requirements.
 
 After an inline run succeeds, its detail page offers **Publish this task to GitHub**.
-Steward lists repositories visible through the user's governed GitHub connection and
-marks each repository as ready or not ready. Readiness requires the repository's stable
-owner and repository IDs to be admitted as a source in `githubSource.bindings`; a
-mutable repository name is not authority. Organization policy may also have to allow
-the Steward OAuth App to access the repository before it becomes visible.
+Steward lists the repositories owned by the GitHub user of the governed connection and
+marks each repository as ready or not ready. In 0.3.12 the browser sends a blank
+repository query, which lists only that user's own repositories; repositories owned by
+an organization are not listed by default. A caller of
+`GET /app/api/v1/github/repositories` can pass an explicit search `query`, such as
+`org:<organization>` or `repo:<owner>/<name>`, to reach them. Readiness requires the
+repository's stable owner and repository IDs to be admitted as a source in
+`githubSource.bindings`; a mutable repository name is not authority. Organization
+policy may also have to allow the Steward OAuth App to access the repository before it
+becomes visible.
 
 Publication is a server-owned operation. Steward reconstructs the successful run's
 exact one-file inline package, renders the pinned `steward-run` v0.8.0-or-later caller,
@@ -144,7 +149,7 @@ separately from bridge execution.
 
 ## First-run prerequisite failures
 
-The 0.3.11 first-run path fails before creating a Task or runtime when a required
+The 0.3.12 first-run path fails before creating a Task or runtime when a required
 deployment or identity prerequisite is absent. Use the following exact signals; do
 not diagnose these cases as generic database, Kubernetes, or credential failures.
 
