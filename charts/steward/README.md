@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.11` and application `0.3.11`.
+Current release contract: chart `0.3.12` and application `0.3.12`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -406,7 +406,8 @@ bounded diagnostic.
 | `bridge-proxy-policy` | OpenShell denied the provider request before MCP-GW handled it. |
 | `bridge-runtime-authorization` | MCP-GW rejected the runtime's authority. |
 | `bridge-token-grant` | OpenShell could not exchange the placeholder for the runtime-bound GitHub credential. Retry once, then inspect MCP-GW token-grant health. |
-| `bridge-response-contract` | MCP-GW returned a response that did not satisfy Steward's pinned provider contract. |
+| `bridge-contract` | The bridge rejected the request Steward sent it: the invocation, the operation allowlist, or the operation's `request.json` contract. This indicates mismatched apiserver and bridge versions or a Steward defect, not a provider failure. Deploy the apiserver and Connections bridge from the same release. |
+| `bridge-response-contract` | MCP-GW returned a response that did not satisfy Steward's pinned provider contract. A dispatch tool error reporting the workflow or ref as not found (or already existing) is also reported here: it is a definite rejection, not a queued run or an outage to retry. |
 | `bridge-gateway-transport` | The governed runtime could not complete the transport request to MCP-GW. |
 | `bridge-gateway-status` | Historical category from older bridges for an unexpected successful disconnect response. New invalid response bodies use `bridge-response-contract`. |
 | `bridge-gateway-body` | The governed runtime could not read the bounded MCP-GW response body. |
