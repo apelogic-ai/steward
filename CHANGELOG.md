@@ -7,6 +7,43 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- The Connections bridge now speaks MCP Streamable HTTP sessions. Each bridge
+  operation sends `initialize` (protocol `2025-06-18`), then
+  `notifications/initialized`, sends every tool call of that operation with the
+  `Mcp-Session-Id` the server issued and the negotiated `MCP-Protocol-Version`,
+  and ends with a best-effort `DELETE` of the session. Previously the bridge
+  sent bare `tools/call` requests, so on a deployment whose
+  `connectionsBridge.mcpGatewayOrigin` is a session-enforcing gateway such as
+  the MCP-GW agentgateway, every governed GitHub MCP operation (repository
+  search with a query, workflow detection, publication, dispatch, run status
+  and rerun) failed with `bridge-gateway-http` and upstream status 400. A
+  direct GitHub wrapper origin, which issues no session, keeps working: the
+  bridge then sends no session header and no `DELETE`. An expired session (HTTP
+  404) is re-initialized once per operation and the refused call is resent.
+  Connect, status and disconnect still use MCP-GW's REST routes and are
+  unchanged.
+- A gateway's rejection of the MCP session (an HTTP 400 naming the session, or
+  a session that expires again after one re-initialization), an invalid
+  `initialize` result or protocol version, or an invalid issued session ID is
+  reported as the new `bridge-gateway-session` failure category
+  (`gateway_session_failed` at the Connections API), with a fixed bridge
+  diagnostic such as
+  `bridge MCP-GW session could not be established (session rejected)`.
+  Every other failure during the handshake, including an MCP-GW outage, keeps
+  its existing category: `bridge-gateway-http` with `failure_detail`, and the
+  credential, authority, token-grant, transport and response-size categories.
+  The bridge and the control plane must come from this release for the new
+  category to be recognized; an older control plane reports it as
+  `bridge_failed`.
+- Each MCP operation now makes two more requests (`initialize` and
+  `notifications/initialized`) and, against a session-issuing gateway, a final
+  `DELETE` bounded to two seconds. No migration or Helm value change is
+  required. The session `DELETE` needs an MCP-GW provider profile that permits
+  that method, as provider-profile bundle 1.2.2 does; where the proxy refuses
+  it, the close is skipped and the gateway expires the idle session.
+
 ## [0.3.13] - 2026-10-08
 
 This patch makes the browser's default repository picker use the deployment's

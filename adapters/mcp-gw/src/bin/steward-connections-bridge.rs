@@ -80,6 +80,11 @@ fn gateway_failure(error: &PortError) -> String {
         PortError::Failed { reason } if reason.starts_with("MCP-GW returned HTTP ") => {
             format!("bridge {reason}")
         }
+        PortError::Failed { reason }
+            if reason.starts_with("MCP-GW session could not be established") =>
+        {
+            format!("bridge {reason}")
+        }
         PortError::Rejected { .. } => {
             "bridge MCP-GW response violated its bounded contract".to_owned()
         }
@@ -480,6 +485,13 @@ mod tests {
             }),
             "bridge MCP-GW returned HTTP 400 (OAuth redirect target is not allowed)",
             "the bridge must retain the adapter's already-sanitized bounded gateway diagnostic"
+        );
+        assert_eq!(
+            gateway_failure(&PortError::Failed {
+                reason: "MCP-GW session could not be established (session expired)".to_owned(),
+            }),
+            "bridge MCP-GW session could not be established (session expired)",
+            "an MCP session failure keeps its own fixed category, not a generic outage"
         );
     }
 }
