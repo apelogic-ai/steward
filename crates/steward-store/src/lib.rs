@@ -9141,13 +9141,12 @@ impl PgStore {
                    AND operations.idempotency_identity = $3 \
                    AND (operations.operation_state IN ('queued', 'provisioning', 'running') \
                      OR (operations.operation_state = 'succeeded' \
-                        AND operations.result_expires_at > now() AND $4)) \
+                        AND operations.result_expires_at > now())) \
                  ORDER BY operations.created_at DESC LIMIT 1",
             )
             .bind(request.task.owner_user_id)
             .bind(request.operation_kind.as_str())
             .bind(request.idempotency_identity)
-            .bind(request.allow_result_cache)
             .fetch_optional(&mut *transaction)
             .await
             .map_err(database_error)?,
@@ -10745,7 +10744,6 @@ fn validate_connection_operation_request(
         }
         || (request.operation_kind != ConnectionOperationKind::Status
             && !request.allow_status_cache)
-        || (request.operation_kind.is_mutation() && !request.allow_result_cache)
         || request.input_archive.is_empty()
         || request.task.runtime_ownership != steward_types::RuntimeOwnership::Provisioned
         || request.task.runtime_spec.agent_type.name != "connections-bridge"
@@ -11773,9 +11771,6 @@ pub struct ConnectionOperationReservationRequest<'a> {
     /// Status-only cache control. False forces a new status operation while still joining an
     /// identical in-flight status. Mutating operations must always set this to true.
     pub allow_status_cache: bool,
-    /// Completed-result cache control. False forces a new read operation while still joining an
-    /// identical in-flight operation. Mutating operations must always set this to true.
-    pub allow_result_cache: bool,
     pub input_archive: &'a [u8],
     pub task: TaskReservationRequest<'a>,
 }

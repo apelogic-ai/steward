@@ -139,17 +139,17 @@ file content is logged. Migration 0064 adds those operation kinds and internal
 authority v4 while preserving the exact v1, v2, and v3 authority tuples for historical
 rows.
 
-Repository listings reuse a completed per-user, request-bound result for 60 seconds.
-**Refresh repositories** bypasses that completed value but still joins an identical
-request already in flight. Publication, dispatch, and other writes never use this read
-cache. Each completed operation emits one structured latency line with
-`operation_kind`, `queue_wait_ms`, `attempt_duration_ms`, and `total_latency_ms`.
-The issue #305 local-main sample measured uncached repository operations at
+When a governed operation has a recorded execution-attempt start and finish, its
+reconciler emits one structured latency line with `operation_kind`, `queue_wait_ms`,
+`attempt_duration_ms`, and `total_latency_ms`. Operations that fail before an attempt
+starts do not emit this line; a timing-query failure emits a bounded
+`connection operation latency unavailable` line and never stops reconciliation. The
+issue #305 local-main sample measured repository operations at
 22.945–24.066 seconds total: 13.437–15.497 seconds before bridge execution and
 5.274–7.314 seconds in the bridge attempt. Image pull accounted for only 353 ms in the
-sample that pulled an image. Deployments should use the same fields to verify cached
-repository responses below one second and to diagnose uncached runtime activation
-separately from bridge execution.
+sample that pulled an image. Deployments can use the same fields to diagnose runtime
+activation separately from bridge execution. Prometheus export remains deferred until
+Steward has a metrics mechanism.
 
 ## First-run prerequisite failures
 

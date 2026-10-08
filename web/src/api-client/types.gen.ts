@@ -4107,10 +4107,6 @@ export type ListRepositoriesData = {
         query?: string;
         page?: number;
         perPage?: number;
-        /**
-         * Bypass a completed cached listing while still joining an identical in-flight request.
-         */
-        refresh?: boolean;
     };
     url: '/app/api/v1/github/repositories';
 };

@@ -4,7 +4,6 @@ import type { GithubRepositoriesResponse } from "@/api-client";
 
 import {
   GITHUB_REPOSITORIES_KEY,
-  githubRepositoriesQuery,
   githubRepositoriesSwrOptions,
   RepositoryListingError,
   repositoryResourceState,
@@ -27,11 +26,6 @@ test("the shared repository cache uses one key and never revalidates on its own"
     revalidateOnReconnect: false,
     shouldRetryOnError: false,
   });
-});
-
-test("explicit refresh bypasses the server repository cache", () => {
-  expect(githubRepositoriesQuery()).toEqual({ query: "", page: 1, perPage: 100 });
-  expect(githubRepositoriesQuery(true)).toEqual({ query: "", page: 1, perPage: 100, refresh: true });
 });
 
 test("repository resource state keeps the loading, ready, and error shapes", () => {

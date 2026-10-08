@@ -37,19 +37,13 @@ export class RepositoryListingError extends Error {
   }
 }
 
-export function githubRepositoriesQuery(refresh = false) {
-  return { query: "", page: 1, perPage: 100, ...(refresh ? { refresh: true } : {}) };
-}
-
-export async function fetchGithubRepositories(
-  { refresh = false }: Readonly<{ refresh?: boolean }> = {},
-): Promise<GithubRepositoriesResponse> {
+export async function fetchGithubRepositories(): Promise<GithubRepositoriesResponse> {
   let result: Awaited<ReturnType<typeof listRepositories>>;
   try {
     result = await listRepositories({
       cache: "no-store",
       credentials: "same-origin",
-      query: githubRepositoriesQuery(refresh),
+      query: { query: "", page: 1, perPage: 100 },
     });
   } catch {
     throw new RepositoryListingError("repository_query_failed", null);
@@ -80,13 +74,11 @@ export function GithubRepositoriesProvider({ children }: Readonly<{ children: Re
 export function useGithubRepositories() {
   const { data, error, isValidating, mutate } = useSWR<GithubRepositoriesResponse, unknown>(
     GITHUB_REPOSITORIES_KEY,
-    () => fetchGithubRepositories(),
+    fetchGithubRepositories,
     githubRepositoriesSwrOptions,
   );
   const state = useMemo(() => repositoryResourceState({ data, error, isValidating }), [data, error, isValidating]);
-  const refresh = useCallback(() => {
-    void mutate(fetchGithubRepositories({ refresh: true }), { revalidate: false });
-  }, [mutate]);
+  const refresh = useCallback(() => { void mutate(); }, [mutate]);
   return { refresh, state };
 }
 

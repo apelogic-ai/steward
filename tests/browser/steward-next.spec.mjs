@@ -2904,7 +2904,7 @@ test("Get started exposes repository failures with retry without hiding the test
   }
 });
 
-test("Get started can explicitly refresh a cached repository listing", async ({ browser }) => {
+test("Get started can explicitly refresh the shared repository listing", async ({ browser }) => {
   const developer = await guardedPage(browser, { inlineRun: true });
   try {
     await developer.page.goto(`${origin}/get-started`);
@@ -2914,8 +2914,6 @@ test("Get started can explicitly refresh a cached repository listing", async ({ 
 
     await runStep.getByRole("button", { name: "Refresh repositories" }).click();
     await expect.poll(() => developer.governedGithubRequests.filter((url) => new URL(url).pathname === "/app/api/v1/github/repositories").length).toBe(2);
-    const repositoryRequests = developer.governedGithubRequests.filter((url) => new URL(url).pathname === "/app/api/v1/github/repositories");
-    expect(new URL(repositoryRequests[1]).searchParams.get("refresh")).toBe("true");
   } finally {
     await closeGuardedPage(developer);
   }
@@ -3133,7 +3131,6 @@ test("a successful inline run publishes and dispatches the exact governed GitHub
     await expect(developer.page.getByText("No matching generated workflow is present yet.")).toBeVisible();
 
     await developer.page.getByRole("button", { name: "Publish as pull request" }).click();
-    await expect.poll(() => developer.mutations.some((entry) => entry.path.endsWith("/github/publish"))).toBe(true);
     const publication = developer.mutations.find((entry) => entry.path.endsWith("/github/publish"));
     expectMutationProof(publication);
     expect(publication.body.owner).toBe("example-org");
@@ -3144,7 +3141,6 @@ test("a successful inline run publishes and dispatches the exact governed GitHub
 
     await expect(developer.page.getByText("The exact generated workflow is present on the default branch.")).toBeVisible({ timeout: 10_000 });
     await developer.page.getByRole("button", { name: "Run on GitHub" }).click();
-    await expect.poll(() => developer.mutations.some((entry) => entry.path.endsWith("/github/dispatch"))).toBe(true);
     const dispatch = developer.mutations.find((entry) => entry.path.endsWith("/github/dispatch"));
     expectMutationProof(dispatch);
     expect(dispatch.body).toMatchObject({ owner: "example-org", repository: "agentic-ops", inputs: {} });

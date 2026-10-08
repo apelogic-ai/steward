@@ -52,7 +52,6 @@ pub const CONNECTION_RESPONSE_DEADLINE_SECONDS: i64 =
     steward_connections_v1::RESPONSE_DEADLINE_SECONDS;
 pub const CONNECTION_STATUS_CACHE_SECONDS: i64 = 5;
 pub const CONNECTION_MUTATION_RESULT_SECONDS: i64 = 30;
-pub const GITHUB_REPOSITORY_CACHE_SECONDS: i64 = 60;
 pub const GITHUB_RERUN_RESULT_SECONDS: i64 = 600;
 pub const CONNECTION_CLEANUP_STALL_SECONDS: i64 = 150;
 pub const MCP_GW_OAUTH_STATE_LIFETIME_SECONDS: i64 =
@@ -75,14 +74,6 @@ const MAX_RUN_STATUS_BRIDGE_RESULT_BYTES: usize = 128 * 1024;
 const MAX_RUN_STATUS_JOBS: usize = 30;
 const MAX_RUN_STATUS_FAILURE_LOG_BYTES: usize = 8 * 1024;
 const TAR_BLOCK_BYTES: usize = 512;
-
-const fn connection_result_ttl_seconds(operation: StoredOperationKind) -> i64 {
-    match operation {
-        StoredOperationKind::Repositories => GITHUB_REPOSITORY_CACHE_SECONDS,
-        StoredOperationKind::Rerun => GITHUB_RERUN_RESULT_SECONDS,
-        _ => CONNECTION_MUTATION_RESULT_SECONDS,
-    }
-}
 const RECONCILE_INTERVAL: StdDuration = StdDuration::from_millis(100);
 const DIRECT_STATUS_DEADLINE: StdDuration = StdDuration::from_secs(1);
 const CONNECTION_ASSOCIATION_DEADLINE: StdDuration = StdDuration::from_secs(1);
@@ -621,21 +612,6 @@ struct ConnectionReservationIdentity<'a> {
     publication_branch: Option<&'a str>,
 }
 
-struct ConnectionReservation<'a> {
-    operation: ConnectionOperationKind,
-    allow_status_cache: bool,
-    allow_result_cache: bool,
-    request_body: Option<Value>,
-    identity: ConnectionReservationIdentity<'a>,
-}
-
-pub(crate) struct AutomationOperationIdentity<'a> {
-    pub(crate) idempotency_identity: &'a str,
-    pub(crate) idempotency_scope: Option<&'a str>,
-    pub(crate) publication_subject: Option<&'a str>,
-    pub(crate) allow_result_cache: bool,
-}
-
 const STAGED_CONNECTIONS_WARNING: &str = "connections bridge enabled but taskOrchestrationMode=staged; Connections operations are refused";
 
 fn connection_orchestration_error(mode: TaskOrchestrationMode) -> Option<ConnectionBrokerError> {
@@ -676,14 +652,16 @@ impl<B> GovernedConnectionsBroker<B> {
         &self,
         canonical_user_id: &CanonicalUserId,
         display_email: &str,
-        reservation: ConnectionReservation<'_>,
+        operation: ConnectionOperationKind,
+        allow_status_cache: bool,
+        request_body: Option<Value>,
+        identity: ConnectionReservationIdentity<'_>,
     ) -> Result<ConnectionOperationRecord, ConnectionBrokerError> {
         if let Some(error) = connection_orchestration_error(self.orchestration_mode) {
             return Err(error);
         }
         let email = Email::parse(display_email.to_owned())
             .map_err(|_| ConnectionBrokerError::Unavailable)?;
-        let operation = reservation.operation;
         let plan = plan_connection_operation(
             canonical_user_id,
             &email,
@@ -699,17 +677,16 @@ impl<B> GovernedConnectionsBroker<B> {
             | ConnectionOperationKind::Workflow
             | ConnectionOperationKind::RunStatus
             | ConnectionOperationKind::Dispatch
-            | ConnectionOperationKind::Publish => reservation
-                .request_body
-                .ok_or(ConnectionBrokerError::Unavailable)?,
+            | ConnectionOperationKind::Publish => {
+                request_body.ok_or(ConnectionBrokerError::Unavailable)?
+            }
         };
         let input = single_file_archive(
             "request.json",
             &serde_json::to_vec(&body).map_err(|_| ConnectionBrokerError::Unavailable)?,
         )?;
         let operation_id = Uuid::new_v4();
-        let operation_key = reservation
-            .identity
+        let operation_key = identity
             .operation
             .map(str::to_owned)
             .unwrap_or_else(|| operation_id.to_string());
@@ -789,11 +766,10 @@ impl<B> GovernedConnectionsBroker<B> {
                 authority_digest: &plan.authority_digest,
                 bindings: &bindings,
                 idempotency_identity: &operation_key,
-                idempotency_scope: reservation.identity.client_scope,
-                publication_branch: reservation.identity.publication_branch,
+                idempotency_scope: identity.client_scope,
+                publication_branch: identity.publication_branch,
                 response_deadline_seconds: CONNECTION_RESPONSE_DEADLINE_SECONDS,
-                allow_status_cache: reservation.allow_status_cache,
-                allow_result_cache: reservation.allow_result_cache,
+                allow_status_cache,
                 input_archive: &input,
                 task,
             })
@@ -846,7 +822,9 @@ impl<B> GovernedConnectionsBroker<B> {
         session: &ConnectionSession<B>,
         operation: ConnectionOperationKind,
         mut request_body: Value,
-        identity: AutomationOperationIdentity<'_>,
+        idempotency_identity: &str,
+        idempotency_scope: Option<&str>,
+        publication_subject: Option<&str>,
     ) -> Result<Value, ConnectionBrokerError> {
         if matches!(
             operation,
@@ -858,9 +836,7 @@ impl<B> GovernedConnectionsBroker<B> {
             return Err(ConnectionBrokerError::Unavailable);
         }
         if operation == ConnectionOperationKind::Publish {
-            let subject = identity
-                .publication_subject
-                .ok_or(ConnectionBrokerError::Unavailable)?;
+            let subject = publication_subject.ok_or(ConnectionBrokerError::Unavailable)?;
             let previous_branch = self
                 .store
                 .connection_publication_branch(&session.subject.canonical_user_id, subject)
@@ -885,16 +861,13 @@ impl<B> GovernedConnectionsBroker<B> {
                 .reserve(
                     &session.subject.canonical_user_id,
                     &session.subject.display_email,
-                    ConnectionReservation {
-                        operation,
-                        allow_status_cache: true,
-                        allow_result_cache: true,
-                        request_body: Some(request_body),
-                        identity: ConnectionReservationIdentity {
-                            operation: Some(identity.idempotency_identity),
-                            client_scope: identity.idempotency_scope,
-                            publication_branch: Some(&branch),
-                        },
+                    operation,
+                    true,
+                    Some(request_body),
+                    ConnectionReservationIdentity {
+                        operation: Some(idempotency_identity),
+                        client_scope: idempotency_scope,
+                        publication_branch: Some(&branch),
                     },
                 )
                 .await?;
@@ -910,16 +883,13 @@ impl<B> GovernedConnectionsBroker<B> {
             .reserve(
                 &session.subject.canonical_user_id,
                 &session.subject.display_email,
-                ConnectionReservation {
-                    operation,
-                    allow_status_cache: true,
-                    allow_result_cache: identity.allow_result_cache,
-                    request_body: Some(request_body),
-                    identity: ConnectionReservationIdentity {
-                        operation: Some(identity.idempotency_identity),
-                        client_scope: identity.idempotency_scope,
-                        publication_branch: None,
-                    },
+                operation,
+                true,
+                Some(request_body),
+                ConnectionReservationIdentity {
+                    operation: Some(idempotency_identity),
+                    client_scope: idempotency_scope,
+                    publication_branch: None,
                 },
             )
             .await?;
@@ -965,13 +935,10 @@ impl<B> GovernedConnectionsBroker<B> {
             .reserve(
                 &session.subject.canonical_user_id,
                 &session.subject.display_email,
-                ConnectionReservation {
-                    operation: ConnectionOperationKind::Status,
-                    allow_status_cache: allow_cache,
-                    allow_result_cache: true,
-                    request_body: None,
-                    identity: ConnectionReservationIdentity::default(),
-                },
+                ConnectionOperationKind::Status,
+                allow_cache,
+                None,
+                ConnectionReservationIdentity::default(),
             )
             .await?;
         let completed = if record.operation_state == ConnectionOperationState::Succeeded {
@@ -1048,13 +1015,10 @@ where
                 .reserve(
                     &session.subject.canonical_user_id,
                     &session.subject.display_email,
-                    ConnectionReservation {
-                        operation: ConnectionOperationKind::Start,
-                        allow_status_cache: true,
-                        allow_result_cache: true,
-                        request_body: None,
-                        identity: ConnectionReservationIdentity::default(),
-                    },
+                    ConnectionOperationKind::Start,
+                    true,
+                    None,
+                    ConnectionReservationIdentity::default(),
                 )
                 .await?;
             Ok(ReservedConnectionStart {
@@ -1165,13 +1129,10 @@ where
                 .reserve(
                     &session.subject.canonical_user_id,
                     &session.subject.display_email,
-                    ConnectionReservation {
-                        operation: ConnectionOperationKind::Disconnect,
-                        allow_status_cache: true,
-                        allow_result_cache: true,
-                        request_body: None,
-                        identity: ConnectionReservationIdentity::default(),
-                    },
+                    ConnectionOperationKind::Disconnect,
+                    true,
+                    None,
+                    ConnectionReservationIdentity::default(),
                 )
                 .await?;
             Ok(ReservedConnectionStart {
@@ -1209,16 +1170,13 @@ where
                 .reserve(
                     &session.subject.canonical_user_id,
                     &session.subject.display_email,
-                    ConnectionReservation {
-                        operation: ConnectionOperationKind::Rerun,
-                        allow_status_cache: true,
-                        allow_result_cache: true,
-                        request_body: Some(body),
-                        identity: ConnectionReservationIdentity {
-                            operation: Some(&idempotency_identity),
-                            client_scope: Some(&idempotency_scope),
-                            publication_branch: None,
-                        },
+                    ConnectionOperationKind::Rerun,
+                    true,
+                    Some(body),
+                    ConnectionReservationIdentity {
+                        operation: Some(&idempotency_identity),
+                        client_scope: Some(&idempotency_scope),
+                        publication_branch: None,
                     },
                 )
                 .await?;
@@ -1276,6 +1234,20 @@ impl ConnectionOperationReconciler {
         self
     }
 
+    async fn report_operation_timing(
+        &self,
+        operation_id: Uuid,
+        operation_kind: StoredOperationKind,
+    ) {
+        if let Some(line) = connection_operation_timing_report(
+            operation_id,
+            operation_kind,
+            self.store.connection_operation_timing(operation_id).await,
+        ) {
+            (self.latency_reporter)(line);
+        }
+    }
+
     pub async fn run(self) {
         loop {
             if let Err(error) = self.reconcile_once().await {
@@ -1299,12 +1271,8 @@ impl ConnectionOperationReconciler {
             .fail_connection_operation(operation_id, failure.category, detail.as_ref())
             .await?;
         (self.failure_reporter)(connection_operation_failure_log_line(operation_id, failure));
-        if let Some(timing) = self.store.connection_operation_timing(operation_id).await? {
-            (self.latency_reporter)(connection_operation_latency_log_line(
-                operation_kind,
-                timing,
-            ));
-        }
+        self.report_operation_timing(operation_id, operation_kind)
+            .await;
         Ok(())
     }
 
@@ -1431,24 +1399,23 @@ impl ConnectionOperationReconciler {
                                     digest.as_deref(),
                                     ConnectionOperationRetention {
                                         cache_ttl_seconds: CONNECTION_STATUS_CACHE_SECONDS,
-                                        result_ttl_seconds: connection_result_ttl_seconds(
-                                            operation.operation_kind,
-                                        ),
+                                        result_ttl_seconds: if operation.operation_kind
+                                            == StoredOperationKind::Rerun
+                                        {
+                                            GITHUB_RERUN_RESULT_SECONDS
+                                        } else {
+                                            CONNECTION_MUTATION_RESULT_SECONDS
+                                        },
                                         oauth_lifetime_seconds: MCP_GW_OAUTH_STATE_LIFETIME_SECONDS
                                             + MCP_GW_OAUTH_CLOCK_SKEW_SECONDS,
                                     },
                                 )
                                 .await?;
-                            if let Some(timing) = self
-                                .store
-                                .connection_operation_timing(operation.operation_id)
-                                .await?
-                            {
-                                (self.latency_reporter)(connection_operation_latency_log_line(
-                                    operation.operation_kind,
-                                    timing,
-                                ));
-                            }
+                            self.report_operation_timing(
+                                operation.operation_id,
+                                operation.operation_kind,
+                            )
+                            .await;
                         }
                         Err(error) => {
                             self.fail_operation(
@@ -1573,6 +1540,21 @@ fn connection_operation_latency_log_line(
         timing.attempt_duration_ms,
         timing.total_latency_ms,
     )
+}
+
+fn connection_operation_timing_report<E>(
+    operation_id: Uuid,
+    operation: StoredOperationKind,
+    timing: Result<Option<ConnectionOperationTiming>, E>,
+) -> Option<String> {
+    match timing {
+        Ok(Some(timing)) => Some(connection_operation_latency_log_line(operation, timing)),
+        Ok(None) => None,
+        Err(_) => Some(format!(
+            "connection operation latency unavailable: operation_id={operation_id} operation_kind={}",
+            operation.as_str()
+        )),
+    }
 }
 
 fn connection_broker_error(
@@ -2394,18 +2376,16 @@ mod tests {
     };
 
     use super::{
-        BridgeResultError, CONNECTION_MUTATION_RESULT_SECONDS,
-        CONNECTION_RESPONSE_DEADLINE_SECONDS, CONNECTIONS_AUTHORITY_DIGEST,
+        BridgeResultError, CONNECTION_RESPONSE_DEADLINE_SECONDS, CONNECTIONS_AUTHORITY_DIGEST,
         CONNECTIONS_AUTHORITY_DOCUMENT, CONNECTIONS_AUTHORITY_VERSION, CONNECTIONS_SERVICE,
         ConnectionExecutionBindings, ConnectionOperationKind, GITHUB_ATTESTATION_TRUST_MODE,
-        GITHUB_REPOSITORY_CACHE_SECONDS, GITHUB_RERUN_RESULT_SECONDS, GovernedConnectionPlanError,
-        MAX_BRIDGE_RESULT_BYTES, MAX_REPOSITORIES_BRIDGE_RESULT_BYTES,
+        GovernedConnectionPlanError, MAX_BRIDGE_RESULT_BYTES, MAX_REPOSITORIES_BRIDGE_RESULT_BYTES,
         MAX_RUN_STATUS_BRIDGE_RESULT_BYTES, MAX_RUN_STATUS_FAILURE_LOG_BYTES, MAX_RUN_STATUS_JOBS,
         MCP_GW_CONTRACT_VERSION, MCP_GW_OAUTH_CLOCK_SKEW_SECONDS,
         MCP_GW_OAUTH_STATE_LIFETIME_SECONDS, OPERATOR_PINNED_TRUST_MODE,
         ProviderConnectionStatusSource, SplitConnectionsBroker, bounded_single_file_archive,
-        bridge_result, connection_operation_latency_log_line, connection_orchestration_error,
-        connection_result_ttl_seconds, connections_startup_warning, plan_connection_operation,
+        bridge_result, connection_operation_latency_log_line, connection_operation_timing_report,
+        connection_orchestration_error, connections_startup_warning, plan_connection_operation,
         provider_status, single_file_archive, start_poll_deadline, valid_operator_pinned_image,
     };
     use steward_store::{ConnectionOAuthPhase, ConnectionOperationState};
@@ -2413,22 +2393,6 @@ mod tests {
     #[derive(Clone)]
     struct RejectingMutations {
         status_calls: Arc<AtomicUsize>,
-    }
-
-    #[test]
-    fn repository_reads_have_a_sixty_second_result_cache() {
-        assert_eq!(
-            connection_result_ttl_seconds(steward_store::ConnectionOperationKind::Repositories),
-            GITHUB_REPOSITORY_CACHE_SECONDS
-        );
-        assert_eq!(
-            connection_result_ttl_seconds(steward_store::ConnectionOperationKind::Rerun),
-            GITHUB_RERUN_RESULT_SECONDS
-        );
-        assert_eq!(
-            connection_result_ttl_seconds(steward_store::ConnectionOperationKind::Dispatch),
-            CONNECTION_MUTATION_RESULT_SECONDS
-        );
     }
 
     #[test]
@@ -2443,6 +2407,22 @@ mod tests {
                 },
             ),
             "connection operation latency: operation_kind=repositories queue_wait_ms=1700 attempt_duration_ms=7000 total_latency_ms=8900"
+        );
+    }
+
+    #[test]
+    fn timing_query_failure_is_reported_without_becoming_a_reconcile_error() {
+        let operation_id =
+            Uuid::parse_str("00000000-0000-4000-8000-000000000305").expect("fixed operation UUID");
+        assert_eq!(
+            connection_operation_timing_report::<()>(
+                operation_id,
+                steward_store::ConnectionOperationKind::Repositories,
+                Err(()),
+            ),
+            Some(format!(
+                "connection operation latency unavailable: operation_id={operation_id} operation_kind=repositories"
+            ))
         );
     }
 
