@@ -3725,6 +3725,7 @@ dependencies = [
  "tokio",
  "utoipa",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

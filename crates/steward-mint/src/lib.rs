@@ -23,7 +23,8 @@ pub use steward_ports::{
     SvidAssertion, SvidValidationError, ValidatedWorkload, WorkloadIdentity as SvidValidator,
 };
 use steward_types::{
-    AgentRuntime, CanonicalAuthorityBinding, Phase, Principal, RuntimeId, ToolGrant,
+    AgentRuntime, CanonicalAuthorityBinding, CanonicalUserId, Phase, Principal, RuntimeId,
+    ToolGrant,
 };
 use uuid::Uuid;
 
@@ -188,6 +189,53 @@ pub trait CredentialGrantResolver: Send + Sync + 'static {
         scope: &[String],
         authority: &AuthorityBinding,
     ) -> impl Future<Output = Result<CredentialGrant, MintError>> + Send;
+}
+
+/// Resolve one user-custodied inference credential after runtime authority is verified.
+///
+/// Implementations own the storage boundary. The resolver deliberately selects the stable
+/// canonical runtime owner rather than an email or caller-supplied identifier.
+pub trait ManagedInferenceCredentialSource: Send + Sync + 'static {
+    fn resolve(
+        &self,
+        owner_user_id: &CanonicalUserId,
+    ) -> impl Future<Output = Result<Option<OpaqueAccessToken>, MintError>> + Send;
+}
+
+#[derive(Clone)]
+pub struct ManagedCredentialGrantResolver<S> {
+    source: S,
+}
+
+impl<S> ManagedCredentialGrantResolver<S> {
+    pub fn new(source: S) -> Self {
+        Self { source }
+    }
+}
+
+impl<S> CredentialGrantResolver for ManagedCredentialGrantResolver<S>
+where
+    S: ManagedInferenceCredentialSource,
+{
+    async fn resolve(
+        &self,
+        scope: &[String],
+        authority: &AuthorityBinding,
+    ) -> Result<CredentialGrant, MintError> {
+        if scope != ["inference"] {
+            return Ok(CredentialGrant::NotHandled);
+        }
+        let owner_user_id = authority
+            .canonical_authority
+            .as_ref()
+            .map(|binding| &binding.owner_user_id)
+            .ok_or(MintError::CredentialUnavailable)?;
+        self.source
+            .resolve(owner_user_id)
+            .await?
+            .map(CredentialGrant::AccessToken)
+            .ok_or(MintError::CredentialUnavailable)
+    }
 }
 
 pub struct NoCredentialGrantResolver;
