@@ -1,6 +1,6 @@
 {
   "schemaVersion": "steward.product-compatibility/v1",
-  "stewardVersion": "0.3.12",
+  "stewardVersion": "0.3.13",
   "taskApiContract": "steward.task/v2",
   "clientCapabilities": {
     "envelopeDigestSelector": {

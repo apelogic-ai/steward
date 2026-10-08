@@ -7,6 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.13] - 2026-10-08
+
+This patch makes the browser's default repository picker use the deployment's
+admitted source catalog, shares that listing across the browser flow, restores
+the execution transcript required by `steward-run` 0.8.1, and adds structured
+latency reporting for governed connection operations. It adds no migrations and
+changes no Helm values or provider-profile contracts.
+
 ### Changed
 
 - With `githubSource` enabled and at least one source in `githubSource.bindings`,
@@ -81,6 +89,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   token requests only `metadata: read`. With NetworkPolicy enabled, the
   existing `networkPolicy.githubApiCidrs` egress already covers these calls.
   No migration or Helm value changes.
+- Governed connection-operation reconciliation now emits one structured latency
+  line when an execution attempt has both start and finish timestamps. The line
+  includes `operation_kind`, `queue_wait_ms`, `attempt_duration_ms`, and
+  `total_latency_ms`, separating controller/runtime activation from bridge
+  execution. An unavailable timing query emits a bounded diagnostic and never
+  stops reconciliation; operations that fail before an attempt starts emit no
+  latency line. No scan cadence, runtime lifecycle, or metrics surface changed.
 
 ### Fixed
 
@@ -135,6 +150,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   contract, now gets a non-retryable `500` with error `task_output_delivery_failed` and
   a bounded `failureReason` instead of an archive the runner would reject. No migration
   or caller change is required.
+
+### Upgrade and rollback
+
+- No migrations since v0.3.12; the newest migration remains 0067. No Helm value,
+  schema default, or provider-profile change is required.
+- Deploy the v0.3.13 chart and all component images as one release unit.
+- Rollback to v0.3.12 needs no database restore because v0.3.13 adds no schema
+  or durable-state contract; restore the v0.3.12 chart and its full
+  component-image set together.
 
 ## [0.3.12] - 2026-10-07
 
@@ -882,7 +906,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.12...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.13...HEAD
+[0.3.13]: https://github.com/apelogic-ai/steward/compare/v0.3.12...v0.3.13
 [0.3.12]: https://github.com/apelogic-ai/steward/compare/v0.3.11...v0.3.12
 [0.3.11]: https://github.com/apelogic-ai/steward/compare/v0.3.10...v0.3.11
 [0.3.10]: https://github.com/apelogic-ai/steward/compare/v0.3.9...v0.3.10
