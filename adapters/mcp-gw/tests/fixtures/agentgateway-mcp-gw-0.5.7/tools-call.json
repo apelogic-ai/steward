@@ -1,0 +1,9 @@
+{
+  "status": "200 OK",
+  "headers": [
+    "content-type: text/event-stream",
+    "cache-control: no-cache",
+    "transfer-encoding: chunked"
+  ],
+  "body": "data: {\"jsonrpc\":\"2.0\",\"id\":\"steward-github-me\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"login\\\": \\\"alice\\\", \\\"id\\\": 1000001}\"}],\"isError\":false}}\n\n"
+}

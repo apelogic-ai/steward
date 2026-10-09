@@ -340,6 +340,7 @@ function connectionFailureMessage(failure: ConnectionOperationErrorResponse): st
     gateway_status_invalid: "An older connection bridge reported an unexpected successful MCP-GW response. Ask an administrator to verify the deployed Steward and MCP-GW versions.",
     gateway_body_unavailable: "The governed runtime could not read MCP-GW's response body. Retry once; if it continues, ask an administrator to inspect gateway health.",
     gateway_unavailable: "MCP-GW is unavailable. Retry once; if it continues, ask an administrator to inspect the gateway service.",
+    gateway_session_failed: "The governed runtime could not establish an MCP session with MCP-GW. Retry once; if it continues, ask an administrator to verify the bridge's MCP-GW origin and the gateway's session support.",
     runtime_create_failed: "The governed connection runtime could not be created. Ask an administrator to inspect Steward runtime admission and controller events.",
     runtime_start_failed: "The governed connection runtime failed to start. Ask an administrator to inspect the AgentRuntime and OpenShell sandbox status.",
     connection_deadline_exceeded: "The governed connection did not become ready before its deadline. Retry once; if it continues, ask an administrator to inspect runtime health.",

@@ -1489,6 +1489,7 @@ fn connection_operation_failure(
         Some("bridge-gateway-body") => "bridge-gateway-body",
         Some("bridge-gateway-unavailable") => "bridge-gateway-unavailable",
         Some("bridge-gateway-http") => "bridge-gateway-http",
+        Some("bridge-gateway-session") => "bridge-gateway-session",
         Some("runtime_create_admission_rejected") => "runtime_create_admission_rejected",
         Some("runtime_start_failed") => "runtime_start_failed",
         Some("deadline_exceeded") => "deadline_exceeded",
@@ -1572,6 +1573,7 @@ fn connection_broker_error(
         Some("bridge-gateway-status") => ConnectionBrokerError::GatewayStatusInvalid,
         Some("bridge-gateway-body") => ConnectionBrokerError::GatewayBodyUnavailable,
         Some("bridge-gateway-unavailable") => ConnectionBrokerError::GatewayUnavailable,
+        Some("bridge-gateway-session") => ConnectionBrokerError::GatewaySessionFailed,
         Some("invalid_bridge_result") => ConnectionBrokerError::ProviderResponseInvalid,
         Some("bridge_result_too_large") => ConnectionBrokerError::BridgeResultTooLarge,
         Some("runtime_create_admission_rejected") => ConnectionBrokerError::RuntimeCreateFailed,
@@ -1734,6 +1736,10 @@ mod finalized_connection_operation_tests {
             (
                 "bridge-gateway-unavailable",
                 crate::connections::ConnectionBrokerError::GatewayUnavailable,
+            ),
+            (
+                "bridge-gateway-session",
+                crate::connections::ConnectionBrokerError::GatewaySessionFailed,
             ),
         ] {
             assert_eq!(

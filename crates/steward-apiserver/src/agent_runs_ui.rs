@@ -2286,6 +2286,7 @@ where
                 | ConnectionBrokerError::GatewayStatusInvalid
                 | ConnectionBrokerError::GatewayBodyUnavailable
                 | ConnectionBrokerError::GatewayUnavailable
+                | ConnectionBrokerError::GatewaySessionFailed
                 | ConnectionBrokerError::RuntimeCreateFailed
                 | ConnectionBrokerError::RuntimeStartFailed
                 | ConnectionBrokerError::DeadlineExceeded

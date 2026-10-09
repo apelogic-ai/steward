@@ -1,0 +1,8 @@
+{
+  "status": "400 Bad Request",
+  "headers": [
+    "content-type: text/plain",
+    "content-length: 30"
+  ],
+  "body": "mcp: invalid session ID header"
+}

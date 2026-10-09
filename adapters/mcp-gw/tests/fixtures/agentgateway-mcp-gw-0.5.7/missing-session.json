@@ -1,0 +1,8 @@
+{
+  "status": "400 Bad Request",
+  "headers": [
+    "content-type: text/plain",
+    "content-length: 59"
+  ],
+  "body": "mcp: session header is required for non-initialize requests"
+}

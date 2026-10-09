@@ -239,6 +239,7 @@ pub enum ConnectionBrokerError {
     GatewayStatusInvalid,
     GatewayBodyUnavailable,
     GatewayUnavailable,
+    GatewaySessionFailed,
     RuntimeCreateFailed,
     RuntimeStartFailed,
     DeadlineExceeded,
@@ -825,6 +826,7 @@ fn connection_broker_problem(error: ConnectionBrokerError) -> ConnectionOperatio
             ("gateway_body_unavailable", None, None, None)
         }
         ConnectionBrokerError::GatewayUnavailable => ("gateway_unavailable", None, None, None),
+        ConnectionBrokerError::GatewaySessionFailed => ("gateway_session_failed", None, None, None),
         ConnectionBrokerError::RuntimeCreateFailed => ("runtime_create_failed", None, None, None),
         ConnectionBrokerError::RuntimeStartFailed => ("runtime_start_failed", None, None, None),
         ConnectionBrokerError::DeadlineExceeded => {
@@ -1610,6 +1612,10 @@ mod tests {
             (
                 ConnectionBrokerError::GatewayUnavailable,
                 "gateway_unavailable",
+            ),
+            (
+                ConnectionBrokerError::GatewaySessionFailed,
+                "gateway_session_failed",
             ),
             (
                 ConnectionBrokerError::RuntimeCreateFailed,

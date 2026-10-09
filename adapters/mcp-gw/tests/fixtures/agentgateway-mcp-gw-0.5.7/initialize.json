@@ -1,0 +1,10 @@
+{
+  "status": "200 OK",
+  "headers": [
+    "content-type: text/event-stream",
+    "cache-control: no-cache",
+    "mcp-session-id: eyJ0IjoibWNwIiwicyI6W3sidCI6ImZpeHR1cmUifV0sInIiOiJiOWVmMjQ3My0xMjI3LTRkOTMtOWQ0Yi0wNjlhZDIxNWIxOGMifQ",
+    "transfer-encoding: chunked"
+  ],
+  "body": "data: {\"jsonrpc\":\"2.0\",\"id\":\"steward-mcp-initialize\",\"result\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fixture-upstream\",\"version\":\"1.0.0\"}}}\n\n"
+}
