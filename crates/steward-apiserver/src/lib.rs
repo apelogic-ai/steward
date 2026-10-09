@@ -13690,6 +13690,10 @@ mod tests {
             approved.spec.llms.push(additional_model);
             let mut authority = serde_json::to_value(&approved.spec)
                 .map_err(|error| format!("serialize approved authority: {error}"))?;
+            authority
+                .as_object_mut()
+                .ok_or_else(|| "approved authority fixture must be an object".to_owned())?
+                .remove("workspace");
             authority["llms"] = serde_json::json!([{
                 "provider": "openai",
                 "model": "gpt-5.4"
