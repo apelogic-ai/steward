@@ -300,6 +300,7 @@ pub enum ReconcileError {
     Authority(String),
     DeletionPending,
     InferenceRevocationTimedOut,
+    ManagedModeStockCredentialPresent,
 }
 
 impl fmt::Display for ReconcileError {
@@ -364,6 +365,49 @@ impl InferencePlane for NoInferencePlane {
     ) -> Result<ProvisionedInference, PortError> {
         Err(PortError::Unsupported {
             operation: "inference credential provisioning",
+        })
+    }
+
+    async fn reconcile_configuration(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn observe(
+        &self,
+        _request: &InferenceRequest,
+    ) -> Result<InferenceObservation, PortError> {
+        Ok(InferenceObservation::Absent)
+    }
+
+    async fn revoke(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ManagedInferencePlane;
+
+impl InferencePlane for ManagedInferencePlane {
+    fn capabilities(&self) -> InferenceCapabilities {
+        let mut capabilities = InferenceCapabilities::default();
+        capabilities.runtime_credential_provisioning = false;
+        capabilities
+    }
+
+    async fn validate_configuration(
+        &self,
+        _models: &[steward_types::ModelRef],
+        _budget: &steward_types::Budget,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn provision(
+        &self,
+        _request: &InferenceRequest,
+    ) -> Result<ProvisionedInference, PortError> {
+        Err(PortError::Unsupported {
+            operation: "managed inference credential provisioning",
         })
     }
 
@@ -3467,6 +3511,9 @@ async fn run_controller_inner<R: SandboxRuntime, I: InferencePlane>(
 
 enum InferenceReconcile {
     Inactive,
+    Managed {
+        reference: String,
+    },
     Active {
         reference: String,
         spend: steward_types::SpendSummary,
@@ -3474,6 +3521,22 @@ enum InferenceReconcile {
     Exhausted {
         spend: steward_types::SpendSummary,
     },
+}
+
+fn ensure_managed_mode_has_no_stock_credential(
+    runtime: &AgentRuntime,
+    stock_secret_present: bool,
+) -> Result<(), ReconcileError> {
+    let stock_reference_present = runtime
+        .status
+        .as_ref()
+        .and_then(|status| status.refs.litellm_key.as_deref())
+        .is_some_and(|reference| reference != steward_types::MANAGED_INFERENCE_REFERENCE);
+    if stock_secret_present || stock_reference_present {
+        Err(ReconcileError::ManagedModeStockCredentialPresent)
+    } else {
+        Ok(())
+    }
 }
 
 fn inference_request(runtime: &AgentRuntime) -> Result<InferenceRequest, ReconcileError> {
@@ -3641,6 +3704,18 @@ async fn reconcile_inference<I: InferencePlane>(
         .get_opt(&request.runtime.0)
         .await
         .map_err(ControllerError::Kubernetes)?;
+    if !inference.capabilities().runtime_credential_provisioning {
+        ensure_managed_mode_has_no_stock_credential(runtime, secret.is_some())
+            .map_err(ControllerError::Reconcile)?;
+        return if request.models.is_empty() {
+            Ok(InferenceReconcile::Inactive)
+        } else {
+            Ok(InferenceReconcile::Managed {
+                reference: steward_types::MANAGED_INFERENCE_REFERENCE.to_owned(),
+            })
+        };
+    }
+
     if request.models.is_empty() {
         if secret.is_some()
             || runtime
@@ -4267,7 +4342,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     match &inference {
                         InferenceReconcile::Active { spend, .. } => Some((spend, false)),
                         InferenceReconcile::Exhausted { spend } => Some((spend, true)),
-                        InferenceReconcile::Inactive => None,
+                        InferenceReconcile::Inactive | InferenceReconcile::Managed { .. } => None,
                     },
                 ) {
                     authority
@@ -4301,7 +4376,10 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         )
                         .await;
                     }
-                    InferenceReconcile::Active { reference, spend } => Some((reference, spend)),
+                    InferenceReconcile::Active { reference, spend } => {
+                        Some((reference, Some(spend)))
+                    }
+                    InferenceReconcile::Managed { reference } => Some((reference, None)),
                     InferenceReconcile::Inactive => None,
                 };
                 let decision = match reconcile_once(
@@ -4322,7 +4400,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                 };
                 if let Some((reference, spend)) = inference_status {
                     status.refs.litellm_key = Some(reference);
-                    status.spend = Some(spend);
+                    status.spend = spend;
                 }
                 let running = status.phase == Phase::Running;
                 if runtime.status.as_ref() != Some(&status) {
@@ -5372,13 +5450,14 @@ mod tests {
     use tower::service_fn;
 
     use super::{
-        Action, AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ReconcileDecision,
-        ReconcileIntent, RuntimeCreateErrorClass, SERVICE_PRINCIPAL_ANNOTATION, TaskRuntimeAction,
-        TaskRuntimeBinding, TaskRuntimeBindingStore, authority_action,
+        Action, AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ManagedInferencePlane,
+        ReconcileDecision, ReconcileIntent, RuntimeCreateErrorClass, SERVICE_PRINCIPAL_ANNOTATION,
+        TaskRuntimeAction, TaskRuntimeBinding, TaskRuntimeBindingStore, authority_action,
         authority_application_action, classify_runtime_create_status, cleanup_runtime,
         connection_operation_authority_action, connection_operation_failure_log_line,
-        create_task_runtime_inner, exhausted_spend_to_preserve, failed_runtime_status,
-        inference_action, provider_control_bindings_match, reconcile_once, replace_as_controller,
+        create_task_runtime_inner, ensure_managed_mode_has_no_stock_credential,
+        exhausted_spend_to_preserve, failed_runtime_status, inference_action,
+        provider_control_bindings_match, reconcile_once, replace_as_controller,
         runtime_authority_action, runtime_start_failed, runtime_ttl_action,
         runtime_with_spend_top_up, sandbox_execution_class, sandbox_task_diagnostics,
         server_task_runtime_manifest, status_merge_patch, suspend_runtime,
@@ -5412,6 +5491,86 @@ mod tests {
         assert_eq!(
             classify_runtime_create_status(None),
             RuntimeCreateErrorClass::Ambiguous
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_inference_plane_validates_runtime_policy_without_managing_gateway_keys()
+    -> Result<(), String> {
+        let runtime = fixture();
+        let request = InferenceRequest {
+            runtime: RuntimeId("managed-inference-runtime".to_owned()),
+            models: runtime.spec.llms.clone(),
+            budget: runtime.spec.budget.clone(),
+        };
+        let plane = ManagedInferencePlane;
+        assert!(!plane.capabilities().runtime_credential_provisioning);
+        plane
+            .validate_configuration(&request.models, &request.budget)
+            .await
+            .map_err(|error| format!("managed configuration must remain admissible: {error:?}"))?;
+        assert!(matches!(
+            plane.provision(&request).await,
+            Err(PortError::Unsupported { .. })
+        ));
+        assert_eq!(
+            plane
+                .observe(&request)
+                .await
+                .map_err(|error| format!("managed inference observation failed: {error:?}"))?,
+            InferenceObservation::Absent
+        );
+        plane
+            .revoke(&request)
+            .await
+            .map_err(|error| format!("managed inference cleanup failed: {error:?}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn managed_mode_rejects_a_leftover_stock_runtime_credential() {
+        let clean = fixture();
+        assert_eq!(
+            ensure_managed_mode_has_no_stock_credential(&clean, true),
+            Err(super::ReconcileError::ManagedModeStockCredentialPresent),
+            "managed mode must force operators back through stock-mode revocation instead of deleting the local evidence and orphaning an upstream key"
+        );
+        let mut stock_reference = fixture();
+        stock_reference.status = Some(steward_types::AgentRuntimeStatus {
+            phase: steward_types::Phase::Running,
+            observed_generation: 1,
+            spec_digest: "sha256:fixture".to_owned(),
+            refs: steward_types::RuntimeRefs {
+                litellm_key: Some("stock-runtime-key".to_owned()),
+                ..steward_types::RuntimeRefs::default()
+            },
+            conditions: Vec::new(),
+            spend: None,
+        });
+        assert_eq!(
+            ensure_managed_mode_has_no_stock_credential(&stock_reference, false),
+            Err(super::ReconcileError::ManagedModeStockCredentialPresent),
+            "a persisted stock key reference remains revocation evidence even when its Secret is already absent"
+        );
+        let mut managed_reference = fixture();
+        managed_reference.status = Some(steward_types::AgentRuntimeStatus {
+            phase: steward_types::Phase::Running,
+            observed_generation: 1,
+            spec_digest: "sha256:fixture".to_owned(),
+            refs: steward_types::RuntimeRefs {
+                litellm_key: Some(steward_types::MANAGED_INFERENCE_REFERENCE.to_owned()),
+                ..steward_types::RuntimeRefs::default()
+            },
+            conditions: Vec::new(),
+            spend: None,
+        });
+        assert_eq!(
+            ensure_managed_mode_has_no_stock_credential(&clean, false),
+            Ok(())
+        );
+        assert_eq!(
+            ensure_managed_mode_has_no_stock_credential(&managed_reference, false),
+            Ok(())
         );
     }
 

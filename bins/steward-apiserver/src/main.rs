@@ -30,14 +30,14 @@ use steward_apiserver::{
     KubernetesTokenReviewAudience, MAX_EXECUTION_BINDING_CATALOG_BYTES,
     MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, StewardRunWorkflowInstallationMode, TaskApiConfig,
     agent_runs_ui, browser_admin, browser_auth, browser_task_rerunner, browser_task_router,
-    connections, github_automation, google_oidc, governed_connections, operator_admin, router,
-    stable_runtime_bridge, task_router, user_envelopes, workflows,
+    connections, github_automation, google_oidc, governed_connections, inference_connections,
+    operator_admin, router, stable_runtime_bridge, task_router, user_envelopes, workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
-    EnvelopeTemplatePublication, PgStore, TaskOrchestrationMode,
+    EnvelopeTemplatePublication, ManagedInferenceKeyCipher, PgStore, TaskOrchestrationMode,
 };
-use steward_types::{CanonicalUserId, OrganizationId};
+use steward_types::{CanonicalUserId, InferenceMode, OrganizationId};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{sleep, timeout};
@@ -130,6 +130,8 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     }
     let client = kube::Client::try_default().await?;
     let task_orchestration_mode = task_orchestration_mode()?;
+    let inference_mode = inference_mode()?;
+    let managed_inference_cipher = managed_inference_cipher(inference_mode)?;
     let store = PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?;
     store.migrate().await?;
     ensure_default_llm_template(&store).await?;
@@ -208,7 +210,9 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         Some(adapter) => task_api_config.with_git_hosting_plane(adapter),
         None => task_api_config,
     };
-    let task_api_config = task_api_config.with_task_orchestration_mode(task_orchestration_mode);
+    let task_api_config = task_api_config
+        .with_task_orchestration_mode(task_orchestration_mode)
+        .with_inference_mode(inference_mode);
     let workflow_agents = task_api_config.execution_binding_advertisements();
     let runtimes = KubeRuntimeRepository::new(client);
     let browser = browser_application_router(
@@ -224,6 +228,8 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
             task_execution_bindings_active,
             github_source_enabled,
             github_actor_issuer: task_identity_issuer,
+            inference_mode,
+            managed_inference_cipher,
         },
     )
     .await?;
@@ -294,6 +300,42 @@ fn execution_enabled() -> Result<bool, io::Error> {
         _ => Err(io::Error::other(
             "STEWARD_EXECUTION_ENABLED must be true or false",
         )),
+    }
+}
+
+fn inference_mode() -> Result<InferenceMode, io::Error> {
+    let value = env::var("STEWARD_INFERENCE_MODE").unwrap_or_else(|_| "stock".to_owned());
+    InferenceMode::parse(&value).map_err(io::Error::other)
+}
+
+fn managed_inference_cipher(
+    mode: InferenceMode,
+) -> Result<Option<ManagedInferenceKeyCipher>, io::Error> {
+    let path = env::var("STEWARD_MANAGED_INFERENCE_ENCRYPTION_KEY_FILE").ok();
+    match (mode, path) {
+        (InferenceMode::Stock, None) => Ok(None),
+        (InferenceMode::Stock, Some(_)) => Err(io::Error::other(
+            "stock inference mode must not configure a managed credential encryption key",
+        )),
+        (InferenceMode::Managed, None) => Err(io::Error::other(
+            "managed inference mode requires STEWARD_MANAGED_INFERENCE_ENCRYPTION_KEY_FILE",
+        )),
+        (InferenceMode::Managed, Some(path)) => fs::read(path)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "failed to read managed inference encryption key: {error}"
+                ))
+            })
+            .and_then(|mut bytes| {
+                let cipher = ManagedInferenceKeyCipher::from_bytes(&bytes).map_err(|error| {
+                    io::Error::other(format!(
+                        "managed inference encryption key is invalid: {error}"
+                    ))
+                });
+                bytes.fill(0);
+                cipher
+            })
+            .map(Some),
     }
 }
 
@@ -708,6 +750,8 @@ struct BrowserApplicationConfig {
     task_execution_bindings_active: bool,
     github_source_enabled: bool,
     github_actor_issuer: Option<String>,
+    inference_mode: InferenceMode,
+    managed_inference_cipher: Option<ManagedInferenceKeyCipher>,
 }
 
 async fn browser_application_router(
@@ -810,6 +854,12 @@ async fn browser_application_router(
         application_config.task_orchestration_mode,
         application_config.connection_auto_association_issuer,
     )?;
+    let inference_connections = inference_connections::PgInferenceConnectionBroker::new(
+        store.clone(),
+        application_config.inference_mode,
+        application_config.managed_inference_cipher,
+    )
+    .map_err(io::Error::other)?;
     if workflows::ensure_sample_workflow(&store, &workflow_agents)
         .await
         .map_err(|error| io::Error::other(format!("sample Workflow bootstrap failed: {error}")))?
@@ -876,6 +926,10 @@ async fn browser_application_router(
         .merge(browser_task_router(
             store.clone(),
             task_api_config,
+            auth.clone(),
+        ))
+        .merge(inference_connections::protected_router(
+            inference_connections,
             auth.clone(),
         ));
     let app = match connections {

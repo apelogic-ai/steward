@@ -53,7 +53,7 @@ use steward_types::direct_package::{
     MAX_EXECUTION_STREAM_BYTES, MAX_EXECUTION_TRANSCRIPT_BYTES,
 };
 #[cfg(feature = "runtime")]
-use steward_types::{AgentType, RuntimeRefs};
+use steward_types::{AgentType, MANAGED_INFERENCE_REFERENCE, RuntimeRefs};
 #[cfg(feature = "runtime")]
 use tokio::sync::Mutex;
 #[cfg(feature = "runtime")]
@@ -595,9 +595,55 @@ fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
 }
 
 #[cfg(feature = "runtime")]
+fn managed_inference_failure_category(stderr: &[u8]) -> Option<&'static str> {
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if stderr.contains("invalid api key")
+        || stderr.contains("invalid_api_key")
+        || stderr.contains("incorrect api key")
+        || ((stderr.contains("inference")
+            || stderr.contains("litellm")
+            || stderr.contains("openai"))
+            && (stderr.contains("unauthorized")
+                || stderr.contains("forbidden")
+                || stderr.contains("status 401")
+                || stderr.contains("status 403")))
+    {
+        Some("inference_key_rejected")
+    } else if stderr.contains("insufficient_quota")
+        || ((stderr.contains("inference")
+            || stderr.contains("litellm")
+            || stderr.contains("openai"))
+            && (stderr.contains("budget exceeded")
+                || stderr.contains("budget_exceeded")
+                || stderr.contains("spend limit exceeded")
+                || stderr.contains("quota exceeded")))
+    {
+        Some("inference_budget_exhausted")
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn task_failure_category(stderr: &[u8], managed_inference: bool) -> &'static str {
+    if managed_inference {
+        managed_inference_failure_category(stderr)
+            .unwrap_or_else(|| task_agent_failure_category(stderr))
+    } else {
+        task_agent_failure_category(stderr)
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn request_uses_managed_inference(request: &SandboxTaskRequest) -> bool {
+    request.refs.litellm_key.as_deref() == Some(MANAGED_INFERENCE_REFERENCE)
+}
+
+#[cfg(feature = "runtime")]
 fn attach_task_agent_failure_category(
     observation: SandboxTaskObservation,
     stderr: &[u8],
+    managed_inference: bool,
 ) -> SandboxTaskObservation {
     match observation {
         SandboxTaskObservation::Failed {
@@ -605,7 +651,7 @@ fn attach_task_agent_failure_category(
             ..
         } => SandboxTaskObservation::Failed {
             adapter_observation_id,
-            reason: task_agent_failure_category(stderr).to_owned(),
+            reason: task_failure_category(stderr, managed_inference).to_owned(),
         },
         SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
@@ -613,7 +659,7 @@ fn attach_task_agent_failure_category(
             ..
         } => SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
-            reason: task_agent_failure_category(stderr).to_owned(),
+            reason: task_failure_category(stderr, managed_inference).to_owned(),
             transcript,
         },
         observation => observation,
@@ -2438,7 +2484,11 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                     .observe_task(attempt_id, request)
                     .await
                     .map(|observation| {
-                        attach_task_agent_failure_category(observation, &executed.stderr)
+                        attach_task_agent_failure_category(
+                            observation,
+                            &executed.stderr,
+                            request_uses_managed_inference(request),
+                        )
                     });
             }
             Err(execution_error) => execution_error,
@@ -2567,7 +2617,13 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             "failed" => {
                 let reason = transcript.as_ref().map_or_else(
                     || "task agent failed; inspect the bounded controller diagnostic".to_owned(),
-                    |transcript| task_agent_failure_category(&transcript.stderr).to_owned(),
+                    |transcript| {
+                        task_failure_category(
+                            &transcript.stderr,
+                            request_uses_managed_inference(request),
+                        )
+                        .to_owned()
+                    },
                 );
                 Ok(if let Some(transcript) = transcript {
                     SandboxTaskObservation::FailedWithTranscript {
@@ -2871,8 +2927,8 @@ mod tests {
         staging_archive_chunks, staging_extract_command, staging_prepare_command,
         task_agent_failure_category, task_attempt_directory, task_attempt_execution_command,
         task_attempt_observation_command, task_attempt_transcript_stream_command,
-        task_process_log_record, task_transcript_requested, validate_raw_sandbox_binding,
-        validate_workload_exchange_endpoint,
+        task_failure_category, task_process_log_record, task_transcript_requested,
+        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -4915,6 +4971,24 @@ mod tests {
             "authentication"
         );
         assert_eq!(task_agent_failure_category(b"opaque failure"), "agent");
+        assert_eq!(
+            task_failure_category(b"openai error: incorrect api key provided", false),
+            "agent",
+            "stock mode must preserve its existing failure category"
+        );
+        assert_eq!(
+            task_failure_category(b"openai error: incorrect api key provided", true),
+            "inference_key_rejected"
+        );
+        assert_eq!(
+            task_failure_category(b"openai error code: insufficient_quota", true),
+            "inference_budget_exhausted"
+        );
+        assert_eq!(
+            task_failure_category(b"tool provider returned unauthorized status 401", true),
+            "authentication",
+            "managed mode must not relabel unrelated tool authentication failures"
+        );
     }
 
     #[cfg(feature = "runtime")]
@@ -4932,6 +5006,7 @@ mod tests {
                     transcript: transcript.clone(),
                 },
                 b"steward-connections-bridge: bridge MCP-GW rejected runtime authorization",
+                false,
             ),
             SandboxTaskObservation::FailedWithTranscript {
                 adapter_observation_id: "attempt-a".to_owned(),
@@ -4951,6 +5026,7 @@ mod tests {
                     transcript: transcript.clone(),
                 },
                 b"opaque stderr",
+                false,
             ),
             SandboxTaskObservation::SucceededWithTranscript {
                 adapter_observation_id: "attempt-b".to_owned(),

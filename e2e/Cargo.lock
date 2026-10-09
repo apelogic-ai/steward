@@ -3725,6 +3725,7 @@ dependencies = [
  "tokio",
  "utoipa",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -3777,12 +3778,14 @@ dependencies = [
 name = "steward-store"
 version = "0.0.0"
 dependencies = [
+ "ring",
  "serde_json",
  "sha2",
  "sqlx",
  "steward-admission",
  "steward-types",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

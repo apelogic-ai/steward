@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BrowserRunView } from "@/api-client";
 
-import { packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards } from "./run-views";
+import { inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -77,6 +77,14 @@ test("package viewer resolves inline and file prompts to the same text", () => {
     "task-definition.json": JSON.stringify({ prompt: "prompt.md" }),
     "prompt.md": text,
   })).toEqual({ label: "prompt.md", text });
+});
+
+test("managed inference failures direct the user to replace the saved key", () => {
+  expect(inferenceFailureGuidance("inference-key-rejected"))
+    .toContain("Replace it in Connections");
+  expect(inferenceFailureGuidance("inference-budget-exhausted"))
+    .toContain("Replace it in Connections");
+  expect(inferenceFailureGuidance("agent")).toBeNull();
 });
 
 describe("GitHub reruns", () => {
