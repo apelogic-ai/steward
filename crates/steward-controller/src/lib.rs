@@ -4448,12 +4448,25 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
     inference: &I,
     sandbox_runtime: &R,
 ) -> Result<ReconcileDecision, ControllerError> {
+    let cleanup_safety = ensure_inference_cleanup_is_safe(runtime, client.clone(), inference).await;
     let inference_request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
     let sandbox_cleanup = async {
         reconcile_once(runtime, ReconcileIntent::Delete, sandbox_runtime)
             .await
             .map_err(ControllerError::Reconcile)
     };
+    if let Err(error) = cleanup_safety {
+        return match sandbox_cleanup.await? {
+            ReconcileDecision::Status(mut status) => {
+                status.refs.litellm_key = runtime
+                    .status
+                    .as_ref()
+                    .and_then(|prior| prior.refs.litellm_key.clone());
+                Ok(ReconcileDecision::Status(status))
+            }
+            ReconcileDecision::Deleted => Err(error),
+        };
+    }
     let (inference_result, credential_result, sandbox_result) = futures::join!(
         revoke_inference_if_required(runtime, inference, &inference_request),
         delete_credential_secret(client, runtime),
@@ -4476,6 +4489,35 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
 }
 
 const INFERENCE_REVOCATION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+async fn ensure_inference_cleanup_is_safe<I: InferencePlane>(
+    runtime: &AgentRuntime,
+    client: Client,
+    inference: &I,
+) -> Result<(), ControllerError> {
+    if inference.capabilities().runtime_credential_provisioning {
+        return Ok(());
+    }
+    ensure_managed_mode_has_no_stock_credential(runtime, false)
+        .map_err(ControllerError::Reconcile)?;
+    let namespace = runtime
+        .namespace()
+        .ok_or(ControllerError::Reconcile(ReconcileError::MissingNamespace))?;
+    let runtime_uid = runtime
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or(ControllerError::Reconcile(
+            ReconcileError::MissingRuntimeUid,
+        ))?;
+    let secret_present = runtime_secret_api(client, &namespace)
+        .get_opt(runtime_uid)
+        .await
+        .map_err(ControllerError::Kubernetes)?
+        .is_some();
+    ensure_managed_mode_has_no_stock_credential(runtime, secret_present)
+        .map_err(ControllerError::Reconcile)
+}
 
 async fn revoke_inference_if_required<I: InferencePlane>(
     runtime: &AgentRuntime,
@@ -4537,7 +4579,12 @@ async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferenceP
     inference: &I,
     spend: Option<steward_types::SpendSummary>,
 ) -> Result<Action, ControllerError> {
+    let cleanup_safety = ensure_inference_cleanup_is_safe(runtime, client.clone(), inference).await;
     let request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
+    if let Err(error) = cleanup_safety {
+        suspend_runtime(runtime, api, sandbox_runtime, spend).await?;
+        return Err(error);
+    }
     let (revoke_result, credential_result, suspension_result) = futures::join!(
         revoke_inference_if_required(runtime, inference, &request),
         delete_credential_secret(client, runtime),
@@ -5572,6 +5619,77 @@ mod tests {
             ensure_managed_mode_has_no_stock_credential(&managed_reference, false),
             Ok(())
         );
+    }
+
+    #[tokio::test]
+    async fn managed_mode_refuses_cleanup_of_a_stock_credential() -> Result<(), String> {
+        let runtime = running_model_free_runtime(Some("stock-runtime-key"));
+        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let sandbox_deleted = Arc::new(AtomicBool::new(false));
+        let sandbox = SignallingDeleteRuntime {
+            deleted: sandbox_deleted.clone(),
+        };
+
+        let result = cleanup_runtime(&runtime, client, &ManagedInferencePlane, &sandbox).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(super::ControllerError::Reconcile(
+                    super::ReconcileError::ManagedModeStockCredentialPresent
+                ))
+            ),
+            "managed cleanup must preserve stock revocation evidence"
+        );
+        assert!(
+            sandbox_deleted.load(Ordering::SeqCst),
+            "cleanup must stop the sandbox while waiting for stock-mode key revocation"
+        );
+        assert!(
+            !secret_deleted.load(Ordering::SeqCst),
+            "cleanup must not delete the stock credential Secret before revocation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_mode_suspends_but_preserves_a_stock_credential() -> Result<(), String> {
+        let runtime = running_model_free_runtime(Some("stock-runtime-key"));
+        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
+        let sandbox_deleted = Arc::new(AtomicBool::new(false));
+        let sandbox = SignallingDeleteRuntime {
+            deleted: sandbox_deleted.clone(),
+        };
+
+        let result = suspend_runtime_with_inference_cleanup(
+            &runtime,
+            &api,
+            &sandbox,
+            client,
+            &ManagedInferencePlane,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(super::ControllerError::Reconcile(
+                    super::ReconcileError::ManagedModeStockCredentialPresent
+                ))
+            ),
+            "managed suspension must keep stock revocation retryable"
+        );
+        assert!(
+            sandbox_deleted.load(Ordering::SeqCst),
+            "suspension must still stop the sandbox"
+        );
+        assert!(
+            !secret_deleted.load(Ordering::SeqCst),
+            "suspension must preserve the stock credential Secret as revocation evidence"
+        );
+        Ok(())
     }
 
     #[tokio::test]

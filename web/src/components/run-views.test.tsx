@@ -134,6 +134,20 @@ describe("GitHub reruns", () => {
       .toBe("Re-run is disabled until task orchestration is active (stage 2).");
   });
 
+  test("directs a rerun with no managed key to Connections", async () => {
+    const outcome = await pollRerun(
+      async () => ({
+        error: { error: "inference_key_missing" },
+        response: { ok: false, status: 422 },
+      }),
+      async () => { throw new Error("must not wait"); },
+    );
+
+    expect(outcome).toEqual({ failure: "inference-key-missing" });
+    expect(rerunFailureMessage("inference-key-missing"))
+      .toContain("Add an inference API key in Connections");
+  });
+
   test("bounds server-controlled retry delays and times out as unavailable", async () => {
     const waits: number[] = [];
     const outcome = await pollRerun(

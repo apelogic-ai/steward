@@ -15,13 +15,11 @@ use steward_mint::{
     AuthenticatedControlPlaneWorkload, AuthorityBinding, AuthorityResolver,
     ControlPlaneClientCredential, ControlPlaneMintConfig, ControlPlaneWorkloadAuthenticator,
     CredentialGrant, CredentialGrantResolver, DEFAULT_AUTHORITY_TTL, IntrospectionClientCredential,
-    MAX_CONTROL_PLANE_AUTHORITY_TTL, ManagedCredentialGrantResolver,
-    ManagedInferenceCredentialSource, Mint, MintConfig, MintError, MintSigningKey,
+    MAX_CONTROL_PLANE_AUTHORITY_TTL, Mint, MintConfig, MintError, MintSigningKey,
     OpaqueAccessToken, ValidatedWorkload, authority_from_runtime_refs, control_plane_router,
     router,
 };
-use steward_store::{ManagedInferenceKeyCipher, PgStore};
-use steward_types::{AgentRuntime, InferenceMode, RuntimeId};
+use steward_types::{AgentRuntime, RuntimeId};
 use tokio::net::TcpListener;
 
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
@@ -89,50 +87,6 @@ fn credential_from_secret(
 #[derive(Clone)]
 struct KubernetesCredentialGrantResolver {
     client: Client,
-}
-
-#[derive(Clone)]
-struct PostgresManagedInferenceCredentialSource {
-    store: PgStore,
-    cipher: ManagedInferenceKeyCipher,
-}
-
-impl ManagedInferenceCredentialSource for PostgresManagedInferenceCredentialSource {
-    async fn resolve(
-        &self,
-        owner_user_id: &steward_types::CanonicalUserId,
-    ) -> Result<Option<OpaqueAccessToken>, MintError> {
-        let credential = self
-            .store
-            .resolve_managed_inference_credential(owner_user_id, &self.cipher)
-            .await
-            .map_err(|_| MintError::AuthorityUnavailable)?;
-        credential
-            .map(|credential| {
-                OpaqueAccessToken::new(credential.into_secret())
-                    .map_err(|_| MintError::CredentialUnavailable)
-            })
-            .transpose()
-    }
-}
-
-#[derive(Clone)]
-enum DeploymentCredentialGrantResolver {
-    Stock(KubernetesCredentialGrantResolver),
-    Managed(ManagedCredentialGrantResolver<PostgresManagedInferenceCredentialSource>),
-}
-
-impl CredentialGrantResolver for DeploymentCredentialGrantResolver {
-    async fn resolve(
-        &self,
-        scope: &[String],
-        authority: &AuthorityBinding,
-    ) -> Result<CredentialGrant, MintError> {
-        match self {
-            Self::Stock(resolver) => resolver.resolve(scope, authority).await,
-            Self::Managed(resolver) => resolver.resolve(scope, authority).await,
-        }
-    }
 }
 
 impl CredentialGrantResolver for KubernetesCredentialGrantResolver {
@@ -243,18 +197,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         identity,
         runtimes: Api::all(client.clone()),
     };
-    let credential_resolver = match inference_mode()? {
-        InferenceMode::Stock => {
-            DeploymentCredentialGrantResolver::Stock(KubernetesCredentialGrantResolver {
-                client: client.clone(),
-            })
-        }
-        InferenceMode::Managed => DeploymentCredentialGrantResolver::Managed(
-            ManagedCredentialGrantResolver::new(PostgresManagedInferenceCredentialSource {
-                store: PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?,
-                cipher: managed_inference_cipher()?,
-            }),
-        ),
+    let credential_resolver = KubernetesCredentialGrantResolver {
+        client: client.clone(),
     };
     let validator = SpireSvidValidator::connect_env()
         .await
@@ -363,23 +307,6 @@ fn install_rustls_crypto_provider() -> Result<(), io::Error> {
 
 fn required(name: &str) -> Result<String, io::Error> {
     env::var(name).map_err(|_| io::Error::other(format!("{name} is required")))
-}
-
-fn inference_mode() -> Result<InferenceMode, io::Error> {
-    let value = env::var("STEWARD_INFERENCE_MODE").unwrap_or_else(|_| "stock".to_owned());
-    InferenceMode::parse(&value).map_err(io::Error::other)
-}
-
-fn managed_inference_cipher() -> Result<ManagedInferenceKeyCipher, io::Error> {
-    let path = required("STEWARD_MANAGED_INFERENCE_ENCRYPTION_KEY_FILE")?;
-    let mut material = fs::read(path).map_err(|error| {
-        io::Error::other(format!(
-            "failed to read STEWARD_MANAGED_INFERENCE_ENCRYPTION_KEY_FILE: {error}"
-        ))
-    })?;
-    let cipher = ManagedInferenceKeyCipher::from_bytes(&material).map_err(io::Error::other);
-    material.fill(0);
-    cipher
 }
 
 fn load_signing_key(path: &str) -> Result<MintSigningKey, io::Error> {

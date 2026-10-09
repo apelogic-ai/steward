@@ -616,17 +616,6 @@ Steward release namespace also creates `steward-workflows`.
 - `config.apiserver.inferenceEndpoint` is the OpenAI-compatible Responses endpoint for
   `codex-v1`; `config.apiserver.anthropicInferenceEndpoint` is the Anthropic-compatible API
   base URL for `claude-code-v1`. Agent images, packages, and bindings cannot override them.
-- `inference.mode` defaults to `stock`: the controller uses
-  `config.controller.litellmUrl` and `secrets.litellm` to provision one bounded
-  credential per runtime. `managed` instead requires
-  `inference.managed.encryptionKeySecret.name` and a dedicated read-only
-  `inference.managed.databaseSecret.name`; users add one encrypted gateway
-  key under **Connections → Inference / LLMs**, Mint resolves it for the
-  runtime's verified owner, and the controller receives no LiteLLM master key.
-  Drain all stock runtimes and verify their upstream keys are revoked before
-  switching modes; managed mode fails closed on a leftover stock credential.
-  See [managed inference credentials](../../docs/installation/managed-inference.md)
-  for custody, rollout, backup, and rollback.
 - `jira.enabled` defaults to `false`. When enabled, `jiraBaseUrl`,
   `jiraProjectKey`, and `jiraAccountEmail` are required; the base URL must be
   HTTPS and the account email must correspond to the token in the existing
@@ -648,9 +637,8 @@ Steward release namespace also creates `steward-workflows`.
   and inference ports and does not read governed endpoint or credential
   configuration. The API does not construct a coding-agent adapter. Active
   Task orchestration and active execution bindings are rejected. With
-  `execution.enabled=true`, `config.controller.openshellEndpoint` is required;
-  `config.controller.litellmUrl` is additionally required in `stock` inference
-  mode and deliberately absent in `managed` mode.
+  `execution.enabled=true`, `config.controller.litellmUrl` and
+  `config.controller.openshellEndpoint` are required internal service endpoints.
 - The OpenShell endpoint must use HTTPS. `openshellServerName` pins the TLS
   identity, while `secrets.openshellClient` supplies the trusted CA, client
   certificate, and private key.
@@ -739,12 +727,10 @@ for all Steward pods, then opens only these paths:
   apiserver (the default is empty and therefore denies all workload callers);
 - configured Kubernetes API/VPC CIDRs to the validating webhook;
 - OpenShell and MCP-GW namespaces to the mint only in governed mode;
-- controller to Postgres and the Kubernetes API, plus OpenShell and workload
-  exchange in governed mode; LiteLLM management egress is present only in
-  `stock` inference mode;
+- controller to Postgres and the Kubernetes API, plus LiteLLM, OpenShell, and
+  workload exchange only in governed mode;
 - apiserver to Postgres and the Kubernetes API, plus Jira only when enabled;
-- mint to the Kubernetes API in governed mode and to Postgres only in
-  `managed` inference mode; and
+- mint to the Kubernetes API only in governed mode; and
 - all Steward components to cluster DNS.
 
 `kubeApiCidrs`, `postgresCidrs`, and `jiraCidrs` default to empty arrays. Empty

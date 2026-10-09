@@ -4118,7 +4118,6 @@ dependencies = [
  "steward-adapter-openshell",
  "steward-adapter-spire",
  "steward-mint",
- "steward-store",
  "steward-types",
  "tokio",
  "tokio-rustls",

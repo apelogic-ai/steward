@@ -2,9 +2,9 @@
 
 use std::hash::Hash;
 
-use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode, header};
-use axum::middleware::{self, Next};
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
@@ -16,11 +16,8 @@ use steward_types::{CanonicalUserId, InferenceMode};
 use zeroize::Zeroize;
 
 use crate::BoxFuture;
-use crate::browser_auth::{
-    BrowserAuthService, BrowserMutationProof, BrowserSessionBinding, BrowserSessionContext,
-    protect_browser_routes,
-};
-use crate::connections::{ConnectionMutationProof, ConnectionSession, ConnectionSubject};
+use crate::browser_auth::{BrowserAuthService, BrowserSessionBinding, protect_browser_routes};
+use crate::connections::{ConnectionMutationProof, ConnectionSession, adapt_browser_context};
 
 pub const INFERENCE_CONNECTIONS_API_VERSION: &str = "steward.inference-connections/v1";
 
@@ -173,7 +170,6 @@ impl InferenceConnectionBroker for PgInferenceConnectionBroker {
         user_id: &'a CanonicalUserId,
     ) -> BoxFuture<'a, Result<bool, InferenceConnectionError>> {
         Box::pin(async move {
-            self.cipher()?;
             self.store
                 .remove_managed_inference_credential(user_id, user_id.as_str())
                 .await
@@ -209,26 +205,6 @@ where
     let routes = inner_router::<B, BrowserSessionBinding>(broker)
         .route_layer(middleware::from_fn(adapt_browser_context));
     protect_browser_routes(routes, browser_auth)
-}
-
-async fn adapt_browser_context(mut request: Request, next: Next) -> Response {
-    if let Some(context) = request.extensions().get::<BrowserSessionContext>().cloned() {
-        request.extensions_mut().insert(ConnectionSession {
-            subject: ConnectionSubject {
-                canonical_user_id: context.principal.canonical_user_id,
-                display_email: context.principal.display_email.as_str().to_owned(),
-            },
-            binding: context.binding,
-        });
-        if matches!(
-            *request.method(),
-            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-        ) && request.extensions().get::<BrowserMutationProof>().is_some()
-        {
-            request.extensions_mut().insert(ConnectionMutationProof);
-        }
-    }
-    next.run(request).await
 }
 
 fn response(
@@ -396,6 +372,7 @@ mod tests {
     use axum::body::to_bytes;
 
     use super::*;
+    use crate::connections::ConnectionSubject;
 
     #[derive(Clone)]
     struct FakeBroker {
@@ -443,9 +420,6 @@ mod tests {
             _user_id: &'a CanonicalUserId,
         ) -> BoxFuture<'a, Result<bool, InferenceConnectionError>> {
             Box::pin(async move {
-                if self.mode != InferenceMode::Managed {
-                    return Err(InferenceConnectionError::ManagedModeRequired);
-                }
                 Ok(self
                     .saved
                     .lock()
@@ -518,6 +492,33 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stock_mode_still_allows_destroying_a_stored_managed_key() -> Result<(), String> {
+        let saved = Arc::new(Mutex::new(Some(
+            "fixture-managed-credential-wxyz".to_owned(),
+        )));
+        let broker = FakeBroker {
+            mode: InferenceMode::Stock,
+            status: None,
+            saved: saved.clone(),
+        };
+        let response = remove_inference_credential(
+            Some(Extension(session()?)),
+            Some(Extension(ConnectionMutationProof)),
+            State(InferenceConnectionsState { broker }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            saved
+                .lock()
+                .map_err(|_| "fake credential lock was poisoned")?
+                .is_none(),
+            "rolling back to stock mode must not strand encrypted user credentials"
+        );
         Ok(())
     }
 }

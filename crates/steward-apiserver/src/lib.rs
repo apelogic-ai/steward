@@ -13227,15 +13227,19 @@ mod tests {
         let browser_ledger = versioned_task_ledger_with_runtime_minutes()?;
         enable_inline_for_versioned_task_fixture(&browser_ledger, true)?;
         let browser_tasks = browser_ledger.tasks.clone();
+        let browser_key_present = browser_ledger.managed_inference_credential_present.clone();
         let origin = "http://127.0.0.1:33001";
         let (auth, session_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::User).await?;
-        let browser_missing = browser_task_router(
+        let browser_app = browser_task_router(
             browser_ledger,
             task_api_config()?.with_inference_mode(InferenceMode::Managed),
             auth,
-        )
-        .oneshot(
+        );
+        let browser_request = |idempotency_key: &'static str,
+                               session_cookie: &str,
+                               csrf: &str|
+         -> Result<Request<Body>, String> {
             Request::builder()
                 .method("POST")
                 .uri("/app/api/v1/runs")
@@ -13243,13 +13247,20 @@ mod tests {
                 .header(header::ORIGIN, origin)
                 .header("sec-fetch-site", "same-origin")
                 .header("x-steward-csrf", csrf)
-                .header("idempotency-key", "managed-browser-key-missing")
+                .header("idempotency-key", idempotency_key)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(inline_browser_task_body().to_string()))
-                .map_err(|error| format!("build managed browser Task request: {error}"))?,
-        )
-        .await
-        .map_err(|error| format!("submit managed browser Task without key: {error}"))?;
+                .map_err(|error| format!("build managed browser Task request: {error}"))
+        };
+        let browser_missing = browser_app
+            .clone()
+            .oneshot(browser_request(
+                "managed-browser-key-missing",
+                &session_cookie,
+                &csrf,
+            )?)
+            .await
+            .map_err(|error| format!("submit managed browser Task without key: {error}"))?;
         assert_eq!(browser_missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(
             browser_tasks
@@ -13263,6 +13274,7 @@ mod tests {
             .lock()
             .map_err(|_| "fake managed-inference credential lock was poisoned")? = true;
         let accepted = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -13276,6 +13288,58 @@ mod tests {
             .await
             .map_err(|error| format!("submit managed Task with key: {error}"))?;
         assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+        *key_present
+            .lock()
+            .map_err(|_| "fake managed-inference credential lock was poisoned")? = false;
+        let versioned_retry = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "managed-key-present")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"workflow":"repository-review@1"}"#))
+                    .map_err(|error| format!("build managed Task retry: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("retry managed Task after key removal: {error}"))?;
+        assert_eq!(
+            versioned_retry.status(),
+            StatusCode::OK,
+            "an exact versioned retry must return its reserved Task after key removal"
+        );
+
+        *browser_key_present
+            .lock()
+            .map_err(|_| "fake managed-inference credential lock was poisoned")? = true;
+        let browser_accepted = browser_app
+            .clone()
+            .oneshot(browser_request(
+                "managed-browser-retry",
+                &session_cookie,
+                &csrf,
+            )?)
+            .await
+            .map_err(|error| format!("submit managed browser Task with key: {error}"))?;
+        assert_eq!(browser_accepted.status(), StatusCode::ACCEPTED);
+        *browser_key_present
+            .lock()
+            .map_err(|_| "fake managed-inference credential lock was poisoned")? = false;
+        let browser_retry = browser_app
+            .oneshot(browser_request(
+                "managed-browser-retry",
+                &session_cookie,
+                &csrf,
+            )?)
+            .await
+            .map_err(|error| format!("retry managed browser Task after key removal: {error}"))?;
+        assert_eq!(
+            browser_retry.status(),
+            StatusCode::ACCEPTED,
+            "an exact browser retry must return its reserved Task after key removal"
+        );
         Ok(())
     }
 

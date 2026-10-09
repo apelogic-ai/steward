@@ -21,16 +21,8 @@ execution:
   # after OpenShell, identity, inference, and RuntimeClass preflight.
   enabled: false
 inference:
-  # stock provisions one bounded LiteLLM key per runtime. managed uses one
-  # encrypted, user-supplied inference gateway key for each Steward user.
+  # Runtime credential mode. This release supports stock provisioning.
   mode: stock
-  managed:
-    databaseSecret:
-      name: ""
-      key: url
-    encryptionKeySecret:
-      name: ""
-      key: encryption-key
 serviceAccounts:
   # The chart creates these fixed service accounts. Annotations support
   # platform workload identity (for example, EKS IRSA) without exposing any

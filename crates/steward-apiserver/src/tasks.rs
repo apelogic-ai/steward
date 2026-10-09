@@ -2333,9 +2333,21 @@ where
         identity: TaskIdentity,
         request: &BrowserTaskSubmission,
     ) -> Result<(TaskRecord, BrowserTaskEvidence), ApiError> {
+        let existing = self
+            .ledger
+            .task_by_idempotency(
+                &identity.service,
+                identity.canonical_user_id.as_str(),
+                idempotency_key,
+            )
+            .await
+            .map_err(ApiError::Store)?;
         let resolved =
             resolve_browser_package_pre_admission(&self.ledger, &self.config, &identity, request)
                 .await?;
+        if let Some(record) = existing {
+            return Ok((record, resolved.evidence));
+        }
         let approved = resolved
             .envelope
             .approved_envelope
@@ -3987,6 +3999,20 @@ where
         return Err(ApiError::Admission(
             "versioned Workflows use a server-owned runtime path".to_owned(),
         ));
+    }
+    if let Some(record) = application
+        .ledger
+        .task_by_idempotency(
+            &identity.service,
+            identity.canonical_user_id.as_str(),
+            idempotency_key,
+        )
+        .await
+        .map_err(ApiError::Store)?
+    {
+        return application
+            .retry_existing_task(&identity, Some(&reference), request, record)
+            .await;
     }
     let workflow = application
         .ledger

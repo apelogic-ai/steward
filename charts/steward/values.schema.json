@@ -39,34 +39,9 @@
     "inference": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["mode", "managed"],
+      "required": ["mode"],
       "properties": {
-        "mode": {"enum": ["stock", "managed"]},
-        "managed": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["databaseSecret", "encryptionKeySecret"],
-          "properties": {
-            "databaseSecret": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["name", "key"],
-              "properties": {
-                "name": {"type": "string"},
-                "key": {"$ref": "#/definitions/nonempty"}
-              }
-            },
-            "encryptionKeySecret": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["name", "key"],
-              "properties": {
-                "name": {"type": "string"},
-                "key": {"$ref": "#/definitions/nonempty"}
-              }
-            }
-          }
-        }
+        "mode": {"const": "stock"}
       }
     },
     "images": {
@@ -1283,27 +1258,6 @@
               "controller": {
                 "properties": {
                   "litellmUrl": {"type": "string", "pattern": "^https?://", "minLength": 9}
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    {
-      "if": {"properties": {"inference": {"properties": {"mode": {"const": "managed"}}}}},
-      "then": {
-        "properties": {
-          "inference": {
-            "properties": {
-              "managed": {
-                "properties": {
-                  "databaseSecret": {
-                    "properties": {"name": {"$ref": "#/definitions/nonempty"}}
-                  },
-                  "encryptionKeySecret": {
-                    "properties": {"name": {"$ref": "#/definitions/nonempty"}}
-                  }
                 }
               }
             }
