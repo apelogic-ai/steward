@@ -204,7 +204,16 @@ fn execution_enabled() -> Result<bool, io::Error> {
 
 fn inference_mode() -> Result<InferenceMode, io::Error> {
     let value = env::var("STEWARD_INFERENCE_MODE").unwrap_or_else(|_| "stock".to_owned());
-    InferenceMode::parse(&value).map_err(io::Error::other)
+    parse_inference_mode(&value)
+}
+
+fn parse_inference_mode(value: &str) -> Result<InferenceMode, io::Error> {
+    match InferenceMode::parse(value).map_err(io::Error::other)? {
+        InferenceMode::Stock => Ok(InferenceMode::Stock),
+        InferenceMode::Managed => Err(io::Error::other(
+            "managed inference mode is not available until Mint runtime wiring is released",
+        )),
+    }
 }
 
 fn core_only_configuration() -> Result<(), io::Error> {
@@ -778,7 +787,7 @@ mod tests {
         GITHUB_ATTESTATION_TRUST_MODE, OPERATOR_PINNED_TRUST_MODE, TlsListener,
         bridge_gateway_origin_for_image, bridge_gateway_version_for_image,
         connections_bridge_startup_log, decode_tls_material, install_rustls_crypto_provider,
-        openshell_task_log_mode, verify_bridge_image_provenance,
+        openshell_task_log_mode, parse_inference_mode, verify_bridge_image_provenance,
         verify_connections_bridge_image_configuration,
     };
     use steward_adapter_openshell::OpenShellTaskLogMode;
@@ -799,6 +808,18 @@ mod tests {
             OpenShellTaskLogMode::Full
         );
         Ok(())
+    }
+
+    #[test]
+    fn managed_inference_mode_is_rejected_before_controller_startup() {
+        assert_eq!(
+            parse_inference_mode("stock").ok(),
+            Some(steward_types::InferenceMode::Stock)
+        );
+        assert!(
+            parse_inference_mode("managed").is_err(),
+            "the controller must not activate managed inference before Mint can resolve its credentials"
+        );
     }
 
     #[test]

@@ -2346,6 +2346,12 @@ where
             resolve_browser_package_pre_admission(&self.ledger, &self.config, &identity, request)
                 .await?;
         if let Some(record) = existing {
+            let envelope_digest = resolved
+                .envelope
+                .envelope_digest
+                .as_deref()
+                .ok_or(ApiError::MissingEnvelope)?;
+            validate_browser_task_retry(&identity, &resolved.evidence, envelope_digest, &record)?;
             return Ok((record, resolved.evidence));
         }
         let approved = resolved
@@ -3600,6 +3606,33 @@ fn validate_direct_task_retry(
         || record.workflow_version.is_some()
         || record.workflow_digest.is_some()
         || record.direct_task_evidence.as_ref() != Some(evidence)
+    {
+        return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+    }
+    Ok(())
+}
+
+fn validate_browser_task_retry(
+    identity: &TaskIdentity,
+    evidence: &BrowserTaskEvidence,
+    envelope_digest: &str,
+    record: &TaskRecord,
+) -> Result<(), ApiError> {
+    let acting_user = identity.acting_user.as_ref().map(|email| email.0.as_str());
+    let acting_user_id = identity
+        .acting_user
+        .as_ref()
+        .map(|_| identity.canonical_user_id.as_str());
+    if record.identity_binding_state != "bound"
+        || record.submitter_service != identity.service
+        || record.acting_user.as_deref() != acting_user
+        || record.acting_user_id.as_deref() != acting_user_id
+        || record.owner != identity.owner.0
+        || record.owner_user_id.as_deref() != Some(identity.canonical_user_id.as_str())
+        || record.runtime_ownership != RuntimeOwnership::Provisioned
+        || record.task_origin != TaskOrigin::Browser
+        || record.user_envelope_digest.as_deref() != Some(envelope_digest)
+        || record.browser_task_evidence.as_ref() != Some(evidence)
     {
         return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
     }

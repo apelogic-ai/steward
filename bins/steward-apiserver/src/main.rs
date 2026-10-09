@@ -305,7 +305,16 @@ fn execution_enabled() -> Result<bool, io::Error> {
 
 fn inference_mode() -> Result<InferenceMode, io::Error> {
     let value = env::var("STEWARD_INFERENCE_MODE").unwrap_or_else(|_| "stock".to_owned());
-    InferenceMode::parse(&value).map_err(io::Error::other)
+    parse_inference_mode(&value)
+}
+
+fn parse_inference_mode(value: &str) -> Result<InferenceMode, io::Error> {
+    match InferenceMode::parse(value).map_err(io::Error::other)? {
+        InferenceMode::Stock => Ok(InferenceMode::Stock),
+        InferenceMode::Managed => Err(io::Error::other(
+            "managed inference mode is not available until Mint runtime wiring is released",
+        )),
+    }
 }
 
 fn managed_inference_cipher(
@@ -1911,12 +1920,24 @@ mod tests {
         bootstrap_rbac_arguments, connection_auto_association_issuer, decode_tls_material,
         format_effective_access_human, github_source_adapter_from_values,
         install_rustls_crypto_provider, kubernetes_token_review_audience, operator_exit_code,
-        parse_custom_envelope_safety_ceiling, parse_execution_bindings_mode,
+        parse_custom_envelope_safety_ceiling, parse_execution_bindings_mode, parse_inference_mode,
         parse_template_document, stable_bridge_configuration_from_values,
         validate_execution_bindings, with_claude_code_execution_adapter,
     };
 
     static NEXT_PREFLIGHT_CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn managed_inference_mode_is_rejected_before_apiserver_startup() {
+        assert_eq!(
+            parse_inference_mode("stock").ok(),
+            Some(steward_types::InferenceMode::Stock)
+        );
+        assert!(
+            parse_inference_mode("managed").is_err(),
+            "the apiserver must not expose a managed mode that Mint cannot execute"
+        );
+    }
 
     #[test]
     fn connection_auto_association_requires_both_feature_switches() {

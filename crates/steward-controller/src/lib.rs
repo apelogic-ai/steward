@@ -4550,6 +4550,7 @@ async fn suspend_runtime<R: SandboxRuntime>(
     api: &Api<AgentRuntime>,
     sandbox_runtime: &R,
     spend: Option<steward_types::SpendSummary>,
+    preserve_inference_reference: bool,
 ) -> Result<Action, ControllerError> {
     let decision = reconcile_once(runtime, ReconcileIntent::Delete, sandbox_runtime)
         .await
@@ -4559,6 +4560,12 @@ async fn suspend_runtime<R: SandboxRuntime>(
         ReconcileDecision::Status(status) => (status, StdDuration::from_secs(2)),
     };
     status.spend = spend;
+    if preserve_inference_reference {
+        status.refs.litellm_key = runtime
+            .status
+            .as_ref()
+            .and_then(|status| status.refs.litellm_key.clone());
+    }
     if runtime.status.as_ref() != Some(&status) {
         api.patch_status(
             &runtime.name_any(),
@@ -4582,13 +4589,13 @@ async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferenceP
     let cleanup_safety = ensure_inference_cleanup_is_safe(runtime, client.clone(), inference).await;
     let request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
     if let Err(error) = cleanup_safety {
-        suspend_runtime(runtime, api, sandbox_runtime, spend).await?;
+        suspend_runtime(runtime, api, sandbox_runtime, spend, true).await?;
         return Err(error);
     }
     let (revoke_result, credential_result, suspension_result) = futures::join!(
         revoke_inference_if_required(runtime, inference, &request),
         delete_credential_secret(client, runtime),
-        suspend_runtime(runtime, api, sandbox_runtime, spend),
+        suspend_runtime(runtime, api, sandbox_runtime, spend, false),
     );
 
     let action = suspension_result?;
@@ -5624,7 +5631,7 @@ mod tests {
     #[tokio::test]
     async fn managed_mode_refuses_cleanup_of_a_stock_credential() -> Result<(), String> {
         let runtime = running_model_free_runtime(Some("stock-runtime-key"));
-        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let (client, secret_deleted, _) = successful_cleanup_client(&runtime)?;
         let sandbox_deleted = Arc::new(AtomicBool::new(false));
         let sandbox = SignallingDeleteRuntime {
             deleted: sandbox_deleted.clone(),
@@ -5655,7 +5662,7 @@ mod tests {
     #[tokio::test]
     async fn managed_mode_suspends_but_preserves_a_stock_credential() -> Result<(), String> {
         let runtime = running_model_free_runtime(Some("stock-runtime-key"));
-        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let (client, secret_deleted, status_patch) = successful_cleanup_client(&runtime)?;
         let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
         let sandbox_deleted = Arc::new(AtomicBool::new(false));
         let sandbox = SignallingDeleteRuntime {
@@ -5688,6 +5695,20 @@ mod tests {
         assert!(
             !secret_deleted.load(Ordering::SeqCst),
             "suspension must preserve the stock credential Secret as revocation evidence"
+        );
+        let patch = status_patch
+            .lock()
+            .map_err(|_| "status patch lock was poisoned")?
+            .clone()
+            .ok_or_else(|| "suspension must patch AgentRuntime status".to_owned())?;
+        let patch: serde_json::Value = serde_json::from_slice(&patch)
+            .map_err(|error| format!("decode suspension status patch: {error}"))?;
+        assert_eq!(
+            patch
+                .pointer("/status/refs/litellmKey")
+                .and_then(|value| value.as_str()),
+            Some("stock-runtime-key"),
+            "suspension must retain the stock credential reference until revocation can complete"
         );
         Ok(())
     }
@@ -7081,10 +7102,10 @@ mod tests {
     async fn suspension_requeues_promptly_while_sandbox_deletion_is_pending() -> Result<(), String>
     {
         let runtime = fixture();
-        let (client, _) = successful_cleanup_client(&runtime)?;
+        let (client, _, _) = successful_cleanup_client(&runtime)?;
         let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
 
-        let action = suspend_runtime(&runtime, &api, &ProvisioningDeleteRuntime, None)
+        let action = suspend_runtime(&runtime, &api, &ProvisioningDeleteRuntime, None, false)
             .await
             .map_err(|error| {
                 format!("pending sandbox deletion must remain reconcilable: {error}")
@@ -7098,16 +7119,19 @@ mod tests {
         Ok(())
     }
 
-    fn successful_cleanup_client(
-        runtime: &AgentRuntime,
-    ) -> Result<(Client, Arc<AtomicBool>), String> {
+    type CleanupClientFixture = (Client, Arc<AtomicBool>, Arc<Mutex<Option<Vec<u8>>>>);
+
+    fn successful_cleanup_client(runtime: &AgentRuntime) -> Result<CleanupClientFixture, String> {
         let serialized_runtime = serde_json::to_vec(runtime)
             .map_err(|error| format!("fixture runtime must be serializable: {error}"))?;
         let secret_deleted = Arc::new(AtomicBool::new(false));
         let secret_deleted_for_service = secret_deleted.clone();
+        let status_patch = Arc::new(Mutex::new(None));
+        let status_patch_for_service = status_patch.clone();
         let client = Client::new(
             service_fn(move |request: Request<KubeBody>| {
                 let serialized_runtime = serialized_runtime.clone();
+                let status_patch = status_patch_for_service.clone();
                 if request.method() == Method::DELETE && request.uri().path().contains("/secrets/")
                 {
                     secret_deleted_for_service.store(true, Ordering::SeqCst);
@@ -7116,6 +7140,11 @@ mod tests {
                     let body = if request.method() == Method::PATCH
                         && request.uri().path().ends_with("/status")
                     {
+                        if let Ok(bytes) = request.into_body().collect_bytes().await
+                            && let Ok(mut observed_patch) = status_patch.lock()
+                        {
+                            *observed_patch = Some(bytes.to_vec());
+                        }
                         serialized_runtime
                     } else {
                         br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
@@ -7128,14 +7157,14 @@ mod tests {
             }),
             "team-a",
         );
-        Ok((client, secret_deleted))
+        Ok((client, secret_deleted, status_patch))
     }
 
     #[tokio::test]
     async fn authority_suspension_of_model_free_runtime_without_inference_ref_skips_revocation()
     -> Result<(), String> {
         let runtime = running_model_free_runtime(None);
-        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let (client, secret_deleted, _) = successful_cleanup_client(&runtime)?;
         let sandbox_deleted = Arc::new(AtomicBool::new(false));
         let sandbox = SignallingDeleteRuntime {
             deleted: sandbox_deleted.clone(),
@@ -7247,7 +7276,7 @@ mod tests {
     async fn termination_of_model_free_runtime_without_inference_ref_skips_revocation()
     -> Result<(), String> {
         let runtime = running_model_free_runtime(None);
-        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let (client, secret_deleted, _) = successful_cleanup_client(&runtime)?;
         let sandbox_deleted = Arc::new(AtomicBool::new(false));
         let sandbox = SignallingDeleteRuntime {
             deleted: sandbox_deleted.clone(),
@@ -7277,7 +7306,7 @@ mod tests {
     async fn termination_with_removed_models_and_cached_inference_ref_still_revokes()
     -> Result<(), String> {
         let runtime = running_model_free_runtime(Some("key-a"));
-        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let (client, secret_deleted, _) = successful_cleanup_client(&runtime)?;
         let sandbox_deleted = Arc::new(AtomicBool::new(false));
         let sandbox = SignallingDeleteRuntime {
             deleted: sandbox_deleted.clone(),

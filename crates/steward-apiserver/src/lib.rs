@@ -12199,6 +12199,21 @@ mod tests {
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
         enable_inline_for_versioned_task_fixture(&ledger, true)?;
+        {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let mut alternate = envelopes
+                .first()
+                .cloned()
+                .ok_or_else(|| "browser Task fixture requires one User Envelope".to_owned())?;
+            alternate.id = Uuid::from_u128(44);
+            alternate.template_id = Some("engineer".to_owned());
+            alternate.envelope_instance_id = Some("envelope-instance-alternate".to_owned());
+            alternate.envelope_digest = Some(format!("sha256:{}", "d".repeat(64)));
+            envelopes.push(alternate);
+        }
         let origin = "http://127.0.0.1:33001";
         let (auth, session_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::User).await?;
@@ -12250,6 +12265,25 @@ mod tests {
             assert!(tasks[0].input_archive.is_some());
             assert!(tasks[0].execute_requested);
         }
+
+        let mut changed_envelope = inline_browser_task_body();
+        changed_envelope["envelopeDigest"] =
+            serde_json::Value::String(format!("steward:sha256:{}", "d".repeat(64)));
+        let envelope_conflict = app
+            .clone()
+            .oneshot(request(&changed_envelope)?)
+            .await
+            .map_err(|error| format!("submit browser retry with changed Envelope: {error}"))?;
+        let envelope_conflict_status = envelope_conflict.status();
+        let envelope_conflict_body = to_bytes(envelope_conflict.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read changed-Envelope retry response: {error}"))?;
+        assert_eq!(
+            envelope_conflict_status,
+            StatusCode::CONFLICT,
+            "a browser retry cannot select a different User Envelope: {}",
+            String::from_utf8_lossy(&envelope_conflict_body)
+        );
 
         let mut changed = inline_browser_task_body();
         let definition = changed
