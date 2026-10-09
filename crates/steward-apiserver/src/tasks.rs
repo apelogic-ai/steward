@@ -3463,6 +3463,10 @@ where
             .collect::<BTreeMap<_, _>>();
         for (module_path, module_url) in modules {
             let full_path = prefixed_workspace_path(&parent.prefix, module_path.as_str())?;
+            if !workspace_submodule_is_selected(&parent.paths, &module_path) {
+                resolved.push(skipped_workspace_submodule(full_path, "path_not_selected")?);
+                continue;
+            }
             let Some(object) = gitlinks.get(module_path.as_str()) else {
                 resolved.push(skipped_workspace_submodule(full_path, "gitlink_missing")?);
                 continue;
@@ -3560,6 +3564,18 @@ where
         entries: resolved,
         inventory,
     })
+}
+
+fn workspace_submodule_is_selected(paths: &[WorkspacePath], module_path: &RelativePath) -> bool {
+    paths.is_empty()
+        || paths.iter().any(|path| {
+            let selected = path.as_str().strip_suffix('/').unwrap_or(path.as_str());
+            module_path.as_str() == selected
+                || module_path
+                    .as_str()
+                    .strip_prefix(selected)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
 }
 
 fn parse_gitmodules(bytes: &[u8]) -> Result<Vec<(RelativePath, String)>, ApiError> {
@@ -4120,11 +4136,6 @@ async fn prepare_task_input_archive(
     let Some(workspace) = workspace else {
         return Ok(caller_archive.to_vec());
     };
-    let git = config.direct_git_resolver.as_ref().ok_or_else(|| {
-        ApiError::TaskRuntimeContractUnavailable(
-            "workspace_git_source_resolver_unavailable".to_owned(),
-        )
-    })?;
     let mut material = Vec::new();
     let manifest = canonical_json_bytes(workspace).map_err(ApiError::Admission)?;
     append_workspace_tar_file(&mut material, "manifest.json", &manifest)?;
@@ -4141,6 +4152,11 @@ async fn prepare_task_input_archive(
         else {
             continue;
         };
+        let git = config.direct_git_resolver.as_ref().ok_or_else(|| {
+            ApiError::TaskRuntimeContractUnavailable(
+                "workspace_git_source_resolver_unavailable".to_owned(),
+            )
+        })?;
         let depth = match history {
             WorkspaceGitHistory::None => Some(1),
             WorkspaceGitHistory::Depth(depth) => Some(*depth),
@@ -4235,6 +4251,9 @@ async fn append_workspace_git_pack(
         return Err(ApiError::Admission(
             "workspace_git_pack_identity_mismatch".to_owned(),
         ));
+    }
+    if pack.bytes.len() as u64 > request.max_bytes {
+        return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
     }
     append_workspace_tar_file(material, pack_path, &pack.bytes)?;
     if !pack.shallow.is_empty() {
@@ -5581,9 +5600,10 @@ mod workflow_request_tests {
 
     use super::{
         TaskApiConfig, TaskCreateRequest, TaskSubmissionRequest, browser_inputs_archive,
-        browser_inputs_from_archive, browser_rerun_submission, resolve_versioned_task_plan,
-        stable_task_runtime_name, task_orchestration_reservation,
+        browser_inputs_from_archive, browser_rerun_submission, prepare_task_input_archive,
+        resolve_versioned_task_plan, stable_task_runtime_name, task_orchestration_reservation,
         validate_workspace_deployment_policy, versioned_workflow_reference,
+        workspace_submodule_is_selected,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{Envelope, EnvelopeSpec};
@@ -5591,7 +5611,7 @@ mod workflow_request_tests {
         PortError, TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
     };
     use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
-    use steward_types::direct_package::WorkspaceEntry;
+    use steward_types::direct_package::{WorkspaceEntry, WorkspaceEvidence};
     use steward_types::{
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
     };
@@ -5628,6 +5648,54 @@ mod workflow_request_tests {
             validate_workspace_deployment_policy(&config.workspace_policy, &git),
             Err(ApiError::Admission(ref reason)) if reason == "workspace_limit_exceeded"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_workspace_materializes_only_selected_submodules() -> Result<(), String> {
+        let selected = [steward_types::direct_package::WorkspacePath::parse("src/")?];
+        let inside = steward_types::direct_package::RelativePath::parse("src/vendor/proto")?;
+        let outside = steward_types::direct_package::RelativePath::parse("vendor/other")?;
+
+        assert!(workspace_submodule_is_selected(&selected, &inside));
+        assert!(!workspace_submodule_is_selected(&selected, &outside));
+        assert!(workspace_submodule_is_selected(&[], &outside));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scratch_only_workspace_does_not_require_a_git_resolver() -> Result<(), String> {
+        let evidence: WorkspaceEvidence = serde_json::from_value(serde_json::json!({
+            "entries": [{
+                "type": "scratch",
+                "name": "scratch",
+                "size": "2Gi",
+                "contentDigest": format!("steward:sha256:{}", "a".repeat(64))
+            }],
+            "workspaceDigest": format!("steward:sha256:{}", "b".repeat(64))
+        }))
+        .map_err(|error| error.to_string())?;
+
+        let archive =
+            prepare_task_input_archive(&TaskApiConfig::default(), b"caller", Some(&evidence))
+                .await
+                .map_err(|error| format!("prepare scratch-only workspace: {error:?}"))?;
+        let parts = steward_types::task_input_archive::split_task_input_archive(&archive)
+            .map_err(|error| format!("split scratch-only workspace frame: {error:?}"))?;
+        assert_eq!(parts.caller_archive, b"caller");
+        let material = parts
+            .workspace_archive
+            .ok_or_else(|| "scratch-only workspace manifest was not framed".to_owned())?;
+        assert!(
+            material
+                .windows(b"manifest.json".len())
+                .any(|window| window == b"manifest.json")
+        );
+        assert!(
+            !material
+                .windows(b"packs/".len())
+                .any(|window| window == b"packs/")
+        );
         Ok(())
     }
 

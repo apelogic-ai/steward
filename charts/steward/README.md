@@ -569,6 +569,12 @@ Steward release namespace also creates `steward-workflows`.
   The chart validates it, renders it into an immutable content-addressed ConfigMap,
   mounts it read-only in the apiserver, and rolls the apiserver when its checksum
   changes. See [Execution bindings](../../docs/installation/execution-bindings.md).
+- `workspace` governs typed Task workspaces before runtime creation.
+  `enabledTypes` selects `git` and/or `scratch`; `maxTotalSize`, `maxFiles`,
+  `maxHistoryDepth`, and `maxSubmoduleDepth` are deployment ceilings.
+  `scratchVolumeSize` is the real OpenShell workspace backing capacity and must match
+  the requested scratch size. Git source access still comes only from stable
+  `githubSource.bindings`; no Git credential enters the sandbox.
 - `config.apiserver.starterTask` is the optional deployment-owned default shown by
   **Get started** and **Run now**. It is a complete inline TaskDefinition plus its
   default inputs, execution-log choice, repository package path, and optional Git and

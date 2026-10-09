@@ -884,10 +884,13 @@ pub struct GitWorkspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<WorkspaceName>,
     #[serde(default)]
+    #[schema(value_type = WorkspaceGitRepositorySchema)]
     pub repository: WorkspaceGitRepository,
     #[serde(default, rename = "ref")]
+    #[schema(value_type = WorkspaceGitRefSchema)]
     pub git_ref: WorkspaceGitRef,
     #[serde(default)]
+    #[schema(value_type = WorkspaceGitHistorySchema)]
     pub history: WorkspaceGitHistory,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<WorkspacePath>,
@@ -897,6 +900,52 @@ pub struct GitWorkspace {
     pub access: WorkspaceAccess,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<WorkspaceLimits>,
+}
+
+/// OpenAPI projection of the custom `"self" | { ownerId, repositoryId }` wire shape.
+#[derive(utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum WorkspaceGitRepositorySchema {
+    SelfRepository(WorkspaceSelfRepositorySchema),
+    Explicit(WorkspaceGitRepositoryIdentity),
+}
+
+#[derive(utoipa::ToSchema)]
+pub enum WorkspaceSelfRepositorySchema {
+    #[serde(rename = "self")]
+    SelfRepository,
+}
+
+/// OpenAPI projection of the custom `"trigger" | "git:sha1:..."` wire shape.
+#[derive(utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum WorkspaceGitRefSchema {
+    Trigger(WorkspaceTriggerRefSchema),
+    Exact(ExactGitCommit),
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceTriggerRefSchema {
+    Trigger,
+}
+
+/// OpenAPI projection of the custom `"none" | "full" | { depth }` wire shape.
+#[derive(utoipa::ToSchema)]
+#[serde(untagged)]
+pub enum WorkspaceGitHistorySchema {
+    Mode(WorkspaceGitHistoryModeSchema),
+    Depth {
+        #[schema(minimum = 1)]
+        depth: u32,
+    },
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceGitHistoryModeSchema {
+    None,
+    Full,
 }
 
 impl GitWorkspace {
@@ -1633,19 +1682,24 @@ pub enum ResolvedWorkspaceEntry {
         name: WorkspaceName,
         access: WorkspaceAccess,
         repository: RepositoryUrl,
+        #[serde(rename = "repositoryId")]
         repository_id: StableProviderId,
+        #[serde(rename = "repositoryOwnerId")]
         repository_owner_id: StableProviderId,
         commit: ExactGitCommit,
+        #[schema(value_type = WorkspaceGitHistorySchema)]
         history: WorkspaceGitHistory,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         paths: Vec<WorkspacePath>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         submodules: Vec<ResolvedWorkspaceSubmodule>,
+        #[serde(rename = "contentDigest")]
         content_digest: ContentDigest,
     },
     Scratch {
         name: WorkspaceName,
         size: ResourceQuantity,
+        #[serde(rename = "contentDigest")]
         content_digest: ContentDigest,
     },
 }

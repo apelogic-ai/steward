@@ -196,6 +196,21 @@ rendered value is part of the apiserver pod template, Helm rolls the apiserver a
 browser reads the new value at runtime from an authenticated no-store endpoint. No
 web or apiserver image rebuild is needed.
 
+### Governed Task workspaces
+
+Set the chart's top-level `workspace` values to choose the enabled `git` and `scratch`
+entry types and the deployment ceilings for total bytes, files, Git history depth, and
+submodule recursion. `scratchVolumeSize` must match OpenShell's
+`workspace_default_storage_size`; this is the filesystem-enforced scratch capacity.
+Git workspaces use only repositories admitted by stable ID in `githubSource.bindings`.
+Steward fetches exact objects through the source GitHub App, strips credentials and
+remotes before the agent starts, and records the pinned commit in Task evidence.
+
+Developers can declare `workspace` directly in a `steward.task-definition/v2` package.
+For an inline browser run, **Check out this repository** writes the equivalent entry
+using the selected admitted repository and resolves its default-branch HEAD at
+submission. Tasks that omit `workspace` retain their existing behavior.
+
 ## Secret and integration inventory
 
 The chart references existing names and keys; it never puts secret bytes in

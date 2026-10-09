@@ -101,6 +101,7 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
   const [modelName, setModelName] = useState(typeof existingModel?.model === "string" ? existingModel.model : "");
   const [prompt, setPrompt] = useState(typeof definition?.promptText === "string" ? definition.promptText : "Write the requested result under $STEWARD_OUTPUT_DIR/out/.");
   const [skills, setSkills] = useState(jsonText(definition?.skills, []));
+  const [workspace, setWorkspace] = useState(jsonText(definition?.workspace, []));
   const [outputs, setOutputs] = useState(jsonText(definition?.outputs, [{ path: "out", kind: "directory", required: true }]));
   const [requires, setRequires] = useState(definition?.requires ? jsonText(definition.requires, {}) : "");
   const [additionalFiles, setAdditionalFiles] = useState(jsonText(existing ? Object.fromEntries(Object.entries(existing.files).filter(([filePath]) => filePath !== existing.path)) : {}, {}));
@@ -115,10 +116,11 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
   function previewPackage(): { definition: Record<string, unknown>; files: Record<string, string> } | null {
     try {
       const parsedSkills = JSON.parse(skills);
+      const parsedWorkspace = JSON.parse(workspace);
       const parsedOutputs = JSON.parse(outputs);
       const parsedRequires = requires.trim() ? JSON.parse(requires) : undefined;
       const parsedFiles = JSON.parse(additionalFiles);
-      if (!Array.isArray(parsedSkills) || !Array.isArray(parsedOutputs) || !parsedFiles || typeof parsedFiles !== "object" || Array.isArray(parsedFiles)) return null;
+      if (!Array.isArray(parsedSkills) || !Array.isArray(parsedWorkspace) || !Array.isArray(parsedOutputs) || !parsedFiles || typeof parsedFiles !== "object" || Array.isArray(parsedFiles)) return null;
       const taskDefinition: Record<string, unknown> = {
         schemaVersion: "steward.task-definition/v2",
         name,
@@ -126,6 +128,7 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
         runtime: { agentRef, ...(modelProvider.trim() && modelName.trim() ? { model: { provider: modelProvider.trim(), model: modelName.trim() } } : {}) },
         promptText: prompt,
         skills: parsedSkills,
+        workspace: parsedWorkspace,
         outputs: parsedOutputs,
         ...(parsedRequires === undefined ? {} : { requires: parsedRequires }),
       };
@@ -159,7 +162,7 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
       router.push(`/tasks/${encodeURIComponent(result.data.task.contentDigest)}`);
       return;
     }
-    setFailure("Steward rejected this package. Check its paths, Task definition, skills, outputs, and requirements.");
+    setFailure("Steward rejected this package. Check its paths, Task definition, skills, workspace, outputs, and requirements.");
     setStatus("error");
   }
 
@@ -172,6 +175,7 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
       <div className="grid gap-4 sm:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Model provider<input className={fieldClass} onChange={(event) => setModelProvider(event.target.value)} placeholder="Optional" value={modelProvider} /></label><label className="grid gap-2 text-sm font-semibold">Model<input className={fieldClass} onChange={(event) => setModelName(event.target.value)} placeholder="Optional" value={modelName} /></label></div>
       <label className="grid gap-2 text-sm font-semibold md:col-span-2">Prompt<textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} required value={prompt} /></label>
       <label className="grid gap-2 text-sm font-semibold">Skills (JSON array)<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setSkills(event.target.value)} spellCheck={false} value={skills} /></label>
+      <label className="grid gap-2 text-sm font-semibold">Workspace (JSON array)<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setWorkspace(event.target.value)} placeholder={'[{"git": {}}, {"scratch": {"size": "2Gi"}}]'} spellCheck={false} value={workspace} /></label>
       <label className="grid gap-2 text-sm font-semibold">Outputs (JSON array)<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setOutputs(event.target.value)} spellCheck={false} value={outputs} /></label>
       <label className="grid gap-2 text-sm font-semibold">Requirements (optional JSON)<textarea className="min-h-36 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setRequires(event.target.value)} placeholder="Omitted: use the selected Envelope maximum" spellCheck={false} value={requires} /></label>
       <label className="grid gap-2 text-sm font-semibold">Additional package files (JSON object)<textarea className="min-h-36 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setAdditionalFiles(event.target.value)} spellCheck={false} value={additionalFiles} /></label>

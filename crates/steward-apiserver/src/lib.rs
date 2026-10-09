@@ -12906,6 +12906,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_workspace_rejects_required_unadmitted_submodule_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "submodules": {
+                    "mode": "admitted",
+                    "required": ["vendor/foreign"]
+                }
+            }
+        }]);
+        let mut git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let caller = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
+        let foreign = RepositoryUrl::parse("https://github.com/example-org/foreign.git")?;
+        Arc::make_mut(&mut git.repositories).insert(
+            foreign.as_str().to_owned(),
+            GitRepositoryIdentity {
+                repository: foreign,
+                repository_id: StableProviderId::parse("9991")?,
+                repository_owner_id: StableProviderId::parse("9990")?,
+            },
+        );
+        let parent_commit = format!("git:sha1:{}", "c".repeat(40));
+        Arc::make_mut(&mut git.files).insert(
+            (
+                caller.as_str().to_owned(),
+                parent_commit.clone(),
+                ".gitmodules".to_owned(),
+            ),
+            b"[submodule \"foreign\"]\n  path = vendor/foreign\n  url = https://github.com/example-org/foreign.git\n"
+                .to_vec(),
+        );
+        Arc::make_mut(&mut git.trees).insert(
+            (caller.as_str().to_owned(), parent_commit),
+            vec![
+                GitTreeEntry {
+                    path: steward_types::direct_package::RelativePath::parse(".gitmodules")?,
+                    mode: "100644".to_owned(),
+                    kind: "blob".to_owned(),
+                    object: "b".repeat(40),
+                    size: Some(128),
+                },
+                GitTreeEntry {
+                    path: steward_types::direct_package::RelativePath::parse("vendor/foreign")?,
+                    mode: "160000".to_owned(),
+                    kind: "commit".to_owned(),
+                    object: "d".repeat(40),
+                    size: None,
+                },
+            ],
+        );
+        let app = direct_test_app(ledger.clone(), git)?;
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-workspace-required-unadmitted-submodule",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_git_required_submodule_unavailable",
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn direct_workspace_rejects_unadmitted_repository_before_reservation()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;

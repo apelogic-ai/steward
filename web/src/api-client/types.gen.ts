@@ -685,6 +685,7 @@ export type BrowserRunView = {
     workflowDigest?: string | null;
     workflowName?: string | null;
     workflowVersion?: number | null;
+    workspace?: null | WorkspaceEvidence;
 };
 
 export type BrowserTaskEvidence = {
@@ -698,6 +699,7 @@ export type BrowserTaskEvidence = {
     promptSource?: PromptSourceKind;
     revision: string;
     source: string;
+    workspace?: null | WorkspaceEvidence;
 };
 
 export type BrowserTaskListItem = {
@@ -977,6 +979,7 @@ export type DirectTaskBindingEvidence = {
     schemaVersion: string;
     sourceProvenance: SourceProvenance;
     taskUid: Uuid;
+    workspace?: null | WorkspaceEvidence;
 };
 
 export type DirectTaskDefinition = {
@@ -989,6 +992,7 @@ export type DirectTaskDefinition = {
     schemaVersion: string;
     skills?: Array<RelativePath>;
     version: number;
+    workspace?: Array<WorkspaceEntry>;
 };
 
 export type DirectTaskPhase = 'submitted' | 'parked' | 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -1153,6 +1157,17 @@ export type GeneratedGithubActionsWorkflow = {
     sha256: string;
     suggestedPath: string;
     yaml: string;
+};
+
+export type GitWorkspace = {
+    access?: WorkspaceAccess;
+    history?: WorkspaceGitHistorySchema;
+    limits?: null | WorkspaceLimits;
+    name?: null | WorkspaceName;
+    paths?: Array<WorkspacePath>;
+    ref?: WorkspaceGitRefSchema;
+    repository?: WorkspaceGitRepositorySchema;
+    submodules?: WorkspaceGitSubmodules;
 };
 
 export type GithubActionsWorkflowResponse = {
@@ -1528,6 +1543,35 @@ export type ResolvedSource = {
     repositoryOwnerId: StableProviderId;
 };
 
+export type ResolvedWorkspaceEntry = {
+    access: WorkspaceAccess;
+    commit: ExactGitCommit;
+    contentDigest: ContentDigest;
+    history: WorkspaceGitHistorySchema;
+    name: WorkspaceName;
+    paths?: Array<WorkspacePath>;
+    repository: RepositoryUrl;
+    repositoryId: StableProviderId;
+    repositoryOwnerId: StableProviderId;
+    submodules?: Array<ResolvedWorkspaceSubmodule>;
+    type: 'git';
+} | {
+    contentDigest: ContentDigest;
+    name: WorkspaceName;
+    size: ResourceQuantity;
+    type: 'scratch';
+};
+
+export type ResolvedWorkspaceSubmodule = {
+    commit?: null | ExactGitCommit;
+    path: RelativePath;
+    reason?: null | BoundedText;
+    repository?: null | RepositoryUrl;
+    repositoryId?: null | StableProviderId;
+    repositoryOwnerId?: null | StableProviderId;
+    status: WorkspaceSubmoduleStatus;
+};
+
 export type ResourceQuantity = string;
 
 export type RunnerPlatform = 'linux' | 'mac' | 'windows';
@@ -1572,6 +1616,12 @@ export type SaveBrowserTaskResponse = {
  */
 export type SaveInferenceCredentialRequest = {
     apiKey: string;
+};
+
+export type ScratchWorkspace = {
+    limits?: null | WorkspaceLimits;
+    name?: null | WorkspaceName;
+    size: ResourceQuantity;
 };
 
 export type SessionPrincipalResponse = {
@@ -1799,6 +1849,70 @@ export type WorkflowRun = {
     attempt: number;
     id: StableProviderId;
 };
+
+export type WorkspaceAccess = 'read-only' | 'copy';
+
+export type WorkspaceEntry = WorkspaceGitEntry | WorkspaceScratchEntry;
+
+export type WorkspaceEvidence = {
+    entries: Array<ResolvedWorkspaceEntry>;
+    workspaceDigest: ContentDigest;
+};
+
+export type WorkspaceGitEntry = {
+    git: GitWorkspace;
+};
+
+export type WorkspaceGitHistoryModeSchema = 'none' | 'full';
+
+/**
+ * OpenAPI projection of the custom `"none" | "full" | { depth }` wire shape.
+ */
+export type WorkspaceGitHistorySchema = WorkspaceGitHistoryModeSchema | {
+    depth: number;
+};
+
+/**
+ * OpenAPI projection of the custom `"trigger" | "git:sha1:..."` wire shape.
+ */
+export type WorkspaceGitRefSchema = WorkspaceTriggerRefSchema | ExactGitCommit;
+
+export type WorkspaceGitRepositoryIdentity = {
+    ownerId: StableProviderId;
+    repositoryId: StableProviderId;
+};
+
+/**
+ * OpenAPI projection of the custom `"self" | { ownerId, repositoryId }` wire shape.
+ */
+export type WorkspaceGitRepositorySchema = WorkspaceSelfRepositorySchema | WorkspaceGitRepositoryIdentity;
+
+export type WorkspaceGitSubmodules = {
+    mode?: WorkspaceSubmoduleMode;
+    recursive?: boolean;
+    required?: Array<RelativePath>;
+};
+
+export type WorkspaceLimits = {
+    files?: number | null;
+    size?: null | ResourceQuantity;
+};
+
+export type WorkspaceName = string;
+
+export type WorkspacePath = string;
+
+export type WorkspaceScratchEntry = {
+    scratch: ScratchWorkspace;
+};
+
+export type WorkspaceSelfRepositorySchema = 'self';
+
+export type WorkspaceSubmoduleMode = 'none' | 'admitted';
+
+export type WorkspaceSubmoduleStatus = 'materialized' | 'skipped';
+
+export type WorkspaceTriggerRefSchema = 'trigger';
 
 export type AllRunsData = {
     body?: never;
