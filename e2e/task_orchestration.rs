@@ -879,6 +879,7 @@ fn browser_direct_package_evidence(
         inline_files: (source == "inline")
             .then(|| BTreeMap::from([("task-definition.json".to_owned(), "{}".to_owned())])),
         diagnostics: Default::default(),
+        workspace: None,
         prompt_source: PromptSourceKind::Inline,
     };
     evidence.validate()?;
