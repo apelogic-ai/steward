@@ -338,6 +338,114 @@
       },
       "additionalProperties": false
     },
+    "workspaceName": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]{1,40}$"
+    },
+    "workspacePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*/?$"
+    },
+    "workspaceLimits": {
+      "type": "object",
+      "properties": {
+        "size": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "files": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "workspaceGitRepository": {
+      "oneOf": [
+        { "const": "self" },
+        {
+          "type": "object",
+          "required": ["ownerId", "repositoryId"],
+          "properties": {
+            "ownerId": { "$ref": "#/$defs/providerId" },
+            "repositoryId": { "$ref": "#/$defs/providerId" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "workspaceGitRef": {
+      "oneOf": [
+        { "const": "trigger" },
+        { "$ref": "#/$defs/exactGitCommit" }
+      ]
+    },
+    "workspaceGitHistory": {
+      "oneOf": [
+        { "enum": ["none", "full"] },
+        {
+          "type": "object",
+          "required": ["depth"],
+          "properties": { "depth": { "type": "integer", "minimum": 1 } },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "workspaceGitSubmodules": {
+      "type": "object",
+      "properties": {
+        "mode": { "enum": ["none", "admitted"], "default": "none" },
+        "required": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/relativePath" },
+          "default": []
+        },
+        "recursive": { "type": "boolean", "default": false }
+      },
+      "additionalProperties": false
+    },
+    "gitWorkspace": {
+      "type": "object",
+      "properties": {
+        "name": { "$ref": "#/$defs/workspaceName" },
+        "repository": { "$ref": "#/$defs/workspaceGitRepository", "default": "self" },
+        "ref": { "$ref": "#/$defs/workspaceGitRef", "default": "trigger" },
+        "history": { "$ref": "#/$defs/workspaceGitHistory", "default": "none" },
+        "paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/workspacePath" },
+          "default": []
+        },
+        "submodules": { "$ref": "#/$defs/workspaceGitSubmodules", "default": {} },
+        "access": { "enum": ["read-only", "copy"], "default": "read-only" },
+        "limits": { "$ref": "#/$defs/workspaceLimits" }
+      },
+      "additionalProperties": false
+    },
+    "scratchWorkspace": {
+      "type": "object",
+      "required": ["size"],
+      "properties": {
+        "name": { "$ref": "#/$defs/workspaceName" },
+        "size": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "limits": { "$ref": "#/$defs/workspaceLimits" }
+      },
+      "additionalProperties": false
+    },
+    "workspaceEntry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["git"],
+          "properties": { "git": { "$ref": "#/$defs/gitWorkspace" } },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["scratch"],
+          "properties": { "scratch": { "$ref": "#/$defs/scratchWorkspace" } },
+          "additionalProperties": false
+        }
+      ]
+    },
     "taskDefinition": {
       "type": "object",
       "required": ["schemaVersion", "name", "version", "runtime", "outputs"],
@@ -352,6 +460,12 @@
           "type": "array",
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/relativePath" },
+          "default": []
+        },
+        "workspace": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/workspaceEntry" },
           "default": []
         },
         "outputs": {
