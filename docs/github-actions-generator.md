@@ -1,6 +1,6 @@
 # Steward GitHub Actions generator contract
 
-Status: current contract for Steward v0.3.13
+Status: current contract for Steward v0.3.14
 
 The generator turns one authoritative Steward envelope selection and one bounded task template
 into workflow YAML that a developer may inspect, copy, commit, and dispatch. It never selects a

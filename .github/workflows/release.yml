@@ -628,7 +628,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.13"
+          test "$version" = "0.3.14"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
@@ -753,16 +753,16 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.13 makes the browser default repository picker list the deployment-owned admitted source catalog directly through the source GitHub App. Organization-owned admitted repositories appear without a query, resolved with repository-scoped metadata-only tokens and a bounded stale-while-revalidate cache; explicit searches still use the governed per-user connection.\n\n'
-            printf 'Get started step 4 now shows the repository picker, and the browser shares one repository-list request across Get started and task publication until the user refreshes, retries, disconnects, or reloads the page.\n\n'
-            printf 'This release fixes issue 317: full execution-log Tasks once again deliver the reserved stdout and stderr transcript required by steward-run 0.8.1. The runner-facing archive is rebuilt from validated out/ entries with Steward-authored headers, then receives the durable transcript. Permanent delivery failures return non-retryable task_output_delivery_failed errors.\n\n'
-            printf 'Governed connection operations now emit structured queue, attempt, and total latency fields when attempt timing is available, without changing reconciliation cadence or runtime lifecycle.\n\n'
-            printf 'This release retains everything shipped in v0.3.12, including the pinned GitHub MCP v1.6.0 compatibility fixes and bounded bridge failure categories.\n\n'
+            printf 'Steward v0.3.14 fixes issue 330: the Connections bridge now establishes an MCP Streamable HTTP session before its tool calls. Each governed GitHub operation sends initialize, then notifications/initialized, carries the issued Mcp-Session-Id and negotiated MCP-Protocol-Version on every tools/call, ends with a best-effort session DELETE, and re-initializes once when the gateway answers 404 for an ended session. Publication, workflow detection, dispatch, run status, rerun, and explicit repository searches now work behind the MCP-GW agentgateway origin; on v0.3.13 and earlier, including v0.3.12, they failed with bridge-gateway-http and upstream status 400. Direct GitHub wrapper origins and the legacy 0.3.2 rerun are unchanged. The fix was verified against the agentgateway image pinned by MCP-GW 0.5.7.\n\n'
+            printf 'A new connection-operation failure category, bridge-gateway-session, reported as gateway_session_failed at the Connections API, identifies an MCP session the gateway rejected, that ended again after one re-initialization, or whose initialize reply or session ID was invalid. Every other failure keeps its existing category.\n\n'
+            printf 'Mint adds a ManagedCredentialGrantResolver library component for managed inference credentials. It is not wired to a credential store or the browser yet, so this release has no behavior change from it.\n\n'
+            printf 'This release retains everything shipped in v0.3.13, including the admitted source repository listing, the restored execution transcript for full execution-log Tasks, and governed operation latency reporting.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
             printf 'This patch adds no migrations; the newest migration remains 0067. No Helm value or provider-profile transition is required. Installations upgrading from versions before v0.3.11 must first follow the v0.3.11 upgrade notes.\n\n'
-            printf 'Deploy the v0.3.13 chart and images as one release unit.\n\n'
-            printf 'Rollback from v0.3.13 to v0.3.12 requires no database restore; restore the v0.3.12 chart and complete component-image set together.\n\n'
+            printf 'Deploy the v0.3.14 chart and images as one release unit. The fix lives in the bridge: when connectionsBridge is enabled, update connectionsBridge.image, sourceCommit, signerIdentity, and attestationBundle to the values under Stable bridge provenance inputs below; an earlier bridge keeps the defect.\n\n'
+            printf 'The session DELETE is permitted by provider-profile bundle 1.2.2. With an earlier bundle the OpenShell proxy denies and logs that request; the operation result is unaffected.\n\n'
+            printf 'Rollback from v0.3.14 to v0.3.13 requires no database restore; restore the v0.3.13 chart and complete component-image set, including the bridge coordinates, together.\n\n'
             printf '## Required action\n\n'
             printf 'Before upgrading governed installations, set spire.className to the installed SPIRE controller class and choose exactly one owner for the OpenShell sandbox registration: keep the chart default, or disable spire.sandboxRegistration only when the platform retains the equivalent registration. Before enabling browser Run now, authorize each Git source through the operator-managed source-repository binding catalog and configure the intended Envelope templates.\n\n'
             printf '## Acceptance\n\n'
@@ -834,7 +834,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.13.json
+          subject-path: dist/steward-product-compatibility-0.3.14.json
 
       - name: Archive product compatibility verification material
         env:
@@ -844,7 +844,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.13.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.14.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 
