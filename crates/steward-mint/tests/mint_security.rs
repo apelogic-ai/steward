@@ -185,18 +185,20 @@ async fn managed_inference_rejects_a_missing_owner_credential() -> Result<(), St
 
 #[tokio::test]
 async fn managed_inference_does_not_handle_non_inference_scopes() -> Result<(), String> {
-    let (resolver, calls) = managed_resolver(
-        canonical_user_id()?,
-        Ok(Some("sk-steward-test-managed-key")),
-    );
+    let (resolver, calls) =
+        managed_resolver(canonical_user_id()?, Err(MintError::AuthorityUnavailable));
 
     let result = resolver
         .resolve(&["tools".to_owned()], &active_binding()?)
         .await
-        .map_err(|error| format!("non-inference scope must not fail: {error:?}"))?;
+        .map_err(|error| format!("database outage must not fail a tool-only grant: {error:?}"))?;
 
     assert!(matches!(result, CredentialGrant::NotHandled));
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "tool-only grants must not consult unavailable inference storage"
+    );
     Ok(())
 }
 

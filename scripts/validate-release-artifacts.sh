@@ -15,6 +15,8 @@ python3 "${root}/scripts/test-platform-preflight.py"
 bash "${root}/scripts/test-package-platform-preflight.sh"
 chart_contract_mode="$(bash "${root}/scripts/release-chart-contract.sh" "${root}/charts/steward/Chart.yaml")"
 rendered="$(mktemp)"
+managed_inference_rendered="$(mktemp)"
+managed_inference_mint_deployment="$(mktemp)"
 default_rendered="$(mktemp)"
 stable_bridge_rendered="$(mktemp)"
 stable_bridge_bundle="$(mktemp)"
@@ -56,7 +58,9 @@ cleanup() {
   if [[ -n "${web_container_id}" ]]; then
     docker stop --time 5 "${web_container_id}" >/dev/null 2>&1
   fi
-  rm -f "${rendered}" "${default_rendered}" "${stable_bridge_rendered}" "${stable_bridge_bundle}" \
+  rm -f "${rendered}" "${managed_inference_rendered}" \
+    "${managed_inference_mint_deployment}" "${default_rendered}" \
+    "${stable_bridge_rendered}" "${stable_bridge_bundle}" \
     "${stable_bridge_configmap}" "${stable_bridge_deployment}" \
     "${stable_bridge_controller_deployment}" "${connections_bridge_rendered}" \
     "${connections_bridge_bundle}" "${connections_bridge_configmap}" \
@@ -306,6 +310,44 @@ if [[ "${chart_contract_mode}" == customer-v1 ]]; then
     echo 'governed execution must not implicitly enable Jira' >&2
     exit 1
   fi
+  if grep -Eq 'STEWARD_MANAGED_INFERENCE_|steward-managed-inference-database' "${rendered}"; then
+    echo 'stock inference must not project managed database or encryption-key material' >&2
+    exit 1
+  fi
+  helm template steward "${root}/charts/steward" \
+    --namespace steward \
+    --include-crds \
+    "${image_values[@]}" \
+    --set-string inference.mode=managed \
+    --set-string databaseTls.mode=verify-full \
+    --set-string databaseTls.ca.name=steward-database-ca \
+    --set-string databaseTls.ca.key=ca.crt \
+    --set 'networkPolicy.postgresCidrs[0]=192.0.2.0/24' \
+    > "${managed_inference_rendered}"
+  for managed_inference_fragment in \
+    'name: STEWARD_INFERENCE_MODE, value: "managed"' \
+    'name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: steward-managed-inference-database, key: url } }' \
+    'secretName: steward-managed-inference' \
+    'key: encryption-key' \
+    'ipBlock: { cidr: 192.0.2.0/24 }'
+  do
+    if ! grep -Fq "${managed_inference_fragment}" "${managed_inference_rendered}"; then
+      echo "managed inference render omitted ${managed_inference_fragment}" >&2
+      exit 1
+    fi
+  done
+  if [[ "$(grep -Fc 'name: STEWARD_MANAGED_INFERENCE_ENCRYPTION_KEY_FILE, value: /run/managed-inference/encryption-key' "${managed_inference_rendered}")" != "2" ]]; then
+    echo 'managed inference must project the encryption key into exactly the apiserver and Mint' >&2
+    exit 1
+  fi
+  awk '
+    BEGIN { RS = "---\\n" }
+    $0 ~ /kind: Deployment/ && $0 ~ /name: steward-mint/ { print; exit }
+  ' "${managed_inference_rendered}" > "${managed_inference_mint_deployment}"
+  grep -Fxq '            - { name: database-tls-ca, mountPath: /run/database-tls, readOnly: true }' \
+    "${managed_inference_mint_deployment}"
+  grep -Fxq '            name: steward-database-ca' \
+    "${managed_inference_mint_deployment}"
 fi
 if [[ "$(grep -c 'name: STEWARD_TASK_EXECUTION_BINDINGS_FILE' "${rendered}")" != "1" ]] ||
   ! grep -Fq 'name: STEWARD_TASK_EXECUTION_BINDINGS_MODE, value: "staged"' "${rendered}" ||

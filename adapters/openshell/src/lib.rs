@@ -603,32 +603,34 @@ fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
 
 #[cfg(feature = "runtime")]
 fn managed_inference_failure_category(stderr: &[u8]) -> Option<&'static str> {
-    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
-    let is_inference_error = stderr.contains("inference")
-        || stderr.contains("litellm")
-        || stderr.contains("openai")
-        || stderr.contains("anthropic");
-    if is_inference_error
-        && (stderr.contains("invalid api key")
-            || stderr.contains("invalid_api_key")
-            || stderr.contains("incorrect api key")
-            || stderr.contains("unauthorized")
-            || stderr.contains("forbidden")
-            || stderr.contains("status 401")
-            || stderr.contains("status 403"))
-    {
-        Some("inference_key_rejected")
-    } else if is_inference_error
-        && (stderr.contains("insufficient_quota")
-            || stderr.contains("budget exceeded")
-            || stderr.contains("budget_exceeded")
-            || stderr.contains("spend limit exceeded")
-            || stderr.contains("quota exceeded"))
-    {
-        Some("inference_budget_exhausted")
-    } else {
-        None
-    }
+    String::from_utf8_lossy(stderr).lines().find_map(|line| {
+        let line = line.to_ascii_lowercase();
+        let is_inference_error = line.contains("inference")
+            || line.contains("litellm")
+            || line.contains("openai")
+            || line.contains("anthropic");
+        if is_inference_error
+            && (line.contains("invalid api key")
+                || line.contains("invalid_api_key")
+                || line.contains("incorrect api key")
+                || line.contains("unauthorized")
+                || line.contains("forbidden")
+                || line.contains("status 401")
+                || line.contains("status 403"))
+        {
+            Some("inference_key_rejected")
+        } else if is_inference_error
+            && (line.contains("insufficient_quota")
+                || line.contains("budget exceeded")
+                || line.contains("budget_exceeded")
+                || line.contains("spend limit exceeded")
+                || line.contains("quota exceeded"))
+        {
+            Some("inference_budget_exhausted")
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(feature = "runtime")]
@@ -5320,6 +5322,11 @@ mod tests {
             task_failure_category(b"jira: invalid api key", true),
             "authentication",
             "managed mode must not relabel a tool provider's rejected key"
+        );
+        assert_eq!(
+            task_failure_category(b"openai request completed\njira: invalid api key\n", true),
+            "authentication",
+            "an unrelated inference line must not relabel a later tool failure"
         );
         assert_eq!(
             task_failure_category(

@@ -3786,11 +3786,11 @@ mod tests {
         DecisionFiling, DecisionFilingClaim, EnvelopeInstanceGrantRecord,
         EnvelopeRequestDecisionReference, EnvelopeRequestRecord, EnvelopeRequestStatus,
         EnvelopeRequestStatusEventRecord, EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication,
-        EnvelopeTemplateRevisionRecord, GrantApplication, GrantReversion, ParkRejection,
-        ParkedAdmission, PendingApproval, PendingEnvelopeRequest, StoreError, TaskAdmissionLookup,
-        TaskAdmissionRecord, TaskOrchestrationState, TaskRecord, TaskReservation,
-        TaskReservationRequest, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
-        WorkflowRevisionRecord,
+        EnvelopeTemplateRevisionRecord, GrantApplication, GrantReversion,
+        ManagedInferenceKeyCipher, ParkRejection, ParkedAdmission, PendingApproval,
+        PendingEnvelopeRequest, StoreError, TaskAdmissionLookup, TaskAdmissionRecord,
+        TaskOrchestrationState, TaskRecord, TaskReservation, TaskReservationRequest,
+        TaskRuntimeOperationRecord, TaskRuntimeOwnership, WorkflowRevisionRecord,
     };
     use steward_types::direct_package::{
         ClosureEntryKind, ExactGitCommit, InvocationKind, PromptSourceKind, RepositoryUrl,
@@ -8366,9 +8366,10 @@ mod tests {
     }
 
     impl TaskSubmissionLedger for FakeLedger {
-        fn has_managed_inference_credential<'a>(
+        fn managed_inference_credential_is_usable<'a>(
             &'a self,
             _owner_user_id: &'a CanonicalUserId,
+            _cipher: &'a ManagedInferenceKeyCipher,
         ) -> BoxFuture<'a, Result<bool, StoreError>> {
             Box::pin(async move {
                 self.managed_inference_credential_present
@@ -13813,7 +13814,11 @@ mod tests {
         let ledger = versioned_task_ledger()?;
         let tasks = ledger.tasks.clone();
         let key_present = ledger.managed_inference_credential_present.clone();
-        let config = task_api_config()?.with_inference_mode(InferenceMode::Managed);
+        let cipher = ManagedInferenceKeyCipher::from_bytes(&[7_u8; 32])
+            .map_err(|error| format!("build managed-inference test cipher: {error}"))?;
+        let config = task_api_config()?
+            .with_inference_mode(InferenceMode::Managed)
+            .with_managed_inference_cipher(cipher.clone());
         let app = task_router(ledger, FakeTaskIdentityResolver, config);
 
         let missing = app
@@ -13858,6 +13863,7 @@ mod tests {
             FakeTaskIdentityResolver,
             task_api_config()?
                 .with_inference_mode(InferenceMode::Managed)
+                .with_managed_inference_cipher(cipher.clone())
                 .with_git_hosting_plane(same_repository_direct_git_fixture()?),
         );
         let direct_missing = direct_app
@@ -13897,7 +13903,9 @@ mod tests {
             signed_in_browser(origin, LocalFakeIdentity::User).await?;
         let browser_app = browser_task_router(
             browser_ledger,
-            task_api_config()?.with_inference_mode(InferenceMode::Managed),
+            task_api_config()?
+                .with_inference_mode(InferenceMode::Managed)
+                .with_managed_inference_cipher(cipher),
             auth,
         );
         let browser_request = |idempotency_key: &'static str,

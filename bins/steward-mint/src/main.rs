@@ -15,11 +15,13 @@ use steward_mint::{
     AuthenticatedControlPlaneWorkload, AuthorityBinding, AuthorityResolver,
     ControlPlaneClientCredential, ControlPlaneMintConfig, ControlPlaneWorkloadAuthenticator,
     CredentialGrant, CredentialGrantResolver, DEFAULT_AUTHORITY_TTL, IntrospectionClientCredential,
-    MAX_CONTROL_PLANE_AUTHORITY_TTL, Mint, MintConfig, MintError, MintSigningKey,
+    MAX_CONTROL_PLANE_AUTHORITY_TTL, ManagedCredentialGrantResolver,
+    ManagedInferenceCredentialSource, Mint, MintConfig, MintError, MintSigningKey,
     OpaqueAccessToken, ValidatedWorkload, authority_from_runtime_refs, control_plane_router,
     router,
 };
-use steward_types::{AgentRuntime, RuntimeId};
+use steward_store::{ManagedInferenceKeyCipher, PgStore, StoreError};
+use steward_types::{AgentRuntime, CanonicalUserId, InferenceMode, RuntimeId};
 use tokio::net::TcpListener;
 
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
@@ -87,6 +89,57 @@ fn credential_from_secret(
 #[derive(Clone)]
 struct KubernetesCredentialGrantResolver {
     client: Client,
+}
+
+#[derive(Clone)]
+struct PostgresManagedInferenceCredentialSource {
+    store: PgStore,
+    cipher: ManagedInferenceKeyCipher,
+}
+
+impl ManagedInferenceCredentialSource for PostgresManagedInferenceCredentialSource {
+    async fn resolve(
+        &self,
+        owner_user_id: &CanonicalUserId,
+    ) -> Result<Option<OpaqueAccessToken>, MintError> {
+        self.store
+            .resolve_managed_inference_credential(owner_user_id, &self.cipher)
+            .await
+            .map_err(managed_inference_store_error)?
+            .map(|credential| {
+                OpaqueAccessToken::new(credential.into_secret())
+                    .map_err(|_| MintError::CredentialUnavailable)
+            })
+            .transpose()
+    }
+}
+
+fn managed_inference_store_error(error: StoreError) -> MintError {
+    match error {
+        StoreError::InvalidManagedInferenceCredential
+        | StoreError::InvalidManagedInferenceEncryptionKey
+        | StoreError::ManagedInferenceCredentialUnavailable => MintError::CredentialUnavailable,
+        _ => MintError::AuthorityUnavailable,
+    }
+}
+
+#[derive(Clone)]
+enum DeploymentCredentialGrantResolver {
+    Stock(KubernetesCredentialGrantResolver),
+    Managed(ManagedCredentialGrantResolver<PostgresManagedInferenceCredentialSource>),
+}
+
+impl CredentialGrantResolver for DeploymentCredentialGrantResolver {
+    async fn resolve(
+        &self,
+        scope: &[String],
+        authority: &AuthorityBinding,
+    ) -> Result<CredentialGrant, MintError> {
+        match self {
+            Self::Stock(resolver) => resolver.resolve(scope, authority).await,
+            Self::Managed(resolver) => resolver.resolve(scope, authority).await,
+        }
+    }
 }
 
 impl CredentialGrantResolver for KubernetesCredentialGrantResolver {
@@ -197,8 +250,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         identity,
         runtimes: Api::all(client.clone()),
     };
-    let credential_resolver = KubernetesCredentialGrantResolver {
-        client: client.clone(),
+    let inference_mode = inference_mode()?;
+    let credential_resolver = match inference_mode {
+        InferenceMode::Stock => {
+            DeploymentCredentialGrantResolver::Stock(KubernetesCredentialGrantResolver {
+                client: client.clone(),
+            })
+        }
+        InferenceMode::Managed => {
+            let store = PgStore::connect_lazy(&required("STEWARD_DATABASE_URL")?)?;
+            DeploymentCredentialGrantResolver::Managed(ManagedCredentialGrantResolver::new(
+                PostgresManagedInferenceCredentialSource {
+                    store,
+                    cipher: load_managed_inference_cipher(&required(
+                        "STEWARD_MANAGED_INFERENCE_ENCRYPTION_KEY_FILE",
+                    )?)?,
+                },
+            ))
+        }
     };
     let validator = SpireSvidValidator::connect_env()
         .await
@@ -309,6 +378,22 @@ fn required(name: &str) -> Result<String, io::Error> {
     env::var(name).map_err(|_| io::Error::other(format!("{name} is required")))
 }
 
+fn inference_mode() -> Result<InferenceMode, io::Error> {
+    InferenceMode::parse(&env::var("STEWARD_INFERENCE_MODE").unwrap_or_else(|_| "stock".to_owned()))
+        .map_err(io::Error::other)
+}
+
+fn load_managed_inference_cipher(path: &str) -> Result<ManagedInferenceKeyCipher, io::Error> {
+    let mut material = fs::read(path)?;
+    let cipher = ManagedInferenceKeyCipher::from_bytes(&material).map_err(|_| {
+        io::Error::other(
+            "STEWARD_MANAGED_INFERENCE_ENCRYPTION_KEY_FILE must contain exactly 32 bytes",
+        )
+    });
+    material.fill(0);
+    cipher
+}
+
 fn load_signing_key(path: &str) -> Result<MintSigningKey, io::Error> {
     let mut material = fs::read(path)?;
     let mut bytes: [u8; 32] = material.as_slice().try_into().map_err(|_| {
@@ -340,7 +425,7 @@ mod tests {
 
     use super::{
         INFERENCE_CREDENTIAL_DATA_KEY, RUNTIME_UID_LABEL, credential_from_secret,
-        credential_secret_name,
+        credential_secret_name, managed_inference_store_error,
     };
 
     fn runtime(uid: &str, workspace: &str, sandbox: &str) -> AgentRuntime {
@@ -506,6 +591,24 @@ mod tests {
         assert!(
             matches!(result, Err(MintError::CredentialUnavailable)),
             "an untrusted runtime identifier must not become a Kubernetes Secret name"
+        );
+    }
+
+    #[test]
+    fn managed_inference_storage_failures_have_bounded_categories() {
+        assert_eq!(
+            managed_inference_store_error(
+                steward_store::StoreError::ManagedInferenceCredentialUnavailable,
+            ),
+            MintError::CredentialUnavailable,
+            "decrypt failures must not expose key or ciphertext details"
+        );
+        assert_eq!(
+            managed_inference_store_error(steward_store::StoreError::Database(
+                "database detail that must not escape".to_owned(),
+            )),
+            MintError::AuthorityUnavailable,
+            "database failures must remain a bounded availability category"
         );
     }
 

@@ -215,6 +215,10 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let task_api_config = task_api_config
         .with_task_orchestration_mode(task_orchestration_mode)
         .with_inference_mode(inference_mode);
+    let task_api_config = match managed_inference_cipher.clone() {
+        Some(cipher) => task_api_config.with_managed_inference_cipher(cipher),
+        None => task_api_config,
+    };
     let workflow_agents = task_api_config.execution_binding_advertisements();
     let runtimes = KubeRuntimeRepository::new(client);
     let browser = browser_application_router(
@@ -311,12 +315,7 @@ fn inference_mode() -> Result<InferenceMode, io::Error> {
 }
 
 fn parse_inference_mode(value: &str) -> Result<InferenceMode, io::Error> {
-    match InferenceMode::parse(value).map_err(io::Error::other)? {
-        InferenceMode::Stock => Ok(InferenceMode::Stock),
-        InferenceMode::Managed => Err(io::Error::other(
-            "managed inference mode is not available until Mint runtime wiring is released",
-        )),
-    }
+    InferenceMode::parse(value).map_err(io::Error::other)
 }
 
 fn managed_inference_cipher(
@@ -1930,14 +1929,15 @@ mod tests {
     static NEXT_PREFLIGHT_CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn managed_inference_mode_is_rejected_before_apiserver_startup() {
+    fn managed_inference_mode_is_accepted_by_apiserver_startup() {
         assert_eq!(
             parse_inference_mode("stock").ok(),
             Some(steward_types::InferenceMode::Stock)
         );
-        assert!(
-            parse_inference_mode("managed").is_err(),
-            "the apiserver must not expose a managed mode that Mint cannot execute"
+        assert_eq!(
+            parse_inference_mode("managed").ok(),
+            Some(steward_types::InferenceMode::Managed),
+            "the apiserver must admit managed mode once Mint can resolve stored credentials"
         );
     }
 

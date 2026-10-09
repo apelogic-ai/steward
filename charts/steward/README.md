@@ -53,6 +53,9 @@ only after supplying and verifying those governed-execution dependencies;
 `jira.enabled=true` separately opts in to Jira. See the
 [installation guide](../../docs/installation/installation-guide.md) for the
 complete prerequisite, Secret, procedure, and delivery-test matrix.
+Managed per-user inference credentials require a separate read-only database
+role and deployment encryption key; see
+[managed inference](../../docs/installation/managed-inference.md).
 
 The chart creates no Secret values, PVCs, database, ingress controller,
 cert-manager issuer, or SPIRE control plane. Choose TLS mode before rendering:

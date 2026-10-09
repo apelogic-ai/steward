@@ -21,7 +21,7 @@ execution:
   # after OpenShell, identity, inference, and RuntimeClass preflight.
   enabled: false
 inference:
-  # Runtime credential mode. This release supports stock provisioning.
+  # Runtime credential mode. Managed mode resolves each user's encrypted key in Mint.
   mode: stock
 serviceAccounts:
   # The chart creates these fixed service accounts. Annotations support
@@ -70,6 +70,15 @@ secrets:
   database:
     name: steward-database
     key: url
+  managedInferenceDatabase:
+    # Managed mode uses a distinct PostgreSQL credential limited to reading
+    # managed_inference_credentials.
+    name: steward-managed-inference-database
+    key: url
+  managedInferenceEncryptionKey:
+    # Shared only by the apiserver admission check and Mint credential resolver.
+    name: steward-managed-inference
+    key: encryption-key
   jira:
     name: steward-jira
     key: token

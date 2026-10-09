@@ -42,7 +42,7 @@
       "additionalProperties": false,
       "required": ["mode"],
       "properties": {
-        "mode": {"const": "stock"}
+        "mode": {"enum": ["stock", "managed"]}
       }
     },
     "images": {
@@ -147,9 +147,11 @@
     "secrets": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["database", "jira", "litellm", "openshellClient", "mint"],
+      "required": ["database", "managedInferenceDatabase", "managedInferenceEncryptionKey", "jira", "litellm", "openshellClient", "mint"],
       "properties": {
         "database": {"$ref": "#/definitions/secretKey"},
+        "managedInferenceDatabase": {"$ref": "#/definitions/secretKey"},
+        "managedInferenceEncryptionKey": {"$ref": "#/definitions/secretKey"},
         "jira": {"$ref": "#/definitions/secretKey"},
         "litellm": {"$ref": "#/definitions/secretKey"},
         "openshellClient": {
