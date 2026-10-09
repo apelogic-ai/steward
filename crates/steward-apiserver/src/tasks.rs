@@ -3086,14 +3086,16 @@ where
                         ledger,
                         config,
                         git.as_ref(),
-                        &repository,
-                        &commit,
-                        &entry.git.paths,
-                        &entry.git.submodules.required,
-                        entry.git.submodules.recursive,
-                        config.workspace_policy.max_submodule_depth,
-                        context.caller,
-                        context.browser,
+                        WorkspaceSubmoduleRequest {
+                            repository: &repository,
+                            commit: &commit,
+                            paths: &entry.git.paths,
+                            required: &entry.git.submodules.required,
+                            recursive: entry.git.submodules.recursive,
+                            max_depth: config.workspace_policy.max_submodule_depth,
+                            caller: context.caller,
+                            browser: context.browser,
+                        },
                     )
                     .await?
                 } else {
@@ -3398,28 +3400,32 @@ struct PendingWorkspaceSubmodules {
     discover_submodules: bool,
 }
 
+struct WorkspaceSubmoduleRequest<'a> {
+    repository: &'a GitRepositoryIdentity,
+    commit: &'a steward_types::direct_package::ExactGitCommit,
+    paths: &'a [WorkspacePath],
+    required: &'a [RelativePath],
+    recursive: bool,
+    max_depth: usize,
+    caller: Option<&'a TriggerRepository>,
+    browser: bool,
+}
+
 async fn resolve_workspace_submodules<L>(
     ledger: &L,
     config: &TaskApiConfig,
     git: &dyn DirectGitResolver,
-    repository: &GitRepositoryIdentity,
-    commit: &steward_types::direct_package::ExactGitCommit,
-    paths: &[WorkspacePath],
-    required: &[RelativePath],
-    recursive: bool,
-    max_depth: usize,
-    caller: Option<&TriggerRepository>,
-    browser: bool,
+    request: WorkspaceSubmoduleRequest<'_>,
 ) -> Result<WorkspaceSubmoduleResolution, ApiError>
 where
     L: TaskSubmissionLedger,
 {
     let mut pending = vec![PendingWorkspaceSubmodules {
-        repository: repository.clone(),
-        commit: commit.clone(),
+        repository: request.repository.clone(),
+        commit: request.commit.clone(),
         prefix: String::new(),
         depth: 0,
-        paths: paths.to_vec(),
+        paths: request.paths.to_vec(),
         discover_submodules: true,
     }];
     let mut resolved = Vec::new();
@@ -3499,8 +3505,8 @@ where
             if !workspace_repository_is_authorized(
                 ledger,
                 config,
-                caller,
-                browser,
+                request.caller,
+                request.browser,
                 &child_repository,
             )
             .await?
@@ -3520,8 +3526,8 @@ where
                 commit: Some(child_commit.clone()),
                 reason: None,
             });
-            if recursive {
-                if parent.depth >= max_depth {
+            if request.recursive {
+                if parent.depth >= request.max_depth {
                     return Err(ApiError::Admission(
                         "workspace_git_submodule_depth_exceeded".to_owned(),
                     ));
@@ -3552,7 +3558,8 @@ where
         .filter(|entry| entry.status == WorkspaceSubmoduleStatus::Materialized)
         .map(|entry| entry.path.as_str())
         .collect::<BTreeSet<_>>();
-    if required
+    if request
+        .required
         .iter()
         .any(|required| !materialized.contains(required.as_str()))
     {
