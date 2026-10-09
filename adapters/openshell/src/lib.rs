@@ -2940,6 +2940,7 @@ fn workspace_materialization_command(evidence: &WorkspaceEvidence) -> Result<Str
                 commit,
                 history,
                 paths,
+                submodules,
                 ..
             } => {
                 let destination = format!("/sandbox/workspace/{}", name.as_str());
@@ -2970,6 +2971,32 @@ fn workspace_materialization_command(evidence: &WorkspaceEvidence) -> Result<Str
                 command.push_str(&format!(
                     "git -C {destination} checkout -q -f refs/heads/steward; "
                 ));
+                for (submodule_index, submodule) in submodules.iter().enumerate() {
+                    if submodule.status
+                        != steward_types::direct_package::WorkspaceSubmoduleStatus::Materialized
+                    {
+                        continue;
+                    }
+                    let submodule_commit = submodule
+                        .commit
+                        .as_ref()
+                        .and_then(|commit| commit.as_str().strip_prefix("git:sha1:"))
+                        .ok_or_else(workspace_staging_rejected)?;
+                    let submodule_destination = shell_quote(&format!(
+                        "/sandbox/workspace/{}/{}",
+                        name.as_str(),
+                        submodule.path.as_str()
+                    ));
+                    let submodule_pack = shell_quote(&format!(
+                        "/sandbox/steward-workspace-source/submodules/{index}/{submodule_index}.pack"
+                    ));
+                    let submodule_shallow = shell_quote(&format!(
+                        "/sandbox/steward-workspace-source/submodules/{index}/{submodule_index}.shallow"
+                    ));
+                    command.push_str(&format!(
+                        "rm -rf {submodule_destination}; mkdir -p {submodule_destination}; git init -q {submodule_destination}; git -C {submodule_destination} index-pack --fix-thin --stdin < {submodule_pack} >/dev/null; if [ -f {submodule_shallow} ]; then cp {submodule_shallow} {submodule_destination}/.git/shallow; fi; git -C {submodule_destination} update-ref refs/heads/steward {submodule_commit}; git -C {submodule_destination} symbolic-ref HEAD refs/heads/steward; git -C {submodule_destination} checkout -q -f refs/heads/steward; rm -rf {submodule_destination}/.git; "
+                    ));
+                }
                 if *history == WorkspaceGitHistory::None {
                     command.push_str(&format!("rm -rf {destination}/.git; "));
                 }
@@ -3071,8 +3098,9 @@ mod tests {
     #[cfg(feature = "runtime")]
     use steward_types::direct_package::{
         ContentDigest, ExactGitCommit, ExecutionLogMode, RepositoryUrl, ResolvedWorkspaceEntry,
-        StableProviderId, WorkspaceAccess, WorkspaceEvidence, WorkspaceGitHistory, WorkspaceName,
-        WorkspacePath, canonical_json_bytes,
+        ResolvedWorkspaceSubmodule, StableProviderId, WorkspaceAccess, WorkspaceEvidence,
+        WorkspaceGitHistory, WorkspaceName, WorkspacePath, WorkspaceSubmoduleStatus,
+        canonical_json_bytes,
     };
     #[cfg(feature = "runtime")]
     use steward_types::{
@@ -3756,7 +3784,20 @@ mod tests {
             commit: ExactGitCommit::parse(format!("git:sha1:{}", "a".repeat(40)))?,
             history: WorkspaceGitHistory::None,
             paths: vec![WorkspacePath::parse("src/")?],
-            submodules: Vec::new(),
+            submodules: vec![ResolvedWorkspaceSubmodule {
+                path: steward_types::direct_package::RelativePath::parse("vendor/proto")?,
+                status: WorkspaceSubmoduleStatus::Materialized,
+                repository: Some(RepositoryUrl::parse(
+                    "https://github.example.test/example-org/proto.git",
+                )?),
+                repository_id: Some(StableProviderId::parse("789")?),
+                repository_owner_id: Some(StableProviderId::parse("456")?),
+                commit: Some(ExactGitCommit::parse(format!(
+                    "git:sha1:{}",
+                    "c".repeat(40)
+                ))?),
+                reason: None,
+            }],
             content_digest: ContentDigest::parse(format!("steward:sha256:{}", "b".repeat(64)))?,
         }];
         let digest = Sha256::digest(canonical_json_bytes(&entries)?);
@@ -3770,6 +3811,9 @@ mod tests {
         assert!(command.contains(&"a".repeat(40)));
         assert!(command.contains("sparse-checkout set --no-cone -- 'src/'"));
         assert!(command.contains("rm -rf '/sandbox/workspace/source'/.git"));
+        assert!(command.contains("submodules/0/0.pack"));
+        assert!(command.contains("'/sandbox/workspace/source/vendor/proto'"));
+        assert!(command.contains(&"c".repeat(40)));
         assert!(command.contains("chmod -R a-w '/sandbox/workspace/source'"));
         assert!(!command.contains("remote add"));
         assert!(!command.contains("github.example.test"));

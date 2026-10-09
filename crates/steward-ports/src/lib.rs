@@ -572,6 +572,31 @@ pub struct GitPack {
     pub bytes: Vec<u8>,
 }
 
+/// Exact, bounded request for the paths and object identities in one Git commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitTreeRequest {
+    pub repository: GitRepositoryIdentity,
+    pub commit: ExactGitCommit,
+    pub max_entries: usize,
+}
+
+/// One provider-neutral entry from an exact Git tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitTreeEntry {
+    pub path: RelativePath,
+    pub mode: String,
+    pub kind: String,
+    pub object: String,
+}
+
+/// The recursive tree of one exact commit, with repository identity revalidated after the read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitTree {
+    pub repository: GitRepositoryIdentity,
+    pub commit: ExactGitCommit,
+    pub entries: Vec<GitTreeEntry>,
+}
+
 /// Stable provider identifiers of one repository, without a mutable name.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GitRepositoryReference {
@@ -631,6 +656,17 @@ pub trait GitHostingPlane: Send + Sync + 'static {
         async {
             Err(PortError::Unsupported {
                 operation: "read_pack",
+            })
+        }
+    }
+
+    fn read_tree(
+        &self,
+        _request: &GitTreeRequest,
+    ) -> impl Future<Output = Result<GitTree, PortError>> + Send {
+        async {
+            Err(PortError::Unsupported {
+                operation: "read_tree",
             })
         }
     }

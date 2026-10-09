@@ -9,7 +9,8 @@ use reqwest::{Client, Response, StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use steward_ports::{
     GitFile, GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
-    GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, PortError,
+    GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree,
+    GitTreeEntry as PortGitTreeEntry, GitTreeRequest, PortError,
 };
 use steward_types::direct_package::{
     ExactGitCommit, MAX_PACKAGE_FILE_BYTES, RepositoryUrl, StableProviderId,
@@ -417,7 +418,7 @@ impl GitHubSourceAdapter {
         let components: Vec<&str> = request.path.as_str().split('/').collect();
         let mut tree_sha = commit.tree.sha;
         for (index, component) in components.iter().enumerate() {
-            let tree: GitTree = self
+            let tree: WireGitTree = self
                 .get_json(
                     &format!(
                         "{}/repos/{}/{}/git/trees/{}",
@@ -817,6 +818,84 @@ impl GitHostingPlane for GitHubSourceAdapter {
         })
     }
 
+    async fn read_tree(&self, request: &GitTreeRequest) -> Result<GitTree, PortError> {
+        if request.max_entries == 0 || request.max_entries > 100_000 {
+            return Err(rejected("Git tree entry bound is invalid"));
+        }
+        let coordinates =
+            RepositoryCoordinates::parse(&request.repository.repository, &self.clone_origin)?;
+        let authorized = self.authenticate_repository(&coordinates).await?;
+        if authorized.identity != request.repository {
+            return Err(rejected(
+                "GitHub repository stable identity does not match request",
+            ));
+        }
+        let commit_sha = request
+            .commit
+            .as_str()
+            .strip_prefix("git:sha1:")
+            .ok_or_else(|| rejected("exact Git commit is invalid"))?;
+        let commit: GitCommit = self
+            .get_json(
+                &format!(
+                    "{}/repos/{}/{}/git/commits/{}",
+                    self.api_origin, coordinates.owner, coordinates.name, commit_sha
+                ),
+                &authorized.token,
+                Authentication::Installation,
+                METADATA_RESPONSE_BYTES,
+                "read exact Git commit tree",
+            )
+            .await?;
+        if commit.sha != commit_sha || !valid_sha1(&commit.tree.sha) {
+            return Err(rejected("GitHub returned an inconsistent commit object"));
+        }
+        let tree: WireGitTree = self
+            .get_json(
+                &format!(
+                    "{}/repos/{}/{}/git/trees/{}?recursive=1",
+                    self.api_origin, coordinates.owner, coordinates.name, commit.tree.sha
+                ),
+                &authorized.token,
+                Authentication::Installation,
+                TREE_RESPONSE_BYTES,
+                "read recursive exact Git tree",
+            )
+            .await?;
+        if tree.sha != commit.tree.sha || tree.truncated || tree.tree.len() > request.max_entries {
+            return Err(rejected(
+                "GitHub returned an incomplete or oversized Git tree",
+            ));
+        }
+        let mut entries = Vec::with_capacity(tree.tree.len());
+        for entry in tree.tree {
+            if !valid_sha1(&entry.sha)
+                || !matches!(entry.kind.as_str(), "blob" | "tree" | "commit")
+                || !matches!(
+                    entry.mode.as_str(),
+                    "040000" | "100644" | "100755" | "120000" | "160000"
+                )
+            {
+                return Err(rejected("GitHub returned an invalid Git tree entry"));
+            }
+            entries.push(PortGitTreeEntry {
+                path: steward_types::direct_package::RelativePath::parse(entry.path)
+                    .map_err(|_| rejected("GitHub returned an invalid Git tree path"))?,
+                mode: entry.mode,
+                kind: entry.kind,
+                object: entry.sha,
+            });
+        }
+        entries.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
+        self.revalidate_repository(&coordinates, &authorized)
+            .await?;
+        Ok(GitTree {
+            repository: authorized.identity,
+            commit: request.commit.clone(),
+            entries,
+        })
+    }
+
     async fn resolve_revision(
         &self,
         request: &GitRevisionRequest,
@@ -1023,14 +1102,14 @@ struct GitObjectReference {
 }
 
 #[derive(Deserialize)]
-struct GitTree {
+struct WireGitTree {
     sha: String,
     truncated: bool,
-    tree: Vec<GitTreeEntry>,
+    tree: Vec<WireGitTreeEntry>,
 }
 
 #[derive(Deserialize)]
-struct GitTreeEntry {
+struct WireGitTreeEntry {
     path: String,
     mode: String,
     #[serde(rename = "type")]
@@ -1292,7 +1371,7 @@ mod tests {
     use serde_json::json;
     use steward_ports::{
         GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRepositoryReference,
-        GitRevisionRequest, PortError,
+        GitRevisionRequest, GitTreeRequest, PortError,
     };
     use steward_types::direct_package::{
         ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
@@ -1623,6 +1702,41 @@ mod tests {
                 .iter()
                 .all(|request| !request.contains("caller-credential"))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_bounded_recursive_tree_at_exact_commit() -> Result<(), String> {
+        let mut responses = authentication_responses();
+        responses.extend([
+            ResponseSpec::json(json!({"sha": COMMIT, "tree": {"sha": ROOT_TREE}})),
+            ResponseSpec::json(json!({
+                "sha": ROOT_TREE,
+                "truncated": false,
+                "tree": [
+                    {"path": ".gitmodules", "mode": "100644", "type": "blob", "sha": BLOB},
+                    {"path": "vendor/proto", "mode": "160000", "type": "commit", "sha": CATALOG_TREE}
+                ]
+            })),
+            metadata(1001, 1000, "example-org/source-a"),
+            installation(7001, 1000),
+        ]);
+        let mock = MockGitHub::start(responses)?;
+        let request = GitTreeRequest {
+            repository: identity(REPOSITORY, 1001, 1000)?,
+            commit: ExactGitCommit::parse(format!("git:sha1:{COMMIT}"))?,
+            max_entries: 4,
+        };
+        let tree = port(adapter(&mock)?.read_tree(&request).await)?;
+        assert_eq!(tree.repository, request.repository);
+        assert_eq!(tree.commit, request.commit);
+        assert_eq!(tree.entries.len(), 2);
+        assert_eq!(tree.entries[1].path.as_str(), "vendor/proto");
+        assert_eq!(tree.entries[1].mode, "160000");
+        assert_eq!(tree.entries[1].object, CATALOG_TREE);
+        let requests = mock.finish()?;
+        assert!(requests[3].contains(&format!("/git/commits/{COMMIT}")));
+        assert!(requests[4].contains(&format!("/git/trees/{ROOT_TREE}?recursive=1")));
         Ok(())
     }
 

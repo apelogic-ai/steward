@@ -3774,8 +3774,9 @@ mod tests {
     use steward_ports::{
         DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitFile,
         GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
-        GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, PortError,
-        TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
+        GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree, GitTreeEntry,
+        GitTreeRequest, PortError, TaskExecutionAdapter, TaskExecutionPlan,
+        TaskExecutionPlanRequest,
     };
     use steward_store::{
         AdminApprovalRecord, AdminEnvelopeProvisionRequest, AdminEnvelopeRequestRecord,
@@ -4027,6 +4028,7 @@ mod tests {
     struct FakeDirectGit {
         repositories: Arc<BTreeMap<String, GitRepositoryIdentity>>,
         files: Arc<BTreeMap<(String, String, String), Vec<u8>>>,
+        trees: Arc<BTreeMap<(String, String), Vec<GitTreeEntry>>>,
         wrong_object_path: Option<String>,
         reads: Arc<Mutex<Vec<(String, String, String)>>>,
     }
@@ -4138,6 +4140,24 @@ mod tests {
             })
         }
 
+        async fn read_tree(&self, request: &GitTreeRequest) -> Result<GitTree, PortError> {
+            let key = (
+                request.repository.repository.as_str().to_owned(),
+                request.commit.as_str().to_owned(),
+            );
+            let entries = self.trees.get(&key).cloned().unwrap_or_default();
+            if entries.len() > request.max_entries {
+                return Err(PortError::Rejected {
+                    reason: "deterministic fake tree exceeds its entry bound".to_owned(),
+                });
+            }
+            Ok(GitTree {
+                repository: request.repository.clone(),
+                commit: request.commit.clone(),
+                entries,
+            })
+        }
+
         async fn resolve_revision(
             &self,
             _request: &GitRevisionRequest,
@@ -4198,6 +4218,7 @@ mod tests {
                     b"Summarize the supplied repository evidence.\n".to_vec(),
                 ),
             ])),
+            trees: Arc::new(BTreeMap::new()),
             wrong_object_path: wrong_object_path.map(str::to_owned),
             reads: Arc::new(Mutex::new(Vec::new())),
         })
@@ -11336,6 +11357,7 @@ mod tests {
                 source_identity,
             )])),
             files: Arc::new(files),
+            trees: Arc::new(BTreeMap::new()),
             wrong_object_path: None,
             reads: Arc::new(Mutex::new(Vec::new())),
         })
@@ -11515,6 +11537,7 @@ mod tests {
         Ok(FakeDirectGit {
             repositories: Arc::new(BTreeMap::from([(repository.as_str().to_owned(), identity)])),
             files: Arc::new(files),
+            trees: Arc::new(BTreeMap::new()),
             wrong_object_path: None,
             reads: Arc::new(Mutex::new(Vec::new())),
         })
@@ -12714,6 +12737,154 @@ mod tests {
             material
                 .windows(b"PACKdeterministic-fixture".len())
                 .any(|window| { window == b"PACKdeterministic-fixture" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_resolves_required_admitted_submodule_at_exact_gitlink()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        ledger
+            .source_repository_bindings
+            .lock()
+            .map_err(|_| "fake source-repository binding lock was poisoned".to_owned())?
+            .push((
+                "7890".to_owned(),
+                "123456".to_owned(),
+                "7890".to_owned(),
+                "888888".to_owned(),
+            ));
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "submodules": {
+                    "mode": "admitted",
+                    "required": ["vendor/proto"]
+                }
+            }
+        }]);
+        let mut git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let caller = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
+        let child = RepositoryUrl::parse("https://github.com/example-org/proto.git")?;
+        Arc::make_mut(&mut git.repositories).insert(
+            child.as_str().to_owned(),
+            GitRepositoryIdentity {
+                repository: child,
+                repository_id: StableProviderId::parse("888888")?,
+                repository_owner_id: StableProviderId::parse("7890")?,
+            },
+        );
+        let parent_commit = format!("git:sha1:{}", "c".repeat(40));
+        Arc::make_mut(&mut git.files).insert(
+            (
+                caller.as_str().to_owned(),
+                parent_commit.clone(),
+                ".gitmodules".to_owned(),
+            ),
+            b"[submodule \"proto\"]\n  path = vendor/proto\n  url = https://github.com/example-org/proto.git\n"
+                .to_vec(),
+        );
+        Arc::make_mut(&mut git.trees).insert(
+            (caller.as_str().to_owned(), parent_commit),
+            vec![
+                GitTreeEntry {
+                    path: steward_types::direct_package::RelativePath::parse(".gitmodules")?,
+                    mode: "100644".to_owned(),
+                    kind: "blob".to_owned(),
+                    object: "b".repeat(40),
+                },
+                GitTreeEntry {
+                    path: steward_types::direct_package::RelativePath::parse("vendor/proto")?,
+                    mode: "160000".to_owned(),
+                    kind: "commit".to_owned(),
+                    object: "d".repeat(40),
+                },
+            ],
+        );
+        let app = direct_test_app(ledger.clone(), git)?;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-workspace-submodule")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build submodule workspace request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit submodule workspace request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let task_uid = {
+            let tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?;
+            let submodule = tasks[0]
+                .direct_task_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.workspace.as_ref())
+                .and_then(|workspace| workspace.entries.first())
+                .and_then(|entry| match entry {
+                    steward_types::direct_package::ResolvedWorkspaceEntry::Git {
+                        submodules,
+                        ..
+                    } => submodules.first(),
+                    _ => None,
+                })
+                .ok_or_else(|| "workspace evidence omitted the submodule".to_owned())?;
+            assert_eq!(submodule.path.as_str(), "vendor/proto");
+            assert_eq!(
+                submodule.status,
+                steward_types::direct_package::WorkspaceSubmoduleStatus::Materialized
+            );
+            let expected_submodule_commit = format!("git:sha1:{}", "d".repeat(40));
+            assert_eq!(
+                submodule.commit.as_ref().map(ExactGitCommit::as_str),
+                Some(expected_submodule_commit.as_str())
+            );
+            tasks[0].task_uid
+        };
+        let upload = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/tasks/{task_uid}/inputs"))
+                    .header("authorization", "Bearer github-assertion")
+                    .header("content-type", "application/x-tar")
+                    .body(Body::from(Vec::<u8>::new()))
+                    .map_err(|error| format!("build submodule input upload: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("upload submodule workspace inputs: {error}"))?;
+        assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+        let stored = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake task ledger lock was poisoned")?[0]
+            .input_archive
+            .clone()
+            .ok_or_else(|| "workspace input frame was not stored".to_owned())?;
+        let parts = steward_types::task_input_archive::split_task_input_archive(&stored)
+            .map_err(|error| format!("split submodule workspace input frame: {error:?}"))?;
+        let material = parts
+            .workspace_archive
+            .ok_or_else(|| "submodule workspace material was not framed".to_owned())?;
+        assert!(
+            material
+                .windows(b"submodules/0/0.pack".len())
+                .any(|window| window == b"submodules/0/0.pack")
         );
         Ok(())
     }

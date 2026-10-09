@@ -27,7 +27,7 @@ use steward_admission::{
 };
 use steward_ports::{
     GitFile, GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
-    GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest,
+    GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree, GitTreeRequest,
     MAX_TASK_INPUT_ARCHIVE_BYTES, TaskExecutionAdapter, TaskExecutionPlanRequest,
 };
 use steward_store::{
@@ -42,9 +42,10 @@ use steward_types::direct_package::{
     DirectTaskSubmission, EnvelopeDigest, EnvelopeEvidence, ExecutionLogMode, InstructionSkill,
     InvocationKind, InvocationManifest, PACKAGE_CLOSURE_CONTRACT_VERSION, PackageClosure,
     PackageCommit, PromptSourceKind, RelativePath, RepositoryUrl, ResolvedSource,
-    ResolvedWorkspaceEntry, SourceProvenance, StableProviderId, TASK_BINDING_EVIDENCE_SCHEMA,
-    TaskOrigin, TriggerRepository, WorkspaceEntry, WorkspaceEvidence, WorkspaceGitHistory,
-    WorkspaceGitRepository, WorkspaceName, WorkspaceSubmoduleMode, canonical_json_bytes,
+    ResolvedWorkspaceEntry, ResolvedWorkspaceSubmodule, SourceProvenance, StableProviderId,
+    TASK_BINDING_EVIDENCE_SCHEMA, TaskOrigin, TriggerRepository, WorkspaceEntry, WorkspaceEvidence,
+    WorkspaceGitHistory, WorkspaceGitRepository, WorkspaceName, WorkspaceSubmoduleMode,
+    WorkspaceSubmoduleStatus, canonical_json_bytes,
 };
 use steward_types::task_input_archive::{frame_task_input_archive, split_task_input_archive};
 use steward_types::task_output_archive::{
@@ -209,6 +210,11 @@ trait DirectGitResolver: Send + Sync {
         &'a self,
         request: &'a GitPackRequest,
     ) -> BoxFuture<'a, Result<GitPack, steward_ports::PortError>>;
+
+    fn read_tree<'a>(
+        &'a self,
+        request: &'a GitTreeRequest,
+    ) -> BoxFuture<'a, Result<GitTree, steward_ports::PortError>>;
 }
 
 impl<G> DirectGitResolver for G
@@ -251,6 +257,13 @@ where
         request: &'a GitPackRequest,
     ) -> BoxFuture<'a, Result<GitPack, steward_ports::PortError>> {
         Box::pin(GitHostingPlane::read_pack(self, request))
+    }
+
+    fn read_tree<'a>(
+        &'a self,
+        request: &'a GitTreeRequest,
+    ) -> BoxFuture<'a, Result<GitTree, steward_ports::PortError>> {
+        Box::pin(GitHostingPlane::read_tree(self, request))
     }
 }
 
@@ -2917,11 +2930,6 @@ where
     for entry in entries {
         let resolved_entry = match entry {
             WorkspaceEntry::Git(entry) => {
-                if entry.git.submodules.mode == WorkspaceSubmoduleMode::Admitted {
-                    return Err(ApiError::Admission(
-                        "workspace_git_submodules_not_supported".to_owned(),
-                    ));
-                }
                 let (repository, is_self) = match &entry.git.repository {
                     WorkspaceGitRepository::SelfRepository => (
                         context.self_repository.cloned().ok_or_else(|| {
@@ -2989,6 +2997,22 @@ where
                         .await
                         .map_err(source_port_error)?,
                 };
+                let submodules = if entry.git.submodules.mode == WorkspaceSubmoduleMode::Admitted {
+                    resolve_workspace_submodules(
+                        ledger,
+                        config,
+                        git.as_ref(),
+                        &repository,
+                        &commit,
+                        &entry.git.submodules.required,
+                        entry.git.submodules.recursive,
+                        context.caller,
+                        context.browser,
+                    )
+                    .await?
+                } else {
+                    Vec::new()
+                };
                 let content_digest = workspace_entry_digest(&serde_json::json!({
                     "type": "git",
                     "name": name,
@@ -2999,7 +3023,7 @@ where
                     "commit": commit,
                     "history": entry.git.history,
                     "paths": entry.git.paths,
-                    "submodules": entry.git.submodules,
+                    "submodules": submodules,
                     "limits": entry.git.limits,
                 }))?;
                 ResolvedWorkspaceEntry::Git {
@@ -3011,7 +3035,7 @@ where
                     commit,
                     history: entry.git.history.clone(),
                     paths: entry.git.paths.clone(),
-                    submodules: Vec::new(),
+                    submodules,
                     content_digest,
                 }
             }
@@ -3048,6 +3072,314 @@ where
     };
     evidence.validate().map_err(ApiError::Admission)?;
     Ok(Some(evidence))
+}
+
+const MAX_WORKSPACE_GIT_TREE_ENTRIES: usize = 100_000;
+const MAX_WORKSPACE_SUBMODULE_DEPTH: usize = 4;
+const MAX_GITMODULES_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone)]
+struct PendingWorkspaceSubmodules {
+    repository: GitRepositoryIdentity,
+    commit: steward_types::direct_package::ExactGitCommit,
+    prefix: String,
+    depth: usize,
+}
+
+async fn resolve_workspace_submodules<L>(
+    ledger: &L,
+    config: &TaskApiConfig,
+    git: &dyn DirectGitResolver,
+    repository: &GitRepositoryIdentity,
+    commit: &steward_types::direct_package::ExactGitCommit,
+    required: &[RelativePath],
+    recursive: bool,
+    caller: Option<&TriggerRepository>,
+    browser: bool,
+) -> Result<Vec<ResolvedWorkspaceSubmodule>, ApiError>
+where
+    L: TaskSubmissionLedger,
+{
+    let mut pending = vec![PendingWorkspaceSubmodules {
+        repository: repository.clone(),
+        commit: commit.clone(),
+        prefix: String::new(),
+        depth: 0,
+    }];
+    let mut resolved = Vec::new();
+    while let Some(parent) = pending.pop() {
+        let tree = git
+            .read_tree(&GitTreeRequest {
+                repository: parent.repository.clone(),
+                commit: parent.commit.clone(),
+                max_entries: MAX_WORKSPACE_GIT_TREE_ENTRIES,
+            })
+            .await
+            .map_err(source_port_error)?;
+        if tree.repository != parent.repository || tree.commit != parent.commit {
+            return Err(ApiError::Admission(
+                "workspace_git_tree_identity_mismatch".to_owned(),
+            ));
+        }
+        let gitmodules_path = RelativePath::parse(".gitmodules").map_err(ApiError::Admission)?;
+        let has_gitmodules = tree.entries.iter().any(|entry| {
+            entry.path == gitmodules_path
+                && entry.kind == "blob"
+                && matches!(entry.mode.as_str(), "100644" | "100755")
+        });
+        let modules = if has_gitmodules {
+            let file = git
+                .read_file(&GitFileRequest {
+                    repository: parent.repository.clone(),
+                    commit: parent.commit.clone(),
+                    path: gitmodules_path,
+                    max_bytes: MAX_GITMODULES_BYTES,
+                })
+                .await
+                .map_err(source_port_error)?;
+            if file.repository != parent.repository || file.commit != parent.commit {
+                return Err(ApiError::Admission(
+                    "workspace_git_submodule_manifest_identity_mismatch".to_owned(),
+                ));
+            }
+            parse_gitmodules(&file.bytes)?
+        } else {
+            Vec::new()
+        };
+        let gitlinks = tree
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == "commit" && entry.mode == "160000")
+            .map(|entry| (entry.path.as_str(), entry.object.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        for (module_path, module_url) in modules {
+            let full_path = prefixed_workspace_path(&parent.prefix, module_path.as_str())?;
+            let Some(object) = gitlinks.get(module_path.as_str()) else {
+                resolved.push(skipped_workspace_submodule(full_path, "gitlink_missing")?);
+                continue;
+            };
+            let child_commit =
+                steward_types::direct_package::ExactGitCommit::parse(format!("git:sha1:{object}"))
+                    .map_err(|_| {
+                        ApiError::Admission("workspace_git_submodule_gitlink_invalid".to_owned())
+                    })?;
+            let child_url = match workspace_submodule_repository_url(
+                &parent.repository.repository,
+                &module_url,
+            ) {
+                Ok(value) => value,
+                Err(reason) => {
+                    resolved.push(skipped_workspace_submodule(full_path, reason)?);
+                    continue;
+                }
+            };
+            let child_repository = match git.resolve_repository(&child_url).await {
+                Ok(value) => value,
+                Err(_) => {
+                    resolved.push(skipped_workspace_submodule(
+                        full_path,
+                        "repository_unavailable",
+                    )?);
+                    continue;
+                }
+            };
+            if !workspace_repository_is_authorized(
+                ledger,
+                config,
+                caller,
+                browser,
+                &child_repository,
+            )
+            .await?
+            {
+                resolved.push(skipped_workspace_submodule(
+                    full_path,
+                    "repository_not_admitted",
+                )?);
+                continue;
+            }
+            resolved.push(ResolvedWorkspaceSubmodule {
+                path: full_path.clone(),
+                status: WorkspaceSubmoduleStatus::Materialized,
+                repository: Some(child_repository.repository.clone()),
+                repository_id: Some(child_repository.repository_id.clone()),
+                repository_owner_id: Some(child_repository.repository_owner_id.clone()),
+                commit: Some(child_commit.clone()),
+                reason: None,
+            });
+            if recursive {
+                if parent.depth >= MAX_WORKSPACE_SUBMODULE_DEPTH {
+                    return Err(ApiError::Admission(
+                        "workspace_git_submodule_depth_exceeded".to_owned(),
+                    ));
+                }
+                pending.push(PendingWorkspaceSubmodules {
+                    repository: child_repository,
+                    commit: child_commit,
+                    prefix: full_path.as_str().to_owned(),
+                    depth: parent.depth + 1,
+                });
+            }
+        }
+    }
+    resolved.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
+    let materialized = resolved
+        .iter()
+        .filter(|entry| entry.status == WorkspaceSubmoduleStatus::Materialized)
+        .map(|entry| entry.path.as_str())
+        .collect::<BTreeSet<_>>();
+    if required
+        .iter()
+        .any(|required| !materialized.contains(required.as_str()))
+    {
+        return Err(ApiError::Admission(
+            "workspace_git_required_submodule_unavailable".to_owned(),
+        ));
+    }
+    Ok(resolved)
+}
+
+fn parse_gitmodules(bytes: &[u8]) -> Result<Vec<(RelativePath, String)>, ApiError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| ApiError::Admission("workspace_git_submodule_manifest_invalid".to_owned()))?;
+    let mut modules = Vec::new();
+    let mut path = None;
+    let mut url = None;
+    let mut in_section = false;
+    let flush = |modules: &mut Vec<(RelativePath, String)>,
+                 path: &mut Option<RelativePath>,
+                 url: &mut Option<String>,
+                 in_section: bool|
+     -> Result<(), ApiError> {
+        if !in_section {
+            return Ok(());
+        }
+        let path = path.take().ok_or_else(|| {
+            ApiError::Admission("workspace_git_submodule_manifest_invalid".to_owned())
+        })?;
+        let url = url.take().ok_or_else(|| {
+            ApiError::Admission("workspace_git_submodule_manifest_invalid".to_owned())
+        })?;
+        modules.push((path, url));
+        Ok(())
+    };
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        if line.starts_with("[submodule \"") && line.ends_with("\"]") {
+            flush(&mut modules, &mut path, &mut url, in_section)?;
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            return Err(ApiError::Admission(
+                "workspace_git_submodule_manifest_invalid".to_owned(),
+            ));
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(ApiError::Admission(
+                "workspace_git_submodule_manifest_invalid".to_owned(),
+            ));
+        };
+        match key.trim() {
+            "path" if path.is_none() => {
+                path = Some(RelativePath::parse(value.trim().to_owned()).map_err(|_| {
+                    ApiError::Admission("workspace_git_submodule_manifest_invalid".to_owned())
+                })?);
+            }
+            "url" if url.is_none() && !value.trim().is_empty() => {
+                url = Some(value.trim().to_owned());
+            }
+            "branch" | "update" | "ignore" | "shallow" => {}
+            _ => {
+                return Err(ApiError::Admission(
+                    "workspace_git_submodule_manifest_invalid".to_owned(),
+                ));
+            }
+        }
+    }
+    flush(&mut modules, &mut path, &mut url, in_section)?;
+    let mut paths = BTreeSet::new();
+    if modules
+        .iter()
+        .any(|(path, _)| !paths.insert(path.as_str().to_owned()))
+    {
+        return Err(ApiError::Admission(
+            "workspace_git_submodule_manifest_invalid".to_owned(),
+        ));
+    }
+    Ok(modules)
+}
+
+fn prefixed_workspace_path(prefix: &str, path: &str) -> Result<RelativePath, ApiError> {
+    let value = if prefix.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{prefix}/{path}")
+    };
+    RelativePath::parse(value)
+        .map_err(|_| ApiError::Admission("workspace_git_submodule_path_invalid".to_owned()))
+}
+
+fn skipped_workspace_submodule(
+    path: RelativePath,
+    reason: &str,
+) -> Result<ResolvedWorkspaceSubmodule, ApiError> {
+    Ok(ResolvedWorkspaceSubmodule {
+        path,
+        status: WorkspaceSubmoduleStatus::Skipped,
+        repository: None,
+        repository_id: None,
+        repository_owner_id: None,
+        commit: None,
+        reason: Some(BoundedText::parse(reason.to_owned()).map_err(ApiError::Admission)?),
+    })
+}
+
+fn workspace_submodule_repository_url(
+    parent: &RepositoryUrl,
+    value: &str,
+) -> Result<RepositoryUrl, &'static str> {
+    let parent = parent
+        .as_str()
+        .strip_prefix("https://")
+        .and_then(|value| value.strip_suffix(".git"))
+        .ok_or("repository_url_invalid")?;
+    let (host, parent_path) = parent.split_once('/').ok_or("repository_url_invalid")?;
+    let candidate = if let Some(rest) = value.strip_prefix("https://") {
+        let (candidate_host, _) = rest.split_once('/').ok_or("url_not_supported")?;
+        if candidate_host != host {
+            return Err("foreign_host");
+        }
+        value.to_owned()
+    } else if let Some(rest) = value.strip_prefix("git@") {
+        let (candidate_host, path) = rest.split_once(':').ok_or("url_not_supported")?;
+        if candidate_host != host {
+            return Err("foreign_host");
+        }
+        format!("https://{host}/{path}")
+    } else if value.starts_with("./") || value.starts_with("../") {
+        let mut components = parent_path
+            .split('/')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        components.pop();
+        for component in value.split('/') {
+            match component {
+                "." | "" => {}
+                ".." => {
+                    components.pop().ok_or("url_not_supported")?;
+                }
+                component => components.push(component.to_owned()),
+            }
+        }
+        format!("https://{host}/{}", components.join("/"))
+    } else {
+        return Err("url_not_supported");
+    };
+    RepositoryUrl::parse(candidate).map_err(|_| "url_not_supported")
 }
 
 async fn describe_workspace_repository(
@@ -3480,59 +3812,73 @@ async fn prepare_task_input_archive(
             repository_owner_id,
             commit,
             history,
+            submodules,
             ..
         } = entry
         else {
             continue;
         };
-        let reserved = caller_archive
-            .len()
-            .checked_add(material.len())
-            .and_then(|value| value.checked_add(4096))
-            .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
-        let remaining = MAX_TASK_INPUT_ARCHIVE_BYTES
-            .checked_sub(reserved)
-            .filter(|value| *value > 0)
-            .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
         let depth = match history {
             WorkspaceGitHistory::None => Some(1),
             WorkspaceGitHistory::Depth(depth) => Some(*depth),
             WorkspaceGitHistory::Full => None,
         };
-        let request = GitPackRequest {
-            repository: GitRepositoryIdentity {
-                repository: repository.clone(),
-                repository_id: repository_id.clone(),
-                repository_owner_id: repository_owner_id.clone(),
+        append_workspace_git_pack(
+            git.as_ref(),
+            caller_archive.len(),
+            &mut material,
+            &format!("packs/{index}.pack"),
+            &format!("shallow/{index}"),
+            GitPackRequest {
+                repository: GitRepositoryIdentity {
+                    repository: repository.clone(),
+                    repository_id: repository_id.clone(),
+                    repository_owner_id: repository_owner_id.clone(),
+                },
+                commit: commit.clone(),
+                depth,
+                max_bytes: 1,
             },
-            commit: commit.clone(),
-            depth,
-            max_bytes: remaining as u64,
-        };
-        let pack = git.read_pack(&request).await.map_err(source_port_error)?;
-        if pack.repository != request.repository || pack.commit != request.commit {
-            return Err(ApiError::Admission(
-                "workspace_git_pack_identity_mismatch".to_owned(),
-            ));
-        }
-        append_workspace_tar_file(&mut material, &format!("packs/{index}.pack"), &pack.bytes)?;
-        if !pack.shallow.is_empty() {
-            let shallow = pack
-                .shallow
-                .iter()
-                .map(|commit| {
-                    commit
-                        .as_str()
-                        .strip_prefix("git:sha1:")
-                        .unwrap_or(commit.as_str())
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            append_workspace_tar_file(
+        )
+        .await?;
+        for (submodule_index, submodule) in submodules.iter().enumerate() {
+            if submodule.status != WorkspaceSubmoduleStatus::Materialized {
+                continue;
+            }
+            append_workspace_git_pack(
+                git.as_ref(),
+                caller_archive.len(),
                 &mut material,
-                &format!("shallow/{index}"),
-                format!("{shallow}\n").as_bytes(),
-            )?;
+                &format!("submodules/{index}/{submodule_index}.pack"),
+                &format!("submodules/{index}/{submodule_index}.shallow"),
+                GitPackRequest {
+                    repository: GitRepositoryIdentity {
+                        repository: submodule.repository.clone().ok_or_else(|| {
+                            ApiError::Admission(
+                                "workspace submodule evidence is invalid".to_owned(),
+                            )
+                        })?,
+                        repository_id: submodule.repository_id.clone().ok_or_else(|| {
+                            ApiError::Admission(
+                                "workspace submodule evidence is invalid".to_owned(),
+                            )
+                        })?,
+                        repository_owner_id: submodule.repository_owner_id.clone().ok_or_else(
+                            || {
+                                ApiError::Admission(
+                                    "workspace submodule evidence is invalid".to_owned(),
+                                )
+                            },
+                        )?,
+                    },
+                    commit: submodule.commit.clone().ok_or_else(|| {
+                        ApiError::Admission("workspace submodule evidence is invalid".to_owned())
+                    })?,
+                    depth: Some(1),
+                    max_bytes: 1,
+                },
+            )
+            .await?;
         }
     }
     material.extend_from_slice(&[0_u8; 1024]);
@@ -3542,6 +3888,47 @@ async fn prepare_task_input_archive(
         return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
     }
     Ok(framed)
+}
+
+async fn append_workspace_git_pack(
+    git: &dyn DirectGitResolver,
+    caller_archive_len: usize,
+    material: &mut Vec<u8>,
+    pack_path: &str,
+    shallow_path: &str,
+    mut request: GitPackRequest,
+) -> Result<(), ApiError> {
+    let reserved = caller_archive_len
+        .checked_add(material.len())
+        .and_then(|value| value.checked_add(4096))
+        .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
+    let remaining = MAX_TASK_INPUT_ARCHIVE_BYTES
+        .checked_sub(reserved)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
+    request.max_bytes = remaining as u64;
+    let pack = git.read_pack(&request).await.map_err(source_port_error)?;
+    if pack.repository != request.repository || pack.commit != request.commit {
+        return Err(ApiError::Admission(
+            "workspace_git_pack_identity_mismatch".to_owned(),
+        ));
+    }
+    append_workspace_tar_file(material, pack_path, &pack.bytes)?;
+    if !pack.shallow.is_empty() {
+        let shallow = pack
+            .shallow
+            .iter()
+            .map(|commit| {
+                commit
+                    .as_str()
+                    .strip_prefix("git:sha1:")
+                    .unwrap_or(commit.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        append_workspace_tar_file(material, shallow_path, format!("{shallow}\n").as_bytes())?;
+    }
+    Ok(())
 }
 
 fn append_workspace_tar_file(
