@@ -494,6 +494,8 @@ pub struct BrowserTaskEvidence {
     pub inline_files: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub diagnostics: DiagnosticsRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceEvidence>,
     #[serde(default, skip_serializing_if = "PromptSourceKind::is_path")]
     pub prompt_source: PromptSourceKind,
 }
@@ -522,6 +524,9 @@ impl BrowserTaskEvidence {
             .ok_or_else(|| "browser package closure is missing".to_owned())?;
         closure.validate()?;
         validate_prompt_source(self.prompt_source, closure)?;
+        if let Some(workspace) = &self.workspace {
+            workspace.validate()?;
+        }
         if closure.entry_point != self.path {
             return Err("browser package path differs from its closure entry point".to_owned());
         }
@@ -1049,9 +1054,7 @@ impl<'de> Deserialize<'de> for WorkspaceGitHistory {
         #[serde(untagged)]
         enum Wire {
             Mode(String),
-            Depth {
-                depth: u32,
-            },
+            Depth { depth: u32 },
         }
         match Wire::deserialize(deserializer)? {
             Wire::Mode(mode) if mode == "none" => Ok(Self::None),
@@ -1084,9 +1087,7 @@ impl WorkspaceGitSubmodules {
         if self.mode == WorkspaceSubmoduleMode::None
             && (!self.required.is_empty() || self.recursive)
         {
-            return Err(
-                "workspace git submodule requirements require mode admitted".to_owned(),
-            );
+            return Err("workspace git submodule requirements require mode admitted".to_owned());
         }
         Ok(())
     }
@@ -1519,6 +1520,8 @@ pub struct DirectTaskBindingEvidence {
     pub envelope: EnvelopeEvidence,
     pub effective_requirements: DirectRequirements,
     pub diagnostics: DiagnosticsRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceEvidence>,
     #[serde(default, skip_serializing_if = "PromptSourceKind::is_path")]
     pub prompt_source: PromptSourceKind,
 }
@@ -1533,6 +1536,9 @@ impl DirectTaskBindingEvidence {
         self.source_provenance.validate()?;
         self.closure.validate()?;
         validate_prompt_source(self.prompt_source, &self.closure)?;
+        if let Some(workspace) = &self.workspace {
+            workspace.validate()?;
+        }
         self.effective_requirements.validate()?;
         if self.envelope.revision == 0 {
             return Err("Envelope evidence revision must be positive".to_owned());
@@ -1583,6 +1589,139 @@ impl DirectTaskBindingEvidence {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceEvidence {
+    pub entries: Vec<ResolvedWorkspaceEntry>,
+    pub workspace_digest: ContentDigest,
+}
+
+impl WorkspaceEvidence {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.entries.is_empty() || self.entries.len() > 32 {
+            return Err("workspace evidence entry count is outside the allowed bounds".to_owned());
+        }
+        let mut names = BTreeSet::new();
+        for entry in &self.entries {
+            entry.validate()?;
+            if !names.insert(entry.name().as_str()) {
+                return Err(format!(
+                    "duplicate resolved workspace entry name {}",
+                    entry.name().as_str()
+                ));
+            }
+        }
+        let digest = Sha256::digest(canonical_json_bytes(&self.entries)?);
+        if self.workspace_digest.as_str() != format!("steward:sha256:{digest:x}") {
+            return Err("workspace digest does not match its resolved entries".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ResolvedWorkspaceEntry {
+    Git {
+        name: WorkspaceName,
+        access: WorkspaceAccess,
+        repository: RepositoryUrl,
+        repository_id: StableProviderId,
+        repository_owner_id: StableProviderId,
+        commit: ExactGitCommit,
+        history: WorkspaceGitHistory,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<WorkspacePath>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        submodules: Vec<ResolvedWorkspaceSubmodule>,
+        content_digest: ContentDigest,
+    },
+    Scratch {
+        name: WorkspaceName,
+        size: ResourceQuantity,
+        content_digest: ContentDigest,
+    },
+}
+
+impl ResolvedWorkspaceEntry {
+    pub fn name(&self) -> &WorkspaceName {
+        match self {
+            Self::Git { name, .. } | Self::Scratch { name, .. } => name,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Git {
+                history,
+                paths,
+                submodules,
+                ..
+            } => {
+                history.validate()?;
+                require_unique_values(paths, "resolved workspace path")?;
+                let mut submodule_paths = BTreeSet::new();
+                for submodule in submodules {
+                    submodule.validate()?;
+                    if !submodule_paths.insert(submodule.path.as_str()) {
+                        return Err(format!(
+                            "duplicate resolved workspace submodule {}",
+                            submodule.path.as_str()
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Self::Scratch { .. } => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolvedWorkspaceSubmodule {
+    pub path: RelativePath,
+    pub status: WorkspaceSubmoduleStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<RepositoryUrl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<StableProviderId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_owner_id: Option<StableProviderId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<ExactGitCommit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<BoundedText>,
+}
+
+impl ResolvedWorkspaceSubmodule {
+    fn validate(&self) -> Result<(), String> {
+        let has_identity = self.repository.is_some()
+            && self.repository_id.is_some()
+            && self.repository_owner_id.is_some()
+            && self.commit.is_some();
+        match self.status {
+            WorkspaceSubmoduleStatus::Materialized if has_identity && self.reason.is_none() => {
+                Ok(())
+            }
+            WorkspaceSubmoduleStatus::Skipped if !has_identity && self.reason.is_some() => Ok(()),
+            _ => Err("resolved workspace submodule evidence is inconsistent".to_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSubmoduleStatus {
+    Materialized,
+    Skipped,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]

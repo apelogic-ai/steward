@@ -12,6 +12,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
+use futures::StreamExt as _;
 use jsonwebtoken::jwk::{Jwk, JwkSet, KeyAlgorithm, PublicKeyUse};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 #[cfg(test)]
@@ -25,9 +26,9 @@ use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec, evaluate_with_grants,
 };
 use steward_ports::{
-    GitFile, GitFileRequest, GitHostingPlane, GitRepositoryDescription, GitRepositoryIdentity,
-    GitRepositoryReference, GitRevisionRequest, MAX_TASK_INPUT_ARCHIVE_BYTES, TaskExecutionAdapter,
-    TaskExecutionPlanRequest,
+    GitFile, GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
+    GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest,
+    MAX_TASK_INPUT_ARCHIVE_BYTES, TaskExecutionAdapter, TaskExecutionPlanRequest,
 };
 use steward_store::{
     EnvelopeRequestRecord, FederatedSubjectObservation, FederatedSubjectRecord, PgStore,
@@ -40,10 +41,12 @@ use steward_types::direct_package::{
     DirectTaskBindingEvidence, DirectTaskDefinition, DirectTaskPhase, DirectTaskStatusResponse,
     DirectTaskSubmission, EnvelopeDigest, EnvelopeEvidence, ExecutionLogMode, InstructionSkill,
     InvocationKind, InvocationManifest, PACKAGE_CLOSURE_CONTRACT_VERSION, PackageClosure,
-    PackageCommit, PromptSourceKind, RelativePath, RepositoryUrl, ResolvedSource, SourceProvenance,
-    StableProviderId, TASK_BINDING_EVIDENCE_SCHEMA, TaskOrigin, TriggerRepository,
-    canonical_json_bytes,
+    PackageCommit, PromptSourceKind, RelativePath, RepositoryUrl, ResolvedSource,
+    ResolvedWorkspaceEntry, SourceProvenance, StableProviderId, TASK_BINDING_EVIDENCE_SCHEMA,
+    TaskOrigin, TriggerRepository, WorkspaceEntry, WorkspaceEvidence, WorkspaceGitHistory,
+    WorkspaceGitRepository, WorkspaceName, WorkspaceSubmoduleMode, canonical_json_bytes,
 };
+use steward_types::task_input_archive::{frame_task_input_archive, split_task_input_archive};
 use steward_types::task_output_archive::{
     TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputTranscriptError,
     task_output_archive_with_execution_transcript,
@@ -146,6 +149,7 @@ struct DirectTaskPreAdmission {
     spec: AgentRuntimeSpec,
     command: Vec<String>,
     execution_binding: TaskExecutionBinding,
+    workspace: Option<WorkspaceEvidence>,
 }
 
 struct BrowserTaskPreAdmission {
@@ -155,6 +159,13 @@ struct BrowserTaskPreAdmission {
     spec: AgentRuntimeSpec,
     command: Vec<String>,
     execution_binding: TaskExecutionBinding,
+}
+
+struct WorkspaceResolutionContext<'a> {
+    self_repository: Option<&'a GitRepositoryIdentity>,
+    trigger_commit: Option<&'a steward_types::direct_package::ExactGitCommit>,
+    caller: Option<&'a TriggerRepository>,
+    browser: bool,
 }
 
 /// `(index, result)` pairs in completion order, at most one per requested repository.
@@ -193,6 +204,11 @@ trait DirectGitResolver: Send + Sync {
         'a,
         Result<steward_types::direct_package::ExactGitCommit, steward_ports::PortError>,
     >;
+
+    fn read_pack<'a>(
+        &'a self,
+        request: &'a GitPackRequest,
+    ) -> BoxFuture<'a, Result<GitPack, steward_ports::PortError>>;
 }
 
 impl<G> DirectGitResolver for G
@@ -228,6 +244,13 @@ where
         Result<steward_types::direct_package::ExactGitCommit, steward_ports::PortError>,
     > {
         Box::pin(GitHostingPlane::resolve_revision(self, request))
+    }
+
+    fn read_pack<'a>(
+        &'a self,
+        request: &'a GitPackRequest,
+    ) -> BoxFuture<'a, Result<GitPack, steward_ports::PortError>> {
+        Box::pin(GitHostingPlane::read_pack(self, request))
     }
 }
 
@@ -2131,6 +2154,44 @@ where
         Ok(identity) => identity,
         Err(error) => return error.into_response(),
     };
+    let record = match state
+        .application
+        .ledger
+        .task_for_submitter(
+            task_uid,
+            &identity.service,
+            identity.canonical_user_id.as_str(),
+        )
+        .await
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => return ApiError::Store(StoreError::TaskNotFound).into_response(),
+        Err(error) => return ApiError::Store(error).into_response(),
+    };
+    if let Some(existing) = record.input_archive.as_deref() {
+        let matches = split_task_input_archive(existing)
+            .is_ok_and(|parts| parts.caller_archive == archive.as_ref());
+        return if matches {
+            StatusCode::NO_CONTENT.into_response()
+        } else {
+            ApiError::Store(StoreError::InvalidTaskTransition).into_response()
+        };
+    }
+    let workspace = record
+        .direct_task_evidence
+        .as_ref()
+        .and_then(|evidence| evidence.workspace.as_ref())
+        .or_else(|| {
+            record
+                .browser_task_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.workspace.as_ref())
+        });
+    let archive =
+        match prepare_task_input_archive(&state.application.config, &archive, workspace).await {
+            Ok(archive) => archive,
+            Err(error) => return error.into_response(),
+        };
     match state
         .application
         .ledger
@@ -2138,7 +2199,7 @@ where
             task_uid,
             &identity.service,
             identity.canonical_user_id.as_str(),
-            &archive,
+            archive.as_ref(),
         )
         .await
     {
@@ -2215,7 +2276,13 @@ where
                 .await
                 .map_err(|error| self.browser_task_persistence_error(error))?
         };
-        let input_archive = browser_inputs_archive(&request.inputs)?;
+        let caller_input_archive = browser_inputs_archive(&request.inputs)?;
+        let input_archive = prepare_task_input_archive(
+            &self.config,
+            &caller_input_archive,
+            evidence.workspace.as_ref(),
+        )
+        .await?;
         if record.browser_task_evidence.as_ref() != Some(&evidence) {
             return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
         }
@@ -2291,6 +2358,7 @@ where
             closure_digest,
             inline_files: None,
             diagnostics: request.diagnostics,
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         };
         evidence.validate().map_err(ApiError::Admission)?;
@@ -2827,6 +2895,223 @@ fn browser_rerun_submission(
     }
 }
 
+async fn resolve_workspace_evidence<L>(
+    ledger: &L,
+    config: &TaskApiConfig,
+    entries: &[WorkspaceEntry],
+    context: WorkspaceResolutionContext<'_>,
+) -> Result<Option<WorkspaceEvidence>, ApiError>
+where
+    L: TaskSubmissionLedger,
+{
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let git = config.direct_git_resolver.as_ref().ok_or_else(|| {
+        ApiError::TaskRuntimeContractUnavailable(
+            "workspace_git_source_resolver_unavailable".to_owned(),
+        )
+    })?;
+    let mut resolved = Vec::with_capacity(entries.len());
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let resolved_entry = match entry {
+            WorkspaceEntry::Git(entry) => {
+                if entry.git.submodules.mode == WorkspaceSubmoduleMode::Admitted {
+                    return Err(ApiError::Admission(
+                        "workspace_git_submodules_not_supported".to_owned(),
+                    ));
+                }
+                let (repository, is_self) = match &entry.git.repository {
+                    WorkspaceGitRepository::SelfRepository => (
+                        context.self_repository.cloned().ok_or_else(|| {
+                            ApiError::Admission("workspace_git_self_unavailable".to_owned())
+                        })?,
+                        true,
+                    ),
+                    WorkspaceGitRepository::Explicit(reference) => {
+                        let reference = GitRepositoryReference {
+                            repository_owner_id: reference.owner_id.clone(),
+                            repository_id: reference.repository_id.clone(),
+                        };
+                        (
+                            describe_workspace_repository(git.as_ref(), &reference)
+                                .await?
+                                .0,
+                            false,
+                        )
+                    }
+                };
+                if !is_self
+                    && !workspace_repository_is_authorized(
+                        ledger,
+                        config,
+                        context.caller,
+                        context.browser,
+                        &repository,
+                    )
+                    .await?
+                {
+                    return Err(ApiError::Admission(
+                        "workspace_git_repository_not_admitted".to_owned(),
+                    ));
+                }
+                let (_, description) = describe_workspace_repository(
+                    git.as_ref(),
+                    &GitRepositoryReference {
+                        repository_owner_id: repository.repository_owner_id.clone(),
+                        repository_id: repository.repository_id.clone(),
+                    },
+                )
+                .await?;
+                let name = match &entry.git.name {
+                    Some(name) => name.clone(),
+                    None => WorkspaceName::parse(description.name.clone()).map_err(|_| {
+                        ApiError::Admission(
+                            "workspace_git_name_requires_explicit_valid_name".to_owned(),
+                        )
+                    })?,
+                };
+                let commit = match &entry.git.git_ref {
+                    steward_types::direct_package::WorkspaceGitRef::Exact(commit) => commit.clone(),
+                    steward_types::direct_package::WorkspaceGitRef::Trigger
+                        if is_self && context.trigger_commit.is_some() =>
+                    {
+                        context.trigger_commit.cloned().ok_or_else(|| {
+                            ApiError::Admission("workspace_git_trigger_unavailable".to_owned())
+                        })?
+                    }
+                    steward_types::direct_package::WorkspaceGitRef::Trigger => git
+                        .resolve_revision(&GitRevisionRequest {
+                            repository: repository.clone(),
+                            reference: description.default_branch.clone(),
+                        })
+                        .await
+                        .map_err(source_port_error)?,
+                };
+                let content_digest = workspace_entry_digest(&serde_json::json!({
+                    "type": "git",
+                    "name": name,
+                    "access": entry.git.access,
+                    "repository": repository.repository,
+                    "repositoryId": repository.repository_id,
+                    "repositoryOwnerId": repository.repository_owner_id,
+                    "commit": commit,
+                    "history": entry.git.history,
+                    "paths": entry.git.paths,
+                    "submodules": entry.git.submodules,
+                    "limits": entry.git.limits,
+                }))?;
+                ResolvedWorkspaceEntry::Git {
+                    name,
+                    access: entry.git.access,
+                    repository: repository.repository,
+                    repository_id: repository.repository_id,
+                    repository_owner_id: repository.repository_owner_id,
+                    commit,
+                    history: entry.git.history.clone(),
+                    paths: entry.git.paths.clone(),
+                    submodules: Vec::new(),
+                    content_digest,
+                }
+            }
+            WorkspaceEntry::Scratch(entry) => {
+                let name = entry
+                    .scratch
+                    .name
+                    .clone()
+                    .unwrap_or(WorkspaceName::parse("scratch").map_err(ApiError::Admission)?);
+                let content_digest = workspace_entry_digest(&serde_json::json!({
+                    "type": "scratch",
+                    "name": name,
+                    "size": entry.scratch.size,
+                    "limits": entry.scratch.limits,
+                }))?;
+                ResolvedWorkspaceEntry::Scratch {
+                    name,
+                    size: entry.scratch.size.clone(),
+                    content_digest,
+                }
+            }
+        };
+        if !names.insert(resolved_entry.name().as_str().to_owned()) {
+            return Err(ApiError::Admission(
+                "workspace_entry_name_conflict".to_owned(),
+            ));
+        }
+        resolved.push(resolved_entry);
+    }
+    let workspace_digest = workspace_entry_digest(&resolved)?;
+    let evidence = WorkspaceEvidence {
+        entries: resolved,
+        workspace_digest,
+    };
+    evidence.validate().map_err(ApiError::Admission)?;
+    Ok(Some(evidence))
+}
+
+async fn describe_workspace_repository(
+    git: &dyn DirectGitResolver,
+    reference: &GitRepositoryReference,
+) -> Result<(GitRepositoryIdentity, GitRepositoryDescription), ApiError> {
+    let references = [reference.clone()];
+    let mut descriptions = git.describe_repositories(&references);
+    let (index, description) = descriptions
+        .next()
+        .await
+        .ok_or_else(|| ApiError::Admission("workspace_git_repository_unresolved".to_owned()))?;
+    if index != 0 || descriptions.next().await.is_some() {
+        return Err(ApiError::Admission(
+            "workspace_git_repository_unresolved".to_owned(),
+        ));
+    }
+    let description = description.map_err(source_port_error)?;
+    if description.repository_owner_id != reference.repository_owner_id
+        || description.repository_id != reference.repository_id
+    {
+        return Err(ApiError::Admission(
+            "workspace_git_repository_identity_mismatch".to_owned(),
+        ));
+    }
+    let repository = RepositoryUrl::parse(format!("{}.git", description.web_url))
+        .map_err(|_| ApiError::Admission("workspace_git_repository_unresolved".to_owned()))?;
+    Ok((
+        GitRepositoryIdentity {
+            repository,
+            repository_id: description.repository_id.clone(),
+            repository_owner_id: description.repository_owner_id.clone(),
+        },
+        description,
+    ))
+}
+
+async fn workspace_repository_is_authorized<L>(
+    ledger: &L,
+    config: &TaskApiConfig,
+    caller: Option<&TriggerRepository>,
+    browser: bool,
+    repository: &GitRepositoryIdentity,
+) -> Result<bool, ApiError>
+where
+    L: TaskSubmissionLedger,
+{
+    if browser {
+        return Ok(config.browser_source_repository_is_authorized(repository));
+    }
+    let caller = caller.ok_or(ApiError::TaskAuthentication)?;
+    Ok(config.source_repository_is_authorized(caller, repository)
+        || ledger
+            .active_source_repository_binding(caller, repository)
+            .await
+            .map_err(ApiError::Store)?)
+}
+
+fn workspace_entry_digest(value: &impl Serialize) -> Result<ContentDigest, ApiError> {
+    let bytes = canonical_json_bytes(value).map_err(ApiError::Admission)?;
+    let digest = Sha256::digest(bytes);
+    ContentDigest::parse(format!("steward:sha256:{digest:x}")).map_err(ApiError::Admission)
+}
+
 async fn resolve_browser_package_pre_admission<L>(
     ledger: &L,
     config: &TaskApiConfig,
@@ -2836,103 +3121,111 @@ async fn resolve_browser_package_pre_admission<L>(
 where
     L: TaskSubmissionLedger,
 {
-    let (definition, prompt, closure, closure_digest, revision, inline_files) =
-        if request.package.source == "inline" {
-            let files =
-                request.package.files.as_ref().ok_or_else(|| {
-                    ApiError::Admission("inline packages require files".to_owned())
-                })?;
-            let definition_bytes = files
-                .get(request.package.path.as_str())
-                .ok_or_else(|| {
-                    ApiError::Admission("inline package entry point is missing".to_owned())
-                })?
-                .as_bytes();
-            let definition = serde_json::from_slice::<DirectTaskDefinition>(definition_bytes)
-                .map_err(|_| ApiError::Admission("direct TaskDefinition is invalid".to_owned()))?;
-            definition.validate().map_err(ApiError::Admission)?;
-            let (prompt, closure, closure_digest) = resolve_inline_package_closure(
-                &request.package.path,
-                &definition,
-                definition_bytes,
-                files,
-            )?;
-            if let Some(expected) = request.package.revision.as_deref()
-                && expected != closure_digest.as_str()
-            {
-                return Err(ApiError::Admission(
-                    "inline package revision does not match its computed digest".to_owned(),
-                ));
-            }
-            (
-                definition,
-                prompt,
-                closure,
-                closure_digest.clone(),
-                closure_digest.as_str().to_owned(),
-                Some(files.clone()),
+    let (
+        definition,
+        prompt,
+        closure,
+        closure_digest,
+        revision,
+        inline_files,
+        workspace_self_repository,
+    ) = if request.package.source == "inline" {
+        let files = request
+            .package
+            .files
+            .as_ref()
+            .ok_or_else(|| ApiError::Admission("inline packages require files".to_owned()))?;
+        let definition_bytes = files
+            .get(request.package.path.as_str())
+            .ok_or_else(|| ApiError::Admission("inline package entry point is missing".to_owned()))?
+            .as_bytes();
+        let definition = serde_json::from_slice::<DirectTaskDefinition>(definition_bytes)
+            .map_err(|_| ApiError::Admission("direct TaskDefinition is invalid".to_owned()))?;
+        definition.validate().map_err(ApiError::Admission)?;
+        let (prompt, closure, closure_digest) = resolve_inline_package_closure(
+            &request.package.path,
+            &definition,
+            definition_bytes,
+            files,
+        )?;
+        if let Some(expected) = request.package.revision.as_deref()
+            && expected != closure_digest.as_str()
+        {
+            return Err(ApiError::Admission(
+                "inline package revision does not match its computed digest".to_owned(),
+            ));
+        }
+        (
+            definition,
+            prompt,
+            closure,
+            closure_digest.clone(),
+            closure_digest.as_str().to_owned(),
+            Some(files.clone()),
+            None,
+        )
+    } else {
+        let git = config.direct_git_resolver.as_ref().ok_or_else(|| {
+            ApiError::TaskRuntimeContractUnavailable(
+                "direct package Git source resolver is unavailable".to_owned(),
             )
+        })?;
+        let repository =
+            RepositoryUrl::parse(request.package.source.clone()).map_err(ApiError::Admission)?;
+        let repository = git
+            .resolve_repository(&repository)
+            .await
+            .map_err(|_| ApiError::BrowserTaskSourceUnauthorized)?;
+        if !config.browser_source_repository_is_authorized(&repository) {
+            return Err(ApiError::BrowserTaskSourceUnauthorized);
+        }
+        let requested_revision = request.package.revision.as_deref().ok_or_else(|| {
+            ApiError::Admission("repository package revision is required".to_owned())
+        })?;
+        let commit = if requested_revision.starts_with("git:sha1:") {
+            steward_types::direct_package::ExactGitCommit::parse(requested_revision.to_owned())
+                .map_err(ApiError::Admission)?
         } else {
-            let git = config.direct_git_resolver.as_ref().ok_or_else(|| {
-                ApiError::TaskRuntimeContractUnavailable(
-                    "direct package Git source resolver is unavailable".to_owned(),
-                )
-            })?;
-            let repository = RepositoryUrl::parse(request.package.source.clone())
-                .map_err(ApiError::Admission)?;
-            let repository = git
-                .resolve_repository(&repository)
-                .await
-                .map_err(|_| ApiError::BrowserTaskSourceUnauthorized)?;
-            if !config.browser_source_repository_is_authorized(&repository) {
-                return Err(ApiError::BrowserTaskSourceUnauthorized);
-            }
-            let requested_revision = request.package.revision.as_deref().ok_or_else(|| {
-                ApiError::Admission("repository package revision is required".to_owned())
-            })?;
-            let commit = if requested_revision.starts_with("git:sha1:") {
-                steward_types::direct_package::ExactGitCommit::parse(requested_revision.to_owned())
-                    .map_err(ApiError::Admission)?
-            } else {
-                git.resolve_revision(&GitRevisionRequest {
-                    repository: repository.clone(),
-                    reference: requested_revision.to_owned(),
-                })
-                .await
-                .map_err(source_port_error)?
-            };
-            let definition_request = GitFileRequest {
+            git.resolve_revision(&GitRevisionRequest {
                 repository: repository.clone(),
-                commit: commit.clone(),
-                path: request.package.path.clone(),
-                max_bytes: steward_types::direct_package::MAX_PACKAGE_FILE_BYTES,
-            };
-            let definition_file = git
-                .read_file(&definition_request)
-                .await
-                .map_err(source_port_error)?;
-            let definition_bytes = verified_git_file(definition_file, &definition_request)?;
-            let definition = serde_json::from_slice::<DirectTaskDefinition>(&definition_bytes)
-                .map_err(|_| ApiError::Admission("direct TaskDefinition is invalid".to_owned()))?;
-            definition.validate().map_err(ApiError::Admission)?;
-            let (prompt, closure, closure_digest) = resolve_package_closure(
-                git.as_ref(),
-                &repository,
-                &commit,
-                &request.package.path,
-                &definition,
-                &definition_bytes,
-            )
-            .await?;
-            (
-                definition,
-                prompt,
-                closure,
-                closure_digest,
-                commit.as_str().to_owned(),
-                None,
-            )
+                reference: requested_revision.to_owned(),
+            })
+            .await
+            .map_err(source_port_error)?
         };
+        let definition_request = GitFileRequest {
+            repository: repository.clone(),
+            commit: commit.clone(),
+            path: request.package.path.clone(),
+            max_bytes: steward_types::direct_package::MAX_PACKAGE_FILE_BYTES,
+        };
+        let definition_file = git
+            .read_file(&definition_request)
+            .await
+            .map_err(source_port_error)?;
+        let definition_bytes = verified_git_file(definition_file, &definition_request)?;
+        let definition = serde_json::from_slice::<DirectTaskDefinition>(&definition_bytes)
+            .map_err(|_| ApiError::Admission("direct TaskDefinition is invalid".to_owned()))?;
+        definition.validate().map_err(ApiError::Admission)?;
+        let (prompt, closure, closure_digest) = resolve_package_closure(
+            git.as_ref(),
+            &repository,
+            &commit,
+            &request.package.path,
+            &definition,
+            &definition_bytes,
+        )
+        .await?;
+        (
+            definition,
+            prompt,
+            closure,
+            closure_digest,
+            commit.as_str().to_owned(),
+            None,
+            Some(repository),
+        )
+    };
 
     let envelope = resolve_direct_user_envelope(
         ledger,
@@ -3011,6 +3304,18 @@ where
     };
     let (command, execution_binding) =
         resolve_direct_execution_plan(config, &definition, &prompt, &spec, &model)?;
+    let workspace = resolve_workspace_evidence(
+        ledger,
+        config,
+        &definition.workspace,
+        WorkspaceResolutionContext {
+            self_repository: workspace_self_repository.as_ref(),
+            trigger_commit: None,
+            caller: None,
+            browser: true,
+        },
+    )
+    .await?;
     let evidence = BrowserTaskEvidence {
         source: request.package.source.clone(),
         revision,
@@ -3019,6 +3324,7 @@ where
         closure_digest,
         inline_files,
         diagnostics: request.diagnostics,
+        workspace,
         prompt_source: PromptSourceKind::for_definition(&definition),
     };
     evidence.validate().map_err(ApiError::Admission)?;
@@ -3151,6 +3457,123 @@ fn inline_file<'a>(
         .ok_or_else(|| ApiError::Admission(format!("package file {} is missing", path.as_str())))
 }
 
+async fn prepare_task_input_archive(
+    config: &TaskApiConfig,
+    caller_archive: &[u8],
+    workspace: Option<&WorkspaceEvidence>,
+) -> Result<Vec<u8>, ApiError> {
+    let Some(workspace) = workspace else {
+        return Ok(caller_archive.to_vec());
+    };
+    let git = config.direct_git_resolver.as_ref().ok_or_else(|| {
+        ApiError::TaskRuntimeContractUnavailable(
+            "workspace_git_source_resolver_unavailable".to_owned(),
+        )
+    })?;
+    let mut material = Vec::new();
+    let manifest = canonical_json_bytes(workspace).map_err(ApiError::Admission)?;
+    append_workspace_tar_file(&mut material, "manifest.json", &manifest)?;
+    for (index, entry) in workspace.entries.iter().enumerate() {
+        let ResolvedWorkspaceEntry::Git {
+            repository,
+            repository_id,
+            repository_owner_id,
+            commit,
+            history,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let reserved = caller_archive
+            .len()
+            .checked_add(material.len())
+            .and_then(|value| value.checked_add(4096))
+            .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
+        let remaining = MAX_TASK_INPUT_ARCHIVE_BYTES
+            .checked_sub(reserved)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
+        let depth = match history {
+            WorkspaceGitHistory::None => Some(1),
+            WorkspaceGitHistory::Depth(depth) => Some(*depth),
+            WorkspaceGitHistory::Full => None,
+        };
+        let request = GitPackRequest {
+            repository: GitRepositoryIdentity {
+                repository: repository.clone(),
+                repository_id: repository_id.clone(),
+                repository_owner_id: repository_owner_id.clone(),
+            },
+            commit: commit.clone(),
+            depth,
+            max_bytes: remaining as u64,
+        };
+        let pack = git.read_pack(&request).await.map_err(source_port_error)?;
+        if pack.repository != request.repository || pack.commit != request.commit {
+            return Err(ApiError::Admission(
+                "workspace_git_pack_identity_mismatch".to_owned(),
+            ));
+        }
+        append_workspace_tar_file(&mut material, &format!("packs/{index}.pack"), &pack.bytes)?;
+        if !pack.shallow.is_empty() {
+            let shallow = pack
+                .shallow
+                .iter()
+                .map(|commit| {
+                    commit
+                        .as_str()
+                        .strip_prefix("git:sha1:")
+                        .unwrap_or(commit.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            append_workspace_tar_file(
+                &mut material,
+                &format!("shallow/{index}"),
+                format!("{shallow}\n").as_bytes(),
+            )?;
+        }
+    }
+    material.extend_from_slice(&[0_u8; 1024]);
+    let framed = frame_task_input_archive(caller_archive, &material)
+        .map_err(|_| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
+    if framed.len() > MAX_TASK_INPUT_ARCHIVE_BYTES {
+        return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
+    }
+    Ok(framed)
+}
+
+fn append_workspace_tar_file(
+    archive: &mut Vec<u8>,
+    name: &str,
+    contents: &[u8],
+) -> Result<(), ApiError> {
+    if name.is_empty() || name.len() > 100 || name.starts_with('/') || name.contains("..") {
+        return Err(ApiError::Admission(
+            "workspace material path is invalid".to_owned(),
+        ));
+    }
+    let mut header = vec![0_u8; 512];
+    header[..name.len()].copy_from_slice(name.as_bytes());
+    write_tar_octal(&mut header[100..108], 0o600)?;
+    write_tar_octal(&mut header[108..116], 0)?;
+    write_tar_octal(&mut header[116..124], 0)?;
+    write_tar_octal(&mut header[124..136], contents.len() as u64)?;
+    write_tar_octal(&mut header[136..148], 0)?;
+    header[148..156].fill(b' ');
+    header[156] = b'0';
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+    let checksum: u64 = header.iter().map(|byte| u64::from(*byte)).sum();
+    write_tar_checksum(&mut header[148..156], checksum)?;
+    archive.extend_from_slice(&header);
+    archive.extend_from_slice(contents);
+    let padding = (512 - contents.len() % 512) % 512;
+    archive.resize(archive.len() + padding, 0);
+    Ok(())
+}
+
 fn browser_inputs_archive(inputs: &serde_json::Value) -> Result<Vec<u8>, ApiError> {
     let bytes = canonical_json_bytes(inputs).map_err(ApiError::Admission)?;
     let mut archive = vec![0_u8; 512];
@@ -3174,6 +3597,9 @@ fn browser_inputs_archive(inputs: &serde_json::Value) -> Result<Vec<u8>, ApiErro
 }
 
 fn browser_inputs_from_archive(archive: &[u8]) -> Result<serde_json::Value, ApiError> {
+    let archive = split_task_input_archive(archive)
+        .map_err(|_| ApiError::Admission("browser Task input archive is invalid".to_owned()))?
+        .caller_archive;
     let header = archive
         .get(..512)
         .ok_or_else(|| ApiError::Admission("browser Task input archive is invalid".to_owned()))?;
@@ -3476,6 +3902,18 @@ where
     let (command, execution_binding) =
         resolve_direct_execution_plan(config, &definition, &prompt, &spec, &model)?;
     let prompt_source = PromptSourceKind::for_definition(&definition);
+    let workspace = resolve_workspace_evidence(
+        ledger,
+        config,
+        &definition.workspace,
+        WorkspaceResolutionContext {
+            self_repository: Some(&invocation_identity),
+            trigger_commit: Some(&provenance.triggered_sha),
+            caller: Some(&provenance.repository),
+            browser: false,
+        },
+    )
+    .await?;
     Ok(DirectTaskPreAdmission {
         definition,
         invocation_kind,
@@ -3490,6 +3928,7 @@ where
         spec,
         command,
         execution_binding,
+        workspace,
     })
 }
 
@@ -3579,6 +4018,7 @@ fn direct_task_evidence(
         },
         effective_requirements: pre_admission.effective_requirements.clone(),
         diagnostics: pre_admission.diagnostics,
+        workspace: pre_admission.workspace.clone(),
         prompt_source: pre_admission.prompt_source,
     };
     evidence.validate().map_err(ApiError::Admission)?;

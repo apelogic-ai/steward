@@ -4599,6 +4599,7 @@ mod tests {
                 ),
             ])),
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         };
         let mut own = run(own_task, owner);
@@ -4690,6 +4691,7 @@ mod tests {
                 ),
             ])),
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         };
         let mut succeeded = run(succeeded_task, owner);
@@ -4764,6 +4766,7 @@ mod tests {
                 "{}".to_owned(),
             )])),
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         });
         let workflow_digest = format!("sha256:{}", "e".repeat(64));
@@ -4795,6 +4798,7 @@ mod tests {
             closure_digest: ContentDigest::parse(registry_digest.clone())?,
             inline_files: None,
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         });
         let malformed_task = Uuid::parse_str("77777777-7777-4777-8777-777777777777")
@@ -4809,6 +4813,7 @@ mod tests {
             closure_digest: ContentDigest::parse(format!("steward:sha256:{}", "d".repeat(64)))?,
             inline_files: None,
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         });
         let ledger = FakeLedger::default();
@@ -5053,6 +5058,7 @@ mod tests {
                 "{}".to_owned(),
             )])),
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         });
         let ledger = FakeLedger::default();

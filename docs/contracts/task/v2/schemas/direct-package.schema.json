@@ -446,6 +446,90 @@
         }
       ]
     },
+    "resolvedWorkspaceSubmodule": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["path", "status", "repository", "repositoryId", "repositoryOwnerId", "commit"],
+          "properties": {
+            "path": { "$ref": "#/$defs/relativePath" },
+            "status": { "const": "materialized" },
+            "repository": { "$ref": "#/$defs/repositoryUrl" },
+            "repositoryId": { "$ref": "#/$defs/providerId" },
+            "repositoryOwnerId": { "$ref": "#/$defs/providerId" },
+            "commit": { "$ref": "#/$defs/exactGitCommit" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["path", "status", "reason"],
+          "properties": {
+            "path": { "$ref": "#/$defs/relativePath" },
+            "status": { "const": "skipped" },
+            "reason": { "$ref": "#/$defs/boundedText" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "resolvedWorkspaceEntry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "name", "access", "repository", "repositoryId", "repositoryOwnerId", "commit", "history", "contentDigest"],
+          "properties": {
+            "type": { "const": "git" },
+            "name": { "$ref": "#/$defs/workspaceName" },
+            "access": { "enum": ["read-only", "copy"] },
+            "repository": { "$ref": "#/$defs/repositoryUrl" },
+            "repositoryId": { "$ref": "#/$defs/providerId" },
+            "repositoryOwnerId": { "$ref": "#/$defs/providerId" },
+            "commit": { "$ref": "#/$defs/exactGitCommit" },
+            "history": { "$ref": "#/$defs/workspaceGitHistory" },
+            "paths": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/workspacePath" },
+              "default": []
+            },
+            "submodules": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/resolvedWorkspaceSubmodule" },
+              "default": []
+            },
+            "contentDigest": { "$ref": "#/$defs/stewardDigest" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "name", "size", "contentDigest"],
+          "properties": {
+            "type": { "const": "scratch" },
+            "name": { "$ref": "#/$defs/workspaceName" },
+            "size": { "type": "string", "minLength": 1, "maxLength": 32 },
+            "contentDigest": { "$ref": "#/$defs/stewardDigest" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "workspaceEvidence": {
+      "type": "object",
+      "required": ["entries", "workspaceDigest"],
+      "properties": {
+        "entries": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/resolvedWorkspaceEntry" }
+        },
+        "workspaceDigest": { "$ref": "#/$defs/stewardDigest" }
+      },
+      "additionalProperties": false
+    },
     "taskDefinition": {
       "type": "object",
       "required": ["schemaVersion", "name", "version", "runtime", "outputs"],
@@ -624,6 +708,7 @@
         "envelope": { "$ref": "#/$defs/envelopeEvidence" },
         "effectiveRequirements": { "$ref": "#/$defs/directRequirements" },
         "diagnostics": { "$ref": "#/$defs/diagnostics" },
+        "workspace": { "$ref": "#/$defs/workspaceEvidence" },
         "promptSource": { "enum": ["path", "inline"], "default": "path" }
       },
       "additionalProperties": false

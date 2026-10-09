@@ -1,6 +1,7 @@
 //! Vendor-neutral domain types shared by Steward components.
 
 pub mod direct_package;
+pub mod task_input_archive;
 pub mod task_output_archive;
 
 use std::borrow::Cow;

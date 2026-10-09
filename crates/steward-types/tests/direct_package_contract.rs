@@ -636,11 +636,48 @@ fn task_definition_rejects_malformed_workspace_entries() -> Result<(), String> {
         } }]),
         serde_json::json!([{ "git": { "limits": { "files": 0 } } }]),
     ] {
-        let definition: DirectTaskDefinition = serde_json::from_value(definition_with(workspace))
-            .map_err(|error| format!("invalid workspace shape must parse: {error}"))?;
+        let definition: DirectTaskDefinition =
+            serde_json::from_value(definition_with(workspace))
+                .map_err(|error| format!("invalid workspace shape must parse: {error}"))?;
         assert!(definition.validate().is_err());
     }
     Ok(())
+}
+
+#[test]
+fn binding_evidence_records_resolved_workspace_identity_and_digest() -> Result<(), String> {
+    let mut evidence = parse_value("fixtures/positive/task-binding-evidence.json")?;
+    let entries = serde_json::json!([
+        {
+            "type": "git",
+            "name": "caller",
+            "access": "read-only",
+            "repository": "https://github.com/example-org/caller.git",
+            "repositoryId": "2000001",
+            "repositoryOwnerId": "1000001",
+            "commit": "git:sha1:1111111111111111111111111111111111111111",
+            "history": { "depth": 20 },
+            "paths": ["src/"],
+            "contentDigest": format!("steward:sha256:{}", "a".repeat(64))
+        },
+        {
+            "type": "scratch",
+            "name": "scratch",
+            "size": "2Gi",
+            "contentDigest": format!("steward:sha256:{}", "b".repeat(64))
+        }
+    ]);
+    let workspace_digest = format!(
+        "steward:sha256:{:x}",
+        Sha256::digest(canonical_json_bytes(&entries)?)
+    );
+    evidence["workspace"] = serde_json::json!({
+        "entries": entries,
+        "workspaceDigest": workspace_digest
+    });
+    let evidence: DirectTaskBindingEvidence = serde_json::from_value(evidence)
+        .map_err(|error| format!("workspace evidence must parse: {error}"))?;
+    evidence.validate()
 }
 
 #[test]

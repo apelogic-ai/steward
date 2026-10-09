@@ -3773,7 +3773,8 @@ mod tests {
     use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec};
     use steward_ports::{
         DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitFile,
-        GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRevisionRequest, PortError,
+        GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
+        GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, PortError,
         TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
     };
     use steward_store::{
@@ -4031,6 +4032,54 @@ mod tests {
     }
 
     impl GitHostingPlane for FakeDirectGit {
+        fn describe_repositories<'a>(
+            &'a self,
+            repositories: &'a [GitRepositoryReference],
+        ) -> impl futures::Stream<Item = (usize, Result<GitRepositoryDescription, PortError>)> + Send + 'a
+        {
+            futures::stream::iter(repositories.iter().enumerate().map(|(index, reference)| {
+                let resolved = self
+                    .repositories
+                    .values()
+                    .find(|identity| {
+                        identity.repository_owner_id == reference.repository_owner_id
+                            && identity.repository_id == reference.repository_id
+                    })
+                    .map(|identity| {
+                        let coordinates = identity
+                            .repository
+                            .as_str()
+                            .strip_prefix("https://github.com/")
+                            .and_then(|value| value.strip_suffix(".git"))
+                            .and_then(|value| value.split_once('/'))
+                            .ok_or_else(|| PortError::Failed {
+                                reason: "fake repository URL is invalid".to_owned(),
+                            })?;
+                        Ok(GitRepositoryDescription {
+                            owner: coordinates.0.to_owned(),
+                            repository_owner_id: identity.repository_owner_id.clone(),
+                            name: coordinates.1.to_owned(),
+                            repository_id: identity.repository_id.clone(),
+                            default_branch: "main".to_owned(),
+                            private: true,
+                            web_url: identity
+                                .repository
+                                .as_str()
+                                .strip_suffix(".git")
+                                .unwrap_or(identity.repository.as_str())
+                                .to_owned(),
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        Err(PortError::Rejected {
+                            reason: "repository is not present in the deterministic fake"
+                                .to_owned(),
+                        })
+                    });
+                (index, resolved)
+            }))
+        }
+
         async fn resolve_repository(
             &self,
             repository: &RepositoryUrl,
@@ -4073,6 +4122,19 @@ mod tests {
                 commit,
                 path: request.path.clone(),
                 bytes,
+            })
+        }
+
+        async fn read_pack(&self, request: &GitPackRequest) -> Result<GitPack, PortError> {
+            Ok(GitPack {
+                repository: request.repository.clone(),
+                commit: request.commit.clone(),
+                shallow: if request.depth.is_some() {
+                    vec![request.commit.clone()]
+                } else {
+                    Vec::new()
+                },
+                bytes: b"PACKdeterministic-fixture".to_vec(),
             })
         }
 
@@ -12547,6 +12609,147 @@ mod tests {
         );
         drop(tasks);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_resolves_trigger_identity_and_frames_credential_free_pack()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {"history": {"depth": 5}, "access": "copy"}
+        }]);
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct workspace request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct workspace request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let task_uid = {
+            let tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?;
+            let evidence = tasks[0]
+                .direct_task_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.workspace.as_ref())
+                .ok_or_else(|| "workspace evidence was not persisted".to_owned())?;
+            let entry = evidence
+                .entries
+                .first()
+                .ok_or_else(|| "workspace evidence omitted its entry".to_owned())?;
+            match entry {
+                steward_types::direct_package::ResolvedWorkspaceEntry::Git {
+                    name,
+                    repository_id,
+                    commit,
+                    history,
+                    ..
+                } => {
+                    assert_eq!(name.as_str(), "caller");
+                    assert_eq!(repository_id.as_str(), "123456");
+                    assert_eq!(commit.as_str(), format!("git:sha1:{}", "c".repeat(40)));
+                    assert_eq!(
+                        history,
+                        &steward_types::direct_package::WorkspaceGitHistory::Depth(5)
+                    );
+                }
+                _ => return Err("workspace evidence was not a Git entry".to_owned()),
+            }
+            tasks[0].task_uid
+        };
+        let caller_archive = b"caller-authored-tar";
+        let upload = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/tasks/{task_uid}/inputs"))
+                    .header("authorization", "Bearer github-assertion")
+                    .header("content-type", "application/x-tar")
+                    .body(Body::from(caller_archive.as_slice()))
+                    .map_err(|error| format!("build workspace input upload: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("upload workspace inputs: {error}"))?;
+        assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+        let stored = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake task ledger lock was poisoned")?[0]
+            .input_archive
+            .clone()
+            .ok_or_else(|| "workspace input frame was not stored".to_owned())?;
+        let parts = steward_types::task_input_archive::split_task_input_archive(&stored)
+            .map_err(|error| format!("split workspace input frame: {error:?}"))?;
+        assert_eq!(parts.caller_archive, caller_archive);
+        let material = parts
+            .workspace_archive
+            .ok_or_else(|| "workspace material was not framed separately".to_owned())?;
+        assert!(
+            material
+                .windows(b"manifest.json".len())
+                .any(|window| window == b"manifest.json")
+        );
+        assert!(
+            material
+                .windows(b"PACKdeterministic-fixture".len())
+                .any(|window| { window == b"PACKdeterministic-fixture" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_rejects_unadmitted_repository_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "repository": {"ownerId": "9990", "repositoryId": "9991"},
+                "ref": format!("git:sha1:{}", "d".repeat(40))
+            }
+        }]);
+        let mut git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let foreign = RepositoryUrl::parse("https://github.com/example-org/foreign.git")?;
+        Arc::make_mut(&mut git.repositories).insert(
+            foreign.as_str().to_owned(),
+            GitRepositoryIdentity {
+                repository: foreign,
+                repository_id: StableProviderId::parse("9991")?,
+                repository_owner_id: StableProviderId::parse("9990")?,
+            },
+        );
+        let app = direct_test_app(ledger.clone(), git)?;
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-workspace-unadmitted",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_git_repository_not_admitted",
+        )
+        .await
     }
 
     #[tokio::test]
