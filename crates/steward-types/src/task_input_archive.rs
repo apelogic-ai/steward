@@ -111,12 +111,14 @@ mod tests {
     }
 
     #[test]
-    fn malformed_frame_fails_closed() {
-        let mut framed = frame_task_input_archive(b"caller", b"workspace").expect("valid frame");
+    fn malformed_frame_fails_closed() -> Result<(), String> {
+        let mut framed = frame_task_input_archive(b"caller", b"workspace")
+            .map_err(|error| format!("frame failed: {error:?}"))?;
         framed.pop();
         assert_eq!(
             split_task_input_archive(&framed).err(),
             Some(TaskInputArchiveError::InvalidFrame)
         );
+        Ok(())
     }
 }
