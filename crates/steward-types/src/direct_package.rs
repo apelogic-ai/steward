@@ -1677,6 +1677,7 @@ impl DirectTaskBindingEvidence {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceEvidence {
     pub entries: Vec<ResolvedWorkspaceEntry>,
+    pub max_materialized_bytes: u64,
     pub workspace_digest: ContentDigest,
 }
 
@@ -1684,6 +1685,14 @@ impl WorkspaceEvidence {
     pub fn validate(&self) -> Result<(), String> {
         if self.entries.is_empty() || self.entries.len() > 32 {
             return Err("workspace evidence entry count is outside the allowed bounds".to_owned());
+        }
+        if self.max_materialized_bytes == 0
+            && self
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, ResolvedWorkspaceEntry::Git { .. }))
+        {
+            return Err("workspace materialized-byte limit must be positive".to_owned());
         }
         let mut names = BTreeSet::new();
         for entry in &self.entries {
@@ -1695,7 +1704,10 @@ impl WorkspaceEvidence {
                 ));
             }
         }
-        let digest = Sha256::digest(canonical_json_bytes(&self.entries)?);
+        let digest = Sha256::digest(canonical_json_bytes(&serde_json::json!({
+            "entries": &self.entries,
+            "maxMaterializedBytes": self.max_materialized_bytes,
+        }))?);
         if self.workspace_digest.as_str() != format!("steward:sha256:{digest:x}") {
             return Err("workspace digest does not match its resolved entries".to_owned());
         }
@@ -1726,6 +1738,8 @@ pub enum ResolvedWorkspaceEntry {
         paths: Vec<WorkspacePath>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         submodules: Vec<ResolvedWorkspaceSubmodule>,
+        #[serde(rename = "maxMaterializedBytes")]
+        max_materialized_bytes: u64,
         #[serde(rename = "contentDigest")]
         content_digest: ContentDigest,
     },
@@ -1750,8 +1764,14 @@ impl ResolvedWorkspaceEntry {
                 history,
                 paths,
                 submodules,
+                max_materialized_bytes,
                 ..
             } => {
+                if *max_materialized_bytes == 0 {
+                    return Err(
+                        "workspace entry materialized-byte limit must be positive".to_owned()
+                    );
+                }
                 history.validate()?;
                 require_unique_values(paths, "resolved workspace path")?;
                 let mut submodule_paths = BTreeSet::new();

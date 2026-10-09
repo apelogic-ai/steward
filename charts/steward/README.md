@@ -571,7 +571,8 @@ Steward release namespace also creates `steward-workflows`.
   changes. See [Execution bindings](../../docs/installation/execution-bindings.md).
 - `workspace` governs typed Task workspaces before runtime creation.
   `enabledTypes` selects `git` and/or `scratch`; `maxTotalSize`, `maxFiles`,
-  `maxHistoryDepth`, and `maxSubmoduleDepth` are deployment ceilings.
+  `maxHistoryDepth`, `maxSubmoduleDepth`, `maxSubmodulesPerEntry`,
+  `maxTotalSubmodules`, and `maxTreeReads` are deployment ceilings.
   `scratchVolumeSize` is the real OpenShell workspace backing capacity and must match
   the requested scratch size. Git source access still comes only from stable
   `githubSource.bindings`; no Git credential enters the sandbox.

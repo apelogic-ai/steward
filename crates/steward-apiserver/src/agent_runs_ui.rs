@@ -3890,8 +3890,10 @@ mod tests {
                 "repositoryOwnerId": "7890",
                 "commit": format!("git:sha1:{}", "a".repeat(40)),
                 "history": {"depth": 20},
+                "maxMaterializedBytes": 62914560,
                 "contentDigest": format!("steward:sha256:{}", "b".repeat(64))
             }],
+            "maxMaterializedBytes": 62914560,
             "workspaceDigest": format!("steward:sha256:{}", "c".repeat(64))
         }))
         .map_err(|error| error.to_string())?;

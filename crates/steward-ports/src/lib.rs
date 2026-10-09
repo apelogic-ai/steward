@@ -8,6 +8,35 @@ use steward_types::direct_package::{
     DiagnosticsRequest, ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
     WorkspaceEvidence,
 };
+
+/// One safe, provider-neutral path from a Git tree.
+///
+/// Git permits more file-name characters than Steward package references. This type preserves
+/// those names while rejecting only paths that could escape the checkout or address Git's own
+/// metadata directory.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GitTreePath(String);
+
+impl GitTreePath {
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 4096
+            || value.starts_with('/')
+            || value.contains('\0')
+            || value
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".." | ".git"))
+        {
+            return Err("Git tree path is invalid".to_owned());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 use steward_types::{
     AgentType, Budget, DisposableExecutionBinding, ModelRef, RuntimeId, RuntimeRefs, SpendSummary,
     ToolGrant,
@@ -583,7 +612,7 @@ pub struct GitTreeRequest {
 /// One provider-neutral entry from an exact Git tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitTreeEntry {
-    pub path: RelativePath,
+    pub path: GitTreePath,
     pub mode: String,
     pub kind: String,
     pub object: String,
@@ -677,4 +706,31 @@ pub trait GitHostingPlane: Send + Sync + 'static {
         &self,
         request: &GitRevisionRequest,
     ) -> impl Future<Output = Result<ExactGitCommit, PortError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GitTreePath;
+
+    #[test]
+    fn git_tree_paths_accept_common_names_but_reject_escape_and_metadata() {
+        for path in [
+            "app/[id]/page.tsx",
+            "vendor/@types/index.d.ts",
+            "c++/main.cc",
+            "My File.md",
+        ] {
+            assert!(GitTreePath::parse(path).is_ok(), "{path}");
+        }
+        for path in [
+            "",
+            "/root",
+            "../escape",
+            "dir/../escape",
+            ".git/config",
+            "dir/.git/config",
+        ] {
+            assert!(GitTreePath::parse(path).is_err(), "{path}");
+        }
+    }
 }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use steward_ports::{
     GitFile, GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
     GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree,
-    GitTreeEntry as PortGitTreeEntry, GitTreeRequest, PortError,
+    GitTreeEntry as PortGitTreeEntry, GitTreePath, GitTreeRequest, PortError,
 };
 use steward_types::direct_package::{
     ExactGitCommit, MAX_PACKAGE_FILE_BYTES, RepositoryUrl, StableProviderId,
@@ -880,7 +880,7 @@ impl GitHostingPlane for GitHubSourceAdapter {
                 return Err(rejected("GitHub returned an invalid Git tree entry"));
             }
             entries.push(PortGitTreeEntry {
-                path: steward_types::direct_package::RelativePath::parse(entry.path)
+                path: GitTreePath::parse(entry.path)
                     .map_err(|_| rejected("GitHub returned an invalid Git tree path"))?,
                 mode: entry.mode,
                 kind: entry.kind,
@@ -1719,7 +1719,11 @@ mod tests {
                 "truncated": false,
                 "tree": [
                     {"path": ".gitmodules", "mode": "100644", "type": "blob", "sha": BLOB, "size": 128},
-                    {"path": "vendor/proto", "mode": "160000", "type": "commit", "sha": CATALOG_TREE}
+                    {"path": "vendor/proto", "mode": "160000", "type": "commit", "sha": CATALOG_TREE},
+                    {"path": "app/[id]/page.tsx", "mode": "100644", "type": "blob", "sha": BLOB, "size": 12},
+                    {"path": "vendor/@types/index.d.ts", "mode": "100644", "type": "blob", "sha": BLOB, "size": 12},
+                    {"path": "c++/main.cc", "mode": "100644", "type": "blob", "sha": BLOB, "size": 12},
+                    {"path": "My File.md", "mode": "100644", "type": "blob", "sha": BLOB, "size": 12}
                 ]
             })),
             metadata(1001, 1000, "example-org/source-a"),
@@ -1729,17 +1733,26 @@ mod tests {
         let request = GitTreeRequest {
             repository: identity(REPOSITORY, 1001, 1000)?,
             commit: ExactGitCommit::parse(format!("git:sha1:{COMMIT}"))?,
-            max_entries: 4,
+            max_entries: 8,
         };
         let tree = port(adapter(&mock)?.read_tree(&request).await)?;
         assert_eq!(tree.repository, request.repository);
         assert_eq!(tree.commit, request.commit);
-        assert_eq!(tree.entries.len(), 2);
-        assert_eq!(tree.entries[1].path.as_str(), "vendor/proto");
-        assert_eq!(tree.entries[1].mode, "160000");
-        assert_eq!(tree.entries[1].object, CATALOG_TREE);
+        assert_eq!(tree.entries.len(), 6);
+        assert!(
+            tree.entries
+                .iter()
+                .any(|entry| entry.path.as_str() == "app/[id]/page.tsx")
+        );
+        let submodule = tree
+            .entries
+            .iter()
+            .find(|entry| entry.path.as_str() == "vendor/proto")
+            .ok_or_else(|| "submodule tree entry was omitted".to_owned())?;
+        assert_eq!(submodule.mode, "160000");
+        assert_eq!(submodule.object, CATALOG_TREE);
         assert_eq!(tree.entries[0].size, Some(128));
-        assert_eq!(tree.entries[1].size, None);
+        assert_eq!(submodule.size, None);
         let requests = mock.finish()?;
         assert!(requests[3].contains(&format!("/git/commits/{COMMIT}")));
         assert!(requests[4].contains(&format!("/git/trees/{ROOT_TREE}?recursive=1")));

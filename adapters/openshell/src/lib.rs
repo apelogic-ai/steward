@@ -2916,7 +2916,7 @@ fn staging_extract_command() -> &'static str {
 
 #[cfg(feature = "runtime")]
 fn workspace_staging_prepare_command() -> &'static str {
-    "set -eu; rm -rf /sandbox/steward-workspace-source /sandbox/workspace; rm -f /sandbox/steward-workspace.tar; mkdir -p /sandbox/steward-workspace-source /sandbox/workspace; : > /sandbox/steward-workspace.tar"
+    "set -eu; if [ -e /sandbox/workspace ]; then chmod -R u+w /sandbox/workspace; fi; rm -rf /sandbox/steward-workspace-source /sandbox/workspace; rm -f /sandbox/steward-workspace.tar; mkdir -p /sandbox/steward-workspace-source /sandbox/workspace; : > /sandbox/steward-workspace.tar"
 }
 
 #[cfg(feature = "runtime")]
@@ -2963,7 +2963,7 @@ fn workspace_materialization_command(evidence: &WorkspaceEvidence) -> Result<Str
                         "git -C {destination} sparse-checkout init --no-cone; git -C {destination} sparse-checkout set --no-cone -- {} ; ",
                         paths
                             .iter()
-                            .map(|path| shell_quote(path.as_str()))
+                            .map(|path| shell_quote(&format!("/{}", path.as_str())))
                             .collect::<Vec<_>>()
                             .join(" ")
                     ));
@@ -3828,18 +3828,25 @@ mod tests {
                 ))?),
                 reason: None,
             }],
+            max_materialized_bytes: 62_914_560,
             content_digest: ContentDigest::parse(format!("steward:sha256:{}", "b".repeat(64)))?,
         }];
-        let digest = Sha256::digest(canonical_json_bytes(&entries)?);
+        let max_materialized_bytes = 62_914_560_u64;
+        let digest = Sha256::digest(canonical_json_bytes(&serde_json::json!({
+            "entries": &entries,
+            "maxMaterializedBytes": max_materialized_bytes,
+        }))?);
         let evidence = WorkspaceEvidence {
             entries,
+            max_materialized_bytes,
             workspace_digest: ContentDigest::parse(format!("steward:sha256:{digest:x}"))?,
         };
         let command = workspace_materialization_command(&evidence)
             .map_err(|error| format!("render workspace materializer: {error:?}"))?;
         assert!(command.contains("index-pack --fix-thin --stdin"));
         assert!(command.contains(&"a".repeat(40)));
-        assert!(command.contains("sparse-checkout set --no-cone -- 'src/'"));
+        assert!(command.contains("sparse-checkout set --no-cone -- '/src/'"));
+        assert!(!command.contains("sparse-checkout set --no-cone -- 'src/'"));
         assert!(command.contains("rm -rf '/sandbox/workspace/source'/.git"));
         assert!(command.contains("submodules/0/0.pack"));
         assert!(command.contains("'/sandbox/workspace/source/vendor/proto'"));
@@ -3858,9 +3865,14 @@ mod tests {
             size: ResourceQuantity::parse("2Gi")?,
             content_digest: ContentDigest::parse(format!("steward:sha256:{}", "d".repeat(64)))?,
         }];
-        let digest = Sha256::digest(canonical_json_bytes(&entries)?);
+        let max_materialized_bytes = 2_147_483_648_u64;
+        let digest = Sha256::digest(canonical_json_bytes(&serde_json::json!({
+            "entries": &entries,
+            "maxMaterializedBytes": max_materialized_bytes,
+        }))?);
         let evidence = WorkspaceEvidence {
             entries,
+            max_materialized_bytes,
             workspace_digest: ContentDigest::parse(format!("steward:sha256:{digest:x}"))?,
         };
         let command = workspace_materialization_command(&evidence)

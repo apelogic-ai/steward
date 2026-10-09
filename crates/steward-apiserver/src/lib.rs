@@ -12837,14 +12837,14 @@ mod tests {
             (caller.as_str().to_owned(), parent_commit),
             vec![
                 GitTreeEntry {
-                    path: steward_types::direct_package::RelativePath::parse(".gitmodules")?,
+                    path: steward_ports::GitTreePath::parse(".gitmodules")?,
                     mode: "100644".to_owned(),
                     kind: "blob".to_owned(),
                     object: "b".repeat(40),
                     size: Some(128),
                 },
                 GitTreeEntry {
-                    path: steward_types::direct_package::RelativePath::parse("vendor/proto")?,
+                    path: steward_ports::GitTreePath::parse("vendor/proto")?,
                     mode: "160000".to_owned(),
                     kind: "commit".to_owned(),
                     object: "d".repeat(40),
@@ -12977,14 +12977,14 @@ mod tests {
             (caller.as_str().to_owned(), parent_commit),
             vec![
                 GitTreeEntry {
-                    path: steward_types::direct_package::RelativePath::parse(".gitmodules")?,
+                    path: steward_ports::GitTreePath::parse(".gitmodules")?,
                     mode: "100644".to_owned(),
                     kind: "blob".to_owned(),
                     object: "b".repeat(40),
                     size: Some(128),
                 },
                 GitTreeEntry {
-                    path: steward_types::direct_package::RelativePath::parse("vendor/foreign")?,
+                    path: steward_ports::GitTreePath::parse("vendor/foreign")?,
                     mode: "160000".to_owned(),
                     kind: "commit".to_owned(),
                     object: "d".repeat(40),
@@ -13056,14 +13056,14 @@ mod tests {
             ),
             vec![
                 GitTreeEntry {
-                    path: steward_types::direct_package::RelativePath::parse("README.md")?,
+                    path: steward_ports::GitTreePath::parse("README.md")?,
                     mode: "100644".to_owned(),
                     kind: "blob".to_owned(),
                     object: "b".repeat(40),
                     size: Some(512),
                 },
                 GitTreeEntry {
-                    path: steward_types::direct_package::RelativePath::parse("src/lib.rs")?,
+                    path: steward_ports::GitTreePath::parse("src/lib.rs")?,
                     mode: "100644".to_owned(),
                     kind: "blob".to_owned(),
                     object: "d".repeat(40),

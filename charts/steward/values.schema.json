@@ -436,7 +436,10 @@
         "scratchVolumeSize",
         "maxFiles",
         "maxHistoryDepth",
-        "maxSubmoduleDepth"
+        "maxSubmoduleDepth",
+        "maxSubmodulesPerEntry",
+        "maxTotalSubmodules",
+        "maxTreeReads"
       ],
       "properties": {
         "enabledTypes": {
@@ -449,7 +452,10 @@
         "scratchVolumeSize": {"type": "string", "pattern": "^[1-9][0-9]*(?:Ki|Mi|Gi|Ti|K|M|G|T)?$"},
         "maxFiles": {"type": "integer", "minimum": 1},
         "maxHistoryDepth": {"type": "integer", "minimum": 1, "maximum": 4294967295},
-        "maxSubmoduleDepth": {"type": "integer", "minimum": 0, "maximum": 16}
+        "maxSubmoduleDepth": {"type": "integer", "minimum": 0, "maximum": 16},
+        "maxSubmodulesPerEntry": {"type": "integer", "minimum": 1},
+        "maxTotalSubmodules": {"type": "integer", "minimum": 1},
+        "maxTreeReads": {"type": "integer", "minimum": 1}
       }
     },
     "tls": {

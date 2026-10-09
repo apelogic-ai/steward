@@ -1553,6 +1553,7 @@ export type ResolvedWorkspaceEntry = {
     commit: ExactGitCommit;
     contentDigest: ContentDigest;
     history: WorkspaceGitHistorySchema;
+    maxMaterializedBytes: number;
     name: WorkspaceName;
     paths?: Array<WorkspacePath>;
     repository: RepositoryUrl;
@@ -1871,6 +1872,7 @@ export type WorkspaceEntryType = 'git' | 'scratch';
 
 export type WorkspaceEvidence = {
     entries: Array<ResolvedWorkspaceEntry>;
+    maxMaterializedBytes: number;
     workspaceDigest: ContentDigest;
 };
 

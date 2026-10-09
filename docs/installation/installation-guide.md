@@ -215,7 +215,10 @@ authority ceiling. Omitting it grants no workspace entry types. For example:
   "maxTotalSize": "2Gi",
   "maxFiles": 100000,
   "maxHistoryDepth": 1000,
-  "maxSubmoduleDepth": 4
+  "maxSubmoduleDepth": 4,
+  "maxSubmodulesPerEntry": 32,
+  "maxTotalSubmodules": 64,
+  "maxTreeReads": 64
 }
 ```
 

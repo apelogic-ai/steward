@@ -658,6 +658,7 @@ fn binding_evidence_records_resolved_workspace_identity_and_digest() -> Result<(
             "commit": "git:sha1:1111111111111111111111111111111111111111",
             "history": { "depth": 20 },
             "paths": ["src/"],
+            "maxMaterializedBytes": 62914560,
             "contentDigest": format!("steward:sha256:{}", "a".repeat(64))
         },
         {
@@ -667,12 +668,17 @@ fn binding_evidence_records_resolved_workspace_identity_and_digest() -> Result<(
             "contentDigest": format!("steward:sha256:{}", "b".repeat(64))
         }
     ]);
+    let max_materialized_bytes = 62_914_560_u64;
     let workspace_digest = format!(
         "steward:sha256:{:x}",
-        Sha256::digest(canonical_json_bytes(&entries)?)
+        Sha256::digest(canonical_json_bytes(&serde_json::json!({
+            "entries": &entries,
+            "maxMaterializedBytes": max_materialized_bytes,
+        }))?)
     );
     evidence["workspace"] = serde_json::json!({
         "entries": entries,
+        "maxMaterializedBytes": max_materialized_bytes,
         "workspaceDigest": workspace_digest
     });
     let evidence: DirectTaskBindingEvidence = serde_json::from_value(evidence)

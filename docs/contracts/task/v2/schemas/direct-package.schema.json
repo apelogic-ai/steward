@@ -477,7 +477,7 @@
       "oneOf": [
         {
           "type": "object",
-          "required": ["type", "name", "access", "repository", "repositoryId", "repositoryOwnerId", "commit", "history", "contentDigest"],
+          "required": ["type", "name", "access", "repository", "repositoryId", "repositoryOwnerId", "commit", "history", "maxMaterializedBytes", "contentDigest"],
           "properties": {
             "type": { "const": "git" },
             "name": { "$ref": "#/$defs/workspaceName" },
@@ -499,6 +499,7 @@
               "items": { "$ref": "#/$defs/resolvedWorkspaceSubmodule" },
               "default": []
             },
+            "maxMaterializedBytes": { "type": "integer", "minimum": 1 },
             "contentDigest": { "$ref": "#/$defs/stewardDigest" }
           },
           "additionalProperties": false
@@ -518,7 +519,7 @@
     },
     "workspaceEvidence": {
       "type": "object",
-      "required": ["entries", "workspaceDigest"],
+      "required": ["entries", "maxMaterializedBytes", "workspaceDigest"],
       "properties": {
         "entries": {
           "type": "array",
@@ -526,6 +527,7 @@
           "maxItems": 32,
           "items": { "$ref": "#/$defs/resolvedWorkspaceEntry" }
         },
+        "maxMaterializedBytes": { "type": "integer", "minimum": 0 },
         "workspaceDigest": { "$ref": "#/$defs/stewardDigest" }
       },
       "additionalProperties": false
