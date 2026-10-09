@@ -11269,6 +11269,20 @@ mod tests {
         ))
     }
 
+    fn direct_test_app_with_workspace_policy(
+        ledger: FakeLedger,
+        git: FakeDirectGit,
+        workspace_policy: serde_json::Value,
+    ) -> Result<axum::Router, String> {
+        Ok(task_router(
+            ledger,
+            FakeTaskIdentityResolver,
+            task_api_config()?
+                .with_git_hosting_plane(git)
+                .with_workspace_policy_json(Some(&workspace_policy.to_string()))?,
+        ))
+    }
+
     fn enable_inline_for_versioned_task_fixture(
         ledger: &FakeLedger,
         enabled: bool,
@@ -12795,12 +12809,14 @@ mod tests {
                     mode: "100644".to_owned(),
                     kind: "blob".to_owned(),
                     object: "b".repeat(40),
+                    size: Some(128),
                 },
                 GitTreeEntry {
                     path: steward_types::direct_package::RelativePath::parse("vendor/proto")?,
                     mode: "160000".to_owned(),
                     kind: "commit".to_owned(),
                     object: "d".repeat(40),
+                    size: None,
                 },
             ],
         );
@@ -12919,6 +12935,62 @@ mod tests {
             "direct-workspace-unadmitted",
             StatusCode::UNPROCESSABLE_ENTITY,
             "workspace_git_repository_not_admitted",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_rejects_resolved_tree_over_task_cap_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {"limits": {"files": 1, "size": "1Ki"}}
+        }]);
+        let mut git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let caller = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
+        Arc::make_mut(&mut git.trees).insert(
+            (
+                caller.as_str().to_owned(),
+                format!("git:sha1:{}", "c".repeat(40)),
+            ),
+            vec![
+                GitTreeEntry {
+                    path: steward_types::direct_package::RelativePath::parse("README.md")?,
+                    mode: "100644".to_owned(),
+                    kind: "blob".to_owned(),
+                    object: "b".repeat(40),
+                    size: Some(512),
+                },
+                GitTreeEntry {
+                    path: steward_types::direct_package::RelativePath::parse("src/lib.rs")?,
+                    mode: "100644".to_owned(),
+                    kind: "blob".to_owned(),
+                    object: "d".repeat(40),
+                    size: Some(512),
+                },
+            ],
+        );
+        let app = direct_test_app_with_workspace_policy(
+            ledger.clone(),
+            git,
+            serde_json::json!({
+                "enabledTypes": ["git"],
+                "maxTotalSize": "2Gi",
+                "scratchVolumeSize": "2Gi",
+                "maxFiles": 100,
+                "maxHistoryDepth": 20,
+                "maxSubmoduleDepth": 2
+            }),
+        )?;
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-workspace-tree-over-cap",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_limit_exceeded",
         )
         .await
     }

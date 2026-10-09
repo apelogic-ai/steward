@@ -409,6 +409,7 @@ spec:
             - { name: STEWARD_TASK_ANTHROPIC_INFERENCE_ENDPOINT, value: {{ .Values.config.apiserver.anthropicInferenceEndpoint | quote }} }
 {{- end }}
             - { name: STEWARD_TASK_MCP_GW_ENDPOINT, value: {{ .Values.config.apiserver.mcpGatewayEndpoint | quote }} }
+            - { name: STEWARD_WORKSPACE_POLICY_JSON, value: {{ .Values.workspace | toJson | quote }} }
 {{- if .Values.githubSource.enabled }}
             - { name: STEWARD_GITHUB_SOURCE_APP_ID, value: {{ .Values.githubSource.appId | quote }} }
             - { name: STEWARD_GITHUB_SOURCE_PRIVATE_KEY_FILE, value: /run/github-source-private-key/private-key.pem }

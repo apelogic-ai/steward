@@ -587,6 +587,8 @@ pub struct GitTreeEntry {
     pub mode: String,
     pub kind: String,
     pub object: String,
+    /// Uncompressed blob size reported by the hosting provider. Trees and gitlinks omit it.
+    pub size: Option<u64>,
 }
 
 /// The recursive tree of one exact commit, with repository identity revalidated after the read.

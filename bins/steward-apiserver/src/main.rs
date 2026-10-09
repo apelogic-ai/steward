@@ -172,6 +172,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     };
     let task_execution_bindings_json = configured_execution_bindings_json()?;
     let source_repository_bindings_json = configured_source_repository_bindings_json()?;
+    let workspace_policy_json = optional_unicode_environment("STEWARD_WORKSPACE_POLICY_JSON")?;
     let github_source = configured_github_source_adapter()?;
     let github_source_enabled = github_source.is_some();
     let task_auth_discovery = configured_task_identity
@@ -204,6 +205,7 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         .and_then(|config| {
             config.with_source_repository_bindings_json(source_repository_bindings_json.as_deref())
         })
+        .and_then(|config| config.with_workspace_policy_json(workspace_policy_json.as_deref()))
         .and_then(|config| config.with_execution_bindings_active(task_execution_bindings_active))
         .map_err(io::Error::other)?;
     let task_api_config = match github_source {

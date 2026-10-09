@@ -44,8 +44,8 @@ use steward_types::direct_package::{
     PackageCommit, PromptSourceKind, RelativePath, RepositoryUrl, ResolvedSource,
     ResolvedWorkspaceEntry, ResolvedWorkspaceSubmodule, SourceProvenance, StableProviderId,
     TASK_BINDING_EVIDENCE_SCHEMA, TaskOrigin, TriggerRepository, WorkspaceEntry, WorkspaceEvidence,
-    WorkspaceGitHistory, WorkspaceGitRepository, WorkspaceName, WorkspaceSubmoduleMode,
-    WorkspaceSubmoduleStatus, canonical_json_bytes,
+    WorkspaceGitHistory, WorkspaceGitRepository, WorkspaceName, WorkspacePath,
+    WorkspaceSubmoduleMode, WorkspaceSubmoduleStatus, canonical_json_bytes,
 };
 use steward_types::task_input_archive::{frame_task_input_archive, split_task_input_archive};
 use steward_types::task_output_archive::{
@@ -217,6 +217,71 @@ trait DirectGitResolver: Send + Sync {
     ) -> BoxFuture<'a, Result<GitTree, steward_ports::PortError>>;
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceDeploymentPolicyDocument {
+    enabled_types: BTreeSet<String>,
+    max_total_size: String,
+    scratch_volume_size: String,
+    max_files: u64,
+    max_history_depth: u32,
+    max_submodule_depth: usize,
+}
+
+#[derive(Clone)]
+struct WorkspaceDeploymentPolicy {
+    enabled_types: BTreeSet<String>,
+    max_total_bytes: u64,
+    scratch_volume_bytes: u64,
+    max_files: u64,
+    max_history_depth: u32,
+    max_submodule_depth: usize,
+}
+
+impl Default for WorkspaceDeploymentPolicy {
+    fn default() -> Self {
+        Self {
+            enabled_types: BTreeSet::from(["git".to_owned(), "scratch".to_owned()]),
+            max_total_bytes: 2 * 1024 * 1024 * 1024,
+            scratch_volume_bytes: 2 * 1024 * 1024 * 1024,
+            max_files: 100_000,
+            max_history_depth: 1_000,
+            max_submodule_depth: 4,
+        }
+    }
+}
+
+impl TryFrom<WorkspaceDeploymentPolicyDocument> for WorkspaceDeploymentPolicy {
+    type Error = String;
+
+    fn try_from(value: WorkspaceDeploymentPolicyDocument) -> Result<Self, Self::Error> {
+        if value.enabled_types.is_empty()
+            || value
+                .enabled_types
+                .iter()
+                .any(|entry| !matches!(entry.as_str(), "git" | "scratch"))
+            || value.max_files == 0
+            || value.max_history_depth == 0
+            || value.max_submodule_depth > 16
+        {
+            return Err("workspace deployment policy is invalid".to_owned());
+        }
+        let max_total_bytes = parse_workspace_size_bytes(&value.max_total_size)
+            .ok_or_else(|| "workspace deployment policy is invalid".to_owned())?;
+        let scratch_volume_bytes = parse_workspace_size_bytes(&value.scratch_volume_size)
+            .filter(|size| *size <= max_total_bytes)
+            .ok_or_else(|| "workspace deployment policy is invalid".to_owned())?;
+        Ok(Self {
+            enabled_types: value.enabled_types,
+            max_total_bytes,
+            scratch_volume_bytes,
+            max_files: value.max_files,
+            max_history_depth: value.max_history_depth,
+            max_submodule_depth: value.max_submodule_depth,
+        })
+    }
+}
+
 impl<G> DirectGitResolver for G
 where
     G: GitHostingPlane,
@@ -278,6 +343,7 @@ pub struct TaskApiConfig {
     source_repository_bindings: BTreeSet<SourceRepositoryBindingKey>,
     failure_reporter: TaskSubmissionFailureReporter,
     inference_mode: InferenceMode,
+    workspace_policy: WorkspaceDeploymentPolicy,
 }
 
 impl Default for TaskApiConfig {
@@ -292,6 +358,7 @@ impl Default for TaskApiConfig {
             source_repository_bindings: BTreeSet::new(),
             failure_reporter: Arc::new(|line| eprintln!("{line}")),
             inference_mode: InferenceMode::Stock,
+            workspace_policy: WorkspaceDeploymentPolicy::default(),
         }
     }
 }
@@ -418,6 +485,19 @@ impl TaskApiConfig {
                 return Err("source repository binding catalog contains a duplicate".to_owned());
             }
         }
+        Ok(self)
+    }
+
+    pub fn with_workspace_policy_json(mut self, value: Option<&str>) -> Result<Self, String> {
+        let Some(value) = value else {
+            return Ok(self);
+        };
+        if value.len() > 16 * 1024 {
+            return Err("workspace deployment policy is invalid".to_owned());
+        }
+        let document = serde_json::from_str::<WorkspaceDeploymentPolicyDocument>(value)
+            .map_err(|_| "workspace deployment policy is invalid".to_owned())?;
+        self.workspace_policy = document.try_into()?;
         Ok(self)
     }
 
@@ -2920,16 +3000,20 @@ where
     if entries.is_empty() {
         return Ok(None);
     }
-    let git = config.direct_git_resolver.as_ref().ok_or_else(|| {
-        ApiError::TaskRuntimeContractUnavailable(
-            "workspace_git_source_resolver_unavailable".to_owned(),
-        )
-    })?;
+    let git = config.direct_git_resolver.as_ref();
     let mut resolved = Vec::with_capacity(entries.len());
     let mut names = BTreeSet::new();
+    let mut materialized_bytes = 0_u64;
+    let mut materialized_files = 0_u64;
     for entry in entries {
+        validate_workspace_deployment_policy(&config.workspace_policy, entry)?;
         let resolved_entry = match entry {
             WorkspaceEntry::Git(entry) => {
+                let git = git.ok_or_else(|| {
+                    ApiError::TaskRuntimeContractUnavailable(
+                        "workspace_git_source_resolver_unavailable".to_owned(),
+                    )
+                })?;
                 let (repository, is_self) = match &entry.git.repository {
                     WorkspaceGitRepository::SelfRepository => (
                         context.self_repository.cloned().ok_or_else(|| {
@@ -2997,22 +3081,56 @@ where
                         .await
                         .map_err(source_port_error)?,
                 };
-                let submodules = if entry.git.submodules.mode == WorkspaceSubmoduleMode::Admitted {
+                let resolution = if entry.git.submodules.mode == WorkspaceSubmoduleMode::Admitted {
                     resolve_workspace_submodules(
                         ledger,
                         config,
                         git.as_ref(),
                         &repository,
                         &commit,
+                        &entry.git.paths,
                         &entry.git.submodules.required,
                         entry.git.submodules.recursive,
+                        config.workspace_policy.max_submodule_depth,
                         context.caller,
                         context.browser,
                     )
                     .await?
                 } else {
-                    Vec::new()
+                    let tree = read_workspace_tree(git.as_ref(), &repository, &commit).await?;
+                    WorkspaceSubmoduleResolution {
+                        entries: Vec::new(),
+                        inventory: workspace_tree_inventory(&tree, &entry.git.paths)?,
+                    }
                 };
+                let entry_size_limit = workspace_entry_size_limit(
+                    entry.git.limits.as_ref(),
+                    config.workspace_policy.max_total_bytes,
+                )?;
+                let entry_file_limit = entry
+                    .git
+                    .limits
+                    .as_ref()
+                    .and_then(|limits| limits.files)
+                    .unwrap_or(config.workspace_policy.max_files);
+                if resolution.inventory.bytes > entry_size_limit
+                    || resolution.inventory.files > entry_file_limit
+                {
+                    return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
+                }
+                materialized_bytes = materialized_bytes
+                    .checked_add(resolution.inventory.bytes)
+                    .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
+                materialized_files = materialized_files
+                    .checked_add(resolution.inventory.files)
+                    .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
+                if materialized_bytes > config.workspace_policy.max_total_bytes
+                    || materialized_bytes > config.workspace_policy.scratch_volume_bytes
+                    || materialized_files > config.workspace_policy.max_files
+                {
+                    return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
+                }
+                let submodules = resolution.entries;
                 let content_digest = workspace_entry_digest(&serde_json::json!({
                     "type": "git",
                     "name": name,
@@ -3074,9 +3192,201 @@ where
     Ok(Some(evidence))
 }
 
+fn parse_workspace_size_bytes(value: &str) -> Option<u64> {
+    let (amount, multiplier) = [
+        ("Ti", 1024_u64.pow(4)),
+        ("Gi", 1024_u64.pow(3)),
+        ("Mi", 1024_u64.pow(2)),
+        ("Ki", 1024_u64),
+        ("T", 1000_u64.pow(4)),
+        ("G", 1000_u64.pow(3)),
+        ("M", 1000_u64.pow(2)),
+        ("K", 1000_u64),
+    ]
+    .into_iter()
+    .find_map(|(suffix, multiplier)| {
+        value
+            .strip_suffix(suffix)
+            .map(|amount| (amount, multiplier))
+    })
+    .unwrap_or((value, 1));
+    amount
+        .parse::<u64>()
+        .ok()
+        .filter(|amount| *amount > 0)
+        .and_then(|amount| amount.checked_mul(multiplier))
+}
+
+fn validate_workspace_deployment_policy(
+    policy: &WorkspaceDeploymentPolicy,
+    entry: &WorkspaceEntry,
+) -> Result<(), ApiError> {
+    let (entry_type, limits) = match entry {
+        WorkspaceEntry::Git(entry) => {
+            match entry.git.history {
+                WorkspaceGitHistory::Depth(depth) if depth > policy.max_history_depth => {
+                    return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
+                }
+                WorkspaceGitHistory::Full => {
+                    return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
+                }
+                _ => {}
+            }
+            if entry.git.submodules.recursive && policy.max_submodule_depth == 0 {
+                return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
+            }
+            ("git", entry.git.limits.as_ref())
+        }
+        WorkspaceEntry::Scratch(entry) => {
+            let size = parse_workspace_size_bytes(entry.scratch.size.as_str())
+                .ok_or_else(|| ApiError::Admission("workspace_limit_invalid".to_owned()))?;
+            if size > policy.max_total_bytes {
+                return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
+            }
+            if size != policy.scratch_volume_bytes {
+                return Err(ApiError::Admission(
+                    "workspace_scratch_size_unavailable".to_owned(),
+                ));
+            }
+            if let Some(limit) = entry
+                .scratch
+                .limits
+                .as_ref()
+                .and_then(|limits| limits.size.as_ref())
+            {
+                let limit = parse_workspace_size_bytes(limit.as_str())
+                    .ok_or_else(|| ApiError::Admission("workspace_limit_invalid".to_owned()))?;
+                if size > limit {
+                    return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
+                }
+            }
+            ("scratch", entry.scratch.limits.as_ref())
+        }
+    };
+    if !policy.enabled_types.contains(entry_type) {
+        return Err(ApiError::Admission(
+            "workspace_entry_type_not_allowed".to_owned(),
+        ));
+    }
+    if let Some(files) = limits.and_then(|limits| limits.files)
+        && files > policy.max_files
+    {
+        return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
+    }
+    if let Some(size) = limits.and_then(|limits| limits.size.as_ref()) {
+        let size = parse_workspace_size_bytes(size.as_str())
+            .ok_or_else(|| ApiError::Admission("workspace_limit_invalid".to_owned()))?;
+        if size > policy.max_total_bytes {
+            return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn workspace_entry_size_limit(
+    limits: Option<&steward_types::direct_package::WorkspaceLimits>,
+    deployment_limit: u64,
+) -> Result<u64, ApiError> {
+    limits
+        .and_then(|limits| limits.size.as_ref())
+        .map(|size| {
+            parse_workspace_size_bytes(size.as_str())
+                .ok_or_else(|| ApiError::Admission("workspace_limit_invalid".to_owned()))
+                .and_then(|size| {
+                    if size <= deployment_limit {
+                        Ok(size)
+                    } else {
+                        Err(ApiError::Admission("workspace_limit_exceeded".to_owned()))
+                    }
+                })
+        })
+        .transpose()
+        .map(|limit| limit.unwrap_or(deployment_limit))
+}
+
 const MAX_WORKSPACE_GIT_TREE_ENTRIES: usize = 100_000;
-const MAX_WORKSPACE_SUBMODULE_DEPTH: usize = 4;
 const MAX_GITMODULES_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, Copy, Default)]
+struct WorkspaceTreeInventory {
+    files: u64,
+    bytes: u64,
+}
+
+impl WorkspaceTreeInventory {
+    fn add(&mut self, other: Self) -> Result<(), ApiError> {
+        self.files = self
+            .files
+            .checked_add(other.files)
+            .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
+        self.bytes = self
+            .bytes
+            .checked_add(other.bytes)
+            .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
+        Ok(())
+    }
+}
+
+struct WorkspaceSubmoduleResolution {
+    entries: Vec<ResolvedWorkspaceSubmodule>,
+    inventory: WorkspaceTreeInventory,
+}
+
+async fn read_workspace_tree(
+    git: &dyn DirectGitResolver,
+    repository: &GitRepositoryIdentity,
+    commit: &steward_types::direct_package::ExactGitCommit,
+) -> Result<GitTree, ApiError> {
+    let tree = git
+        .read_tree(&GitTreeRequest {
+            repository: repository.clone(),
+            commit: commit.clone(),
+            max_entries: MAX_WORKSPACE_GIT_TREE_ENTRIES,
+        })
+        .await
+        .map_err(source_port_error)?;
+    if tree.repository != *repository || tree.commit != *commit {
+        return Err(ApiError::Admission(
+            "workspace_git_tree_identity_mismatch".to_owned(),
+        ));
+    }
+    Ok(tree)
+}
+
+fn workspace_tree_inventory(
+    tree: &GitTree,
+    paths: &[WorkspacePath],
+) -> Result<WorkspaceTreeInventory, ApiError> {
+    let mut inventory = WorkspaceTreeInventory::default();
+    for entry in tree.entries.iter().filter(|entry| entry.kind == "blob") {
+        if !paths.is_empty()
+            && !paths.iter().any(|path| {
+                let selected = path.as_str().strip_suffix('/').unwrap_or(path.as_str());
+                entry.path.as_str() == selected
+                    || entry
+                        .path
+                        .as_str()
+                        .strip_prefix(selected)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+        {
+            continue;
+        }
+        inventory.files = inventory
+            .files
+            .checked_add(1)
+            .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
+        inventory.bytes = inventory
+            .bytes
+            .checked_add(
+                entry
+                    .size
+                    .ok_or_else(|| ApiError::Admission("workspace_git_tree_invalid".to_owned()))?,
+            )
+            .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
+    }
+    Ok(inventory)
+}
 
 #[derive(Clone)]
 struct PendingWorkspaceSubmodules {
@@ -3084,6 +3394,8 @@ struct PendingWorkspaceSubmodules {
     commit: steward_types::direct_package::ExactGitCommit,
     prefix: String,
     depth: usize,
+    paths: Vec<WorkspacePath>,
+    discover_submodules: bool,
 }
 
 async fn resolve_workspace_submodules<L>(
@@ -3092,11 +3404,13 @@ async fn resolve_workspace_submodules<L>(
     git: &dyn DirectGitResolver,
     repository: &GitRepositoryIdentity,
     commit: &steward_types::direct_package::ExactGitCommit,
+    paths: &[WorkspacePath],
     required: &[RelativePath],
     recursive: bool,
+    max_depth: usize,
     caller: Option<&TriggerRepository>,
     browser: bool,
-) -> Result<Vec<ResolvedWorkspaceSubmodule>, ApiError>
+) -> Result<WorkspaceSubmoduleResolution, ApiError>
 where
     L: TaskSubmissionLedger,
 {
@@ -3105,21 +3419,16 @@ where
         commit: commit.clone(),
         prefix: String::new(),
         depth: 0,
+        paths: paths.to_vec(),
+        discover_submodules: true,
     }];
     let mut resolved = Vec::new();
+    let mut inventory = WorkspaceTreeInventory::default();
     while let Some(parent) = pending.pop() {
-        let tree = git
-            .read_tree(&GitTreeRequest {
-                repository: parent.repository.clone(),
-                commit: parent.commit.clone(),
-                max_entries: MAX_WORKSPACE_GIT_TREE_ENTRIES,
-            })
-            .await
-            .map_err(source_port_error)?;
-        if tree.repository != parent.repository || tree.commit != parent.commit {
-            return Err(ApiError::Admission(
-                "workspace_git_tree_identity_mismatch".to_owned(),
-            ));
+        let tree = read_workspace_tree(git, &parent.repository, &parent.commit).await?;
+        inventory.add(workspace_tree_inventory(&tree, &parent.paths)?)?;
+        if !parent.discover_submodules {
+            continue;
         }
         let gitmodules_path = RelativePath::parse(".gitmodules").map_err(ApiError::Admission)?;
         let has_gitmodules = tree.entries.iter().any(|entry| {
@@ -3208,7 +3517,7 @@ where
                 reason: None,
             });
             if recursive {
-                if parent.depth >= MAX_WORKSPACE_SUBMODULE_DEPTH {
+                if parent.depth >= max_depth {
                     return Err(ApiError::Admission(
                         "workspace_git_submodule_depth_exceeded".to_owned(),
                     ));
@@ -3218,6 +3527,17 @@ where
                     commit: child_commit,
                     prefix: full_path.as_str().to_owned(),
                     depth: parent.depth + 1,
+                    paths: Vec::new(),
+                    discover_submodules: true,
+                });
+            } else {
+                pending.push(PendingWorkspaceSubmodules {
+                    repository: child_repository,
+                    commit: child_commit,
+                    prefix: full_path.as_str().to_owned(),
+                    depth: parent.depth + 1,
+                    paths: Vec::new(),
+                    discover_submodules: false,
                 });
             }
         }
@@ -3236,7 +3556,10 @@ where
             "workspace_git_required_submodule_unavailable".to_owned(),
         ));
     }
-    Ok(resolved)
+    Ok(WorkspaceSubmoduleResolution {
+        entries: resolved,
+        inventory,
+    })
 }
 
 fn parse_gitmodules(bytes: &[u8]) -> Result<Vec<(RelativePath, String)>, ApiError> {
@@ -5259,7 +5582,8 @@ mod workflow_request_tests {
     use super::{
         TaskApiConfig, TaskCreateRequest, TaskSubmissionRequest, browser_inputs_archive,
         browser_inputs_from_archive, browser_rerun_submission, resolve_versioned_task_plan,
-        stable_task_runtime_name, task_orchestration_reservation, versioned_workflow_reference,
+        stable_task_runtime_name, task_orchestration_reservation,
+        validate_workspace_deployment_policy, versioned_workflow_reference,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{Envelope, EnvelopeSpec};
@@ -5267,12 +5591,45 @@ mod workflow_request_tests {
         PortError, TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
     };
     use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
+    use steward_types::direct_package::WorkspaceEntry;
     use steward_types::{
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
     };
     use uuid::Uuid;
 
     struct ExampleExecutionAdapter;
+
+    #[test]
+    fn workspace_policy_rejects_disabled_types_and_over_cap_history() -> Result<(), String> {
+        let config = TaskApiConfig::default().with_workspace_policy_json(Some(
+            &serde_json::json!({
+                "enabledTypes": ["git"],
+                "maxTotalSize": "2Gi",
+                "scratchVolumeSize": "2Gi",
+                "maxFiles": 100,
+                "maxHistoryDepth": 20,
+                "maxSubmoduleDepth": 2
+            })
+            .to_string(),
+        ))?;
+        let scratch: WorkspaceEntry = serde_json::from_value(serde_json::json!({
+            "scratch": {"size": "2Gi"}
+        }))
+        .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            validate_workspace_deployment_policy(&config.workspace_policy, &scratch),
+            Err(ApiError::Admission(ref reason)) if reason == "workspace_entry_type_not_allowed"
+        ));
+        let git: WorkspaceEntry = serde_json::from_value(serde_json::json!({
+            "git": {"history": {"depth": 21}}
+        }))
+        .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            validate_workspace_deployment_policy(&config.workspace_policy, &git),
+            Err(ApiError::Admission(ref reason)) if reason == "workspace_limit_exceeded"
+        ));
+        Ok(())
+    }
 
     #[test]
     fn browser_inputs_round_trip_through_the_persisted_archive() -> Result<(), String> {

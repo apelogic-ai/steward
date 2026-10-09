@@ -875,6 +875,7 @@ impl GitHostingPlane for GitHubSourceAdapter {
                     entry.mode.as_str(),
                     "040000" | "100644" | "100755" | "120000" | "160000"
                 )
+                || (entry.kind == "blob") != entry.size.is_some()
             {
                 return Err(rejected("GitHub returned an invalid Git tree entry"));
             }
@@ -884,6 +885,7 @@ impl GitHostingPlane for GitHubSourceAdapter {
                 mode: entry.mode,
                 kind: entry.kind,
                 object: entry.sha,
+                size: entry.size,
             });
         }
         entries.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
@@ -1115,6 +1117,8 @@ struct WireGitTreeEntry {
     #[serde(rename = "type")]
     kind: String,
     sha: String,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1714,7 +1718,7 @@ mod tests {
                 "sha": ROOT_TREE,
                 "truncated": false,
                 "tree": [
-                    {"path": ".gitmodules", "mode": "100644", "type": "blob", "sha": BLOB},
+                    {"path": ".gitmodules", "mode": "100644", "type": "blob", "sha": BLOB, "size": 128},
                     {"path": "vendor/proto", "mode": "160000", "type": "commit", "sha": CATALOG_TREE}
                 ]
             })),
@@ -1734,6 +1738,8 @@ mod tests {
         assert_eq!(tree.entries[1].path.as_str(), "vendor/proto");
         assert_eq!(tree.entries[1].mode, "160000");
         assert_eq!(tree.entries[1].object, CATALOG_TREE);
+        assert_eq!(tree.entries[0].size, Some(128));
+        assert_eq!(tree.entries[1].size, None);
         let requests = mock.finish()?;
         assert!(requests[3].contains(&format!("/git/commits/{COMMIT}")));
         assert!(requests[4].contains(&format!("/git/trees/{ROOT_TREE}?recursive=1")));

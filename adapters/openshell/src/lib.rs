@@ -3004,15 +3004,45 @@ fn workspace_materialization_command(evidence: &WorkspaceEvidence) -> Result<Str
                     command.push_str(&format!("chmod -R a-w {destination}; "));
                 }
             }
-            ResolvedWorkspaceEntry::Scratch { .. } => {
-                return Err(PortError::Rejected {
-                    reason: "scratch workspace filesystem quota is unavailable".to_owned(),
-                });
+            ResolvedWorkspaceEntry::Scratch { name, size, .. } => {
+                let size_bytes =
+                    workspace_size_bytes(size.as_str()).ok_or_else(workspace_staging_rejected)?;
+                let size_kib = size_bytes.div_ceil(1024);
+                let destination = shell_quote(&format!("/sandbox/workspace/{}", name.as_str()));
+                command.push_str(&format!(
+                    "mkdir -p {destination}; workspace_capacity_kib=$(df -Pk {destination} | awk 'NR == 2 {{ print $2 }}'); case \"$workspace_capacity_kib\" in ''|*[!0-9]*) exit 1;; esac; [ \"$workspace_capacity_kib\" -le {size_kib} ]; chmod u+rwx {destination}; "
+                ));
             }
         }
     }
     command.push_str("rm -rf /sandbox/steward-workspace-source");
     Ok(command)
+}
+
+#[cfg(feature = "runtime")]
+fn workspace_size_bytes(value: &str) -> Option<u64> {
+    let (amount, multiplier) = [
+        ("Ti", 1024_u64.pow(4)),
+        ("Gi", 1024_u64.pow(3)),
+        ("Mi", 1024_u64.pow(2)),
+        ("Ki", 1024_u64),
+        ("T", 1000_u64.pow(4)),
+        ("G", 1000_u64.pow(3)),
+        ("M", 1000_u64.pow(2)),
+        ("K", 1000_u64),
+    ]
+    .into_iter()
+    .find_map(|(suffix, multiplier)| {
+        value
+            .strip_suffix(suffix)
+            .map(|amount| (amount, multiplier))
+    })
+    .unwrap_or((value, 1));
+    amount
+        .parse::<u64>()
+        .ok()
+        .filter(|amount| *amount > 0)
+        .and_then(|amount| amount.checked_mul(multiplier))
 }
 
 #[cfg(feature = "runtime")]
@@ -3098,9 +3128,9 @@ mod tests {
     #[cfg(feature = "runtime")]
     use steward_types::direct_package::{
         ContentDigest, ExactGitCommit, ExecutionLogMode, RepositoryUrl, ResolvedWorkspaceEntry,
-        ResolvedWorkspaceSubmodule, StableProviderId, WorkspaceAccess, WorkspaceEvidence,
-        WorkspaceGitHistory, WorkspaceName, WorkspacePath, WorkspaceSubmoduleStatus,
-        canonical_json_bytes,
+        ResolvedWorkspaceSubmodule, ResourceQuantity, StableProviderId, WorkspaceAccess,
+        WorkspaceEvidence, WorkspaceGitHistory, WorkspaceName, WorkspacePath,
+        WorkspaceSubmoduleStatus, canonical_json_bytes,
     };
     #[cfg(feature = "runtime")]
     use steward_types::{
@@ -3817,6 +3847,27 @@ mod tests {
         assert!(command.contains("chmod -R a-w '/sandbox/workspace/source'"));
         assert!(!command.contains("remote add"));
         assert!(!command.contains("github.example.test"));
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn workspace_materializer_creates_scratch_only_on_a_bounded_volume() -> Result<(), String> {
+        let entries = vec![ResolvedWorkspaceEntry::Scratch {
+            name: WorkspaceName::parse("scratch")?,
+            size: ResourceQuantity::parse("2Gi")?,
+            content_digest: ContentDigest::parse(format!("steward:sha256:{}", "d".repeat(64)))?,
+        }];
+        let digest = Sha256::digest(canonical_json_bytes(&entries)?);
+        let evidence = WorkspaceEvidence {
+            entries,
+            workspace_digest: ContentDigest::parse(format!("steward:sha256:{digest:x}"))?,
+        };
+        let command = workspace_materialization_command(&evidence)
+            .map_err(|error| format!("render scratch materializer: {error:?}"))?;
+        assert!(command.contains("mkdir -p '/sandbox/workspace/scratch'"));
+        assert!(command.contains("df -Pk '/sandbox/workspace/scratch'"));
+        assert!(command.contains("-le 2097152"));
         Ok(())
     }
 
