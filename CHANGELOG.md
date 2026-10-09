@@ -20,6 +20,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Added additive migration 0068 for envelope-encrypted per-user inference
   credentials and non-secret immutable audit history. The managed-mode guide
   documents the deployment key, backup unit, upgrade, and rollback boundary.
+## [0.3.14] - 2026-10-08
+
+This patch makes governed GitHub operations work again on deployments whose
+Connections bridge reaches GitHub through the MCP-GW agentgateway origin, adds
+the `bridge-gateway-session` failure category, and adds an unwired Mint
+resolver for managed inference credentials. It adds no migrations and changes
+no Helm values, chart defaults or provider-profile contracts.
+
+**Impact of the fixed defect (issue 330):** on Steward 0.3.13 and earlier,
+including 0.3.12, a deployment whose `connectionsBridge.mcpGatewayOrigin` is
+the MCP-GW agentgateway (a session-enforcing MCP gateway) could not publish a
+task definition to GitHub, detect its workflow, dispatch it, read its run
+status, rerun it, or search repositories with an explicit query; every such
+operation failed with `bridge-gateway-http` and upstream status 400, and Get
+started's publication step returned HTTP 503. Deployments using a direct
+GitHub wrapper origin were not affected. Connect, status and disconnect use
+MCP-GW's REST routes and kept working. With `githubSource` bound, the 0.3.13
+blank-query admitted repository listing runs no bridge operation, so the picker
+kept working and the failure surfaced only at publication or detection; on
+earlier releases, and on 0.3.13 without bindings, the blank-query listing uses
+the bridge and failed too. The fix was verified against the agentgateway image
+pinned by MCP-GW 0.5.7. Upgrade affected deployments to 0.3.14, including the
+bridge coordinates (see "Upgrade and rollback").
 
 ### Fixed
 
@@ -64,10 +87,47 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Each MCP operation now makes two more requests (`initialize` and
   `notifications/initialized`). Against a session-issuing gateway the final
   `DELETE` is always sent, bounded to two seconds, and its result is ignored;
-  the gateway also expires idle sessions. An MCP-GW provider profile that does
-  not permit `DELETE`, such as provider-profile bundles before 1.2.2, makes the
-  OpenShell proxy deny and log that request; the operation's result is
-  unaffected. No migration or Helm value change is required.
+  the gateway also expires idle sessions. The session `DELETE` is permitted
+  only by provider-profile bundle 1.2.2 (published since 0.3.4), whose MCP-GW
+  profile includes `DELETE` in its method set. With an earlier bundle installed,
+  the OpenShell proxy denies and logs each session `DELETE`; this is harmless,
+  because the operation's result is unaffected and the gateway expires the idle
+  session, but install bundle 1.2.2 to stop the denials. No migration or Helm
+  value change is required.
+
+### Added
+
+- Mint library: `ManagedCredentialGrantResolver`, a `CredentialGrantResolver`
+  for managed inference credentials, and its `ManagedInferenceCredentialSource`
+  trait. For the `inference` scope it returns the stored credential of the
+  runtime's verified canonical owner, and fails closed with
+  `CredentialUnavailable` when the runtime admits no models, has no canonical
+  authority, has no acting user or acts for a user other than its owner, or the
+  source has no credential. Mint's `AuthorityBinding` gains an `llms` field
+  copied from the runtime's admitted models. The resolver is **not wired to a credential store,
+  the Mint binary or the browser yet, so there is no behavior change** in this
+  release; no configuration enables it.
+
+### Upgrade and rollback
+
+- No migrations since v0.3.13; the newest migration remains 0067. No Helm
+  value, schema default, or provider-profile contract change is required.
+- Deploy the v0.3.14 chart and all component images as one release unit. The
+  fix lives in the Connections bridge, so when `connectionsBridge.enabled=true`
+  update `connectionsBridge.image`, `connectionsBridge.sourceCommit`,
+  `connectionsBridge.signerIdentity`, and `connectionsBridge.attestationBundle`
+  to the values under "Stable bridge provenance inputs" in the v0.3.14 release
+  notes; a deployment that keeps an earlier bridge keeps the defect. The
+  apiserver, controller and web UI must also come from this release to
+  recognize and explain `bridge-gateway-session`.
+- Keep or install provider-profile bundle 1.2.2 so the session `DELETE` is
+  permitted; an earlier bundle only causes logged, harmless proxy denials.
+- Rollback to v0.3.13 needs no database restore because v0.3.14 adds no schema
+  or durable-state contract; restore the v0.3.13 chart and its full
+  component-image set, including the bridge coordinates, together. Rolling
+  back restores the defect on agentgateway origins, and operations already
+  recorded with `bridge-gateway-session` read as a generic unavailable failure
+  on v0.3.13.
 
 ## [0.3.13] - 2026-10-08
 
@@ -968,7 +1028,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.13...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.14...HEAD
+[0.3.14]: https://github.com/apelogic-ai/steward/compare/v0.3.13...v0.3.14
 [0.3.13]: https://github.com/apelogic-ai/steward/compare/v0.3.12...v0.3.13
 [0.3.12]: https://github.com/apelogic-ai/steward/compare/v0.3.11...v0.3.12
 [0.3.11]: https://github.com/apelogic-ai/steward/compare/v0.3.10...v0.3.11
