@@ -514,6 +514,10 @@ fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
     {
         "bridge-gateway-transport"
     } else if stderr.contains("steward-connections-bridge:")
+        && stderr.contains("mcp-gw session could not be established")
+    {
+        "bridge-gateway-session"
+    } else if stderr.contains("steward-connections-bridge:")
         && stderr.contains("mcp-gw returned http ")
     {
         "bridge-gateway-http"
@@ -929,6 +933,7 @@ fn sanitized_provider_control_transcript(
                 | "bridge-response-contract"
                 | "bridge-gateway-transport"
                 | "bridge-gateway-http"
+                | "bridge-gateway-session"
                 | "bridge-gateway-body"
                 | "bridge-gateway-unavailable"
                 | "bridge-input"
@@ -3294,6 +3299,17 @@ mod tests {
             None,
             "multiline provider-control stderr must never reach durable task diagnostics"
         );
+        assert_eq!(
+            sanitized_provider_control_transcript(SandboxTaskTranscript {
+                stdout: Vec::new(),
+                stderr: b"steward-connections-bridge: bridge MCP-GW session could not be established (session expired)\n".to_vec(),
+            }),
+            Some(SandboxTaskTranscript {
+                stdout: Vec::new(),
+                stderr: b"steward-connections-bridge: bridge MCP-GW session could not be established (session expired)\n".to_vec(),
+            }),
+            "an MCP session failure is a fixed bounded bridge diagnostic"
+        );
     }
 
     #[cfg(feature = "runtime")]
@@ -4884,6 +4900,13 @@ mod tests {
             ),
             "bridge-gateway-http",
             "an actionable gateway response must not be mislabeled as a proxy-policy failure"
+        );
+        assert_eq!(
+            task_agent_failure_category(
+                b"steward-connections-bridge: bridge MCP-GW session could not be established (initialize returned HTTP 400)"
+            ),
+            "bridge-gateway-session",
+            "an MCP session failure must not be reported as a generic gateway HTTP failure"
         );
         assert_eq!(
             task_agent_failure_category(

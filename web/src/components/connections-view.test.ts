@@ -55,6 +55,8 @@ describe("governed provider connection controls", () => {
     expect(source).toContain("verify the deployed Steward and MCP-GW versions");
     expect(source).toContain("gateway_body_unavailable");
     expect(source).toContain("gateway_unavailable");
+    expect(source).toContain("gateway_session_failed");
+    expect(source).toContain("establish an MCP session with MCP-GW");
     expect(source).toContain("runtime_create_failed");
     expect(source).toContain("inspect Steward runtime admission and controller events");
     expect(source).toContain("runtime_start_failed");
