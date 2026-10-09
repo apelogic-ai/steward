@@ -2642,6 +2642,10 @@ test("Get started completes the governed test-to-GitHub journey from server evid
 
     const triggerStep = await openStep("Trigger a test run");
     await triggerStep.getByRole("button", { name: "Run on GitHub" }).click();
+    await expect.poll(
+      () => developer.mutations.filter((mutation) => mutation.path.endsWith("/github/dispatch")).length,
+      { message: "the governed GitHub dispatch should reach the same-origin boundary" },
+    ).toBe(1);
     const dispatch = developer.mutations.find((mutation) => mutation.path.endsWith("/github/dispatch"));
     expectMutationProof(dispatch);
     expect(dispatch.body).toMatchObject({ owner: "example-org", repository: "agentic-ops" });
