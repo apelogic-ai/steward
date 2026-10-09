@@ -632,6 +632,7 @@ mod browser_rbac_tests {
                     currency: "USD".to_owned(),
                 },
                 runtime_minutes_limit: None,
+                workspace: None,
                 ttl: Duration("1h".to_owned()),
                 runner: RunnerRequirements::default(),
             },
@@ -11613,6 +11614,7 @@ mod task_execution_binding_tests {
                 tools: spec.tools.clone(),
                 budget: spec.budget.clone(),
                 runtime_minutes_limit: None,
+                workspace: None,
                 ttl: spec.ttl.clone(),
                 runner: spec.runner.clone(),
             },
@@ -14770,5 +14772,6 @@ fn grant_dimension(delta: &AdmissionDelta) -> &'static str {
         AdmissionDelta::RunnerMemory { .. } => "runner-memory",
         AdmissionDelta::RunnerCompute { .. } => "runner-compute",
         AdmissionDelta::RunnerStorage { .. } => "runner-storage",
+        AdmissionDelta::Workspace { .. } => "workspace",
     }
 }

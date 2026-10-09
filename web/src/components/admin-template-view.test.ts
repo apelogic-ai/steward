@@ -51,6 +51,7 @@ describe("first envelope template", () => {
       templateId: "not valid",
       thresholdJson: "not-json",
       tools: [{ provider: "github", resource: "repository", action: "write" }],
+      workspaceJson: "",
     });
 
     expect(errors).toEqual({
@@ -79,7 +80,41 @@ describe("first envelope template", () => {
       templateId: "engineering.v1",
       thresholdJson: "",
       tools: [],
+      workspaceJson: "",
     })).toEqual({});
+  });
+
+  test("validates the optional workspace authority before submission", () => {
+    const common = {
+      allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
+      allowedTools: new Set<string>(),
+      autoApproveToCeiling: true,
+      displayName: "Engineering",
+      envelope: authoredEnvelope(),
+      memberRoles: ["engineer"],
+      models: [{ provider: "provider-a", model: "model-a" }],
+      monthlyLimit: "10.00",
+      singleRunLimit: "1.00",
+      templateId: "engineer",
+      thresholdJson: "",
+      tools: [],
+    };
+    expect(validateTemplateFields({
+      ...common,
+      workspaceJson: JSON.stringify({
+        allowedTypes: ["git", "scratch"],
+        maxTotalSize: "2Gi",
+        maxFiles: 100_000,
+        maxHistoryDepth: 1_000,
+        maxSubmoduleDepth: 4,
+      }),
+    })).toEqual({});
+    expect(validateTemplateFields({
+      ...common,
+      workspaceJson: JSON.stringify({ allowedTypes: ["git"], maxTotalSize: "2GB" }),
+    })).toEqual({
+      workspace: "Enter a complete valid workspace authority object or leave it blank.",
+    });
   });
 
   test("rejects valid JSON when the threshold is invalid or wider than its ceiling", () => {
@@ -103,6 +138,7 @@ describe("first envelope template", () => {
       templateId: "engineer",
       thresholdJson: JSON.stringify(threshold),
       tools: [],
+      workspaceJson: "",
     })).toEqual({ threshold: "Enter a valid envelope within this template ceiling." });
   });
 
@@ -127,6 +163,7 @@ describe("first envelope template", () => {
       templateId: "engineer",
       thresholdJson: "",
       tools: [],
+      workspaceJson: "",
     })).toEqual({
       ttl: "Enter a TTL.",
       runtimeMinutes: "Enter a non-negative decimal.",
@@ -151,6 +188,7 @@ describe("first envelope template", () => {
       templateId: "engineer",
       thresholdJson: "",
       tools: [],
+      workspaceJson: "",
     })).toEqual({
       displayName: "Use at most 128 characters.",
       memberRoles: "Use at most 64 eligible member roles.",

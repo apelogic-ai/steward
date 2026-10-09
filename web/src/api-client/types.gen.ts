@@ -346,6 +346,7 @@ export type BrowserEnvelopeSpec = {
     runtimeMinutesLimit?: string | null;
     tools: Array<ToolGrant>;
     ttl: Duration;
+    workspace?: null | WorkspaceAuthority;
 };
 
 export type BrowserEnvelopeTemplateListItem = {
@@ -958,6 +959,10 @@ export type DirectAdmissionDelta = {
     ceiling?: null | ResourceQuantity;
     dimension: 'runnerStorage';
     requested: ResourceQuantity;
+} | {
+    ceiling?: null | WorkspaceAuthority;
+    dimension: 'workspace';
+    requested: WorkspaceAuthority;
 };
 
 export type DirectRequirements = {
@@ -1852,7 +1857,17 @@ export type WorkflowRun = {
 
 export type WorkspaceAccess = 'read-only' | 'copy';
 
+export type WorkspaceAuthority = {
+    allowedTypes: Array<WorkspaceEntryType>;
+    maxFiles: number;
+    maxHistoryDepth: number;
+    maxSubmoduleDepth: number;
+    maxTotalSize: ResourceQuantity;
+};
+
 export type WorkspaceEntry = WorkspaceGitEntry | WorkspaceScratchEntry;
+
+export type WorkspaceEntryType = 'git' | 'scratch';
 
 export type WorkspaceEvidence = {
     entries: Array<ResolvedWorkspaceEntry>;

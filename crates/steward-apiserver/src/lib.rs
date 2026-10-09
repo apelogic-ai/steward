@@ -3794,7 +3794,8 @@ mod tests {
     };
     use steward_types::direct_package::{
         ClosureEntryKind, ExactGitCommit, InvocationKind, PromptSourceKind, RepositoryUrl,
-        SourceProvenance, SourceProvider, StableProviderId, TaskOrigin,
+        ResourceQuantity, SourceProvenance, SourceProvider, StableProviderId, TaskOrigin,
+        WorkspaceAuthority, WorkspaceEntryType,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
@@ -6224,6 +6225,13 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 runtime_minutes_limit: None,
+                workspace: Some(WorkspaceAuthority {
+                    allowed_types: vec![WorkspaceEntryType::Git],
+                    max_total_size: ResourceQuantity::parse("2Gi")?,
+                    max_files: 100_000,
+                    max_history_depth: 1_000,
+                    max_submodule_depth: 4,
+                }),
                 ttl: Duration("8h".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
             },
@@ -6283,6 +6291,11 @@ mod tests {
             body.pointer("/templates/1/memberRoles/0"),
             Some(&serde_json::json!("engineer")),
             "multiple stable template IDs must be eligible for the same role"
+        );
+        assert_eq!(
+            body.pointer("/templates/1/envelope/spec/workspace/maxHistoryDepth"),
+            Some(&serde_json::json!(1_000)),
+            "workspace authority must survive browser authoring and list projection"
         );
         Ok(())
     }
@@ -8849,6 +8862,7 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 runtime_minutes_limit: None,
+                workspace: None,
                 ttl: Duration("24h".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
             },
@@ -8874,6 +8888,7 @@ mod tests {
                             currency: "USD".to_owned(),
                         },
                         runtime_minutes_limit: None,
+                        workspace: None,
                         ttl: Duration("24h".to_owned()),
                         runner: steward_types::RunnerRequirements::default(),
                     },
@@ -8892,6 +8907,7 @@ mod tests {
                             currency: "USD".to_owned(),
                         },
                         runtime_minutes_limit: None,
+                        workspace: None,
                         ttl: Duration("24h".to_owned()),
                         runner: steward_types::RunnerRequirements::default(),
                     },
@@ -8962,6 +8978,7 @@ mod tests {
                         currency: "USD".to_owned(),
                     },
                     runtime_minutes_limit: None,
+                    workspace: None,
                     ttl: Duration("24h".to_owned()),
                     runner: steward_types::RunnerRequirements::default(),
                 },
@@ -8980,6 +8997,7 @@ mod tests {
                         currency: "USD".to_owned(),
                     },
                     runtime_minutes_limit: None,
+                    workspace: None,
                     ttl: Duration("24h".to_owned()),
                     runner: steward_types::RunnerRequirements::default(),
                 },
@@ -9052,6 +9070,13 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 runtime_minutes_limit: None,
+                workspace: Some(WorkspaceAuthority {
+                    allowed_types: vec![WorkspaceEntryType::Git, WorkspaceEntryType::Scratch],
+                    max_total_size: ResourceQuantity::parse("2Gi")?,
+                    max_files: 100_000,
+                    max_history_depth: 1_000,
+                    max_submodule_depth: 4,
+                }),
                 ttl: Duration("4h".to_owned()),
                 runner: steward_types::RunnerRequirements {
                     platforms: vec![steward_types::RunnerPlatform::Linux],
@@ -9103,6 +9128,13 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 runtime_minutes_limit: None,
+                workspace: Some(WorkspaceAuthority {
+                    allowed_types: vec![WorkspaceEntryType::Git, WorkspaceEntryType::Scratch],
+                    max_total_size: ResourceQuantity::parse("4Gi")?,
+                    max_files: 200_000,
+                    max_history_depth: 2_000,
+                    max_submodule_depth: 8,
+                }),
                 ttl: Duration("24h".to_owned()),
                 runner: steward_types::RunnerRequirements {
                     platforms: vec![steward_types::RunnerPlatform::Linux],
@@ -13055,6 +13087,88 @@ mod tests {
             &ledger,
             app,
             "direct-workspace-tree-over-cap",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_limit_exceeded",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_rejects_type_absent_from_envelope_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let envelope = envelopes
+                .first_mut()
+                .ok_or_else(|| "fixture requires a User Envelope".to_owned())?;
+            envelope.requested_envelope.spec.workspace = None;
+            envelope
+                .approved_envelope
+                .as_mut()
+                .ok_or_else(|| "fixture requires an approved Envelope".to_owned())?
+                .spec
+                .workspace = None;
+        }
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{"git": {}}]);
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-workspace-envelope-type",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_entry_type_not_allowed",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_rejects_history_over_envelope_cap_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let envelope = envelopes
+                .first_mut()
+                .ok_or_else(|| "fixture requires a User Envelope".to_owned())?;
+            for spec in [
+                &mut envelope.requested_envelope.spec,
+                &mut envelope
+                    .approved_envelope
+                    .as_mut()
+                    .ok_or_else(|| "fixture requires an approved Envelope".to_owned())?
+                    .spec,
+            ] {
+                spec.workspace
+                    .as_mut()
+                    .ok_or_else(|| "fixture requires workspace authority".to_owned())?
+                    .max_history_depth = 4;
+            }
+        }
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {"history": {"depth": 5}}
+        }]);
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-workspace-envelope-cap",
             StatusCode::UNPROCESSABLE_ENTITY,
             "workspace_limit_exceeded",
         )

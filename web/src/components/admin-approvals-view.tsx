@@ -152,6 +152,7 @@ function deltaLabel(dimension: AdminRequestView["deltas"][number]["dimension"]):
     runnerMemory: "Memory",
     runnerCompute: "Compute",
     runnerStorage: "Storage",
+    workspace: "Workspace",
   }[dimension];
 }
 

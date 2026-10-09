@@ -760,6 +760,10 @@ pub enum DirectAdmissionDelta {
         requested: ResourceQuantity,
         ceiling: Option<ResourceQuantity>,
     },
+    Workspace {
+        requested: WorkspaceAuthority,
+        ceiling: Option<WorkspaceAuthority>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -1148,6 +1152,35 @@ pub enum WorkspaceSubmoduleMode {
     #[default]
     None,
     Admitted,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceEntryType {
+    Git,
+    Scratch,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspaceAuthority {
+    pub allowed_types: Vec<WorkspaceEntryType>,
+    pub max_total_size: ResourceQuantity,
+    pub max_files: u64,
+    pub max_history_depth: u32,
+    pub max_submodule_depth: u32,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]

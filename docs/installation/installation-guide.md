@@ -206,6 +206,23 @@ Git workspaces use only repositories admitted by stable ID in `githubSource.bind
 Steward fetches exact objects through the source GitHub App, strips credentials and
 remotes before the agent starts, and records the pinned commit in Task evidence.
 
+Each Envelope that may run workspace-bearing Tasks must also include a `workspace`
+authority ceiling. Omitting it grants no workspace entry types. For example:
+
+```json
+{
+  "allowedTypes": ["git", "scratch"],
+  "maxTotalSize": "2Gi",
+  "maxFiles": 100000,
+  "maxHistoryDepth": 1000,
+  "maxSubmoduleDepth": 4
+}
+```
+
+Template approval bounds the provisioned User Envelope through the ordinary Envelope
+subset check. At Task admission, Steward intersects that approved User Envelope with
+the chart deployment ceiling and any per-entry Task limits before reserving a runtime.
+
 Developers can declare `workspace` directly in a `steward.task-definition/v2` package.
 For an inline browser run, **Check out this repository** writes the equivalent entry
 using the selected admitted repository and resolves its default-branch HEAD at

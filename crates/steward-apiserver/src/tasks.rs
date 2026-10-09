@@ -43,9 +43,10 @@ use steward_types::direct_package::{
     InvocationKind, InvocationManifest, PACKAGE_CLOSURE_CONTRACT_VERSION, PackageClosure,
     PackageCommit, PromptSourceKind, RelativePath, RepositoryUrl, ResolvedSource,
     ResolvedWorkspaceEntry, ResolvedWorkspaceSubmodule, SourceProvenance, StableProviderId,
-    TASK_BINDING_EVIDENCE_SCHEMA, TaskOrigin, TriggerRepository, WorkspaceEntry, WorkspaceEvidence,
-    WorkspaceGitHistory, WorkspaceGitRepository, WorkspaceName, WorkspacePath,
-    WorkspaceSubmoduleMode, WorkspaceSubmoduleStatus, canonical_json_bytes,
+    TASK_BINDING_EVIDENCE_SCHEMA, TaskOrigin, TriggerRepository, WorkspaceAuthority,
+    WorkspaceEntry, WorkspaceEntryType, WorkspaceEvidence, WorkspaceGitHistory,
+    WorkspaceGitRepository, WorkspaceName, WorkspacePath, WorkspaceSubmoduleMode,
+    WorkspaceSubmoduleStatus, canonical_json_bytes,
 };
 use steward_types::task_input_archive::{frame_task_input_archive, split_task_input_archive};
 use steward_types::task_output_archive::{
@@ -233,6 +234,15 @@ struct WorkspaceDeploymentPolicy {
     enabled_types: BTreeSet<String>,
     max_total_bytes: u64,
     scratch_volume_bytes: u64,
+    max_files: u64,
+    max_history_depth: u32,
+    max_submodule_depth: usize,
+}
+
+#[derive(Clone)]
+struct WorkspaceAdmissionPolicy {
+    allowed_types: BTreeSet<WorkspaceEntryType>,
+    max_total_bytes: u64,
     max_files: u64,
     max_history_depth: u32,
     max_submodule_depth: usize,
@@ -2992,6 +3002,7 @@ async fn resolve_workspace_evidence<L>(
     ledger: &L,
     config: &TaskApiConfig,
     entries: &[WorkspaceEntry],
+    authority: Option<&WorkspaceAuthority>,
     context: WorkspaceResolutionContext<'_>,
 ) -> Result<Option<WorkspaceEvidence>, ApiError>
 where
@@ -3000,13 +3011,14 @@ where
     if entries.is_empty() {
         return Ok(None);
     }
+    let policy = workspace_admission_policy(&config.workspace_policy, authority)?;
     let git = config.direct_git_resolver.as_ref();
     let mut resolved = Vec::with_capacity(entries.len());
     let mut names = BTreeSet::new();
     let mut materialized_bytes = 0_u64;
     let mut materialized_files = 0_u64;
     for entry in entries {
-        validate_workspace_deployment_policy(&config.workspace_policy, entry)?;
+        validate_workspace_policy(&config.workspace_policy, &policy, entry)?;
         let resolved_entry = match entry {
             WorkspaceEntry::Git(entry) => {
                 let git = git.ok_or_else(|| {
@@ -3092,7 +3104,7 @@ where
                             paths: &entry.git.paths,
                             required: &entry.git.submodules.required,
                             recursive: entry.git.submodules.recursive,
-                            max_depth: config.workspace_policy.max_submodule_depth,
+                            max_depth: policy.max_submodule_depth,
                             caller: context.caller,
                             browser: context.browser,
                         },
@@ -3105,16 +3117,14 @@ where
                         inventory: workspace_tree_inventory(&tree, &entry.git.paths)?,
                     }
                 };
-                let entry_size_limit = workspace_entry_size_limit(
-                    entry.git.limits.as_ref(),
-                    config.workspace_policy.max_total_bytes,
-                )?;
+                let entry_size_limit =
+                    workspace_entry_size_limit(entry.git.limits.as_ref(), policy.max_total_bytes)?;
                 let entry_file_limit = entry
                     .git
                     .limits
                     .as_ref()
                     .and_then(|limits| limits.files)
-                    .unwrap_or(config.workspace_policy.max_files);
+                    .unwrap_or(policy.max_files);
                 if resolution.inventory.bytes > entry_size_limit
                     || resolution.inventory.files > entry_file_limit
                 {
@@ -3126,9 +3136,9 @@ where
                 materialized_files = materialized_files
                     .checked_add(resolution.inventory.files)
                     .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
-                if materialized_bytes > config.workspace_policy.max_total_bytes
+                if materialized_bytes > policy.max_total_bytes
                     || materialized_bytes > config.workspace_policy.scratch_volume_bytes
-                    || materialized_files > config.workspace_policy.max_files
+                    || materialized_files > policy.max_files
                 {
                     return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
                 }
@@ -3219,8 +3229,30 @@ fn parse_workspace_size_bytes(value: &str) -> Option<u64> {
         .and_then(|amount| amount.checked_mul(multiplier))
 }
 
-fn validate_workspace_deployment_policy(
-    policy: &WorkspaceDeploymentPolicy,
+fn workspace_admission_policy(
+    deployment: &WorkspaceDeploymentPolicy,
+    authority: Option<&WorkspaceAuthority>,
+) -> Result<WorkspaceAdmissionPolicy, ApiError> {
+    let authority = authority
+        .ok_or_else(|| ApiError::Admission("workspace_entry_type_not_allowed".to_owned()))?;
+    let authority_bytes = parse_workspace_size_bytes(authority.max_total_size.as_str())
+        .ok_or_else(|| ApiError::Admission("workspace_limit_invalid".to_owned()))?;
+    Ok(WorkspaceAdmissionPolicy {
+        allowed_types: authority.allowed_types.iter().copied().collect(),
+        max_total_bytes: deployment.max_total_bytes.min(authority_bytes),
+        max_files: deployment.max_files.min(authority.max_files),
+        max_history_depth: deployment
+            .max_history_depth
+            .min(authority.max_history_depth),
+        max_submodule_depth: deployment
+            .max_submodule_depth
+            .min(authority.max_submodule_depth as usize),
+    })
+}
+
+fn validate_workspace_policy(
+    deployment: &WorkspaceDeploymentPolicy,
+    policy: &WorkspaceAdmissionPolicy,
     entry: &WorkspaceEntry,
 ) -> Result<(), ApiError> {
     let (entry_type, limits) = match entry {
@@ -3234,10 +3266,12 @@ fn validate_workspace_deployment_policy(
                 }
                 _ => {}
             }
-            if entry.git.submodules.recursive && policy.max_submodule_depth == 0 {
+            if entry.git.submodules.mode == WorkspaceSubmoduleMode::Admitted
+                && policy.max_submodule_depth == 0
+            {
                 return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
             }
-            ("git", entry.git.limits.as_ref())
+            (WorkspaceEntryType::Git, entry.git.limits.as_ref())
         }
         WorkspaceEntry::Scratch(entry) => {
             let size = parse_workspace_size_bytes(entry.scratch.size.as_str())
@@ -3245,7 +3279,7 @@ fn validate_workspace_deployment_policy(
             if size > policy.max_total_bytes {
                 return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
             }
-            if size != policy.scratch_volume_bytes {
+            if size != deployment.scratch_volume_bytes {
                 return Err(ApiError::Admission(
                     "workspace_scratch_size_unavailable".to_owned(),
                 ));
@@ -3262,10 +3296,16 @@ fn validate_workspace_deployment_policy(
                     return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
                 }
             }
-            ("scratch", entry.scratch.limits.as_ref())
+            (WorkspaceEntryType::Scratch, entry.scratch.limits.as_ref())
         }
     };
-    if !policy.enabled_types.contains(entry_type) {
+    let deployment_type = match entry_type {
+        WorkspaceEntryType::Git => "git",
+        WorkspaceEntryType::Scratch => "scratch",
+    };
+    if !deployment.enabled_types.contains(deployment_type)
+        || !policy.allowed_types.contains(&entry_type)
+    {
         return Err(ApiError::Admission(
             "workspace_entry_type_not_allowed".to_owned(),
         ));
@@ -3986,6 +4026,7 @@ where
         ledger,
         config,
         &definition.workspace,
+        approved.spec.workspace.as_ref(),
         WorkspaceResolutionContext {
             self_repository: workspace_self_repository.as_ref(),
             trigger_commit: None,
@@ -4642,6 +4683,7 @@ where
         ledger,
         config,
         &definition.workspace,
+        approved.spec.workspace.as_ref(),
         WorkspaceResolutionContext {
             self_repository: Some(&invocation_identity),
             trigger_commit: Some(&provenance.triggered_sha),
@@ -5109,10 +5151,11 @@ fn verified_git_file(file: GitFile, request: &GitFileRequest) -> Result<Vec<u8>,
 fn direct_requirements_from_envelope(spec: &EnvelopeSpec) -> Result<DirectRequirements, ApiError> {
     let mut authority = serde_json::to_value(spec)
         .map_err(|error| ApiError::Admission(format!("Envelope cannot be projected: {error}")))?;
-    authority
+    let authority = authority
         .as_object_mut()
-        .ok_or_else(|| ApiError::Admission("Envelope authority is invalid".to_owned()))?
-        .remove("runtimeMinutesLimit");
+        .ok_or_else(|| ApiError::Admission("Envelope authority is invalid".to_owned()))?;
+    authority.remove("runtimeMinutesLimit");
+    authority.remove("workspace");
     let budget = authority
         .get_mut("budget")
         .and_then(serde_json::Value::as_object_mut)
@@ -5609,7 +5652,7 @@ mod workflow_request_tests {
         TaskApiConfig, TaskCreateRequest, TaskSubmissionRequest, browser_inputs_archive,
         browser_inputs_from_archive, browser_rerun_submission, prepare_task_input_archive,
         resolve_versioned_task_plan, stable_task_runtime_name, task_orchestration_reservation,
-        validate_workspace_deployment_policy, versioned_workflow_reference,
+        validate_workspace_policy, versioned_workflow_reference, workspace_admission_policy,
         workspace_submodule_is_selected,
     };
     use crate::{ApiError, TaskIdentity};
@@ -5618,7 +5661,7 @@ mod workflow_request_tests {
         PortError, TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
     };
     use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
-    use steward_types::direct_package::{WorkspaceEntry, WorkspaceEvidence};
+    use steward_types::direct_package::{WorkspaceAuthority, WorkspaceEntry, WorkspaceEvidence};
     use steward_types::{
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
     };
@@ -5643,8 +5686,18 @@ mod workflow_request_tests {
             "scratch": {"size": "2Gi"}
         }))
         .map_err(|error| error.to_string())?;
+        let authority: WorkspaceAuthority = serde_json::from_value(serde_json::json!({
+            "allowedTypes": ["git"],
+            "maxTotalSize": "2Gi",
+            "maxFiles": 100,
+            "maxHistoryDepth": 20,
+            "maxSubmoduleDepth": 2
+        }))
+        .map_err(|error| error.to_string())?;
+        let policy = workspace_admission_policy(&config.workspace_policy, Some(&authority))
+            .map_err(|error| format!("derive workspace admission policy: {error:?}"))?;
         assert!(matches!(
-            validate_workspace_deployment_policy(&config.workspace_policy, &scratch),
+            validate_workspace_policy(&config.workspace_policy, &policy, &scratch),
             Err(ApiError::Admission(ref reason)) if reason == "workspace_entry_type_not_allowed"
         ));
         let git: WorkspaceEntry = serde_json::from_value(serde_json::json!({
@@ -5652,7 +5705,7 @@ mod workflow_request_tests {
         }))
         .map_err(|error| error.to_string())?;
         assert!(matches!(
-            validate_workspace_deployment_policy(&config.workspace_policy, &git),
+            validate_workspace_policy(&config.workspace_policy, &policy, &git),
             Err(ApiError::Admission(ref reason)) if reason == "workspace_limit_exceeded"
         ));
         Ok(())
@@ -6059,6 +6112,7 @@ mod workflow_request_tests {
                     currency: "USD".to_owned(),
                 },
                 runtime_minutes_limit: None,
+                workspace: None,
                 ttl: Duration("15m".to_owned()),
                 runner: RunnerRequirements::default(),
             },
