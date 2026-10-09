@@ -993,6 +993,7 @@ pub enum ApiError {
     TaskNotReady,
     TaskOutputNotReady,
     InferenceKeyMissing,
+    InferenceKeyUnusable,
     TaskPersistenceFailed,
     DirectPackageSourceDisabled,
     TaskRuntimeContractUnavailable(String),
@@ -2748,6 +2749,19 @@ impl IntoResponse for ApiError {
                 )
                     .into_response();
             }
+            Self::InferenceKeyUnusable => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(TaskErrorResponse {
+                        error: "inference_key_unusable".to_owned(),
+                        failure_reason: Some(
+                            "Replace the inference key under Connections > Inference / LLMs, then retry the run."
+                                .to_owned(),
+                        ),
+                    }),
+                )
+                    .into_response();
+            }
             Self::TaskOutputDeliveryFailed(reason) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -2815,9 +2829,10 @@ impl IntoResponse for ApiError {
             Self::TaskOutputNotReady => StatusCode::CONFLICT,
             Self::TaskOutputDeliveryFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Store(StoreError::BrowserTaskConcurrencyLimit) => StatusCode::TOO_MANY_REQUESTS,
-            Self::MissingEnvelope | Self::MissingRuntimeUid | Self::InferenceKeyMissing => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            Self::MissingEnvelope
+            | Self::MissingRuntimeUid
+            | Self::InferenceKeyMissing
+            | Self::InferenceKeyUnusable => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             Self::InvalidBudgetIncrease { .. } | Self::Admission(_) => {
                 StatusCode::UNPROCESSABLE_ENTITY
@@ -7073,6 +7088,7 @@ mod tests {
         cumulative_escalations: Arc<Mutex<Vec<CumulativeEscalationRecord>>>,
         envelope_instance_grants: Arc<Mutex<Vec<(Uuid, EnvelopeInstanceGrantRecord)>>>,
         managed_inference_credential_present: Arc<Mutex<bool>>,
+        managed_inference_credential_error: Arc<Mutex<Option<StoreError>>>,
     }
 
     #[derive(Clone)]
@@ -8372,6 +8388,18 @@ mod tests {
             _cipher: &'a ManagedInferenceKeyCipher,
         ) -> BoxFuture<'a, Result<bool, StoreError>> {
             Box::pin(async move {
+                if let Some(error) = self
+                    .managed_inference_credential_error
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake managed-inference error lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .clone()
+                {
+                    return Err(error);
+                }
                 self.managed_inference_credential_present
                     .lock()
                     .map(|present| *present)
@@ -8944,6 +8972,7 @@ mod tests {
             cumulative_escalations: Arc::new(Mutex::new(Vec::new())),
             envelope_instance_grants: Arc::new(Mutex::new(Vec::new())),
             managed_inference_credential_present: Arc::new(Mutex::new(false)),
+            managed_inference_credential_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -14011,6 +14040,53 @@ mod tests {
             browser_retry.status(),
             StatusCode::ACCEPTED,
             "an exact browser retry must return its reserved Task after key removal"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_inference_reports_an_undecryptable_key_as_user_actionable()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        *ledger
+            .managed_inference_credential_error
+            .lock()
+            .map_err(|_| "fake managed-inference error lock was poisoned")? =
+            Some(StoreError::ManagedInferenceCredentialUnavailable);
+        let cipher = ManagedInferenceKeyCipher::from_bytes(&[7_u8; 32])
+            .map_err(|error| format!("build managed-inference test cipher: {error}"))?;
+        let app = task_router(
+            ledger,
+            FakeTaskIdentityResolver,
+            task_api_config()?
+                .with_inference_mode(InferenceMode::Managed)
+                .with_managed_inference_cipher(cipher),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "managed-key-unusable")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"workflow":"repository-review@1"}"#))
+                    .map_err(|error| format!("build managed Task request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit managed Task with unusable key: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read managed-key error response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("decode managed-key error response: {error}"))?,
+            serde_json::json!({
+                "error": "inference_key_unusable",
+                "failureReason": "Replace the inference key under Connections > Inference / LLMs, then retry the run.",
+            })
         );
         Ok(())
     }

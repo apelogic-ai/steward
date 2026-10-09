@@ -23,7 +23,8 @@ pub use steward_ports::{
     SvidAssertion, SvidValidationError, ValidatedWorkload, WorkloadIdentity as SvidValidator,
 };
 use steward_types::{
-    AgentRuntime, CanonicalAuthorityBinding, ModelRef, Phase, Principal, RuntimeId, ToolGrant,
+    AgentRuntime, CanonicalAuthorityBinding, MANAGED_INFERENCE_REFERENCE, ModelRef, Phase,
+    Principal, RuntimeId, ToolGrant,
 };
 use uuid::Uuid;
 
@@ -82,6 +83,7 @@ pub struct AuthorityBinding {
     pub principal: Principal,
     pub canonical_authority: Option<CanonicalAuthorityBinding>,
     pub llms: Vec<ModelRef>,
+    pub inference_reference: Option<String>,
     pub tools: Vec<ToolGrant>,
     pub state: AuthorityState,
 }
@@ -131,6 +133,10 @@ pub fn authority_from_runtime_refs(
         principal: runtime.spec.principal.clone(),
         canonical_authority: runtime.spec.canonical_authority.clone(),
         llms: runtime.spec.llms.clone(),
+        inference_reference: runtime
+            .status
+            .as_ref()
+            .and_then(|status| status.refs.litellm_key.clone()),
         tools: runtime.spec.tools.clone(),
         state: authority_state(runtime.metadata.deletion_timestamp.is_some(), phase),
     })
@@ -227,6 +233,9 @@ where
             return Ok(CredentialGrant::NotHandled);
         }
         if authority.llms.is_empty() {
+            return Err(MintError::CredentialUnavailable);
+        }
+        if authority.inference_reference.as_deref() != Some(MANAGED_INFERENCE_REFERENCE) {
             return Err(MintError::CredentialUnavailable);
         }
         let canonical_authority = authority

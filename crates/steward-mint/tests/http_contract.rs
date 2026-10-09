@@ -44,6 +44,7 @@ fn active_user_binding() -> Result<AuthorityBinding, String> {
         },
         canonical_authority: Some(person_authority()?),
         llms: Vec::new(),
+        inference_reference: None,
         tools: Vec::new(),
         state: AuthorityState::Active,
     })
@@ -110,6 +111,7 @@ impl AuthorityResolver for FixedResolver {
                     },
                     canonical_authority: Some(canonical_authority),
                     llms: Vec::new(),
+                    inference_reference: None,
                     tools: Vec::new(),
                     state: AuthorityState::Active,
                 }),
@@ -510,6 +512,7 @@ impl AuthorityResolver for RevocableResolver {
                     },
                     canonical_authority: Some(canonical_authority),
                     llms: Vec::new(),
+                    inference_reference: None,
                     tools: Vec::new(),
                     state,
                 }),

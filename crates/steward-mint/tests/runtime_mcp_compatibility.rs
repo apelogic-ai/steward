@@ -69,6 +69,7 @@ fn authority() -> Result<AuthorityBinding, String> {
             provider: "openai".to_owned(),
             model: "gpt-test".to_owned(),
         }],
+        inference_reference: None,
         tools: vec![ToolGrant {
             provider: "github".to_owned(),
             resource: "get_file_contents".to_owned(),

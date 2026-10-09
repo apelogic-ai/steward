@@ -1,10 +1,15 @@
 # Managed inference
 
+This managed-mode contract is introduced in Steward 0.3.15.
+
 Managed inference lets each user store an inference API key through Steward's
 Connections UI. Steward encrypts the key at rest. Mint decrypts it only after a
-live runtime proves its workload identity, owner binding, and model authority,
-then returns it through the runtime's short-lived inference grant. The
-controller does not create a LiteLLM virtual key in this mode.
+live runtime proves its workload identity and owner binding, has model
+authority, and has been reconciled with the managed-inference marker. Mint then
+returns the user's long-lived key in the runtime's inference grant. The grant's
+`expires_in` controls only the egress proxy's cache lifetime; it does not expire
+or revoke the upstream key. The controller does not create a LiteLLM virtual
+key in this mode.
 
 Use `inference.mode=stock` when the controller should provision and revoke
 runtime-scoped LiteLLM keys from a deployment master key. Use
@@ -65,10 +70,20 @@ The controller's LiteLLM management URL and `secrets.litellm` master key are not
 mounted in managed mode. Ensure the PostgreSQL CIDR and port are admitted by
 the Mint egress NetworkPolicy.
 
+The upstream key's own LiteLLM limits govern models and budget. Steward checks
+the Task's requested model during admission, but managed mode does not enforce
+model or budget limits on each inference call and does not track inference
+spend. Removing the key from Steward prevents future grants; it cannot revoke
+the credential at the upstream service. If the key is exposed, it remains
+usable after the runtime ends until the user or upstream administrator revokes
+or rotates it.
+
 After deployment, each user saves their own key under **Connections →
 Inference / LLMs**. A model Task is rejected before reservation when the key is
 missing or cannot be decrypted. The plaintext key is exposed only at Mint's
-runtime inference-token response and the configured egress proxy.
+runtime inference-token response and the configured egress proxy, plus the
+apiserver's transient decryptability check before Task reservation. None of
+these components persists a second plaintext copy.
 
 ## Rotation
 

@@ -1921,6 +1921,7 @@ pub enum BrowserTaskRerunError {
     Unsupported,
     EnvelopeUnavailable,
     InferenceKeyMissing,
+    InferenceKeyUnusable,
     Rejected,
     Unavailable,
 }
@@ -3032,6 +3033,7 @@ where
                     | ApiError::TaskWorkflowNotFound
                     | ApiError::DirectPackageSourceDisabled => BrowserTaskRerunError::Rejected,
                     ApiError::InferenceKeyMissing => BrowserTaskRerunError::InferenceKeyMissing,
+                    ApiError::InferenceKeyUnusable => BrowserTaskRerunError::InferenceKeyUnusable,
                     _ => BrowserTaskRerunError::Unavailable,
                 })
         })
@@ -5455,15 +5457,18 @@ async fn require_managed_inference_credential<L: TaskSubmissionLedger>(
         .as_ref()
         .ok_or(StoreError::InvalidManagedInferenceEncryptionKey)
         .map_err(ApiError::Store)?;
-    if application
+    match application
         .ledger
         .managed_inference_credential_is_usable(&identity.canonical_user_id, cipher)
         .await
-        .map_err(ApiError::Store)?
     {
-        Ok(())
-    } else {
-        Err(ApiError::InferenceKeyMissing)
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ApiError::InferenceKeyMissing),
+        Err(
+            StoreError::InvalidManagedInferenceCredential
+            | StoreError::ManagedInferenceCredentialUnavailable,
+        ) => Err(ApiError::InferenceKeyUnusable),
+        Err(error) => Err(ApiError::Store(error)),
     }
 }
 

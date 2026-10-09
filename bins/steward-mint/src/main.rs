@@ -522,6 +522,7 @@ mod tests {
             },
             canonical_authority: None,
             llms: Vec::new(),
+            inference_reference: None,
             tools: Vec::new(),
             state: AuthorityState::Active,
         }

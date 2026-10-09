@@ -21,10 +21,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   create, replace, inspect metadata for, and delete their own credential via
   `/app/api/v1/connections/inference`; plaintext credential material is never
   returned after submission.
-- The chart accepts only `inference.mode: stock` in this release. Managed
-  runtime activation remains unavailable until the separately reviewed Mint
-  wiring lands. The admission foundation reports `inference_key_missing` when
-  a managed model Task has no stored credential.
+- Steward 0.3.15 activates `inference.mode: managed`. The chart projects the
+  dedicated `secrets.managedInferenceDatabase` reader credential into Mint and
+  the `secrets.managedInferenceEncryptionKey` file into only the apiserver and
+  Mint. Mint uses a least-privilege reader role for
+  `managed_inference_credentials`; stock mode remains the default and projects
+  none of this managed material.
+- Managed model Tasks fail before reservation with `inference_key_missing` or
+  the user-actionable `inference_key_unusable`. Switching between stock and
+  managed mode requires stopping submissions, draining or revoking existing
+  runtimes, changing the chart configuration, and verifying a fresh Task;
+  live runtimes are never switched in place.
 
 ## [0.3.14] - 2026-10-08
 
