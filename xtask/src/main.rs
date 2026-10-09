@@ -3799,7 +3799,7 @@ mod tests {
             "production images must run as a numeric non-root user"
         );
         for required in [
-            "FROM ubuntu:24.04@sha256:",
+            "FROM mirror.gcr.io/library/ubuntu:24.04@sha256:",
             "apt-get install --yes --no-install-recommends iproute2",
             "rm -rf /var/lib/apt/lists/*",
             "test -x /bin/cat",
