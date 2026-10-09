@@ -377,6 +377,7 @@ spec:
 {{ toYaml .Values.probes.apiserver.liveness | nindent 12 }}
           env:
             - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.database.name }}, key: {{ .Values.secrets.database.key }} } } }
+            - { name: STEWARD_INFERENCE_MODE, value: {{ .Values.inference.mode | quote }} }
             - { name: STEWARD_TASK_ORCHESTRATION_MODE, value: {{ .Values.config.taskOrchestrationMode | quote }} }
 {{- if .Values.jira.enabled }}
             - { name: STEWARD_JIRA_TOKEN, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.jira.name }}, key: {{ .Values.secrets.jira.key }} } } }
@@ -561,6 +562,7 @@ spec:
 {{ toYaml .Values.probes.controller.liveness | nindent 12 }}
           env:
             - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.database.name }}, key: {{ .Values.secrets.database.key }} } } }
+            - { name: STEWARD_INFERENCE_MODE, value: {{ .Values.inference.mode | quote }} }
             - { name: STEWARD_TASK_ORCHESTRATION_MODE, value: {{ .Values.config.taskOrchestrationMode | quote }} }
             - { name: STEWARD_EXECUTION_ENABLED, value: {{ .Values.execution.enabled | quote }} }
 {{- if .Values.jira.enabled }}
@@ -570,8 +572,10 @@ spec:
             - { name: STEWARD_JIRA_ACCOUNT_EMAIL, value: {{ .Values.config.apiserver.jiraAccountEmail | quote }} }
 {{- end }}
 {{- if .Values.execution.enabled }}
+{{- if eq .Values.inference.mode "stock" }}
             - { name: STEWARD_LITELLM_MASTER_KEY, valueFrom: { secretKeyRef: { name: {{ .Values.secrets.litellm.name }}, key: {{ .Values.secrets.litellm.key }} } } }
             - { name: STEWARD_LITELLM_URL, value: {{ .Values.config.controller.litellmUrl | quote }} }
+{{- end }}
             - { name: STEWARD_OPENSHELL_ENDPOINT, value: {{ .Values.config.controller.openshellEndpoint | quote }} }
             - { name: STEWARD_OPENSHELL_SERVER_NAME, value: {{ .Values.config.controller.openshellServerName | quote }} }
 {{- if .Values.config.controller.openshellRuntimeClassName }}
@@ -972,9 +976,11 @@ spec:
   policyTypes: [Egress]
 {{- if or .Values.execution.enabled .Values.networkPolicy.postgresCidrs (and .Values.jira.enabled .Values.networkPolicy.jiraCidrs) .Values.networkPolicy.kubeApiCidrs }}
   egress:
-{{- if .Values.execution.enabled }}
+{{- if and .Values.execution.enabled (eq .Values.inference.mode "stock") }}
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.litellmNamespace }} } } }]
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.litellm }} }]
+{{- end }}
+{{- if .Values.execution.enabled }}
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.openshellNamespace }} } } }]
       ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.openshell }} }]
     - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.identityExchangeNamespace }} } } }]

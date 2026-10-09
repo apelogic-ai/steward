@@ -15,6 +15,50 @@ pub const PENDING_APPROVAL_ANNOTATION: &str = "agents.apelogic.ai/pending-approv
 pub const TASK_EXECUTION_BINDING_ANNOTATION: &str = "agents.apelogic.ai/task-execution-binding";
 pub const TASK_EXECUTION_BINDING_SCHEMA_VERSION: &str = "steward/task-execution-binding/v1";
 pub const TASK_EXECUTION_BINDING_DIGEST_DOMAIN: &[u8] = b"steward.execution-bindings/v1\0";
+pub const MANAGED_INFERENCE_REFERENCE: &str = "managed-user-credential";
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceMode {
+    #[default]
+    Stock,
+    Managed,
+}
+
+impl InferenceMode {
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "stock" => Ok(Self::Stock),
+            "managed" => Ok(Self::Managed),
+            _ => Err("inference mode must be stock or managed"),
+        }
+    }
+}
+
+/// Returns whether a value is a syntactically valid opaque OAuth bearer token.
+///
+/// Managed inference credentials use this boundary before encryption so Mint cannot
+/// later reject a value that the Connections API accepted. Padding is allowed only
+/// after at least one payload byte and only at the end of the value.
+pub fn is_valid_opaque_bearer_token(value: &str) -> bool {
+    let mut saw_padding = false;
+    let mut saw_payload = false;
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            if byte == b'=' {
+                saw_padding = true;
+                return saw_payload;
+            }
+            let allowed = byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/');
+            if allowed {
+                saw_payload = true;
+            }
+            !saw_padding && allowed
+        })
+}
 
 pub fn runtime_activated_condition(observed_generation: i64) -> Condition {
     Condition {

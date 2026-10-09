@@ -5,6 +5,7 @@
   "required": [
     "images",
     "execution",
+    "inference",
     "web",
     "secrets",
     "databaseTls",
@@ -34,6 +35,14 @@
       "additionalProperties": false,
       "required": ["enabled"],
       "properties": {"enabled": {"type": "boolean"}}
+    },
+    "inference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {"const": "stock"}
+      }
     },
     "images": {
       "type": "object",
@@ -1227,7 +1236,27 @@
                   "openshellEndpoint": {"type": "string", "pattern": "^https://", "minLength": 9},
                   "openshellServerName": {"$ref": "#/definitions/nonempty"},
                   "workloadExchangeEndpoint": {"type": "string", "pattern": "^https://[^/?#]+(?::[0-9]+)?/v1/workload/exchange$", "minLength": 38},
-                  "workloadExchangeServerName": {"$ref": "#/definitions/nonempty"},
+                  "workloadExchangeServerName": {"$ref": "#/definitions/nonempty"}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "execution": {"properties": {"enabled": {"const": true}}},
+          "inference": {"properties": {"mode": {"const": "stock"}}}
+        }
+      },
+      "then": {
+        "properties": {
+          "config": {
+            "properties": {
+              "controller": {
+                "properties": {
                   "litellmUrl": {"type": "string", "pattern": "^https?://", "minLength": 9}
                 }
               }

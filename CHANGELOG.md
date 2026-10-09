@@ -7,6 +7,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Managed-inference custody foundation: additive migration 0068 stores one
+  encrypted credential per canonical user plus append-only audit events. The
+  migration is intentionally retained on rollback. Authenticated users can
+  create, replace, inspect metadata for, and delete their own credential via
+  `/app/api/v1/connections/inference`; plaintext credential material is never
+  returned after submission.
+- The chart accepts only `inference.mode: stock` in this release. Managed
+  runtime activation remains unavailable until the separately reviewed Mint
+  wiring lands. The admission foundation reports `inference_key_missing` when
+  a managed model Task has no stored credential.
+
 ## [0.3.14] - 2026-10-08
 
 This patch makes governed GitHub operations work again on deployments whose

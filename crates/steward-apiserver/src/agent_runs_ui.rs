@@ -2336,6 +2336,14 @@ where
             .into_response(),
         Err(BrowserTaskRerunError::Unsupported) => StatusCode::CONFLICT.into_response(),
         Err(BrowserTaskRerunError::EnvelopeUnavailable) => StatusCode::CONFLICT.into_response(),
+        Err(BrowserTaskRerunError::InferenceKeyMissing) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "inference_key_missing",
+                "failureReason": "Add an inference key under Connections > Inference / LLMs, then retry the run.",
+            })),
+        )
+            .into_response(),
         Err(BrowserTaskRerunError::Rejected) => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
         Err(BrowserTaskRerunError::Unavailable) => {
             browser_runs_error(StatusCode::SERVICE_UNAVAILABLE)
@@ -3648,6 +3656,20 @@ mod tests {
                     .push((source.task_uid, idempotency_key.to_owned()));
                 Ok(self.rerun_task_uid)
             })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FailingBrowserTaskRerunner(BrowserTaskRerunError);
+
+    impl BrowserTaskRerunner for FailingBrowserTaskRerunner {
+        fn rerun<'a>(
+            &'a self,
+            _session: &'a BrowserSessionContext,
+            _source: &'a TaskRecord,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, Result<Uuid, BrowserTaskRerunError>> {
+            Box::pin(async move { Err(self.0) })
         }
     }
 
@@ -5046,15 +5068,15 @@ mod tests {
         });
         let (service, session_cookie, csrf) =
             signed_in_cookie_and_csrf(LocalFakeIdentity::User).await?;
-        let response = protected_router_with_task_reruns(ledger, rerunner, service)
+        let response = protected_router_with_task_reruns(ledger.clone(), rerunner, service.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri(format!("/app/api/v1/runs/{source_task_uid}/rerun"))
-                    .header(header::COOKIE, session_cookie)
+                    .header(header::COOKIE, &session_cookie)
                     .header(header::ORIGIN, "http://127.0.0.1:33001")
                     .header("sec-fetch-site", "same-origin")
-                    .header("x-steward-csrf", csrf)
+                    .header("x-steward-csrf", &csrf)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"idempotencyKey":"one-click"}"#))
                     .map_err(|error| format!("build browser rerun request: {error}"))?,
@@ -5078,6 +5100,36 @@ mod tests {
                 format!("browser-rerun:{source_task_uid}:one-click")
             )]
         );
+
+        let missing = protected_router_with_task_reruns(
+            ledger,
+            Arc::new(FailingBrowserTaskRerunner(
+                BrowserTaskRerunError::InferenceKeyMissing,
+            )),
+            service,
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/app/api/v1/runs/{source_task_uid}/rerun"))
+                .header(header::COOKIE, session_cookie)
+                .header(header::ORIGIN, "http://127.0.0.1:33001")
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"idempotencyKey":"missing-key"}"#))
+                .map_err(|error| format!("build missing-key rerun request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute missing-key rerun request: {error}"))?;
+        assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(missing.into_body(), 4096)
+                .await
+                .map_err(|error| format!("read missing-key rerun response: {error}"))?,
+        )
+        .map_err(|error| format!("decode missing-key rerun response: {error}"))?;
+        assert_eq!(body["error"], "inference_key_missing");
         Ok(())
     }
 

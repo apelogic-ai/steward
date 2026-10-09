@@ -300,6 +300,7 @@ pub enum ReconcileError {
     Authority(String),
     DeletionPending,
     InferenceRevocationTimedOut,
+    ManagedModeStockCredentialPresent,
 }
 
 impl fmt::Display for ReconcileError {
@@ -364,6 +365,49 @@ impl InferencePlane for NoInferencePlane {
     ) -> Result<ProvisionedInference, PortError> {
         Err(PortError::Unsupported {
             operation: "inference credential provisioning",
+        })
+    }
+
+    async fn reconcile_configuration(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn observe(
+        &self,
+        _request: &InferenceRequest,
+    ) -> Result<InferenceObservation, PortError> {
+        Ok(InferenceObservation::Absent)
+    }
+
+    async fn revoke(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ManagedInferencePlane;
+
+impl InferencePlane for ManagedInferencePlane {
+    fn capabilities(&self) -> InferenceCapabilities {
+        let mut capabilities = InferenceCapabilities::default();
+        capabilities.runtime_credential_provisioning = false;
+        capabilities
+    }
+
+    async fn validate_configuration(
+        &self,
+        _models: &[steward_types::ModelRef],
+        _budget: &steward_types::Budget,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn provision(
+        &self,
+        _request: &InferenceRequest,
+    ) -> Result<ProvisionedInference, PortError> {
+        Err(PortError::Unsupported {
+            operation: "managed inference credential provisioning",
         })
     }
 
@@ -3467,6 +3511,9 @@ async fn run_controller_inner<R: SandboxRuntime, I: InferencePlane>(
 
 enum InferenceReconcile {
     Inactive,
+    Managed {
+        reference: String,
+    },
     Active {
         reference: String,
         spend: steward_types::SpendSummary,
@@ -3474,6 +3521,22 @@ enum InferenceReconcile {
     Exhausted {
         spend: steward_types::SpendSummary,
     },
+}
+
+fn ensure_managed_mode_has_no_stock_credential(
+    runtime: &AgentRuntime,
+    stock_secret_present: bool,
+) -> Result<(), ReconcileError> {
+    let stock_reference_present = runtime
+        .status
+        .as_ref()
+        .and_then(|status| status.refs.litellm_key.as_deref())
+        .is_some_and(|reference| reference != steward_types::MANAGED_INFERENCE_REFERENCE);
+    if stock_secret_present || stock_reference_present {
+        Err(ReconcileError::ManagedModeStockCredentialPresent)
+    } else {
+        Ok(())
+    }
 }
 
 fn inference_request(runtime: &AgentRuntime) -> Result<InferenceRequest, ReconcileError> {
@@ -3641,6 +3704,18 @@ async fn reconcile_inference<I: InferencePlane>(
         .get_opt(&request.runtime.0)
         .await
         .map_err(ControllerError::Kubernetes)?;
+    if !inference.capabilities().runtime_credential_provisioning {
+        ensure_managed_mode_has_no_stock_credential(runtime, secret.is_some())
+            .map_err(ControllerError::Reconcile)?;
+        return if request.models.is_empty() {
+            Ok(InferenceReconcile::Inactive)
+        } else {
+            Ok(InferenceReconcile::Managed {
+                reference: steward_types::MANAGED_INFERENCE_REFERENCE.to_owned(),
+            })
+        };
+    }
+
     if request.models.is_empty() {
         if secret.is_some()
             || runtime
@@ -4267,7 +4342,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     match &inference {
                         InferenceReconcile::Active { spend, .. } => Some((spend, false)),
                         InferenceReconcile::Exhausted { spend } => Some((spend, true)),
-                        InferenceReconcile::Inactive => None,
+                        InferenceReconcile::Inactive | InferenceReconcile::Managed { .. } => None,
                     },
                 ) {
                     authority
@@ -4301,7 +4376,10 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         )
                         .await;
                     }
-                    InferenceReconcile::Active { reference, spend } => Some((reference, spend)),
+                    InferenceReconcile::Active { reference, spend } => {
+                        Some((reference, Some(spend)))
+                    }
+                    InferenceReconcile::Managed { reference } => Some((reference, None)),
                     InferenceReconcile::Inactive => None,
                 };
                 let decision = match reconcile_once(
@@ -4322,7 +4400,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                 };
                 if let Some((reference, spend)) = inference_status {
                     status.refs.litellm_key = Some(reference);
-                    status.spend = Some(spend);
+                    status.spend = spend;
                 }
                 let running = status.phase == Phase::Running;
                 if runtime.status.as_ref() != Some(&status) {
@@ -4370,12 +4448,25 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
     inference: &I,
     sandbox_runtime: &R,
 ) -> Result<ReconcileDecision, ControllerError> {
+    let cleanup_safety = ensure_inference_cleanup_is_safe(runtime, client.clone(), inference).await;
     let inference_request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
     let sandbox_cleanup = async {
         reconcile_once(runtime, ReconcileIntent::Delete, sandbox_runtime)
             .await
             .map_err(ControllerError::Reconcile)
     };
+    if let Err(error) = cleanup_safety {
+        return match sandbox_cleanup.await? {
+            ReconcileDecision::Status(mut status) => {
+                status.refs.litellm_key = runtime
+                    .status
+                    .as_ref()
+                    .and_then(|prior| prior.refs.litellm_key.clone());
+                Ok(ReconcileDecision::Status(status))
+            }
+            ReconcileDecision::Deleted => Err(error),
+        };
+    }
     let (inference_result, credential_result, sandbox_result) = futures::join!(
         revoke_inference_if_required(runtime, inference, &inference_request),
         delete_credential_secret(client, runtime),
@@ -4398,6 +4489,35 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
 }
 
 const INFERENCE_REVOCATION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
+async fn ensure_inference_cleanup_is_safe<I: InferencePlane>(
+    runtime: &AgentRuntime,
+    client: Client,
+    inference: &I,
+) -> Result<(), ControllerError> {
+    if inference.capabilities().runtime_credential_provisioning {
+        return Ok(());
+    }
+    ensure_managed_mode_has_no_stock_credential(runtime, false)
+        .map_err(ControllerError::Reconcile)?;
+    let namespace = runtime
+        .namespace()
+        .ok_or(ControllerError::Reconcile(ReconcileError::MissingNamespace))?;
+    let runtime_uid = runtime
+        .metadata
+        .uid
+        .as_deref()
+        .ok_or(ControllerError::Reconcile(
+            ReconcileError::MissingRuntimeUid,
+        ))?;
+    let secret_present = runtime_secret_api(client, &namespace)
+        .get_opt(runtime_uid)
+        .await
+        .map_err(ControllerError::Kubernetes)?
+        .is_some();
+    ensure_managed_mode_has_no_stock_credential(runtime, secret_present)
+        .map_err(ControllerError::Reconcile)
+}
 
 async fn revoke_inference_if_required<I: InferencePlane>(
     runtime: &AgentRuntime,
@@ -4430,6 +4550,7 @@ async fn suspend_runtime<R: SandboxRuntime>(
     api: &Api<AgentRuntime>,
     sandbox_runtime: &R,
     spend: Option<steward_types::SpendSummary>,
+    preserve_inference_reference: bool,
 ) -> Result<Action, ControllerError> {
     let decision = reconcile_once(runtime, ReconcileIntent::Delete, sandbox_runtime)
         .await
@@ -4439,6 +4560,12 @@ async fn suspend_runtime<R: SandboxRuntime>(
         ReconcileDecision::Status(status) => (status, StdDuration::from_secs(2)),
     };
     status.spend = spend;
+    if preserve_inference_reference {
+        status.refs.litellm_key = runtime
+            .status
+            .as_ref()
+            .and_then(|status| status.refs.litellm_key.clone());
+    }
     if runtime.status.as_ref() != Some(&status) {
         api.patch_status(
             &runtime.name_any(),
@@ -4459,11 +4586,16 @@ async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferenceP
     inference: &I,
     spend: Option<steward_types::SpendSummary>,
 ) -> Result<Action, ControllerError> {
+    let cleanup_safety = ensure_inference_cleanup_is_safe(runtime, client.clone(), inference).await;
     let request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
+    if let Err(error) = cleanup_safety {
+        suspend_runtime(runtime, api, sandbox_runtime, spend, true).await?;
+        return Err(error);
+    }
     let (revoke_result, credential_result, suspension_result) = futures::join!(
         revoke_inference_if_required(runtime, inference, &request),
         delete_credential_secret(client, runtime),
-        suspend_runtime(runtime, api, sandbox_runtime, spend),
+        suspend_runtime(runtime, api, sandbox_runtime, spend, false),
     );
 
     let action = suspension_result?;
@@ -5372,13 +5504,14 @@ mod tests {
     use tower::service_fn;
 
     use super::{
-        Action, AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ReconcileDecision,
-        ReconcileIntent, RuntimeCreateErrorClass, SERVICE_PRINCIPAL_ANNOTATION, TaskRuntimeAction,
-        TaskRuntimeBinding, TaskRuntimeBindingStore, authority_action,
+        Action, AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ManagedInferencePlane,
+        ReconcileDecision, ReconcileIntent, RuntimeCreateErrorClass, SERVICE_PRINCIPAL_ANNOTATION,
+        TaskRuntimeAction, TaskRuntimeBinding, TaskRuntimeBindingStore, authority_action,
         authority_application_action, classify_runtime_create_status, cleanup_runtime,
         connection_operation_authority_action, connection_operation_failure_log_line,
-        create_task_runtime_inner, exhausted_spend_to_preserve, failed_runtime_status,
-        inference_action, provider_control_bindings_match, reconcile_once, replace_as_controller,
+        create_task_runtime_inner, ensure_managed_mode_has_no_stock_credential,
+        exhausted_spend_to_preserve, failed_runtime_status, inference_action,
+        provider_control_bindings_match, reconcile_once, replace_as_controller,
         runtime_authority_action, runtime_start_failed, runtime_ttl_action,
         runtime_with_spend_top_up, sandbox_execution_class, sandbox_task_diagnostics,
         server_task_runtime_manifest, status_merge_patch, suspend_runtime,
@@ -5413,6 +5546,171 @@ mod tests {
             classify_runtime_create_status(None),
             RuntimeCreateErrorClass::Ambiguous
         );
+    }
+
+    #[tokio::test]
+    async fn managed_inference_plane_validates_runtime_policy_without_managing_gateway_keys()
+    -> Result<(), String> {
+        let runtime = fixture();
+        let request = InferenceRequest {
+            runtime: RuntimeId("managed-inference-runtime".to_owned()),
+            models: runtime.spec.llms.clone(),
+            budget: runtime.spec.budget.clone(),
+        };
+        let plane = ManagedInferencePlane;
+        assert!(!plane.capabilities().runtime_credential_provisioning);
+        plane
+            .validate_configuration(&request.models, &request.budget)
+            .await
+            .map_err(|error| format!("managed configuration must remain admissible: {error:?}"))?;
+        assert!(matches!(
+            plane.provision(&request).await,
+            Err(PortError::Unsupported { .. })
+        ));
+        assert_eq!(
+            plane
+                .observe(&request)
+                .await
+                .map_err(|error| format!("managed inference observation failed: {error:?}"))?,
+            InferenceObservation::Absent
+        );
+        plane
+            .revoke(&request)
+            .await
+            .map_err(|error| format!("managed inference cleanup failed: {error:?}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn managed_mode_rejects_a_leftover_stock_runtime_credential() {
+        let clean = fixture();
+        assert_eq!(
+            ensure_managed_mode_has_no_stock_credential(&clean, true),
+            Err(super::ReconcileError::ManagedModeStockCredentialPresent),
+            "managed mode must force operators back through stock-mode revocation instead of deleting the local evidence and orphaning an upstream key"
+        );
+        let mut stock_reference = fixture();
+        stock_reference.status = Some(steward_types::AgentRuntimeStatus {
+            phase: steward_types::Phase::Running,
+            observed_generation: 1,
+            spec_digest: "sha256:fixture".to_owned(),
+            refs: steward_types::RuntimeRefs {
+                litellm_key: Some("stock-runtime-key".to_owned()),
+                ..steward_types::RuntimeRefs::default()
+            },
+            conditions: Vec::new(),
+            spend: None,
+        });
+        assert_eq!(
+            ensure_managed_mode_has_no_stock_credential(&stock_reference, false),
+            Err(super::ReconcileError::ManagedModeStockCredentialPresent),
+            "a persisted stock key reference remains revocation evidence even when its Secret is already absent"
+        );
+        let mut managed_reference = fixture();
+        managed_reference.status = Some(steward_types::AgentRuntimeStatus {
+            phase: steward_types::Phase::Running,
+            observed_generation: 1,
+            spec_digest: "sha256:fixture".to_owned(),
+            refs: steward_types::RuntimeRefs {
+                litellm_key: Some(steward_types::MANAGED_INFERENCE_REFERENCE.to_owned()),
+                ..steward_types::RuntimeRefs::default()
+            },
+            conditions: Vec::new(),
+            spend: None,
+        });
+        assert_eq!(
+            ensure_managed_mode_has_no_stock_credential(&clean, false),
+            Ok(())
+        );
+        assert_eq!(
+            ensure_managed_mode_has_no_stock_credential(&managed_reference, false),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_mode_refuses_cleanup_of_a_stock_credential() -> Result<(), String> {
+        let runtime = running_model_free_runtime(Some("stock-runtime-key"));
+        let (client, secret_deleted, _) = successful_cleanup_client(&runtime)?;
+        let sandbox_deleted = Arc::new(AtomicBool::new(false));
+        let sandbox = SignallingDeleteRuntime {
+            deleted: sandbox_deleted.clone(),
+        };
+
+        let result = cleanup_runtime(&runtime, client, &ManagedInferencePlane, &sandbox).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(super::ControllerError::Reconcile(
+                    super::ReconcileError::ManagedModeStockCredentialPresent
+                ))
+            ),
+            "managed cleanup must preserve stock revocation evidence"
+        );
+        assert!(
+            sandbox_deleted.load(Ordering::SeqCst),
+            "cleanup must stop the sandbox while waiting for stock-mode key revocation"
+        );
+        assert!(
+            !secret_deleted.load(Ordering::SeqCst),
+            "cleanup must not delete the stock credential Secret before revocation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_mode_suspends_but_preserves_a_stock_credential() -> Result<(), String> {
+        let runtime = running_model_free_runtime(Some("stock-runtime-key"));
+        let (client, secret_deleted, status_patch) = successful_cleanup_client(&runtime)?;
+        let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
+        let sandbox_deleted = Arc::new(AtomicBool::new(false));
+        let sandbox = SignallingDeleteRuntime {
+            deleted: sandbox_deleted.clone(),
+        };
+
+        let result = suspend_runtime_with_inference_cleanup(
+            &runtime,
+            &api,
+            &sandbox,
+            client,
+            &ManagedInferencePlane,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(super::ControllerError::Reconcile(
+                    super::ReconcileError::ManagedModeStockCredentialPresent
+                ))
+            ),
+            "managed suspension must keep stock revocation retryable"
+        );
+        assert!(
+            sandbox_deleted.load(Ordering::SeqCst),
+            "suspension must still stop the sandbox"
+        );
+        assert!(
+            !secret_deleted.load(Ordering::SeqCst),
+            "suspension must preserve the stock credential Secret as revocation evidence"
+        );
+        let patch = status_patch
+            .lock()
+            .map_err(|_| "status patch lock was poisoned")?
+            .clone()
+            .ok_or_else(|| "suspension must patch AgentRuntime status".to_owned())?;
+        let patch: serde_json::Value = serde_json::from_slice(&patch)
+            .map_err(|error| format!("decode suspension status patch: {error}"))?;
+        assert_eq!(
+            patch
+                .pointer("/status/refs/litellmKey")
+                .and_then(|value| value.as_str()),
+            Some("stock-runtime-key"),
+            "suspension must retain the stock credential reference until revocation can complete"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -6804,10 +7102,10 @@ mod tests {
     async fn suspension_requeues_promptly_while_sandbox_deletion_is_pending() -> Result<(), String>
     {
         let runtime = fixture();
-        let (client, _) = successful_cleanup_client(&runtime)?;
+        let (client, _, _) = successful_cleanup_client(&runtime)?;
         let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
 
-        let action = suspend_runtime(&runtime, &api, &ProvisioningDeleteRuntime, None)
+        let action = suspend_runtime(&runtime, &api, &ProvisioningDeleteRuntime, None, false)
             .await
             .map_err(|error| {
                 format!("pending sandbox deletion must remain reconcilable: {error}")
@@ -6821,16 +7119,19 @@ mod tests {
         Ok(())
     }
 
-    fn successful_cleanup_client(
-        runtime: &AgentRuntime,
-    ) -> Result<(Client, Arc<AtomicBool>), String> {
+    type CleanupClientFixture = (Client, Arc<AtomicBool>, Arc<Mutex<Option<Vec<u8>>>>);
+
+    fn successful_cleanup_client(runtime: &AgentRuntime) -> Result<CleanupClientFixture, String> {
         let serialized_runtime = serde_json::to_vec(runtime)
             .map_err(|error| format!("fixture runtime must be serializable: {error}"))?;
         let secret_deleted = Arc::new(AtomicBool::new(false));
         let secret_deleted_for_service = secret_deleted.clone();
+        let status_patch = Arc::new(Mutex::new(None));
+        let status_patch_for_service = status_patch.clone();
         let client = Client::new(
             service_fn(move |request: Request<KubeBody>| {
                 let serialized_runtime = serialized_runtime.clone();
+                let status_patch = status_patch_for_service.clone();
                 if request.method() == Method::DELETE && request.uri().path().contains("/secrets/")
                 {
                     secret_deleted_for_service.store(true, Ordering::SeqCst);
@@ -6839,6 +7140,11 @@ mod tests {
                     let body = if request.method() == Method::PATCH
                         && request.uri().path().ends_with("/status")
                     {
+                        if let Ok(bytes) = request.into_body().collect_bytes().await
+                            && let Ok(mut observed_patch) = status_patch.lock()
+                        {
+                            *observed_patch = Some(bytes.to_vec());
+                        }
                         serialized_runtime
                     } else {
                         br#"{"apiVersion":"v1","kind":"Status","metadata":{},"status":"Success","code":200}"#
@@ -6851,14 +7157,14 @@ mod tests {
             }),
             "team-a",
         );
-        Ok((client, secret_deleted))
+        Ok((client, secret_deleted, status_patch))
     }
 
     #[tokio::test]
     async fn authority_suspension_of_model_free_runtime_without_inference_ref_skips_revocation()
     -> Result<(), String> {
         let runtime = running_model_free_runtime(None);
-        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let (client, secret_deleted, _) = successful_cleanup_client(&runtime)?;
         let sandbox_deleted = Arc::new(AtomicBool::new(false));
         let sandbox = SignallingDeleteRuntime {
             deleted: sandbox_deleted.clone(),
@@ -6970,7 +7276,7 @@ mod tests {
     async fn termination_of_model_free_runtime_without_inference_ref_skips_revocation()
     -> Result<(), String> {
         let runtime = running_model_free_runtime(None);
-        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let (client, secret_deleted, _) = successful_cleanup_client(&runtime)?;
         let sandbox_deleted = Arc::new(AtomicBool::new(false));
         let sandbox = SignallingDeleteRuntime {
             deleted: sandbox_deleted.clone(),
@@ -7000,7 +7306,7 @@ mod tests {
     async fn termination_with_removed_models_and_cached_inference_ref_still_revokes()
     -> Result<(), String> {
         let runtime = running_model_free_runtime(Some("key-a"));
-        let (client, secret_deleted) = successful_cleanup_client(&runtime)?;
+        let (client, secret_deleted, _) = successful_cleanup_client(&runtime)?;
         let sandbox_deleted = Arc::new(AtomicBool::new(false));
         let sandbox = SignallingDeleteRuntime {
             deleted: sandbox_deleted.clone(),

@@ -20,6 +20,9 @@ execution:
   # Core API/webhook mode. Governed execution requires an explicit switch
   # after OpenShell, identity, inference, and RuntimeClass preflight.
   enabled: false
+inference:
+  # Runtime credential mode. This release supports stock provisioning.
+  mode: stock
 serviceAccounts:
   # The chart creates these fixed service accounts. Annotations support
   # platform workload identity (for example, EKS IRSA) without exposing any

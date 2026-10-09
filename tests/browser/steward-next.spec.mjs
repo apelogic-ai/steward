@@ -838,6 +838,7 @@ async function guardedPage(browser, {
   connectionStartFailure = null,
   connectionStartHangPoll = false,
   connectionStartPendingDeadlineMs = null,
+  inferenceMode = "stock",
   emptyCollections = false,
   expectedHttpStatuses = [],
   executionLogs = {
@@ -1768,6 +1769,35 @@ async function guardedPage(browser, {
     }],
     available: [{ provider: "github", displayName: "GitHub", enabled: true }],
   }));
+  let inferenceCredential = null;
+  await context.route(`${origin}/app/api/v1/connections/inference`, async (route) => {
+    if (route.request().method() === "PUT") {
+      const body = route.request().postDataJSON();
+      mutations.push({
+        path: "/app/api/v1/connections/inference",
+        headers: route.request().headers(),
+        body,
+      });
+      inferenceCredential = {
+        lastFour: body.apiKey.slice(-4),
+        savedAt: "2026-10-08T12:00:00.000000Z",
+      };
+    } else if (route.request().method() === "DELETE") {
+      mutations.push({
+        path: "/app/api/v1/connections/inference",
+        headers: route.request().headers(),
+        body: null,
+      });
+      inferenceCredential = null;
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
+    await json(route, {
+      apiVersion: "steward.inference-connections/v1",
+      mode: inferenceMode,
+      credential: inferenceCredential,
+    });
+  });
   let browserPreferences = {
     apiVersion: ["steward", "preferences/v1"].join("."),
     onboardingDismissed: initialOnboardingDismissed,
@@ -2612,6 +2642,10 @@ test("Get started completes the governed test-to-GitHub journey from server evid
 
     const triggerStep = await openStep("Trigger a test run");
     await triggerStep.getByRole("button", { name: "Run on GitHub" }).click();
+    await expect.poll(
+      () => developer.mutations.filter((mutation) => mutation.path.endsWith("/github/dispatch")).length,
+      { message: "the governed GitHub dispatch should reach the same-origin boundary" },
+    ).toBe(1);
     const dispatch = developer.mutations.find((mutation) => mutation.path.endsWith("/github/dispatch"));
     expectMutationProof(dispatch);
     expect(dispatch.body).toMatchObject({ owner: "example-org", repository: "agentic-ops" });
@@ -4174,6 +4208,36 @@ test("connection OAuth starts through a same-origin Rust mutation", async ({ bro
     await developer.page.getByRole("button", { name: "Connect GitHub" }).click();
     await expect(developer.page).toHaveURL(`${origin}/connections?oauth=started`);
     expectMutationProof(developer.mutations.find((mutation) => mutation.path.endsWith("/start")));
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("managed inference keys can be added, replaced, and removed without redisplay", async ({ browser }) => {
+  const developer = await guardedPage(browser, { inferenceMode: "managed" });
+  const firstKey = "fixture-managed-key-wxyz";
+  const replacementKey = "fixture-replacement-key-abcd";
+  try {
+    await developer.page.goto(`${origin}/connections`);
+    await expect(developer.page.getByRole("heading", { name: "Tools / MCP servers" })).toBeVisible();
+    await expect(developer.page.getByRole("heading", { name: "Inference / LLMs" })).toBeVisible();
+    await developer.page.getByRole("button", { name: "Add API key" }).click();
+    await developer.page.getByLabel("Inference API key").fill(firstKey);
+    await developer.page.getByRole("button", { name: "Save API key" }).click();
+    await expect(developer.page.getByText(/key ending in/)).toContainText("wxyz");
+    await expect(developer.page.locator("body")).not.toContainText(firstKey);
+
+    await developer.page.getByRole("button", { name: "Replace API key" }).click();
+    await developer.page.getByLabel("Inference API key").fill(replacementKey);
+    await developer.page.getByRole("button", { name: "Save API key" }).click();
+    await expect(developer.page.getByText(/key ending in/)).toContainText("abcd");
+    await expect(developer.page.locator("body")).not.toContainText(replacementKey);
+
+    await developer.page.getByRole("button", { name: "Remove API key…" }).click();
+    await developer.page.getByRole("button", { name: "Remove API key", exact: true }).click();
+    await expect(developer.page.getByRole("button", { name: "Add API key" })).toBeVisible();
+    expect(developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/connections/inference"))
+      .toHaveLength(3);
   } finally {
     await closeGuardedPage(developer);
   }

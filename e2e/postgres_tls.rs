@@ -26,8 +26,8 @@ use steward_store::{
     BrowserMemberStateChange, BrowserRbacAssignment, BrowserRbacAssignmentAction,
     BrowserRbacAssignmentChange, BrowserTaskVersionPublication, FederatedSubjectAssociation,
     FederatedSubjectAssociationMethod, FederatedSubjectAuditAction, FederatedSubjectDisable,
-    FederatedSubjectObservation, FederatedSubjectState, FederatedSubjectUnlink, PgStore,
-    StoreError,
+    FederatedSubjectObservation, FederatedSubjectState, FederatedSubjectUnlink,
+    ManagedInferenceKeyCipher, PgStore, StoreError,
 };
 use steward_types::direct_package::SourceProvenance;
 use steward_types::{
@@ -104,6 +104,88 @@ fn migration_set(maximum_version: Option<i64>) -> Migrator {
         locking: false,
         no_tx: false,
     }
+}
+
+async fn verify_managed_inference_reader_grant(
+    store: &PgStore,
+    database_url: &str,
+) -> Result<(), Box<dyn Error>> {
+    let user_id = CanonicalUserId::parse(
+        sqlx::query_scalar::<_, String>(
+            "SELECT user_id FROM canonical_users WHERE state = 'active' ORDER BY user_id LIMIT 1",
+        )
+        .fetch_one(store.pool())
+        .await?,
+    )?;
+    let cipher = ManagedInferenceKeyCipher::from_bytes(&[17_u8; 32])?;
+    store
+        .put_managed_inference_credential(
+            &user_id,
+            "fixture-reader-credential-abcd",
+            user_id.as_str(),
+            &cipher,
+        )
+        .await?;
+    let role = format!("managed_inference_reader_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE ROLE {role} NOLOGIN"))
+        .execute(store.pool())
+        .await?;
+    sqlx::query(&format!("GRANT USAGE ON SCHEMA public TO {role}"))
+        .execute(store.pool())
+        .await?;
+    sqlx::query(&format!(
+        "GRANT SELECT ON managed_inference_credentials TO {role}"
+    ))
+    .execute(store.pool())
+    .await?;
+
+    let connection_role = role.clone();
+    let restricted_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |connection, _metadata| {
+            let set_role = format!("SET ROLE {connection_role}");
+            Box::pin(async move {
+                sqlx::query(&set_role).execute(connection).await?;
+                Ok(())
+            })
+        })
+        .connect(database_url)
+        .await?;
+    let restricted_store = PgStore::new(restricted_pool.clone());
+    let credential_read = restricted_store
+        .resolve_managed_inference_credential(&user_id, &cipher)
+        .await;
+    let canonical_user_read = sqlx::query("SELECT user_id FROM canonical_users LIMIT 1")
+        .fetch_optional(&restricted_pool)
+        .await;
+    restricted_pool.close().await;
+    sqlx::query(&format!(
+        "REVOKE SELECT ON managed_inference_credentials FROM {role}"
+    ))
+    .execute(store.pool())
+    .await?;
+    sqlx::query(&format!("REVOKE USAGE ON SCHEMA public FROM {role}"))
+        .execute(store.pool())
+        .await?;
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(store.pool())
+        .await?;
+    store
+        .remove_managed_inference_credential(&user_id, user_id.as_str())
+        .await?;
+
+    assert_eq!(
+        credential_read?
+            .ok_or("restricted Mint resolver did not find the managed credential")?
+            .expose_secret(),
+        "fixture-reader-credential-abcd",
+        "Mint's documented read-only role must resolve managed credentials without broader table access"
+    );
+    assert!(
+        canonical_user_read.is_err(),
+        "Mint's documented role must not require access to canonical_users"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -240,17 +322,51 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
             ))
         })?;
     let historical_before_task_library = historical_task_identity_snapshot(&store).await?;
-    migration_set(None).run(store.pool()).await.map_err(|error| {
-        io::Error::other(format!(
-            "Steward Task-library migration must complete over the required TLS session: {error}"
-        ))
-    })?;
+    migration_set(Some(67))
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward Task-library migration must complete over the required TLS session: {error}"
+            ))
+        })?;
     assert_eq!(
         historical_task_identity_snapshot(&store).await?,
         historical_before_task_library,
         "migration 0067 must not rewrite historical Tasks, runs, or canonical identities"
     );
     verify_browser_task_library_upgrade(&store).await?;
+
+    let historical_before_managed_inference = historical_task_identity_snapshot(&store).await?;
+    let users_before_managed_inference =
+        sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM canonical_users")
+            .fetch_one(store.pool())
+            .await?;
+    migration_set(None).run(store.pool()).await.map_err(|error| {
+        io::Error::other(format!(
+            "Steward managed-inference migration must complete over the required TLS session: {error}"
+        ))
+    })?;
+    assert_eq!(
+        historical_task_identity_snapshot(&store).await?,
+        historical_before_managed_inference,
+        "migration 0068 must not rewrite historical Tasks, runs, or canonical identities"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM canonical_users")
+            .fetch_one(store.pool())
+            .await?,
+        users_before_managed_inference,
+        "migration 0068 must preserve every existing canonical user"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM managed_inference_credentials")
+            .fetch_one(store.pool())
+            .await?,
+        0,
+        "migration 0068 must not invent credentials for existing users"
+    );
+    verify_managed_inference_reader_grant(&store, &verified_tls_url).await?;
     assert_connection_failure_detail_upgrade_result(&store).await?;
     assert_github_repository_automation_upgrade_result(&store).await?;
     assert_maximum_source_provenance_upgrade_result(&store, &maximum_direct_source_provenance)

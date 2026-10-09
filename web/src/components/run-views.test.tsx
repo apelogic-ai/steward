@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BrowserRunView } from "@/api-client";
 
-import { packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards } from "./run-views";
+import { inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -79,6 +79,14 @@ test("package viewer resolves inline and file prompts to the same text", () => {
   })).toEqual({ label: "prompt.md", text });
 });
 
+test("managed inference failures direct the user to replace the saved key", () => {
+  expect(inferenceFailureGuidance("inference-key-rejected"))
+    .toContain("Replace it in Connections");
+  expect(inferenceFailureGuidance("inference-budget-exhausted"))
+    .toContain("Replace it in Connections");
+  expect(inferenceFailureGuidance("agent")).toBeNull();
+});
+
 describe("GitHub reruns", () => {
   test("polls a pending rerun with one idempotent request until its task is correlated", async () => {
     const attempts = [
@@ -124,6 +132,20 @@ describe("GitHub reruns", () => {
     expect(outcome).toEqual({ failure: "orchestration-not-active" });
     expect(rerunFailureMessage("orchestration-not-active"))
       .toBe("Re-run is disabled until task orchestration is active (stage 2).");
+  });
+
+  test("directs a rerun with no managed key to Connections", async () => {
+    const outcome = await pollRerun(
+      async () => ({
+        error: { error: "inference_key_missing" },
+        response: { ok: false, status: 422 },
+      }),
+      async () => { throw new Error("must not wait"); },
+    );
+
+    expect(outcome).toEqual({ failure: "inference-key-missing" });
+    expect(rerunFailureMessage("inference-key-missing"))
+      .toContain("Add an inference API key in Connections");
   });
 
   test("bounds server-controlled retry delays and times out as unavailable", async () => {

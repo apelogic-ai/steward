@@ -94,6 +94,16 @@ function isTerminalPhase(phase: string): boolean {
   return phase === "failed" || phase === "succeeded" || phase === "cancelled";
 }
 
+export function inferenceFailureGuidance(errorCategory: string | null | undefined): string | null {
+  if (errorCategory === "inference-key-rejected") {
+    return "The inference gateway rejected your saved API key. Replace it in Connections, then retry the run.";
+  }
+  if (errorCategory === "inference-budget-exhausted") {
+    return "The saved inference key has exhausted its upstream budget. Replace it in Connections or ask the gateway administrator to increase its budget.";
+  }
+  return null;
+}
+
 type RunEventSnapshot = {
   eventId: number;
   run: BrowserRunView;
@@ -137,9 +147,20 @@ type RerunAttempt = {
   response?: { ok: boolean; status: number };
 };
 
-type RerunOutcome = { taskUid: string } | { failure: ConnectionMutationState };
+type RerunFailureState = ConnectionMutationState | "inference-key-missing";
+type RerunOutcome = { taskUid: string } | { failure: RerunFailureState };
 
-export function rerunFailureMessage(state: ConnectionMutationState): string {
+function errorCode(error: unknown): string | null {
+  return typeof error === "object" && error !== null && "error" in error
+    && typeof (error as { error?: unknown }).error === "string"
+    ? (error as { error: string }).error
+    : null;
+}
+
+export function rerunFailureMessage(state: RerunFailureState): string {
+  if (state === "inference-key-missing") {
+    return "Add an inference API key in Connections, then retry the run.";
+  }
   return state === "orchestration-not-active"
     ? "Re-run is disabled until task orchestration is active (stage 2)."
     : `The run could not be re-run (${state}).`;
@@ -158,6 +179,9 @@ export async function pollRerun(
     const result = await attempt();
     if (result.response?.ok && result.data?.taskUid) return { taskUid: result.data.taskUid };
     if (result.response?.status !== 202) {
+      if (result.response?.status === 422 && errorCode(result.error) === "inference_key_missing") {
+        return { failure: "inference-key-missing" };
+      }
       return { failure: classifyConnectionMutationFailure(result.response?.status, result.error) };
     }
     if (index + 1 < maxAttempts) {
@@ -437,7 +461,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
   const session = useSession();
   const [cancelState, setCancelState] = useState<"idle" | "working" | "cancelled" | MutationFailureState>("idle");
   const [cancelOpen, setCancelOpen] = useState(false);
-  const [rerunState, setRerunState] = useState<"idle" | "working" | ConnectionMutationState>("idle");
+  const [rerunState, setRerunState] = useState<"idle" | "working" | RerunFailureState>("idle");
   const [liveRun, setLiveRun] = useState<BrowserRunResponse | null>(null);
   const [liveTimeline, setLiveTimeline] = useState<BrowserRunTimelineResponse | null>(null);
   const loadRun = useCallback(() => admin
@@ -533,6 +557,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
         const timelineEvents = liveTimeline?.events ?? (timelineState.status === "ready" ? timelineState.value.events : []);
         const admitted = timelineEvents.find((event) => event.kind === "admitted");
         const runtimeBound = timelineEvents.find((event) => event.kind === "runtimeBound");
+        const inferenceGuidance = run.phase === "failed" ? inferenceFailureGuidance(run.errorCategory) : null;
         return (
           <article className="space-y-6">
             <header className="flex flex-wrap items-start justify-between gap-5">
@@ -551,8 +576,9 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 else setRerunState(outcome.failure);
               }} type="button">{rerunState === "working" ? "Starting…" : "Re-run"}</button>{!isTerminalPhase(run.phase) ? <details className="relative"><summary aria-label="More run actions" className="grid min-h-10 min-w-10 cursor-pointer list-none place-items-center rounded-control border bg-panel px-3 text-lg font-semibold">···</summary><div className="absolute right-0 z-10 mt-1 min-w-40 rounded-control border bg-panel p-1 shadow-lg"><button className="w-full rounded-control px-3 py-2 text-left text-sm font-semibold text-err hover:bg-err-soft" disabled={cancelState === "working" || cancelState === "cancelled"} onClick={() => setCancelOpen(true)} type="button">{cancelState === "working" ? "Cancelling…" : cancelState === "cancelled" ? "Cancellation requested" : "Cancel run"}</button></div></details> : null}</div> : null}
             </header>
-            {rerunState !== "idle" && rerunState !== "working" ? <p className="text-sm text-err" role="alert">{rerunFailureMessage(rerunState)}</p> : null}
+            {rerunState !== "idle" && rerunState !== "working" ? <p className="text-sm text-err" role="alert">{rerunFailureMessage(rerunState)}{rerunState === "inference-key-missing" ? <> <Link className="font-semibold underline" href="/connections">Open Connections</Link></> : null}</p> : null}
             {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="text-sm text-err" role="alert">The run could not be cancelled ({cancelState}).</p> : null}
+            {inferenceGuidance ? <p className="rounded-control border border-err/30 bg-err-soft px-4 py-3 text-sm text-err" role="alert">{inferenceGuidance} <Link className="font-semibold underline" href="/connections">Open Connections</Link></p> : null}
             <ConfirmationDialog cancelLabel="Keep running" confirmLabel="Cancel run" description="The agent will stop and its runtime credentials will be revoked. This cannot be undone." onConfirm={() => void cancelRun()} onOpenChange={setCancelOpen} open={cancelOpen} pending={cancelState === "working"} title="Cancel this run?" />
             <div className="grid min-h-[540px] overflow-hidden rounded-panel border bg-panel lg:grid-cols-[260px_minmax(0,1fr)]">
               <nav aria-label="Run jobs" className="border-b border-line lg:border-b-0 lg:border-r">

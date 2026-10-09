@@ -4028,6 +4028,7 @@ dependencies = [
  "tower",
  "utoipa",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -4081,7 +4082,9 @@ dependencies = [
  "steward-adapter-litellm",
  "steward-adapter-openshell",
  "steward-controller",
+ "steward-ports",
  "steward-store",
+ "steward-types",
  "tokio",
  "tokio-rustls",
 ]
@@ -4133,12 +4136,14 @@ dependencies = [
 name = "steward-store"
 version = "0.0.0"
 dependencies = [
+ "ring",
  "serde_json",
  "sha2",
  "sqlx",
  "steward-admission",
  "steward-types",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

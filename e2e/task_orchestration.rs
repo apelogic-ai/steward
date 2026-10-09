@@ -33,8 +33,8 @@ use steward_apiserver::{
     AuthenticatedCaller, AuthenticationError, BoxFuture, RequestAuthenticator, operator_admin,
 };
 use steward_controller::{
-    TaskControllerError, reconcile_agent_runtime_work_item, reconcile_task_orchestration_work_item,
-    webhook_router_for_controller,
+    ManagedInferencePlane, TaskControllerError, reconcile_agent_runtime_work_item,
+    reconcile_task_orchestration_work_item, webhook_router_for_controller,
 };
 use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
@@ -43,8 +43,9 @@ use steward_ports::{
     SandboxTaskRequest, SandboxTaskRuntime, SandboxTaskTranscript, TaskAttemptId,
 };
 use steward_store::{
-    AgentRunLogStream, EnvelopeRequestReservationRequest, EnvelopeRequestStatus,
-    EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, MAX_ACTIVE_BROWSER_TASKS_PER_USER,
+    AgentRunLogStream, BrowserMemberStateAction, BrowserMemberStateChange,
+    EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
+    EnvelopeTemplatePublication, MAX_ACTIVE_BROWSER_TASKS_PER_USER, ManagedInferenceKeyCipher,
     PgStore, StoreError, TaskActivationObservation, TaskExecutionObservation,
     TaskExecutionTransition, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
     WorkflowPublication,
@@ -184,6 +185,148 @@ impl Drop for ServerGuard {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+#[tokio::test]
+async fn managed_inference_credentials_are_encrypted_replaceable_and_destroyed_on_deprovision()
+-> Result<(), Box<dyn Error>> {
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool.clone());
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let policy = OrganizationIdentityPolicy::new(
+        "https://accounts.google.com",
+        "example.com",
+        OrganizationId::parse("org_example")?,
+    )?;
+    let actor = store
+        .register_canonical_identity(
+            &policy.validate(
+                "https://accounts.google.com",
+                &format!("managed-inference-actor-{suffix}"),
+                "example.com",
+                &format!("alice-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let target = store
+        .register_canonical_identity(
+            &policy.validate(
+                "https://accounts.google.com",
+                &format!("managed-inference-target-{suffix}"),
+                "example.com",
+                &format!("bob-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let cipher = ManagedInferenceKeyCipher::from_bytes(&[9_u8; 32])?;
+    let first = "fixture-managed-credential-wxyz";
+    let replacement = "fixture-managed-replacement-abcd";
+
+    let added = store
+        .put_managed_inference_credential(&target.user_id, first, actor.user_id.as_str(), &cipher)
+        .await?;
+    assert_eq!(added.last_four, "wxyz");
+    let stored_ciphertext = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT ciphertext FROM managed_inference_credentials WHERE user_id = $1",
+    )
+    .bind(target.user_id.as_str())
+    .fetch_one(&pool)
+    .await?;
+    assert!(
+        !stored_ciphertext
+            .windows(first.len())
+            .any(|window| window == first.as_bytes()),
+        "the database must not contain the plaintext credential"
+    );
+    assert_eq!(
+        store
+            .resolve_managed_inference_credential(&target.user_id, &cipher)
+            .await?
+            .ok_or("managed inference credential was not stored")?
+            .expose_secret(),
+        first
+    );
+
+    let replaced = store
+        .put_managed_inference_credential(
+            &target.user_id,
+            replacement,
+            actor.user_id.as_str(),
+            &cipher,
+        )
+        .await?;
+    assert_eq!(replaced.last_four, "abcd");
+    assert_eq!(
+        store
+            .resolve_managed_inference_credential(&target.user_id, &cipher)
+            .await?
+            .ok_or("managed inference replacement was not stored")?
+            .expose_secret(),
+        replacement
+    );
+    assert!(
+        store
+            .remove_managed_inference_credential(&target.user_id, actor.user_id.as_str())
+            .await?
+    );
+    assert!(
+        store
+            .resolve_managed_inference_credential(&target.user_id, &cipher)
+            .await?
+            .is_none()
+    );
+
+    store
+        .put_managed_inference_credential(
+            &target.user_id,
+            replacement,
+            actor.user_id.as_str(),
+            &cipher,
+        )
+        .await?;
+    let implicit_delete = sqlx::query("DELETE FROM canonical_users WHERE user_id = $1")
+        .bind(target.user_id.as_str())
+        .execute(&pool)
+        .await;
+    assert!(
+        implicit_delete.is_err(),
+        "canonical-user deletion must not bypass explicit credential removal and its audit event"
+    );
+    store
+        .change_browser_member_state(BrowserMemberStateChange {
+            user_id: &target.user_id,
+            action: BrowserMemberStateAction::Disable,
+            actor: &actor.user_id,
+        })
+        .await?;
+    assert!(
+        store
+            .resolve_managed_inference_credential(&target.user_id, &cipher)
+            .await?
+            .is_none(),
+        "deprovisioning must destroy Steward's managed inference credential"
+    );
+    let audit_counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        "SELECT count(*), \
+                count(*) FILTER (WHERE action = 'added'), \
+                count(*) FILTER (WHERE action = 'replaced'), \
+                count(*) FILTER (WHERE action = 'removed') \
+         FROM managed_inference_credential_audit WHERE user_id = $1",
+    )
+    .bind(target.user_id.as_str())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(audit_counts, (5, 2, 1, 2));
+    Ok(())
 }
 
 #[tokio::test]
@@ -3348,11 +3491,21 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         TaskOrchestrationState::ActivationPending
     );
 
-    let successful_inference = ActiveInference::default();
+    let managed_key = format!("sk-managed-orchestration-{suffix}");
+    let managed_cipher = ManagedInferenceKeyCipher::from_bytes(&[13_u8; 32])?;
+    store
+        .put_managed_inference_credential(
+            &identity.user_id,
+            &managed_key,
+            identity.user_id.as_str(),
+            &managed_cipher,
+        )
+        .await?;
+    let successful_inference = ManagedInferencePlane;
     reconcile_agent_runtime_work_item(
         &client,
         task_runtime.clone(),
-        successful_inference.clone(),
+        successful_inference,
         store.clone(),
         successful_activated_runtime,
     )
@@ -3366,11 +3519,38 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     reconcile_agent_runtime_work_item(
         &client,
         task_runtime.clone(),
-        successful_inference.clone(),
+        successful_inference,
         store.clone(),
         successful_finalizing_runtime,
     )
     .await?;
+    let managed_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("managed runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("managed runtime fixture is absent"))?;
+    let managed_status = managed_runtime
+        .status
+        .as_ref()
+        .ok_or_else(|| io::Error::other("managed runtime status is absent"))?;
+    assert_eq!(
+        managed_status.refs.litellm_key.as_deref(),
+        Some(steward_types::MANAGED_INFERENCE_REFERENCE)
+    );
+    assert_eq!(managed_status.spend, None);
+    assert!(
+        kubernetes
+            .credential_secret
+            .lock()
+            .map_err(|_| io::Error::other("credential Secret fixture was poisoned"))?
+            .is_none(),
+        "managed mode must not copy the user's key into a runtime Secret"
+    );
+    assert!(
+        !serde_json::to_string(&managed_runtime)?.contains(&managed_key),
+        "managed credential material must not enter the AgentRuntime"
+    );
     reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
     assert_eq!(
         operation(&store, successful_task_uid).await?.state,
@@ -3416,7 +3596,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     reconcile_agent_runtime_work_item(
         &client,
         task_runtime.clone(),
-        successful_inference.clone(),
+        successful_inference,
         store.clone(),
         successful_deleting_runtime,
     )
@@ -3429,6 +3609,15 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         .ok_or(StoreError::TaskNotFound)?;
     assert!(successful_task.finalized);
     assert_eq!(successful_task.phase, TaskPhase::Succeeded);
+    assert_eq!(
+        store
+            .resolve_managed_inference_credential(&identity.user_id, &managed_cipher)
+            .await?
+            .ok_or_else(|| io::Error::other("managed key disappeared after the run"))?
+            .expose_secret(),
+        managed_key,
+        "runtime cleanup must not destroy the user's long-lived managed key"
+    );
     let successful_archive = store
         .agent_run_output_archive(successful_task_uid, identity.user_id.as_str())
         .await?

@@ -50,7 +50,8 @@ use steward_types::task_output_archive::{
 };
 use steward_types::{
     AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, Email,
-    ModelRef, Principal, RuntimeOwnership, TaskExecutionBinding, TaskPhase, ToolGrant,
+    InferenceMode, ModelRef, Principal, RuntimeOwnership, TaskExecutionBinding, TaskPhase,
+    ToolGrant,
 };
 use uuid::Uuid;
 
@@ -240,6 +241,7 @@ pub struct TaskApiConfig {
     direct_git_resolver: Option<Arc<dyn DirectGitResolver>>,
     source_repository_bindings: BTreeSet<SourceRepositoryBindingKey>,
     failure_reporter: TaskSubmissionFailureReporter,
+    inference_mode: InferenceMode,
 }
 
 impl Default for TaskApiConfig {
@@ -253,6 +255,7 @@ impl Default for TaskApiConfig {
             direct_git_resolver: None,
             source_repository_bindings: BTreeSet::new(),
             failure_reporter: Arc::new(|line| eprintln!("{line}")),
+            inference_mode: InferenceMode::Stock,
         }
     }
 }
@@ -317,6 +320,11 @@ impl TaskApiConfig {
 
     pub fn with_task_orchestration_mode(mut self, mode: TaskOrchestrationMode) -> Self {
         self.orchestration_mode = mode;
+        self
+    }
+
+    pub fn with_inference_mode(mut self, mode: InferenceMode) -> Self {
+        self.inference_mode = mode;
         self
     }
 
@@ -1358,6 +1366,13 @@ fn valid_email(value: &str) -> bool {
 }
 
 pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
+    fn has_managed_inference_credential<'a>(
+        &'a self,
+        _owner_user_id: &'a CanonicalUserId,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async { Ok(false) })
+    }
+
     fn active_source_repository_binding<'a>(
         &'a self,
         _caller: &'a TriggerRepository,
@@ -1453,6 +1468,15 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
 }
 
 impl TaskSubmissionLedger for PgStore {
+    fn has_managed_inference_credential<'a>(
+        &'a self,
+        owner_user_id: &'a CanonicalUserId,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(
+            async move { PgStore::has_managed_inference_credential(self, owner_user_id).await },
+        )
+    }
+
     fn active_provisioned_user_envelopes_by_digest<'a>(
         &'a self,
         owner_user_id: &'a CanonicalUserId,
@@ -1721,6 +1745,7 @@ pub(crate) struct BrowserTaskState<L> {
 pub enum BrowserTaskRerunError {
     Unsupported,
     EnvelopeUnavailable,
+    InferenceKeyMissing,
     Rejected,
     Unavailable,
 }
@@ -2308,9 +2333,27 @@ where
         identity: TaskIdentity,
         request: &BrowserTaskSubmission,
     ) -> Result<(TaskRecord, BrowserTaskEvidence), ApiError> {
+        let existing = self
+            .ledger
+            .task_by_idempotency(
+                &identity.service,
+                identity.canonical_user_id.as_str(),
+                idempotency_key,
+            )
+            .await
+            .map_err(ApiError::Store)?;
         let resolved =
             resolve_browser_package_pre_admission(&self.ledger, &self.config, &identity, request)
                 .await?;
+        if let Some(record) = existing {
+            let envelope_digest = resolved
+                .envelope
+                .envelope_digest
+                .as_deref()
+                .ok_or(ApiError::MissingEnvelope)?;
+            validate_browser_task_retry(&identity, &resolved.evidence, envelope_digest, &record)?;
+            return Ok((record, resolved.evidence));
+        }
         let approved = resolved
             .envelope
             .approved_envelope
@@ -2327,6 +2370,7 @@ where
             .as_deref()
             .ok_or(ApiError::MissingEnvelope)?;
         let decision = AdmissionDecision::Admit;
+        require_managed_inference_credential(self, &identity, &resolved.spec).await?;
         let task_uid = Uuid::new_v4();
         let operation_id = Uuid::new_v4();
         let runtime_name = stable_task_runtime_name(operation_id);
@@ -2484,6 +2528,7 @@ where
                 "Task requirements exceed the provisioned User Envelope".to_owned(),
             ));
         }
+        require_managed_inference_credential(self, &identity, &spec).await?;
         let operation_id = Uuid::new_v4();
         let runtime_name = stable_task_runtime_name(operation_id);
         let orchestration = task_orchestration_reservation(
@@ -2757,6 +2802,7 @@ where
                     | ApiError::TaskSourceUnauthorized(_)
                     | ApiError::TaskWorkflowNotFound
                     | ApiError::DirectPackageSourceDisabled => BrowserTaskRerunError::Rejected,
+                    ApiError::InferenceKeyMissing => BrowserTaskRerunError::InferenceKeyMissing,
                     _ => BrowserTaskRerunError::Unavailable,
                 })
         })
@@ -3566,6 +3612,33 @@ fn validate_direct_task_retry(
     Ok(())
 }
 
+fn validate_browser_task_retry(
+    identity: &TaskIdentity,
+    evidence: &BrowserTaskEvidence,
+    envelope_digest: &str,
+    record: &TaskRecord,
+) -> Result<(), ApiError> {
+    let acting_user = identity.acting_user.as_ref().map(|email| email.0.as_str());
+    let acting_user_id = identity
+        .acting_user
+        .as_ref()
+        .map(|_| identity.canonical_user_id.as_str());
+    if record.identity_binding_state != "bound"
+        || record.submitter_service != identity.service
+        || record.acting_user.as_deref() != acting_user
+        || record.acting_user_id.as_deref() != acting_user_id
+        || record.owner != identity.owner.0
+        || record.owner_user_id.as_deref() != Some(identity.canonical_user_id.as_str())
+        || record.runtime_ownership != RuntimeOwnership::Provisioned
+        || record.task_origin != TaskOrigin::Browser
+        || record.user_envelope_digest.as_deref() != Some(envelope_digest)
+        || record.browser_task_evidence.as_ref() != Some(evidence)
+    {
+        return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+    }
+    Ok(())
+}
+
 async fn resolve_package_closure(
     git: &dyn DirectGitResolver,
     repository: &GitRepositoryIdentity,
@@ -3924,6 +3997,26 @@ fn direct_runtime_spec(
     })
 }
 
+async fn require_managed_inference_credential<L: TaskSubmissionLedger>(
+    application: &TaskApplicationService<L>,
+    identity: &TaskIdentity,
+    spec: &AgentRuntimeSpec,
+) -> Result<(), ApiError> {
+    if application.config.inference_mode != InferenceMode::Managed || spec.llms.is_empty() {
+        return Ok(());
+    }
+    if application
+        .ledger
+        .has_managed_inference_credential(&identity.canonical_user_id)
+        .await
+        .map_err(ApiError::Store)?
+    {
+        Ok(())
+    } else {
+        Err(ApiError::InferenceKeyMissing)
+    }
+}
+
 async fn submit_versioned_task<L>(
     application: &TaskApplicationService<L>,
     idempotency_key: &str,
@@ -3939,6 +4032,20 @@ where
         return Err(ApiError::Admission(
             "versioned Workflows use a server-owned runtime path".to_owned(),
         ));
+    }
+    if let Some(record) = application
+        .ledger
+        .task_by_idempotency(
+            &identity.service,
+            identity.canonical_user_id.as_str(),
+            idempotency_key,
+        )
+        .await
+        .map_err(ApiError::Store)?
+    {
+        return application
+            .retry_existing_task(&identity, Some(&reference), request, record)
+            .await;
     }
     let workflow = application
         .ledger
@@ -3968,6 +4075,7 @@ where
             "Workflow runtime exceeds its pinned User Envelope".to_owned(),
         ));
     }
+    require_managed_inference_credential(application, &identity, &plan.spec).await?;
     let decision = AdmissionDecision::Admit;
     let workflow_reference = format!("{}@{}", plan.workflow.name, plan.workflow.version);
     let task_uid = Uuid::new_v4();
