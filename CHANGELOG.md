@@ -9,6 +9,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- TaskDefinition v2 supports governed `git` and `scratch` workspace entries.
+  Steward resolves exact Git commits before runtime creation, applies deployment,
+  approved User Envelope and per-entry limits, materializes credential-free working
+  data beneath `/sandbox/workspace`, and records immutable workspace evidence.
+  Once workspace-bearing Task evidence is stored, rollback to a pre-workspace
+  Steward release requires restoring the database from a compatible backup.
 - Managed-inference custody foundation: additive migration 0068 stores one
   encrypted credential per canonical user plus append-only audit events. The
   migration is intentionally retained on rollback. Authenticated users can

@@ -196,6 +196,41 @@ rendered value is part of the apiserver pod template, Helm rolls the apiserver a
 browser reads the new value at runtime from an authenticated no-store endpoint. No
 web or apiserver image rebuild is needed.
 
+### Governed Task workspaces
+
+Set the chart's top-level `workspace` values to choose the enabled `git` and `scratch`
+entry types and the deployment ceilings for total bytes, files, Git history depth, and
+submodule recursion. `scratchVolumeSize` must match OpenShell's
+`workspace_default_storage_size`; this is the filesystem-enforced scratch capacity.
+Git workspaces use only repositories admitted by stable ID in `githubSource.bindings`.
+Steward fetches exact objects through the source GitHub App, strips credentials and
+remotes before the agent starts, and records the pinned commit in Task evidence.
+
+Each Envelope that may run workspace-bearing Tasks must also include a `workspace`
+authority ceiling. Omitting it grants no workspace entry types. For example:
+
+```json
+{
+  "allowedTypes": ["git", "scratch"],
+  "maxTotalSize": "2Gi",
+  "maxFiles": 100000,
+  "maxHistoryDepth": 1000,
+  "maxSubmoduleDepth": 4,
+  "maxSubmodulesPerEntry": 32,
+  "maxTotalSubmodules": 64,
+  "maxTreeReads": 64
+}
+```
+
+Template approval bounds the provisioned User Envelope through the ordinary Envelope
+subset check. At Task admission, Steward intersects that approved User Envelope with
+the chart deployment ceiling and any per-entry Task limits before reserving a runtime.
+
+Developers can declare `workspace` directly in a `steward.task-definition/v2` package.
+For an inline browser run, **Check out this repository** writes the equivalent entry
+using the selected admitted repository and resolves its default-branch HEAD at
+submission. Tasks that omit `workspace` retain their existing behavior.
+
 ## Secret and integration inventory
 
 The chart references existing names and keys; it never puts secret bytes in

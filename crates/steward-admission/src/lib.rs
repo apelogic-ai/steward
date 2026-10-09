@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
+use steward_types::direct_package::{WorkspaceAuthority, WorkspaceEntryType};
 use steward_types::{
     AgentRuntimeSpec, Budget, Duration, KubernetesQuantity, ModelRef, RunnerPlatform,
     RunnerRequirements, SpendSummary, ToolGrant,
@@ -66,6 +67,7 @@ pub mod internal_authorities {
                         compute: Some(KubernetesQuantity("100m".to_owned())),
                         storage: Some(KubernetesQuantity("64Mi".to_owned())),
                     },
+                    workspace: None,
                 },
             }
         }
@@ -265,6 +267,8 @@ pub struct EnvelopeSpec {
     pub ttl: Duration,
     #[serde(default)]
     pub runner: RunnerRequirements,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceAuthority>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -332,6 +336,10 @@ pub enum AdmissionDelta {
     RunnerStorage {
         requested: KubernetesQuantity,
         ceiling: Option<KubernetesQuantity>,
+    },
+    Workspace {
+        requested: WorkspaceAuthority,
+        ceiling: Option<WorkspaceAuthority>,
     },
 }
 
@@ -405,6 +413,13 @@ impl AdmissionDelta {
                 requested.0,
                 ceiling.as_ref().map_or("none", |value| value.0.as_str())
             ),
+            Self::Workspace { requested, ceiling } => format!(
+                "workspace requested {}, ceiling {}",
+                workspace_authority_summary(requested),
+                ceiling
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), workspace_authority_summary)
+            ),
         }
     }
 }
@@ -418,6 +433,7 @@ pub enum AdmissionError {
     InvalidTtl { value: String },
     InvalidRunnerQuantity { resource: String, value: String },
     DuplicateRunnerPlatform { platform: RunnerPlatform },
+    InvalidWorkspaceAuthority { reason: String },
     UnsupportedBindings,
 }
 
@@ -443,6 +459,9 @@ pub fn validate_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
     }
     duration_seconds(&envelope.spec.ttl)?;
     validate_runner(&envelope.spec.runner)?;
+    if let Some(workspace) = &envelope.spec.workspace {
+        validate_workspace_authority(workspace)?;
+    }
     Ok(())
 }
 
@@ -474,6 +493,7 @@ pub fn evaluate(
             runtime_minutes_limit: envelope.spec.runtime_minutes_limit.clone(),
             ttl: request.ttl.clone(),
             runner: request.runner.clone(),
+            workspace: None,
         },
         envelope,
     )
@@ -628,11 +648,95 @@ fn evaluate_envelope_spec(
             ceiling: envelope.spec.runner.storage.clone(),
         });
     }
+    if let Some(requested) = request.workspace.as_ref()
+        && !workspace_authority_is_within(requested, envelope.spec.workspace.as_ref())?
+    {
+        deltas.push(AdmissionDelta::Workspace {
+            requested: requested.clone(),
+            ceiling: envelope.spec.workspace.clone(),
+        });
+    }
     if deltas.is_empty() {
         Ok(AdmissionDecision::Admit)
     } else {
         Ok(AdmissionDecision::Reject { deltas })
     }
+}
+
+fn workspace_authority_summary(authority: &WorkspaceAuthority) -> String {
+    let types = authority
+        .allowed_types
+        .iter()
+        .map(|entry_type| match entry_type {
+            WorkspaceEntryType::Git => "git",
+            WorkspaceEntryType::Scratch => "scratch",
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "types=[{types}], total={}, files={}, history={}, submodules={}",
+        authority.max_total_size.as_str(),
+        authority.max_files,
+        authority.max_history_depth,
+        authority.max_submodule_depth
+    )
+}
+
+fn validate_workspace_authority(authority: &WorkspaceAuthority) -> Result<(), AdmissionError> {
+    if authority.allowed_types.is_empty() {
+        return Err(AdmissionError::InvalidWorkspaceAuthority {
+            reason: "allowedTypes must not be empty".to_owned(),
+        });
+    }
+    for (index, entry_type) in authority.allowed_types.iter().enumerate() {
+        if authority.allowed_types[..index].contains(entry_type) {
+            return Err(AdmissionError::InvalidWorkspaceAuthority {
+                reason: "allowedTypes contains a duplicate".to_owned(),
+            });
+        }
+    }
+    if authority.max_files == 0 {
+        return Err(AdmissionError::InvalidWorkspaceAuthority {
+            reason: "maxFiles must be positive".to_owned(),
+        });
+    }
+    if authority.max_history_depth == 0 {
+        return Err(AdmissionError::InvalidWorkspaceAuthority {
+            reason: "maxHistoryDepth must be positive".to_owned(),
+        });
+    }
+    workspace_quantity(authority.max_total_size.as_str())?;
+    Ok(())
+}
+
+fn workspace_authority_is_within(
+    requested: &WorkspaceAuthority,
+    ceiling: Option<&WorkspaceAuthority>,
+) -> Result<bool, AdmissionError> {
+    validate_workspace_authority(requested)?;
+    let Some(ceiling) = ceiling else {
+        return Ok(false);
+    };
+    validate_workspace_authority(ceiling)?;
+    Ok(requested
+        .allowed_types
+        .iter()
+        .all(|entry_type| ceiling.allowed_types.contains(entry_type))
+        && workspace_quantity(requested.max_total_size.as_str())?
+            <= workspace_quantity(ceiling.max_total_size.as_str())?
+        && requested.max_files <= ceiling.max_files
+        && requested.max_history_depth <= ceiling.max_history_depth
+        && requested.max_submodule_depth <= ceiling.max_submodule_depth)
+}
+
+fn workspace_quantity(value: &str) -> Result<u128, AdmissionError> {
+    runner_quantity(
+        &KubernetesQuantity(value.to_owned()),
+        RunnerResource::Storage,
+    )
+    .map_err(|_| AdmissionError::InvalidWorkspaceAuthority {
+        reason: format!("maxTotalSize is invalid: {value}"),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1036,12 +1140,19 @@ fn grant_covers(
         ) => runner_quantity(requested, RunnerResource::Storage).and_then(|requested| {
             runner_quantity(granted, RunnerResource::Storage).map(|granted| requested <= granted)
         }),
+        (
+            AdmissionDelta::Workspace {
+                requested: granted, ..
+            },
+            AdmissionDelta::Workspace { requested, .. },
+        ) => workspace_authority_is_within(requested, Some(granted)),
         _ => Ok(false),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use steward_types::direct_package::{ResourceQuantity, WorkspaceAuthority, WorkspaceEntryType};
     use steward_types::{
         AgentRuntimeSpec, AgentType, BindingRef, Budget, Duration, Email, KubernetesQuantity,
         ModelRef, Principal, RunnerPlatform, RunnerRequirements, ToolGrant,
@@ -1072,6 +1183,7 @@ mod tests {
                     runtime_minutes_limit: None,
                     ttl: Duration(ttl.to_owned()),
                     runner: RunnerRequirements::default(),
+                    workspace: None,
                 },
             };
             assert!(
@@ -1124,8 +1236,54 @@ mod tests {
                 runtime_minutes_limit: None,
                 ttl: Duration("24h".to_owned()),
                 runner: RunnerRequirements::default(),
+                workspace: None,
             },
         }
+    }
+
+    fn workspace_authority(
+        allowed_types: Vec<WorkspaceEntryType>,
+        max_total_size: &str,
+        max_files: u64,
+        max_history_depth: u32,
+        max_submodule_depth: u32,
+    ) -> Result<WorkspaceAuthority, String> {
+        Ok(WorkspaceAuthority {
+            allowed_types,
+            max_total_size: ResourceQuantity::parse(max_total_size)?,
+            max_files,
+            max_history_depth,
+            max_submodule_depth,
+        })
+    }
+
+    #[test]
+    fn envelope_workspace_authority_cannot_widen_any_cap() -> Result<(), String> {
+        let mut ceiling = envelope_with_budget("100.00");
+        ceiling.spec.workspace = Some(workspace_authority(
+            vec![WorkspaceEntryType::Git],
+            "1Gi",
+            1_000,
+            100,
+            1,
+        )?);
+        let mut candidate = ceiling.clone();
+        candidate.spec.workspace = Some(workspace_authority(
+            vec![WorkspaceEntryType::Git, WorkspaceEntryType::Scratch],
+            "2Gi",
+            2_000,
+            200,
+            2,
+        )?);
+
+        let decision = envelope_is_within(&candidate, &ceiling)
+            .map_err(|error| format!("workspace authority comparison failed: {error:?}"))?;
+        assert!(matches!(
+            decision,
+            AdmissionDecision::Reject { deltas }
+                if matches!(deltas.as_slice(), [AdmissionDelta::Workspace { .. }])
+        ));
+        Ok(())
     }
 
     fn budget_with_single_run_limit(monthly_limit: &str, single_run_limit: &str) -> Budget {

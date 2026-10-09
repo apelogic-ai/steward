@@ -1,7 +1,8 @@
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -12,7 +13,12 @@ use steward_ports::{
     SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
     SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
-use steward_types::direct_package::{DiagnosticsRequest, ExecutionLogMode};
+use steward_types::direct_package::{
+    ContentDigest, DiagnosticsRequest, ExactGitCommit, ExecutionLogMode, RepositoryUrl,
+    ResolvedWorkspaceEntry, StableProviderId, WorkspaceAccess, WorkspaceEvidence,
+    WorkspaceGitHistory, WorkspaceName, canonical_json_bytes,
+};
+use steward_types::task_input_archive::frame_task_input_archive;
 use steward_types::task_output_archive::{
     TaskOutputArchiveCompatibility, task_output_archive_entries,
 };
@@ -101,6 +107,160 @@ fn make_input_archive(run_dir: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
     let archive = fs::read(&archive_path)
         .map_err(|error| format!("failed to read input archive: {error}"))?;
     Ok((archive, payload))
+}
+
+fn command_stdout(command: &mut Command, description: &str) -> Result<Vec<u8>, String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to start {description}: {error}"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!(
+            "{description} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn make_workspace_archive(
+    run_dir: &Path,
+    caller_archive: &[u8],
+) -> Result<(Vec<u8>, WorkspaceEvidence), String> {
+    let repository = run_dir.join("workspace-git-fixture");
+    fs::create_dir_all(&repository)
+        .map_err(|error| format!("failed to create workspace Git fixture: {error}"))?;
+    run(
+        Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .arg(&repository),
+        "workspace Git fixture initialization",
+    )?;
+    run(
+        Command::new("git").args(["-C"]).arg(&repository).args([
+            "config",
+            "user.email",
+            "alice@example.com",
+        ]),
+        "workspace Git author email configuration",
+    )?;
+    run(
+        Command::new("git")
+            .args(["-C"])
+            .arg(&repository)
+            .args(["config", "user.name", "alice"]),
+        "workspace Git author configuration",
+    )?;
+    fs::write(repository.join("tracked.txt"), "first line\n")
+        .map_err(|error| format!("failed to write first workspace revision: {error}"))?;
+    run(
+        Command::new("git")
+            .args(["-C"])
+            .arg(&repository)
+            .args(["add", "tracked.txt"]),
+        "workspace Git first add",
+    )?;
+    run(
+        Command::new("git")
+            .args(["-C"])
+            .arg(&repository)
+            .args(["commit", "-m", "first revision"]),
+        "workspace Git first commit",
+    )?;
+    fs::write(repository.join("tracked.txt"), "first line\nsecond line\n")
+        .map_err(|error| format!("failed to write second workspace revision: {error}"))?;
+    run(
+        Command::new("git").args(["-C"]).arg(&repository).args([
+            "commit",
+            "-am",
+            "second revision",
+        ]),
+        "workspace Git second commit",
+    )?;
+    let head = String::from_utf8(command_stdout(
+        Command::new("git")
+            .args(["-C"])
+            .arg(&repository)
+            .args(["rev-parse", "HEAD"]),
+        "workspace Git HEAD resolution",
+    )?)
+    .map_err(|_| "workspace Git HEAD was not UTF-8".to_owned())?;
+    let commit = ExactGitCommit::parse(format!("git:sha1:{}", head.trim()))?;
+    let mut pack = Command::new("git")
+        .args(["-C"])
+        .arg(&repository)
+        .args(["pack-objects", "--stdout", "--revs"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start workspace Git pack creation: {error}"))?;
+    pack.stdin
+        .take()
+        .ok_or_else(|| "workspace Git pack stdin was unavailable".to_owned())?
+        .write_all(format!("{}\n", head.trim()).as_bytes())
+        .map_err(|error| format!("failed to select workspace Git pack commit: {error}"))?;
+    let pack = pack
+        .wait_with_output()
+        .map_err(|error| format!("failed to wait for workspace Git pack: {error}"))?;
+    if !pack.status.success() {
+        return Err(format!(
+            "workspace Git pack creation failed: {}",
+            String::from_utf8_lossy(&pack.stderr).trim()
+        ));
+    }
+
+    let content_digest = ContentDigest::parse(format!("steward:sha256:{}", "a".repeat(64)))?;
+    let entries = vec![ResolvedWorkspaceEntry::Git {
+        name: WorkspaceName::parse("source")?,
+        access: WorkspaceAccess::Copy,
+        repository: RepositoryUrl::parse("https://github.com/example-org/source.git")?,
+        repository_id: StableProviderId::parse("123456")?,
+        repository_owner_id: StableProviderId::parse("7890")?,
+        commit,
+        history: WorkspaceGitHistory::Depth(2),
+        paths: Vec::new(),
+        submodules: Vec::new(),
+        max_materialized_bytes: 62_914_560,
+        content_digest,
+    }];
+    let max_materialized_bytes = 62_914_560_u64;
+    let digest = Sha256::digest(canonical_json_bytes(&serde_json::json!({
+        "entries": &entries,
+        "maxMaterializedBytes": max_materialized_bytes,
+    }))?);
+    let evidence = WorkspaceEvidence {
+        entries,
+        max_materialized_bytes,
+        workspace_digest: ContentDigest::parse(format!("steward:sha256:{digest:x}"))?,
+    };
+    evidence.validate()?;
+
+    let source = run_dir.join("workspace-archive-source");
+    fs::create_dir_all(source.join("packs"))
+        .map_err(|error| format!("failed to create workspace archive source: {error}"))?;
+    fs::write(
+        source.join("manifest.json"),
+        canonical_json_bytes(&evidence)?,
+    )
+    .map_err(|error| format!("failed to write workspace manifest: {error}"))?;
+    fs::write(source.join("packs/0.pack"), pack.stdout)
+        .map_err(|error| format!("failed to write workspace Git pack: {error}"))?;
+    let archive_path = run_dir.join("workspace.tar");
+    run(
+        Command::new("tar")
+            .arg("-cf")
+            .arg(&archive_path)
+            .arg("-C")
+            .arg(&source)
+            .args(["manifest.json", "packs/0.pack"]),
+        "workspace archive creation",
+    )?;
+    let workspace_archive = fs::read(archive_path)
+        .map_err(|error| format!("failed to read workspace archive: {error}"))?;
+    let framed = frame_task_input_archive(caller_archive, &workspace_archive)
+        .map_err(|error| format!("failed to frame workspace archive: {error:?}"))?;
+    Ok((framed, evidence))
 }
 
 fn output_payload(run_dir: &Path, archive: &[u8]) -> Result<Vec<u8>, String> {
@@ -232,6 +392,7 @@ async fn verify_attempt_failure_semantics(
             "mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; sleep 60".to_owned(),
         ],
         diagnostics: Default::default(),
+        workspace: None,
         execution_binding: None,
     };
     let attempt = TaskAttemptId("00000000-0000-4000-8000-000000000002".to_owned());
@@ -380,7 +541,8 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
     request.refs = refs.clone();
 
     let run_dir = PathBuf::from(required("STEWARD_RUN_DIR")?);
-    let (input_archive, expected_payload) = make_input_archive(&run_dir)?;
+    let (caller_archive, expected_payload) = make_input_archive(&run_dir)?;
+    let (input_archive, workspace) = make_workspace_archive(&run_dir, &caller_archive)?;
     let attempt_id = TaskAttemptId("00000000-0000-4000-8000-000000000001".to_owned());
     let task_result = runtime
         .start_task(
@@ -393,11 +555,12 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
                 command: vec![
                     "/bin/sh".to_owned(),
                     "-c".to_owned(),
-                    "set -eu; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"; printf task-stdout; printf task-stderr >&2".to_owned(),
+                    "set -eu; repository=/sandbox/workspace/source; test \"$(git -C \"$repository\" log --format=%s -2)\" = 'second revision\nfirst revision'; git -C \"$repository\" blame --porcelain tracked.txt | grep -Fq 'summary first revision'; test -z \"$(git -C \"$repository\" remote)\"; ! git -C \"$repository\" push >/dev/null 2>&1; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"; printf task-stdout; printf task-stderr >&2".to_owned(),
                 ],
                 diagnostics: DiagnosticsRequest {
                     execution_log: ExecutionLogMode::Full,
                 },
+                workspace: Some(workspace),
                 execution_binding: None,
             },
             &input_archive,
@@ -418,7 +581,7 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
         });
 
     let failure_semantics = if task_result.is_ok() {
-        verify_attempt_failure_semantics(&runtime, &request, &input_archive).await
+        verify_attempt_failure_semantics(&runtime, &request, &caller_archive).await
     } else {
         Ok(())
     };

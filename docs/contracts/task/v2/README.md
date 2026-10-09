@@ -81,6 +81,7 @@ The direct TaskDefinition schema is `steward.task-definition/v2`. It contains:
 - exactly one prompt source: a Markdown path relative to the TaskDefinition directory
   in `prompt`, or verbatim inline UTF-8 text in `promptText`;
 - zero or more instruction-skill descriptor paths, also relative to that directory;
+- zero or more typed workspace entries;
 - one or more workspace-relative declared outputs beneath `out`; and
 - optional complete `requires`.
 
@@ -95,6 +96,34 @@ authority; this v1 schema can never acquire executable meaning.
 It is part of the canonical TaskDefinition bytes and therefore needs no separate
 prompt closure entry. There is no templating or substitution. Existing `prompt`
 packages retain their exact bytes, closure, digest and runtime behavior.
+
+## Governed workspaces
+
+An optional `workspace` array supplies working data without giving the sandbox source
+credentials. Each item is exactly one of `{"git": {...}}` or
+`{"scratch": {...}}` and is materialized beneath `/sandbox/workspace/<name>` before
+the agent starts. Omitting `workspace` preserves the prior runtime behavior.
+
+A Git entry identifies `"self"` or an explicit stable owner/repository ID pair. Its
+`ref` is `"trigger"` or an exact `git:sha1:<40-hex>` commit, and `history` is
+`"none"`, `{"depth": N}`, or `"full"` when deployment and Envelope policy permit
+it. Optional `paths` select a sparse working tree. Submodules are disabled by default;
+`mode: admitted` permits only source-App-installed repositories admitted by stable ID,
+always at the parent gitlink commit. Required submodules fail admission if they cannot
+be materialized. `read-only` is the default; `copy` is writable but has no remote or
+credential, so changes leave only through declared outputs.
+
+A scratch entry is an empty writable directory with a requested size. Deployment,
+Envelope, and per-entry limits are intersected before any runtime is created. Steward
+records every exact repository/commit and content digest, plus one combined workspace
+digest, in Task evidence. The sandbox receives the same resolved inventory at
+`/sandbox/workspace/.steward-workspace.json`.
+
+The selected User Envelope must contain a `workspace` authority object with
+`allowedTypes`, `maxTotalSize`, `maxFiles`, `maxHistoryDepth`, and
+`maxSubmoduleDepth`. No object means no workspace authority. Task admission applies
+the minimum of the deployment, approved User Envelope, and per-entry limits before
+any runtime reservation.
 
 Omitted `requires` means the resolved Envelope's entire approved authority values
 become effective. A present `requires` object is a complete narrower candidate: its

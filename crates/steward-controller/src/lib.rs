@@ -2441,12 +2441,30 @@ fn sandbox_task_request(
         agent_type: task.runtime_spec.agent_type.clone(),
         command: task.agent_command.clone(),
         diagnostics,
+        workspace: sandbox_task_workspace(
+            execution_class,
+            task.direct_task_evidence.as_ref(),
+            task.browser_task_evidence.as_ref(),
+        ),
         execution_binding: task
             .execution_binding
             .as_ref()
             .and_then(TaskExecutionBinding::disposable)
             .cloned(),
     }
+}
+
+fn sandbox_task_workspace(
+    execution_class: SandboxExecutionClass,
+    evidence: Option<&steward_types::direct_package::DirectTaskBindingEvidence>,
+    browser_evidence: Option<&steward_types::direct_package::BrowserTaskEvidence>,
+) -> Option<steward_types::direct_package::WorkspaceEvidence> {
+    if execution_class != SandboxExecutionClass::Agent {
+        return None;
+    }
+    evidence
+        .and_then(|evidence| evidence.workspace.clone())
+        .or_else(|| browser_evidence.and_then(|evidence| evidence.workspace.clone()))
 }
 
 fn sandbox_task_diagnostics(
@@ -7659,6 +7677,7 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 runtime_minutes_limit: None,
+                workspace: None,
                 ttl: Duration("1h".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
             },
@@ -8402,6 +8421,7 @@ mod webhook_tests {
                         currency: "USD".to_owned(),
                     },
                     runtime_minutes_limit: None,
+                    workspace: None,
                     ttl: Duration("24h".to_owned()),
                     runner: steward_types::RunnerRequirements::default(),
                 },

@@ -7,8 +7,8 @@ use steward_types::direct_package::{
     AgentRef, ContentDigest, Decimal, DirectTaskBindingEvidence, DirectTaskDefinition,
     DirectTaskStatusResponse, DirectTaskSubmission, Duration, ExactGitCommit, ExecutionLogMode,
     InstructionSkill, InvocationManifest, PackageClosure, RelativePath, RepositoryUrl,
-    SOURCE_PROVENANCE_JWT_CLAIM, Slug, SourceProvenance, StableProviderId, Uuid,
-    canonical_json_bytes,
+    SOURCE_PROVENANCE_JWT_CLAIM, Slug, SourceProvenance, StableProviderId, Uuid, WorkspaceName,
+    WorkspacePath, canonical_json_bytes,
 };
 
 const CONTRACT_ROOT: &str = "../../docs/contracts/task/v2";
@@ -279,6 +279,10 @@ fn matches_schema_pattern(pattern: &str, value: &str) -> Result<bool, String> {
             Uuid::parse(value).is_ok()
         }
         "^[a-z][a-z0-9-]{0,62}$" => Slug::parse(value).is_ok(),
+        "^[a-z0-9-]{1,40}$" => WorkspaceName::parse(value).is_ok(),
+        "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*/?$" => {
+            WorkspacePath::parse(value).is_ok()
+        }
         "^\\S(?:.*\\S)?$" => {
             !value.is_empty()
                 && value
@@ -549,6 +553,137 @@ fn positive_wire_fixtures_parse_and_validate() -> Result<(), String> {
         assert_eq!(evidence_json.pointer(path), Some(&serde_json::Value::Null));
     }
     Ok(())
+}
+
+#[test]
+fn task_definition_accepts_typed_workspace_entries() -> Result<(), String> {
+    let definition = serde_json::json!({
+        "schemaVersion": "steward.task-definition/v2",
+        "name": "repository-review",
+        "version": 1,
+        "runtime": { "agentRef": "example-agent@1.2.3" },
+        "promptText": "Review the repository and write out/report.md.",
+        "workspace": [
+            { "git": {} },
+            {
+                "git": {
+                    "name": "proto",
+                    "repository": { "ownerId": "1000001", "repositoryId": "2000001" },
+                    "ref": "trigger",
+                    "history": { "depth": 200 },
+                    "paths": ["src", "docs"],
+                    "submodules": {
+                        "mode": "admitted",
+                        "required": ["vendor/proto"],
+                        "recursive": false
+                    },
+                    "access": "copy",
+                    "limits": { "size": "2Gi", "files": 10000 }
+                }
+            },
+            { "scratch": { "size": "2Gi" } }
+        ],
+        "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+    });
+    let schema = parse_value("schemas/direct-package.schema.json")?;
+    let definition_schema = schema
+        .pointer("/$defs/taskDefinition")
+        .ok_or_else(|| "TaskDefinition schema must exist".to_owned())?;
+    validate_schema_instance(&schema, definition_schema, &definition, "$task")?;
+    let definition: DirectTaskDefinition = serde_json::from_value(definition)
+        .map_err(|error| format!("workspace TaskDefinition must parse: {error}"))?;
+    definition.validate()
+}
+
+#[test]
+fn task_definition_rejects_malformed_workspace_entries() -> Result<(), String> {
+    fn definition_with(workspace: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": "steward.task-definition/v2",
+            "name": "repository-review",
+            "version": 1,
+            "runtime": { "agentRef": "example-agent@1.2.3" },
+            "promptText": "Review the repository and write out/report.md.",
+            "workspace": workspace,
+            "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+        })
+    }
+
+    let schema = parse_value("schemas/direct-package.schema.json")?;
+    let definition_schema = schema
+        .pointer("/$defs/taskDefinition")
+        .ok_or_else(|| "TaskDefinition schema must exist".to_owned())?;
+    for workspace in [
+        serde_json::json!([{ "artifact": {} }]),
+        serde_json::json!([{ "git": {}, "scratch": { "size": "1Gi" } }]),
+        serde_json::json!([{ "git": { "history": { "depth": 0 } } }]),
+        serde_json::json!([{ "scratch": {} }]),
+    ] {
+        let definition = definition_with(workspace);
+        assert!(
+            validate_schema_instance(&schema, definition_schema, &definition, "$task").is_err()
+        );
+        assert!(serde_json::from_value::<DirectTaskDefinition>(definition).is_err());
+    }
+
+    for workspace in [
+        serde_json::json!([
+            { "git": { "name": "source" } },
+            { "scratch": { "name": "source", "size": "1Gi" } }
+        ]),
+        serde_json::json!([{ "git": {
+            "submodules": { "mode": "none", "required": ["vendor/proto"] }
+        } }]),
+        serde_json::json!([{ "git": { "limits": { "files": 0 } } }]),
+    ] {
+        let definition: DirectTaskDefinition =
+            serde_json::from_value(definition_with(workspace))
+                .map_err(|error| format!("invalid workspace shape must parse: {error}"))?;
+        assert!(definition.validate().is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn binding_evidence_records_resolved_workspace_identity_and_digest() -> Result<(), String> {
+    let mut evidence = parse_value("fixtures/positive/task-binding-evidence.json")?;
+    let entries = serde_json::json!([
+        {
+            "type": "git",
+            "name": "caller",
+            "access": "read-only",
+            "repository": "https://github.com/example-org/caller.git",
+            "repositoryId": "2000001",
+            "repositoryOwnerId": "1000001",
+            "commit": "git:sha1:1111111111111111111111111111111111111111",
+            "history": { "depth": 20 },
+            "paths": ["src/"],
+            "maxMaterializedBytes": 62914560,
+            "contentDigest": format!("steward:sha256:{}", "a".repeat(64))
+        },
+        {
+            "type": "scratch",
+            "name": "scratch",
+            "size": "2Gi",
+            "contentDigest": format!("steward:sha256:{}", "b".repeat(64))
+        }
+    ]);
+    let max_materialized_bytes = 62_914_560_u64;
+    let workspace_digest = format!(
+        "steward:sha256:{:x}",
+        Sha256::digest(canonical_json_bytes(&serde_json::json!({
+            "entries": &entries,
+            "maxMaterializedBytes": max_materialized_bytes,
+        }))?)
+    );
+    evidence["workspace"] = serde_json::json!({
+        "entries": entries,
+        "maxMaterializedBytes": max_materialized_bytes,
+        "workspaceDigest": workspace_digest
+    });
+    let evidence: DirectTaskBindingEvidence = serde_json::from_value(evidence)
+        .map_err(|error| format!("workspace evidence must parse: {error}"))?;
+    evidence.validate()
 }
 
 #[test]

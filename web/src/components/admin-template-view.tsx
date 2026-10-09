@@ -14,6 +14,7 @@ import {
   type ModelRef,
   type RunnerPlatform,
   type ToolGrant,
+  type WorkspaceAuthority,
 } from "@/api-client";
 import { DataTable, FormSection, GrantChipList, SectionCard, TagSelect, grantKindForAction } from "@/components/hs";
 import { ToolPicker, dedupeToolGrants, toolKey } from "@/components/tool-picker";
@@ -24,7 +25,7 @@ import { useSession } from "@/session/session-context";
 
 type TemplateMutationState = "idle" | "saving" | "saved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
 
-type TemplateField = "templateId" | "displayName" | "memberRoles" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "memory" | "compute" | "storage" | "models" | "tools" | "threshold";
+type TemplateField = "templateId" | "displayName" | "memberRoles" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "memory" | "compute" | "storage" | "models" | "tools" | "workspace" | "threshold";
 
 export type TemplateFieldErrors = Partial<Record<TemplateField, string>>;
 
@@ -122,8 +123,38 @@ function runnerQuantity(value: string, resource: "compute" | "memory" | "storage
   return quantity > 0n && quantity <= 340282366920938463463374607431768211455n ? quantity : null;
 }
 
+function isWorkspaceAuthority(value: unknown): value is WorkspaceAuthority {
+  if (!isRecord(value)
+    || !Array.isArray(value.allowedTypes)
+    || value.allowedTypes.length === 0
+    || value.allowedTypes.some((entry) => entry !== "git" && entry !== "scratch")
+    || new Set(value.allowedTypes).size !== value.allowedTypes.length
+    || typeof value.maxTotalSize !== "string"
+    || runnerQuantity(value.maxTotalSize, "storage") === null
+    || typeof value.maxFiles !== "number"
+    || !Number.isSafeInteger(value.maxFiles)
+    || value.maxFiles <= 0
+    || typeof value.maxHistoryDepth !== "number"
+    || !Number.isSafeInteger(value.maxHistoryDepth)
+    || value.maxHistoryDepth <= 0
+    || typeof value.maxSubmoduleDepth !== "number"
+    || !Number.isSafeInteger(value.maxSubmoduleDepth)
+    || value.maxSubmoduleDepth < 0) return false;
+  return true;
+}
+
+function workspaceAuthorityFromJson(value: string): WorkspaceAuthority | null | undefined {
+  if (!value.trim()) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isWorkspaceAuthority(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function validEnvelopeSemantics(envelope: BrowserEnvelope): boolean {
-  const { budget, runner, runtimeMinutesLimit, ttl } = envelope.spec;
+  const { budget, runner, runtimeMinutesLimit, ttl, workspace } = envelope.spec;
   const platforms = runner?.platforms ?? [];
   return envelope.revision > 0
     && validDecimal(budget.monthlyLimit)
@@ -134,7 +165,8 @@ function validEnvelopeSemantics(envelope: BrowserEnvelope): boolean {
     && new Set(platforms).size === platforms.length
     && (runner?.memory == null || runnerQuantity(runner.memory, "memory") !== null)
     && (runner?.compute == null || runnerQuantity(runner.compute, "compute") !== null)
-    && (runner?.storage == null || runnerQuantity(runner.storage, "storage") !== null);
+    && (runner?.storage == null || runnerQuantity(runner.storage, "storage") !== null)
+    && (workspace == null || isWorkspaceAuthority(workspace));
 }
 
 function envelopeIsWithin(candidate: BrowserEnvelope, ceiling: BrowserEnvelope): boolean {
@@ -166,6 +198,16 @@ function envelopeIsWithin(candidate: BrowserEnvelope, ceiling: BrowserEnvelope):
     const allowedQuantity = runnerQuantity(allowed, resource);
     if (requestedQuantity === null || allowedQuantity === null || requestedQuantity > allowedQuantity) return false;
   }
+  const candidateWorkspace = candidate.spec.workspace;
+  if (candidateWorkspace != null) {
+    const ceilingWorkspace = ceiling.spec.workspace;
+    if (ceilingWorkspace == null
+      || candidateWorkspace.allowedTypes.some((entry) => !ceilingWorkspace.allowedTypes.includes(entry))
+      || (runnerQuantity(candidateWorkspace.maxTotalSize, "storage") ?? 1n) > (runnerQuantity(ceilingWorkspace.maxTotalSize, "storage") ?? 0n)
+      || candidateWorkspace.maxFiles > ceilingWorkspace.maxFiles
+      || candidateWorkspace.maxHistoryDepth > ceilingWorkspace.maxHistoryDepth
+      || candidateWorkspace.maxSubmoduleDepth > ceilingWorkspace.maxSubmoduleDepth) return false;
+  }
   return true;
 }
 
@@ -196,7 +238,8 @@ function isBrowserEnvelope(value: unknown): value is BrowserEnvelope {
   const validRuntimeMinutes = spec.runtimeMinutesLimit === undefined
     || spec.runtimeMinutesLimit === null
     || typeof spec.runtimeMinutesLimit === "string";
-  return validBudget && validModels && validTools && validRunner && validRuntimeMinutes && typeof spec.ttl === "string";
+  const validWorkspace = spec.workspace === undefined || spec.workspace === null || isWorkspaceAuthority(spec.workspace);
+  return validBudget && validModels && validTools && validRunner && validRuntimeMinutes && validWorkspace && typeof spec.ttl === "string";
 }
 
 function isAutoProvisionThreshold(value: unknown): value is BrowserEnvelope | null | undefined {
@@ -221,6 +264,7 @@ export function validateTemplateFields({
   templateId,
   thresholdJson,
   tools,
+  workspaceJson,
 }: Readonly<{
   allowedModels: ReadonlySet<string>;
   allowedTools: ReadonlySet<string>;
@@ -234,6 +278,7 @@ export function validateTemplateFields({
   templateId: string;
   thresholdJson: string;
   tools: Array<ToolGrant>;
+  workspaceJson: string;
 }>): TemplateFieldErrors {
   const errors: TemplateFieldErrors = {};
   if (!templateId) errors.templateId = "Enter a template ID.";
@@ -259,6 +304,7 @@ export function validateTemplateFields({
   if (models.length === 0) errors.models = "Select at least one model.";
   else if (models.some((model) => !allowedModels.has(modelKey(model)))) errors.models = "Remove or replace every model not listed in the capability catalog.";
   if (tools.some((tool) => !allowedTools.has(toolKey(tool)))) errors.tools = "Remove or replace every tool not listed in the capability catalog.";
+  if (workspaceAuthorityFromJson(workspaceJson) === null) errors.workspace = "Enter a complete valid workspace authority object or leave it blank.";
   if (!autoApproveToCeiling) {
     try {
       const threshold = JSON.parse(thresholdJson) as unknown;
@@ -615,6 +661,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
   const [autoApproveToCeiling, setAutoApproveToCeiling] = useState(autoProvisionThreshold === null || autoProvisionThreshold === undefined);
   const [thresholdJson, setThresholdJson] = useState(JSON.stringify(autoProvisionThreshold ?? template, null, 2));
   const [allowInlineBrowserTasks, setAllowInlineBrowserTasks] = useState(initialAllowInlineBrowserTasks);
+  const [workspaceJson, setWorkspaceJson] = useState(template.spec.workspace ? JSON.stringify(template.spec.workspace, null, 2) : "");
   const parsedRoles = [...new Set(roles.split(",").map((role) => role.trim()).filter(Boolean))].sort();
   const selectedRoles = templateMemberRoles(templateIdDraft, parsedRoles, rolesEdited);
   const missingModels = models.filter((model) => !allowedModels.has(modelKey(model)));
@@ -656,6 +703,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
     const memory = String(fields.get("memory") ?? "").trim();
     const compute = String(fields.get("compute") ?? "").trim();
     const storage = String(fields.get("storage") ?? "").trim();
+    const workspace = workspaceAuthorityFromJson(workspaceJson);
     const envelope: BrowserEnvelope = {
       revision: create || saveAsNew ? 1 : currentRevision + 1,
       spec: {
@@ -667,6 +715,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         llms: models,
         tools,
         ...(runtimeMinutesLimit.trim() ? { runtimeMinutesLimit: runtimeMinutesLimit.trim() } : {}),
+        ...(workspace ? { workspace } : {}),
         ttl: String(fields.get("ttl") ?? "").trim(),
         runner: {
           platforms,
@@ -704,6 +753,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       templateId,
       thresholdJson: thresholdJsonForValidation,
       tools,
+      workspaceJson,
     });
     setFieldErrors(errors);
     setRejectionCode(null);
@@ -779,6 +829,9 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
           <ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} tools={tools} />
           <FieldError message={fieldErrors.tools} />
         </FormSection>
+        <FormSection description="Optional ceiling for typed Task workspaces. Blank means this template grants no workspace entries." title="Workspace authority">
+          <label className="grid gap-2 text-sm font-semibold">Workspace authority (JSON)<textarea aria-invalid={Boolean(fieldErrors.workspace)} className="min-h-44 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setWorkspaceJson(event.target.value); clearFieldError("workspace"); }} placeholder={'{"allowedTypes":["git","scratch"],"maxTotalSize":"2Gi","maxFiles":100000,"maxHistoryDepth":1000,"maxSubmoduleDepth":4}'} spellCheck={false} value={workspaceJson} /><FieldError message={fieldErrors.workspace} /></label>
+        </FormSection>
         <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
           <div className="space-y-4"><label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => { setAutoApproveToCeiling(event.target.checked); clearFieldError("threshold"); }} type="checkbox" />Auto-approve every request within the ceiling</label>{!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea aria-invalid={Boolean(fieldErrors.threshold)} className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setThresholdJson(event.target.value); clearFieldError("threshold"); }} spellCheck={false} value={thresholdJson} /><FieldError message={fieldErrors.threshold} /></label> : null}</div>
         </FormSection>
@@ -815,6 +868,8 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       <FormSection description="Only models supported by the inference gateway can be selected." title="Models"><fieldset><legend className="sr-only">Models</legend><TagSelect addPlaceholder="Add…" emptyPlaceholder="Search models…" inputDisabled={modelCatalog.length === 0} label="Models" onChange={(keys) => { setModels(keys.flatMap((key) => { const model = [...modelCatalog, ...missingModels].find((candidate) => modelKey(candidate) === key); return model ? [model] : []; })); clearFieldError("models"); }} options={modelOptions} value={models.map(modelKey)} /><FieldError message={fieldErrors.models} />{missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}</fieldset></FormSection>
 
       <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Groups appear only when supplied as authoritative catalog metadata.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} previousTools={previousTools} tools={tools} /><FieldError message={fieldErrors.tools} /></fieldset></FormSection>
+
+      <FormSection description="Optional ceiling for typed Task workspaces. Blank means this template grants no workspace entries." title="Workspace authority"><label className="grid gap-2 text-sm font-semibold">Workspace authority (JSON)<textarea aria-invalid={Boolean(fieldErrors.workspace)} className="min-h-44 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setWorkspaceJson(event.target.value); clearFieldError("workspace"); }} placeholder={'{"allowedTypes":["git","scratch"],"maxTotalSize":"2Gi","maxFiles":100000,"maxHistoryDepth":1000,"maxSubmoduleDepth":4}'} spellCheck={false} value={workspaceJson} /><FieldError message={fieldErrors.workspace} /></label></FormSection>
 
       <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
         <div className="space-y-4">

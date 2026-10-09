@@ -8,8 +8,9 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::{Client, Response, StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use steward_ports::{
-    GitFile, GitFileRequest, GitHostingPlane, GitRepositoryDescription, GitRepositoryIdentity,
-    GitRepositoryReference, GitRevisionRequest, PortError,
+    GitFile, GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
+    GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree,
+    GitTreeEntry as PortGitTreeEntry, GitTreePath, GitTreeRequest, PortError,
 };
 use steward_types::direct_package::{
     ExactGitCommit, MAX_PACKAGE_FILE_BYTES, RepositoryUrl, StableProviderId,
@@ -21,6 +22,8 @@ const API_ORIGIN: &str = "https://api.github.com";
 const CLONE_ORIGIN: &str = "https://github.com";
 const METADATA_RESPONSE_BYTES: u64 = 1024 * 1024;
 const TREE_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_GIT_PACK_BYTES: u64 = 256 * 1024 * 1024;
+const GIT_UPLOAD_PACK_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
 const TOKEN_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_INSTALLATION_TOKEN_BYTES: usize = 4096;
 const INSTALLATIONS_PER_PAGE: usize = 100;
@@ -28,6 +31,119 @@ const MAX_INSTALLATION_PAGES: usize = 10;
 const DESCRIBE_CONCURRENCY: usize = 8;
 /// Revocation is best effort and must not hold a result back for long.
 const REVOKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn encode_upload_pack_request(
+    commit: &ExactGitCommit,
+    depth: Option<u32>,
+) -> Result<Vec<u8>, PortError> {
+    if depth == Some(0) {
+        return Err(rejected("Git history depth must be positive"));
+    }
+    let sha = commit
+        .as_str()
+        .strip_prefix("git:sha1:")
+        .ok_or_else(|| rejected("exact Git commit is invalid"))?;
+    let mut request = Vec::new();
+    append_pkt_line(
+        &mut request,
+        format!(
+            "want {sha} multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=steward-github-source/0.0.0\n"
+        )
+        .as_bytes(),
+    )?;
+    if let Some(depth) = depth {
+        append_pkt_line(&mut request, format!("deepen {depth}\n").as_bytes())?;
+    }
+    request.extend_from_slice(b"0000");
+    append_pkt_line(&mut request, b"done\n")?;
+    Ok(request)
+}
+
+fn append_pkt_line(target: &mut Vec<u8>, payload: &[u8]) -> Result<(), PortError> {
+    let length = payload
+        .len()
+        .checked_add(4)
+        .filter(|length| *length <= 0xffff)
+        .ok_or_else(|| rejected("Git protocol packet is too large"))?;
+    target.extend_from_slice(format!("{length:04x}").as_bytes());
+    target.extend_from_slice(payload);
+    Ok(())
+}
+
+fn decode_upload_pack_result(
+    response: &[u8],
+    max_bytes: u64,
+) -> Result<(Vec<u8>, Vec<ExactGitCommit>), PortError> {
+    let mut cursor = 0_usize;
+    let mut pack = Vec::new();
+    let mut shallow = Vec::new();
+    while cursor < response.len() {
+        if response[cursor..].starts_with(b"PACK") {
+            append_pack_bytes(&mut pack, &response[cursor..], max_bytes)?;
+            cursor = response.len();
+            continue;
+        }
+        let header = response
+            .get(cursor..cursor.saturating_add(4))
+            .ok_or_else(|| rejected("GitHub returned a truncated Git protocol packet"))?;
+        let header = std::str::from_utf8(header)
+            .ok()
+            .and_then(|value| usize::from_str_radix(value, 16).ok())
+            .ok_or_else(|| rejected("GitHub returned an invalid Git protocol packet"))?;
+        cursor += 4;
+        if header <= 2 {
+            continue;
+        }
+        if header < 4 {
+            return Err(rejected("GitHub returned an invalid Git protocol packet"));
+        }
+        let payload_length = header - 4;
+        let payload = response
+            .get(cursor..cursor.saturating_add(payload_length))
+            .ok_or_else(|| rejected("GitHub returned a truncated Git protocol packet"))?;
+        cursor += payload_length;
+        match payload.first() {
+            Some(1) => append_pack_bytes(&mut pack, &payload[1..], max_bytes)?,
+            Some(2) => {}
+            Some(3) => return Err(rejected("GitHub rejected the exact Git object request")),
+            _ if payload == b"NAK\n" || payload.starts_with(b"unshallow ") => {}
+            _ if payload.starts_with(b"shallow ") => {
+                let commit = payload
+                    .strip_prefix(b"shallow ")
+                    .and_then(|value| value.strip_suffix(b"\n"))
+                    .and_then(|value| std::str::from_utf8(value).ok())
+                    .ok_or_else(|| rejected("GitHub returned an invalid shallow boundary"))?;
+                shallow.push(
+                    ExactGitCommit::parse(format!("git:sha1:{commit}"))
+                        .map_err(|_| rejected("GitHub returned an invalid shallow boundary"))?,
+                );
+            }
+            _ => {
+                return Err(rejected(
+                    "GitHub returned an unexpected Git protocol packet",
+                ));
+            }
+        }
+    }
+    if !pack.starts_with(b"PACK") {
+        return Err(rejected("GitHub response did not contain a Git pack"));
+    }
+    shallow.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    shallow.dedup();
+    Ok((pack, shallow))
+}
+
+fn append_pack_bytes(target: &mut Vec<u8>, bytes: &[u8], max_bytes: u64) -> Result<(), PortError> {
+    let next = target
+        .len()
+        .checked_add(bytes.len())
+        .ok_or_else(|| rejected("Git pack exceeds the requested byte bound"))?;
+    if next as u64 > max_bytes {
+        return Err(rejected("Git pack exceeds the requested byte bound"));
+    }
+    target.extend_from_slice(bytes);
+    Ok(())
+}
 
 /// GitHub App credentials. Deliberately implements neither `Debug` nor `Display`.
 pub struct GitHubAppCredentials {
@@ -302,7 +418,7 @@ impl GitHubSourceAdapter {
         let components: Vec<&str> = request.path.as_str().split('/').collect();
         let mut tree_sha = commit.tree.sha;
         for (index, component) in components.iter().enumerate() {
-            let tree: GitTree = self
+            let tree: WireGitTree = self
                 .get_json(
                     &format!(
                         "{}/repos/{}/{}/git/trees/{}",
@@ -647,6 +763,141 @@ impl GitHostingPlane for GitHubSourceAdapter {
         })
     }
 
+    async fn read_pack(&self, request: &GitPackRequest) -> Result<GitPack, PortError> {
+        if request.max_bytes == 0
+            || request.max_bytes > MAX_GIT_PACK_BYTES
+            || request.depth == Some(0)
+        {
+            return Err(rejected("Git pack bounds are invalid"));
+        }
+        let coordinates =
+            RepositoryCoordinates::parse(&request.repository.repository, &self.clone_origin)?;
+        let authorized = self.authenticate_repository(&coordinates).await?;
+        if authorized.identity != request.repository {
+            return Err(rejected(
+                "GitHub repository stable identity does not match request",
+            ));
+        }
+        let body = encode_upload_pack_request(&request.commit, request.depth)?;
+        let response = self
+            .client
+            .post(format!(
+                "{}/{}/{}.git/git-upload-pack",
+                self.clone_origin, coordinates.owner, coordinates.name
+            ))
+            .header("Accept", "application/x-git-upload-pack-result")
+            .header("Content-Type", "application/x-git-upload-pack-request")
+            .header("Git-Protocol", "version=0")
+            .basic_auth("x-access-token", Some(authorized.token.expose()))
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| failed("read exact Git pack"))?;
+        if response.status().is_redirection() {
+            return Err(rejected("GitHub Git redirects are forbidden"));
+        }
+        if !response.status().is_success() {
+            if response.status().is_client_error() {
+                return Err(rejected("GitHub rejected the exact Git pack request"));
+            }
+            return Err(failed("read exact Git pack"));
+        }
+        let response_bound = request
+            .max_bytes
+            .checked_add(GIT_UPLOAD_PACK_OVERHEAD_BYTES)
+            .ok_or_else(|| rejected("Git pack bounds are invalid"))?;
+        let response = read_bounded(response, response_bound, "read exact Git pack").await?;
+        let (bytes, shallow) = decode_upload_pack_result(&response, request.max_bytes)?;
+        self.revalidate_repository(&coordinates, &authorized)
+            .await?;
+        Ok(GitPack {
+            repository: authorized.identity,
+            commit: request.commit.clone(),
+            shallow,
+            bytes,
+        })
+    }
+
+    async fn read_tree(&self, request: &GitTreeRequest) -> Result<GitTree, PortError> {
+        if request.max_entries == 0 || request.max_entries > 100_000 {
+            return Err(rejected("Git tree entry bound is invalid"));
+        }
+        let coordinates =
+            RepositoryCoordinates::parse(&request.repository.repository, &self.clone_origin)?;
+        let authorized = self.authenticate_repository(&coordinates).await?;
+        if authorized.identity != request.repository {
+            return Err(rejected(
+                "GitHub repository stable identity does not match request",
+            ));
+        }
+        let commit_sha = request
+            .commit
+            .as_str()
+            .strip_prefix("git:sha1:")
+            .ok_or_else(|| rejected("exact Git commit is invalid"))?;
+        let commit: GitCommit = self
+            .get_json(
+                &format!(
+                    "{}/repos/{}/{}/git/commits/{}",
+                    self.api_origin, coordinates.owner, coordinates.name, commit_sha
+                ),
+                &authorized.token,
+                Authentication::Installation,
+                METADATA_RESPONSE_BYTES,
+                "read exact Git commit tree",
+            )
+            .await?;
+        if commit.sha != commit_sha || !valid_sha1(&commit.tree.sha) {
+            return Err(rejected("GitHub returned an inconsistent commit object"));
+        }
+        let tree: WireGitTree = self
+            .get_json(
+                &format!(
+                    "{}/repos/{}/{}/git/trees/{}?recursive=1",
+                    self.api_origin, coordinates.owner, coordinates.name, commit.tree.sha
+                ),
+                &authorized.token,
+                Authentication::Installation,
+                TREE_RESPONSE_BYTES,
+                "read recursive exact Git tree",
+            )
+            .await?;
+        if tree.sha != commit.tree.sha || tree.truncated || tree.tree.len() > request.max_entries {
+            return Err(rejected(
+                "GitHub returned an incomplete or oversized Git tree",
+            ));
+        }
+        let mut entries = Vec::with_capacity(tree.tree.len());
+        for entry in tree.tree {
+            if !valid_sha1(&entry.sha)
+                || !matches!(entry.kind.as_str(), "blob" | "tree" | "commit")
+                || !matches!(
+                    entry.mode.as_str(),
+                    "040000" | "100644" | "100755" | "120000" | "160000"
+                )
+                || (entry.kind == "blob") != entry.size.is_some()
+            {
+                return Err(rejected("GitHub returned an invalid Git tree entry"));
+            }
+            entries.push(PortGitTreeEntry {
+                path: GitTreePath::parse(entry.path)
+                    .map_err(|_| rejected("GitHub returned an invalid Git tree path"))?,
+                mode: entry.mode,
+                kind: entry.kind,
+                object: entry.sha,
+                size: entry.size,
+            });
+        }
+        entries.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
+        self.revalidate_repository(&coordinates, &authorized)
+            .await?;
+        Ok(GitTree {
+            repository: authorized.identity,
+            commit: request.commit.clone(),
+            entries,
+        })
+    }
+
     async fn resolve_revision(
         &self,
         request: &GitRevisionRequest,
@@ -853,19 +1104,21 @@ struct GitObjectReference {
 }
 
 #[derive(Deserialize)]
-struct GitTree {
+struct WireGitTree {
     sha: String,
     truncated: bool,
-    tree: Vec<GitTreeEntry>,
+    tree: Vec<WireGitTreeEntry>,
 }
 
 #[derive(Deserialize)]
-struct GitTreeEntry {
+struct WireGitTreeEntry {
     path: String,
     mode: String,
     #[serde(rename = "type")]
     kind: String,
     sha: String,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1122,13 +1375,13 @@ mod tests {
     use serde_json::json;
     use steward_ports::{
         GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRepositoryReference,
-        GitRevisionRequest, PortError,
+        GitRevisionRequest, GitTreeRequest, PortError,
     };
     use steward_types::direct_package::{
         ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
     };
 
-    use super::GitHubSourceAdapter;
+    use super::{GitHubSourceAdapter, decode_upload_pack_result, encode_upload_pack_request};
 
     const CLONE_ORIGIN: &str = "https://github.example.test";
     const REPOSITORY: &str = "https://github.example.test/example-org/source-a.git";
@@ -1136,6 +1389,45 @@ mod tests {
     const ROOT_TREE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const CATALOG_TREE: &str = "cccccccccccccccccccccccccccccccccccccccc";
     const BLOB: &str = "dddddddddddddddddddddddddddddddddddddddd";
+
+    #[test]
+    fn upload_pack_request_pins_the_exact_commit_and_depth() -> Result<(), String> {
+        let commit = ExactGitCommit::parse(format!("git:sha1:{COMMIT}"))?;
+        let request = encode_upload_pack_request(&commit, Some(20))
+            .map_err(|error| format!("encode upload-pack request: {error:?}"))?;
+        let rendered = String::from_utf8(request).map_err(|error| error.to_string())?;
+        assert!(rendered.contains(&format!("want {COMMIT} ")));
+        assert!(rendered.contains("deepen 20\n"));
+        assert!(rendered.ends_with("00000009done\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn upload_pack_result_extracts_only_pack_sideband() -> Result<(), String> {
+        fn packet(payload: &[u8]) -> Vec<u8> {
+            let mut encoded = format!("{:04x}", payload.len() + 4).into_bytes();
+            encoded.extend_from_slice(payload);
+            encoded
+        }
+        let mut response = packet(b"NAK\n");
+        response.extend(packet(
+            b"shallow bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        ));
+        response.extend(packet(b"\x02counting objects\n"));
+        response.extend(packet(b"\x01PACKfixture-one"));
+        response.extend(packet(b"\x01fixture-two"));
+        response.extend_from_slice(b"0000");
+        assert_eq!(
+            decode_upload_pack_result(&response, 64)
+                .map_err(|error| format!("decode upload-pack result: {error:?}"))?,
+            (
+                b"PACKfixture-onefixture-two".to_vec(),
+                vec![ExactGitCommit::parse(format!("git:sha1:{ROOT_TREE}"))?]
+            )
+        );
+        assert!(decode_upload_pack_result(&response, 8).is_err());
+        Ok(())
+    }
 
     struct ResponseSpec {
         status: u16,
@@ -1414,6 +1706,56 @@ mod tests {
                 .iter()
                 .all(|request| !request.contains("caller-credential"))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_bounded_recursive_tree_at_exact_commit() -> Result<(), String> {
+        let mut responses = authentication_responses();
+        responses.extend([
+            ResponseSpec::json(json!({"sha": COMMIT, "tree": {"sha": ROOT_TREE}})),
+            ResponseSpec::json(json!({
+                "sha": ROOT_TREE,
+                "truncated": false,
+                "tree": [
+                    {"path": ".gitmodules", "mode": "100644", "type": "blob", "sha": BLOB, "size": 128},
+                    {"path": "vendor/proto", "mode": "160000", "type": "commit", "sha": CATALOG_TREE},
+                    {"path": "app/[id]/page.tsx", "mode": "100644", "type": "blob", "sha": BLOB, "size": 12},
+                    {"path": "vendor/@types/index.d.ts", "mode": "100644", "type": "blob", "sha": BLOB, "size": 12},
+                    {"path": "c++/main.cc", "mode": "100644", "type": "blob", "sha": BLOB, "size": 12},
+                    {"path": "My File.md", "mode": "100644", "type": "blob", "sha": BLOB, "size": 12}
+                ]
+            })),
+            metadata(1001, 1000, "example-org/source-a"),
+            installation(7001, 1000),
+        ]);
+        let mock = MockGitHub::start(responses)?;
+        let request = GitTreeRequest {
+            repository: identity(REPOSITORY, 1001, 1000)?,
+            commit: ExactGitCommit::parse(format!("git:sha1:{COMMIT}"))?,
+            max_entries: 8,
+        };
+        let tree = port(adapter(&mock)?.read_tree(&request).await)?;
+        assert_eq!(tree.repository, request.repository);
+        assert_eq!(tree.commit, request.commit);
+        assert_eq!(tree.entries.len(), 6);
+        assert!(
+            tree.entries
+                .iter()
+                .any(|entry| entry.path.as_str() == "app/[id]/page.tsx")
+        );
+        let submodule = tree
+            .entries
+            .iter()
+            .find(|entry| entry.path.as_str() == "vendor/proto")
+            .ok_or_else(|| "submodule tree entry was omitted".to_owned())?;
+        assert_eq!(submodule.mode, "160000");
+        assert_eq!(submodule.object, CATALOG_TREE);
+        assert_eq!(tree.entries[0].size, Some(128));
+        assert_eq!(submodule.size, None);
+        let requests = mock.finish()?;
+        assert!(requests[3].contains(&format!("/git/commits/{COMMIT}")));
+        assert!(requests[4].contains(&format!("/git/trees/{ROOT_TREE}?recursive=1")));
         Ok(())
     }
 

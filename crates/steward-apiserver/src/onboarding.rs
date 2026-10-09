@@ -174,6 +174,7 @@ fn built_in_starter_task(
             prompt: None,
             prompt_text: Some(BUILT_IN_STARTER_PROMPT.to_owned()),
             skills: Vec::new(),
+            workspace: Vec::new(),
             outputs: vec![DeclaredOutput {
                 path: RelativePath::parse("out/hello.txt")?,
                 kind: OutputKind::File,

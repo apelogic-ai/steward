@@ -6,7 +6,37 @@ use futures::Stream;
 
 use steward_types::direct_package::{
     DiagnosticsRequest, ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
+    WorkspaceEvidence,
 };
+
+/// One safe, provider-neutral path from a Git tree.
+///
+/// Git permits more file-name characters than Steward package references. This type preserves
+/// those names while rejecting only paths that could escape the checkout or address Git's own
+/// metadata directory.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GitTreePath(String);
+
+impl GitTreePath {
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 4096
+            || value.starts_with('/')
+            || value.contains('\0')
+            || value
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".." | ".git"))
+        {
+            return Err("Git tree path is invalid".to_owned());
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 use steward_types::{
     AgentType, Budget, DisposableExecutionBinding, ModelRef, RuntimeId, RuntimeRefs, SpendSummary,
     ToolGrant,
@@ -220,6 +250,9 @@ pub struct SandboxTaskRequest {
     /// Immutable caller-visible diagnostics selected by the admitted direct package.
     /// Legacy tasks and provider-control operations always carry the default disabled value.
     pub diagnostics: DiagnosticsRequest,
+    /// Immutable workspace identities resolved at admission. Materializers consume only this
+    /// server-authored evidence plus the separately framed workspace archive.
+    pub workspace: Option<WorkspaceEvidence>,
     /// The exact deployment binding persisted when the Task was reserved.
     pub execution_binding: Option<DisposableExecutionBinding>,
 }
@@ -544,6 +577,57 @@ pub struct GitFile {
     pub bytes: Vec<u8>,
 }
 
+/// Exact, bounded request for Git objects needed to materialize one repository workspace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitPackRequest {
+    pub repository: GitRepositoryIdentity,
+    pub commit: ExactGitCommit,
+    /// `None` requests all history reachable from `commit`; a positive value requests a shallow
+    /// history of that many commits.
+    pub depth: Option<u32>,
+    pub max_bytes: u64,
+}
+
+/// A credential-free Git pack whose object IDs remain the provider's exact Git identities.
+///
+/// This type deliberately omits `Debug`: repository content must not enter logs through
+/// accidental diagnostic formatting.
+#[derive(Clone, Eq, PartialEq)]
+pub struct GitPack {
+    pub repository: GitRepositoryIdentity,
+    pub commit: ExactGitCommit,
+    /// Boundary commits returned by the hosting service for a shallow fetch.
+    pub shallow: Vec<ExactGitCommit>,
+    pub bytes: Vec<u8>,
+}
+
+/// Exact, bounded request for the paths and object identities in one Git commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitTreeRequest {
+    pub repository: GitRepositoryIdentity,
+    pub commit: ExactGitCommit,
+    pub max_entries: usize,
+}
+
+/// One provider-neutral entry from an exact Git tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitTreeEntry {
+    pub path: GitTreePath,
+    pub mode: String,
+    pub kind: String,
+    pub object: String,
+    /// Uncompressed blob size reported by the hosting provider. Trees and gitlinks omit it.
+    pub size: Option<u64>,
+}
+
+/// The recursive tree of one exact commit, with repository identity revalidated after the read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitTree {
+    pub repository: GitRepositoryIdentity,
+    pub commit: ExactGitCommit,
+    pub entries: Vec<GitTreeEntry>,
+}
+
 /// Stable provider identifiers of one repository, without a mutable name.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GitRepositoryReference {
@@ -596,8 +680,57 @@ pub trait GitHostingPlane: Send + Sync + 'static {
         request: &GitFileRequest,
     ) -> impl Future<Output = Result<GitFile, PortError>> + Send;
 
+    fn read_pack(
+        &self,
+        _request: &GitPackRequest,
+    ) -> impl Future<Output = Result<GitPack, PortError>> + Send {
+        async {
+            Err(PortError::Unsupported {
+                operation: "read_pack",
+            })
+        }
+    }
+
+    fn read_tree(
+        &self,
+        _request: &GitTreeRequest,
+    ) -> impl Future<Output = Result<GitTree, PortError>> + Send {
+        async {
+            Err(PortError::Unsupported {
+                operation: "read_tree",
+            })
+        }
+    }
+
     fn resolve_revision(
         &self,
         request: &GitRevisionRequest,
     ) -> impl Future<Output = Result<ExactGitCommit, PortError>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GitTreePath;
+
+    #[test]
+    fn git_tree_paths_accept_common_names_but_reject_escape_and_metadata() {
+        for path in [
+            "app/[id]/page.tsx",
+            "vendor/@types/index.d.ts",
+            "c++/main.cc",
+            "My File.md",
+        ] {
+            assert!(GitTreePath::parse(path).is_ok(), "{path}");
+        }
+        for path in [
+            "",
+            "/root",
+            "../escape",
+            "dir/../escape",
+            ".git/config",
+            "dir/.git/config",
+        ] {
+            assert!(GitTreePath::parse(path).is_err(), "{path}");
+        }
+    }
 }

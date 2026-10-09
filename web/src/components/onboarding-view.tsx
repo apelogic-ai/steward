@@ -164,11 +164,13 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
   const provisionedRequest = activeEnvelopes[0];
   const repositoryData = repositories.status === "ready" ? repositories.value : null;
   const repositoryList = useMemo(() => repositoryData?.repositories ?? [], [repositoryData]);
-  const readyRepository = defaultOnboardingRepository(repositoryList);
+  const readyRepository = useMemo(() => defaultOnboardingRepository(repositoryList), [repositoryList]);
   const [selectedTemplateId, setSelectedTemplateId] = useState(data.templates.templates[0]?.id ?? "");
   const [selectedEnvelopeId, setSelectedEnvelopeId] = useState(provisionedRequest?.id ?? "");
   const [agentRef, setAgentRef] = useState(data.starterTask.taskDefinition.runtime.agentRef);
   const [prompt, setPrompt] = useState(data.starterTask.taskDefinition.promptText ?? "");
+  const [checkoutRepository, setCheckoutRepository] = useState(false);
+  const [historyDepth, setHistoryDepth] = useState("");
   const [inputs, setInputs] = useState<InputRow[]>(() => inputRows(data.starterTask.inputs));
   const [createdRunUid, setCreatedRunUid] = useState<string | null>(null);
   const [runState, setRunState] = useState<"idle" | "submitting" | "error">("idle");
@@ -190,7 +192,10 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
   const [workflowTab, setWorkflowTab] = useState<"full" | "job">("full");
 
   const selectedEnvelope = activeEnvelopes.find((request) => request.id === selectedEnvelopeId) ?? activeEnvelopes[0];
-  const selectedRepository = repositoryList.find((repository) => repository.repositoryId === selectedRepositoryId) ?? readyRepository;
+  const selectedRepository = useMemo(
+    () => repositoryList.find((repository) => repository.repositoryId === selectedRepositoryId) ?? readyRepository,
+    [readyRepository, repositoryList, selectedRepositoryId],
+  );
   const envelope = selectedEnvelope?.approvedEnvelope ?? selectedEnvelope?.requestedEnvelope;
   const agentOptions = compatibleAgents(data.workflows.agents.map((agent) => agent.agentRef), envelope?.spec.llms ?? []);
   const { selected: selectedAgent, warning: agentWarning } = effectiveAgentSelection(agentOptions, agentRef);
@@ -200,11 +205,16 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
     selectedAgent,
     envelope?.spec.llms ?? [],
   );
+  const parsedHistoryDepth = historyDepth.trim() === "" ? undefined : Number(historyDepth);
+  const historyDepthValid = parsedHistoryDepth === undefined || (Number.isSafeInteger(parsedHistoryDepth) && parsedHistoryDepth > 0);
   const effectiveFiles = selectedAgent && selectedModel
     ? inlineFiles(
         { ...data.starterTask, taskDefinition: { ...data.starterTask.taskDefinition, promptText: prompt } },
         selectedAgent.agentRef,
         selectedModel,
+        checkoutRepository && selectedRepository?.ready && historyDepthValid
+          ? { repository: selectedRepository, historyDepth: parsedHistoryDepth }
+          : undefined,
       )
     : null;
   const testRun = baseProgress.helloWorldRun;
@@ -467,9 +477,10 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
         </div>
         {readinessFailure ? <p className="text-sm text-warn">{readinessFailure}</p> : null}
         {agentWarning || modelWarning ? <p className="text-sm text-warn">{agentWarning ?? modelWarning}</p> : null}
+        <div className="space-y-3 rounded-control border p-4"><label className="flex items-center gap-3 text-sm font-semibold"><input aria-label="Include checkout in task workspace" checked={checkoutRepository} onChange={(event) => setCheckoutRepository(event.target.checked)} type="checkbox" />Check out this repository</label>{checkoutRepository ? <label className="grid max-w-sm gap-2 text-sm font-semibold">History depth (optional)<input className={fieldClass} min={1} onChange={(event) => setHistoryDepth(event.target.value)} placeholder="Files only" step={1} type="number" value={historyDepth} /></label> : null}{checkoutRepository && !historyDepthValid ? <p className="text-sm text-err" role="alert">History depth must be a positive whole number.</p> : null}<p className="text-xs text-muted-ink">The selected repository is pinned at its default-branch HEAD and materialized read-only.</p></div>
         <label className="grid gap-2 text-sm font-semibold">Prompt<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-sm font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label>
         <div className="space-y-3"><div className="flex items-center justify-between gap-3"><strong className="text-sm">Inputs</strong><button className="rounded-control border px-3 py-1.5 text-sm font-semibold" onClick={() => setInputs((rows) => [...rows, { id: crypto.randomUUID(), name: "", value: "" }])} type="button">+ Add input</button></div>{inputs.map((row) => <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]" key={row.id}><input aria-label="Input name" className={fieldClass} onChange={(event) => setInputs((rows) => rows.map((candidate) => candidate.id === row.id ? { ...candidate, name: event.target.value } : candidate))} placeholder="name" value={row.name} /><input aria-label={`Input value for ${row.name || "new input"}`} className={fieldClass} onChange={(event) => setInputs((rows) => rows.map((candidate) => candidate.id === row.id ? { ...candidate, value: event.target.value } : candidate))} placeholder="value" value={row.value} /><button aria-label={`Remove input ${row.name || "row"}`} className="rounded-control border px-3 text-sm" onClick={() => setInputs((rows) => rows.filter((candidate) => candidate.id !== row.id))} type="button">Remove</button></div>)}<p className="text-xs text-muted-ink">Inputs are passed to the agent as <code>in/inputs.json</code>.</p></div>
-        <div className="flex flex-wrap items-center gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={runState === "submitting" || !selectedEnvelope || !effectiveFiles} type="submit">{runState === "submitting" ? "Starting…" : "Run test"}</button><span className="text-xs text-muted-ink">Spends from this envelope. Typically under 0.05 USD.</span></div>
+        <div className="flex flex-wrap items-center gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={runState === "submitting" || !selectedEnvelope || !effectiveFiles || (checkoutRepository && (!selectedRepository?.ready || !historyDepthValid))} type="submit">{runState === "submitting" ? "Starting…" : "Run test"}</button><span className="text-xs text-muted-ink">Spends from this envelope. Typically under 0.05 USD.</span></div>
         {runFailure ? <p className="text-sm text-err" role="alert">{runFailure}</p> : null}
         {createdRunUid ? <LiveRunCard onTerminal={onRefresh} taskUid={createdRunUid} /> : testRun ? <RunSummary run={testRun} /> : null}
       </form>,

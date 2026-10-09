@@ -3054,6 +3054,8 @@ test("Run now submits an inline package under the selected envelope", async ({ b
     await expect(developer.page.getByRole("textbox", { name: /^Prompt\b/ })).toHaveValue(starterTaskFixture.taskDefinition.promptText);
     await expect(developer.page.getByRole("textbox", { name: /^Inputs \(JSON object\)/ })).toHaveValue(JSON.stringify(starterTaskFixture.inputs, null, 2));
     await expect(developer.page.getByRole("checkbox", { name: /Capture execution log/ })).toBeChecked();
+    await developer.page.getByRole("checkbox", { name: "Check out this repository" }).check();
+    await developer.page.getByRole("spinbutton", { name: "History depth (optional)" }).fill("12");
     await developer.page.getByRole("button", { name: "Run now" }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}`);
 
@@ -3073,6 +3075,13 @@ test("Run now submits an inline package under the selected envelope", async ({ b
       promptText: starterTaskFixture.taskDefinition.promptText,
       outputs: starterTaskFixture.taskDefinition.outputs,
       runtime: { agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } },
+      workspace: [{
+        git: {
+          repository: { ownerId: "org_example", repositoryId: "repo_agentic_ops" },
+          ref: "trigger",
+          history: { depth: 12 },
+        },
+      }],
     });
 
     await developer.page.goto(`${origin}/runs/new?choose=task`);

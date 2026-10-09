@@ -138,6 +138,18 @@ githubSource:
   bindings:
     contractVersion: steward.source-repository-bindings/v1
     bindings: []
+workspace:
+  # Must match the OpenShell Kubernetes driver's workspace_default_storage_size so scratch
+  # remains a kernel-enforced volume bound rather than an advisory application limit.
+  enabledTypes: [git, scratch]
+  maxTotalSize: 2Gi
+  scratchVolumeSize: 2Gi
+  maxFiles: 100000
+  maxHistoryDepth: 1000
+  maxSubmoduleDepth: 4
+  maxSubmodulesPerEntry: 32
+  maxTotalSubmodules: 64
+  maxTreeReads: 64
 tls:
   # customerSecret consumes operator-issued TLS Secrets and a public webhook CA.
   # certManager creates both Certificates with the explicitly selected issuer.

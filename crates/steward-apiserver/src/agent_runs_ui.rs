@@ -25,6 +25,7 @@ use steward_store::{
 use steward_types::direct_package::{
     AgentRef, ContentDigest, DirectRequirements, DirectTaskDefinition, ExecutionLogMode,
     PackageClosure, PromptSourceKind, RelativePath, RuntimeSelection, TaskOrigin,
+    WorkspaceEvidence,
 };
 use steward_types::task_output_archive::{
     TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputArchiveCompatibility, TaskOutputArchiveEntry,
@@ -429,6 +430,7 @@ pub(crate) struct BrowserRunView {
     task_uid: Uuid,
     origin: TaskOrigin,
     package: Option<BrowserRunPackageView>,
+    workspace: Option<WorkspaceEvidence>,
     workflow: String,
     workflow_name: Option<String>,
     workflow_version: Option<i64>,
@@ -2737,10 +2739,21 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
                 prompt_source: PromptSourceKind::Path,
             })
         });
+    let workspace = record
+        .browser_task_evidence
+        .as_ref()
+        .and_then(|evidence| evidence.workspace.clone())
+        .or_else(|| {
+            record
+                .direct_task_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.workspace.clone())
+        });
     BrowserRunView {
         task_uid: record.task_uid,
         origin: record.task_origin,
         package,
+        workspace,
         workflow: record.workflow,
         workflow_name: record.workflow_name,
         workflow_version: record.workflow_version,
@@ -2961,7 +2974,7 @@ mod tests {
     use axum::http::{Request, StatusCode, header};
     use steward_store::{AgentRunSpend, AgentRunTimelineEvent, TaskRecord, WorkflowRevisionRecord};
     use steward_types::direct_package::{
-        BrowserTaskEvidence, ContentDigest, PromptSourceKind, RelativePath,
+        BrowserTaskEvidence, ContentDigest, PromptSourceKind, RelativePath, WorkspaceEvidence,
     };
     use steward_types::{
         AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal,
@@ -3863,6 +3876,48 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn run_snapshot_exposes_the_immutable_workspace_evidence() -> Result<(), String> {
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let workspace: WorkspaceEvidence = serde_json::from_value(serde_json::json!({
+            "entries": [{
+                "type": "git",
+                "name": "source",
+                "access": "read-only",
+                "repository": "https://github.com/example-org/source.git",
+                "repositoryId": "123456",
+                "repositoryOwnerId": "7890",
+                "commit": format!("git:sha1:{}", "a".repeat(40)),
+                "history": {"depth": 20},
+                "maxMaterializedBytes": 62914560,
+                "contentDigest": format!("steward:sha256:{}", "b".repeat(64))
+            }],
+            "maxMaterializedBytes": 62914560,
+            "workspaceDigest": format!("steward:sha256:{}", "c".repeat(64))
+        }))
+        .map_err(|error| error.to_string())?;
+        let mut record = run(task_uid, "usr_0123456789abcdef0123456789abcdef");
+        record.browser_task_evidence = Some(BrowserTaskEvidence {
+            source: "inline".to_owned(),
+            revision: format!("steward:sha256:{}", "d".repeat(64)),
+            path: RelativePath::parse("task-definition.json")?,
+            closure: None,
+            closure_digest: ContentDigest::parse(format!("steward:sha256:{}", "d".repeat(64)))?,
+            inline_files: None,
+            diagnostics: Default::default(),
+            workspace: Some(workspace),
+            prompt_source: PromptSourceKind::Inline,
+        });
+
+        let value =
+            serde_json::to_value(browser_run_view(record)).map_err(|error| error.to_string())?;
+        assert_eq!(value["workspace"]["entries"][0]["name"], "source");
+        assert_eq!(value["workspace"]["entries"][0]["history"]["depth"], 20);
+        assert_eq!(value["workspace"]["entries"][0]["repositoryId"], "123456");
+        Ok(())
+    }
+
     fn run_event_snapshot(
         task_uid: Uuid,
         owner_user_id: &str,
@@ -4599,6 +4654,7 @@ mod tests {
                 ),
             ])),
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         };
         let mut own = run(own_task, owner);
@@ -4690,6 +4746,7 @@ mod tests {
                 ),
             ])),
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         };
         let mut succeeded = run(succeeded_task, owner);
@@ -4764,6 +4821,7 @@ mod tests {
                 "{}".to_owned(),
             )])),
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         });
         let workflow_digest = format!("sha256:{}", "e".repeat(64));
@@ -4795,6 +4853,7 @@ mod tests {
             closure_digest: ContentDigest::parse(registry_digest.clone())?,
             inline_files: None,
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         });
         let malformed_task = Uuid::parse_str("77777777-7777-4777-8777-777777777777")
@@ -4809,6 +4868,7 @@ mod tests {
             closure_digest: ContentDigest::parse(format!("steward:sha256:{}", "d".repeat(64)))?,
             inline_files: None,
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         });
         let ledger = FakeLedger::default();
@@ -5053,6 +5113,7 @@ mod tests {
                 "{}".to_owned(),
             )])),
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Path,
         });
         let ledger = FakeLedger::default();

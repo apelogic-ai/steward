@@ -41,6 +41,23 @@ test("inline Run now packages keep the prompt in the single TaskDefinition file"
   });
 });
 
+test("inline Run now pins the selected repository and optional history in workspace", () => {
+  const files = inlineFiles(
+    starterTask,
+    "codex@0.140.0",
+    { provider: "openai", model: "gpt-5.4" },
+    { repository: { ownerId: "1000", repositoryId: "1001" }, historyDepth: 25 },
+  );
+
+  expect(JSON.parse(files[starterTask.packagePath] ?? "{}").workspace).toEqual([{
+    git: {
+      repository: { ownerId: "1000", repositoryId: "1001" },
+      ref: "trigger",
+      history: { depth: 25 },
+    },
+  }]);
+});
+
 test("inline Run now keeps declared authority but follows a compatible model fallback", () => {
   const configured = {
     ...starterTask,

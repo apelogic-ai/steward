@@ -20,7 +20,7 @@ use steward_store::{
 };
 use steward_types::direct_package::{
     DIRECT_TASK_CONTRACT_VERSION, DiagnosticsRequest, ExecutionLogMode, InvocationManifest,
-    PackageCommit, PackageReference, RelativePath, RepositoryUrl,
+    PackageCommit, PackageReference, RelativePath, RepositoryUrl, WorkspaceAuthority,
 };
 use steward_types::{
     Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
@@ -173,6 +173,8 @@ pub struct BrowserEnvelopeSpec {
     pub ttl: Duration,
     #[serde(default)]
     pub runner: RunnerRequirements,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceAuthority>,
 }
 
 impl From<Envelope> for BrowserEnvelope {
@@ -186,6 +188,7 @@ impl From<Envelope> for BrowserEnvelope {
                 runtime_minutes_limit: envelope.spec.runtime_minutes_limit,
                 ttl: envelope.spec.ttl,
                 runner: envelope.spec.runner,
+                workspace: envelope.spec.workspace,
             },
         }
     }
@@ -202,6 +205,7 @@ impl From<BrowserEnvelope> for Envelope {
                 runtime_minutes_limit: envelope.spec.runtime_minutes_limit,
                 ttl: envelope.spec.ttl,
                 runner: envelope.spec.runner,
+                workspace: envelope.spec.workspace,
             },
         }
     }
@@ -1713,6 +1717,7 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 runtime_minutes_limit: Some("120".to_owned()),
+                workspace: None,
                 ttl: Duration("72h".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
             },

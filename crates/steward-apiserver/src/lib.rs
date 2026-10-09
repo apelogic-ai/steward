@@ -3773,8 +3773,10 @@ mod tests {
     use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec};
     use steward_ports::{
         DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitFile,
-        GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRevisionRequest, PortError,
-        TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
+        GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
+        GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree, GitTreeEntry,
+        GitTreeRequest, PortError, TaskExecutionAdapter, TaskExecutionPlan,
+        TaskExecutionPlanRequest,
     };
     use steward_store::{
         AdminApprovalRecord, AdminEnvelopeProvisionRequest, AdminEnvelopeRequestRecord,
@@ -3792,7 +3794,8 @@ mod tests {
     };
     use steward_types::direct_package::{
         ClosureEntryKind, ExactGitCommit, InvocationKind, PromptSourceKind, RepositoryUrl,
-        SourceProvenance, SourceProvider, StableProviderId, TaskOrigin,
+        ResourceQuantity, SourceProvenance, SourceProvider, StableProviderId, TaskOrigin,
+        WorkspaceAuthority, WorkspaceEntryType,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentType, Budget, CanonicalAuthorityBinding,
@@ -4026,11 +4029,60 @@ mod tests {
     struct FakeDirectGit {
         repositories: Arc<BTreeMap<String, GitRepositoryIdentity>>,
         files: Arc<BTreeMap<(String, String, String), Vec<u8>>>,
+        trees: Arc<BTreeMap<(String, String), Vec<GitTreeEntry>>>,
         wrong_object_path: Option<String>,
         reads: Arc<Mutex<Vec<(String, String, String)>>>,
     }
 
     impl GitHostingPlane for FakeDirectGit {
+        fn describe_repositories<'a>(
+            &'a self,
+            repositories: &'a [GitRepositoryReference],
+        ) -> impl futures::Stream<Item = (usize, Result<GitRepositoryDescription, PortError>)> + Send + 'a
+        {
+            futures::stream::iter(repositories.iter().enumerate().map(|(index, reference)| {
+                let resolved = self
+                    .repositories
+                    .values()
+                    .find(|identity| {
+                        identity.repository_owner_id == reference.repository_owner_id
+                            && identity.repository_id == reference.repository_id
+                    })
+                    .map(|identity| {
+                        let coordinates = identity
+                            .repository
+                            .as_str()
+                            .strip_prefix("https://github.com/")
+                            .and_then(|value| value.strip_suffix(".git"))
+                            .and_then(|value| value.split_once('/'))
+                            .ok_or_else(|| PortError::Failed {
+                                reason: "fake repository URL is invalid".to_owned(),
+                            })?;
+                        Ok(GitRepositoryDescription {
+                            owner: coordinates.0.to_owned(),
+                            repository_owner_id: identity.repository_owner_id.clone(),
+                            name: coordinates.1.to_owned(),
+                            repository_id: identity.repository_id.clone(),
+                            default_branch: "main".to_owned(),
+                            private: true,
+                            web_url: identity
+                                .repository
+                                .as_str()
+                                .strip_suffix(".git")
+                                .unwrap_or(identity.repository.as_str())
+                                .to_owned(),
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        Err(PortError::Rejected {
+                            reason: "repository is not present in the deterministic fake"
+                                .to_owned(),
+                        })
+                    });
+                (index, resolved)
+            }))
+        }
+
         async fn resolve_repository(
             &self,
             repository: &RepositoryUrl,
@@ -4073,6 +4125,37 @@ mod tests {
                 commit,
                 path: request.path.clone(),
                 bytes,
+            })
+        }
+
+        async fn read_pack(&self, request: &GitPackRequest) -> Result<GitPack, PortError> {
+            Ok(GitPack {
+                repository: request.repository.clone(),
+                commit: request.commit.clone(),
+                shallow: if request.depth.is_some() {
+                    vec![request.commit.clone()]
+                } else {
+                    Vec::new()
+                },
+                bytes: b"PACKdeterministic-fixture".to_vec(),
+            })
+        }
+
+        async fn read_tree(&self, request: &GitTreeRequest) -> Result<GitTree, PortError> {
+            let key = (
+                request.repository.repository.as_str().to_owned(),
+                request.commit.as_str().to_owned(),
+            );
+            let entries = self.trees.get(&key).cloned().unwrap_or_default();
+            if entries.len() > request.max_entries {
+                return Err(PortError::Rejected {
+                    reason: "deterministic fake tree exceeds its entry bound".to_owned(),
+                });
+            }
+            Ok(GitTree {
+                repository: request.repository.clone(),
+                commit: request.commit.clone(),
+                entries,
             })
         }
 
@@ -4136,6 +4219,7 @@ mod tests {
                     b"Summarize the supplied repository evidence.\n".to_vec(),
                 ),
             ])),
+            trees: Arc::new(BTreeMap::new()),
             wrong_object_path: wrong_object_path.map(str::to_owned),
             reads: Arc::new(Mutex::new(Vec::new())),
         })
@@ -6141,6 +6225,13 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 runtime_minutes_limit: None,
+                workspace: Some(WorkspaceAuthority {
+                    allowed_types: vec![WorkspaceEntryType::Git],
+                    max_total_size: ResourceQuantity::parse("2Gi")?,
+                    max_files: 100_000,
+                    max_history_depth: 1_000,
+                    max_submodule_depth: 4,
+                }),
                 ttl: Duration("8h".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
             },
@@ -6200,6 +6291,11 @@ mod tests {
             body.pointer("/templates/1/memberRoles/0"),
             Some(&serde_json::json!("engineer")),
             "multiple stable template IDs must be eligible for the same role"
+        );
+        assert_eq!(
+            body.pointer("/templates/1/envelope/spec/workspace/maxHistoryDepth"),
+            Some(&serde_json::json!(1_000)),
+            "workspace authority must survive browser authoring and list projection"
         );
         Ok(())
     }
@@ -8766,6 +8862,7 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 runtime_minutes_limit: None,
+                workspace: None,
                 ttl: Duration("24h".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
             },
@@ -8791,6 +8888,7 @@ mod tests {
                             currency: "USD".to_owned(),
                         },
                         runtime_minutes_limit: None,
+                        workspace: None,
                         ttl: Duration("24h".to_owned()),
                         runner: steward_types::RunnerRequirements::default(),
                     },
@@ -8809,6 +8907,7 @@ mod tests {
                             currency: "USD".to_owned(),
                         },
                         runtime_minutes_limit: None,
+                        workspace: None,
                         ttl: Duration("24h".to_owned()),
                         runner: steward_types::RunnerRequirements::default(),
                     },
@@ -8879,6 +8978,7 @@ mod tests {
                         currency: "USD".to_owned(),
                     },
                     runtime_minutes_limit: None,
+                    workspace: None,
                     ttl: Duration("24h".to_owned()),
                     runner: steward_types::RunnerRequirements::default(),
                 },
@@ -8897,6 +8997,7 @@ mod tests {
                         currency: "USD".to_owned(),
                     },
                     runtime_minutes_limit: None,
+                    workspace: None,
                     ttl: Duration("24h".to_owned()),
                     runner: steward_types::RunnerRequirements::default(),
                 },
@@ -8969,6 +9070,13 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 runtime_minutes_limit: None,
+                workspace: Some(WorkspaceAuthority {
+                    allowed_types: vec![WorkspaceEntryType::Git, WorkspaceEntryType::Scratch],
+                    max_total_size: ResourceQuantity::parse("2Gi")?,
+                    max_files: 100_000,
+                    max_history_depth: 1_000,
+                    max_submodule_depth: 4,
+                }),
                 ttl: Duration("4h".to_owned()),
                 runner: steward_types::RunnerRequirements {
                     platforms: vec![steward_types::RunnerPlatform::Linux],
@@ -9020,6 +9128,13 @@ mod tests {
                     currency: "USD".to_owned(),
                 },
                 runtime_minutes_limit: None,
+                workspace: Some(WorkspaceAuthority {
+                    allowed_types: vec![WorkspaceEntryType::Git, WorkspaceEntryType::Scratch],
+                    max_total_size: ResourceQuantity::parse("4Gi")?,
+                    max_files: 200_000,
+                    max_history_depth: 2_000,
+                    max_submodule_depth: 8,
+                }),
                 ttl: Duration("24h".to_owned()),
                 runner: steward_types::RunnerRequirements {
                     platforms: vec![steward_types::RunnerPlatform::Linux],
@@ -11186,6 +11301,20 @@ mod tests {
         ))
     }
 
+    fn direct_test_app_with_workspace_policy(
+        ledger: FakeLedger,
+        git: FakeDirectGit,
+        workspace_policy: serde_json::Value,
+    ) -> Result<axum::Router, String> {
+        Ok(task_router(
+            ledger,
+            FakeTaskIdentityResolver,
+            task_api_config()?
+                .with_git_hosting_plane(git)
+                .with_workspace_policy_json(Some(&workspace_policy.to_string()))?,
+        ))
+    }
+
     fn enable_inline_for_versioned_task_fixture(
         ledger: &FakeLedger,
         enabled: bool,
@@ -11274,6 +11403,7 @@ mod tests {
                 source_identity,
             )])),
             files: Arc::new(files),
+            trees: Arc::new(BTreeMap::new()),
             wrong_object_path: None,
             reads: Arc::new(Mutex::new(Vec::new())),
         })
@@ -11453,6 +11583,7 @@ mod tests {
         Ok(FakeDirectGit {
             repositories: Arc::new(BTreeMap::from([(repository.as_str().to_owned(), identity)])),
             files: Arc::new(files),
+            trees: Arc::new(BTreeMap::new()),
             wrong_object_path: None,
             reads: Arc::new(Mutex::new(Vec::new())),
         })
@@ -12550,6 +12681,501 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_workspace_resolves_trigger_identity_and_frames_credential_free_pack()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {"history": {"depth": 5}, "access": "copy"}
+        }]);
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct workspace request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct workspace request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let task_uid = {
+            let tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?;
+            let evidence = tasks[0]
+                .direct_task_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.workspace.as_ref())
+                .ok_or_else(|| "workspace evidence was not persisted".to_owned())?;
+            let entry = evidence
+                .entries
+                .first()
+                .ok_or_else(|| "workspace evidence omitted its entry".to_owned())?;
+            match entry {
+                steward_types::direct_package::ResolvedWorkspaceEntry::Git {
+                    name,
+                    repository_id,
+                    commit,
+                    history,
+                    ..
+                } => {
+                    assert_eq!(name.as_str(), "caller");
+                    assert_eq!(repository_id.as_str(), "123456");
+                    assert_eq!(commit.as_str(), format!("git:sha1:{}", "c".repeat(40)));
+                    assert_eq!(
+                        history,
+                        &steward_types::direct_package::WorkspaceGitHistory::Depth(5)
+                    );
+                }
+                _ => return Err("workspace evidence was not a Git entry".to_owned()),
+            }
+            tasks[0].task_uid
+        };
+        let caller_archive = b"caller-authored-tar";
+        let upload = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/tasks/{task_uid}/inputs"))
+                    .header("authorization", "Bearer github-assertion")
+                    .header("content-type", "application/x-tar")
+                    .body(Body::from(caller_archive.as_slice()))
+                    .map_err(|error| format!("build workspace input upload: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("upload workspace inputs: {error}"))?;
+        assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+        let stored = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake task ledger lock was poisoned")?[0]
+            .input_archive
+            .clone()
+            .ok_or_else(|| "workspace input frame was not stored".to_owned())?;
+        let parts = steward_types::task_input_archive::split_task_input_archive(&stored)
+            .map_err(|error| format!("split workspace input frame: {error:?}"))?;
+        assert_eq!(parts.caller_archive, caller_archive);
+        let material = parts
+            .workspace_archive
+            .ok_or_else(|| "workspace material was not framed separately".to_owned())?;
+        assert!(
+            material
+                .windows(b"manifest.json".len())
+                .any(|window| window == b"manifest.json")
+        );
+        assert!(
+            material
+                .windows(b"PACKdeterministic-fixture".len())
+                .any(|window| { window == b"PACKdeterministic-fixture" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_resolves_required_admitted_submodule_at_exact_gitlink()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        ledger
+            .source_repository_bindings
+            .lock()
+            .map_err(|_| "fake source-repository binding lock was poisoned".to_owned())?
+            .push((
+                "7890".to_owned(),
+                "123456".to_owned(),
+                "7890".to_owned(),
+                "888888".to_owned(),
+            ));
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "submodules": {
+                    "mode": "admitted",
+                    "required": ["vendor/proto"]
+                }
+            }
+        }]);
+        let mut git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let caller = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
+        let child = RepositoryUrl::parse("https://github.com/example-org/proto.git")?;
+        Arc::make_mut(&mut git.repositories).insert(
+            child.as_str().to_owned(),
+            GitRepositoryIdentity {
+                repository: child,
+                repository_id: StableProviderId::parse("888888")?,
+                repository_owner_id: StableProviderId::parse("7890")?,
+            },
+        );
+        let parent_commit = format!("git:sha1:{}", "c".repeat(40));
+        Arc::make_mut(&mut git.files).insert(
+            (
+                caller.as_str().to_owned(),
+                parent_commit.clone(),
+                ".gitmodules".to_owned(),
+            ),
+            b"[submodule \"proto\"]\n  path = vendor/proto\n  url = https://github.com/example-org/proto.git\n"
+                .to_vec(),
+        );
+        Arc::make_mut(&mut git.trees).insert(
+            (caller.as_str().to_owned(), parent_commit),
+            vec![
+                GitTreeEntry {
+                    path: steward_ports::GitTreePath::parse(".gitmodules")?,
+                    mode: "100644".to_owned(),
+                    kind: "blob".to_owned(),
+                    object: "b".repeat(40),
+                    size: Some(128),
+                },
+                GitTreeEntry {
+                    path: steward_ports::GitTreePath::parse("vendor/proto")?,
+                    mode: "160000".to_owned(),
+                    kind: "commit".to_owned(),
+                    object: "d".repeat(40),
+                    size: None,
+                },
+            ],
+        );
+        let app = direct_test_app(ledger.clone(), git)?;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-workspace-submodule")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build submodule workspace request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit submodule workspace request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let task_uid = {
+            let tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?;
+            let submodule = tasks[0]
+                .direct_task_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.workspace.as_ref())
+                .and_then(|workspace| workspace.entries.first())
+                .and_then(|entry| match entry {
+                    steward_types::direct_package::ResolvedWorkspaceEntry::Git {
+                        submodules,
+                        ..
+                    } => submodules.first(),
+                    _ => None,
+                })
+                .ok_or_else(|| "workspace evidence omitted the submodule".to_owned())?;
+            assert_eq!(submodule.path.as_str(), "vendor/proto");
+            assert_eq!(
+                submodule.status,
+                steward_types::direct_package::WorkspaceSubmoduleStatus::Materialized
+            );
+            let expected_submodule_commit = format!("git:sha1:{}", "d".repeat(40));
+            assert_eq!(
+                submodule.commit.as_ref().map(ExactGitCommit::as_str),
+                Some(expected_submodule_commit.as_str())
+            );
+            tasks[0].task_uid
+        };
+        let upload = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/tasks/{task_uid}/inputs"))
+                    .header("authorization", "Bearer github-assertion")
+                    .header("content-type", "application/x-tar")
+                    .body(Body::from(Vec::<u8>::new()))
+                    .map_err(|error| format!("build submodule input upload: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("upload submodule workspace inputs: {error}"))?;
+        assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+        let stored = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake task ledger lock was poisoned")?[0]
+            .input_archive
+            .clone()
+            .ok_or_else(|| "workspace input frame was not stored".to_owned())?;
+        let parts = steward_types::task_input_archive::split_task_input_archive(&stored)
+            .map_err(|error| format!("split submodule workspace input frame: {error:?}"))?;
+        let material = parts
+            .workspace_archive
+            .ok_or_else(|| "submodule workspace material was not framed".to_owned())?;
+        assert!(
+            material
+                .windows(b"submodules/0/0.pack".len())
+                .any(|window| window == b"submodules/0/0.pack")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_rejects_required_unadmitted_submodule_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "submodules": {
+                    "mode": "admitted",
+                    "required": ["vendor/foreign"]
+                }
+            }
+        }]);
+        let mut git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let caller = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
+        let foreign = RepositoryUrl::parse("https://github.com/example-org/foreign.git")?;
+        Arc::make_mut(&mut git.repositories).insert(
+            foreign.as_str().to_owned(),
+            GitRepositoryIdentity {
+                repository: foreign,
+                repository_id: StableProviderId::parse("9991")?,
+                repository_owner_id: StableProviderId::parse("9990")?,
+            },
+        );
+        let parent_commit = format!("git:sha1:{}", "c".repeat(40));
+        Arc::make_mut(&mut git.files).insert(
+            (
+                caller.as_str().to_owned(),
+                parent_commit.clone(),
+                ".gitmodules".to_owned(),
+            ),
+            b"[submodule \"foreign\"]\n  path = vendor/foreign\n  url = https://github.com/example-org/foreign.git\n"
+                .to_vec(),
+        );
+        Arc::make_mut(&mut git.trees).insert(
+            (caller.as_str().to_owned(), parent_commit),
+            vec![
+                GitTreeEntry {
+                    path: steward_ports::GitTreePath::parse(".gitmodules")?,
+                    mode: "100644".to_owned(),
+                    kind: "blob".to_owned(),
+                    object: "b".repeat(40),
+                    size: Some(128),
+                },
+                GitTreeEntry {
+                    path: steward_ports::GitTreePath::parse("vendor/foreign")?,
+                    mode: "160000".to_owned(),
+                    kind: "commit".to_owned(),
+                    object: "d".repeat(40),
+                    size: None,
+                },
+            ],
+        );
+        let app = direct_test_app(ledger.clone(), git)?;
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-workspace-required-unadmitted-submodule",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_git_required_submodule_unavailable",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_rejects_unadmitted_repository_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "repository": {"ownerId": "9990", "repositoryId": "9991"},
+                "ref": format!("git:sha1:{}", "d".repeat(40))
+            }
+        }]);
+        let mut git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let foreign = RepositoryUrl::parse("https://github.com/example-org/foreign.git")?;
+        Arc::make_mut(&mut git.repositories).insert(
+            foreign.as_str().to_owned(),
+            GitRepositoryIdentity {
+                repository: foreign,
+                repository_id: StableProviderId::parse("9991")?,
+                repository_owner_id: StableProviderId::parse("9990")?,
+            },
+        );
+        let app = direct_test_app(ledger.clone(), git)?;
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-workspace-unadmitted",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_git_repository_not_admitted",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_rejects_resolved_tree_over_task_cap_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {"limits": {"files": 1, "size": "1Ki"}}
+        }]);
+        let mut git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let caller = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
+        Arc::make_mut(&mut git.trees).insert(
+            (
+                caller.as_str().to_owned(),
+                format!("git:sha1:{}", "c".repeat(40)),
+            ),
+            vec![
+                GitTreeEntry {
+                    path: steward_ports::GitTreePath::parse("README.md")?,
+                    mode: "100644".to_owned(),
+                    kind: "blob".to_owned(),
+                    object: "b".repeat(40),
+                    size: Some(512),
+                },
+                GitTreeEntry {
+                    path: steward_ports::GitTreePath::parse("src/lib.rs")?,
+                    mode: "100644".to_owned(),
+                    kind: "blob".to_owned(),
+                    object: "d".repeat(40),
+                    size: Some(512),
+                },
+            ],
+        );
+        let app = direct_test_app_with_workspace_policy(
+            ledger.clone(),
+            git,
+            serde_json::json!({
+                "enabledTypes": ["git"],
+                "maxTotalSize": "2Gi",
+                "scratchVolumeSize": "2Gi",
+                "maxFiles": 100,
+                "maxHistoryDepth": 20,
+                "maxSubmoduleDepth": 2
+            }),
+        )?;
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-workspace-tree-over-cap",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_limit_exceeded",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_rejects_type_absent_from_envelope_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let envelope = envelopes
+                .first_mut()
+                .ok_or_else(|| "fixture requires a User Envelope".to_owned())?;
+            envelope.requested_envelope.spec.workspace = None;
+            envelope
+                .approved_envelope
+                .as_mut()
+                .ok_or_else(|| "fixture requires an approved Envelope".to_owned())?
+                .spec
+                .workspace = None;
+        }
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{"git": {}}]);
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-workspace-envelope-type",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_entry_type_not_allowed",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_rejects_history_over_envelope_cap_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        {
+            let mut envelopes = ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "fake User Envelope ledger lock was poisoned")?;
+            let envelope = envelopes
+                .first_mut()
+                .ok_or_else(|| "fixture requires a User Envelope".to_owned())?;
+            for spec in [
+                &mut envelope.requested_envelope.spec,
+                &mut envelope
+                    .approved_envelope
+                    .as_mut()
+                    .ok_or_else(|| "fixture requires an approved Envelope".to_owned())?
+                    .spec,
+            ] {
+                spec.workspace
+                    .as_mut()
+                    .ok_or_else(|| "fixture requires workspace authority".to_owned())?
+                    .max_history_depth = 4;
+            }
+        }
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {"history": {"depth": 5}}
+        }]);
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-workspace-envelope-cap",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_limit_exceeded",
+        )
+        .await
+    }
+
+    #[tokio::test]
     async fn configured_repository_binding_rejects_a_different_stable_source_identity()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
@@ -13064,6 +13690,10 @@ mod tests {
             approved.spec.llms.push(additional_model);
             let mut authority = serde_json::to_value(&approved.spec)
                 .map_err(|error| format!("serialize approved authority: {error}"))?;
+            authority
+                .as_object_mut()
+                .ok_or_else(|| "approved authority fixture must be an object".to_owned())?
+                .remove("workspace");
             authority["llms"] = serde_json::json!([{
                 "provider": "openai",
                 "model": "gpt-5.4"

@@ -50,8 +50,11 @@ use steward_ports::{
 #[cfg(feature = "runtime")]
 use steward_types::direct_package::{
     EXECUTION_STDERR_ARCHIVE_PATH, EXECUTION_STDOUT_ARCHIVE_PATH, ExecutionLogMode,
-    MAX_EXECUTION_STREAM_BYTES, MAX_EXECUTION_TRANSCRIPT_BYTES,
+    MAX_EXECUTION_STREAM_BYTES, MAX_EXECUTION_TRANSCRIPT_BYTES, ResolvedWorkspaceEntry,
+    WorkspaceAccess, WorkspaceEvidence, WorkspaceGitHistory,
 };
+#[cfg(feature = "runtime")]
+use steward_types::task_input_archive::split_task_input_archive;
 #[cfg(feature = "runtime")]
 use steward_types::{AgentType, MANAGED_INFERENCE_REFERENCE, RuntimeRefs};
 #[cfg(feature = "runtime")]
@@ -1751,6 +1754,71 @@ impl OpenShellRuntime {
         Ok(())
     }
 
+    async fn stage_workspace_archive(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        archive: &[u8],
+        evidence: &WorkspaceEvidence,
+    ) -> Result<(), PortError> {
+        let scoped = self.authenticated_client().await?.workspace(workspace);
+        let prepare = scoped
+            .exec(
+                sandbox,
+                &[
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    workspace_staging_prepare_command().to_owned(),
+                ],
+                ExecOptions {
+                    timeout: Some(StdDuration::from_secs(120)),
+                    ..ExecOptions::default()
+                },
+            )
+            .await
+            .map_err(port_failure)?;
+        if prepare.exit_code != 0 {
+            return Err(workspace_staging_rejected());
+        }
+        for chunk in staging_archive_chunks(archive) {
+            let append = scoped
+                .exec(
+                    sandbox,
+                    &[
+                        "/bin/sh".to_owned(),
+                        "-c".to_owned(),
+                        workspace_staging_append_command().to_owned(),
+                    ],
+                    ExecOptions {
+                        timeout: Some(StdDuration::from_secs(120)),
+                        stdin: Some(chunk.to_vec()),
+                        ..ExecOptions::default()
+                    },
+                )
+                .await
+                .map_err(port_failure)?;
+            if append.exit_code != 0 {
+                return Err(workspace_staging_rejected());
+            }
+        }
+        let command = workspace_materialization_command(evidence)?;
+        let materialize = scoped
+            .exec(
+                sandbox,
+                &["/bin/sh".to_owned(), "-c".to_owned(), command],
+                ExecOptions {
+                    timeout: Some(StdDuration::from_secs(300)),
+                    ..ExecOptions::default()
+                },
+            )
+            .await
+            .map_err(port_failure)?;
+        if materialize.exit_code != 0 {
+            return Err(workspace_staging_rejected());
+        }
+        Ok(())
+    }
+
     async fn task_attempt_transcript(
         &self,
         workspace: &str,
@@ -2356,9 +2424,16 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: "task command must contain only non-empty arguments".to_owned(),
             });
         }
+        let input =
+            split_task_input_archive(input_archive).map_err(|_| input_staging_rejected())?;
+        let workspace_archive = match (&request.workspace, input.workspace_archive) {
+            (None, None) => None,
+            (Some(_), Some(archive)) => Some(archive),
+            _ => return Err(workspace_staging_rejected()),
+        };
         let is_connections_bridge = request.agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE;
         if is_connections_bridge {
-            validate_connections_bridge_archive(input_archive, "request.json")?;
+            validate_connections_bridge_archive(input.caller_archive, "request.json")?;
         }
         let snapshot = self
             .authenticated_client()
@@ -2426,8 +2501,12 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 reason: "Task attempt marker could not be reserved".to_owned(),
             });
         }
-        self.stage_input_archive(workspace, sandbox, input_archive)
+        self.stage_input_archive(workspace, sandbox, input.caller_archive)
             .await?;
+        if let (Some(archive), Some(evidence)) = (workspace_archive, request.workspace.as_ref()) {
+            self.stage_workspace_archive(workspace, sandbox, archive, evidence)
+                .await?;
+        }
         let sandbox_id = self
             .resolve_raw_sandbox_binding(
                 workspace,
@@ -2836,9 +2915,147 @@ fn staging_extract_command() -> &'static str {
 }
 
 #[cfg(feature = "runtime")]
+fn workspace_staging_prepare_command() -> &'static str {
+    "set -eu; if [ -e /sandbox/workspace ]; then chmod -R u+w /sandbox/workspace; fi; rm -rf /sandbox/steward-workspace-source /sandbox/workspace; rm -f /sandbox/steward-workspace.tar; mkdir -p /sandbox/steward-workspace-source /sandbox/workspace; : > /sandbox/steward-workspace.tar"
+}
+
+#[cfg(feature = "runtime")]
+fn workspace_staging_append_command() -> &'static str {
+    "set -eu; cat >> /sandbox/steward-workspace.tar"
+}
+
+#[cfg(feature = "runtime")]
+fn workspace_materialization_command(evidence: &WorkspaceEvidence) -> Result<String, PortError> {
+    evidence
+        .validate()
+        .map_err(|_| workspace_staging_rejected())?;
+    let mut command = String::from(
+        "set -eu; tar -xf /sandbox/steward-workspace.tar -C /sandbox/steward-workspace-source; rm -f /sandbox/steward-workspace.tar; cp /sandbox/steward-workspace-source/manifest.json /sandbox/workspace/.steward-workspace.json; ",
+    );
+    for (index, entry) in evidence.entries.iter().enumerate() {
+        match entry {
+            ResolvedWorkspaceEntry::Git {
+                name,
+                access,
+                commit,
+                history,
+                paths,
+                submodules,
+                ..
+            } => {
+                let destination = format!("/sandbox/workspace/{}", name.as_str());
+                let destination = shell_quote(&destination);
+                let pack = shell_quote(&format!(
+                    "/sandbox/steward-workspace-source/packs/{index}.pack"
+                ));
+                let shallow = shell_quote(&format!(
+                    "/sandbox/steward-workspace-source/shallow/{index}"
+                ));
+                let commit = commit
+                    .as_str()
+                    .strip_prefix("git:sha1:")
+                    .ok_or_else(workspace_staging_rejected)?;
+                command.push_str(&format!(
+                    "mkdir -p {destination}; git init -q {destination}; git -C {destination} index-pack --fix-thin --stdin < {pack} >/dev/null; if [ -f {shallow} ]; then cp {shallow} {destination}/.git/shallow; fi; git -C {destination} update-ref refs/heads/steward {commit}; git -C {destination} symbolic-ref HEAD refs/heads/steward; "
+                ));
+                if !paths.is_empty() {
+                    command.push_str(&format!(
+                        "git -C {destination} sparse-checkout init --no-cone; git -C {destination} sparse-checkout set --no-cone -- {} ; ",
+                        paths
+                            .iter()
+                            .map(|path| shell_quote(&format!("/{}", path.as_str())))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ));
+                }
+                command.push_str(&format!(
+                    "git -C {destination} checkout -q -f refs/heads/steward; "
+                ));
+                for (submodule_index, submodule) in submodules.iter().enumerate() {
+                    if submodule.status
+                        != steward_types::direct_package::WorkspaceSubmoduleStatus::Materialized
+                    {
+                        continue;
+                    }
+                    let submodule_commit = submodule
+                        .commit
+                        .as_ref()
+                        .and_then(|commit| commit.as_str().strip_prefix("git:sha1:"))
+                        .ok_or_else(workspace_staging_rejected)?;
+                    let submodule_destination = shell_quote(&format!(
+                        "/sandbox/workspace/{}/{}",
+                        name.as_str(),
+                        submodule.path.as_str()
+                    ));
+                    let submodule_pack = shell_quote(&format!(
+                        "/sandbox/steward-workspace-source/submodules/{index}/{submodule_index}.pack"
+                    ));
+                    let submodule_shallow = shell_quote(&format!(
+                        "/sandbox/steward-workspace-source/submodules/{index}/{submodule_index}.shallow"
+                    ));
+                    command.push_str(&format!(
+                        "rm -rf {submodule_destination}; mkdir -p {submodule_destination}; git init -q {submodule_destination}; git -C {submodule_destination} index-pack --fix-thin --stdin < {submodule_pack} >/dev/null; if [ -f {submodule_shallow} ]; then cp {submodule_shallow} {submodule_destination}/.git/shallow; fi; git -C {submodule_destination} update-ref refs/heads/steward {submodule_commit}; git -C {submodule_destination} symbolic-ref HEAD refs/heads/steward; git -C {submodule_destination} checkout -q -f refs/heads/steward; rm -rf {submodule_destination}/.git; "
+                    ));
+                }
+                if *history == WorkspaceGitHistory::None {
+                    command.push_str(&format!("rm -rf {destination}/.git; "));
+                }
+                if *access == WorkspaceAccess::ReadOnly {
+                    command.push_str(&format!("chmod -R a-w {destination}; "));
+                }
+            }
+            ResolvedWorkspaceEntry::Scratch { name, size, .. } => {
+                let size_bytes =
+                    workspace_size_bytes(size.as_str()).ok_or_else(workspace_staging_rejected)?;
+                let size_kib = size_bytes.div_ceil(1024);
+                let destination = shell_quote(&format!("/sandbox/workspace/{}", name.as_str()));
+                command.push_str(&format!(
+                    "mkdir -p {destination}; workspace_capacity_kib=$(df -Pk {destination} | awk 'NR == 2 {{ print $2 }}'); case \"$workspace_capacity_kib\" in ''|*[!0-9]*) exit 1;; esac; [ \"$workspace_capacity_kib\" -le {size_kib} ]; chmod u+rwx {destination}; "
+                ));
+            }
+        }
+    }
+    command.push_str("rm -rf /sandbox/steward-workspace-source");
+    Ok(command)
+}
+
+#[cfg(feature = "runtime")]
+fn workspace_size_bytes(value: &str) -> Option<u64> {
+    let (amount, multiplier) = [
+        ("Ti", 1024_u64.pow(4)),
+        ("Gi", 1024_u64.pow(3)),
+        ("Mi", 1024_u64.pow(2)),
+        ("Ki", 1024_u64),
+        ("T", 1000_u64.pow(4)),
+        ("G", 1000_u64.pow(3)),
+        ("M", 1000_u64.pow(2)),
+        ("K", 1000_u64),
+    ]
+    .into_iter()
+    .find_map(|(suffix, multiplier)| {
+        value
+            .strip_suffix(suffix)
+            .map(|amount| (amount, multiplier))
+    })
+    .unwrap_or((value, 1));
+    amount
+        .parse::<u64>()
+        .ok()
+        .filter(|amount| *amount > 0)
+        .and_then(|amount| amount.checked_mul(multiplier))
+}
+
+#[cfg(feature = "runtime")]
 fn input_staging_rejected() -> PortError {
     PortError::Rejected {
         reason: "task input archive could not be staged".to_owned(),
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn workspace_staging_rejected() -> PortError {
+    PortError::Rejected {
+        reason: "task workspace could not be materialized".to_owned(),
     }
 }
 
@@ -2909,7 +3126,12 @@ mod tests {
         SandboxTaskOutput, SandboxTaskTranscript, TaskAttemptId,
     };
     #[cfg(feature = "runtime")]
-    use steward_types::direct_package::ExecutionLogMode;
+    use steward_types::direct_package::{
+        ContentDigest, ExactGitCommit, ExecutionLogMode, RepositoryUrl, ResolvedWorkspaceEntry,
+        ResolvedWorkspaceSubmodule, ResourceQuantity, StableProviderId, WorkspaceAccess,
+        WorkspaceEvidence, WorkspaceGitHistory, WorkspaceName, WorkspacePath,
+        WorkspaceSubmoduleStatus, canonical_json_bytes,
+    };
     #[cfg(feature = "runtime")]
     use steward_types::{
         AgentType, DisposableExecutionBinding, ExecutionProviderProfile, ExecutionProviderProfiles,
@@ -2934,6 +3156,7 @@ mod tests {
         task_attempt_observation_command, task_attempt_transcript_stream_command,
         task_failure_category, task_process_log_record, task_transcript_requested,
         validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
+        workspace_materialization_command,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -3577,6 +3800,87 @@ mod tests {
                 .contains("tar -xf /sandbox/steward-input.tar -C /sandbox/steward-input")
         );
         assert!(staging_extract_command().contains("rm -f /sandbox/steward-input.tar"));
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn workspace_materializer_checks_out_exact_objects_without_a_remote() -> Result<(), String> {
+        let entries = vec![ResolvedWorkspaceEntry::Git {
+            name: WorkspaceName::parse("source")?,
+            access: WorkspaceAccess::ReadOnly,
+            repository: RepositoryUrl::parse("https://github.example.test/example-org/source.git")?,
+            repository_id: StableProviderId::parse("123")?,
+            repository_owner_id: StableProviderId::parse("456")?,
+            commit: ExactGitCommit::parse(format!("git:sha1:{}", "a".repeat(40)))?,
+            history: WorkspaceGitHistory::None,
+            paths: vec![WorkspacePath::parse("src/")?],
+            submodules: vec![ResolvedWorkspaceSubmodule {
+                path: steward_types::direct_package::RelativePath::parse("vendor/proto")?,
+                status: WorkspaceSubmoduleStatus::Materialized,
+                repository: Some(RepositoryUrl::parse(
+                    "https://github.example.test/example-org/proto.git",
+                )?),
+                repository_id: Some(StableProviderId::parse("789")?),
+                repository_owner_id: Some(StableProviderId::parse("456")?),
+                commit: Some(ExactGitCommit::parse(format!(
+                    "git:sha1:{}",
+                    "c".repeat(40)
+                ))?),
+                reason: None,
+            }],
+            max_materialized_bytes: 62_914_560,
+            content_digest: ContentDigest::parse(format!("steward:sha256:{}", "b".repeat(64)))?,
+        }];
+        let max_materialized_bytes = 62_914_560_u64;
+        let digest = Sha256::digest(canonical_json_bytes(&serde_json::json!({
+            "entries": &entries,
+            "maxMaterializedBytes": max_materialized_bytes,
+        }))?);
+        let evidence = WorkspaceEvidence {
+            entries,
+            max_materialized_bytes,
+            workspace_digest: ContentDigest::parse(format!("steward:sha256:{digest:x}"))?,
+        };
+        let command = workspace_materialization_command(&evidence)
+            .map_err(|error| format!("render workspace materializer: {error:?}"))?;
+        assert!(command.contains("index-pack --fix-thin --stdin"));
+        assert!(command.contains(&"a".repeat(40)));
+        assert!(command.contains("sparse-checkout set --no-cone -- '/src/'"));
+        assert!(!command.contains("sparse-checkout set --no-cone -- 'src/'"));
+        assert!(command.contains("rm -rf '/sandbox/workspace/source'/.git"));
+        assert!(command.contains("submodules/0/0.pack"));
+        assert!(command.contains("'/sandbox/workspace/source/vendor/proto'"));
+        assert!(command.contains(&"c".repeat(40)));
+        assert!(command.contains("chmod -R a-w '/sandbox/workspace/source'"));
+        assert!(!command.contains("remote add"));
+        assert!(!command.contains("github.example.test"));
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn workspace_materializer_creates_scratch_only_on_a_bounded_volume() -> Result<(), String> {
+        let entries = vec![ResolvedWorkspaceEntry::Scratch {
+            name: WorkspaceName::parse("scratch")?,
+            size: ResourceQuantity::parse("2Gi")?,
+            content_digest: ContentDigest::parse(format!("steward:sha256:{}", "d".repeat(64)))?,
+        }];
+        let max_materialized_bytes = 2_147_483_648_u64;
+        let digest = Sha256::digest(canonical_json_bytes(&serde_json::json!({
+            "entries": &entries,
+            "maxMaterializedBytes": max_materialized_bytes,
+        }))?);
+        let evidence = WorkspaceEvidence {
+            entries,
+            max_materialized_bytes,
+            workspace_digest: ContentDigest::parse(format!("steward:sha256:{digest:x}"))?,
+        };
+        let command = workspace_materialization_command(&evidence)
+            .map_err(|error| format!("render scratch materializer: {error:?}"))?;
+        assert!(command.contains("mkdir -p '/sandbox/workspace/scratch'"));
+        assert!(command.contains("df -Pk '/sandbox/workspace/scratch'"));
+        assert!(command.contains("-le 2097152"));
+        Ok(())
     }
 
     #[cfg(feature = "runtime")]

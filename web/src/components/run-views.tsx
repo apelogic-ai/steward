@@ -25,6 +25,7 @@ import {
   type GithubRunStatusResponse,
   type MyRunsResponse,
   type PublishTaskResponse,
+  type WorkspaceEvidence,
   type WorkflowDetectionResponse,
 } from "@/api-client";
 import { DataTable, FilterChips } from "@/components/hs";
@@ -42,6 +43,17 @@ import { EmptyState, PageHeader, ResourceBoundary, StatusBadge } from "@/compone
 function dateTime(value: string): string {
   const parsed = new Date(value);
   return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString();
+}
+
+function workspaceHistoryLabel(value: unknown): string {
+  if (value === "none") return "files only";
+  if (value === "full") return "full history";
+  if (value && typeof value === "object" && "depth" in value && typeof value.depth === "number") return `depth ${value.depth}`;
+  return "history unavailable";
+}
+
+export function WorkspaceEvidencePanel({ workspace }: Readonly<{ workspace: WorkspaceEvidence }>) {
+  return <section className="rounded-card border bg-panel p-5"><div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-semibold">Workspace</h2><p className="mt-1 text-xs text-muted-ink">Resolved and pinned before the runtime was created.</p></div><code className="max-w-full break-all text-xs text-muted-ink">{workspace.workspaceDigest}</code></div><div className="mt-4 grid gap-3">{workspace.entries.map((entry) => entry.type === "git" ? <div className="rounded-control border p-4" key={entry.name}><div className="flex flex-wrap items-center justify-between gap-2"><strong>{entry.name}</strong><span className="rounded-full border px-2 py-0.5 text-xs">Git · {entry.access}</span></div><p className="mt-2 break-all font-mono text-xs">{entry.repository}</p><p className="mt-1 break-all font-mono text-xs text-muted-ink">{entry.commit} · {workspaceHistoryLabel(entry.history)}</p>{entry.paths?.length ? <p className="mt-2 text-xs text-muted-ink">Paths: {entry.paths.join(", ")}</p> : null}{entry.submodules?.length ? <ul className="mt-3 space-y-1 text-xs">{entry.submodules.map((submodule) => <li key={submodule.path}><code>{submodule.path}</code> · {submodule.status}{submodule.commit ? ` · ${submodule.commit}` : ""}{submodule.reason ? ` · ${submodule.reason}` : ""}</li>)}</ul> : null}</div> : <div className="rounded-control border p-4" key={entry.name}><div className="flex flex-wrap items-center justify-between gap-2"><strong>{entry.name}</strong><span className="rounded-full border px-2 py-0.5 text-xs">Scratch</span></div><p className="mt-2 text-xs text-muted-ink">Writable · capped at {entry.size}</p></div>)}</div></section>;
 }
 
 function runUpdatedAt(value: BrowserRunView): number {
@@ -580,6 +592,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
             {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="text-sm text-err" role="alert">The run could not be cancelled ({cancelState}).</p> : null}
             {inferenceGuidance ? <p className="rounded-control border border-err/30 bg-err-soft px-4 py-3 text-sm text-err" role="alert">{inferenceGuidance} <Link className="font-semibold underline" href="/connections">Open Connections</Link></p> : null}
             <ConfirmationDialog cancelLabel="Keep running" confirmLabel="Cancel run" description="The agent will stop and its runtime credentials will be revoked. This cannot be undone." onConfirm={() => void cancelRun()} onOpenChange={setCancelOpen} open={cancelOpen} pending={cancelState === "working"} title="Cancel this run?" />
+            {run.workspace ? <WorkspaceEvidencePanel workspace={run.workspace} /> : null}
             <div className="grid min-h-[540px] overflow-hidden rounded-panel border bg-panel lg:grid-cols-[260px_minmax(0,1fr)]">
               <nav aria-label="Run jobs" className="border-b border-line lg:border-b-0 lg:border-r">
                 <div className="border-b border-line-soft px-5 py-4 text-sm font-semibold">Jobs</div>

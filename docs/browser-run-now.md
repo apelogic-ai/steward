@@ -102,6 +102,13 @@ deployment-owned execution-binding catalog; it does not require a published Work
 It selects only a coding agent whose model family is allowed by the selected Envelope
 and records that exact model in the package requirements.
 
+For inline runs, **Check out this repository** adds a typed Git workspace entry for the
+selected admitted repository. The browser submits stable owner/repository IDs and
+`ref: trigger`; Steward resolves the repository's default-branch HEAD to an exact commit
+at admission. Optional positive history depth enables offline `git log` and `git blame`.
+Run detail shows the immutable workspace digest, exact commit, history, sparse paths,
+and every materialized or skipped submodule with its bounded reason.
+
 After an inline run succeeds, its detail page offers **Publish this task to GitHub**.
 The browser sends a blank repository query to `GET /app/api/v1/github/repositories`.
 Starting in 0.3.13, what that lists depends on the deployment:

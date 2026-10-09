@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import type { BrowserRunView } from "@/api-client";
+import type { BrowserRunView, WorkspaceEvidence } from "@/api-client";
 
-import { inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards } from "./run-views";
+import { inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards, WorkspaceEvidencePanel } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -77,6 +77,31 @@ test("package viewer resolves inline and file prompts to the same text", () => {
     "task-definition.json": JSON.stringify({ prompt: "prompt.md" }),
     "prompt.md": text,
   })).toEqual({ label: "prompt.md", text });
+});
+
+test("run details show pinned Git and skipped submodule workspace evidence", () => {
+  const workspace = {
+    entries: [{
+      type: "git",
+      name: "source",
+      access: "read-only",
+      repository: "https://github.com/example-org/source.git",
+      repositoryId: "1001",
+      repositoryOwnerId: "1000",
+      commit: `git:sha1:${"a".repeat(40)}`,
+      history: { depth: 25 },
+      submodules: [{ path: "vendor/optional", status: "skipped", reason: "repository_not_admitted" }],
+      contentDigest: `steward:sha256:${"b".repeat(64)}`,
+    }],
+    workspaceDigest: `steward:sha256:${"c".repeat(64)}`,
+  } as unknown as WorkspaceEvidence;
+  const html = renderToStaticMarkup(<WorkspaceEvidencePanel workspace={workspace} />);
+
+  expect(html).toContain("Workspace");
+  expect(html).toContain("example-org/source.git");
+  expect(html).toContain("depth 25");
+  expect(html).toContain("vendor/optional");
+  expect(html).toContain("repository_not_admitted");
 });
 
 test("managed inference failures direct the user to replace the saved key", () => {

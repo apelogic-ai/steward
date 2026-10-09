@@ -2206,6 +2206,7 @@ mod tests {
                 content.to_owned(),
             )])),
             diagnostics: Default::default(),
+            workspace: None,
             prompt_source: PromptSourceKind::Inline,
         };
         evidence.validate()?;
