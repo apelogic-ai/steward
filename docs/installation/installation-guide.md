@@ -14,7 +14,7 @@ requires an order those products do not own; see
 | Mode | What starts | Additional prerequisites |
 |---|---|---|
 | Core (default, `execution.enabled=false`) | API, admission webhook, and AgentRuntime controller; new Task submission is disabled while orchestration is staged | None of Jira, an inference endpoint, LiteLLM, OpenShell, SPIRE, a Mint Secret, or a RuntimeClass |
-| Governed execution (`execution.enabled=true`) | Core plus Mint, OpenShell reconciliation, LiteLLM inference, and workload identity | OpenShell gateway/client mTLS, LiteLLM, workload exchange, SPIRE CSI and ClusterSPIFFEID, Mint signing material and trust |
+| Governed execution (`execution.enabled=true`) | Core plus Mint, OpenShell reconciliation, governed inference, and workload identity | OpenShell gateway/client mTLS, a stock LiteLLM control plane or [managed inference](managed-inference.md), workload exchange, SPIRE CSI and ClusterSPIFFEID, Mint signing material and trust |
 
 Jira is a separate opt-in decision-channel integration (`jira.enabled=true`) in
 either mode. With Jira disabled, decisions that need it fail closed; the chart
@@ -83,6 +83,8 @@ runtime unless the operator supplies the optional RuntimeClass override.
 This release proves functional sandbox separation and makes no VM-isolation
 claim. See [chart configuration](../../charts/steward/README.md)
 and [execution bindings](execution-bindings.md) before activating Tasks.
+For per-user inference credentials, follow the separate
+[managed-inference setup and rollback procedure](managed-inference.md).
 
 ### Tested versions and integration boundaries
 

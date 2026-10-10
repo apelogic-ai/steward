@@ -31,9 +31,10 @@ use steward_ports::{
     MAX_TASK_INPUT_ARCHIVE_BYTES, TaskExecutionAdapter, TaskExecutionPlanRequest,
 };
 use steward_store::{
-    EnvelopeRequestRecord, FederatedSubjectObservation, FederatedSubjectRecord, PgStore,
-    StoreError, TaskOrchestrationMode, TaskOutputTranscript, TaskRecord, TaskReservationRequest,
-    TaskRuntimeOperationRecord, TaskRuntimeOwnership, WorkflowRevisionRecord,
+    EnvelopeRequestRecord, FederatedSubjectObservation, FederatedSubjectRecord,
+    ManagedInferenceKeyCipher, PgStore, StoreError, TaskOrchestrationMode, TaskOutputTranscript,
+    TaskRecord, TaskReservationRequest, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
+    WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
     BoundedText, BrowserTaskEvidence, BrowserTaskSubmission, ClosureEntry, ClosureEntryKind,
@@ -390,6 +391,7 @@ pub struct TaskApiConfig {
     source_repository_bindings: BTreeSet<SourceRepositoryBindingKey>,
     failure_reporter: TaskSubmissionFailureReporter,
     inference_mode: InferenceMode,
+    managed_inference_cipher: Option<ManagedInferenceKeyCipher>,
     workspace_policy: WorkspaceDeploymentPolicy,
 }
 
@@ -405,6 +407,7 @@ impl Default for TaskApiConfig {
             source_repository_bindings: BTreeSet::new(),
             failure_reporter: Arc::new(|line| eprintln!("{line}")),
             inference_mode: InferenceMode::Stock,
+            managed_inference_cipher: None,
             workspace_policy: WorkspaceDeploymentPolicy::default(),
         }
     }
@@ -475,6 +478,11 @@ impl TaskApiConfig {
 
     pub fn with_inference_mode(mut self, mode: InferenceMode) -> Self {
         self.inference_mode = mode;
+        self
+    }
+
+    pub fn with_managed_inference_cipher(mut self, cipher: ManagedInferenceKeyCipher) -> Self {
+        self.managed_inference_cipher = Some(cipher);
         self
     }
 
@@ -1529,9 +1537,10 @@ fn valid_email(value: &str) -> bool {
 }
 
 pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
-    fn has_managed_inference_credential<'a>(
+    fn managed_inference_credential_is_usable<'a>(
         &'a self,
         _owner_user_id: &'a CanonicalUserId,
+        _cipher: &'a ManagedInferenceKeyCipher,
     ) -> BoxFuture<'a, Result<bool, StoreError>> {
         Box::pin(async { Ok(false) })
     }
@@ -1631,13 +1640,16 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
 }
 
 impl TaskSubmissionLedger for PgStore {
-    fn has_managed_inference_credential<'a>(
+    fn managed_inference_credential_is_usable<'a>(
         &'a self,
         owner_user_id: &'a CanonicalUserId,
+        cipher: &'a ManagedInferenceKeyCipher,
     ) -> BoxFuture<'a, Result<bool, StoreError>> {
-        Box::pin(
-            async move { PgStore::has_managed_inference_credential(self, owner_user_id).await },
-        )
+        Box::pin(async move {
+            PgStore::resolve_managed_inference_credential(self, owner_user_id, cipher)
+                .await
+                .map(|credential| credential.is_some())
+        })
     }
 
     fn active_provisioned_user_envelopes_by_digest<'a>(
@@ -1909,6 +1921,7 @@ pub enum BrowserTaskRerunError {
     Unsupported,
     EnvelopeUnavailable,
     InferenceKeyMissing,
+    InferenceKeyUnusable,
     Rejected,
     Unavailable,
 }
@@ -2830,6 +2843,11 @@ where
                     .to_owned(),
             ));
         }
+        if request.agent_runtime_uid.is_some() {
+            return Err(ApiError::Admission(
+                "versioned Workflows use a server-owned runtime path".to_owned(),
+            ));
+        }
         if let Some(record) = self
             .ledger
             .task_by_idempotency(
@@ -2850,7 +2868,7 @@ where
             ));
         }
         if let Some(reference) = reference {
-            return submit_versioned_task(
+            return submit_new_versioned_task(
                 self,
                 idempotency_key,
                 identity,
@@ -3015,6 +3033,7 @@ where
                     | ApiError::TaskWorkflowNotFound
                     | ApiError::DirectPackageSourceDisabled => BrowserTaskRerunError::Rejected,
                     ApiError::InferenceKeyMissing => BrowserTaskRerunError::InferenceKeyMissing,
+                    ApiError::InferenceKeyUnusable => BrowserTaskRerunError::InferenceKeyUnusable,
                     _ => BrowserTaskRerunError::Unavailable,
                 })
         })
@@ -5432,15 +5451,24 @@ async fn require_managed_inference_credential<L: TaskSubmissionLedger>(
     if application.config.inference_mode != InferenceMode::Managed || spec.llms.is_empty() {
         return Ok(());
     }
-    if application
+    let cipher = application
+        .config
+        .managed_inference_cipher
+        .as_ref()
+        .ok_or(StoreError::InvalidManagedInferenceEncryptionKey)
+        .map_err(ApiError::Store)?;
+    match application
         .ledger
-        .has_managed_inference_credential(&identity.canonical_user_id)
+        .managed_inference_credential_is_usable(&identity.canonical_user_id, cipher)
         .await
-        .map_err(ApiError::Store)?
     {
-        Ok(())
-    } else {
-        Err(ApiError::InferenceKeyMissing)
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ApiError::InferenceKeyMissing),
+        Err(
+            StoreError::InvalidManagedInferenceCredential
+            | StoreError::ManagedInferenceCredentialUnavailable,
+        ) => Err(ApiError::InferenceKeyUnusable),
+        Err(error) => Err(ApiError::Store(error)),
     }
 }
 
@@ -5474,6 +5502,28 @@ where
             .retry_existing_task(&identity, Some(&reference), request, record)
             .await;
     }
+    submit_new_versioned_task(
+        application,
+        idempotency_key,
+        identity,
+        reference,
+        request,
+        browser_task_evidence,
+    )
+    .await
+}
+
+async fn submit_new_versioned_task<L>(
+    application: &TaskApplicationService<L>,
+    idempotency_key: &str,
+    identity: TaskIdentity,
+    reference: WorkflowReference,
+    request: &TaskSubmissionRequest,
+    browser_task_evidence: Option<&BrowserTaskEvidence>,
+) -> Result<(StatusCode, TaskStatusResponse), ApiError>
+where
+    L: AdmissionLedger + TaskSubmissionLedger,
+{
     let workflow = application
         .ledger
         .workflow_revision(&reference.name, reference.version)

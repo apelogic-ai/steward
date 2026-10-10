@@ -114,10 +114,10 @@ function InferenceConnectionCard({ state, refresh }: Readonly<{
   if (state.status !== "ready") {
     return <SectionCard actions={<StatusBadge value={state.status === "loading" ? "Checking" : "Unavailable"} />} title="Inference gateway"><p className="text-sm text-muted-ink">Inference connection metadata is not currently available.</p></SectionCard>;
   }
-  if (value?.mode === "stock") {
-    return <SectionCard actions={<StatusBadge value="Administrator managed" />} title="Inference gateway"><p className="text-sm text-muted-ink">Inference credentials are managed by your Steward administrator. No personal API key is required.</p></SectionCard>;
-  }
   const credential = value?.credential;
+  if (value?.mode === "stock") {
+    return <SectionCard actions={<StatusBadge value="Administrator managed" />} title="Inference gateway"><div className="space-y-4"><p className="text-sm text-muted-ink">Inference credentials are managed by your Steward administrator. No personal API key is required.</p>{credential ? <><p className="text-sm">A managed-mode key saved {new Date(credential.savedAt).toLocaleString()} remains stored · key ending in <span className="font-mono">{credential.lastFour}</span></p><button className="h-10 rounded-control border border-err px-4 text-sm font-semibold text-err" onClick={() => setRemoving(true)} type="button">Remove stored API key…</button><ConfirmationDialog cancelLabel="Keep key" confirmLabel="Remove API key" description="This removes Steward's encrypted copy. It does not revoke or delete the key at the upstream inference service." onConfirm={() => void remove()} onOpenChange={setRemoving} open={removing} pending={action === "working"} title="Remove stored inference API key?" /></> : null}{action === "error" ? <p className="text-sm text-err" role="alert">The inference key operation failed. Retry the removal.</p> : null}</div></SectionCard>;
+  }
   return (
     <SectionCard actions={<StatusBadge value={credential ? "Configured" : "Key required"} />} title="Inference gateway">
       <div className="space-y-4">

@@ -141,9 +141,6 @@ impl InferenceConnectionBroker for PgInferenceConnectionBroker {
     ) -> BoxFuture<'a, Result<Option<ManagedInferenceCredentialStatus>, InferenceConnectionError>>
     {
         Box::pin(async move {
-            if self.mode == InferenceMode::Stock {
-                return Ok(None);
-            }
             self.store
                 .managed_inference_credential_status(user_id)
                 .await
@@ -519,6 +516,34 @@ mod tests {
                 .is_none(),
             "rolling back to stock mode must not strand encrypted user credentials"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stock_mode_reports_stored_key_metadata_for_ui_cleanup() -> Result<(), String> {
+        let broker = FakeBroker {
+            mode: InferenceMode::Stock,
+            status: Some(ManagedInferenceCredentialStatus {
+                last_four: "wxyz".to_owned(),
+                saved_at: "2026-10-09T00:00:00Z".to_owned(),
+            }),
+            saved: Arc::new(Mutex::new(Some(
+                "fixture-managed-credential-wxyz".to_owned(),
+            ))),
+        };
+        let response = get_inference_connection::<FakeBroker, String>(
+            Some(Extension(session()?)),
+            State(InferenceConnectionsState { broker }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read stock inference response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode stock inference response: {error}"))?;
+        assert_eq!(value["mode"], "stock");
+        assert_eq!(value["credential"]["lastFour"], "wxyz");
         Ok(())
     }
 }

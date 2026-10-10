@@ -208,12 +208,7 @@ fn inference_mode() -> Result<InferenceMode, io::Error> {
 }
 
 fn parse_inference_mode(value: &str) -> Result<InferenceMode, io::Error> {
-    match InferenceMode::parse(value).map_err(io::Error::other)? {
-        InferenceMode::Stock => Ok(InferenceMode::Stock),
-        InferenceMode::Managed => Err(io::Error::other(
-            "managed inference mode is not available until Mint runtime wiring is released",
-        )),
-    }
+    InferenceMode::parse(value).map_err(io::Error::other)
 }
 
 fn core_only_configuration() -> Result<(), io::Error> {
@@ -811,14 +806,15 @@ mod tests {
     }
 
     #[test]
-    fn managed_inference_mode_is_rejected_before_controller_startup() {
+    fn managed_inference_mode_is_accepted_by_controller_startup() {
         assert_eq!(
             parse_inference_mode("stock").ok(),
             Some(steward_types::InferenceMode::Stock)
         );
-        assert!(
-            parse_inference_mode("managed").is_err(),
-            "the controller must not activate managed inference before Mint can resolve its credentials"
+        assert_eq!(
+            parse_inference_mode("managed").ok(),
+            Some(steward_types::InferenceMode::Managed),
+            "the controller must activate the managed inference plane without provisioning stock keys"
         );
     }
 

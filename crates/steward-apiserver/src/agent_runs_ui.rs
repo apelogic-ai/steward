@@ -2346,6 +2346,14 @@ where
             })),
         )
             .into_response(),
+        Err(BrowserTaskRerunError::InferenceKeyUnusable) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "inference_key_unusable",
+                "failureReason": "Replace the inference key under Connections > Inference / LLMs, then retry the run.",
+            })),
+        )
+            .into_response(),
         Err(BrowserTaskRerunError::Rejected) => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
         Err(BrowserTaskRerunError::Unavailable) => {
             browser_runs_error(StatusCode::SERVICE_UNAVAILABLE)

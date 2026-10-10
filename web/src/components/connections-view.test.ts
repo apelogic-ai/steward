@@ -108,6 +108,8 @@ describe("governed provider connection controls", () => {
     expect(source).toContain("Add API key");
     expect(source).toContain("Replace API key");
     expect(source).toContain("Remove API key…");
+    expect(source).toContain("Remove stored API key…");
+    expect(source).toContain("A managed-mode key saved");
     expect(source).toContain("GitHub Actions runs admitted as you use this same saved key");
     expect(source).toContain("It does not revoke or delete the key at the upstream inference service.");
   });

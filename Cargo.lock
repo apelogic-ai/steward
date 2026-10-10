@@ -4118,6 +4118,7 @@ dependencies = [
  "steward-adapter-openshell",
  "steward-adapter-spire",
  "steward-mint",
+ "steward-store",
  "steward-types",
  "tokio",
  "tokio-rustls",
@@ -4142,6 +4143,7 @@ dependencies = [
  "sqlx",
  "steward-admission",
  "steward-types",
+ "tokio",
  "uuid",
  "zeroize",
 ]

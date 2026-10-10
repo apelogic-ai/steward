@@ -18,7 +18,8 @@ use steward_mint::{
     SvidAssertion, SvidValidationError, SvidValidator, TokenGrantRequest, ValidatedWorkload,
 };
 use steward_types::{
-    CanonicalAuthorityBinding, CanonicalUserId, Email, ModelRef, Principal, RuntimeId, ToolGrant,
+    CanonicalAuthorityBinding, CanonicalUserId, Email, MANAGED_INFERENCE_REFERENCE, ModelRef,
+    Principal, RuntimeId, ToolGrant,
 };
 
 const EXPECTED_WORKLOAD: &str = "spiffe://example.org/agent/runtime-a";
@@ -106,6 +107,7 @@ fn active_binding() -> Result<AuthorityBinding, String> {
             provider: "openai".to_owned(),
             model: "gpt-test".to_owned(),
         }],
+        inference_reference: Some(MANAGED_INFERENCE_REFERENCE.to_owned()),
         tools: Vec::new(),
         state: AuthorityState::Active,
     })
@@ -185,18 +187,20 @@ async fn managed_inference_rejects_a_missing_owner_credential() -> Result<(), St
 
 #[tokio::test]
 async fn managed_inference_does_not_handle_non_inference_scopes() -> Result<(), String> {
-    let (resolver, calls) = managed_resolver(
-        canonical_user_id()?,
-        Ok(Some("sk-steward-test-managed-key")),
-    );
+    let (resolver, calls) =
+        managed_resolver(canonical_user_id()?, Err(MintError::AuthorityUnavailable));
 
     let result = resolver
         .resolve(&["tools".to_owned()], &active_binding()?)
         .await
-        .map_err(|error| format!("non-inference scope must not fail: {error:?}"))?;
+        .map_err(|error| format!("database outage must not fail a tool-only grant: {error:?}"))?;
 
     assert!(matches!(result, CredentialGrant::NotHandled));
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "tool-only grants must not consult unavailable inference storage"
+    );
     Ok(())
 }
 
@@ -231,6 +235,26 @@ async fn managed_inference_rejects_runtime_without_model_authority() -> Result<(
         calls.load(Ordering::SeqCst),
         0,
         "model-less authority must fail before credential lookup"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn managed_inference_rejects_a_stock_reconciled_runtime() -> Result<(), String> {
+    let (resolver, calls) = managed_resolver(
+        canonical_user_id()?,
+        Ok(Some("sk-steward-test-managed-key")),
+    );
+    let mut binding = active_binding()?;
+    binding.inference_reference = Some("stock-runtime-key".to_owned());
+
+    let result = resolver.resolve(&["inference".to_owned()], &binding).await;
+
+    assert!(matches!(result, Err(MintError::CredentialUnavailable)));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a stock-reconciled runtime must fail before credential lookup"
     );
     Ok(())
 }

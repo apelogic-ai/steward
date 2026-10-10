@@ -7,6 +7,7 @@ use std::fmt;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
+use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use steward_admission::{
@@ -849,7 +850,26 @@ mod managed_inference_credential_tests {
         let decrypted = decrypt_managed_inference_credential(&cipher, &user, encrypted)
             .map_err(|error| error.to_string())?;
         assert_eq!(decrypted.expose_secret(), "sk-obviously-fake-managed-key");
+
+        let encrypted_for_wrong_key =
+            encrypt_managed_inference_credential(&cipher, &user, "sk-obviously-fake-managed-key")
+                .map_err(|error| error.to_string())?;
+        let wrong_cipher = ManagedInferenceKeyCipher::from_bytes(&[8_u8; 32])
+            .map_err(|error| error.to_string())?;
+        assert!(
+            decrypt_managed_inference_credential(&wrong_cipher, &user, encrypted_for_wrong_key)
+                .is_err(),
+            "a credential encrypted by another deployment key must fail closed"
+        );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn lazy_pool_does_not_require_database_availability() {
+        assert!(
+            super::PgStore::connect_lazy("postgres://steward@127.0.0.1:9/steward").is_ok(),
+            "optional managed-inference storage must not connect during Mint startup"
+        );
     }
 
     #[test]
@@ -898,6 +918,17 @@ impl PgStore {
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
         PgPool::connect(database_url)
             .await
+            .map(Self::new)
+            .map_err(database_error)
+    }
+
+    /// Creates a pool without opening a database connection.
+    ///
+    /// This is reserved for optional runtime dependencies whose outage must not prevent the
+    /// surrounding service from starting or serving unrelated operations.
+    pub fn connect_lazy(database_url: &str) -> Result<Self, StoreError> {
+        PgPoolOptions::new()
+            .connect_lazy(database_url)
             .map(Self::new)
             .map_err(database_error)
     }

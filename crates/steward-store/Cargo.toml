@@ -16,5 +16,8 @@ steward-types = { path = "../steward-types", version = "=0.0.0" }
 uuid.workspace = true
 zeroize.workspace = true
 
+[dev-dependencies]
+tokio.workspace = true # Proves optional lazy database pools do not connect during async service startup.
+
 [lints]
 workspace = true
