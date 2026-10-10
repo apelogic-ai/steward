@@ -26,6 +26,7 @@ use steward_apiserver::connections::{
     ConnectionSubject, GithubWorkflowRerunBroker, GithubWorkflowRerunRequest,
     ProviderConnectionBroker, StartedConnection,
 };
+use steward_apiserver::github_automation::{GithubAutomationBroker, GithubAutomationIdentity};
 use steward_apiserver::governed_connections::{
     ConnectionExecutionBindings, ConnectionOperationReconciler, GovernedConnectionsBroker,
     GovernedConnectionsConfig,
@@ -49,8 +50,12 @@ const ALICE_RUNTIME: &str = "long-running-alice";
 const ALICE_AFTER_DISCONNECT_RUNTIME: &str = "new-alice-after-disconnect";
 const BOB_RUNTIME: &str = "long-running-bob";
 const MCP_GW_ISSUER: &str = "http://steward-mint.steward-system.svc.cluster.local:8080";
-const MCP_GW_ORIGIN: &str = "http://mcp-gw.steward-system.svc.cluster.local:8080";
-const MCP_URL: &str = "http://mcp-gw.steward-system.svc.cluster.local:8080/mcp";
+const DIRECT_MCP_GW_ORIGIN: &str = "http://mcp-gw.steward-system.svc.cluster.local:8080";
+const DIRECT_MCP_URL: &str = "http://mcp-gw.steward-system.svc.cluster.local:8080/mcp";
+const AGENTGATEWAY_ORIGIN: &str =
+    "http://mcp-gw-agentgateway.steward-system.svc.cluster.local:8080";
+const AGENTGATEWAY_MCP_URL: &str =
+    "http://mcp-gw-agentgateway.steward-system.svc.cluster.local:8080/mcp";
 
 #[derive(Clone, Copy)]
 struct NoInference;
@@ -119,6 +124,7 @@ impl Harness {
     async fn runtime_for_mode(
         bridge_image: &str,
         artifact_trust_mode: &str,
+        mcp_gateway_origin: &str,
     ) -> Result<OpenShellRuntime, Box<dyn Error>> {
         OpenShellRuntime::connect(OpenShellConnectionConfig {
             endpoint: required("STEWARD_OPENSHELL_ENDPOINT")?,
@@ -141,7 +147,7 @@ impl Harness {
             stable_bridge_gateway_origin: None,
             bridge_image: Some(bridge_image.to_owned()),
             bridge_artifact_trust_mode: Some(artifact_trust_mode.to_owned()),
-            bridge_gateway_origin: Some(MCP_GW_ORIGIN.to_owned()),
+            bridge_gateway_origin: Some(mcp_gateway_origin.to_owned()),
             bridge_gateway_version: Some("0.4.9".to_owned()),
             bridge_runtime_namespace: Some(CONNECTIONS_NAMESPACE.to_owned()),
         })
@@ -170,7 +176,9 @@ impl Harness {
         let store = PgStore::new(database.clone());
         store.migrate().await?;
         let bridge_image = required("STEWARD_CONNECTIONS_TEST_BRIDGE_DIGEST_IMAGE")?;
-        let runtime = Self::runtime_for_mode(&bridge_image, "github-attestation").await?;
+        let runtime =
+            Self::runtime_for_mode(&bridge_image, "github-attestation", DIRECT_MCP_GW_ORIGIN)
+                .await?;
         let client = Client::try_default().await?;
         let mut harness = Self {
             bridge_image,
@@ -223,10 +231,21 @@ impl Harness {
         &mut self,
         artifact_trust_mode: &str,
     ) -> Result<(), Box<dyn Error>> {
+        self.switch_execution_binding(artifact_trust_mode, DIRECT_MCP_GW_ORIGIN)
+            .await
+    }
+
+    async fn switch_execution_binding(
+        &mut self,
+        artifact_trust_mode: &str,
+        mcp_gateway_origin: &str,
+    ) -> Result<(), Box<dyn Error>> {
         if let Some(controller) = self.controller.take() {
             controller.abort();
         }
-        self.runtime = Self::runtime_for_mode(&self.bridge_image, artifact_trust_mode).await?;
+        self.runtime =
+            Self::runtime_for_mode(&self.bridge_image, artifact_trust_mode, mcp_gateway_origin)
+                .await?;
         self.start_controller();
         Ok(())
     }
@@ -268,11 +287,20 @@ impl Harness {
         artifact_trust_mode: &str,
         server_origin: &str,
     ) -> Result<GovernedConnectionsBroker<()>, Box<dyn Error>> {
+        self.broker_for_bindings(artifact_trust_mode, server_origin, DIRECT_MCP_GW_ORIGIN)
+    }
+
+    fn broker_for_bindings(
+        &self,
+        artifact_trust_mode: &str,
+        server_origin: &str,
+        mcp_gateway_origin: &str,
+    ) -> Result<GovernedConnectionsBroker<()>, Box<dyn Error>> {
         let config = GovernedConnectionsConfig::new(
             ConnectionExecutionBindings {
                 artifact_trust_mode: artifact_trust_mode.to_owned(),
                 bridge_image_digest: self.bridge_image.clone(),
-                mcp_gw_origin: MCP_GW_ORIGIN.to_owned(),
+                mcp_gw_origin: mcp_gateway_origin.to_owned(),
                 mcp_gw_version: "0.4.9".to_owned(),
                 namespace: CONNECTIONS_NAMESPACE.to_owned(),
                 runtime_class: env::var("STEWARD_OPENSHELL_RUNTIME_CLASS_NAME").unwrap_or_default(),
@@ -295,6 +323,14 @@ impl Harness {
 
     fn broker(&self) -> Result<GovernedConnectionsBroker<()>, Box<dyn Error>> {
         self.broker_for_mode("github-attestation")
+    }
+
+    fn agentgateway_broker(&self) -> Result<GovernedConnectionsBroker<()>, Box<dyn Error>> {
+        self.broker_for_bindings(
+            "github-attestation",
+            "https://steward.example.test",
+            AGENTGATEWAY_ORIGIN,
+        )
     }
 
     async fn register_user(
@@ -507,6 +543,15 @@ impl Harness {
     }
 
     fn call_tool(&self, namespace: &str, name: &str) -> Result<String, Box<dyn Error>> {
+        self.call_tool_at(namespace, name, DIRECT_MCP_URL)
+    }
+
+    fn call_tool_at(
+        &self,
+        namespace: &str,
+        name: &str,
+        mcp_url: &str,
+    ) -> Result<String, Box<dyn Error>> {
         let workspace = self.runtime_ref(namespace, name, "workspace")?;
         let sandbox = self.runtime_ref(namespace, name, "sandbox")?;
         let request = serde_json::json!({
@@ -545,7 +590,7 @@ impl Harness {
                 "MCP-Protocol-Version: 2025-06-18",
                 "-d",
                 &request,
-                MCP_URL,
+                mcp_url,
             ])
             .output()?;
         Ok(format!(
@@ -553,6 +598,21 @@ impl Harness {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ))
+    }
+
+    fn assert_agentgateway_requires_a_session(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let response = self.call_tool_at(namespace, name, AGENTGATEWAY_MCP_URL)?;
+        if !response.contains("mcp: session header is required for non-initialize requests") {
+            return Err(io::Error::other(format!(
+                "pinned agentgateway did not enforce MCP sessions; response={response:?}"
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     fn wait_tool_contains(
@@ -620,6 +680,46 @@ impl Harness {
         .bind(kind)
         .fetch_one(&self.database)
         .await?)
+    }
+
+    async fn automation_result(
+        &self,
+        user_id: &CanonicalUserId,
+        kind: &str,
+        after_count: i64,
+        label: &str,
+        result: Result<serde_json::Value, ConnectionBrokerError>,
+    ) -> Result<serde_json::Value, Box<dyn Error>> {
+        let error = match result {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let operation_id = self.latest_operation(user_id, kind, after_count).await?;
+        let diagnostic: (
+            String,
+            Option<String>,
+            Option<Json<serde_json::Value>>,
+            String,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT operations.operation_state, operations.failure_category, \
+                    operations.failure_detail, tasks.phase, tasks.failure_reason \
+             FROM connection_operations operations \
+             JOIN task_submissions tasks ON tasks.task_uid = operations.task_uid \
+             WHERE operations.operation_id = $1",
+        )
+        .bind(operation_id)
+        .fetch_one(&self.database)
+        .await?;
+        Err(io::Error::other(format!(
+            "{label}: {error:?}; operation_id={operation_id}, operation_state={}, failure_category={:?}, failure_detail={:?}, task_phase={}, task_failure_reason={:?}",
+            diagnostic.0,
+            diagnostic.1,
+            diagnostic.2.map(|Json(value)| value),
+            diagnostic.3,
+            diagnostic.4
+        ))
+        .into())
     }
 
     async fn wait_operation_finalized(
@@ -876,6 +976,159 @@ where
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+async fn exercise_agentgateway_automation(
+    harness: &mut Harness,
+    session: &ConnectionSession<()>,
+) -> Result<(), Box<dyn Error>> {
+    const WORKFLOW_PATH: &str = ".github/workflows/steward-browser-task.yml";
+    const PACKAGE_PATH: &str = ".steward/tasks/hello/task-definition.json";
+    const WORKFLOW: &str = concat!(
+        "on:\n",
+        "  workflow_dispatch:\n",
+        "    inputs:\n",
+        "      message:\n",
+        "jobs:\n",
+        "  governed:\n",
+        "    uses: example-org/steward-run/.github/workflows/steward-task.yml@0123456789012345678901234567890123456789\n"
+    );
+
+    harness
+        .switch_execution_binding("github-attestation", AGENTGATEWAY_ORIGIN)
+        .await?;
+    let broker = harness.agentgateway_broker()?;
+
+    let user_id = &session.subject.canonical_user_id;
+    let repositories_count = harness.operation_count(user_id, "repositories").await?;
+    let repositories = harness
+        .automation_result(
+            user_id,
+            "repositories",
+            repositories_count,
+            "agentgateway repository search",
+            GithubAutomationBroker::execute(
+                &broker,
+                session,
+                steward_apiserver::governed_connections::ConnectionOperationKind::Repositories,
+                json!({
+                    "query": "repo:example-org/example-repo",
+                    "page": 1,
+                    "perPage": 10
+                }),
+                &GithubAutomationIdentity::fresh("agentgateway-repositories"),
+            )
+            .await,
+        )
+        .await?;
+    assert_eq!(repositories["repositories"][0]["owner"], "example-org");
+    assert_eq!(repositories["repositories"][0]["name"], "example-repo");
+
+    let publish_request = json!({
+        "owner": "example-org",
+        "repo": "example-repo",
+        "baseBranch": "main",
+        "branch": "steward/task-33333333333333333333333333333333",
+        "title": "Publish governed task",
+        "body": "Exact tested package",
+        "files": [
+            {"path": WORKFLOW_PATH, "content": WORKFLOW},
+            {"path": PACKAGE_PATH, "content": "{}"}
+        ]
+    });
+    let publish_count = harness.operation_count(user_id, "publish").await?;
+    let publish = harness
+        .automation_result(
+            user_id,
+            "publish",
+            publish_count,
+            "agentgateway publication",
+            GithubAutomationBroker::execute(
+                &broker,
+                session,
+                steward_apiserver::governed_connections::ConnectionOperationKind::Publish,
+                publish_request.clone(),
+                &GithubAutomationIdentity::write(
+                    "publish",
+                    "agentgateway-publication",
+                    &publish_request,
+                    Some("agentgateway-e2e:example-org/example-repo"),
+                ),
+            )
+            .await,
+        )
+        .await?;
+    assert_eq!(publish["pullRequestNumber"], 17);
+    assert!(publish["branch"].as_str().is_some_and(|branch| {
+        branch.starts_with("steward/task-33333333333333333333333333333333-")
+    }));
+
+    let workflow_count = harness.operation_count(user_id, "workflow").await?;
+    let workflow = harness
+        .automation_result(
+            user_id,
+            "workflow",
+            workflow_count,
+            "agentgateway workflow detection",
+            GithubAutomationBroker::execute(
+                &broker,
+                session,
+                steward_apiserver::governed_connections::ConnectionOperationKind::Workflow,
+                json!({
+                    "owner": "example-org",
+                    "repo": "example-repo",
+                    "path": WORKFLOW_PATH,
+                    "ref": "main",
+                    "expectedContent": WORKFLOW
+                }),
+                &GithubAutomationIdentity::fresh("agentgateway-workflow"),
+            )
+            .await,
+        )
+        .await?;
+    assert_eq!(workflow["exists"], true);
+    assert_eq!(workflow["compatible"], true);
+
+    let dispatch_request = json!({
+        "owner": "example-org",
+        "repo": "example-repo",
+        "workflowId": WORKFLOW_PATH,
+        "ref": "main",
+        "inputs": {"message": "hello"},
+        "expectedContent": WORKFLOW
+    });
+    let dispatch_count = harness.operation_count(user_id, "dispatch").await?;
+    let dispatch = harness
+        .automation_result(
+            user_id,
+            "dispatch",
+            dispatch_count,
+            "agentgateway dispatch",
+            GithubAutomationBroker::execute(
+                &broker,
+                session,
+                steward_apiserver::governed_connections::ConnectionOperationKind::Dispatch,
+                dispatch_request.clone(),
+                &GithubAutomationIdentity::write(
+                    "dispatch",
+                    "agentgateway-dispatch",
+                    &dispatch_request,
+                    Some("agentgateway-e2e:example-org/example-repo"),
+                ),
+            )
+            .await,
+        )
+        .await?;
+    assert_eq!(dispatch["runId"], 101);
+    assert_eq!(
+        dispatch["url"],
+        "https://github.com/example-org/example-repo/actions/runs/101"
+    );
+
+    harness
+        .switch_execution_binding("github-attestation", DIRECT_MCP_GW_ORIGIN)
+        .await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1242,6 +1495,8 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         connection_result(broker.status(&alice).await)?.phase,
         ConnectionPhase::Connected
     );
+    harness.assert_agentgateway_requires_a_session(ALICE_NAMESPACE, ALICE_RUNTIME)?;
+    exercise_agentgateway_automation(&mut harness, &alice).await?;
     let owner = sqlx::query(
         "SELECT hop1_issuer, hop1_subject, email FROM oauth_accounts \
          WHERE provider = 'github' AND revoked_at IS NULL",

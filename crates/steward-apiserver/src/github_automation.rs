@@ -71,6 +71,46 @@ pub struct GithubAutomationIdentity {
     pub(crate) publication_subject: Option<String>,
 }
 
+impl GithubAutomationIdentity {
+    /// Creates an identity for a read whose result must not be reused by another request.
+    pub fn fresh(operation: &str) -> Self {
+        Self {
+            idempotency_identity: format!("github-{operation}:{}", Uuid::new_v4()),
+            idempotency_scope: None,
+            publication_subject: None,
+        }
+    }
+
+    /// Creates the content-bound identity used for governed GitHub mutations.
+    pub fn write(
+        operation: &str,
+        client_key: &str,
+        payload: &Value,
+        subject: Option<&str>,
+    ) -> Self {
+        let subject = subject.map(|subject| operation_subject(operation, subject));
+        let scope = match subject.as_deref() {
+            Some(subject) => format!(
+                "{subject}:client:sha256:{:x}",
+                Sha256::digest(client_key.as_bytes())
+            ),
+            None => format!(
+                "github-{operation}:client:sha256:{:x}",
+                Sha256::digest(client_key.as_bytes())
+            ),
+        };
+        let payload = payload.to_string();
+        Self {
+            idempotency_identity: format!(
+                "{scope}:payload:sha256:{:x}",
+                Sha256::digest(payload.as_bytes())
+            ),
+            idempotency_scope: Some(scope),
+            publication_subject: (operation == "publish").then_some(subject).flatten(),
+        }
+    }
+}
+
 pub trait GithubAutomationBroker<B>: Clone + Send + Sync + 'static
 where
     B: Clone + Eq + Hash + Send + Sync + 'static,
@@ -1823,11 +1863,7 @@ fn valid_idempotency_key(value: &str) -> bool {
 }
 
 fn fresh_operation_identity(operation: &str) -> GithubAutomationIdentity {
-    GithubAutomationIdentity {
-        idempotency_identity: format!("github-{operation}:{}", Uuid::new_v4()),
-        idempotency_scope: None,
-        publication_subject: None,
-    }
+    GithubAutomationIdentity::fresh(operation)
 }
 
 fn scoped_read_operation_identity(operation: &str, subject: &str) -> GithubAutomationIdentity {
@@ -1848,26 +1884,7 @@ fn write_operation_identity(
     payload: &Value,
     subject: Option<&str>,
 ) -> GithubAutomationIdentity {
-    let subject = subject.map(|subject| operation_subject(operation, subject));
-    let scope = match subject.as_deref() {
-        Some(subject) => format!(
-            "{subject}:client:sha256:{:x}",
-            Sha256::digest(client_key.as_bytes())
-        ),
-        None => format!(
-            "github-{operation}:client:sha256:{:x}",
-            Sha256::digest(client_key.as_bytes())
-        ),
-    };
-    let payload = payload.to_string();
-    GithubAutomationIdentity {
-        idempotency_identity: format!(
-            "{scope}:payload:sha256:{:x}",
-            Sha256::digest(payload.as_bytes())
-        ),
-        idempotency_scope: Some(scope),
-        publication_subject: (operation == "publish").then_some(subject).flatten(),
-    }
+    GithubAutomationIdentity::write(operation, client_key, payload, subject)
 }
 
 fn automation_subject(task_uid: Uuid, owner: &str, repository: &str) -> String {

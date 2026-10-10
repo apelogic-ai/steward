@@ -24,6 +24,14 @@ endpoints:
     enforcement: enforce
     allowed_ips:
       - SERVICE_SUBNET
+  - host: mcp-gw-agentgateway.steward-system.svc.cluster.local
+    port: 8080
+    protocol: rest
+    tls: none
+    access: read-write
+    enforcement: enforce
+    allowed_ips:
+      - SERVICE_SUBNET
 binaries:
   - /usr/bin/curl
   - /usr/local/bin/curl

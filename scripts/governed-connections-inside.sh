@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 for variable in \
   STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE \
+  STEWARD_CONNECTIONS_TEST_AGENTGATEWAY_IMAGE \
   STEWARD_CONNECTIONS_TEST_MINT_IMAGE \
   STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE \
   STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE \
@@ -61,6 +62,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}" --name "${cluster_name}"
+kind load docker-image "${STEWARD_CONNECTIONS_TEST_AGENTGATEWAY_IMAGE}" --name "${cluster_name}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_MINT_IMAGE}" --name "${cluster_name}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE}" --name "${cluster_name}"
 kind load docker-image "${STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE}" --name "${cluster_name}"
@@ -131,6 +133,7 @@ chmod 600 "${webhook_key_pem}" "${webhook_key_der}"
 
 "${KUBECTL[@]}" -n steward-system create configmap steward-connections-e2e-fixtures \
   --from-file="mcp_tools.rego=${ROOT}/policy/mcp_tools.rego" \
+  --from-file="agentgateway.yaml=${ROOT}/config/connections-e2e/agentgateway.yaml" \
   --from-file="provider-fixture.ts=${ROOT}/config/connections-e2e/provider-fixture.ts" \
   --dry-run=client -o yaml |
   "${KUBECTL[@]}" apply -f -
@@ -163,6 +166,7 @@ rendered_stack="${STEWARD_RUN_DIR}/governed-connections-stack.yaml"
 sed \
   -e "s#RUN_ID_PLACEHOLDER#${run_id}#g" \
   -e "s#MCP_GW_IMAGE_PLACEHOLDER#${STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE}#g" \
+  -e "s#AGENTGATEWAY_IMAGE_PLACEHOLDER#${STEWARD_CONNECTIONS_TEST_AGENTGATEWAY_IMAGE}#g" \
   -e "s#MINT_IMAGE_PLACEHOLDER#${STEWARD_CONNECTIONS_TEST_MINT_IMAGE}#g" \
   "${ROOT}/config/connections-e2e/stack.yaml" >"${rendered_stack}"
 "${KUBECTL[@]}" apply -f "${rendered_stack}"
@@ -255,6 +259,7 @@ YAML
 "${KUBECTL[@]}" -n steward-system rollout status deployment/provider-fixture --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/steward-mint --timeout=180s
 "${KUBECTL[@]}" -n steward-system rollout status deployment/mcp-gw --timeout=180s
+"${KUBECTL[@]}" -n steward-system rollout status deployment/mcp-gw-agentgateway --timeout=180s
 
 service_subnet="$(
   "${KUBECTL[@]}" -n kube-system get configmap kubeadm-config \

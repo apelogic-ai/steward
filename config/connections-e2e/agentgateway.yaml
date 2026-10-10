@@ -1,0 +1,39 @@
+binds:
+  - port: 8080
+    listeners:
+      - routes:
+          - matches:
+              - path:
+                  exact: /mcp
+              - path:
+                  exact: /.well-known/oauth-protected-resource/mcp
+            policies:
+              mcpAuthentication:
+                mode: strict
+                providers:
+                  - issuer: http://steward-mint.steward-system.svc.cluster.local:8080
+                    audiences:
+                      - steward-mcp
+                    jwks:
+                      url: http://steward-mint.steward-system.svc.cluster.local:8080/.well-known/jwks.json
+                    allowedAlgorithms: [EdDSA]
+                    jwtValidationOptions:
+                      requiredClaims: [exp, iss, sub, aud]
+                    discoverable: false
+                resourceMetadata:
+                  resource: http://mcp-gw-agentgateway.steward-system.svc.cluster.local:8080/mcp
+                  authorizationServers:
+                    - http://steward-mint.steward-system.svc.cluster.local:8080
+                  scopesSupported: [mcp]
+                  bearerMethodsSupported: [header]
+            backends:
+              - mcp:
+                  failureMode: failOpen
+                  prefixMode: never
+                  targets:
+                    - name: github
+                      policies:
+                        backendAuth:
+                          passthrough: {}
+                      mcp:
+                        host: http://mcp-gw.steward-system.svc.cluster.local:8080/mcp
