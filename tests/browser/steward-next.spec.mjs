@@ -246,7 +246,10 @@ const envelopeRequest = {
   templateId: "developer",
   templateRevision: 4,
   requestedEnvelope: envelope,
+  templateEnvelope: envelope,
   approvedEnvelope: envelope,
+  justification: null,
+  ceilingExceedances: [],
   status: "provisioned",
   approvalId: null,
   envelopeInstanceId: "runtime-example-1",
@@ -265,6 +268,8 @@ const pendingEnvelopeRequest = {
   templateRevision: 4,
   requestedEnvelope: envelope,
   templateEnvelope: adminEnvelope,
+  justification: "Needed for a bounded release review.",
+  ceilingExceedances: [{ dimension: "budget", requested: "40.00", ceiling: "25.00", currency: "USD" }],
   createdAt: "2026-08-24T17:05:00Z",
 };
 
@@ -319,6 +324,7 @@ const unifiedEnvelopeRequest = {
   stateAt: pendingEnvelopeRequest.createdAt,
   stateActor: pendingEnvelopeRequest.ownerUserId,
   deltas: [{ dimension: "budget", requested: "40.00", ceiling: "25.00", currency: "USD" }],
+  justification: pendingEnvelopeRequest.justification,
   requestedEnvelope: pendingEnvelopeRequest.requestedEnvelope,
   templateEnvelope: pendingEnvelopeRequest.templateEnvelope,
   history: [{ state: "requested", at: pendingEnvelopeRequest.createdAt, actor: pendingEnvelopeRequest.ownerUserId, reason: null }],
@@ -888,6 +894,7 @@ async function guardedPage(browser, {
   let githubAutomationCompleted = false;
   let publicationEvidence = null;
   let dispatchEvidence = null;
+  let currentEnvelopeRequest = structuredClone(envelopeRequest);
   let currentAdminSetupStatus = adminSetupStatus;
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
@@ -1029,6 +1036,23 @@ async function guardedPage(browser, {
   }));
   await context.route(`${origin}/app/api/v1/envelope-requests*`, async (route) => {
     if (route.request().method() === "POST") {
+      const submitted = route.request().postDataJSON();
+      if (submitted.requestedEnvelope?.spec?.ttl === "5h") {
+        mutations.push({ path: new URL(route.request().url()).pathname, headers: await route.request().allHeaders(), body: submitted });
+        currentEnvelopeRequest = {
+          ...envelopeRequest,
+          approvedEnvelope: null,
+          ceilingExceedances: [{ dimension: "ttl", requested: "5h", ceiling: "4h" }],
+          envelopeDigest: null,
+          envelopeInstanceId: null,
+          justification: submitted.justification,
+          requestedEnvelope: submitted.requestedEnvelope,
+          status: "pending",
+          templateEnvelope: envelope,
+        };
+        await json(route, { apiVersion: "steward.envelope-requests/v1", request: currentEnvelopeRequest }, 201);
+        return;
+      }
       await route.continue();
       return;
     }
@@ -1050,7 +1074,7 @@ async function guardedPage(browser, {
       await route.continue();
       return;
     }
-    await json(route, { apiVersion: "steward.envelope-requests/v1", request: envelopeRequest });
+    await json(route, { apiVersion: "steward.envelope-requests/v1", request: currentEnvelopeRequest });
   });
   const inlineTask = {
       taskId: browserTaskId,
@@ -2031,7 +2055,7 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
     for (const label of ["All", "Provisioned", "Pending", "Rejected"]) {
       await expect(developer.page.getByRole("tab", { name: new RegExp(`^${label}\\s+\\d+$`) })).toBeVisible();
     }
-    for (const label of ["Template", "Status", "Spend this month", "Per run", "TTL", "Tools"]) {
+    for (const label of ["Template", "Status", "Spend this month", "Limit per run", "TTL", "Tools"]) {
       await expect(developer.page.getByRole("columnheader", { name: label })).toBeVisible();
     }
 
@@ -2058,7 +2082,7 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
   const administrator = await guardedPage(browser, { colorScheme: "light", session: administratorSession });
   try {
     await administrator.page.goto(`${origin}/admin/approvals`);
-    await expect(administrator.page.getByText(/Requests above a template’s auto-approval threshold/)).toBeVisible();
+    await expect(administrator.page.getByText(/Requests above a template ceiling/)).toBeVisible();
     await expect(administrator.page.getByRole("table", { name: "Requests" })).toBeVisible();
     await administrator.page.getByRole("link", { name: /Developer/ }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/approvals/${unifiedEnvelopeRequest.id}`);
@@ -2469,6 +2493,75 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await expect(administrator.page.getByRole("navigation", { name: "Run jobs" })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
+  }
+});
+
+test("a value above the template ceiling is submitted for administrator approval", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  try {
+    await developer.page.goto(`${origin}/envelopes/new`);
+    await developer.page.locator("label").filter({ hasText: /^Template/ }).locator("select").selectOption("developer");
+    await developer.page.getByLabel("Time to live").fill("5h");
+
+    const summary = developer.page.getByText("Needs admin approval: 1 value above the template ceiling", { exact: true });
+    await expect(summary).toBeVisible();
+    await expect(developer.page.getByText("Time to live: 5h (ceiling 4h)", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("button", { name: "Submit for approval" })).toBeVisible();
+
+    await developer.page.getByLabel("Time to live").fill("4h");
+    await expect(summary).toHaveCount(0);
+    await expect(developer.page.getByRole("button", { name: "Submit request" })).toBeVisible();
+    await developer.page.getByLabel("Time to live").fill("5h");
+
+    await developer.page.getByLabel("Justification (optional)").fill("Needed for a bounded release review.");
+    await developer.page.getByRole("button", { name: "Submit for approval" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
+    await expect(developer.page.getByText("Pending administrator approval", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Time to live: 5h (ceiling 4h)", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Justification: Needed for a bounded release review.", { exact: true })).toBeVisible();
+
+    const mutation = developer.mutations.find((entry) => entry.path === "/app/api/v1/envelope-requests");
+    expectInterceptedMutationProof(mutation);
+    expect(mutation.body.justification).toBe("Needed for a bounded release review.");
+    expect(mutation.body.requestedEnvelope.spec.ttl).toBe("5h");
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("a field-specific envelope rejection identifies the field and clears after correction", async ({ browser }) => {
+  const failureReason = "Monthly limit exceeds the deployment safety ceiling.";
+  const developer = await guardedPage(browser, {
+    expectedHttpStatuses: [422],
+    mutationFailures: {
+      "/app/api/v1/envelope-requests": {
+        status: 422,
+        body: {
+          apiVersion: "steward.envelope-requests/v1",
+          error: "platform_safety_ceiling_exceeded",
+          failureReason,
+          fields: ["budgetMonthlyLimit"],
+        },
+      },
+    },
+  });
+  try {
+    await developer.page.goto(`${origin}/envelopes/new`);
+    await developer.page.locator("label").filter({ hasText: /^Template/ }).locator("select").selectOption("developer");
+    const monthlyLimit = developer.page.getByLabel("Monthly limit (USD)");
+    await monthlyLimit.fill("999.00");
+    await developer.page.getByRole("button", { name: "Submit for approval" }).click();
+
+    const failureAlert = developer.page.getByRole("alert").filter({ hasText: failureReason });
+    await expect(failureAlert).toHaveText(failureReason);
+    await expect(monthlyLimit).toHaveClass(/border-warn/);
+
+    await monthlyLimit.fill("25.00");
+    await expect(failureAlert).toHaveCount(0);
+    await expect(monthlyLimit).not.toHaveClass(/border-warn/);
+    await expect(developer.page.getByRole("button", { name: "Submit request" })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
   }
 });
 
@@ -3630,10 +3723,10 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(administrator.page).toHaveURL(`${origin}/admin/envelopes/templates/analyst`);
     await expect(administrator.page.getByText("Current revision 4")).toBeVisible();
     await expect(administrator.page.getByRole("combobox", { name: "Limit type" })).toHaveCount(0);
-    await expect(administrator.page.getByRole("textbox", { name: "Per run (USD)" })).toHaveValue("2.50");
+    await expect(administrator.page.getByRole("textbox", { name: "Limit per run (USD)" })).toHaveValue("2.50");
     await expect(administrator.page.getByRole("textbox", { name: "Monthly (USD)" })).toHaveValue("25.00");
     await administrator.page.getByRole("textbox", { name: "Monthly (USD)" }).fill("30.00");
-    await administrator.page.getByRole("textbox", { name: "Per run (USD)" }).fill("3.00");
+    await administrator.page.getByRole("textbox", { name: "Limit per run (USD)" }).fill("3.00");
     await expect(administrator.page.getByRole("textbox", { name: "TTL" })).toHaveValue("4h");
     const model = administrator.page.getByRole("combobox", { name: "Models" });
     await expect(model).toBeVisible();
@@ -3647,7 +3740,7 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(tools.getByText("github:repository:get_file_contents", { exact: true })).toBeVisible();
     await expect(administrator.page.getByRole("heading", { name: "Runner" })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
-    await expect(administrator.page.getByText("Template revision accepted by the Rust authority.")).toBeVisible();
+    await expect(administrator.page.getByText("Template revision saved.")).toBeVisible();
     await expect(administrator.page.getByText("Current revision 5")).toBeVisible();
     const templateMutation = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst");
     expectMutationProof(templateMutation);
@@ -3683,11 +3776,16 @@ test("administrator templates and approvals use typed browser authority", async 
     const envelopeRequestCard = administrator.page.locator("main");
     await expect(envelopeRequestCard.getByText("alice@example.com")).toBeVisible();
     await expect(envelopeRequestCard.getByRole("heading", { name: "Requested vs template ceiling" })).toBeVisible();
+    await expect(envelopeRequestCard.getByText("Requester justification", { exact: true })).toBeVisible();
+    await expect(envelopeRequestCard.getByText("Needed for a bounded release review.", { exact: true })).toBeVisible();
+    await expect(envelopeRequestCard.getByText("40.00 USD", { exact: true }).first()).toBeVisible();
+    await expect(envelopeRequestCard.getByText("25.00 USD", { exact: true }).first()).toBeVisible();
+    await expect(envelopeRequestCard.getByText("Monthly limit: 40.00 USD (ceiling 25.00 USD)", { exact: true })).toBeVisible();
     await expect(envelopeRequestCard.getByRole("button", { name: "Reject" })).toBeDisabled();
     await envelopeRequestCard.getByRole("button", { name: "File reference" }).click();
     await envelopeRequestCard.getByLabel("Rationale", { exact: true }).fill("Approved for the requested bounded envelope.");
     await envelopeRequestCard.getByRole("button", { name: "Approve exception" }).click();
-    await expect(envelopeRequestCard.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
+    await expect(envelopeRequestCard.getByText("The approval was applied.")).toBeVisible();
     const envelopeApprovalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`);
     expectMutationProof(envelopeApprovalMutation);
     expect(envelopeApprovalMutation.body.rationale).toBe("Approved for the requested bounded envelope.");
@@ -3695,12 +3793,12 @@ test("administrator templates and approvals use typed browser authority", async 
     await administrator.page.getByRole("link").filter({ hasText: approvalId }).click();
     const runtimeApprovalCard = administrator.page.locator("main");
     await runtimeApprovalCard.getByRole("button", { name: "File reference" }).click();
-    await expect(runtimeApprovalCard.getByText("Decision reference filed through the server-owned channel.")).toBeVisible();
+    await expect(runtimeApprovalCard.getByText("The decision reference was saved.")).toBeVisible();
     expectMutationProof(administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/approvals/${approvalId}/file`));
     await runtimeApprovalCard.getByLabel("Rationale", { exact: true }).fill("Approved for one bounded investigation.");
     await runtimeApprovalCard.getByLabel("Expires at (RFC 3339)").fill("2026-08-25T17:00:00Z");
     await runtimeApprovalCard.getByRole("button", { name: "Approve exception" }).click();
-    await expect(runtimeApprovalCard.getByText("Approval applied through the governed Rust admission path.")).toBeVisible();
+    await expect(runtimeApprovalCard.getByText("The approval was applied.")).toBeVisible();
     const approvalMutation = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/approvals/${approvalId}/approve`);
     expectMutationProof(approvalMutation);
     expect(approvalMutation.body.evidenceUrl).toBe("https://example.com/decisions/PROJ-123");
@@ -3742,7 +3840,7 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await administrator.page.getByRole("button", { name: "Remove analyst" }).click();
     await administrator.page.getByRole("button", { name: "Remove reviewer" }).click();
     await templateId.fill("not valid");
-    await administrator.page.getByRole("textbox", { name: "Per run (USD)" }).fill("not-a-decimal");
+    await administrator.page.getByRole("textbox", { name: "Limit per run (USD)" }).fill("not-a-decimal");
     await administrator.page.getByRole("textbox", { name: "Monthly (USD)" }).fill("");
     await administrator.page.getByRole("textbox", { name: "TTL" }).fill("");
     await administrator.page.getByRole("button", { name: "Remove provider-a/model-a" }).click();
@@ -3762,7 +3860,7 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await administrator.page.getByRole("textbox", { name: "Display name" }).fill("Operator");
     await roles.fill("operator");
     await roles.press("Enter");
-    await administrator.page.getByRole("textbox", { name: "Per run (USD)" }).fill("1.00");
+    await administrator.page.getByRole("textbox", { name: "Limit per run (USD)" }).fill("1.00");
     await administrator.page.getByRole("textbox", { name: "Monthly (USD)" }).fill("10.00");
     await administrator.page.getByRole("textbox", { name: "TTL" }).fill("15m");
     const models = administrator.page.getByRole("combobox", { name: "Models" });
@@ -4173,7 +4271,7 @@ test("administrator can reject a pending envelope request with an optional reaso
     const confirmation = administrator.page.getByRole("alertdialog", { name: "Reject this request?" });
     await expect(confirmation).toBeVisible();
     await confirmation.getByRole("button", { name: "Reject request" }).click();
-    await expect(envelopeRequestCard.getByText("The envelope request was rejected through the governed Rust admission path.")).toBeVisible();
+    await expect(envelopeRequestCard.getByText("The envelope request was rejected.")).toBeVisible();
     const rejection = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/reject`);
     expectMutationProof(rejection);
     expect(rejection.body).toEqual({ reason: "Authority is not appropriate for this user." });
@@ -4319,7 +4417,7 @@ test("connection OAuth keeps its deadline failure when the operation request abo
   }
 });
 
-test("envelope request keeps a Rust authorization denial explicit", async ({ browser }) => {
+test("envelope request keeps an authorization denial explicit", async ({ browser }) => {
   const developer = await guardedPage(browser, {
     expectedHttpStatuses: [403],
     mutationFailures: { "/app/api/v1/envelope-requests": 403 },
@@ -4327,7 +4425,7 @@ test("envelope request keeps a Rust authorization denial explicit", async ({ bro
   try {
     await developer.page.goto(`${origin}/envelopes/new`);
     await developer.page.getByRole("button", { name: "Submit request" }).click();
-    await expect(developer.page.getByText("The Rust authorization boundary rejected the request.")).toBeVisible();
+    await expect(developer.page.getByText("You are not allowed to submit this request.")).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -4343,13 +4441,13 @@ test("workflow rendering keeps an authoritative outage explicit", async ({ brows
     await developer.page.goto(`${origin}/envelopes/${envelopeId}`);
     await expect(developer.page.getByRole("combobox", { name: "Workflow", exact: true })).toHaveValue("repository-review@1");
     await developer.page.getByRole("button", { name: "Render workflow" }).click();
-    await expect(developer.page.getByText("The authoritative workflow service is unavailable.")).toBeVisible();
+    await expect(developer.page.getByText("Workflow rendering is unavailable. Try again.")).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
 });
 
-test("connection action keeps a Rust authorization denial explicit", async ({ browser }) => {
+test("connection action keeps an authorization denial explicit", async ({ browser }) => {
   const developer = await guardedPage(browser, {
     connectionPhase: "disconnected",
     expectedHttpStatuses: [403],
@@ -4358,7 +4456,7 @@ test("connection action keeps a Rust authorization denial explicit", async ({ br
   try {
     await developer.page.goto(`${origin}/connections`);
     await developer.page.getByRole("button", { name: "Connect GitHub" }).click();
-    await expect(developer.page.getByText("The Rust authorization boundary rejected the connection action.")).toBeVisible();
+    await expect(developer.page.getByText("You are not allowed to manage this connection.")).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }

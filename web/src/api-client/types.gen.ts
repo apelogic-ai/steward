@@ -49,6 +49,7 @@ export type AdminRequestView = {
     escalation?: null | EscalationView;
     history: Array<AdminRequestHistoryEvent>;
     id: string;
+    justification?: string | null;
     kind: AdminRequestKind;
     requestedEnvelope?: null | BrowserEnvelope;
     requester: AdminRequestRequester;
@@ -893,6 +894,7 @@ export type CreateBrowserMemberBody = {
 
 export type CreateEnvelopeRequestBody = {
     idempotencyKey: string;
+    justification?: string | null;
     requestedEnvelope: BrowserEnvelope;
     templateId?: string | null;
     templateRevision?: number | null;
@@ -1058,6 +1060,15 @@ export type EnvelopeEvidence = {
     revision: number;
     uid: Uuid;
 };
+
+export type EnvelopeRequestErrorResponse = {
+    apiVersion: string;
+    error: string;
+    failureReason: string;
+    fields: Array<EnvelopeRequestField>;
+};
+
+export type EnvelopeRequestField = 'requestedEnvelope' | 'justification' | 'rationale' | 'evidenceUrl' | 'expiresAt' | 'budgetMonthlyLimit' | 'budgetSingleRunLimit' | 'runtimeMinutesLimit' | 'ttl' | 'llms' | 'tools' | 'runnerPlatforms' | 'runnerMemory' | 'runnerCompute' | 'runnerStorage' | 'workspace';
 
 export type EnvelopeRequestHistoryEvent = {
     actor: string;
@@ -1795,17 +1806,20 @@ export type UpdateBrowserPreferences = {
 export type UserEnvelopeRequest = {
     approvalId?: string | null;
     approvedEnvelope?: null | BrowserEnvelope;
+    ceilingExceedances: Array<DirectAdmissionDelta>;
     createdAt: string;
     envelopeDigest?: string | null;
     envelopeInstanceId?: string | null;
     history: Array<EnvelopeRequestHistoryEvent>;
     id: string;
+    justification?: string | null;
     reason?: string | null;
     requestedEnvelope: BrowserEnvelope;
     status: EnvelopeRequestStatus;
     statusActor: string;
     statusAt: string;
     statusTemplateRevision?: number | null;
+    templateEnvelope?: null | BrowserEnvelope;
     templateId?: string | null;
     templateRevision?: number | null;
     usage?: null | EnvelopeUsageView;
@@ -2405,14 +2419,16 @@ export type ApproveAdminEnvelopeRequestErrors = {
      */
     409: unknown;
     /**
-     * Approval rationale or decision metadata is invalid
+     * Approval rationale, requested capabilities, or platform safety boundary is invalid
      */
-    422: unknown;
+    422: EnvelopeRequestErrorResponse;
     /**
      * Envelope request authority is unavailable
      */
     503: unknown;
 };
+
+export type ApproveAdminEnvelopeRequestError = ApproveAdminEnvelopeRequestErrors[keyof ApproveAdminEnvelopeRequestErrors];
 
 export type ApproveAdminEnvelopeRequestResponses = {
     200: BrowserEnvelopeRequestDecisionResponse;
@@ -4200,14 +4216,16 @@ export type CreateRequestErrors = {
      */
     409: unknown;
     /**
-     * Requested envelope is invalid
+     * Requested envelope is invalid or outside the deployment review boundary
      */
-    422: unknown;
+    422: EnvelopeRequestErrorResponse;
     /**
      * Envelope requests are unavailable
      */
     503: unknown;
 };
+
+export type CreateRequestError = CreateRequestErrors[keyof CreateRequestErrors];
 
 export type CreateRequestResponses = {
     201: EnvelopeRequestResponse;

@@ -4,6 +4,13 @@ import { readFileSync } from "node:fs";
 const source = readFileSync(new URL("./connections-view.tsx", import.meta.url), "utf8");
 
 describe("governed provider connection controls", () => {
+  test("uses plain connection failure messages", () => {
+    expect(source).toContain("Connections are unavailable. Try again.");
+    expect(source).toContain("The connection action could not be completed.");
+    expect(source).not.toContain("authoritative connection service");
+    expect(source).not.toContain("server-owned connection action");
+  });
+
   test("warns that disconnect affects every present and future runtime", () => {
     expect(source).toContain("every current and future runtime");
     expect(source).toContain("using your identity");

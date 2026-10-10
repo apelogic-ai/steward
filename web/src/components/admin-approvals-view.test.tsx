@@ -58,6 +58,13 @@ const unifiedRequest: AdminRequestView = {
 };
 
 describe("envelope request approval controls", () => {
+  test("uses plain request wording and consistent per-run labels", () => {
+    expect(source).toContain("Limit per run");
+    expect(source).toContain("custom envelope requests");
+    expect(source).not.toContain("Reload the authoritative queue");
+    expect(source).not.toContain("request authority is unavailable");
+  });
+
   test("unified queue preserves rejection and optional approval evidence", () => {
     const html = renderToStaticMarkup(<UnifiedRequestCard request={unifiedRequest} />);
 
@@ -67,6 +74,23 @@ describe("envelope request approval controls", () => {
     expect(html).toContain('name="reason"');
     expect(html).toContain("Expires at (optional)");
     expect(html).not.toContain('name="expiresAt" placeholder="2026-08-25T17:00:00Z" required=""');
+  });
+
+  test("shows the requester justification beside recorded ceiling deltas", () => {
+    const html = renderToStaticMarkup(<UnifiedRequestCard request={{
+      ...unifiedRequest,
+      deltas: [{ ceiling: "200.00", currency: "USD", dimension: "budget", requested: "300.00" }],
+      justification: "Needed for a release review",
+      kind: "ceiling_exceeded",
+    }} />);
+
+    expect(html).toContain("Requester justification");
+    expect(html).toContain("Needed for a release review");
+    expect(html).toContain("Requested vs template ceiling");
+    expect(html).toContain("Needs admin approval: 1 value above the template ceiling");
+    expect(html).toContain("Monthly limit: <strong>300.00 USD</strong> (ceiling 200.00 USD)");
+    expect(html).toContain("300.00 USD");
+    expect(html).toContain("200.00 USD");
   });
 
   test("shows the full requested authority for a template-free custom request", () => {
@@ -119,7 +143,7 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("200.00 USD");
     expect(html).toContain("model-b");
     expect(html).toContain("model-a");
-    expect(html).toContain("Single-run limit");
+    expect(html).toContain("Limit per run");
     expect(html).toContain("30.00 USD");
     expect(html).toContain("20.00 USD");
     expect(html).toContain("Runner platforms");

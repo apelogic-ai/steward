@@ -207,3 +207,8 @@ users and Tasks are not rewritten. Deprovisioning removes the credential while
 retaining its non-secret audit event. The deployment key remains outside the
 database; keep migration 0068 in place on rollback and restore that key with
 the database whenever managed credentials must remain usable.
+
+Migration 0069 records the optional requester justification and the exact
+template-ceiling admission deltas on each immutable Envelope request. Existing
+requests keep an empty delta list and no justification; no request or status
+history is rewritten.

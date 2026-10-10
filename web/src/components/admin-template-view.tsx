@@ -288,7 +288,7 @@ export function validateTemplateFields({
   if (memberRoles.length === 0) errors.memberRoles = "Add at least one eligible member role.";
   else if (memberRoles.length > 64) errors.memberRoles = "Use at most 64 eligible member roles.";
   else if (memberRoles.some((role) => !validTemplateIdentifier(role))) errors.memberRoles = "Use a valid identifier for every eligible member role.";
-  if (!singleRunLimit.trim()) errors.singleRunLimit = "Enter a per-run budget.";
+  if (!singleRunLimit.trim()) errors.singleRunLimit = "Enter a limit per run.";
   else if (!validDecimal(singleRunLimit.trim())) errors.singleRunLimit = decimalMessage;
   if (!monthlyLimit.trim()) errors.monthlyLimit = "Enter a monthly budget.";
   else if (!validDecimal(monthlyLimit.trim())) errors.monthlyLimit = decimalMessage;
@@ -465,10 +465,10 @@ function toolValue(tool: ToolGrant): string {
 
 function mutationMessage(status: Exclude<TemplateMutationState, "idle" | "saving">, rejectionCode: string | null): string {
   return {
-    saved: "Template revision accepted by the Rust authority.",
+    saved: "Template revision saved.",
     conflict: "A newer template revision already exists. Load it before authoring another revision.",
     rejected: `The server rejected the template, so no authority was changed.${rejectionCode ? ` Error code: ${rejectionCode}.` : ""}`,
-    forbidden: "The Rust authorization boundary rejected this template mutation.",
+    forbidden: "You are not allowed to change this template.",
     unavailable: "The authoritative template service is unavailable.",
     error: "The template response could not be accepted.",
   }[status];
@@ -514,7 +514,7 @@ function AuthenticatedTemplateList() {
             { key: "template", label: "Member role", className: "font-semibold", render: (template) => <span><span className="block truncate">{template.displayName}</span><span className="mt-0.5 block truncate font-mono text-xs font-normal text-muted-ink">{template.id}</span></span> },
             { key: "revision", label: "Revision", className: "font-mono text-muted-ink", render: (template) => `rev ${template.envelope.revision}` },
             { key: "monthly", label: "Monthly", className: "tabular-nums", render: (template) => `${template.envelope.spec.budget.monthlyLimit} ${template.envelope.spec.budget.currency}` },
-            { key: "per-run", label: "Per run", className: "tabular-nums", render: (template) => template.envelope.spec.budget.singleRunLimit ? `${template.envelope.spec.budget.singleRunLimit} ${template.envelope.spec.budget.currency}` : "—" },
+            { key: "per-run", label: "Limit per run", className: "tabular-nums", render: (template) => template.envelope.spec.budget.singleRunLimit ? `${template.envelope.spec.budget.singleRunLimit} ${template.envelope.spec.budget.currency}` : "—" },
             { key: "ttl", label: "TTL", className: "font-mono text-muted-ink", render: (template) => template.envelope.spec.ttl },
             { key: "tools", label: "Tools", render: (template) => <GrantChipList grants={template.envelope.spec.tools.map((tool) => ({ kind: grantKindForAction(tool.action), name: toolValue(tool) }))} limit={2} /> },
             { key: "open", label: "", className: "text-right text-lg text-faint-ink", render: () => "›" },
@@ -777,6 +777,8 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
     });
     if (result.data && result.response?.status === 201) {
       setCurrentRevision(result.data.envelope.revision);
+      setAutoApproveToCeiling(result.data.autoProvisionThreshold === null || result.data.autoProvisionThreshold === undefined);
+      setThresholdJson(JSON.stringify(result.data.autoProvisionThreshold ?? result.data.envelope, null, 2));
       if (!create && !saveAsNew) setPreviousTools(dedupeToolGrants(result.data.envelope.spec.tools));
       setStatus("saved");
       if (create || saveAsNew) router.push(`/admin/envelopes/templates/${encodeURIComponent(templateId)}`);
@@ -788,6 +790,14 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
   }
 
   const runner = template.spec.runner;
+  const autoApprovalSection = (
+    <FormSection description="Keep the default to approve every valid request inside the ceiling automatically, or provide a narrower complete envelope threshold." title="Auto-approval">
+      <div className="space-y-4">
+        <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => { setAutoApproveToCeiling(event.target.checked); clearFieldError("threshold"); }} type="checkbox" />Auto-approve every request within the ceiling</label>
+        {!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea aria-invalid={Boolean(fieldErrors.threshold)} className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setThresholdJson(event.target.value); clearFieldError("threshold"); }} spellCheck={false} value={thresholdJson} /><FieldError message={fieldErrors.threshold} /></label> : null}
+      </div>
+    </FormSection>
+  );
   if (create) {
     return (
       <form className="overflow-hidden rounded-card border bg-panel" noValidate onSubmit={submit}>
@@ -800,7 +810,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         </FormSection>
         <FormSection description="Inference spend limits in USD and how long an envelope stays valid." title="Budget and lifetime">
           <div className="grid gap-4 sm:grid-cols-4">
-            <label className="grid gap-2 text-sm font-semibold">Per run (USD)<input aria-invalid={Boolean(fieldErrors.singleRunLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setSingleRunLimit(event.target.value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Limit per run (USD)<input aria-invalid={Boolean(fieldErrors.singleRunLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setSingleRunLimit(event.target.value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label>
             <label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input aria-invalid={Boolean(fieldErrors.monthlyLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setMonthlyLimit(event.target.value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label>
             <label className="grid gap-2 text-sm font-semibold">TTL<input aria-invalid={Boolean(fieldErrors.ttl)} className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" onChange={() => clearFieldError("ttl")} required /><FieldError message={fieldErrors.ttl} /></label>
             <label className="grid gap-2 text-sm font-semibold">Runtime minutes<input aria-invalid={Boolean(fieldErrors.runtimeMinutes)} className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => { setRuntimeMinutesLimit(event.target.value); clearFieldError("runtimeMinutes"); }} placeholder="60" value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label>
@@ -832,9 +842,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         <FormSection description="Optional ceiling for typed Task workspaces. Blank means this template grants no workspace entries." title="Workspace authority">
           <label className="grid gap-2 text-sm font-semibold">Workspace authority (JSON)<textarea aria-invalid={Boolean(fieldErrors.workspace)} className="min-h-44 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setWorkspaceJson(event.target.value); clearFieldError("workspace"); }} placeholder={'{"allowedTypes":["git","scratch"],"maxTotalSize":"2Gi","maxFiles":100000,"maxHistoryDepth":1000,"maxSubmoduleDepth":4}'} spellCheck={false} value={workspaceJson} /><FieldError message={fieldErrors.workspace} /></label>
         </FormSection>
-        <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
-          <div className="space-y-4"><label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => { setAutoApproveToCeiling(event.target.checked); clearFieldError("threshold"); }} type="checkbox" />Auto-approve every request within the ceiling</label>{!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea aria-invalid={Boolean(fieldErrors.threshold)} className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setThresholdJson(event.target.value); clearFieldError("threshold"); }} spellCheck={false} value={thresholdJson} /><FieldError message={fieldErrors.threshold} /></label> : null}</div>
-        </FormSection>
+        {autoApprovalSection}
         <FormSection description="Repository packages remain available when inline authoring is disabled." title="Browser execution">
           <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={allowInlineBrowserTasks} onChange={(event) => setAllowInlineBrowserTasks(event.target.checked)} type="checkbox" />Allow inline browser-authored packages</label>
         </FormSection>
@@ -842,7 +850,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
           <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset>
         </FormSection>
         {status !== "idle" && status !== "saving" ? <p className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status, rejectionCode)}</p> : null}
-        <footer className="sticky bottom-0 flex flex-wrap items-center justify-between gap-4 border-t bg-subtle px-6 py-4"><p className="text-sm text-muted-ink">{models.length} model{models.length === 1 ? "" : "s"} · {tools.length} tool{tools.length === 1 ? "" : "s"} · {singleRunLimit || "—"} USD per run</p><div className="flex gap-3"><Link className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold" href="/admin/envelopes/templates">Cancel</Link><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="create">{status === "saving" ? "Saving…" : "Create template"}</button></div></footer>
+        <footer className="sticky bottom-0 flex flex-wrap items-center justify-between gap-4 border-t bg-subtle px-6 py-4"><p className="text-sm text-muted-ink">{models.length} model{models.length === 1 ? "" : "s"} · {tools.length} tool{tools.length === 1 ? "" : "s"} · Limit per run: {singleRunLimit || "—"} USD</p><div className="flex gap-3"><Link className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold" href="/admin/envelopes/templates">Cancel</Link><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="create">{status === "saving" ? "Saving…" : "Create template"}</button></div></footer>
       </form>
     );
   }
@@ -862,7 +870,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       </FormSection>
 
       <FormSection description="Inference spend limits in USD and how long an envelope stays valid." title="Budget and lifetime">
-        <div className="grid gap-4 sm:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Per run (USD)<input aria-invalid={Boolean(fieldErrors.singleRunLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setSingleRunLimit(event.target.value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label><label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input aria-invalid={Boolean(fieldErrors.monthlyLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setMonthlyLimit(event.target.value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label><label className="grid gap-2 text-sm font-semibold">TTL<input aria-invalid={Boolean(fieldErrors.ttl)} className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" onChange={() => clearFieldError("ttl")} required /><FieldError message={fieldErrors.ttl} /></label><label className="grid gap-2 text-sm font-semibold">Runtime minutes<input aria-invalid={Boolean(fieldErrors.runtimeMinutes)} className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => { setRuntimeMinutesLimit(event.target.value); clearFieldError("runtimeMinutes"); }} placeholder="60" value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label></div>
+        <div className="grid gap-4 sm:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Limit per run (USD)<input aria-invalid={Boolean(fieldErrors.singleRunLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setSingleRunLimit(event.target.value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label><label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input aria-invalid={Boolean(fieldErrors.monthlyLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setMonthlyLimit(event.target.value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label><label className="grid gap-2 text-sm font-semibold">TTL<input aria-invalid={Boolean(fieldErrors.ttl)} className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" onChange={() => clearFieldError("ttl")} required /><FieldError message={fieldErrors.ttl} /></label><label className="grid gap-2 text-sm font-semibold">Runtime minutes<input aria-invalid={Boolean(fieldErrors.runtimeMinutes)} className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => { setRuntimeMinutesLimit(event.target.value); clearFieldError("runtimeMinutes"); }} placeholder="60" value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label></div>
       </FormSection>
 
       <FormSection description="Only models supported by the inference gateway can be selected." title="Models"><fieldset><legend className="sr-only">Models</legend><TagSelect addPlaceholder="Add…" emptyPlaceholder="Search models…" inputDisabled={modelCatalog.length === 0} label="Models" onChange={(keys) => { setModels(keys.flatMap((key) => { const model = [...modelCatalog, ...missingModels].find((candidate) => modelKey(candidate) === key); return model ? [model] : []; })); clearFieldError("models"); }} options={modelOptions} value={models.map(modelKey)} /><FieldError message={fieldErrors.models} />{missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}</fieldset></FormSection>
@@ -871,12 +879,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
 
       <FormSection description="Optional ceiling for typed Task workspaces. Blank means this template grants no workspace entries." title="Workspace authority"><label className="grid gap-2 text-sm font-semibold">Workspace authority (JSON)<textarea aria-invalid={Boolean(fieldErrors.workspace)} className="min-h-44 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setWorkspaceJson(event.target.value); clearFieldError("workspace"); }} placeholder={'{"allowedTypes":["git","scratch"],"maxTotalSize":"2Gi","maxFiles":100000,"maxHistoryDepth":1000,"maxSubmoduleDepth":4}'} spellCheck={false} value={workspaceJson} /><FieldError message={fieldErrors.workspace} /></label></FormSection>
 
-      <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
-        <div className="space-y-4">
-          <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => { setAutoApproveToCeiling(event.target.checked); clearFieldError("threshold"); }} type="checkbox" />Auto-approve every request within the ceiling</label>
-          {!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea aria-invalid={Boolean(fieldErrors.threshold)} className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setThresholdJson(event.target.value); clearFieldError("threshold"); }} spellCheck={false} value={thresholdJson} /><FieldError message={fieldErrors.threshold} /></label> : null}
-        </div>
-      </FormSection>
+      {autoApprovalSection}
 
       <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
 

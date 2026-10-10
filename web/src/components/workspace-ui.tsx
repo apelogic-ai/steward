@@ -45,7 +45,7 @@ export function ResourceBoundary<T>({ children, state }: Readonly<{
   const messages = {
     loading: ["Loading authoritative data", "HyperShell is reading the current server-owned record."],
     "not-found": ["Not found", "The requested record does not exist in your server-authorized scope."],
-    forbidden: ["Forbidden", "The Rust authorization boundary did not permit this request."],
+    forbidden: ["Forbidden", "You are not allowed to view this resource."],
     unavailable: ["Authoritative data unavailable", "The source of truth could not be reached. No placeholder data is shown."],
     error: ["Data could not be accepted", "HyperShell received an unexpected response and has not inferred a successful state."],
   } as const;

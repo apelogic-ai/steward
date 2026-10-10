@@ -18,9 +18,9 @@ use kube::core::Request as KubeRequest;
 use kube::{Client, ResourceExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::{postgres::PgPoolOptions, types::Uuid};
+use sqlx::{postgres::PgPoolOptions, types::Json as SqlJson, types::Uuid};
 use steward_admission::internal_authorities::steward_connections_v1;
-use steward_admission::{AdmissionDecision, Envelope, EnvelopeSpec};
+use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec};
 use steward_apiserver::connections::{
     ConnectionBrokerError, ConnectionSession, ConnectionStartOperation, ConnectionSubject,
     ProviderConnectionBroker,
@@ -399,6 +399,8 @@ async fn concurrent_provisioning_enforces_active_digest_uniqueness_transactional
             template_revision: Some(1),
             requested_envelope: &envelope,
             idempotency_key: &format!("request-a-{suffix}"),
+            justification: None,
+            ceiling_exceedances: &[],
             actor: "test-bootstrap",
         })
         .await?
@@ -410,6 +412,8 @@ async fn concurrent_provisioning_enforces_active_digest_uniqueness_transactional
             template_revision: Some(1),
             requested_envelope: &envelope,
             idempotency_key: &format!("request-b-{suffix}"),
+            justification: None,
+            ceiling_exceedances: &[],
             actor: "test-bootstrap",
         })
         .await?
@@ -1067,6 +1071,8 @@ async fn browser_task_rows_persist_and_concurrency_is_bounded_without_breaking_e
             template_revision: Some(1),
             requested_envelope: &envelope,
             idempotency_key: &format!("browser-limit-envelope-{suffix}"),
+            justification: None,
+            ceiling_exceedances: &[],
             actor: "test-bootstrap",
         })
         .await?
@@ -1882,22 +1888,113 @@ async fn multiple_named_envelope_templates_coexist_for_one_role_and_pin_requests
         template_ids.iter().map(String::as_str).collect::<Vec<_>>()
     );
     let mut request_ids = Vec::new();
+    let mut review_requested_envelope = envelope.clone();
+    review_requested_envelope.spec.ttl = Duration("2h".to_owned());
     for (index, template_id) in template_ids.iter().enumerate() {
+        let requested_envelope = if index == 0 {
+            &review_requested_envelope
+        } else {
+            &envelope
+        };
+        let justification = (index == 0).then_some("Need a longer review window");
+        let ceiling_exceedances = (index == 0)
+            .then(|| {
+                vec![AdmissionDelta::Ttl {
+                    requested: "2h".to_owned(),
+                    ceiling: "1h".to_owned(),
+                }]
+            })
+            .unwrap_or_default();
+        let idempotency_key = format!("template-request-{suffix}-{index}");
         let request = store
             .reserve_envelope_request(EnvelopeRequestReservationRequest {
                 owner_user_id: &identity.user_id,
                 template_id: Some(template_id),
                 template_revision: Some(envelope.revision),
-                requested_envelope: &envelope,
-                idempotency_key: &format!("template-request-{suffix}-{index}"),
+                requested_envelope,
+                idempotency_key: &idempotency_key,
+                justification,
+                ceiling_exceedances: &ceiling_exceedances,
                 actor: identity.user_id.as_str(),
             })
             .await?
             .record;
         assert_eq!(request.template_id.as_ref(), Some(template_id));
+        assert_eq!(request.template_envelope.as_ref(), Some(&envelope));
+        assert_eq!(request.justification.as_deref(), justification);
+        assert_eq!(request.ceiling_exceedances, ceiling_exceedances);
+        let retry = store
+            .reserve_envelope_request(EnvelopeRequestReservationRequest {
+                owner_user_id: &identity.user_id,
+                template_id: Some(template_id),
+                template_revision: Some(envelope.revision),
+                requested_envelope,
+                idempotency_key: &idempotency_key,
+                justification,
+                ceiling_exceedances: &ceiling_exceedances,
+                actor: identity.user_id.as_str(),
+            })
+            .await?;
+        assert_eq!(retry.record, request);
+        assert!(!retry.inserted);
         request_ids.push(request.id);
     }
     assert_ne!(request_ids[0], request_ids[1]);
+
+    assert!(matches!(
+        store
+            .reserve_envelope_request(EnvelopeRequestReservationRequest {
+                owner_user_id: &identity.user_id,
+                template_id: Some(&template_ids[0]),
+                template_revision: Some(envelope.revision),
+                requested_envelope: &review_requested_envelope,
+                idempotency_key: &format!("template-request-{suffix}-0"),
+                justification: Some("A different explanation"),
+                ceiling_exceedances: &[AdmissionDelta::Ttl {
+                    requested: "2h".to_owned(),
+                    ceiling: "1h".to_owned(),
+                }],
+                actor: identity.user_id.as_str(),
+            })
+            .await,
+        Err(StoreError::EnvelopeRequestIdempotencyConflict)
+    ));
+    assert!(matches!(
+        store
+            .reserve_envelope_request(EnvelopeRequestReservationRequest {
+                owner_user_id: &identity.user_id,
+                template_id: Some(&template_ids[0]),
+                template_revision: Some(envelope.revision),
+                requested_envelope: &review_requested_envelope,
+                idempotency_key: &format!("template-request-{suffix}-0"),
+                justification: Some("Need a longer review window"),
+                ceiling_exceedances: &[],
+                actor: identity.user_id.as_str(),
+            })
+            .await,
+        Err(StoreError::EnvelopeRequestIdempotencyConflict)
+    ));
+
+    let invalid_custom_delta = sqlx::query(
+        "INSERT INTO envelope_requests \
+         (id, owner_user_id, template_id, template_revision, requested_envelope, \
+          idempotency_key, justification, ceiling_exceedances) \
+         VALUES ($1, $2, NULL, NULL, $3, $4, NULL, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(identity.user_id.as_str())
+    .bind(SqlJson(envelope.clone()))
+    .bind(format!("invalid-custom-delta-{suffix}"))
+    .bind(SqlJson(vec![AdmissionDelta::Ttl {
+        requested: "2h".to_owned(),
+        ceiling: "1h".to_owned(),
+    }]))
+    .execute(store.pool())
+    .await;
+    assert!(
+        invalid_custom_delta.is_err(),
+        "the database must reject comparison deltas without a pinned template"
+    );
 
     let filing_token = store
         .claim_envelope_request_decision_filing(request_ids[0], "admin-test")
@@ -1928,6 +2025,62 @@ async fn multiple_named_envelope_templates_coexist_for_one_role_and_pin_requests
             .await,
         Err(StoreError::DecisionReferenceMismatch)
     ));
+
+    let mut replacement = envelope.clone();
+    replacement.revision = 2;
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &template_ids[0],
+            display_name: "Develop",
+            member_roles: std::slice::from_ref(&role),
+            ceiling: &replacement,
+            auto_provision_threshold: Some(&replacement),
+            allow_inline_browser_tasks: true,
+            authored_by: "test-revision-author",
+        })
+        .await?;
+    let pinned_revision_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&review_requested_envelope)?)
+    );
+    store
+        .append_envelope_request_status(
+            request_ids[0],
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: Some(Uuid::new_v4()),
+                envelope_instance_id: Some("env_pinned_template_test"),
+                envelope_digest: Some(&pinned_revision_digest),
+                reason: None,
+                rationale: Some("reviewed exception"),
+                evidence_url: Some("https://example.com/decisions/PROJ-123"),
+                expires_at: None,
+                approved_envelope: Some(&review_requested_envelope),
+                actor: "admin-test",
+            },
+        )
+        .await?;
+    let provisioned_from_pinned_revision = store
+        .envelope_request(&identity.user_id, request_ids[0])
+        .await?
+        .ok_or(StoreError::EnvelopeRequestNotFound)?;
+    assert_eq!(
+        provisioned_from_pinned_revision.status,
+        EnvelopeRequestStatus::Provisioned
+    );
+    assert_eq!(
+        provisioned_from_pinned_revision.template_revision,
+        Some(envelope.revision),
+        "approval must retain the immutable revision selected when the request was created"
+    );
+    assert_eq!(
+        store
+            .active_provisioned_user_envelopes(&identity.user_id)
+            .await?
+            .len(),
+        1
+    );
 
     let released_token = store
         .claim_envelope_request_decision_filing(request_ids[1], "admin-test")
@@ -2012,6 +2165,8 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             template_revision: Some(envelope.revision),
             requested_envelope: &envelope,
             idempotency_key: &format!("envelope-{suffix}"),
+            justification: None,
+            ceiling_exceedances: &[],
             actor: identity.user_id.as_str(),
         })
         .await?
@@ -2543,6 +2698,8 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             template_revision: Some(envelope.revision),
             requested_envelope: &envelope,
             idempotency_key: &format!("envelope-{suffix}"),
+            justification: None,
+            ceiling_exceedances: &[],
             actor: "admin@example.com",
         })
         .await?
