@@ -17,6 +17,7 @@ docker info >/dev/null
 setup_started="${SECONDS}"
 
 MCP_GW_LOCAL_IMAGE="steward/mcp-gw-github-wrapper:${RUN_ID}"
+AGENTGATEWAY_LOCAL_IMAGE="steward/mcp-gw-agentgateway:${RUN_ID}"
 MINT_IMAGE="steward/mint:${RUN_ID}"
 BRIDGE_IMAGE="steward/connections-bridge:${RUN_ID}"
 WEBHOOK_IMAGE="steward/connections-webhook:${RUN_ID}"
@@ -26,6 +27,7 @@ cleanup() {
   status="$1"
   trap - EXIT INT TERM
   docker image rm "${MCP_GW_LOCAL_IMAGE}" >/dev/null 2>&1 || true
+  docker image rm "${AGENTGATEWAY_LOCAL_IMAGE}" >/dev/null 2>&1 || true
   docker image rm "${MINT_IMAGE}" >/dev/null 2>&1 || true
   docker image rm "${BRIDGE_IMAGE}" >/dev/null 2>&1 || true
   docker image rm "${WEBHOOK_IMAGE}" >/dev/null 2>&1 || true
@@ -37,9 +39,12 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 MCP_GW_RELEASE_IMAGE="ghcr.io/apelogic-ai/mcp-gw-github-wrapper@sha256:9f1d76b7418caca120ab1651eb5335269127b1b3bccf4abaad79132d7a64cfe4"
+AGENTGATEWAY_RELEASE_IMAGE="ghcr.io/apelogic-ai/mcp-gw-agentgateway@sha256:051e1c979b98561cfb833c8f44a55caac715d231c14bb0060371101fc9465c4a"
 
 docker pull "${MCP_GW_RELEASE_IMAGE}"
 docker tag "${MCP_GW_RELEASE_IMAGE}" "${MCP_GW_LOCAL_IMAGE}"
+docker pull "${AGENTGATEWAY_RELEASE_IMAGE}"
+docker tag "${AGENTGATEWAY_RELEASE_IMAGE}" "${AGENTGATEWAY_LOCAL_IMAGE}"
 if [[ -n "${STEWARD_CONNECTIONS_PREBUILT_DIR:-}" ]]; then
   if [[ "${STEWARD_CONNECTIONS_PREBUILT_DIR}" != /* ]]; then
     echo "STEWARD_CONNECTIONS_PREBUILT_DIR must be an absolute path" >&2
@@ -106,6 +111,7 @@ printf 'governed-connections timing: setup-and-build-seconds=%s\n' \
 STEWARD_RUN_ID="${RUN_ID}" \
 STEWARD_OPEN_SHELL_RELEASE=v0.0.98 \
 STEWARD_CONNECTIONS_TEST_MCP_GW_IMAGE="${MCP_GW_LOCAL_IMAGE}" \
+STEWARD_CONNECTIONS_TEST_AGENTGATEWAY_IMAGE="${AGENTGATEWAY_LOCAL_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_MINT_IMAGE="${MINT_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_BRIDGE_IMAGE="${BRIDGE_IMAGE}" \
 STEWARD_CONNECTIONS_TEST_WEBHOOK_IMAGE="${WEBHOOK_IMAGE}" \

@@ -387,3 +387,42 @@ metadata:
 spec:
   selector: { app: steward-connections-e2e-mcp-gw }
   ports: [{ name: http, port: 8080, targetPort: http }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-gw-agentgateway
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: steward-connections-e2e-agentgateway }
+  template:
+    metadata:
+      labels:
+        app: steward-connections-e2e-agentgateway
+        steward.test/run-id: RUN_ID_PLACEHOLDER
+    spec:
+      containers:
+        - name: agentgateway
+          image: AGENTGATEWAY_IMAGE_PLACEHOLDER
+          imagePullPolicy: Never
+          args: ["--file", "/etc/agentgateway/config.yaml"]
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { tcpSocket: { port: http }, initialDelaySeconds: 2, periodSeconds: 2 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/agentgateway/config.yaml, subPath: agentgateway.yaml, readOnly: true }
+      volumes:
+        - name: config
+          configMap: { name: steward-connections-e2e-fixtures }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-gw-agentgateway
+  namespace: steward-system
+  labels: { steward.test/run-id: RUN_ID_PLACEHOLDER }
+spec:
+  selector: { app: steward-connections-e2e-agentgateway }
+  ports: [{ name: http, port: 8080, targetPort: http }]

@@ -4,6 +4,18 @@ const port = Number(process.env.PORT ?? "8090");
 const fixtureEmail = process.env.FIXTURE_EMAIL ?? "alice@example.com";
 const githubScopes = process.env.FIXTURE_GITHUB_SCOPES ?? "repo";
 const providerToken = "obviously-fake-provider-token";
+const governedWorkflow = [
+  "on:",
+  "  workflow_dispatch:",
+  "    inputs:",
+  "      message:",
+  "jobs:",
+  "  governed:",
+  "    uses: example-org/steward-run/.github/workflows/steward-task.yml@0123456789012345678901234567890123456789",
+  "",
+].join("\n");
+let publicationBranch = "";
+let workflowDispatched = false;
 
 Bun.serve({
   port,
@@ -50,76 +62,105 @@ Bun.serve({
         if (payload.method === "tools/list") {
           return rpcResult(id, {
             tools: [
-              {
-                name: "get_file_contents",
-                description: "Return neutral fixture file contents.",
-                inputSchema: {
-                  type: "object",
-                  properties: {
-                    owner: { type: "string" },
-                    repo: { type: "string" },
-                    path: { type: "string" },
-                  },
-                  required: ["owner", "repo", "path"],
-                  additionalProperties: false,
-                },
-              },
-              {
-                name: "actions_run_trigger",
-                description: "Exercise the governed GitHub Actions mutation boundary.",
-                annotations: {
-                  readOnlyHint: false,
-                  destructiveHint: true,
-                  idempotentHint: false,
-                },
-                inputSchema: {
-                  type: "object",
-                  properties: {
-                    method: { type: "string" },
-                    owner: { type: "string" },
-                    repo: { type: "string" },
-                    run_id: { type: "number" },
-                  },
-                  required: ["method", "owner", "repo"],
-                  additionalProperties: false,
-                },
-              },
+              readTool("get_me"),
+              readTool("search_repositories"),
+              readTool("get_file_contents"),
+              readTool("actions_list"),
+              writeTool("actions_run_trigger"),
+              writeTool("create_branch"),
+              writeTool("push_files"),
+              writeTool("create_pull_request"),
             ],
           });
         }
-        if (
-          payload.method === "tools/call" &&
-          isRecord(payload.params) &&
-          payload.params.name === "get_file_contents"
-        ) {
-          return rpcResult(id, {
-            content: [{ type: "text", text: "governed fixture file contents" }],
-          });
-        }
-        if (
-          payload.method === "tools/call" &&
-          isRecord(payload.params) &&
-          payload.params.name === "actions_run_trigger" &&
-          isRecord(payload.params.arguments)
-        ) {
-          const args = payload.params.arguments;
-          const exactKeys = Object.keys(args).sort().join(",") === "method,owner,repo,run_id";
+        if (payload.method === "tools/call" && isRecord(payload.params)) {
+          const name = payload.params.name;
+          const args = isRecord(payload.params.arguments) ? payload.params.arguments : {};
+          if (name === "get_me") {
+            return toolResult(id, { login: "alice", id: 1000001 });
+          }
+          if (name === "search_repositories") {
+            return toolResult(id, {
+              total_count: 1,
+              incomplete_results: false,
+              items: [
+                {
+                  id: 1296269,
+                  name: "example-repo",
+                  full_name: "example-org/example-repo",
+                  owner: { login: "example-org", id: 1000002, type: "Organization" },
+                  html_url: "https://github.com/example-org/example-repo",
+                  private: false,
+                  default_branch: "main",
+                },
+              ],
+            });
+          }
+          if (name === "get_file_contents") {
+            const content =
+              args.path === ".github/workflows/steward-browser-task.yml"
+                ? governedWorkflow
+                : "governed fixture file contents";
+            return toolResult(id, {
+              content,
+              sha: "0123456789abcdef0123456789abcdef01234567",
+            });
+          }
+          if (name === "create_branch") {
+            publicationBranch = typeof args.branch === "string" ? args.branch : "";
+            return toolResult(id, {
+              ref: `refs/heads/${publicationBranch}`,
+              object: { sha: "1111111111111111111111111111111111111111" },
+            });
+          }
+          if (name === "push_files") {
+            return toolResult(id, {
+              commit: { sha: "2222222222222222222222222222222222222222" },
+            });
+          }
+          if (name === "create_pull_request") {
+            const branch = typeof args.head === "string" ? args.head : publicationBranch;
+            return toolResult(id, {
+              number: 17,
+              html_url: "https://github.com/example-org/example-repo/pull/17",
+              state: "open",
+              head: { ref: branch },
+              base: { ref: "main" },
+            });
+          }
+          if (name === "actions_list") {
+            return toolResult(
+              id,
+              workflowDispatched
+                ? {
+                    workflow_runs: [
+                      {
+                        id: 101,
+                        event: "workflow_dispatch",
+                        html_url:
+                          "https://github.com/example-org/example-repo/actions/runs/101",
+                      },
+                    ],
+                  }
+                : { workflow_runs: [] },
+            );
+          }
+          if (name === "actions_run_trigger" && args.method === "run_workflow") {
+            workflowDispatched = true;
+            return toolResult(id, {});
+          }
           if (
-            exactKeys &&
+            name === "actions_run_trigger" &&
             args.method === "rerun_workflow_run" &&
             args.owner === "example-org" &&
             args.repo === "example-repo" &&
             args.run_id === 12345
           ) {
-            return rpcResult(id, {
-              content: [{ type: "text", text: "provider detail that Steward must discard" }],
-              structuredContent: { accepted: true },
-              isError: false,
-            });
+            return toolResult(id, { accepted: true }, "provider detail that Steward must discard");
           }
           return rpcResult(id, {
-            content: [{ type: "text", text: "invalid rerun fixture request" }],
-            structuredContent: { error: "invalid_rerun_fixture_request" },
+            content: [{ type: "text", text: "invalid governed fixture request" }],
+            structuredContent: { error: "invalid_governed_fixture_request" },
             isError: true,
           });
         }
@@ -145,6 +186,36 @@ async function withProviderToken(
 
 function rpcResult(id: string | number | null, result: unknown): Response {
   return Response.json({ jsonrpc: "2.0", id, result });
+}
+
+function toolResult(
+  id: string | number | null,
+  structuredContent: Record<string, unknown>,
+  text = "fixture operation completed",
+): Response {
+  return rpcResult(id, {
+    content: [{ type: "text", text }],
+    structuredContent,
+    isError: false,
+  });
+}
+
+function readTool(name: string): Record<string, unknown> {
+  return {
+    name,
+    description: `Read neutral ${name} fixture data.`,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+    inputSchema: { type: "object", additionalProperties: true },
+  };
+}
+
+function writeTool(name: string): Record<string, unknown> {
+  return {
+    name,
+    description: `Exercise the governed ${name} mutation boundary.`,
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+    inputSchema: { type: "object", additionalProperties: true },
+  };
 }
 
 function jsonRpcId(value: unknown): string | number | null {
