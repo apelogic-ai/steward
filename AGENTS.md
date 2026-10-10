@@ -216,19 +216,31 @@ For documentation-only changes, run:
 git diff --check origin/main...HEAD
 cargo xtask check-neutrality
 cargo xtask check-secrets
+cargo test -p xtask
+bash scripts/validate-release-version.sh
 ```
+
+The last two are the gates that read documentation: the repository contract
+tests parse the READMEs and guides, and the release version check reads the
+root `README.md` and `CHANGELOG.md`.
 
 Documentation-only means Markdown and static images anywhere in the repository,
 wherever they live: `docs/`, the root `README.md` and `CHANGELOG.md`, and
 Markdown beside code. Location does not decide the gate; content does.
 
+Agent-instruction files — `AGENTS.md`, `CLAUDE.md`, every nested equivalent,
+and the agent and skill definitions under `.claude/` — use the documentation
+gate. The gate is not the approval: changing them still requires the maintainer
+request in "Authority and rule changes".
+
 These are Markdown and still use the full gate:
 
-- agent-instruction files — `AGENTS.md`, `CLAUDE.md`, and every nested
-  equivalent;
 - `docs/contracts/`, which is normative wire contract rather than prose;
-- executable or generated Markdown, and any Markdown a script or CI job
-  consumes as input.
+- executable or generated Markdown;
+- any Markdown compiled or bundled into a product artifact, or read by a
+  script or CI job the documentation gate does not run: a document included
+  with `include_str!`, the chart README, a configuration bundle README, a
+  document copied into an image or a release bundle.
 
 Everything that is not Markdown or a static image uses the full gate: source,
 tests, scripts, dependencies, policy, build, deployment, CI, hooks, schemas,
@@ -251,10 +263,48 @@ Never hand off warnings. Repository Clippy policy treats warnings as errors.
 Whatever the gate, check the diff against "Product rules every change must
 satisfy" before every push; PR review blocks on them.
 
+### CI change classes
+
+CI applies the same selection to pull requests and merge-queue groups. The
+`changes` job classifies the diff with `scripts/ci-change-class.sh`, and each
+lane runs only for the classes that need it:
+
+| Class | The diff contains only | Lanes that run |
+|---|---|---|
+| `docs` | files on the documentation allowlist | `quality / reduced` |
+| `web` | files under `web/` or `tests/browser/`, plus documentation | `quality / reduced`, `e2e / browser user journeys`, `release / chart and images` |
+| `full` | anything else | every lane |
+
+- `quality / reduced` runs the workflow lint, `check-neutrality`,
+  `check-secrets`, the repository contract tests, and the release version
+  check. The browser lane runs `bun run web:check`, which includes the
+  generated-client-is-current check.
+- The classifier is an allowlist and fails safe. An empty or oversized diff, a
+  symlink, a missing or unrelated base, a pull request that does not target
+  `main`, and any error inside the classifier are `full`. A merge-queue group
+  is classified over everything between `main` and the group, so an entry
+  queued behind a non-web change is `full`. Pushes to `main`, scheduled
+  runs, and manual runs are always `full`, and the release workflow does not
+  use classes. A release PR is `full` because it changes chart metadata.
+- The CI documentation allowlist is narrower than the local definition above:
+  agent-instruction files, READMEs, the root `CHANGELOG.md`, Markdown under
+  `.claude/` and `.codex/`, and Markdown and static images under `docs/`. Other Markdown
+  beside code is `full` in CI.
+- `pinned` stays the only required check. It requires `success` from every
+  lane the class runs and `skipped` from every lane the class skips, and fails
+  on anything else, including a `changes` job that failed.
+- The script's path rules and lane table are the source of truth, and
+  `scripts/test-ci-change-class.sh` tests them in `cargo xtask ci`. When a
+  document becomes an input to a build, bundle, or test outside `xtask`, add
+  it to the consumed list in the script in the same change. The tests catch
+  the common cases (a path named in Rust outside `xtask`, in a script, or in
+  an image build), not every way a file can be read, so check by hand too.
+
 ### Documentation currency
 
-The documentation-only gate checks whitespace, neutral identifiers, and secret
-material. It cannot tell whether a document still agrees with the code it
+The documentation-only gate checks whitespace, neutral identifiers, secret
+material, and the specific phrases and versions the contract tests and the
+release version check look for. It cannot tell whether a document still agrees with the code it
 describes, so that judgement is yours:
 
 - A document describing released behavior names the release it describes, so a
