@@ -190,7 +190,7 @@ Steward has a metrics mechanism.
 
 ## First-run prerequisite failures
 
-The 0.3.14 first-run path fails before creating a Task or runtime when a required
+The 0.3.15 first-run path fails before creating a Task or runtime when a required
 deployment or identity prerequisite is absent. Use the following exact signals; do
 not diagnose these cases as generic database, Kubernetes, or credential failures.
 

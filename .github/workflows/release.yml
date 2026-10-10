@@ -628,7 +628,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.14"
+          test "$version" = "0.3.15"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
@@ -745,7 +745,8 @@ jobs:
                 "0064_github_repository_automation_operations.sql",
                 "0065_connection_operation_retry_identities.sql",
                 "0066_task_output_archive_contract.sql",
-                "0067_browser_task_library.sql"
+                "0067_browser_task_library.sql",
+                "0068_managed_inference_credentials.sql"
               ],
               serviceEnvelopeSupported: false
             }' > dist/release-handoff.json
@@ -753,16 +754,16 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.14 fixes issue 330: the Connections bridge now establishes an MCP Streamable HTTP session before its tool calls. Each governed GitHub operation sends initialize, then notifications/initialized, carries the issued Mcp-Session-Id and negotiated MCP-Protocol-Version on every tools/call, ends with a best-effort session DELETE, and re-initializes once when the gateway answers 404 for an ended session. Publication, workflow detection, dispatch, run status, rerun, and explicit repository searches now work behind the MCP-GW agentgateway origin; on v0.3.13 and earlier, including v0.3.12, they failed with bridge-gateway-http and upstream status 400. Direct GitHub wrapper origins and the legacy 0.3.2 rerun are unchanged. The fix was verified against the agentgateway image pinned by MCP-GW 0.5.7.\n\n'
-            printf 'A new connection-operation failure category, bridge-gateway-session, reported as gateway_session_failed at the Connections API, identifies an MCP session the gateway rejected, that ended again after one re-initialization, or whose initialize reply or session ID was invalid. Every other failure keeps its existing category.\n\n'
-            printf 'Mint adds a ManagedCredentialGrantResolver library component for managed inference credentials. It is not wired to a credential store or the browser yet, so this release has no behavior change from it.\n\n'
-            printf 'This release retains everything shipped in v0.3.13, including the admitted source repository listing, the restored execution transcript for full execution-log Tasks, and governed operation latency reporting.\n\n'
+            printf 'Steward v0.3.15 adds governed Task workspaces. TaskDefinition v2 can request exact, admitted Git commits with bounded history, paths and admitted submodules, plus bounded scratch space. Steward resolves and authorizes every entry before execution, materializes it without repository credentials or remotes, and records immutable workspace evidence and /sandbox/workspace/.steward-workspace.json. The Task editor, Run now and Get started can configure repository checkout, and Run details show the resolved entries.\n\n'
+            printf 'Managed inference is now operational. Migration 0068 stores one encrypted per-user inference credential with append-only audit history. In managed mode Mint resolves the verified runtime owner through a lazy, least-privilege PostgreSQL reader; database failure affects inference grants without taking down tool tokens, JWKS or introspection. The chart wires the dedicated database credential and encryption-key Secret, while stock mode remains the default.\n\n'
+            printf 'The governed-connections E2E now deploys the MCP-GW 0.5.7 agentgateway used by the platform, proves its session requirement, and exercises repository search, publication, workflow detection and dispatch through it. Direct-wrapper coverage remains.\n\n'
+            printf 'This release retains everything shipped in v0.3.14, including MCP Streamable HTTP session support and the bridge-gateway-session failure category.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'This patch adds no migrations; the newest migration remains 0067. No Helm value or provider-profile transition is required. Installations upgrading from versions before v0.3.11 must first follow the v0.3.11 upgrade notes.\n\n'
-            printf 'Deploy the v0.3.14 chart and images as one release unit. The fix lives in the bridge: when connectionsBridge is enabled, update connectionsBridge.image, sourceCommit, signerIdentity, and attestationBundle to the values under Stable bridge provenance inputs below; an earlier bridge keeps the defect.\n\n'
-            printf 'The session DELETE is permitted by provider-profile bundle 1.2.2. With an earlier bundle the OpenShell proxy denies and logs that request; the operation result is unaffected.\n\n'
-            printf 'Rollback from v0.3.14 to v0.3.13 requires no database restore; restore the v0.3.13 chart and complete component-image set, including the bridge coordinates, together.\n\n'
+            printf 'Apply additive migration 0068 before enabling managed inference. Managed mode requires the dedicated Mint PostgreSQL reader credential, the managed-inference encryption-key Secret, and PostgreSQL egress when NetworkPolicy is enabled. Stop submissions and drain or revoke stock runtimes before switching modes; live runtimes are never switched in place.\n\n'
+            printf 'Deploy the v0.3.15 chart and all component images as one release unit. Configure workspace deployment caps and keep workspace.scratchVolumeSize aligned with OpenShell workspace storage.\n\n'
+            printf 'The provider-profile bundle remains 1.2.2. Its MCP-GW profile permits the session DELETE used by the bridge.\n\n'
+            printf 'Rollback leaves migration 0068 in place. After any Task with workspace evidence has been stored, rollback to v0.3.14 or earlier requires restoring a database backup from before that Task; those releases cannot read the new evidence shape or framed workspace input.\n\n'
             printf '## Required action\n\n'
             printf 'Before upgrading governed installations, set spire.className to the installed SPIRE controller class and choose exactly one owner for the OpenShell sandbox registration: keep the chart default, or disable spire.sandboxRegistration only when the platform retains the equivalent registration. Before enabling browser Run now, authorize each Git source through the operator-managed source-repository binding catalog and configure the intended Envelope templates.\n\n'
             printf '## Acceptance\n\n'
@@ -834,7 +835,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.14.json
+          subject-path: dist/steward-product-compatibility-0.3.15.json
 
       - name: Archive product compatibility verification material
         env:
@@ -844,7 +845,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.14.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.15.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 

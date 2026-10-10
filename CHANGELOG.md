@@ -7,6 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.15] - 2026-10-09
+
+This release adds governed Git and scratch workspaces to TaskDefinition v2 and
+activates per-user managed inference credentials through Mint. It also promotes
+the MCP-GW agentgateway path from an indirect compatibility assumption to a
+real governed-connections E2E against the pinned gateway. Migration 0068 is
+additive and intentionally retained on rollback.
+
 ### Added
 
 - TaskDefinition v2 supports governed `git` and `scratch` workspace entries.
@@ -32,6 +40,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   managed mode requires stopping submissions, draining or revoking existing
   runtimes, changing the chart configuration, and verifying a fresh Task;
   live runtimes are never switched in place.
+- The governed-connections E2E now deploys the MCP-GW 0.5.7 agentgateway used
+  by the platform, proves session enforcement, and exercises repository search,
+  publication, workflow detection and dispatch through that gateway. The
+  direct-wrapper case remains covered.
+
+### Upgrade and rollback
+
+- Deploy the v0.3.15 chart and all component images as one release unit. Run
+  migration 0068 before enabling managed inference. Managed mode requires the
+  dedicated Mint PostgreSQL reader credential, the managed-inference
+  encryption-key Secret, and PostgreSQL egress when NetworkPolicy is enabled.
+- Before switching an installation from stock to managed inference, stop new
+  submissions and drain or revoke existing stock runtimes. The user's upstream
+  key remains long-lived; the Mint grant lifetime is only a cache lifetime and
+  Steward cannot revoke that key at the upstream inference service.
+- Workspace policy is configured by the chart's `workspace` values and bounded
+  again by each User Envelope and Task. Keep `workspace.scratchVolumeSize`
+  aligned with OpenShell's workspace storage limit so the scratch bound remains
+  kernel-enforced.
+- Rolling back the binaries and chart leaves migration 0068 in place. After a
+  Task with workspace evidence has been stored, rollback to v0.3.14 or earlier
+  requires restoring a database backup from before that Task, because those
+  releases cannot read the new evidence shape or framed workspace input.
 
 ## [0.3.14] - 2026-10-08
 
@@ -1041,7 +1072,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.14...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.15...HEAD
+[0.3.15]: https://github.com/apelogic-ai/steward/compare/v0.3.14...v0.3.15
 [0.3.14]: https://github.com/apelogic-ai/steward/compare/v0.3.13...v0.3.14
 [0.3.13]: https://github.com/apelogic-ai/steward/compare/v0.3.12...v0.3.13
 [0.3.12]: https://github.com/apelogic-ai/steward/compare/v0.3.11...v0.3.12
