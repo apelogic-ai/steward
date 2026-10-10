@@ -70,6 +70,50 @@ function durationExceeds(value: string, ceiling: string): boolean {
   return requested !== null && maximum !== null && requested > maximum;
 }
 
+function optionalDecimalExceeds(value: string | null | undefined, ceiling: string | null | undefined): boolean {
+  if (ceiling === null || ceiling === undefined) return false;
+  if (value === null || value === undefined || !value.trim()) return true;
+  return decimalExceeds(value, ceiling);
+}
+
+function runnerQuantity(value: string, resource: "compute" | "memory" | "storage"): bigint | null {
+  if (resource === "compute") {
+    const match = /^([0-9]+)(m)?$/.exec(value);
+    return match ? BigInt(match[1]) * (match[2] ? 1n : 1000n) : null;
+  }
+  const match = /^([0-9]+)(Ki|Mi|Gi|Ti)$/.exec(value);
+  if (!match) return null;
+  const power = { Ki: 1n, Mi: 2n, Gi: 3n, Ti: 4n }[match[2] as "Ki" | "Mi" | "Gi" | "Ti"];
+  return BigInt(match[1]) * (1024n ** power);
+}
+
+function fixedAuthorityExceedsThreshold(template: AvailableEnvelopeTemplate): boolean {
+  const threshold = template.autoProvisionThreshold;
+  if (!threshold) return false;
+  const requested = template.ceiling.spec;
+  const allowed = threshold.spec;
+  if (optionalDecimalExceeds(requested.budget.singleRunLimit, allowed.budget.singleRunLimit)) return true;
+  if ((requested.runner?.platforms ?? []).some((platform) => !(allowed.runner?.platforms ?? []).includes(platform))) return true;
+  for (const resource of ["memory", "compute", "storage"] as const) {
+    const requestedValue = requested.runner?.[resource];
+    if (requestedValue == null) continue;
+    const allowedValue = allowed.runner?.[resource];
+    if (allowedValue == null) return true;
+    const requestedQuantity = runnerQuantity(requestedValue, resource);
+    const allowedQuantity = runnerQuantity(allowedValue, resource);
+    if (requestedQuantity === null || allowedQuantity === null || requestedQuantity > allowedQuantity) return true;
+  }
+  if (requested.workspace) {
+    if (!allowed.workspace
+      || requested.workspace.allowedTypes.some((entry) => !allowed.workspace?.allowedTypes.includes(entry))
+      || (runnerQuantity(requested.workspace.maxTotalSize, "storage") ?? 1n) > (runnerQuantity(allowed.workspace.maxTotalSize, "storage") ?? 0n)
+      || requested.workspace.maxFiles > allowed.workspace.maxFiles
+      || requested.workspace.maxHistoryDepth > allowed.workspace.maxHistoryDepth
+      || requested.workspace.maxSubmoduleDepth > allowed.workspace.maxSubmoduleDepth) return true;
+  }
+  return false;
+}
+
 export function templateRequestReviewSummary({ budget, models, runtimeMinutes, template, tools, ttl }: Readonly<{
   budget: string;
   models: ReadonlySet<string>;
@@ -93,7 +137,14 @@ export function templateRequestReviewSummary({ budget, models, runtimeMinutes, t
       requested: [...tools].map((tool) => tool.replaceAll("\u0000", ":")).join(", ") || "None",
     } : null,
   ].filter((value): value is EnvelopeExceedanceSummaryValue => value !== null);
-  return { exceedances, requiresApproval: exceedances.length > 0 };
+  const threshold = template.autoProvisionThreshold ?? template.ceiling;
+  const aboveAutomaticThreshold = decimalExceeds(budget, threshold.spec.budget.monthlyLimit)
+    || optionalDecimalExceeds(runtimeMinutes.trim() || null, threshold.spec.runtimeMinutesLimit)
+    || durationExceeds(ttl, threshold.spec.ttl)
+    || [...models].some((model) => !threshold.spec.llms.some((allowed) => `${allowed.provider}\u0000${allowed.model}` === model))
+    || [...tools].some((tool) => !threshold.spec.tools.some((allowed) => `${allowed.provider}\u0000${allowed.resource}\u0000${allowed.action}` === tool))
+    || fixedAuthorityExceedsThreshold(template);
+  return { exceedances, requiresApproval: exceedances.length > 0 || aboveAutomaticThreshold };
 }
 
 export function EnvelopesView() {
@@ -142,7 +193,7 @@ function EnvelopeTable({ names, requests }: Readonly<{ names: ReadonlyMap<string
         const spend = request.usage?.spend;
         return spend ? <Meter limit={Number(spend.limit)} limitLabel={spend.limit} unit={spend.currency} used={Number(spend.observed)} usedLabel={spend.observed} /> : <span className="text-faint-ink">—</span>;
       } },
-      { key: "per-run", label: "Per run", className: "tabular-nums", render: (request) => {
+      { key: "per-run", label: "Limit per run", className: "tabular-nums", render: (request) => {
         const spec = (request.approvedEnvelope ?? request.requestedEnvelope).spec;
         return spec.budget.singleRunLimit ? `${spec.budget.singleRunLimit} ${spec.budget.currency}` : "—";
       } },
@@ -287,17 +338,17 @@ function TemplateEnvelopeRequestForm({ initialTemplateId, onSubmittingChange, te
           <label className="sr-only">Template<select disabled={submission === "submitting"} onChange={(event) => selectTemplate(event.target.value)} value={template.id}>{templates.map((item) => <option key={item.id} value={item.id}>{item.displayName} · revision {item.revision}</option>)}</select></label>
           <div className="grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">{templates.map((item) => <button aria-pressed={item.id === template.id} className={`rounded-tile border p-4 text-left ${item.id === template.id ? "border-brand bg-brand-soft" : "hover:bg-subtle"}`} disabled={submission === "submitting"} key={item.id} onClick={() => selectTemplate(item.id)} type="button"><span className="flex items-center justify-between gap-3"><strong className="text-[15px]">{item.displayName}</strong><span className="font-mono text-xs text-muted-ink">rev {item.revision}</span></span><span className="mt-2 block text-xs text-muted-ink">Up to {item.ceiling.spec.budget.monthlyLimit} {item.ceiling.spec.budget.currency}/mo · {item.ceiling.spec.ttl} · {item.ceiling.spec.tools.length} tools</span></button>)}</div>
         </SectionCard>
-        <SectionCard title={stepTitle("02", "Budget and lifetime")}><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})<input className={fieldClass(exceededFields.has("Monthly limit"))} disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => { setBudget(event.target.value); clearRejectedSubmission(); }} required value={budget} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.budget.monthlyLimit} {template.ceiling.spec.budget.currency}</span></label><label className="grid gap-2 text-sm font-semibold">Time to live<input className={`${fieldClass(exceededFields.has("Time to live"))} font-mono`} disabled={submission === "submitting"} onChange={(event) => { setTtl(event.target.value); clearRejectedSubmission(); }} required value={ttl} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.ttl}</span></label>{template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month<input className={fieldClass(exceededFields.has("Runtime minutes"))} disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => { setRuntimeMinutes(event.target.value); clearRejectedSubmission(); }} required value={runtimeMinutes} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.runtimeMinutesLimit}</span></label> : null}</div></SectionCard>
+        <SectionCard title={stepTitle("02", "Budget and lifetime")}><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})<input className={fieldClass(exceededFields.has("Monthly limit"))} disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => { setBudget(event.target.value); clearRejectedSubmission(); }} required value={budget} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.budget.monthlyLimit} {template.ceiling.spec.budget.currency}</span></label><label className="grid gap-2 text-sm font-semibold">Time to live<input className={`${fieldClass(exceededFields.has("Time to live"))} font-mono`} disabled={submission === "submitting"} onChange={(event) => { setTtl(event.target.value); clearRejectedSubmission(); }} required value={ttl} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.ttl}</span></label>{template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month<input className={fieldClass(exceededFields.has("Runtime minutes"))} disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => { setRuntimeMinutes(event.target.value); clearRejectedSubmission(); }} required value={runtimeMinutes} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.runtimeMinutesLimit} minutes</span></label> : null}</div></SectionCard>
         <SectionCard className={exceededFields.has("Models") || rejectedFields.includes("llms") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("03", "Models")}><TagSelect addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" onChange={(next) => { setModels(new Set(next)); clearRejectedSubmission(); }} options={modelOptions} value={[...models]} /></SectionCard>
         <SectionCard className={exceededFields.has("Tools") || rejectedFields.includes("tools") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("04", "Tools")}><TagSelect addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search GitHub tools…" label="Tools" onChange={(next) => { setTools(new Set(next)); clearRejectedSubmission(); }} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools in the template ceiling are offered.</p></SectionCard>
         <SectionCard title={stepTitle("05", "Request note")}><label className="grid gap-2 text-sm font-semibold">Justification (optional)<textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); clearRejectedSubmission(); }} placeholder="Explain why these limits or capabilities are needed." value={justification} /></label></SectionCard>
       </div>
       <SectionCard className="sticky top-7 flex-[1_1_280px] lg:max-w-[380px]" title="Summary">
-        <dl className="space-y-3 text-sm">{[["Template", template.displayName], ["Monthly limit", `${budget} ${template.ceiling.spec.budget.currency}`], ["Per run", template.ceiling.spec.budget.singleRunLimit ?? "Not set"], ["TTL", ttl], ["Models", String(models.size)], ["Tools", String(tools.size)]].map(([label, value]) => <div className="flex justify-between gap-4" key={label}><dt className="text-muted-ink">{label}</dt><dd className="text-right font-medium">{value}</dd></div>)}</dl>
+        <dl className="space-y-3 text-sm">{[["Template", template.displayName], ["Monthly limit", `${budget} ${template.ceiling.spec.budget.currency}`], ["Limit per run", template.ceiling.spec.budget.singleRunLimit ? `${template.ceiling.spec.budget.singleRunLimit} ${template.ceiling.spec.budget.currency}` : "Not set"], ["TTL", ttl], ["Models", String(models.size)], ["Tools", String(tools.size)]].map(([label, value]) => <div className="flex justify-between gap-4" key={label}><dt className="text-muted-ink">{label}</dt><dd className="text-right font-medium">{value}</dd></div>)}</dl>
         {submission !== "idle" && submission !== "submitting" ? <p className="mt-4 text-sm text-err" role="alert">{failureReason ?? { conflict: "The template revision changed. Reload before retrying.", rejected: "The request is outside the platform safety limits or capability catalog.", forbidden: "You are not allowed to submit this request.", unavailable: "The request service is unavailable.", error: "The request could not be accepted." }[submission]}</p> : null}
         {exceedances.length ? <div className="mt-4"><EnvelopeExceedanceSummary values={exceedances} /></div> : null}
         <button className="mt-5 min-h-10 w-full rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : requiresApproval ? "Submit for approval" : "Submit request"}</button>
-        <p className="mt-3 text-xs leading-5 text-muted-ink">{requiresApproval ? "An administrator will review the requested values." : "This request will be provisioned immediately."}</p>
+        <p className="mt-3 text-xs leading-5 text-muted-ink">{requiresApproval ? exceedances.length ? `${exceedances.length} ${exceedances.length === 1 ? "value exceeds" : "values exceed"} the template ceiling and need admin approval.` : "This request is above the automatic approval limit and needs admin approval." : "This request will be provisioned immediately."}</p>
       </SectionCard>
     </form>
   );
@@ -425,13 +476,14 @@ function EnvelopeDetail({ request }: Readonly<{ request: UserEnvelopeRequest }>)
           value: usage ? `${usage.observed} ${usage.currency}` : "Not reported",
           detail: usage ? <Meter limit={Number(usage.limit)} limitLabel={usage.limit} unit={usage.currency} used={Number(usage.observed)} usedLabel={usage.observed} /> : request.usage?.availability.reason,
         },
-        { label: "Per-run limit", value: envelope.spec.budget.singleRunLimit ? `${envelope.spec.budget.singleRunLimit} ${envelope.spec.budget.currency}` : "Not set" },
+        { label: "Limit per run", value: envelope.spec.budget.singleRunLimit ? `${envelope.spec.budget.singleRunLimit} ${envelope.spec.budget.currency}` : "Not set" },
         { label: "Time to live", value: <span className="font-mono">{envelope.spec.ttl}</span> },
         { label: "Envelope instance", value: <span className="font-mono text-sm">{request.envelopeInstanceId ?? "Not assigned"}</span> },
       ]} />
       {request.reason ? <p className="rounded-card bg-notice p-4 text-sm"><strong>Server reason:</strong> {request.reason}</p> : null}
-      {request.status === "pending" && (request.ceilingExceedances.length || request.justification) ? <SectionCard title="Pending administrator approval">
+      {request.status === "pending" ? <SectionCard title="Pending administrator approval">
         <EnvelopeExceedanceSummary values={request.ceilingExceedances.map(envelopeDeltaSummary)} />
+        {!request.ceilingExceedances.length ? <p className="text-sm">{request.templateId ? "This request is within the template ceiling but above its automatic approval limit." : "This custom envelope request needs administrator approval."}</p> : null}
         {request.justification ? <p className="mt-4 text-sm"><strong>Justification:</strong> {request.justification}</p> : null}
       </SectionCard> : null}
       <div className="grid gap-5 lg:grid-cols-2">
@@ -480,7 +532,7 @@ function WorkflowGenerator({ requestId }: Readonly<{ requestId: string }>) {
           <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "loading"} type="submit">{status === "loading" ? "Rendering…" : "Render workflow"}</button>
         </form>
       )}</ResourceBoundary>
-      {status !== "idle" && status !== "loading" ? <p role="alert" className="text-sm text-red-800">{{ conflict: "The envelope changed before the workflow could be rendered. Reload before retrying.", rejected: "The workflow inputs were rejected.", forbidden: "You are not allowed to render this workflow.", unavailable: "The authoritative workflow service is unavailable.", error: "The workflow response could not be accepted." }[status]}</p> : null}
+      {status !== "idle" && status !== "loading" ? <p role="alert" className="text-sm text-red-800">{{ conflict: "The envelope changed before the workflow could be rendered. Reload before retrying.", rejected: "The workflow inputs were rejected.", forbidden: "You are not allowed to render this workflow.", unavailable: "Workflow rendering is unavailable. Try again.", error: "The workflow response could not be accepted." }[status]}</p> : null}
       {workflow ? <div aria-label="Generated workflow" className="mt-4"><CodeBlock code={workflow.workflow.yaml} language="yaml" path={`${workflow.workflow.suggestedPath} · sha256 ${workflow.workflow.sha256.slice(0, 12)}…`} /></div> : null}
     </SectionCard>
   );

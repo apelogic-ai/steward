@@ -41,6 +41,7 @@ describe("first envelope template", () => {
     const errors = validateTemplateFields({
       allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
       allowedTools: new Set([JSON.stringify(["github", "repository", "read"])]),
+      autoApproveToCeiling: false,
       displayName: "",
       envelope: authoredEnvelope(),
       memberRoles: [],
@@ -48,6 +49,7 @@ describe("first envelope template", () => {
       monthlyLimit: "",
       singleRunLimit: "not-a-decimal",
       templateId: "not valid",
+      thresholdJson: "not-json",
       tools: [{ provider: "github", resource: "repository", action: "write" }],
       workspaceJson: "",
     });
@@ -60,6 +62,7 @@ describe("first envelope template", () => {
       singleRunLimit: "Enter a non-negative decimal.",
       models: "Select at least one model.",
       tools: "Remove or replace every tool not listed in the capability catalog.",
+      threshold: "Enter a complete valid envelope as JSON.",
     });
   });
 
@@ -67,6 +70,7 @@ describe("first envelope template", () => {
     expect(validateTemplateFields({
       allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
       allowedTools: new Set(),
+      autoApproveToCeiling: true,
       displayName: "Engineering",
       envelope: authoredEnvelope(),
       memberRoles: ["engineering:member"],
@@ -74,6 +78,7 @@ describe("first envelope template", () => {
       monthlyLimit: "01.1234567",
       singleRunLimit: "0.",
       templateId: "engineering.v1",
+      thresholdJson: "",
       tools: [],
       workspaceJson: "",
     })).toEqual({});
@@ -83,6 +88,7 @@ describe("first envelope template", () => {
     const common = {
       allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
       allowedTools: new Set<string>(),
+      autoApproveToCeiling: true,
       displayName: "Engineering",
       envelope: authoredEnvelope(),
       memberRoles: ["engineer"],
@@ -90,6 +96,7 @@ describe("first envelope template", () => {
       monthlyLimit: "10.00",
       singleRunLimit: "1.00",
       templateId: "engineer",
+      thresholdJson: "",
       tools: [],
     };
     expect(validateTemplateFields({
@@ -110,6 +117,31 @@ describe("first envelope template", () => {
     });
   });
 
+  test("rejects valid JSON when the threshold is invalid or wider than its ceiling", () => {
+    const ceiling = authoredEnvelope();
+    const threshold = authoredEnvelope();
+    threshold.revision = 2;
+    threshold.spec.budget.monthlyLimit = "11.00";
+    threshold.spec.ttl = "not-a-duration";
+    threshold.spec.runner.memory = "2GB";
+
+    expect(validateTemplateFields({
+      allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
+      allowedTools: new Set(),
+      autoApproveToCeiling: false,
+      displayName: "Engineering",
+      envelope: ceiling,
+      memberRoles: ["engineer"],
+      models: ceiling.spec.llms,
+      monthlyLimit: "10.00",
+      singleRunLimit: "1.00",
+      templateId: "engineer",
+      thresholdJson: JSON.stringify(threshold),
+      tools: [],
+      workspaceJson: "",
+    })).toEqual({ threshold: "Enter a valid envelope within this template ceiling." });
+  });
+
   test("reports invalid lifetime and runner quantities before submission", () => {
     const envelope = authoredEnvelope();
     envelope.spec.ttl = "";
@@ -121,6 +153,7 @@ describe("first envelope template", () => {
     expect(validateTemplateFields({
       allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
       allowedTools: new Set(),
+      autoApproveToCeiling: true,
       displayName: "Engineering",
       envelope,
       memberRoles: ["engineer"],
@@ -128,6 +161,7 @@ describe("first envelope template", () => {
       monthlyLimit: "10.00",
       singleRunLimit: "1.00",
       templateId: "engineer",
+      thresholdJson: "",
       tools: [],
       workspaceJson: "",
     })).toEqual({
@@ -144,6 +178,7 @@ describe("first envelope template", () => {
     expect(validateTemplateFields({
       allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
       allowedTools: new Set(),
+      autoApproveToCeiling: true,
       displayName: "x".repeat(129),
       envelope,
       memberRoles: Array.from({ length: 65 }, (_, index) => `role-${index}`),
@@ -151,6 +186,7 @@ describe("first envelope template", () => {
       monthlyLimit: "10.00",
       singleRunLimit: "1.00",
       templateId: "engineer",
+      thresholdJson: "",
       tools: [],
       workspaceJson: "",
     })).toEqual({

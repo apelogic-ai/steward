@@ -1128,7 +1128,14 @@ where
         Err(error) => return ApiError::Store(error).into_response(),
     };
     if request.status == EnvelopeRequestStatus::Pending {
-        if request.template_id.is_some() && request.template_revision.is_some() {
+        if let (Some(template_id), Some(template_revision)) =
+            (request.template_id.as_deref(), request.template_revision)
+        {
+            match state.ledger.latest_envelope_template(template_id).await {
+                Ok(Some(template)) if template.ceiling.revision == template_revision => {}
+                Ok(_) => return StatusCode::CONFLICT.into_response(),
+                Err(error) => return ApiError::Store(error).into_response(),
+            }
             let Some(template_envelope) = request.template_envelope.as_ref() else {
                 return StatusCode::CONFLICT.into_response();
             };
@@ -1239,12 +1246,26 @@ where
                 .evidence_url
                 .as_deref()
                 .is_some_and(|value| request.evidence_url.as_deref() != Some(value))
-            || body
-                .expires_at
-                .as_deref()
-                .is_some_and(|value| request.expires_at.as_deref() != Some(value))
+            || body.expires_at.as_deref().is_some_and(|value| {
+                request
+                    .expires_at
+                    .as_deref()
+                    .is_none_or(|stored| !same_rfc3339_instant(value, stored))
+            })
         {
             return StatusCode::CONFLICT.into_response();
+        }
+        if let Err(error) = record_envelope_request_resolution(
+            &state.decisions,
+            request_id,
+            request.decision_key.as_deref(),
+            request.evidence_url.as_deref(),
+            request.rationale.as_deref(),
+            &request.status_actor,
+        )
+        .await
+        {
+            return error.into_response();
         }
         return Json(BrowserEnvelopeRequestDecisionResponse {
             api_version: BROWSER_ADMIN_API_VERSION,
@@ -1281,20 +1302,17 @@ where
         .await
     {
         Ok(request) => {
-            if let (Some(key), Some(evidence_url), Some(rationale)) =
-                (decision_key, evidence_url, rationale)
-                && let Err(error) = state
-                    .decisions
-                    .record_resolution(&steward_ports::DecisionResolution {
-                        request_id: request_id.to_string(),
-                        key,
-                        decided_by: actor.to_owned(),
-                        rationale: rationale.to_owned(),
-                        evidence_url: evidence_url.to_owned(),
-                    })
-                    .await
+            if let Err(error) = record_envelope_request_resolution(
+                &state.decisions,
+                request_id,
+                decision_key.as_deref(),
+                evidence_url,
+                rationale,
+                actor,
+            )
+            .await
             {
-                return ApiError::DecisionChannel(format!("{error:?}")).into_response();
+                return error.into_response();
             }
             Json(BrowserEnvelopeRequestDecisionResponse {
                 api_version: BROWSER_ADMIN_API_VERSION,
@@ -1316,6 +1334,40 @@ where
         ),
         Err(error) => ApiError::Store(error).into_response(),
     }
+}
+
+async fn record_envelope_request_resolution<D: DecisionChannel>(
+    decisions: &D,
+    request_id: Uuid,
+    decision_key: Option<&str>,
+    evidence_url: Option<&str>,
+    rationale: Option<&str>,
+    decided_by: &str,
+) -> Result<(), ApiError> {
+    let (Some(key), Some(evidence_url), Some(rationale)) = (decision_key, evidence_url, rationale)
+    else {
+        return Ok(());
+    };
+    decisions
+        .record_resolution(&steward_ports::DecisionResolution {
+            request_id: request_id.to_string(),
+            key: key.to_owned(),
+            decided_by: decided_by.to_owned(),
+            rationale: rationale.to_owned(),
+            evidence_url: evidence_url.to_owned(),
+        })
+        .await
+        .map_err(|error| ApiError::DecisionChannel(format!("{error:?}")))
+}
+
+fn same_rfc3339_instant(left: &str, right: &str) -> bool {
+    let Ok(left) = left.parse::<k8s_openapi::jiff::Timestamp>() else {
+        return false;
+    };
+    let Ok(right) = right.parse::<k8s_openapi::jiff::Timestamp>() else {
+        return false;
+    };
+    left == right
 }
 
 fn valid_https_url(value: &str) -> bool {

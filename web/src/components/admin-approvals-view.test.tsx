@@ -58,6 +58,13 @@ const unifiedRequest: AdminRequestView = {
 };
 
 describe("envelope request approval controls", () => {
+  test("uses plain request wording and consistent per-run labels", () => {
+    expect(source).toContain("Limit per run");
+    expect(source).toContain("custom envelope requests");
+    expect(source).not.toContain("Reload the authoritative queue");
+    expect(source).not.toContain("request authority is unavailable");
+  });
+
   test("unified queue preserves rejection and optional approval evidence", () => {
     const html = renderToStaticMarkup(<UnifiedRequestCard request={unifiedRequest} />);
 
@@ -136,7 +143,7 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("200.00 USD");
     expect(html).toContain("model-b");
     expect(html).toContain("model-a");
-    expect(html).toContain("Single-run limit");
+    expect(html).toContain("Limit per run");
     expect(html).toContain("30.00 USD");
     expect(html).toContain("20.00 USD");
     expect(html).toContain("Runner platforms");

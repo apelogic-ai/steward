@@ -41,7 +41,7 @@ describe("envelope ceiling-exceedance summaries", () => {
     const html = renderToStaticMarkup(<EnvelopeExceedanceSummary values={deltas.map(envelopeDeltaSummary)} />);
     expect(html).toContain("Needs admin approval: 11 values above the template ceiling");
     expect(html).toContain("Monthly limit: <strong>125.00 USD</strong> (ceiling 100.00 USD)");
-    expect(html).toContain("Per-run limit: <strong>5.00 USD</strong> (ceiling 2.00 USD)");
+    expect(html).toContain("Limit per run: <strong>5.00 USD</strong> (ceiling 2.00 USD)");
     expect(html).toContain("Runtime minutes: <strong>90 minutes</strong> (ceiling 60 minutes)");
     expect(html).toContain("Time to live: <strong>2h</strong> (ceiling 1h)");
     expect(html).toContain("Models: <strong>provider-a/model-b</strong> (ceiling provider-a/model-a)");

@@ -36,13 +36,13 @@ type EnvelopeActionState = "idle" | "approving" | "rejecting" | "provisioned" | 
 
 function actionMessage(status: Exclude<UnifiedRequestActionState, "idle" | "filing" | "approving" | "rejecting">): string {
   return {
-    filed: "Decision reference filed through the server-owned channel.",
+    filed: "The decision reference was saved.",
     approved: "The approval was applied.",
     "rejection-complete": "The envelope request was rejected.",
-    conflict: "This approval or its runtime is stale. Reload the authoritative queue.",
+    conflict: "This request changed. Reload the requests page and try again.",
     rejected: "The approval evidence or expiry is invalid.",
     forbidden: "You are not allowed to make this change.",
-    unavailable: "The approval authority is unavailable.",
+    unavailable: "Approvals are unavailable. Try again.",
     error: "The approval response could not be accepted.",
   }[status];
 }
@@ -53,7 +53,7 @@ function envelopeAuthorityItems(spec: BrowserEnvelopeSpec): [string, string][] {
     ["Models", spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") || "None"],
     ["Tools", spec.tools.map((tool) => `${tool.provider}/${tool.resource}:${tool.action}`).join(", ") || "None"],
     ["Monthly limit", `${spec.budget.monthlyLimit} ${spec.budget.currency}`],
-    ["Single-run limit", spec.budget.singleRunLimit
+    ["Limit per run", spec.budget.singleRunLimit
       ? `${spec.budget.singleRunLimit} ${spec.budget.currency}`
       : "Unbounded"],
     ["TTL", spec.ttl],
@@ -70,7 +70,7 @@ export function AdminApprovalsView() {
   const state = useApiResource<AdminRequestsResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Requests above a template ceiling, custom authority requests, and runs that exhaust a cumulative limit wait here for a decision." title="Requests" />
+      <PageHeader description="Requests above a template ceiling, custom envelope requests, and runs that reach a cumulative limit wait here for review." title="Requests" />
       <ResourceBoundary state={state}>{({ requests }) => {
         if (requests.length === 0) return <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">Nothing needs action.</p>;
         const counts = {
@@ -144,7 +144,7 @@ function deltaValue(value: unknown): string {
 function deltaLabel(dimension: AdminRequestView["deltas"][number]["dimension"]): string {
   return {
     budget: "Monthly limit",
-    singleRunBudget: "Per-run limit",
+    singleRunBudget: "Limit per run",
     runtimeMinutes: "Runtime minutes",
     ttl: "TTL",
     models: "Models",
@@ -165,7 +165,7 @@ function deltaSide(delta: AdminRequestView["deltas"][number], side: "ceiling" | 
     return <GrantChipList grants={delta[side].map((tool) => ({ kind: grantKindForAction(tool.action), name: `${tool.resource}:${tool.action}` }))} />;
   }
   const value = delta[side];
-  const suffix = "currency" in delta ? ` ${delta.currency}` : "";
+  const suffix = "currency" in delta ? ` ${delta.currency}` : delta.dimension === "runtimeMinutes" ? " minutes" : "";
   return <span className="font-mono text-sm">{deltaValue(value)}{value === null || value === undefined ? "" : suffix}</span>;
 }
 
@@ -178,7 +178,7 @@ function numericDelta(delta: AdminRequestView["deltas"][number]): string | null 
 
 function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>) {
   if (request.kind === "custom" && request.requestedEnvelope) return <SectionCard title="Requested authority"><DefinitionList items={envelopeAuthorityItems(request.requestedEnvelope.spec)} /><p className="mt-4 rounded-control bg-notice p-4 text-sm">This custom request has no governing template and always requires administrator approval.</p></SectionCard>;
-  if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">This pending request is within the template ceiling.</p>;
+  if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">This request is within the template ceiling but above its automatic approval limit.</p>;
   return (
     <SectionCard title="Requested vs template ceiling">
       <div className="overflow-x-auto">
@@ -452,7 +452,7 @@ export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnve
       ) : null}
       {status !== "idle" && status !== "approving" && status !== "rejecting" ? (
         <p className={status === "provisioned" || status === "rejection-complete" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "provisioned" || status === "rejection-complete" ? "status" : "alert"}>
-          {status === "provisioned" ? "The exact requested envelope was provisioned." : status === "rejection-complete" ? "The envelope request was rejected without creating an envelope." : status === "rejected" ? "The rejection reason is invalid." : status === "conflict" ? "This request or its template revision is stale. Reload the authoritative queue." : status === "forbidden" ? "You are not allowed to make this change." : status === "unavailable" ? "The envelope request authority is unavailable." : "The envelope request response could not be accepted."}
+          {status === "provisioned" ? "The exact requested envelope was provisioned." : status === "rejection-complete" ? "The envelope request was rejected without creating an envelope." : status === "rejected" ? "The rejection reason is invalid." : status === "conflict" ? "This request or its template changed. Reload the requests page and try again." : status === "forbidden" ? "You are not allowed to make this change." : status === "unavailable" ? "Envelope requests are unavailable. Try again." : "The envelope request response could not be accepted."}
         </p>
       ) : null}
     </li>

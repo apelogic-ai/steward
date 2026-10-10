@@ -79,7 +79,8 @@ pub struct AvailableEnvelopeTemplate {
     #[schema(value_type = BrowserEnvelope)]
     pub ceiling: Envelope,
     #[schema(value_type = Option<BrowserEnvelope>)]
-    /// Deprecated compatibility metadata. Request admission uses the template ceiling.
+    /// Requests within this boundary provision automatically. When absent, the ceiling is the
+    /// automatic-provisioning boundary.
     pub auto_provision_threshold: Option<Envelope>,
     pub allow_inline_browser_tasks: bool,
 }
@@ -1351,7 +1352,7 @@ where
             vec![EnvelopeRequestField::RequestedEnvelope],
         );
     }
-    match state
+    let replayed_request = match state
         .broker
         .get_by_idempotency_key(&session, &body.idempotency_key)
         .await
@@ -1362,19 +1363,22 @@ where
                 && existing.requested_envelope == requested_envelope
                 && existing.justification.as_deref() == justification =>
         {
-            return (
-                StatusCode::CREATED,
-                Json(EnvelopeRequestResponse {
-                    api_version: ENVELOPE_REQUESTS_API_VERSION,
-                    request: existing,
-                }),
-            )
-                .into_response();
+            if existing.status != EnvelopeRequestStatus::Pending || existing.template_id.is_none() {
+                return (
+                    StatusCode::CREATED,
+                    Json(EnvelopeRequestResponse {
+                        api_version: ENVELOPE_REQUESTS_API_VERSION,
+                        request: existing,
+                    }),
+                )
+                    .into_response();
+            }
+            Some(existing)
         }
         Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
-        Ok(None) => {}
+        Ok(None) => None,
         Err(error) => return broker_error_response(error),
-    }
+    };
     let template = match (body.template_id.as_deref(), body.template_revision) {
         (None, None) => {
             if let Err(response) = validate_review_boundary(&state.broker, &requested_envelope) {
@@ -1390,6 +1394,16 @@ where
             {
                 Ok(Some(template)) => Some(template),
                 Ok(None) | Err(EnvelopeRequestBrokerError::NotFound) => {
+                    if let Some(existing) = replayed_request {
+                        return (
+                            StatusCode::CREATED,
+                            Json(EnvelopeRequestResponse {
+                                api_version: ENVELOPE_REQUESTS_API_VERSION,
+                                request: existing,
+                            }),
+                        )
+                            .into_response();
+                    }
                     return StatusCode::CONFLICT.into_response();
                 }
                 Err(error) => return broker_error_response(error),
@@ -1408,10 +1422,22 @@ where
             );
         }
         match envelope_is_within(&requested_envelope, &template.ceiling) {
-            Ok(AdmissionDecision::Admit) => true,
+            Ok(AdmissionDecision::Admit) => {
+                let auto_provision_boundary = template
+                    .auto_provision_threshold
+                    .as_ref()
+                    .unwrap_or(&template.ceiling);
+                match envelope_is_within(&requested_envelope, auto_provision_boundary) {
+                    Ok(AdmissionDecision::Admit) => true,
+                    Ok(AdmissionDecision::Reject { .. }) => false,
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                }
+            }
             Ok(AdmissionDecision::Reject { deltas }) => {
                 ceiling_exceedances = deltas;
-                if let Err(response) = validate_review_boundary(&state.broker, &requested_envelope)
+                if replayed_request.is_none()
+                    && let Err(response) =
+                        validate_review_boundary(&state.broker, &requested_envelope)
                 {
                     return *response;
                 }
@@ -1422,6 +1448,16 @@ where
     } else {
         false
     };
+    if !auto_provision && let Some(existing) = replayed_request {
+        return (
+            StatusCode::CREATED,
+            Json(EnvelopeRequestResponse {
+                api_version: ENVELOPE_REQUESTS_API_VERSION,
+                request: existing,
+            }),
+        )
+            .into_response();
+    }
     match state
         .broker
         .create(
@@ -1876,6 +1912,7 @@ mod tests {
             request: ValidatedEnvelopeRequest<'a>,
         ) -> BoxFuture<'a, Result<UserEnvelopeRequest, EnvelopeRequestBrokerError>> {
             let owners = self.create_owners.clone();
+            let replayed_request = self.replayed_request.clone();
             let owner = session.subject.canonical_user_id.clone();
             let status_actor = owner.as_str().to_owned();
             let template_id = request.template.map(|template| template.id.clone());
@@ -1896,8 +1933,14 @@ mod tests {
                     .lock()
                     .map_err(|_| EnvelopeRequestBrokerError::Unavailable)?
                     .push(owner);
+                let id = replayed_request
+                    .lock()
+                    .map_err(|_| EnvelopeRequestBrokerError::Unavailable)?
+                    .as_ref()
+                    .map(|request| request.id)
+                    .unwrap_or_else(Uuid::nil);
                 Ok(UserEnvelopeRequest {
-                    id: Uuid::nil(),
+                    id,
                     template_id,
                     template_revision,
                     requested_envelope,
@@ -2456,6 +2499,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_retry_completes_a_reserved_auto_provision_request() -> Result<(), String> {
+        let requested_envelope = template()
+            .auto_provision_threshold
+            .ok_or_else(|| "missing automatic-provisioning threshold".to_owned())?;
+        let replayed = UserEnvelopeRequest {
+            id: Uuid::from_u128(8),
+            template_id: Some("engineer".to_owned()),
+            template_revision: Some(3),
+            requested_envelope: requested_envelope.clone(),
+            template_envelope: Some(template().ceiling),
+            justification: None,
+            ceiling_exceedances: Vec::new(),
+            approved_envelope: None,
+            status: EnvelopeRequestStatus::Pending,
+            approval_id: None,
+            envelope_instance_id: None,
+            envelope_digest: None,
+            reason: None,
+            status_actor: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+            status_template_revision: Some(3),
+            created_at: "2026-08-17T00:00:00Z".to_owned(),
+            status_at: "2026-08-17T00:00:00Z".to_owned(),
+            history: Vec::new(),
+            usage: None,
+        };
+        let broker = TestBroker::default();
+        *broker
+            .replayed_request
+            .lock()
+            .map_err(|_| "lock replay fixture")? = Some(replayed);
+
+        let response = inner_router(broker.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "templateId": "engineer",
+                            "templateRevision": 3,
+                            "requestedEnvelope": requested_envelope,
+                            "idempotencyKey": "reserved-auto-request-retry",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build automatic retry: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit automatic retry: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read automatic retry: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode automatic retry: {error}"))?;
+        assert_eq!(value["request"]["id"], Uuid::from_u128(8).to_string());
+        assert_eq!(value["request"]["status"], "provisioned");
+        assert_eq!(
+            broker
+                .create_owners
+                .lock()
+                .map_err(|_| "lock automatic retry create calls")?
+                .len(),
+            1,
+            "the retry must resume the reserved request's provisioning transition"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn provisioned_envelope_renders_only_the_server_bound_pinned_workflow()
     -> Result<(), String> {
         let app = inner_router(TestBroker::default());
@@ -2757,8 +2873,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_auto_threshold_does_not_hold_a_request_within_the_template_ceiling()
-    -> Result<(), String> {
+    async fn request_above_auto_threshold_but_within_ceiling_requires_review() -> Result<(), String>
+    {
         let mut requested = template().ceiling;
         requested.spec.budget.monthly_limit = "75.00".to_owned();
         let response = inner_router(TestBroker::default())
@@ -2788,12 +2904,8 @@ mod tests {
             .map_err(|error| format!("read response: {error}"))?;
         let value: serde_json::Value =
             serde_json::from_slice(&body).map_err(|error| format!("parse response: {error}"))?;
-        assert_eq!(value["request"]["status"], "provisioned");
-        assert_eq!(
-            value["request"]["approvedEnvelope"],
-            serde_json::to_value(requested)
-                .map_err(|error| format!("serialize approved envelope: {error}"))?
-        );
+        assert_eq!(value["request"]["status"], "pending");
+        assert!(value["request"]["approvedEnvelope"].is_null());
         Ok(())
     }
 

@@ -27,7 +27,7 @@ export function envelopeDeltaSummary(delta: DirectAdmissionDelta): EnvelopeExcee
     case "budget":
       return { ceiling: `${delta.ceiling} ${delta.currency}`, label: "Monthly limit", requested: `${delta.requested} ${delta.currency}` };
     case "singleRunBudget":
-      return { ceiling: `${delta.ceiling} ${delta.currency}`, label: "Per-run limit", requested: delta.requested ? `${delta.requested} ${delta.currency}` : "Unbounded" };
+      return { ceiling: `${delta.ceiling} ${delta.currency}`, label: "Limit per run", requested: delta.requested ? `${delta.requested} ${delta.currency}` : "Unbounded" };
     case "runtimeMinutes":
       return { ceiling: `${delta.ceiling} minutes`, label: "Runtime minutes", requested: delta.requested ? `${delta.requested} minutes` : "Unbounded" };
     case "ttl":

@@ -5699,7 +5699,9 @@ mod tests {
                     .header("sec-fetch-site", "same-origin")
                     .header("x-steward-csrf", &csrf)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(
+                        r#"{"rationale":"approved for repository review","expiresAt":"2999-01-01T01:00:00+01:00"}"#,
+                    ))
                     .map_err(|error| format!("build repeated envelope approval: {error}"))?,
             )
             .await
@@ -5725,8 +5727,8 @@ mod tests {
                 .lock()
                 .map_err(|_| "lock repeated envelope approval resolutions")?
                 .len(),
-            1,
-            "an idempotent approval retry must not emit a second external resolution"
+            2,
+            "an idempotent approval retry must redeliver the same external resolution"
         );
 
         let changed_approval = admin_app
@@ -5754,7 +5756,7 @@ mod tests {
                 .lock()
                 .map_err(|_| "lock changed envelope approval resolutions")?
                 .len(),
-            1,
+            2,
             "a conflicting retry must not emit different external approval evidence"
         );
 
@@ -5884,7 +5886,7 @@ mod tests {
             .map_err(|error| format!("execute proved template request: {error}"))?;
         assert_eq!(created.status(), StatusCode::CREATED);
 
-        let pinned_revision_approval = admin_app
+        let stale_revision_approval = admin_app
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -5895,14 +5897,14 @@ mod tests {
                     .header("x-steward-csrf", &csrf)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"rationale":"approve current template"}"#))
-                    .map_err(|error| format!("build pinned-revision envelope approval: {error}"))?,
+                    .map_err(|error| format!("build stale-revision envelope approval: {error}"))?,
             )
             .await
-            .map_err(|error| format!("execute pinned-revision envelope approval: {error}"))?;
+            .map_err(|error| format!("execute stale-revision envelope approval: {error}"))?;
         assert_eq!(
-            pinned_revision_approval.status(),
-            StatusCode::OK,
-            "publishing a new template revision must not strand a request bound to an immutable earlier revision"
+            stale_revision_approval.status(),
+            StatusCode::CONFLICT,
+            "an administrator must re-evaluate a request after its template ceiling is superseded"
         );
         let authors = admin_ledger
             .envelope_authors
@@ -6164,6 +6166,107 @@ mod tests {
         assert_eq!(
             approved.rationale.as_deref(),
             Some("approved the requested monthly limit")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provisioned_envelope_retry_redelivers_resolution_with_equivalent_expiry()
+    -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let runtime_repository = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let mut review_ledger = ledger();
+        review_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .spec
+            .budget
+            .monthly_limit = "250.00".to_owned();
+        let safety_ceiling = review_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .clone();
+        review_ledger
+            .decision_references
+            .lock()
+            .map_err(|_| "lock fake decision references")?
+            .push((
+                Uuid::from_u128(4),
+                "PROJ-123".to_owned(),
+                "https://jira.example.com/browse/PROJ-123".to_owned(),
+            ));
+        let decisions = FailOnceResolutionDecisionChannel::default();
+        let recorded = review_ledger.user_envelopes.clone();
+        let (admin_auth, admin_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let app = browser_admin::protected_router_with_custom_envelope_safety(
+            runtime_repository,
+            review_ledger,
+            decisions.clone(),
+            browser_capability_catalog(),
+            Some(safety_ceiling),
+            admin_auth,
+        );
+        let approval = |expires_at: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                .header(header::COOKIE, &admin_cookie)
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", &csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"rationale":"approved for repository review","expiresAt":"{expires_at}"}}"#
+                )))
+                .map_err(|error| format!("build retryable envelope approval: {error}"))
+        };
+
+        let first = app
+            .clone()
+            .oneshot(approval("2999-01-01T00:00:00Z")?)
+            .await
+            .map_err(|error| format!("execute first envelope approval: {error}"))?;
+        assert_eq!(
+            first.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a resolution-channel outage must remain visible after provisioning"
+        );
+        assert_eq!(
+            recorded
+                .lock()
+                .map_err(|_| "lock provisioned envelope requests")?
+                .len(),
+            1,
+            "the first attempt must persist exactly one governed envelope"
+        );
+
+        let retry = app
+            .oneshot(approval("2999-01-01T01:00:00+01:00")?)
+            .await
+            .map_err(|error| format!("execute retried envelope approval: {error}"))?;
+        assert_eq!(
+            retry.status(),
+            StatusCode::OK,
+            "the same expiry instant must permit resolution delivery recovery"
+        );
+        assert_eq!(decisions.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            decisions
+                .resolutions
+                .lock()
+                .map_err(|_| "lock successful decision resolutions")?
+                .len(),
+            1,
+            "the retry must deliver the original resolution after the transient failure"
+        );
+        assert_eq!(
+            recorded
+                .lock()
+                .map_err(|_| "lock retried envelope requests")?
+                .len(),
+            1,
+            "resolution recovery must not provision another envelope"
         );
         Ok(())
     }
@@ -6898,6 +7001,12 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
+    struct FailOnceResolutionDecisionChannel {
+        attempts: Arc<AtomicUsize>,
+        resolutions: Arc<Mutex<Vec<DecisionResolution>>>,
+    }
+
+    #[derive(Clone, Default)]
     struct SlowDecisionChannel {
         requests: Arc<AtomicUsize>,
     }
@@ -6974,6 +7083,35 @@ mod tests {
             &self,
             resolution: &DecisionResolution,
         ) -> Result<(), PortError> {
+            self.resolutions
+                .lock()
+                .map_err(|_| PortError::Failed {
+                    reason: "fake decision-resolution lock was poisoned".to_owned(),
+                })?
+                .push(resolution.clone());
+            Ok(())
+        }
+    }
+
+    impl DecisionChannel for FailOnceResolutionDecisionChannel {
+        async fn request(
+            &self,
+            _request: &DecisionRequest,
+        ) -> Result<DecisionReference, PortError> {
+            Err(PortError::Failed {
+                reason: "unexpected decision request".to_owned(),
+            })
+        }
+
+        async fn record_resolution(
+            &self,
+            resolution: &DecisionResolution,
+        ) -> Result<(), PortError> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(PortError::Failed {
+                    reason: "resolution channel temporarily unavailable".to_owned(),
+                });
+            }
             self.resolutions
                 .lock()
                 .map_err(|_| PortError::Failed {

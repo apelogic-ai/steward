@@ -11,6 +11,14 @@ describe("envelope run history", () => {
     expect(source).toContain("query: { envelopeInstanceId }");
     expect(source).not.toContain("query: { runtimeUid }");
   });
+
+  test("uses the approved request copy and explicit units", () => {
+    expect(source).toContain("Pick an existing template and adjust it, or create your own envelope request.");
+    expect(source).toContain("Limit per run");
+    expect(source).toContain("Ceiling {template.ceiling.spec.runtimeMinutesLimit} minutes");
+    expect(source).toContain("Workflow rendering is unavailable. Try again.");
+    expect(source).not.toContain("authoritative workflow service");
+  });
 });
 
 const template: AvailableEnvelopeTemplate = {
@@ -61,7 +69,7 @@ describe("envelope request review summary", () => {
     });
   });
 
-  test("returns to automatic submission anywhere inside the template ceiling", () => {
+  test("requires review above a narrower automatic approval threshold", () => {
     expect(templateRequestReviewSummary({
       budget: "75.00",
       models: new Set(["provider-a\u0000model-a"]),
@@ -69,6 +77,26 @@ describe("envelope request review summary", () => {
       template,
       tools: new Set(),
       ttl: "30m",
+    })).toEqual({ exceedances: [], requiresApproval: true });
+  });
+
+  test("returns to automatic submission inside the automatic approval threshold", () => {
+    expect(templateRequestReviewSummary({
+      budget: "25.00",
+      models: new Set(["provider-a\u0000model-a"]),
+      runtimeMinutes: "20",
+      template: {
+        ...template,
+        autoProvisionThreshold: {
+          ...template.autoProvisionThreshold!,
+          spec: {
+            ...template.autoProvisionThreshold!.spec,
+            budget: { ...template.ceiling.spec.budget, monthlyLimit: "50.00" },
+          },
+        },
+      },
+      tools: new Set(),
+      ttl: "20m",
     })).toEqual({ exceedances: [], requiresApproval: false });
   });
 });
