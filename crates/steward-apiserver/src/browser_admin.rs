@@ -2021,7 +2021,7 @@ where
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
-                "error": "autoProvisionThreshold is retired; set the template limits to the automatic-approval boundary",
+                "error": steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE,
             })),
         )
             .into_response();

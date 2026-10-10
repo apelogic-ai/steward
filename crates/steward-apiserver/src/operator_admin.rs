@@ -555,7 +555,7 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
     if request.auto_provision_threshold.is_some() {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "autoProvisionThreshold is retired; set the template limits to the automatic-approval boundary",
+            steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE,
         );
     }
     if !crate::browser_admin::valid_template_identifier(&template_id)
@@ -1008,7 +1008,7 @@ mod tests {
             .map_err(|error| format!("parse retired threshold response: {error}"))?;
         assert_eq!(
             body["error"],
-            "autoProvisionThreshold is retired; set the template limits to the automatic-approval boundary"
+            steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE
         );
         Ok(())
     }

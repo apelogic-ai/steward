@@ -18,6 +18,7 @@ import {
   type BrowserEnvelopeRequestDecisionResponse,
   type BrowserEnvelopeRequestView,
   type AdminRequestView,
+  type AdminRequestState,
   type AdminRequestResponse,
   type AdminRequestsResponse,
 } from "@/api-client";
@@ -93,19 +94,72 @@ export function AdminApprovalsView() {
   );
 }
 
-function requestReason(request: AdminRequestView): string {
+const requestStateCopy = {
+  requested: {
+    detail: "Pending administrator approval",
+    label: "Awaiting review",
+    message: "This request is awaiting administrator approval.",
+    reason: "awaiting review",
+  },
+  escalated: {
+    detail: "Pending administrator action",
+    label: "Escalated",
+    message: "This request is awaiting administrator action.",
+    reason: "escalated",
+  },
+  auto_approved: {
+    detail: "Provisioned automatically",
+    label: "Auto-approved",
+    message: "This request was provisioned automatically.",
+    reason: "auto-approved",
+  },
+  approved: {
+    detail: "Approved by an administrator",
+    label: "Approved",
+    message: "This request was approved by an administrator.",
+    reason: "approved",
+  },
+  rejected: {
+    detail: "Request was rejected",
+    label: "Rejected",
+    message: "This request was rejected.",
+    reason: "rejected",
+  },
+  expired: {
+    detail: "Request expired",
+    label: "Expired",
+    message: "This request expired before approval.",
+    reason: "expired",
+  },
+} satisfies Record<AdminRequestState, { detail: string; label: string; message: string; reason: string }>;
+
+export function requestReason(request: AdminRequestView): string {
   return request.kind === "ceiling_exceeded" ? "above limits"
     : request.kind === "cumulative_exhausted" ? "cumulative limit"
-      : request.kind === "within_ceiling" ? "awaiting review" : "custom";
+      : request.kind === "within_ceiling" ? requestStateCopy[request.state].reason : "custom";
 }
 
-function triggerLabel(request: AdminRequestView): [string, string] {
-  if (request.kind === "ceiling_exceeded") return ["Above limits", request.deltas.map((delta) => `${delta.dimension} ${deltaValue(delta.requested)} > ${deltaValue(delta.ceiling)}`).join(" · ")];
+function triggerDeltaValue(delta: AdminRequestView["deltas"][number], side: "ceiling" | "requested"): string {
+  if (delta.dimension === "models") return delta[side].map((model) => `${model.provider}/${model.model}`).join(", ") || "None";
+  if (delta.dimension === "tools") return delta[side].map((tool) => `${tool.resource}:${tool.action}`).join(", ") || "None";
+  if (delta.dimension === "runnerPlatforms") return delta[side].join(", ") || "None";
+  const value = delta[side];
+  if (value === null || value === undefined) return "Not set";
+  if (delta.dimension === "budget" || delta.dimension === "singleRunBudget") return `${deltaValue(value)} ${delta.currency}`;
+  if (delta.dimension === "runtimeMinutes") return `${deltaValue(value)} minutes`;
+  return deltaValue(value);
+}
+
+export function triggerLabel(request: AdminRequestView): [string, string] {
+  if (request.kind === "ceiling_exceeded") return ["Above limits", request.deltas.map((delta) => `${deltaLabel(delta.dimension)} ${triggerDeltaValue(delta, "requested")} > ${triggerDeltaValue(delta, "ceiling")}`).join(" · ")];
   if (request.kind === "cumulative_exhausted") {
     const meter = request.escalation?.meters[0];
     return ["Cumulative limit reached", meter ? `${meter.used} / ${meter.limit} ${meter.unit}` : "Limit exhausted"];
   }
-  if (request.kind === "within_ceiling") return ["Awaiting review", "Pending administrator approval"];
+  if (request.kind === "within_ceiling") {
+    const copy = requestStateCopy[request.state];
+    return [copy.label, copy.detail];
+  }
   return ["Custom request", "No governing template"];
 }
 
@@ -178,7 +232,7 @@ function numericDelta(delta: AdminRequestView["deltas"][number]): string | null 
 
 function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>) {
   if (request.kind === "custom" && request.requestedEnvelope) return <SectionCard title="Requested authority"><DefinitionList items={envelopeAuthorityItems(request.requestedEnvelope.spec)} /><p className="mt-4 rounded-control bg-notice p-4 text-sm">This custom request has no governing template and always requires administrator approval.</p></SectionCard>;
-  if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">This request is awaiting administrator approval.</p>;
+  if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">{requestStateCopy[request.state].message}</p>;
   return (
     <SectionCard title="Requested vs template limits">
       <div className="overflow-x-auto">

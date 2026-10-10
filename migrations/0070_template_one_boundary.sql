@@ -2,7 +2,9 @@
 -- limits. Preserve the stricter boundary of every affected current template
 -- by appending a successor whose limits are the old threshold. Historical
 -- revisions remain readable exactly as authored.
-LOCK TABLE envelope_template_revisions IN SHARE ROW EXCLUSIVE MODE;
+-- ADD CONSTRAINT needs ACCESS EXCLUSIVE later in this transaction. Take that
+-- mode immediately so an old writer cannot deadlock with a lock upgrade.
+LOCK TABLE envelope_template_revisions IN ACCESS EXCLUSIVE MODE;
 
 WITH latest AS MATERIALIZED (
     SELECT DISTINCT ON (template_id)
@@ -46,7 +48,15 @@ ORDER BY template_id;
 
 -- Keep the historical column readable while preventing every future writer,
 -- including an older process during a rolling deployment, from publishing a
--- new threshold-bearing revision. NOT VALID deliberately preserves old rows.
+-- distinct threshold. An equal threshold is the same single boundary and is
+-- accepted for rollback compatibility with older writers. NOT VALID
+-- deliberately preserves historical stricter rows.
 ALTER TABLE envelope_template_revisions
     ADD CONSTRAINT envelope_template_revisions_retired_auto_provision_threshold
-    CHECK (auto_provision_threshold IS NULL) NOT VALID;
+    CHECK (
+        auto_provision_threshold IS NULL
+        OR auto_provision_threshold IS NOT DISTINCT FROM jsonb_build_object(
+            'revision', revision,
+            'spec', spec
+        )
+    ) NOT VALID;

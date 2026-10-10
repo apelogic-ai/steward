@@ -291,6 +291,10 @@ pub struct EnvelopeTemplatePublication<'a> {
     pub authored_by: &'a str,
 }
 
+/// Actionable compatibility error returned when an old client attempts to
+/// publish the retired second template boundary.
+pub const RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE: &str = "Templates now use one set of limits. Set those limits to the point above which administrator review is required.";
+
 /// The current Steward-local browser authorization for one opaque canonical user.
 ///
 /// Google proves who a person is. This record proves only which Steward privileges an
@@ -839,6 +843,11 @@ mod migration_tests {
                 migration.version == 70 && migration.description.contains("template one boundary")
             }),
             "migration 70 must append narrowed template revisions without rewriting template, request, or provisioned-envelope history"
+        );
+        let migration = include_str!("../../../migrations/0070_template_one_boundary.sql");
+        assert!(
+            migration.contains("LOCK TABLE envelope_template_revisions IN ACCESS EXCLUSIVE MODE"),
+            "migration 70 must take its final lock mode up front instead of upgrading while an old writer waits"
         );
     }
 }
@@ -5684,6 +5693,13 @@ impl PgStore {
             .try_get::<Json<Envelope>, _>("requested_envelope")
             .map_err(database_error)?
             .0;
+        if update.to == EnvelopeRequestStatus::Provisioned {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!("active-user-envelope:{}", owner_user_id.as_str()))
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+        }
         let (status_template_revision, template_lock_held) =
             match (template_id.as_deref(), governing_template_revision) {
                 (Some(template_id), Some(governing_revision)) => {
@@ -5733,36 +5749,30 @@ impl PgStore {
         if current != update.from {
             return Err(StoreError::InvalidEnvelopeRequestTransition);
         }
-        if update.to == EnvelopeRequestStatus::Provisioned {
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(format!("active-user-envelope:{}", owner_user_id.as_str()))
-                .execute(&mut *transaction)
-                .await
-                .map_err(database_error)?;
-            if let (Some(template_id), Some(template_revision)) =
+        if update.to == EnvelopeRequestStatus::Provisioned
+            && let (Some(template_id), Some(template_revision)) =
                 (template_id.as_deref(), template_revision)
-            {
-                if !template_lock_held {
-                    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                        .bind(format!("envelope-template:{template_id}"))
-                        .execute(&mut *transaction)
-                        .await
-                        .map_err(database_error)?;
-                }
-                let revision_exists = sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS( \
-                         SELECT 1 FROM envelope_template_revisions \
-                         WHERE template_id = $1 AND revision = $2 \
-                     )",
-                )
-                .bind(template_id)
-                .bind(template_revision)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(database_error)?;
-                if !revision_exists {
-                    return Err(StoreError::EnvelopeRequestTemplateStale);
-                }
+        {
+            if !template_lock_held {
+                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                    .bind(format!("envelope-template:{template_id}"))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(database_error)?;
+            }
+            let revision_exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM envelope_template_revisions \
+                     WHERE template_id = $1 AND revision = $2 \
+                 )",
+            )
+            .bind(template_id)
+            .bind(template_revision)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if !revision_exists {
+                return Err(StoreError::EnvelopeRequestTemplateStale);
             }
         }
         let needs_snapshot = matches!(

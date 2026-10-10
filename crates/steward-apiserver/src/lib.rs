@@ -1307,11 +1307,9 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
     fn claim_envelope_request_decision_filing_at_template_revision<'a>(
         &'a self,
         request_id: Uuid,
-        _governing_template_revision: i64,
+        governing_template_revision: i64,
         claimed_by: &'a str,
-    ) -> BoxFuture<'a, Result<Uuid, StoreError>> {
-        self.claim_envelope_request_decision_filing(request_id, claimed_by)
-    }
+    ) -> BoxFuture<'a, Result<Uuid, StoreError>>;
 
     fn complete_envelope_request_decision_filing<'a>(
         &'a self,
@@ -1351,10 +1349,7 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         request_id: Uuid,
         governing_template_revision: i64,
         update: EnvelopeRequestStatusUpdate<'a>,
-    ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>> {
-        let _ = governing_template_revision;
-        self.append_envelope_request_status(request_id, update)
-    }
+    ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>>;
 
     fn provision_envelope_for_admin<'a>(
         &'a self,
@@ -5971,7 +5966,7 @@ mod tests {
                 .map_err(|error| format!("parse retired threshold response: {error}"))?
                 .pointer("/error"),
             Some(&serde_json::json!(
-                "autoProvisionThreshold is retired; set the template limits to the automatic-approval boundary"
+                steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE
             ))
         );
         let body = serde_json::to_vec(&next)
@@ -7757,6 +7752,9 @@ mod tests {
             publication: EnvelopeTemplatePublication<'a>,
         ) -> BoxFuture<'a, Result<(), StoreError>> {
             Box::pin(async move {
+                if publication.auto_provision_threshold.is_some() {
+                    return Err(StoreError::InvalidEnvelopeTemplate);
+                }
                 let mut templates = self.envelope_templates.lock().map_err(|_| {
                     StoreError::Database("fake envelope-template lock was poisoned".to_owned())
                 })?;
@@ -8520,6 +8518,21 @@ mod tests {
             update: EnvelopeRequestStatusUpdate<'a>,
         ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>> {
             Box::pin(async move {
+                let request = self
+                    .envelope_request_for_admin(request_id)
+                    .await?
+                    .ok_or(StoreError::EnvelopeRequestNotFound)?;
+                let template_id = request
+                    .template_id
+                    .as_deref()
+                    .ok_or(StoreError::InvalidEnvelopeRequestTransition)?;
+                let latest = self
+                    .latest_envelope_template(template_id)
+                    .await?
+                    .ok_or(StoreError::EnvelopeRequestTemplateStale)?;
+                if latest.ceiling.revision != governing_template_revision {
+                    return Err(StoreError::EnvelopeRequestTemplateStale);
+                }
                 let mut decided = self
                     .append_envelope_request_status(request_id, update)
                     .await?;
@@ -9632,6 +9645,72 @@ mod tests {
             tools: Vec::new(),
             catalogs: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn fake_ledger_enforces_retired_threshold_and_current_revision_fences()
+    -> Result<(), String> {
+        let ledger = ledger();
+        let roles = vec!["engineer".to_owned()];
+        let mut ceiling = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "lock fake template ceiling")?
+            .clone();
+        ceiling.revision = 4;
+        let threshold = ceiling.clone();
+
+        let retired_threshold = ledger
+            .insert_envelope_template_revision(EnvelopeTemplatePublication {
+                template_id: "engineer",
+                display_name: "Engineer",
+                member_roles: &roles,
+                ceiling: &ceiling,
+                auto_provision_threshold: Some(&threshold),
+                allow_inline_browser_tasks: true,
+                authored_by: "alice",
+            })
+            .await;
+        assert!(matches!(
+            retired_threshold,
+            Err(StoreError::InvalidEnvelopeTemplate)
+        ));
+
+        let request_id = Uuid::from_u128(4);
+        let stale_transition = ledger
+            .append_envelope_request_status_at_template_revision(
+                request_id,
+                2,
+                EnvelopeRequestStatusUpdate {
+                    from: EnvelopeRequestStatus::Pending,
+                    to: EnvelopeRequestStatus::Rejected,
+                    approval_id: None,
+                    envelope_instance_id: None,
+                    envelope_digest: None,
+                    reason: Some("not approved"),
+                    rationale: None,
+                    evidence_url: None,
+                    expires_at: None,
+                    approved_envelope: None,
+                    actor: "alice",
+                },
+            )
+            .await;
+        assert!(matches!(
+            stale_transition,
+            Err(StoreError::EnvelopeRequestTemplateStale)
+        ));
+        assert_eq!(
+            ledger
+                .envelope_request_for_admin(request_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "fake request disappeared".to_owned())?
+                .status,
+            EnvelopeRequestStatus::Pending,
+            "a stale fake transition must not mutate the request"
+        );
+        Ok(())
     }
 
     fn pending_user_envelope_request(request_id: u128) -> PendingEnvelopeRequest {

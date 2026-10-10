@@ -205,10 +205,15 @@ ORDER BY template_id, revision;
 ```
 
 Keep migration 0070 applied during rollback. Older binaries can read the
-narrowed successor revisions, but they can author the retired field again, so
-stop template writes until every writer runs a one-boundary release. Do not
-delete the migration-authored revisions or rewrite pending and provisioned
-history to manufacture rollback compatibility.
+narrowed successor revisions. The database accepts an older writer's threshold
+only when it is exactly equal to that revision's limits, so it remains the same
+single boundary; every distinct threshold is rejected. If a one-boundary binary
+created a default-template revision, set
+`config.apiserver.defaultLlmTemplate.enabled=false` before rolling back to
+v0.3.15. The previous apiserver will not start with default-template seeding
+enabled against that threshold-free revision. Do not delete the
+migration-authored revisions or rewrite pending and provisioned history to
+manufacture rollback compatibility.
 
 Roll back only to a binary that understands every row written after upgrade.
 In particular, a pre-0051 binary cannot read a template-free request. Before such

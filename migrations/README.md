@@ -219,7 +219,10 @@ its published limits. When a latest revision has a stricter
 that threshold, clears the retired field, preserves the other template metadata,
 and records `system:migration` as author. Templates without a threshold or with
 an equal threshold are unchanged. A not-valid check constraint preserves
-historical threshold-bearing rows for exact reads while rejecting every new
-threshold-bearing revision, including writes from an older process during a
-rolling deployment. Pending requests and already provisioned Envelopes remain
-immutable and are not rewritten.
+historical threshold-bearing rows for exact reads. It accepts only NULL or the
+equal-to-limits threshold emitted by a previous default-template writer during
+a mixed-version rollout; every distinct threshold is rejected. Pending requests
+and already provisioned Envelopes remain immutable and are not rewritten. If a
+one-boundary binary creates a threshold-free default-template revision, disable
+default-template seeding before rolling back to v0.3.15 because that binary
+requires an equal threshold on the configured revision.

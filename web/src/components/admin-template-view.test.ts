@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 
-import { initialEnvelopeTemplate, templateMemberRoles, validateTemplateFields } from "./admin-template-view";
+import { initialEnvelopeTemplate, templateBudgetCurrency, templateMemberRoles, validateTemplateFields } from "./admin-template-view";
+
+const source = readFileSync(new URL("./admin-template-view.tsx", import.meta.url), "utf8");
 
 function authoredEnvelope() {
   return {
@@ -29,6 +32,18 @@ describe("first envelope template", () => {
         runtimeMinutesLimit: "60",
       },
     });
+  });
+
+  test("preserves the template currency and explains TTL duration units", () => {
+    const envelope = authoredEnvelope();
+    envelope.spec.budget.currency = "EUR";
+
+    expect(templateBudgetCurrency(envelope)).toBe("EUR");
+    expect(source).toContain("currency: budgetCurrency");
+    expect(source).not.toContain("Limit per run (USD)");
+    expect(source).not.toContain("Monthly limit (USD)");
+    expect(source).toContain("Time-to-live limit (duration, e.g. 15m)");
+    expect(source).toContain('placeholder="15m"');
   });
 
   test("follows the typed template ID until member roles are explicitly edited", () => {

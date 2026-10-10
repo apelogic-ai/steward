@@ -27,10 +27,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Migration 0070 is append-only and records every generated template revision
   with actor `system:migration`; retain it on rollback. List the affected
   template IDs and successor revisions with
-  `SELECT template_id, revision FROM envelope_template_revisions WHERE authored_by = 'system:migration' ORDER BY template_id, revision`. Stop template
-  authoring during a mixed-version rollout or rollback because an older writer
-  can still attempt to publish the retired field. Do not delete generated
-  revisions or rewrite pending requests and provisioned Envelope history.
+  `SELECT template_id, revision FROM envelope_template_revisions WHERE authored_by = 'system:migration' ORDER BY template_id, revision`. During a mixed-version
+  rollout, migration 0070 accepts the equal-to-limits threshold emitted by the
+  previous default-template writer but rejects every distinct threshold. If a
+  one-boundary binary creates a default-template revision, disable
+  `config.apiserver.defaultLlmTemplate.enabled` before rolling back to v0.3.15;
+  the previous binary will not start with that setting enabled against the
+  threshold-free revision. Do not delete generated revisions or rewrite pending
+  requests and provisioned Envelope history.
 
 ## [0.3.15] - 2026-10-09
 

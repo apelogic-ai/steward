@@ -2681,10 +2681,17 @@ async fn seed_template_one_boundary_upgrade_fixture(store: &PgStore) -> Result<(
          (template_id, revision, display_name, member_roles, spec, \
           auto_provision_threshold, allow_inline_browser_tasks, authored_by) \
          VALUES \
-         ('template-stricter', 3, 'Stricter template', ARRAY['engineer'], $1, $2, false, 'alice'), \
+         ('template-stricter', 1, 'Superseded template', ARRAY['analyst'], \
+          $1, NULL, true, 'alice'), \
+         ('template-stricter', 3, 'Stricter template', ARRAY['analyst', 'engineer'], \
+          $1, $2, false, 'alice'), \
          ('template-equal', 2, 'Equal template', ARRAY['engineer'], $3, $4, true, 'alice'), \
          ('template-without-threshold', 5, 'No threshold template', ARRAY['engineer'], \
-          $5, NULL, true, 'alice')",
+          $5, NULL, true, 'alice'), \
+         ('template-latest-without-threshold', 6, 'Historical threshold template', \
+          ARRAY['analyst'], $1, $2, false, 'alice'), \
+         ('template-latest-without-threshold', 7, 'Current no-threshold template', \
+          ARRAY['engineer'], $5, NULL, true, 'alice')",
     )
     .bind(&ceiling["spec"])
     .bind(&threshold)
@@ -2766,50 +2773,60 @@ async fn assert_template_one_boundary_upgrade_result(
         _,
         (
             i64,
+            String,
+            Vec<String>,
             serde_json::Value,
             Option<serde_json::Value>,
             bool,
             String,
         ),
     >(
-        "SELECT revision, spec, auto_provision_threshold, allow_inline_browser_tasks, \
-                authored_by \
+        "SELECT revision, display_name, member_roles, spec, auto_provision_threshold, \
+                allow_inline_browser_tasks, authored_by \
          FROM envelope_template_revisions \
          WHERE template_id = 'template-stricter' ORDER BY revision",
     )
     .fetch_all(store.pool())
     .await?;
-    assert_eq!(revisions.len(), 2);
-    assert_eq!(revisions[0].0, 3);
-    assert_eq!(revisions[0].1["budget"]["monthlyLimit"], "200.00");
+    assert_eq!(revisions.len(), 3);
+    assert_eq!(revisions[0].0, 1);
+    assert_eq!(revisions[1].0, 3);
+    assert_eq!(revisions[1].3["budget"]["monthlyLimit"], "200.00");
     assert_eq!(
-        revisions[0]
-            .2
+        revisions[1]
+            .4
             .as_ref()
             .and_then(|value| value.pointer("/spec/budget/monthlyLimit")),
         Some(&serde_json::json!("50.00")),
         "the historical threshold-bearing revision must remain unchanged"
     );
-    assert_eq!(revisions[1].0, 4);
-    assert_eq!(revisions[1].1["budget"]["monthlyLimit"], "50.00");
-    assert!(revisions[1].2.is_none());
+    assert_eq!(revisions[2].0, 4, "the successor must be latest + 1");
+    assert_eq!(revisions[2].1, "Stricter template");
+    assert_eq!(revisions[2].2, ["analyst", "engineer"]);
+    assert_eq!(revisions[2].3["budget"]["monthlyLimit"], "50.00");
+    assert!(revisions[2].4.is_none());
     assert!(
-        !revisions[1].3,
+        !revisions[2].5,
         "successor must preserve inline-Task policy"
     );
-    assert_eq!(revisions[1].4, "system:migration");
+    assert_eq!(revisions[2].6, "system:migration");
 
-    for template_id in ["template-equal", "template-without-threshold"] {
+    for (template_id, expected_count, expected_latest) in [
+        ("template-equal", 1, 2),
+        ("template-without-threshold", 1, 5),
+        ("template-latest-without-threshold", 2, 7),
+    ] {
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*)::bigint FROM envelope_template_revisions \
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT count(*)::bigint, max(revision) \
+                 FROM envelope_template_revisions \
                  WHERE template_id = $1",
             )
             .bind(template_id)
             .fetch_one(store.pool())
             .await?,
-            1,
-            "only a strictly different threshold may append a successor"
+            (expected_count, expected_latest),
+            "only a strictly different threshold on the latest revision may append a successor"
         );
     }
 
@@ -2831,6 +2848,15 @@ async fn assert_template_one_boundary_upgrade_result(
         .find(|request| request.request_id == pending_request_id)
         .ok_or("migrated pending request was absent from the approval queue")?;
     assert_eq!(pending_projection.template_revision, Some(3));
+    assert_eq!(
+        pending_projection
+            .requested_envelope
+            .spec
+            .budget
+            .monthly_limit,
+        "150.00",
+        "the migrated pending request must remain between the old threshold and old limits"
+    );
     assert_eq!(
         pending_projection
             .template_envelope
@@ -2897,6 +2923,16 @@ async fn assert_template_one_boundary_upgrade_result(
         Some(3),
         "terminal request evidence must retain the pinned template revision"
     );
+    assert_eq!(
+        provisioned_projection
+            .request
+            .requested_envelope
+            .spec
+            .budget
+            .monthly_limit,
+        "150.00",
+        "the already-provisioned envelope must remain above the migrated 50 USD limits"
+    );
 
     let historical = store
         .envelope_template_revision("template-stricter", 3)
@@ -2921,10 +2957,61 @@ async fn assert_template_one_boundary_upgrade_result(
         .is_err(),
         "the migrated successor must remain append-only"
     );
-    let forbidden_threshold = serde_json::json!({
+    let rollback_spec = serde_json::to_value(&current.ceiling.spec)?;
+    let rollback_equal_threshold = serde_json::json!({
         "revision": 1,
-        "spec": current.ceiling.spec
+        "spec": rollback_spec.clone()
     });
+    sqlx::query(
+        "INSERT INTO envelope_template_revisions \
+         (template_id, revision, display_name, member_roles, spec, \
+          auto_provision_threshold, authored_by) \
+         VALUES ('template-rollback-compatible', 1, 'Rollback compatible', \
+                 ARRAY['engineer'], $1, $2, 'alice')",
+    )
+    .bind(&rollback_spec)
+    .bind(&rollback_equal_threshold)
+    .execute(store.pool())
+    .await?;
+
+    let mut wrong_revision_threshold = rollback_equal_threshold.clone();
+    wrong_revision_threshold["revision"] = serde_json::json!(2);
+    assert!(
+        sqlx::query(
+            "INSERT INTO envelope_template_revisions \
+             (template_id, revision, display_name, member_roles, spec, \
+              auto_provision_threshold, authored_by) \
+             VALUES ('template-wrong-threshold-revision', 1, 'Wrong threshold revision', \
+                     ARRAY['engineer'], $1, $2, 'alice')",
+        )
+        .bind(&rollback_spec)
+        .bind(&wrong_revision_threshold)
+        .execute(store.pool())
+        .await
+        .is_err(),
+        "rollback thresholds must match both the row revision and its limits"
+    );
+
+    let mut extra_field_threshold = rollback_equal_threshold.clone();
+    extra_field_threshold["unexpected"] = serde_json::json!(true);
+    assert!(
+        sqlx::query(
+            "INSERT INTO envelope_template_revisions \
+             (template_id, revision, display_name, member_roles, spec, \
+              auto_provision_threshold, authored_by) \
+             VALUES ('template-extra-threshold-field', 1, 'Extra threshold field', \
+                     ARRAY['engineer'], $1, $2, 'alice')",
+        )
+        .bind(&rollback_spec)
+        .bind(&extra_field_threshold)
+        .execute(store.pool())
+        .await
+        .is_err(),
+        "rollback thresholds must be the exact historical Envelope shape"
+    );
+
+    let mut forbidden_threshold = rollback_equal_threshold;
+    forbidden_threshold["spec"]["budget"]["monthlyLimit"] = serde_json::json!("25.00");
     assert!(
         sqlx::query(
             "INSERT INTO envelope_template_revisions \
@@ -2933,12 +3020,12 @@ async fn assert_template_one_boundary_upgrade_result(
              VALUES ('template-forbidden-threshold', 1, 'Forbidden threshold', \
                      ARRAY['engineer'], $1, $2, 'alice')",
         )
-        .bind(&forbidden_threshold["spec"])
+        .bind(&rollback_spec)
         .bind(&forbidden_threshold)
         .execute(store.pool())
         .await
         .is_err(),
-        "new threshold-bearing template revisions must fail at the database boundary"
+        "only null or exactly equal rollback thresholds may pass the database boundary"
     );
 
     let request_id = pending_request_id;
@@ -3018,7 +3105,7 @@ async fn assert_template_one_boundary_upgrade_result(
         )
         .fetch_one(store.pool())
         .await?,
-        2,
+        3,
         "re-running the migrator must not append another successor"
     );
     Ok(())
