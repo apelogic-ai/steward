@@ -192,8 +192,21 @@ impl GitHostingPlane for FakeAdapter {
 
     async fn resolve_revision(
         &self,
-        _request: &GitRevisionRequest,
+        request: &GitRevisionRequest,
     ) -> Result<steward_types::direct_package::ExactGitCommit, PortError> {
+        let reference =
+            request
+                .reference
+                .strip_prefix("git:ref:")
+                .ok_or_else(|| PortError::Rejected {
+                    reason: "Git reference is invalid".to_owned(),
+                })?;
+        if reference.is_empty() || reference.len() > 512 || reference.chars().any(char::is_control)
+        {
+            return Err(PortError::Rejected {
+                reason: "Git reference is invalid".to_owned(),
+            });
+        }
         steward_types::direct_package::ExactGitCommit::parse(format!("git:sha1:{}", "a".repeat(40)))
             .map_err(|reason| PortError::Failed { reason })
     }

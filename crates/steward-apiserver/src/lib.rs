@@ -4176,8 +4176,23 @@ mod tests {
 
         async fn resolve_revision(
             &self,
-            _request: &GitRevisionRequest,
+            request: &GitRevisionRequest,
         ) -> Result<ExactGitCommit, PortError> {
+            let reference =
+                request
+                    .reference
+                    .strip_prefix("git:ref:")
+                    .ok_or_else(|| PortError::Rejected {
+                        reason: "Git reference is invalid".to_owned(),
+                    })?;
+            if reference.is_empty()
+                || reference.len() > 512
+                || reference.chars().any(char::is_control)
+            {
+                return Err(PortError::Rejected {
+                    reason: "Git reference is invalid".to_owned(),
+                });
+            }
             ExactGitCommit::parse(format!("git:sha1:{}", "c".repeat(40)))
                 .map_err(|reason| PortError::Failed { reason })
         }
@@ -11682,6 +11697,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_inline_checkout_repository_resolves_trigger_with_typed_git_ref()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        enable_inline_for_versioned_task_fixture(&ledger, true)?;
+        let mut request_body = inline_browser_task_body();
+        let definition = request_body["package"]["files"]["task-definition.json"]
+            .as_str()
+            .ok_or_else(|| "inline browser fixture omitted TaskDefinition".to_owned())?;
+        let mut definition = serde_json::from_str::<serde_json::Value>(definition)
+            .map_err(|error| format!("parse inline browser TaskDefinition: {error}"))?;
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "repository": {"ownerId": "7890", "repositoryId": "654321"},
+                "ref": "trigger",
+                "history": {"depth": 12}
+            }
+        }]);
+        request_body["package"]["files"]["task-definition.json"] =
+            serde_json::Value::String(definition.to_string());
+
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let config = task_api_config()?
+            .with_git_hosting_plane(browser_git_fixture()?)
+            .with_source_repository_bindings_json(Some(&direct_source_bindings_json("654321")))?;
+        let response = browser_task_router(ledger.clone(), config, auth)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/runs")
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", csrf)
+                    .header("idempotency-key", "browser-inline-workspace-trigger")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .map_err(|error| format!("build browser workspace request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit browser workspace request: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let tasks = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake Task ledger lock was poisoned")?;
+        let entry = tasks
+            .first()
+            .and_then(|task| task.browser_task_evidence.as_ref())
+            .and_then(|evidence| evidence.workspace.as_ref())
+            .and_then(|workspace| workspace.entries.first())
+            .ok_or_else(|| "browser workspace evidence was not persisted".to_owned())?;
+        match entry {
+            steward_types::direct_package::ResolvedWorkspaceEntry::Git {
+                repository_id,
+                commit,
+                history,
+                ..
+            } => {
+                assert_eq!(repository_id.as_str(), "654321");
+                assert_eq!(commit.as_str(), format!("git:sha1:{}", "c".repeat(40)));
+                assert_eq!(
+                    history,
+                    &steward_types::direct_package::WorkspaceGitHistory::Depth(12)
+                );
+            }
+            _ => return Err("browser workspace evidence was not a Git entry".to_owned()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn browser_registry_alias_uses_the_existing_versioned_workflow_path() -> Result<(), String>
     {
         let ledger = versioned_task_ledger()?;
@@ -12814,6 +12903,72 @@ mod tests {
                 .windows(b"PACKdeterministic-fixture".len())
                 .any(|window| { window == b"PACKdeterministic-fixture" })
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_resolves_explicit_repository_trigger_with_typed_git_ref()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "repository": {"ownerId": "7890", "repositoryId": "654321"},
+                "ref": "trigger",
+                "history": {"depth": 5},
+                "access": "copy"
+            }
+        }]);
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let response = direct_test_app(ledger.clone(), git)?
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-explicit-workspace-trigger")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct workspace request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct workspace request: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let tasks = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake Task ledger lock was poisoned")?;
+        let entry = tasks
+            .first()
+            .and_then(|task| task.direct_task_evidence.as_ref())
+            .and_then(|evidence| evidence.workspace.as_ref())
+            .and_then(|workspace| workspace.entries.first())
+            .ok_or_else(|| "explicit workspace evidence was not persisted".to_owned())?;
+        match entry {
+            steward_types::direct_package::ResolvedWorkspaceEntry::Git {
+                repository_id,
+                commit,
+                history,
+                ..
+            } => {
+                assert_eq!(repository_id.as_str(), "654321");
+                assert_eq!(commit.as_str(), format!("git:sha1:{}", "c".repeat(40)));
+                assert_eq!(
+                    history,
+                    &steward_types::direct_package::WorkspaceGitHistory::Depth(5)
+                );
+            }
+            _ => return Err("explicit workspace evidence was not a Git entry".to_owned()),
+        }
         Ok(())
     }
 

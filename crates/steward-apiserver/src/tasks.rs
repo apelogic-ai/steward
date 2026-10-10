@@ -512,6 +512,17 @@ impl TaskApiConfig {
         ));
     }
 
+    fn report_source_port_failure(
+        &self,
+        operation: &'static str,
+        category: &'static str,
+        diagnostic: &'static str,
+    ) {
+        (self.failure_reporter)(&format!(
+            "task source operation failed operation={operation} category={category} diagnostic={diagnostic}"
+        ));
+    }
+
     pub fn with_source_repository_bindings_json(
         mut self,
         value: Option<&str>,
@@ -3164,10 +3175,12 @@ where
                     steward_types::direct_package::WorkspaceGitRef::Trigger => git
                         .resolve_revision(&GitRevisionRequest {
                             repository: repository.clone(),
-                            reference: description.default_branch.clone(),
+                            reference: git_reference(&description.default_branch)?,
                         })
                         .await
-                        .map_err(source_port_error)?,
+                        .map_err(|error| {
+                            source_port_error_with_reporter(config, "resolve_revision", error)
+                        })?,
                 };
                 let resolution = if entry.git.submodules.mode == WorkspaceSubmoduleMode::Admitted {
                     resolve_workspace_submodules(
@@ -4095,7 +4108,7 @@ where
                 reference: requested_revision.to_owned(),
             })
             .await
-            .map_err(source_port_error)?
+            .map_err(|error| source_port_error_with_reporter(config, "resolve_revision", error))?
         };
         let definition_request = GitFileRequest {
             repository: repository.clone(),
@@ -5346,6 +5359,33 @@ fn resolve_direct_execution_plan(
     Ok((command, TaskExecutionBinding::Disposable(binding)))
 }
 
+fn git_reference(reference: &str) -> Result<String, ApiError> {
+    if reference.is_empty() || reference.len() > 512 || reference.chars().any(char::is_control) {
+        return Err(ApiError::Admission(
+            "workspace_git_repository_unresolved".to_owned(),
+        ));
+    }
+    Ok(format!("git:ref:{reference}"))
+}
+
+fn source_port_error_with_reporter(
+    config: &TaskApiConfig,
+    operation: &'static str,
+    error: steward_ports::PortError,
+) -> ApiError {
+    let (category, diagnostic) = match &error {
+        steward_ports::PortError::Rejected { reason } if reason == "Git reference is invalid" => {
+            ("rejected", "git_reference_invalid")
+        }
+        steward_ports::PortError::Rejected { .. } => ("rejected", "source_rejected"),
+        steward_ports::PortError::Unsupported { .. } => ("unsupported", "source_unsupported"),
+        steward_ports::PortError::Failed { .. } => ("failed", "source_failed"),
+        _ => ("unavailable", "source_unavailable"),
+    };
+    config.report_source_port_failure(operation, category, diagnostic);
+    source_port_error(error)
+}
+
 fn source_port_error(error: steward_ports::PortError) -> ApiError {
     match error {
         steward_ports::PortError::Rejected { .. } => {
@@ -5904,7 +5944,7 @@ pub(crate) fn stable_task_runtime_name(operation_id: Uuid) -> String {
 
 #[cfg(test)]
 mod workflow_request_tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::{
         DirectGitResolver, MAX_WORKSPACE_MATERIALIZED_BYTES, TaskApiConfig, TaskCreateRequest,
@@ -5912,8 +5952,8 @@ mod workflow_request_tests {
         append_workspace_git_pack, browser_input_retry_matches, browser_inputs_archive,
         browser_inputs_from_archive, browser_rerun_submission, browser_workspace_trigger_commit,
         default_workspace_name, prepare_task_input_archive, resolve_versioned_task_plan,
-        stable_task_runtime_name, task_orchestration_reservation, validate_workspace_policy,
-        versioned_workflow_reference, workspace_admission_policy,
+        source_port_error_with_reporter, stable_task_runtime_name, task_orchestration_reservation,
+        validate_workspace_policy, versioned_workflow_reference, workspace_admission_policy,
         workspace_git_materialized_budget, workspace_submodule_is_selected,
         workspace_submodule_repository_url, workspace_tree_inventory,
     };
@@ -5938,6 +5978,51 @@ mod workflow_request_tests {
     struct ExampleExecutionAdapter;
 
     struct OversizedPackResolver;
+
+    #[test]
+    fn source_revision_diagnostics_are_allowlisted_and_public_errors_remain_generic()
+    -> Result<(), String> {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = lines.clone();
+        let config = TaskApiConfig::default().with_failure_reporter(Arc::new(move |line| {
+            if let Ok(mut lines) = captured.lock() {
+                lines.push(line.to_owned());
+            }
+        }));
+
+        let known = source_port_error_with_reporter(
+            &config,
+            "resolve_revision",
+            PortError::Rejected {
+                reason: "Git reference is invalid".to_owned(),
+            },
+        );
+        let hostile = source_port_error_with_reporter(
+            &config,
+            "resolve_revision",
+            PortError::Rejected {
+                reason: "Bearer fixture-secret-value".to_owned(),
+            },
+        );
+
+        for error in [known, hostile] {
+            assert!(matches!(
+                error,
+                ApiError::Admission(ref reason)
+                    if reason == "exact source object could not be resolved"
+            ));
+        }
+        assert_eq!(
+            *lines
+                .lock()
+                .map_err(|_| "source diagnostic log lock was poisoned")?,
+            vec![
+                "task source operation failed operation=resolve_revision category=rejected diagnostic=git_reference_invalid".to_owned(),
+                "task source operation failed operation=resolve_revision category=rejected diagnostic=source_rejected".to_owned(),
+            ]
+        );
+        Ok(())
+    }
 
     impl DirectGitResolver for OversizedPackResolver {
         fn describe_repositories<'a>(
