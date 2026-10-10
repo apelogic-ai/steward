@@ -2433,21 +2433,28 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await expect(developer.page.getByText("5.00 USD")).toBeVisible();
 
     await developer.page.goto(`${origin}/envelopes/new`);
-    const template = developer.page.locator("label").filter({ hasText: /^Template/ }).locator("select");
-    await expect(template.locator("option")).toHaveText(["Analyst · revision 2", "Developer · revision 4"]);
-    await expect(template).toHaveValue("analyst");
+    const template = developer.page.getByRole("combobox", { name: "Template", exact: true });
+    await expect(template.locator("option")).toHaveText([
+      "Analyst · rev 2 — 10.00 USD/month · TTL 2h · 1 tool",
+      "Developer · rev 4 — 25.00 USD/month · TTL 4h · 1 tool",
+      "Custom envelope",
+    ]);
+    await expect(template).toHaveValue("template:analyst");
     await expect(developer.page.getByLabel("Monthly limit (USD)")).toHaveValue("10.00");
+    await expect(developer.page.getByLabel("Limit per run (USD)")).toHaveValue("1.00");
     await expect(developer.page.getByLabel("Time to live")).toHaveValue("2h");
-    await template.selectOption("developer");
+    await template.selectOption("template:developer");
     await expect(developer.page.getByLabel("Monthly limit (USD)")).toHaveValue("25.00");
+    await expect(developer.page.getByLabel("Limit per run (USD)")).toHaveValue("5.00");
     await expect(developer.page.getByLabel("Time to live")).toHaveValue("4h");
+    await developer.page.getByLabel("Limit per run (USD)").fill("4.00");
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
     const provisioned = developer.page.locator("#page-title").getByText("provisioned", { exact: true });
     await expect(provisioned).toHaveAttribute("data-tone", "ok");
     const envelopeMutation = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/envelope-requests");
     expectMutationProof(envelopeMutation);
-    expect(envelopeMutation.body.requestedEnvelope.spec.budget.singleRunLimit).toBe("5.00");
+    expect(envelopeMutation.body.requestedEnvelope.spec.budget.singleRunLimit).toBe("4.00");
 
     const workflow = developer.page.getByRole("combobox", { name: "Workflow", exact: true });
     await expect(workflow.locator("option")).toHaveText(["Repository review · repository-review@1"]);
@@ -2500,7 +2507,7 @@ test("a value above the template ceiling is submitted for administrator approval
   const developer = await guardedPage(browser);
   try {
     await developer.page.goto(`${origin}/envelopes/new`);
-    await developer.page.locator("label").filter({ hasText: /^Template/ }).locator("select").selectOption("developer");
+    await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("template:developer");
     await developer.page.getByLabel("Time to live").fill("5h");
 
     const summary = developer.page.getByText("Needs admin approval: 1 value above the template ceiling", { exact: true });
@@ -2529,6 +2536,27 @@ test("a value above the template ceiling is submitted for administrator approval
   }
 });
 
+test("the per-run limit reports ceiling exceptions and cannot exceed the monthly limit", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  try {
+    await developer.page.goto(`${origin}/envelopes/new?template=developer`);
+    await expect(developer.page.getByRole("combobox", { name: "Template", exact: true })).toHaveValue("template:developer");
+    const singleRunLimit = developer.page.getByLabel("Limit per run (USD)");
+    await singleRunLimit.fill("6.00");
+
+    await expect(singleRunLimit).toHaveClass(/border-warn/);
+    await expect(developer.page.getByText("Above ceiling 5.00 USD", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Limit per run: 6.00 USD (ceiling 5.00 USD)", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("button", { name: "Submit for approval" })).toBeEnabled();
+
+    await developer.page.getByLabel("Monthly limit (USD)").fill("5.00");
+    await expect(developer.page.getByRole("alert").filter({ hasText: "Limit per run cannot exceed the monthly limit." })).toBeVisible();
+    await expect(developer.page.getByRole("button", { name: "Submit for approval" })).toBeDisabled();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("a field-specific envelope rejection identifies the field and clears after correction", async ({ browser }) => {
   const failureReason = "Monthly limit exceeds the deployment safety ceiling.";
   const developer = await guardedPage(browser, {
@@ -2547,7 +2575,7 @@ test("a field-specific envelope rejection identifies the field and clears after 
   });
   try {
     await developer.page.goto(`${origin}/envelopes/new`);
-    await developer.page.locator("label").filter({ hasText: /^Template/ }).locator("select").selectOption("developer");
+    await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("template:developer");
     const monthlyLimit = developer.page.getByLabel("Monthly limit (USD)");
     await monthlyLimit.fill("999.00");
     await developer.page.getByRole("button", { name: "Submit for approval" }).click();
@@ -2572,12 +2600,12 @@ test("users can request a custom envelope without selecting a template", async (
   });
   try {
     await developer.page.goto(`${origin}/envelopes/new`);
-    await developer.page.getByLabel("Request type").selectOption("custom");
-    await expect(developer.page.locator("label").filter({ hasText: /^Template/ }).locator("select")).toHaveCount(0);
+    await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("custom");
+    await expect(developer.page.getByLabel("Request type")).toHaveCount(0);
     await developer.page.getByLabel("Complete envelope JSON").fill(JSON.stringify(analystEnvelope, null, 2));
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await Promise.all([
-      expect(developer.page.getByLabel("Request type")).toBeDisabled(),
+      expect(developer.page.getByRole("combobox", { name: "Template", exact: true })).toBeDisabled(),
       expect(developer.page.getByLabel("Complete envelope JSON")).toBeDisabled(),
       expect(developer.page.locator('button[type="submit"]')).toBeDisabled(),
     ]);
