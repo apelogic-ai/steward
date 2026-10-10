@@ -248,6 +248,9 @@ block; latest/nightly upstream lanes are informational.
 
 Never hand off warnings. Repository Clippy policy treats warnings as errors.
 
+Whatever the gate, check the diff against "Product rules every change must
+satisfy" before every push; PR review blocks on them.
+
 ### Documentation currency
 
 The documentation-only gate checks whitespace, neutral identifiers, and secret
@@ -404,3 +407,66 @@ publication follows this rule regardless of its directory.
 
 Package-specific instructions live beside the relevant code. They add local
 constraints and do not relax these root rules.
+
+## 11. Product rules every change must satisfy
+
+These are standing product decisions. PR review blocks on them, so satisfy them
+before pushing rather than after a review round. They apply to everything a
+change adds or touches; they add to the sections above and relax none of them.
+
+1. **Requests are at or below the ceiling (#352).** Every value a Task or
+   request asks for (models, tools, budget, runtime, resources, workspace
+   parameters) may be anything at or below its effective ceiling. Never require
+   an exact match with a ceiling and never reject a valid value outright.
+   Record the requested and the effective values in evidence.
+2. **Nothing about product configuration is hard-coded (#364).** Model names
+   and families, agent/model compatibility, provider lists, workspace types,
+   caps, and limits come from deployment configuration (capability catalog,
+   execution bindings, chart values) and reach the UI through the API. Add a
+   test where a value unknown to the code flows through. Tests may use
+   literals, subject to "Neutral test data".
+3. **Plain language in everything users see (#361).** No implementation words
+   in UI text or user-facing API messages: "Rust", "admission path",
+   "authority/authoritative", "boundary", "ledger", "broker", "server-owned",
+   "source of truth". Say what happened and what to do next. Internal reason
+   codes go behind a details view.
+4. **Units and labels (#362).** Money always shows its currency with consistent
+   decimals. Limits are labelled as limits ("Limit per run", "Monthly limit").
+   Durations use one shared formatter and unit inputs, not per-component
+   ones; never bare numbers or free-text durations.
+5. **Never weaken an authorization or review control as a side effect.**
+   Removing or loosening a check (approval thresholds, revision guards, RBAC,
+   admission gates), or inverting a test that asserts one, needs an explicit
+   maintainer decision in its own issue, linked from the PR, in addition to
+   "Red tests" and "Changes requiring advance approval".
+6. **Test fakes enforce the real contract (#353).** A fake adapter or resolver
+   must reject what the real one rejects (formats, prefixes, bounds). Any bug
+   found against a real service gets a regression test that fails with the old
+   fake.
+7. **Retries and idempotency.** A retried request must reach the same outcome
+   as an uninterrupted one. It must never strand a resource in a half-done
+   state and never skip side effects such as audit or decision records.
+   Compare parsed values, not raw strings.
+8. **Migrations.** Check every migration against existing table triggers
+   (immutability and monotonicity) and test the upgrade with historical rows.
+   Append new rows or revisions; do not update immutable ones.
+9. **Scope.** One concern per PR, plus whatever "Release batching" and
+   "Documentation currency" require alongside it. Do not remove or redesign
+   behavior the issue did not ask for; file a follow-up instead.
+
+### Pre-push checklist
+
+Before every push, read the diff and confirm:
+
+- no request value is compared for equality with its ceiling, and evidence
+  carries both the requested and the effective value;
+- no model, provider, workspace type, cap, or limit is a literal outside tests;
+- every new or changed user-visible string is plain language, with units,
+  currency, and limit labels;
+- no authorization or review check, and no test asserting one, was loosened
+  without a linked maintainer decision;
+- every fake touched rejects what the real service rejects, and every retry
+  path reaches the same outcome with the same side effects;
+- every migration was checked against table triggers and run over historical
+  rows; and
+- the diff contains one concern, with everything else filed as a follow-up.
