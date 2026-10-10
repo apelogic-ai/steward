@@ -212,3 +212,14 @@ Migration 0069 records the optional requester justification and the exact
 template-ceiling admission deltas on each immutable Envelope request. Existing
 requests keep an empty delta list and no justification; no request or status
 history is rewritten.
+
+Migration 0070 gives each Envelope Template one automatic-provisioning boundary:
+its published limits. When a latest revision has a stricter
+`auto_provision_threshold`, the migration appends a successor whose limits equal
+that threshold, clears the retired field, preserves the other template metadata,
+and records `system:migration` as author. Templates without a threshold or with
+an equal threshold are unchanged. A not-valid check constraint preserves
+historical threshold-bearing rows for exact reads while rejecting every new
+threshold-bearing revision, including writes from an older process during a
+rolling deployment. Pending requests and already provisioned Envelopes remain
+immutable and are not rewritten.

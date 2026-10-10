@@ -1304,6 +1304,15 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         Box::pin(async { Err(StoreError::DecisionFilingInProgress) })
     }
 
+    fn claim_envelope_request_decision_filing_at_template_revision<'a>(
+        &'a self,
+        request_id: Uuid,
+        _governing_template_revision: i64,
+        claimed_by: &'a str,
+    ) -> BoxFuture<'a, Result<Uuid, StoreError>> {
+        self.claim_envelope_request_decision_filing(request_id, claimed_by)
+    }
+
     fn complete_envelope_request_decision_filing<'a>(
         &'a self,
         _request_id: Uuid,
@@ -1336,6 +1345,16 @@ pub trait AdmissionLedger: Clone + Send + Sync + 'static {
         request_id: Uuid,
         update: EnvelopeRequestStatusUpdate<'a>,
     ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>>;
+
+    fn append_envelope_request_status_at_template_revision<'a>(
+        &'a self,
+        request_id: Uuid,
+        governing_template_revision: i64,
+        update: EnvelopeRequestStatusUpdate<'a>,
+    ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>> {
+        let _ = governing_template_revision;
+        self.append_envelope_request_status(request_id, update)
+    }
 
     fn provision_envelope_for_admin<'a>(
         &'a self,
@@ -1909,6 +1928,23 @@ impl AdmissionLedger for PgStore {
         })
     }
 
+    fn claim_envelope_request_decision_filing_at_template_revision<'a>(
+        &'a self,
+        request_id: Uuid,
+        governing_template_revision: i64,
+        claimed_by: &'a str,
+    ) -> BoxFuture<'a, Result<Uuid, StoreError>> {
+        Box::pin(async move {
+            PgStore::claim_envelope_request_decision_filing_at_template_revision(
+                self,
+                request_id,
+                governing_template_revision,
+                claimed_by,
+            )
+            .await
+        })
+    }
+
     fn complete_envelope_request_decision_filing<'a>(
         &'a self,
         request_id: Uuid,
@@ -1967,6 +2003,23 @@ impl AdmissionLedger for PgStore {
         Box::pin(
             async move { PgStore::append_envelope_request_status(self, request_id, update).await },
         )
+    }
+
+    fn append_envelope_request_status_at_template_revision<'a>(
+        &'a self,
+        request_id: Uuid,
+        governing_template_revision: i64,
+        update: EnvelopeRequestStatusUpdate<'a>,
+    ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>> {
+        Box::pin(async move {
+            PgStore::append_envelope_request_status_at_template_revision(
+                self,
+                request_id,
+                governing_template_revision,
+                update,
+            )
+            .await
+        })
     }
 
     fn provision_envelope_for_admin<'a>(
@@ -2601,7 +2654,7 @@ where
             display_name: &member_role,
             member_roles: std::slice::from_ref(&member_role),
             ceiling: &envelope,
-            auto_provision_threshold: Some(&envelope),
+            auto_provision_threshold: None,
             allow_inline_browser_tasks: true,
             authored_by: &admin.actor,
         })
@@ -4905,6 +4958,39 @@ mod tests {
     }
 
     #[test]
+    fn template_openapi_retires_threshold_writes_but_keeps_historical_reads() -> Result<(), String>
+    {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        for schema in ["AuthorEnvelopeTemplateBody", "OperatorTemplateApplyRequest"] {
+            assert!(
+                document
+                    .pointer(&format!(
+                        "/components/schemas/{schema}/properties/autoProvisionThreshold"
+                    ))
+                    .is_none(),
+                "{schema} must not advertise the retired threshold on writes"
+            );
+        }
+        for schema in [
+            "AvailableEnvelopeTemplate",
+            "BrowserEnvelopeTemplateListItem",
+            "BrowserEnvelopeTemplateResponse",
+            "OperatorTemplateResponse",
+        ] {
+            assert!(
+                document
+                    .pointer(&format!(
+                        "/components/schemas/{schema}/properties/autoProvisionThreshold"
+                    ))
+                    .is_some(),
+                "{schema} must preserve historical threshold reads"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn browser_session_is_published_as_an_opaque_cookie_openapi_contract() -> Result<(), String> {
         let document = serde_json::to_value(ApiDoc::openapi())
             .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
@@ -5851,6 +5937,43 @@ mod tests {
             .map_err(|_| "lock browser admin envelope")?
             .clone();
         next.revision += 1;
+        next.spec.budget.monthly_limit = "50.00".to_owned();
+        let retired_threshold = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "displayName": "Engineer",
+                            "memberRoles": ["engineer"],
+                            "envelope": next.clone(),
+                            "autoProvisionThreshold": next.clone(),
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build retired threshold request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute retired threshold request: {error}"))?;
+        assert_eq!(retired_threshold.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let retired_threshold_body = to_bytes(retired_threshold.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read retired threshold response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&retired_threshold_body)
+                .map_err(|error| format!("parse retired threshold response: {error}"))?
+                .pointer("/error"),
+            Some(&serde_json::json!(
+                "autoProvisionThreshold is retired; set the template limits to the automatic-approval boundary"
+            ))
+        );
         let body = serde_json::to_vec(&next)
             .map_err(|error| format!("serialize browser admin envelope: {error}"))?;
         let missing_proof = admin_app
@@ -5886,6 +6009,28 @@ mod tests {
             .map_err(|error| format!("execute proved template request: {error}"))?;
         assert_eq!(created.status(), StatusCode::CREATED);
 
+        let missing_current_rationale = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000006/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .map_err(|error| format!("build current-limit approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute current-limit approval: {error}"))?;
+        assert_eq!(
+            missing_current_rationale.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a request above the current limits requires an administrator rationale even when it was within the pinned revision"
+        );
+
         let stale_revision_approval = admin_app
             .oneshot(
                 Request::builder()
@@ -5903,8 +6048,30 @@ mod tests {
             .map_err(|error| format!("execute stale-revision envelope approval: {error}"))?;
         assert_eq!(
             stale_revision_approval.status(),
-            StatusCode::CONFLICT,
-            "an administrator must re-evaluate a request after its template ceiling is superseded"
+            StatusCode::OK,
+            "a pending request must be re-evaluated against the current template limits"
+        );
+        let stale_revision_approval = to_bytes(stale_revision_approval.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read stale-revision approval: {error}"))?;
+        let stale_revision_approval: serde_json::Value =
+            serde_json::from_slice(&stale_revision_approval)
+                .map_err(|error| format!("parse stale-revision approval: {error}"))?;
+        assert_eq!(
+            stale_revision_approval.pointer("/request/templateRevision"),
+            Some(&serde_json::json!(3)),
+            "the immutable request remains pinned to its original revision"
+        );
+        assert_eq!(
+            admin_ledger
+                .user_envelopes
+                .lock()
+                .map_err(|_| "lock approved envelope requests")?
+                .iter()
+                .find(|request| request.id == Uuid::from_u128(6))
+                .and_then(|request| request.status_template_revision),
+            Some(4),
+            "the transition audit records the current revision that governed approval"
         );
         let authors = admin_ledger
             .envelope_authors
@@ -8194,6 +8361,33 @@ mod tests {
             })
         }
 
+        fn claim_envelope_request_decision_filing_at_template_revision<'a>(
+            &'a self,
+            request_id: Uuid,
+            governing_template_revision: i64,
+            claimed_by: &'a str,
+        ) -> BoxFuture<'a, Result<Uuid, StoreError>> {
+            Box::pin(async move {
+                let request = self
+                    .envelope_request_for_admin(request_id)
+                    .await?
+                    .ok_or(StoreError::EnvelopeRequestNotFound)?;
+                let template_id = request
+                    .template_id
+                    .as_deref()
+                    .ok_or(StoreError::InvalidEnvelopeRequestTransition)?;
+                let latest = self
+                    .latest_envelope_template(template_id)
+                    .await?
+                    .ok_or(StoreError::EnvelopeRequestTemplateStale)?;
+                if latest.ceiling.revision != governing_template_revision {
+                    return Err(StoreError::EnvelopeRequestTemplateStale);
+                }
+                self.claim_envelope_request_decision_filing(request_id, claimed_by)
+                    .await
+            })
+        }
+
         fn complete_envelope_request_decision_filing<'a>(
             &'a self,
             request_id: Uuid,
@@ -8314,6 +8508,27 @@ mod tests {
                     *record = decided.clone();
                 } else {
                     records.push(decided.clone());
+                }
+                Ok(decided)
+            })
+        }
+
+        fn append_envelope_request_status_at_template_revision<'a>(
+            &'a self,
+            request_id: Uuid,
+            governing_template_revision: i64,
+            update: EnvelopeRequestStatusUpdate<'a>,
+        ) -> BoxFuture<'a, Result<EnvelopeRequestRecord, StoreError>> {
+            Box::pin(async move {
+                let mut decided = self
+                    .append_envelope_request_status(request_id, update)
+                    .await?;
+                decided.status_template_revision = Some(governing_template_revision);
+                let mut records = self.user_envelopes.lock().map_err(|_| {
+                    StoreError::Database("fake envelope lock was poisoned".to_owned())
+                })?;
+                if let Some(record) = records.iter_mut().find(|record| record.id == request_id) {
+                    *record = decided.clone();
                 }
                 Ok(decided)
             })

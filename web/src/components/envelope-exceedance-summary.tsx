@@ -53,8 +53,8 @@ export function EnvelopeExceedanceSummary({ values }: Readonly<{ values: Array<E
   if (!values.length) return null;
   return (
     <div className="rounded-control bg-warn-soft p-3 text-sm">
-      <strong>Needs admin approval: {values.length} {values.length === 1 ? "value" : "values"} above the template ceiling</strong>
-      <ul className="mt-2 list-disc ps-5">{values.map(({ ceiling, label, requested }) => <li key={label}>{label}: <strong>{requested}</strong> (ceiling {ceiling})</li>)}</ul>
+      <strong>Needs admin approval: {values.length} {values.length === 1 ? "value" : "values"} above the template&apos;s limits</strong>
+      <ul className="mt-2 list-disc ps-5">{values.map(({ ceiling, label, requested }) => <li key={label}>{label}: <strong>{requested}</strong> (limit {ceiling})</li>)}</ul>
     </div>
   );
 }

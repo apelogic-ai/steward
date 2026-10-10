@@ -566,16 +566,7 @@ fn valid_envelope_template_publication(publication: &EnvelopeTemplatePublication
             .member_roles
             .windows(2)
             .all(|roles| roles[0] < roles[1])
-        && publication
-            .auto_provision_threshold
-            .is_none_or(|threshold| {
-                threshold.revision == publication.ceiling.revision
-                    && validate_envelope(threshold).is_ok()
-                    && matches!(
-                        envelope_is_within(threshold, publication.ceiling),
-                        Ok(AdmissionDecision::Admit)
-                    )
-            })
+        && publication.auto_provision_threshold.is_none()
         && validate_envelope(publication.ceiling).is_ok()
 }
 
@@ -641,10 +632,10 @@ mod browser_rbac_tests {
     }
 
     #[test]
-    fn template_threshold_must_be_valid_and_within_its_ceiling() {
+    fn retired_template_threshold_is_rejected_for_new_revisions() {
         let roles = vec!["engineer".to_owned()];
         let ceiling = envelope("10.00");
-        let threshold = envelope("11.00");
+        let threshold = envelope("5.00");
         let publication = EnvelopeTemplatePublication {
             template_id: "default",
             display_name: "Default",
@@ -837,6 +828,17 @@ mod migration_tests {
                         .contains("envelope request review context")
             }),
             "migration 69 must preserve justification and exact template-ceiling exceedances without rewriting existing requests"
+        );
+    }
+
+    #[test]
+    fn template_one_boundary_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 70 && migration.description.contains("template one boundary")
+            }),
+            "migration 70 must append narrowed template revisions without rewriting template, request, or provisioned-envelope history"
         );
     }
 }
@@ -5142,8 +5144,63 @@ impl PgStore {
         request_id: Uuid,
         claimed_by: &str,
     ) -> Result<Uuid, StoreError> {
+        self.claim_envelope_request_decision_filing_inner(request_id, None, claimed_by)
+            .await
+    }
+
+    /// Claim external decision filing only while the named template revision is still current.
+    pub async fn claim_envelope_request_decision_filing_at_template_revision(
+        &self,
+        request_id: Uuid,
+        governing_template_revision: i64,
+        claimed_by: &str,
+    ) -> Result<Uuid, StoreError> {
+        if governing_template_revision <= 0 {
+            return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        self.claim_envelope_request_decision_filing_inner(
+            request_id,
+            Some(governing_template_revision),
+            claimed_by,
+        )
+        .await
+    }
+
+    async fn claim_envelope_request_decision_filing_inner(
+        &self,
+        request_id: Uuid,
+        governing_template_revision: Option<i64>,
+        claimed_by: &str,
+    ) -> Result<Uuid, StoreError> {
         if claimed_by.trim().is_empty() {
             return Err(StoreError::InvalidEnvelopeRequest);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        if let Some(governing_revision) = governing_template_revision {
+            let template_id = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT template_id FROM envelope_requests WHERE id = $1",
+            )
+            .bind(request_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?
+            .ok_or(StoreError::EnvelopeRequestNotFound)?
+            .ok_or(StoreError::InvalidEnvelopeRequest)?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!("envelope-template:{template_id}"))
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+            let latest_revision = sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT max(revision) FROM envelope_template_revisions WHERE template_id = $1",
+            )
+            .bind(&template_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if latest_revision != Some(governing_revision) {
+                return Err(StoreError::EnvelopeRequestTemplateStale);
+            }
         }
         let token = Uuid::new_v4();
         let claimed = sqlx::query_scalar::<_, Uuid>(
@@ -5167,26 +5224,31 @@ impl PgStore {
         .bind(request_id)
         .bind(token)
         .bind(claimed_by)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
         if let Some(token) = claimed {
+            transaction.commit().await.map_err(database_error)?;
             return Ok(token);
         }
         if !sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM envelope_requests WHERE id = $1)",
         )
         .bind(request_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *transaction)
         .await
         .map_err(database_error)?
         {
             return Err(StoreError::EnvelopeRequestNotFound);
         }
-        if self
-            .envelope_request_decision_reference(request_id)
-            .await?
-            .is_some()
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM envelope_request_decision_references \
+             WHERE request_id = $1)",
+        )
+        .bind(request_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?
         {
             return Err(StoreError::DecisionReferenceMismatch);
         }
@@ -5195,7 +5257,7 @@ impl PgStore {
              WHERE request_id = $1 ORDER BY id DESC LIMIT 1",
         )
         .bind(request_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?
         .unwrap_or(false);
@@ -5407,14 +5469,19 @@ impl PgStore {
         let rows = sqlx::query(
             "SELECT requests.id, users.display_email AS owner_display_email, \
                     requests.template_id, requests.template_revision, \
-                    requests.requested_envelope, templates.spec AS template_spec, \
+                    requests.requested_envelope, \
+                    templates.revision AS current_template_revision, \
+                    templates.spec AS current_template_spec, \
                     to_char(requests.created_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at \
              FROM envelope_requests requests \
              JOIN canonical_users users ON users.user_id = requests.owner_user_id \
-             LEFT JOIN envelope_template_revisions templates \
-               ON templates.template_id = requests.template_id \
-              AND templates.revision = requests.template_revision \
+             LEFT JOIN LATERAL ( \
+                 SELECT revisions.revision, revisions.spec \
+                 FROM envelope_template_revisions revisions \
+                 WHERE revisions.template_id = requests.template_id \
+                 ORDER BY revisions.revision DESC LIMIT 1 \
+             ) templates ON true \
              JOIN LATERAL ( \
                  SELECT events.status \
                  FROM envelope_request_events events \
@@ -5442,10 +5509,10 @@ impl PgStore {
                         .map_err(database_error)?
                         .0,
                     template_envelope: row
-                        .try_get::<Option<i64>, _>("template_revision")
+                        .try_get::<Option<i64>, _>("current_template_revision")
                         .map_err(database_error)?
                         .zip(
-                            row.try_get::<Option<Json<EnvelopeSpec>>, _>("template_spec")
+                            row.try_get::<Option<Json<EnvelopeSpec>>, _>("current_template_spec")
                                 .map_err(database_error)?,
                         )
                         .map(|(revision, spec)| Envelope {
@@ -5464,12 +5531,19 @@ impl PgStore {
     ) -> Result<Vec<AdminEnvelopeRequestRecord>, StoreError> {
         let statement = format!(
             "SELECT records.*, users.display_email AS owner_display_email, \
-                    templates.display_name AS template_display_name \
+                    templates.display_name AS template_display_name, \
+                    templates.revision AS current_template_revision, \
+                    templates.spec AS current_template_spec \
              FROM ({ENVELOPE_REQUEST_COLUMNS}) records \
              JOIN canonical_users users ON users.user_id = records.owner_user_id \
-             LEFT JOIN envelope_template_revisions templates \
-               ON templates.template_id = records.template_id \
-              AND templates.revision = records.template_revision \
+             LEFT JOIN LATERAL ( \
+                 SELECT revisions.revision, revisions.display_name, revisions.spec \
+                 FROM envelope_template_revisions revisions \
+                 WHERE revisions.template_id = records.template_id \
+                   AND (records.status = 'pending' \
+                        OR revisions.revision = records.template_revision) \
+                 ORDER BY revisions.revision DESC LIMIT 1 \
+             ) templates ON true \
              ORDER BY records.created_at DESC, records.id DESC"
         );
         sqlx::query(&statement)
@@ -5483,8 +5557,20 @@ impl PgStore {
                 let template_display_name = row
                     .try_get("template_display_name")
                     .map_err(database_error)?;
+                let current_template_revision = row
+                    .try_get::<Option<i64>, _>("current_template_revision")
+                    .map_err(database_error)?;
+                let current_template_spec = row
+                    .try_get::<Option<Json<EnvelopeSpec>>, _>("current_template_spec")
+                    .map_err(database_error)?;
                 let request = envelope_request_record(row)?;
-                let template_envelope = request.template_envelope.clone();
+                let template_envelope =
+                    current_template_revision
+                        .zip(current_template_spec)
+                        .map(|(revision, spec)| Envelope {
+                            revision,
+                            spec: spec.0,
+                        });
                 Ok(AdminEnvelopeRequestRecord {
                     request,
                     owner_display_email,
@@ -5500,6 +5586,35 @@ impl PgStore {
     pub async fn append_envelope_request_status(
         &self,
         request_id: Uuid,
+        update: EnvelopeRequestStatusUpdate<'_>,
+    ) -> Result<EnvelopeRequestRecord, StoreError> {
+        self.append_envelope_request_status_inner(request_id, None, update)
+            .await
+    }
+
+    /// Append a lifecycle transition governed by the named current template revision while the
+    /// immutable request remains pinned to its originally selected revision.
+    pub async fn append_envelope_request_status_at_template_revision(
+        &self,
+        request_id: Uuid,
+        governing_template_revision: i64,
+        update: EnvelopeRequestStatusUpdate<'_>,
+    ) -> Result<EnvelopeRequestRecord, StoreError> {
+        if governing_template_revision <= 0 {
+            return Err(StoreError::InvalidEnvelopeRequestTransition);
+        }
+        self.append_envelope_request_status_inner(
+            request_id,
+            Some(governing_template_revision),
+            update,
+        )
+        .await
+    }
+
+    async fn append_envelope_request_status_inner(
+        &self,
+        request_id: Uuid,
+        governing_template_revision: Option<i64>,
         update: EnvelopeRequestStatusUpdate<'_>,
     ) -> Result<EnvelopeRequestRecord, StoreError> {
         if !valid_envelope_request_transition(update.from, update.to)
@@ -5569,6 +5684,30 @@ impl PgStore {
             .try_get::<Json<Envelope>, _>("requested_envelope")
             .map_err(database_error)?
             .0;
+        let (status_template_revision, template_lock_held) =
+            match (template_id.as_deref(), governing_template_revision) {
+                (Some(template_id), Some(governing_revision)) => {
+                    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                        .bind(format!("envelope-template:{template_id}"))
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(database_error)?;
+                    let latest_revision = sqlx::query_scalar::<_, Option<i64>>(
+                        "SELECT max(revision) FROM envelope_template_revisions \
+                         WHERE template_id = $1",
+                    )
+                    .bind(template_id)
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(database_error)?;
+                    if latest_revision != Some(governing_revision) {
+                        return Err(StoreError::EnvelopeRequestTemplateStale);
+                    }
+                    (Some(governing_revision), true)
+                }
+                (None, Some(_)) => return Err(StoreError::InvalidEnvelopeRequestTransition),
+                (_, None) => (template_revision, false),
+            };
 
         let latest = sqlx::query(
             "SELECT status FROM envelope_request_events \
@@ -5603,11 +5742,13 @@ impl PgStore {
             if let (Some(template_id), Some(template_revision)) =
                 (template_id.as_deref(), template_revision)
             {
-                sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                    .bind(format!("envelope-template:{template_id}"))
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(database_error)?;
+                if !template_lock_held {
+                    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                        .bind(format!("envelope-template:{template_id}"))
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(database_error)?;
+                }
                 let revision_exists = sqlx::query_scalar::<_, bool>(
                     "SELECT EXISTS( \
                          SELECT 1 FROM envelope_template_revisions \
@@ -5687,7 +5828,7 @@ impl PgStore {
                         "duplicate of active envelope request {existing_id}"
                     ))
                     .bind(update.actor)
-                    .bind(template_revision)
+                    .bind(status_template_revision)
                     .execute(&mut *transaction)
                     .await
                     .map_err(database_error)?;
@@ -5733,7 +5874,7 @@ impl PgStore {
         .bind(update.expires_at)
         .bind(update.approved_envelope.map(Json))
         .bind(update.actor)
-        .bind(template_revision)
+        .bind(status_template_revision)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;

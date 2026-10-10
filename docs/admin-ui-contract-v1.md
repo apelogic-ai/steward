@@ -2,7 +2,7 @@
 
 Status: active browser and API boundary.
 
-Applies to Steward 0.3.15.
+Applies to Steward 0.3.15 and the explicitly marked unreleased 0.3.16 changes.
 Sections that describe unreleased behavior say so explicitly.
 
 ## Presentation ownership
@@ -75,9 +75,10 @@ canonical administrator actor. Filing an external decision first acquires a
 short-lived per-request lease, so concurrent browser retries cannot create two
 external decisions. The completed reference and status history are append-only.
 The approval route continues to accept the legacy empty object only for an
-unfiled within-ceiling request with no new decision metadata. A rationale is
-mandatory for every ceiling-exceeded approval, whenever evidence or expiry
-metadata is supplied, and whenever an external decision has been filed.
+unfiled request within the current template limits with no new decision
+metadata. A rationale is mandatory for every request above the current template
+limits, whenever evidence or expiry metadata is supplied, and whenever an
+external decision has been filed.
 
 ### Envelopes
 
@@ -107,6 +108,20 @@ for the complete transaction and task-selector behavior.
 Template responses retain `memberRole`, set to the first eligible role, as a
 compatibility alias. Catalog-aware clients use the authoritative `memberRoles`
 array.
+
+#### Unreleased 0.3.16: one template boundary
+
+A template has one set of limits. Requests within the current limits provision
+automatically; requests above them enter the approval queue and remain bounded
+by the deployment safety ceiling and capability catalog. The retired
+`autoProvisionThreshold` remains readable only on historical revisions and is
+rejected on new writes.
+
+The upgrade appends a narrower current revision when a historical threshold was
+stricter than its template limits. Pending requests preserve their original
+template revision as immutable evidence, while queue presentation, external
+decision filing, and approval use the current revision under a revision fence.
+Already provisioned Envelopes are not rewritten.
 
 #### Unreleased: capability tool picker
 

@@ -7,6 +7,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- Envelope Templates now have one boundary: requests within the published
+  limits provision automatically, while requests above those limits enter the
+  administrator approval queue when they remain within the deployment safety
+  ceiling and capability catalog. To preserve existing review policy, migration
+  0070 appends a narrower successor revision for each current template whose
+  retired `autoProvisionThreshold` was stricter than its limits. Templates
+  without a threshold are unchanged, pending requests remain pending, and
+  already provisioned Envelopes are unaffected.
+- Historical template revisions continue to expose `autoProvisionThreshold` on
+  reads. New template revisions omit it, and browser or operator writes that set
+  it are rejected with an actionable error. To retain the old behavior of
+  reviewing anything above 50 USD, set the template's monthly limit to 50 USD.
+
+### Upgrade and rollback
+
+- Migration 0070 is append-only and records every generated template revision
+  with actor `system:migration`; retain it on rollback. List the affected
+  template IDs and successor revisions with
+  `SELECT template_id, revision FROM envelope_template_revisions WHERE authored_by = 'system:migration' ORDER BY template_id, revision`. Stop template
+  authoring during a mixed-version rollout or rollback because an older writer
+  can still attempt to publish the retired field. Do not delete generated
+  revisions or rewrite pending requests and provisioned Envelope history.
+
 ## [0.3.15] - 2026-10-09
 
 This release adds governed Git and scratch workspaces to TaskDefinition v2 and

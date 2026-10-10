@@ -221,8 +221,8 @@ export type ApproveEnvelopeRequestBody = {
     evidenceUrl?: string | null;
     expiresAt?: string | null;
     /**
-     * Required for ceiling-exceeded requests and whenever decision metadata is supplied.
-     * Legacy clients may omit it only for an unfiled within-ceiling request.
+     * Required for requests above the template limits and whenever decision metadata is supplied.
+     * Legacy clients may omit it only for an unfiled request within the template limits.
      */
     rationale?: string | null;
 };
@@ -234,7 +234,6 @@ export type AssociateFederatedSubjectBody = {
 
 export type AuthorEnvelopeTemplateBody = {
     allowInlineBrowserTasks?: boolean;
-    autoProvisionThreshold?: null | BrowserEnvelope;
     displayName: string;
     envelope: BrowserEnvelope;
     memberRoles: Array<string>;
@@ -1382,7 +1381,6 @@ export type OperatorRolesResponse = {
 
 export type OperatorTemplateApplyRequest = {
     allowInlineBrowserTasks?: boolean;
-    autoProvisionThreshold?: null | BrowserEnvelope;
     ceiling: BrowserEnvelope;
     displayName: string;
     memberRoles: Array<string>;
@@ -2466,7 +2464,7 @@ export type FileAdminEnvelopeRequestErrors = {
      */
     409: unknown;
     /**
-     * Envelope request does not exceed its template ceiling
+     * Envelope request does not exceed its template limits
      */
     422: unknown;
     /**

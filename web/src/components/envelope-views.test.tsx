@@ -15,7 +15,7 @@ describe("envelope run history", () => {
   test("uses the approved request copy and explicit units", () => {
     expect(source).toContain("Pick an existing template and adjust it, or create your own envelope request.");
     expect(source).toContain("Limit per run");
-    expect(source).toContain("Ceiling {template.ceiling.spec.runtimeMinutesLimit} minutes");
+    expect(source).toContain("Limit {template.ceiling.spec.runtimeMinutesLimit} minutes");
     expect(source).toContain("Workflow rendering is unavailable. Try again.");
     expect(source).not.toContain("authoritative workflow service");
   });
@@ -23,7 +23,7 @@ describe("envelope run history", () => {
 
 const template: AvailableEnvelopeTemplate = {
   allowInlineBrowserTasks: true,
-  autoProvisionThreshold: {
+  ceiling: {
     revision: 3,
     spec: {
       budget: { currency: "USD", monthlyLimit: "50.00", singleRunLimit: "5.00" },
@@ -34,67 +34,50 @@ const template: AvailableEnvelopeTemplate = {
       runtimeMinutesLimit: "30",
     },
   },
-  ceiling: {
-    revision: 3,
-    spec: {
-      budget: { currency: "USD", monthlyLimit: "100.00", singleRunLimit: "10.00" },
-      llms: [{ provider: "provider-a", model: "model-a" }],
-      tools: [],
-      ttl: "1h",
-      runner: {},
-      runtimeMinutesLimit: "60",
-    },
-  },
   displayName: "Engineer",
   id: "engineer",
   revision: 3,
 };
 
 describe("envelope request review summary", () => {
-  test("names every visible value above the template ceiling", () => {
+  test("names every visible value above the template limits", () => {
     expect(templateRequestReviewSummary({
-      budget: "101.00",
+      budget: "150.00",
       models: new Set(["provider-a\u0000model-a"]),
-      runtimeMinutes: "61",
+      runtimeMinutes: "90",
       template,
       tools: new Set(),
-      ttl: "61m",
+      ttl: "2h",
     })).toEqual({
       exceedances: [
-        { ceiling: "100.00 USD", label: "Monthly limit", requested: "101.00 USD" },
-        { ceiling: "60 minutes", label: "Runtime minutes", requested: "61 minutes" },
-        { ceiling: "1h", label: "Time to live", requested: "61m" },
+        { ceiling: "50.00 USD", label: "Monthly limit", requested: "150.00 USD" },
+        { ceiling: "30 minutes", label: "Runtime minutes", requested: "90 minutes" },
+        { ceiling: "30m", label: "Time to live", requested: "2h" },
       ],
       requiresApproval: true,
     });
   });
 
-  test("requires review above a narrower automatic approval threshold", () => {
+  test("requires review above the template limits", () => {
     expect(templateRequestReviewSummary({
-      budget: "75.00",
+      budget: "150.00",
       models: new Set(["provider-a\u0000model-a"]),
       runtimeMinutes: "30",
       template,
       tools: new Set(),
       ttl: "30m",
-    })).toEqual({ exceedances: [], requiresApproval: true });
+    })).toEqual({
+      exceedances: [{ ceiling: "50.00 USD", label: "Monthly limit", requested: "150.00 USD" }],
+      requiresApproval: true,
+    });
   });
 
-  test("returns to automatic submission inside the automatic approval threshold", () => {
+  test("provisions automatically within the template limits", () => {
     expect(templateRequestReviewSummary({
-      budget: "25.00",
+      budget: "40.00",
       models: new Set(["provider-a\u0000model-a"]),
       runtimeMinutes: "20",
-      template: {
-        ...template,
-        autoProvisionThreshold: {
-          ...template.autoProvisionThreshold!,
-          spec: {
-            ...template.autoProvisionThreshold!.spec,
-            budget: { ...template.ceiling.spec.budget, monthlyLimit: "50.00" },
-          },
-        },
-      },
+      template,
       tools: new Set(),
       ttl: "20m",
     })).toEqual({ exceedances: [], requiresApproval: false });
