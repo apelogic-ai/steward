@@ -3785,7 +3785,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration as StdDuration;
 
-    use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec};
+    use steward_admission::{
+        AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec, envelope_is_within,
+    };
     use steward_ports::{
         DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitFile,
         GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
@@ -5223,6 +5225,9 @@ mod tests {
             .spec
             .budget
             .monthly_limit = "250.00".to_owned();
+        let admin_safety_ceiling = admin_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .clone();
         let admin_decisions = FakeDecisionChannel::default();
         let (admin_auth, admin_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
@@ -5253,11 +5258,12 @@ mod tests {
             StatusCode::OK,
             "a pre-redesign client can still approve an unfiled request with an empty object"
         );
-        let admin_app = browser_admin::protected_router(
+        let admin_app = browser_admin::protected_router_with_custom_envelope_safety(
             runtime_repository,
             admin_ledger.clone(),
             admin_decisions.clone(),
             browser_capability_catalog(),
+            Some(admin_safety_ceiling),
             admin_auth,
         );
         let provisioned = admin_app
@@ -5535,6 +5541,22 @@ mod tests {
             .await
             .map_err(|error| format!("execute rationale-free envelope approval: {error}"))?;
         assert_eq!(missing_rationale.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let missing_rationale_body = to_bytes(missing_rationale.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read rationale-free envelope approval: {error}"))?;
+        let missing_rationale: serde_json::Value = serde_json::from_slice(&missing_rationale_body)
+            .map_err(|error| format!("decode rationale-free envelope approval: {error}"))?;
+        assert_eq!(
+            missing_rationale.pointer("/fields"),
+            Some(&serde_json::json!(["rationale"])),
+            "approval 422 responses must preserve their advertised typed body"
+        );
+        assert_eq!(
+            missing_rationale.pointer("/failureReason"),
+            Some(&serde_json::json!(
+                "Rationale is required to approve this request."
+            ))
+        );
 
         let request_summary = admin_app
             .clone()
@@ -5656,6 +5678,15 @@ mod tests {
             approved.pointer("/request/decisionKey"),
             Some(&serde_json::json!("PROJ-123"))
         );
+        assert_eq!(
+            admin_decisions
+                .resolutions
+                .lock()
+                .map_err(|_| "lock envelope approval resolutions")?
+                .len(),
+            1,
+            "the first approval must record exactly one external resolution"
+        );
 
         let repeated_approval = admin_app
             .clone()
@@ -5687,6 +5718,44 @@ mod tests {
         assert_eq!(
             repeated.pointer("/request/approvalId"),
             approved.pointer("/request/approvalId")
+        );
+        assert_eq!(
+            admin_decisions
+                .resolutions
+                .lock()
+                .map_err(|_| "lock repeated envelope approval resolutions")?
+                .len(),
+            1,
+            "an idempotent approval retry must not emit a second external resolution"
+        );
+
+        let changed_approval = admin_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"rationale":"a retry must not rewrite the approval"}"#,
+                    ))
+                    .map_err(|error| format!("build changed envelope approval retry: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute changed envelope approval retry: {error}"))?;
+        assert_eq!(changed_approval.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            admin_decisions
+                .resolutions
+                .lock()
+                .map_err(|_| "lock changed envelope approval resolutions")?
+                .len(),
+            1,
+            "a conflicting retry must not emit different external approval evidence"
         );
 
         let rejected_request = admin_app
@@ -5815,7 +5884,7 @@ mod tests {
             .map_err(|error| format!("execute proved template request: {error}"))?;
         assert_eq!(created.status(), StatusCode::CREATED);
 
-        let stale_approval = admin_app
+        let pinned_revision_approval = admin_app
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -5826,14 +5895,14 @@ mod tests {
                     .header("x-steward-csrf", &csrf)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"rationale":"approve current template"}"#))
-                    .map_err(|error| format!("build stale envelope approval: {error}"))?,
+                    .map_err(|error| format!("build pinned-revision envelope approval: {error}"))?,
             )
             .await
-            .map_err(|error| format!("execute stale envelope approval: {error}"))?;
+            .map_err(|error| format!("execute pinned-revision envelope approval: {error}"))?;
         assert_eq!(
-            stale_approval.status(),
-            StatusCode::CONFLICT,
-            "an administrator must not approve against a superseded template revision"
+            pinned_revision_approval.status(),
+            StatusCode::OK,
+            "publishing a new template revision must not strand a request bound to an immutable earlier revision"
         );
         let authors = admin_ledger
             .envelope_authors
@@ -5892,6 +5961,210 @@ mod tests {
             .await
             .map_err(|error| format!("execute custom approval request: {error}"))?;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn template_exception_approval_rechecks_the_current_platform_safety_ceiling()
+    -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let runtime_repository = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let mut review_ledger = ledger();
+        review_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .spec
+            .budget
+            .monthly_limit = "250.00".to_owned();
+        let mut tightened_ceiling = review_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .clone();
+        tightened_ceiling.spec.budget.monthly_limit = "50.00".to_owned();
+        let recorded = review_ledger.user_envelopes.clone();
+        let (admin_auth, admin_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let app = browser_admin::protected_router_with_custom_envelope_safety(
+            runtime_repository,
+            review_ledger,
+            FakeDecisionChannel::default(),
+            browser_capability_catalog(),
+            Some(tightened_ceiling),
+            admin_auth,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"rationale":"reviewed template exception against the current platform ceiling"}"#,
+                    ))
+                    .map_err(|error| format!("build template-exception approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute template-exception approval: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a rationale must not bypass the current platform safety ceiling"
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read safety rejection: {error}"))?;
+        let rejection: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse safety rejection: {error}"))?;
+        assert_eq!(rejection["error"], "platform_safety_ceiling_exceeded");
+        assert_eq!(
+            rejection["fields"],
+            serde_json::json!(["budgetMonthlyLimit"])
+        );
+        assert!(
+            recorded
+                .lock()
+                .map_err(|_| "lock rejected envelope requests")?
+                .is_empty(),
+            "rejected approval must not persist a provisioning effect"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn template_exception_approval_rechecks_the_current_capability_catalog()
+    -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let runtime_repository = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let mut review_ledger = ledger();
+        review_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .spec
+            .budget
+            .monthly_limit = "250.00".to_owned();
+        let safety_ceiling = review_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .clone();
+        let recorded = review_ledger.user_envelopes.clone();
+        let (admin_auth, admin_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let app = browser_admin::protected_router_with_custom_envelope_safety(
+            runtime_repository,
+            review_ledger,
+            FakeDecisionChannel::default(),
+            browser_admin::CapabilityCatalog::default(),
+            Some(safety_ceiling),
+            admin_auth,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"rationale":"reviewed template exception against the current capability catalog"}"#,
+                    ))
+                    .map_err(|error| format!("build template catalog approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute template catalog approval: {error}"))?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a rationale must not bypass the current capability catalog"
+        );
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read capability rejection: {error}"))?;
+        let rejection: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse capability rejection: {error}"))?;
+        assert_eq!(rejection["error"], "capability_not_available");
+        assert_eq!(rejection["fields"], serde_json::json!(["llms"]));
+        assert!(
+            recorded
+                .lock()
+                .map_err(|_| "lock rejected envelope requests")?
+                .is_empty(),
+            "rejected approval must not persist a provisioning effect"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn template_exception_within_platform_safety_can_be_approved() -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let runtime_repository = FakeRuntimeRepository {
+            runtime: Arc::new(Mutex::new(runtime())),
+        };
+        let mut review_ledger = ledger();
+        review_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .spec
+            .budget
+            .monthly_limit = "250.00".to_owned();
+        let safety_ceiling = review_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .clone();
+        let recorded = review_ledger.user_envelopes.clone();
+        let (admin_auth, admin_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let app = browser_admin::protected_router_with_custom_envelope_safety(
+            runtime_repository,
+            review_ledger,
+            FakeDecisionChannel::default(),
+            browser_capability_catalog(),
+            Some(safety_ceiling),
+            admin_auth,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/api/v1/envelope-requests/00000000-0000-0000-0000-000000000004/approve")
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"rationale":"approved the requested monthly limit"}"#,
+                    ))
+                    .map_err(|error| format!("build template-exception approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute template-exception approval: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let records = recorded
+            .lock()
+            .map_err(|_| "lock approved envelope requests")?;
+        let approved = records
+            .iter()
+            .find(|record| record.id == Uuid::from_u128(4))
+            .ok_or_else(|| "approved envelope request was not persisted".to_owned())?;
+        assert_eq!(approved.status, EnvelopeRequestStatus::Provisioned);
+        assert_eq!(
+            approved.ceiling_exceedances,
+            vec![AdmissionDelta::Budget {
+                requested: "250.00".to_owned(),
+                ceiling: "200.00".to_owned(),
+                currency: "USD".to_owned(),
+            }],
+            "approval must retain the exact requested-versus-template delta"
+        );
+        assert_eq!(
+            approved.rationale.as_deref(),
+            Some("approved the requested monthly limit")
+        );
         Ok(())
     }
 
@@ -7668,6 +7941,16 @@ mod tests {
                 else {
                     return Ok(None);
                 };
+                let ceiling_exceedances = pending
+                    .template_envelope
+                    .as_ref()
+                    .and_then(|template| {
+                        match envelope_is_within(&pending.requested_envelope, template) {
+                            Ok(AdmissionDecision::Reject { deltas }) => Some(deltas),
+                            Ok(AdmissionDecision::Admit) | Err(_) => None,
+                        }
+                    })
+                    .unwrap_or_default();
                 let reference = self.envelope_request_decision_reference(request_id).await?;
                 Ok(Some(EnvelopeRequestRecord {
                     id: pending.request_id,
@@ -7675,6 +7958,7 @@ mod tests {
                         .map_err(|_| StoreError::CanonicalIdentityInvalidRecord)?,
                     template_id: pending.template_id.clone(),
                     template_revision: pending.template_revision,
+                    template_envelope: pending.template_envelope.clone(),
                     requested_envelope: pending.requested_envelope.clone(),
                     approved_envelope: None,
                     status: EnvelopeRequestStatus::Pending,
@@ -7683,6 +7967,8 @@ mod tests {
                     envelope_digest: None,
                     reason: None,
                     rationale: None,
+                    justification: None,
+                    ceiling_exceedances,
                     evidence_url: reference
                         .as_ref()
                         .map(|reference| reference.evidence_url.clone()),
@@ -7862,21 +8148,10 @@ mod tests {
                 if current.status == update.to {
                     return Ok(current);
                 }
-                if update.to == EnvelopeRequestStatus::Provisioned {
-                    if let (Some(template_id), Some(requested_revision)) =
-                        (current.template_id.as_deref(), current.template_revision)
-                    {
-                        let template_revision = self
-                            .latest_envelope_template(template_id)
-                            .await?
-                            .map(|template| template.ceiling.revision);
-                        if template_revision != Some(requested_revision) {
-                            return Err(StoreError::EnvelopeRequestTemplateStale);
-                        }
-                    }
-                    if update.approved_envelope != Some(&current.requested_envelope) {
-                        return Err(StoreError::InvalidEnvelopeRequest);
-                    }
+                if update.to == EnvelopeRequestStatus::Provisioned
+                    && update.approved_envelope != Some(&current.requested_envelope)
+                {
+                    return Err(StoreError::InvalidEnvelopeRequest);
                 }
                 if current.status != update.from {
                     return Err(StoreError::InvalidEnvelopeRequestTransition);
@@ -7927,6 +8202,7 @@ mod tests {
                     owner_user_id: request.owner_user_id.clone(),
                     template_id: Some(request.template_id.to_owned()),
                     template_revision: Some(request.template_revision),
+                    template_envelope: Some(request.requested_envelope.clone()),
                     requested_envelope: request.requested_envelope.clone(),
                     approved_envelope: Some(request.requested_envelope.clone()),
                     status: EnvelopeRequestStatus::Provisioned,
@@ -7935,6 +8211,8 @@ mod tests {
                     envelope_digest: Some(format!("sha256:{}", "a".repeat(64))),
                     reason: None,
                     rationale: None,
+                    justification: None,
+                    ceiling_exceedances: Vec::new(),
                     evidence_url: None,
                     decision_key: None,
                     expires_at: None,
@@ -9140,6 +9418,7 @@ mod tests {
                 owner_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
                 template_id: Some("engineer".to_owned()),
                 template_revision: Some(4),
+                template_envelope: Some(approved.clone()),
                 requested_envelope: approved.clone(),
                 approved_envelope: Some(approved),
                 status: EnvelopeRequestStatus::Provisioned,
@@ -9148,6 +9427,8 @@ mod tests {
                 envelope_digest: Some(format!("sha256:{}", "b".repeat(64))),
                 reason: None,
                 rationale: None,
+                justification: None,
+                ceiling_exceedances: Vec::new(),
                 evidence_url: None,
                 decision_key: None,
                 expires_at: None,

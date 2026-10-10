@@ -11,6 +11,8 @@ import {
   myRuns,
   type AvailableEnvelopeTemplate,
   type BrowserEnvelope,
+  type EnvelopeRequestErrorResponse,
+  type EnvelopeRequestField,
   type EnvelopeRequestResponse,
   type EnvelopeTemplatesResponse,
   type GithubActionsWorkflowResponse,
@@ -18,6 +20,7 @@ import {
   type UserEnvelopeRequest,
 } from "@/api-client";
 import { RunCards } from "@/components/run-views";
+import { EnvelopeExceedanceSummary, type EnvelopeExceedanceSummaryValue, envelopeDeltaSummary } from "@/components/envelope-exceedance-summary";
 import { CodeBlock, DataTable, FilterTabs, GrantChipList, Meter, SectionCard, StatStrip, TagSelect, grantKindForAction } from "@/components/hs";
 import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
@@ -30,6 +33,67 @@ import { workflowReference } from "@/workflows/contracts";
 function dateTime(value: string): string {
   const parsed = new Date(value);
   return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString();
+}
+
+function decimalParts(value: string): { fractional: string; integer: string } | null {
+  if (!/^[0-9]+(?:\.[0-9]*)?$/.test(value)) return null;
+  const [integer = "", fractional = ""] = value.split(".");
+  return { integer: integer.replace(/^0+/, ""), fractional: fractional.replace(/0+$/, "") };
+}
+
+function decimalExceeds(value: string, ceiling: string): boolean {
+  const left = decimalParts(value);
+  const right = decimalParts(ceiling);
+  if (!left || !right) return false;
+  if (left.integer.length !== right.integer.length) return left.integer.length > right.integer.length;
+  if (left.integer !== right.integer) return left.integer > right.integer;
+  const width = Math.max(left.fractional.length, right.fractional.length);
+  return left.fractional.padEnd(width, "0") > right.fractional.padEnd(width, "0");
+}
+
+function envelopeRequestProblem(value: unknown): EnvelopeRequestErrorResponse | null {
+  if (typeof value !== "object" || value === null || !("failureReason" in value)) return null;
+  const problem = value as EnvelopeRequestErrorResponse;
+  return typeof problem.failureReason === "string" && problem.failureReason.trim() && Array.isArray(problem.fields) ? problem : null;
+}
+
+function durationSeconds(value: string): bigint | null {
+  const match = /^([0-9]+)(s|m|h|d)$/.exec(value);
+  if (!match) return null;
+  const multiplier = { s: 1n, m: 60n, h: 3600n, d: 86400n }[match[2] as "s" | "m" | "h" | "d"];
+  return BigInt(match[1]) * multiplier;
+}
+
+function durationExceeds(value: string, ceiling: string): boolean {
+  const requested = durationSeconds(value);
+  const maximum = durationSeconds(ceiling);
+  return requested !== null && maximum !== null && requested > maximum;
+}
+
+export function templateRequestReviewSummary({ budget, models, runtimeMinutes, template, tools, ttl }: Readonly<{
+  budget: string;
+  models: ReadonlySet<string>;
+  runtimeMinutes: string;
+  template: AvailableEnvelopeTemplate;
+  tools: ReadonlySet<string>;
+  ttl: string;
+}>): { exceedances: Array<EnvelopeExceedanceSummaryValue>; requiresApproval: boolean } {
+  const exceedances = [
+    decimalExceeds(budget, template.ceiling.spec.budget.monthlyLimit) ? { ceiling: `${template.ceiling.spec.budget.monthlyLimit} ${template.ceiling.spec.budget.currency}`, label: "Monthly limit", requested: `${budget} ${template.ceiling.spec.budget.currency}` } : null,
+    template.ceiling.spec.runtimeMinutesLimit && runtimeMinutes.trim() && decimalExceeds(runtimeMinutes.trim(), template.ceiling.spec.runtimeMinutesLimit) ? { ceiling: `${template.ceiling.spec.runtimeMinutesLimit} minutes`, label: "Runtime minutes", requested: `${runtimeMinutes.trim()} minutes` } : null,
+    durationExceeds(ttl, template.ceiling.spec.ttl) ? { ceiling: template.ceiling.spec.ttl, label: "Time to live", requested: ttl } : null,
+    [...models].some((model) => !template.ceiling.spec.llms.some((allowed) => `${allowed.provider}\u0000${allowed.model}` === model)) ? {
+      ceiling: template.ceiling.spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") || "None",
+      label: "Models",
+      requested: [...models].map((model) => model.replace("\u0000", "/")).join(", ") || "None",
+    } : null,
+    [...tools].some((tool) => !template.ceiling.spec.tools.some((allowed) => `${allowed.provider}\u0000${allowed.resource}\u0000${allowed.action}` === tool)) ? {
+      ceiling: template.ceiling.spec.tools.map((tool) => `${tool.provider}:${tool.resource}:${tool.action}`).join(", ") || "None",
+      label: "Tools",
+      requested: [...tools].map((tool) => tool.replaceAll("\u0000", ":")).join(", ") || "None",
+    } : null,
+  ].filter((value): value is EnvelopeExceedanceSummaryValue => value !== null);
+  return { exceedances, requiresApproval: exceedances.length > 0 };
 }
 
 export function EnvelopesView() {
@@ -99,7 +163,7 @@ export function NewEnvelopeView() {
   const state = useApiResource<EnvelopeTemplatesResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Pick a template, then narrow it. You can’t go above the template’s ceiling." title="Request an envelope" />
+      <PageHeader description="Pick an existing template and adjust it, or create your own envelope request." title="Request an envelope" />
       <ResourceBoundary state={state}>{({ templates }) => <EnvelopeRequestForm templates={templates} />}</ResourceBoundary>
     </section>
   );
@@ -136,7 +200,17 @@ function TemplateEnvelopeRequestForm({ initialTemplateId, onSubmittingChange, te
   const [ttl, setTtl] = useState(template.ceiling.spec.ttl);
   const [models, setModels] = useState(() => new Set(template.ceiling.spec.llms.map((item) => `${item.provider}\u0000${item.model}`)));
   const [tools, setTools] = useState(() => new Set(template.ceiling.spec.tools.map((item) => `${item.provider}\u0000${item.resource}\u0000${item.action}`)));
+  const [justification, setJustification] = useState("");
   const [submission, setSubmission] = useState<"idle" | "submitting" | MutationFailureState>("idle");
+  const [failureReason, setFailureReason] = useState<string | null>(null);
+  const [rejectedFields, setRejectedFields] = useState<Array<EnvelopeRequestField>>([]);
+
+  function clearRejectedSubmission() {
+    if (submission === "idle" || submission === "submitting") return;
+    setSubmission("idle");
+    setFailureReason(null);
+    setRejectedFields([]);
+  }
 
   function selectTemplate(id: string) {
     const next = templates.find((item) => item.id === id);
@@ -147,19 +221,25 @@ function TemplateEnvelopeRequestForm({ initialTemplateId, onSubmittingChange, te
     setTtl(next.ceiling.spec.ttl);
     setModels(new Set(next.ceiling.spec.llms.map((item) => `${item.provider}\u0000${item.model}`)));
     setTools(new Set(next.ceiling.spec.tools.map((item) => `${item.provider}\u0000${item.resource}\u0000${item.action}`)));
+    setJustification("");
     setSubmission("idle");
+    setFailureReason(null);
+    setRejectedFields([]);
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (session.status !== "authenticated") return;
     setSubmission("submitting");
+    setFailureReason(null);
+    setRejectedFields([]);
     onSubmittingChange(true);
     const result = await createRequest({
       body: {
         idempotencyKey: crypto.randomUUID(),
         templateId: template.id,
         templateRevision: template.revision,
+        justification: justification.trim() || null,
         requestedEnvelope: {
           revision: template.revision,
           spec: {
@@ -184,12 +264,21 @@ function TemplateEnvelopeRequestForm({ initialTemplateId, onSubmittingChange, te
       router.push(`/envelopes/${result.data.request.id}`);
       return;
     }
+    const problem = envelopeRequestProblem(result.error);
+    setFailureReason(problem?.failureReason ?? null);
+    setRejectedFields(problem?.fields ?? []);
     setSubmission(classifyMutationFailure(result.response?.status));
     onSubmittingChange(false);
   }
 
   const modelOptions = template.ceiling.spec.llms.map((item) => ({ key: `${item.provider}\u0000${item.model}`, kind: "model" as const, label: `${item.provider}/${item.model}` }));
   const toolOptions = template.ceiling.spec.tools.map((item) => ({ key: `${item.provider}\u0000${item.resource}\u0000${item.action}`, kind: grantKindForAction(item.action), label: `${item.provider}:${item.resource}:${item.action}` }));
+  const { exceedances, requiresApproval } = templateRequestReviewSummary({ budget, models, runtimeMinutes, template, tools, ttl });
+  const exceededFields = new Set(exceedances.map(({ label }) => label));
+  if (rejectedFields.includes("budgetMonthlyLimit")) exceededFields.add("Monthly limit");
+  if (rejectedFields.includes("runtimeMinutesLimit")) exceededFields.add("Runtime minutes");
+  if (rejectedFields.includes("ttl")) exceededFields.add("Time to live");
+  const fieldClass = (exceeded: boolean) => `min-h-11 rounded-control border px-3 font-normal ${exceeded ? "border-warn ring-1 ring-warn" : ""}`;
   const stepTitle = (number: string, title: string) => <span className="flex items-center gap-3"><span className="font-mono text-xs font-normal text-faint-ink">{number}</span>{title}</span>;
   return (
     <form className="flex flex-wrap items-start gap-5" onSubmit={submit}>
@@ -198,15 +287,17 @@ function TemplateEnvelopeRequestForm({ initialTemplateId, onSubmittingChange, te
           <label className="sr-only">Template<select disabled={submission === "submitting"} onChange={(event) => selectTemplate(event.target.value)} value={template.id}>{templates.map((item) => <option key={item.id} value={item.id}>{item.displayName} · revision {item.revision}</option>)}</select></label>
           <div className="grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">{templates.map((item) => <button aria-pressed={item.id === template.id} className={`rounded-tile border p-4 text-left ${item.id === template.id ? "border-brand bg-brand-soft" : "hover:bg-subtle"}`} disabled={submission === "submitting"} key={item.id} onClick={() => selectTemplate(item.id)} type="button"><span className="flex items-center justify-between gap-3"><strong className="text-[15px]">{item.displayName}</strong><span className="font-mono text-xs text-muted-ink">rev {item.revision}</span></span><span className="mt-2 block text-xs text-muted-ink">Up to {item.ceiling.spec.budget.monthlyLimit} {item.ceiling.spec.budget.currency}/mo · {item.ceiling.spec.ttl} · {item.ceiling.spec.tools.length} tools</span></button>)}</div>
         </SectionCard>
-        <SectionCard title={stepTitle("02", "Budget and lifetime")}><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})<input className="min-h-11 rounded-control border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setBudget(event.target.value)} required value={budget} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.budget.monthlyLimit} {template.ceiling.spec.budget.currency}</span></label><label className="grid gap-2 text-sm font-semibold">Time to live<input className="min-h-11 rounded-control border px-3 font-mono font-normal" disabled={submission === "submitting"} onChange={(event) => setTtl(event.target.value)} required value={ttl} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.ttl}</span></label>{template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month<input className="min-h-11 rounded-control border px-3 font-normal" disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => setRuntimeMinutes(event.target.value)} required value={runtimeMinutes} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.runtimeMinutesLimit}</span></label> : null}</div></SectionCard>
-        <SectionCard title={stepTitle("03", "Models")}><TagSelect addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" onChange={(next) => setModels(new Set(next))} options={modelOptions} value={[...models]} /></SectionCard>
-        <SectionCard title={stepTitle("04", "Tools")}><TagSelect addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search GitHub tools…" label="Tools" onChange={(next) => setTools(new Set(next))} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools in the template ceiling are offered.</p></SectionCard>
+        <SectionCard title={stepTitle("02", "Budget and lifetime")}><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})<input className={fieldClass(exceededFields.has("Monthly limit"))} disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => { setBudget(event.target.value); clearRejectedSubmission(); }} required value={budget} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.budget.monthlyLimit} {template.ceiling.spec.budget.currency}</span></label><label className="grid gap-2 text-sm font-semibold">Time to live<input className={`${fieldClass(exceededFields.has("Time to live"))} font-mono`} disabled={submission === "submitting"} onChange={(event) => { setTtl(event.target.value); clearRejectedSubmission(); }} required value={ttl} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.ttl}</span></label>{template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month<input className={fieldClass(exceededFields.has("Runtime minutes"))} disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => { setRuntimeMinutes(event.target.value); clearRejectedSubmission(); }} required value={runtimeMinutes} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.runtimeMinutesLimit}</span></label> : null}</div></SectionCard>
+        <SectionCard className={exceededFields.has("Models") || rejectedFields.includes("llms") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("03", "Models")}><TagSelect addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" onChange={(next) => { setModels(new Set(next)); clearRejectedSubmission(); }} options={modelOptions} value={[...models]} /></SectionCard>
+        <SectionCard className={exceededFields.has("Tools") || rejectedFields.includes("tools") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("04", "Tools")}><TagSelect addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search GitHub tools…" label="Tools" onChange={(next) => { setTools(new Set(next)); clearRejectedSubmission(); }} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools in the template ceiling are offered.</p></SectionCard>
+        <SectionCard title={stepTitle("05", "Request note")}><label className="grid gap-2 text-sm font-semibold">Justification (optional)<textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); clearRejectedSubmission(); }} placeholder="Explain why these limits or capabilities are needed." value={justification} /></label></SectionCard>
       </div>
       <SectionCard className="sticky top-7 flex-[1_1_280px] lg:max-w-[380px]" title="Summary">
         <dl className="space-y-3 text-sm">{[["Template", template.displayName], ["Monthly limit", `${budget} ${template.ceiling.spec.budget.currency}`], ["Per run", template.ceiling.spec.budget.singleRunLimit ?? "Not set"], ["TTL", ttl], ["Models", String(models.size)], ["Tools", String(tools.size)]].map(([label, value]) => <div className="flex justify-between gap-4" key={label}><dt className="text-muted-ink">{label}</dt><dd className="text-right font-medium">{value}</dd></div>)}</dl>
-        {submission !== "idle" && submission !== "submitting" ? <p className="mt-4 text-sm text-err" role="alert">{{ conflict: "The template revision changed. Reload before retrying.", rejected: "Rust admission rejected the requested authority as outside the template ceiling.", forbidden: "The Rust authorization boundary rejected the request.", unavailable: "The authoritative request service is unavailable.", error: "The request could not be accepted." }[submission]}</p> : null}
-        <button className="mt-5 min-h-10 w-full rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
-        <p className="mt-3 text-xs leading-5 text-muted-ink">{template.autoProvisionThreshold === null || template.autoProvisionThreshold === undefined ? "Provisioned instantly when the request stays within this template ceiling." : "Provisioned instantly when the request stays within the template’s auto-approve threshold; otherwise an administrator reviews it."}</p>
+        {submission !== "idle" && submission !== "submitting" ? <p className="mt-4 text-sm text-err" role="alert">{failureReason ?? { conflict: "The template revision changed. Reload before retrying.", rejected: "The request is outside the platform safety limits or capability catalog.", forbidden: "You are not allowed to submit this request.", unavailable: "The request service is unavailable.", error: "The request could not be accepted." }[submission]}</p> : null}
+        {exceedances.length ? <div className="mt-4"><EnvelopeExceedanceSummary values={exceedances} /></div> : null}
+        <button className="mt-5 min-h-10 w-full rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : requiresApproval ? "Submit for approval" : "Submit request"}</button>
+        <p className="mt-3 text-xs leading-5 text-muted-ink">{requiresApproval ? "An administrator will review the requested values." : "This request will be provisioned immediately."}</p>
       </SectionCard>
     </form>
   );
@@ -234,7 +325,9 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
   const router = useRouter();
   const session = useSession();
   const [envelopeJson, setEnvelopeJson] = useState("");
+  const [justification, setJustification] = useState("");
   const [submission, setSubmission] = useState<"idle" | "submitting" | "invalid" | MutationFailureState>("idle");
+  const [failureReason, setFailureReason] = useState<string | null>(null);
   const idempotencyKey = useRef<string | null>(null);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -242,14 +335,17 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
     if (session.status !== "authenticated") return;
     const requestedEnvelope = parseCustomEnvelope(envelopeJson);
     if (!requestedEnvelope) {
+      setFailureReason(null);
       setSubmission("invalid");
       return;
     }
     setSubmission("submitting");
+    setFailureReason(null);
     onSubmittingChange(true);
     const result = await createRequest({
       body: {
         idempotencyKey: idempotencyKey.current ??= crypto.randomUUID(),
+        justification: justification.trim() || null,
         requestedEnvelope,
       },
       cache: "no-store",
@@ -260,26 +356,27 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
       router.push(`/envelopes/${result.data.request.id}`);
       return;
     }
+    setFailureReason(envelopeRequestProblem(result.error)?.failureReason ?? null);
     setSubmission(classifyMutationFailure(result.response?.status));
     onSubmittingChange(false);
   }
 
-  const failure = submission === "invalid"
+  const failure = failureReason ?? (submission === "invalid"
     ? "Enter a complete envelope JSON object with revision, budget, models, tools, and TTL."
     : submission !== "idle" && submission !== "submitting"
       ? {
           conflict: "An equivalent envelope request already exists. Reload before retrying.",
-          rejected: "HyperShell rejected the custom authority. It must fit the deployment safety ceiling and capability catalog.",
-          forbidden: "The Rust authorization boundary rejected the request.",
-          unavailable: "The authoritative request service is unavailable.",
+          rejected: "The custom request must fit the deployment safety ceiling and capability catalog.",
+          forbidden: "You are not allowed to submit this request.",
+          unavailable: "The request service is unavailable.",
           error: "The request could not be accepted.",
         }[submission]
-      : null;
+      : null);
 
   return (
     <form className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
       <div>
-        <h2 className="font-semibold">Complete requested authority</h2>
+        <h2 className="font-semibold">Custom envelope request</h2>
         <p className="mt-1 text-sm text-muted-ink">Custom requests have no governing template and always require administrator approval. HyperShell validates the complete envelope against the deployment safety ceiling; model, tool, and limit values are specific to this deployment.</p>
       </div>
       <label className="grid gap-2 text-sm font-semibold">Complete envelope JSON
@@ -292,6 +389,9 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
           spellCheck={false}
           value={envelopeJson}
         />
+      </label>
+      <label className="grid gap-2 text-sm font-semibold">Justification (optional)
+        <textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); idempotencyKey.current = null; setSubmission("idle"); }} placeholder="Explain why this envelope is needed." value={justification} />
       </label>
       {failure ? <p className="text-sm text-red-800" role="alert">{failure}</p> : null}
       <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
@@ -330,6 +430,10 @@ function EnvelopeDetail({ request }: Readonly<{ request: UserEnvelopeRequest }>)
         { label: "Envelope instance", value: <span className="font-mono text-sm">{request.envelopeInstanceId ?? "Not assigned"}</span> },
       ]} />
       {request.reason ? <p className="rounded-card bg-notice p-4 text-sm"><strong>Server reason:</strong> {request.reason}</p> : null}
+      {request.status === "pending" && (request.ceilingExceedances.length || request.justification) ? <SectionCard title="Pending administrator approval">
+        <EnvelopeExceedanceSummary values={request.ceilingExceedances.map(envelopeDeltaSummary)} />
+        {request.justification ? <p className="mt-4 text-sm"><strong>Justification:</strong> {request.justification}</p> : null}
+      </SectionCard> : null}
       <div className="grid gap-5 lg:grid-cols-2">
         <SectionCard title="Authority">
           <div className="space-y-5">
@@ -376,7 +480,7 @@ function WorkflowGenerator({ requestId }: Readonly<{ requestId: string }>) {
           <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "loading"} type="submit">{status === "loading" ? "Rendering…" : "Render workflow"}</button>
         </form>
       )}</ResourceBoundary>
-      {status !== "idle" && status !== "loading" ? <p role="alert" className="text-sm text-red-800">{{ conflict: "The envelope changed before the workflow could be rendered. Reload before retrying.", rejected: "Rust rejected the workflow inputs.", forbidden: "The Rust authorization boundary rejected workflow rendering.", unavailable: "The authoritative workflow service is unavailable.", error: "The workflow response could not be accepted." }[status]}</p> : null}
+      {status !== "idle" && status !== "loading" ? <p role="alert" className="text-sm text-red-800">{{ conflict: "The envelope changed before the workflow could be rendered. Reload before retrying.", rejected: "The workflow inputs were rejected.", forbidden: "You are not allowed to render this workflow.", unavailable: "The authoritative workflow service is unavailable.", error: "The workflow response could not be accepted." }[status]}</p> : null}
       {workflow ? <div aria-label="Generated workflow" className="mt-4"><CodeBlock code={workflow.workflow.yaml} language="yaml" path={`${workflow.workflow.suggestedPath} · sha256 ${workflow.workflow.sha256.slice(0, 12)}…`} /></div> : null}
     </SectionCard>
   );

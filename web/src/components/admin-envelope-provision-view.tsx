@@ -83,7 +83,7 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
   const failure = status !== "idle" && status !== "submitting" && status !== "provisioned" ? {
     conflict: "The selected envelope conflicts with the user's active authority. Reload before retrying.",
     rejected: "The user is not eligible for this template or the requested envelope is invalid.",
-    forbidden: "The Rust authorization boundary rejected this provisioning operation.",
+    forbidden: "You are not allowed to provision this envelope.",
     unavailable: "The authoritative envelope service is unavailable.",
     error: "The user or exact template revision could not be provisioned.",
   }[status] : null;

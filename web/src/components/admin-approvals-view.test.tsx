@@ -69,6 +69,23 @@ describe("envelope request approval controls", () => {
     expect(html).not.toContain('name="expiresAt" placeholder="2026-08-25T17:00:00Z" required=""');
   });
 
+  test("shows the requester justification beside recorded ceiling deltas", () => {
+    const html = renderToStaticMarkup(<UnifiedRequestCard request={{
+      ...unifiedRequest,
+      deltas: [{ ceiling: "200.00", currency: "USD", dimension: "budget", requested: "300.00" }],
+      justification: "Needed for a release review",
+      kind: "ceiling_exceeded",
+    }} />);
+
+    expect(html).toContain("Requester justification");
+    expect(html).toContain("Needed for a release review");
+    expect(html).toContain("Requested vs template ceiling");
+    expect(html).toContain("Needs admin approval: 1 value above the template ceiling");
+    expect(html).toContain("Monthly limit: <strong>300.00 USD</strong> (ceiling 200.00 USD)");
+    expect(html).toContain("300.00 USD");
+    expect(html).toContain("200.00 USD");
+  });
+
   test("shows the full requested authority for a template-free custom request", () => {
     const custom: AdminRequestView = {
       ...unifiedRequest,

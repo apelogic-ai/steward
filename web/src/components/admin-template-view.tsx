@@ -25,7 +25,7 @@ import { useSession } from "@/session/session-context";
 
 type TemplateMutationState = "idle" | "saving" | "saved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
 
-type TemplateField = "templateId" | "displayName" | "memberRoles" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "memory" | "compute" | "storage" | "models" | "tools" | "workspace" | "threshold";
+type TemplateField = "templateId" | "displayName" | "memberRoles" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "memory" | "compute" | "storage" | "models" | "tools" | "workspace";
 
 export type TemplateFieldErrors = Partial<Record<TemplateField, string>>;
 
@@ -76,28 +76,6 @@ function validTemplateIdentifier(value: string): boolean {
 
 function validDecimal(value: string): boolean {
   return /^[0-9]+(?:\.[0-9]*)?$/.test(value);
-}
-
-function decimalParts(value: string): { fractional: string; integer: string } | null {
-  if (!validDecimal(value)) return null;
-  const [integer = "", fractional = ""] = value.split(".");
-  return {
-    integer: integer.replace(/^0+/, ""),
-    fractional: fractional.replace(/0+$/, ""),
-  };
-}
-
-function compareDecimals(left: string, right: string): number | null {
-  const leftParts = decimalParts(left);
-  const rightParts = decimalParts(right);
-  if (!leftParts || !rightParts) return null;
-  if (leftParts.integer.length !== rightParts.integer.length) return leftParts.integer.length - rightParts.integer.length;
-  const integerComparison = leftParts.integer < rightParts.integer ? -1 : leftParts.integer > rightParts.integer ? 1 : 0;
-  if (integerComparison !== 0) return integerComparison;
-  const width = Math.max(leftParts.fractional.length, rightParts.fractional.length);
-  const leftFractional = leftParts.fractional.padEnd(width, "0");
-  const rightFractional = rightParts.fractional.padEnd(width, "0");
-  return leftFractional < rightFractional ? -1 : leftFractional > rightFractional ? 1 : 0;
 }
 
 function durationSeconds(value: string): bigint | null {
@@ -153,64 +131,6 @@ function workspaceAuthorityFromJson(value: string): WorkspaceAuthority | null | 
   }
 }
 
-function validEnvelopeSemantics(envelope: BrowserEnvelope): boolean {
-  const { budget, runner, runtimeMinutesLimit, ttl, workspace } = envelope.spec;
-  const platforms = runner?.platforms ?? [];
-  return envelope.revision > 0
-    && validDecimal(budget.monthlyLimit)
-    && (budget.singleRunLimit === undefined || budget.singleRunLimit === null || validDecimal(budget.singleRunLimit))
-    && /^[A-Z]{3}$/.test(budget.currency)
-    && (runtimeMinutesLimit === undefined || runtimeMinutesLimit === null || validDecimal(runtimeMinutesLimit))
-    && durationSeconds(ttl) !== null
-    && new Set(platforms).size === platforms.length
-    && (runner?.memory == null || runnerQuantity(runner.memory, "memory") !== null)
-    && (runner?.compute == null || runnerQuantity(runner.compute, "compute") !== null)
-    && (runner?.storage == null || runnerQuantity(runner.storage, "storage") !== null)
-    && (workspace == null || isWorkspaceAuthority(workspace));
-}
-
-function envelopeIsWithin(candidate: BrowserEnvelope, ceiling: BrowserEnvelope): boolean {
-  if (!validEnvelopeSemantics(candidate) || !validEnvelopeSemantics(ceiling)) return false;
-  if (candidate.revision !== ceiling.revision || candidate.spec.budget.currency !== ceiling.spec.budget.currency) return false;
-  if ((compareDecimals(candidate.spec.budget.monthlyLimit, ceiling.spec.budget.monthlyLimit) ?? 1) > 0) return false;
-  if (ceiling.spec.budget.singleRunLimit !== undefined && ceiling.spec.budget.singleRunLimit !== null) {
-    if (candidate.spec.budget.singleRunLimit === undefined || candidate.spec.budget.singleRunLimit === null) return false;
-    if ((compareDecimals(candidate.spec.budget.singleRunLimit, ceiling.spec.budget.singleRunLimit) ?? 1) > 0) return false;
-  }
-  if (ceiling.spec.runtimeMinutesLimit !== undefined && ceiling.spec.runtimeMinutesLimit !== null) {
-    if (candidate.spec.runtimeMinutesLimit === undefined || candidate.spec.runtimeMinutesLimit === null) return false;
-    if ((compareDecimals(candidate.spec.runtimeMinutesLimit, ceiling.spec.runtimeMinutesLimit) ?? 1) > 0) return false;
-  }
-  const candidateTtl = durationSeconds(candidate.spec.ttl);
-  const ceilingTtl = durationSeconds(ceiling.spec.ttl);
-  if (candidateTtl === null || ceilingTtl === null || candidateTtl > ceilingTtl) return false;
-  if (candidate.spec.llms.some((model) => !ceiling.spec.llms.some((allowed) => modelKey(model) === modelKey(allowed)))) return false;
-  if (candidate.spec.tools.some((tool) => !ceiling.spec.tools.some((allowed) => toolKey(tool) === toolKey(allowed)))) return false;
-  const candidateRunner = candidate.spec.runner;
-  const ceilingRunner = ceiling.spec.runner;
-  if ((candidateRunner?.platforms ?? []).some((platform) => !(ceilingRunner?.platforms ?? []).includes(platform))) return false;
-  for (const resource of ["memory", "compute", "storage"] as const) {
-    const requested = candidateRunner?.[resource];
-    if (requested == null) continue;
-    const allowed = ceilingRunner?.[resource];
-    if (allowed == null) return false;
-    const requestedQuantity = runnerQuantity(requested, resource);
-    const allowedQuantity = runnerQuantity(allowed, resource);
-    if (requestedQuantity === null || allowedQuantity === null || requestedQuantity > allowedQuantity) return false;
-  }
-  const candidateWorkspace = candidate.spec.workspace;
-  if (candidateWorkspace != null) {
-    const ceilingWorkspace = ceiling.spec.workspace;
-    if (ceilingWorkspace == null
-      || candidateWorkspace.allowedTypes.some((entry) => !ceilingWorkspace.allowedTypes.includes(entry))
-      || (runnerQuantity(candidateWorkspace.maxTotalSize, "storage") ?? 1n) > (runnerQuantity(ceilingWorkspace.maxTotalSize, "storage") ?? 0n)
-      || candidateWorkspace.maxFiles > ceilingWorkspace.maxFiles
-      || candidateWorkspace.maxHistoryDepth > ceilingWorkspace.maxHistoryDepth
-      || candidateWorkspace.maxSubmoduleDepth > ceilingWorkspace.maxSubmoduleDepth) return false;
-  }
-  return true;
-}
-
 function isBrowserEnvelope(value: unknown): value is BrowserEnvelope {
   if (!isRecord(value)) return false;
   const envelope = value;
@@ -254,7 +174,6 @@ export function templateMemberRoles(templateId: string, memberRoles: Array<strin
 export function validateTemplateFields({
   allowedModels,
   allowedTools,
-  autoApproveToCeiling,
   displayName: templateDisplayName,
   envelope,
   memberRoles,
@@ -262,13 +181,11 @@ export function validateTemplateFields({
   monthlyLimit,
   singleRunLimit,
   templateId,
-  thresholdJson,
   tools,
   workspaceJson,
 }: Readonly<{
   allowedModels: ReadonlySet<string>;
   allowedTools: ReadonlySet<string>;
-  autoApproveToCeiling: boolean;
   displayName: string;
   envelope: BrowserEnvelope;
   memberRoles: Array<string>;
@@ -276,7 +193,6 @@ export function validateTemplateFields({
   monthlyLimit: string;
   singleRunLimit: string;
   templateId: string;
-  thresholdJson: string;
   tools: Array<ToolGrant>;
   workspaceJson: string;
 }>): TemplateFieldErrors {
@@ -305,14 +221,6 @@ export function validateTemplateFields({
   else if (models.some((model) => !allowedModels.has(modelKey(model)))) errors.models = "Remove or replace every model not listed in the capability catalog.";
   if (tools.some((tool) => !allowedTools.has(toolKey(tool)))) errors.tools = "Remove or replace every tool not listed in the capability catalog.";
   if (workspaceAuthorityFromJson(workspaceJson) === null) errors.workspace = "Enter a complete valid workspace authority object or leave it blank.";
-  if (!autoApproveToCeiling) {
-    try {
-      const threshold = JSON.parse(thresholdJson) as unknown;
-      if (!isBrowserEnvelope(threshold) || !envelopeIsWithin(threshold, envelope)) errors.threshold = "Enter a valid envelope within this template ceiling.";
-    } catch {
-      errors.threshold = "Enter a complete valid envelope as JSON.";
-    }
-  }
   return errors;
 }
 
@@ -465,10 +373,10 @@ function toolValue(tool: ToolGrant): string {
 
 function mutationMessage(status: Exclude<TemplateMutationState, "idle" | "saving">, rejectionCode: string | null): string {
   return {
-    saved: "Template revision accepted by the Rust authority.",
+    saved: "Template revision saved.",
     conflict: "A newer template revision already exists. Load it before authoring another revision.",
     rejected: `The server rejected the template, so no authority was changed.${rejectionCode ? ` Error code: ${rejectionCode}.` : ""}`,
-    forbidden: "The Rust authorization boundary rejected this template mutation.",
+    forbidden: "You are not allowed to change this template.",
     unavailable: "The authoritative template service is unavailable.",
     error: "The template response could not be accepted.",
   }[status];
@@ -634,7 +542,7 @@ function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
   );
 }
 
-function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTasks, autoProvisionThreshold, capabilities, create = false, csrf, memberRole, memberRoles, templateDisplayName, template }: Readonly<{ allowInlineBrowserTasks: boolean; autoProvisionThreshold?: BrowserEnvelope | null; capabilities: CapabilityCatalog; create?: boolean; csrf: string; memberRole: string; memberRoles: Array<string>; templateDisplayName: string; template: BrowserEnvelope }>) {
+function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTasks, capabilities, create = false, csrf, memberRole, memberRoles, templateDisplayName, template }: Readonly<{ allowInlineBrowserTasks: boolean; autoProvisionThreshold?: BrowserEnvelope | null; capabilities: CapabilityCatalog; create?: boolean; csrf: string; memberRole: string; memberRoles: Array<string>; templateDisplayName: string; template: BrowserEnvelope }>) {
   const router = useRouter();
   const modelCatalog = capabilities.models;
   const allowedModels = new Set(modelCatalog.map(modelKey));
@@ -658,8 +566,6 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
   const [roles, setRoles] = useState(memberRoles.join(", "));
   const [rolesEdited, setRolesEdited] = useState(!create);
   const [templateIdDraft, setTemplateIdDraft] = useState("");
-  const [autoApproveToCeiling, setAutoApproveToCeiling] = useState(autoProvisionThreshold === null || autoProvisionThreshold === undefined);
-  const [thresholdJson, setThresholdJson] = useState(JSON.stringify(autoProvisionThreshold ?? template, null, 2));
   const [allowInlineBrowserTasks, setAllowInlineBrowserTasks] = useState(initialAllowInlineBrowserTasks);
   const [workspaceJson, setWorkspaceJson] = useState(template.spec.workspace ? JSON.stringify(template.spec.workspace, null, 2) : "");
   const parsedRoles = [...new Set(roles.split(",").map((role) => role.trim()).filter(Boolean))].sort();
@@ -725,25 +631,9 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         },
       },
     };
-    let nextAutoProvisionThreshold: BrowserEnvelope | null = null;
-    let thresholdJsonForValidation = thresholdJson;
-    if (!autoApproveToCeiling) {
-      try {
-        const parsed: unknown = JSON.parse(thresholdJson);
-        if (isBrowserEnvelope(parsed)) {
-          nextAutoProvisionThreshold = !create && parsed.revision === currentRevision
-            ? { ...parsed, revision: envelope.revision }
-            : parsed;
-          thresholdJsonForValidation = JSON.stringify(nextAutoProvisionThreshold);
-        }
-      } catch {
-        // The field validator below owns the inline malformed-JSON diagnostic.
-      }
-    }
     const errors = validateTemplateFields({
       allowedModels,
       allowedTools,
-      autoApproveToCeiling,
       displayName: name,
       envelope,
       memberRoles: selectedRoles,
@@ -751,7 +641,6 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       monthlyLimit,
       singleRunLimit,
       templateId,
-      thresholdJson: thresholdJsonForValidation,
       tools,
       workspaceJson,
     });
@@ -767,7 +656,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         displayName: name.trim(),
         memberRoles: selectedRoles,
         envelope,
-        autoProvisionThreshold: nextAutoProvisionThreshold,
+        autoProvisionThreshold: null,
         allowInlineBrowserTasks,
       },
       cache: "no-store",
@@ -832,9 +721,6 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         <FormSection description="Optional ceiling for typed Task workspaces. Blank means this template grants no workspace entries." title="Workspace authority">
           <label className="grid gap-2 text-sm font-semibold">Workspace authority (JSON)<textarea aria-invalid={Boolean(fieldErrors.workspace)} className="min-h-44 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setWorkspaceJson(event.target.value); clearFieldError("workspace"); }} placeholder={'{"allowedTypes":["git","scratch"],"maxTotalSize":"2Gi","maxFiles":100000,"maxHistoryDepth":1000,"maxSubmoduleDepth":4}'} spellCheck={false} value={workspaceJson} /><FieldError message={fieldErrors.workspace} /></label>
         </FormSection>
-        <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
-          <div className="space-y-4"><label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => { setAutoApproveToCeiling(event.target.checked); clearFieldError("threshold"); }} type="checkbox" />Auto-approve every request within the ceiling</label>{!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea aria-invalid={Boolean(fieldErrors.threshold)} className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setThresholdJson(event.target.value); clearFieldError("threshold"); }} spellCheck={false} value={thresholdJson} /><FieldError message={fieldErrors.threshold} /></label> : null}</div>
-        </FormSection>
         <FormSection description="Repository packages remain available when inline authoring is disabled." title="Browser execution">
           <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={allowInlineBrowserTasks} onChange={(event) => setAllowInlineBrowserTasks(event.target.checked)} type="checkbox" />Allow inline browser-authored packages</label>
         </FormSection>
@@ -870,13 +756,6 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Groups appear only when supplied as authoritative catalog metadata.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} previousTools={previousTools} tools={tools} /><FieldError message={fieldErrors.tools} /></fieldset></FormSection>
 
       <FormSection description="Optional ceiling for typed Task workspaces. Blank means this template grants no workspace entries." title="Workspace authority"><label className="grid gap-2 text-sm font-semibold">Workspace authority (JSON)<textarea aria-invalid={Boolean(fieldErrors.workspace)} className="min-h-44 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setWorkspaceJson(event.target.value); clearFieldError("workspace"); }} placeholder={'{"allowedTypes":["git","scratch"],"maxTotalSize":"2Gi","maxFiles":100000,"maxHistoryDepth":1000,"maxSubmoduleDepth":4}'} spellCheck={false} value={workspaceJson} /><FieldError message={fieldErrors.workspace} /></label></FormSection>
-
-      <FormSection description="Keep the default to auto-approve every valid request inside the ceiling, or provide a narrower complete envelope threshold." title="Auto-approval">
-        <div className="space-y-4">
-          <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={autoApproveToCeiling} onChange={(event) => { setAutoApproveToCeiling(event.target.checked); clearFieldError("threshold"); }} type="checkbox" />Auto-approve every request within the ceiling</label>
-          {!autoApproveToCeiling ? <label className="grid gap-2 text-sm font-semibold">Auto-approve up to (complete envelope JSON)<textarea aria-invalid={Boolean(fieldErrors.threshold)} className="min-h-56 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setThresholdJson(event.target.value); clearFieldError("threshold"); }} spellCheck={false} value={thresholdJson} /><FieldError message={fieldErrors.threshold} /></label> : null}
-        </div>
-      </FormSection>
 
       <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
 

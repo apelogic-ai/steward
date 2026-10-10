@@ -9,8 +9,8 @@ not email addresses, are authorization and mutation keys. Email is display-only.
 ## Authority model
 
 `envelope_template_revisions` is the sole authority for template identity,
-immutable revisions, eligible member roles, ceilings, and automatic-provisioning
-thresholds. Legacy `envelopes(scope_kind = 'member_role')` rows remain read-only
+immutable revisions, eligible member roles, and ceilings. Legacy
+`envelopes(scope_kind = 'member_role')` rows remain read-only
 for one compatibility window; new template and provisioning operations neither
 read nor write them.
 
@@ -23,13 +23,13 @@ Template-backed requests are handled as follows:
 
 | Requested authority | Result |
 |---|---|
-| At or below `autoProvisionThreshold` | Provision automatically |
-| Above the threshold but within the ceiling | Remain pending for an administrator |
-| Above the ceiling | Reject with `422` |
-| Threshold omitted | Treat the ceiling as the threshold |
+| At or below the template ceiling | Provision automatically |
+| Above the template ceiling but within the deployment safety ceiling and capability catalog | Remain pending for an administrator |
+| Outside the deployment safety ceiling or capability catalog | Reject with `422` and identify the affected field |
 
-Template authoring rejects a malformed threshold or one outside the ceiling.
-A template-free request omits both `templateId` and `templateRevision`, carries
+The deprecated `autoProvisionThreshold` field remains accepted as compatibility
+metadata but does not affect request admission. A template-free request omits
+both `templateId` and `templateRevision`, carries
 the complete requested Envelope, and always remains pending until an explicit
 administrator decision. Operators must configure
 `config.apiserver.customEnvelopeSafetyCeiling`; otherwise custom requests fail

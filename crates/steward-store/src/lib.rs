@@ -825,6 +825,20 @@ mod migration_tests {
             "migration 68 must add encrypted per-user inference credentials and append-only audit without rewriting existing rows"
         );
     }
+
+    #[test]
+    fn envelope_request_review_context_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 69
+                    && migration
+                        .description
+                        .contains("envelope request review context")
+            }),
+            "migration 69 must preserve justification and exact template-ceiling exceedances without rewriting existing requests"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4821,6 +4835,11 @@ impl PgStore {
             .is_some_and(|template_id| template_id.trim().is_empty())
             || request.template_id.is_some() != request.template_revision.is_some()
             || request.idempotency_key.trim().is_empty()
+            || request.justification.is_some_and(|value| {
+                value.trim() != value || value.is_empty() || value.chars().count() > 2_000
+            })
+            || request.ceiling_exceedances.len() > 11
+            || (request.template_id.is_none() && !request.ceiling_exceedances.is_empty())
             || request.actor.trim().is_empty()
         {
             return Err(StoreError::InvalidEnvelopeRequest);
@@ -4836,7 +4855,8 @@ impl PgStore {
             .await
             .map_err(database_error)?;
         let existing = sqlx::query(
-            "SELECT id, template_id, template_revision, requested_envelope \
+            "SELECT id, template_id, template_revision, requested_envelope, \
+                    justification, ceiling_exceedances \
              FROM envelope_requests \
              WHERE owner_user_id = $1 AND idempotency_key = $2",
         )
@@ -4854,9 +4874,17 @@ impl PgStore {
                 .try_get::<Json<Envelope>, _>("requested_envelope")
                 .map_err(database_error)?
                 .0;
+            let justification: Option<String> =
+                row.try_get("justification").map_err(database_error)?;
+            let ceiling_exceedances = row
+                .try_get::<Json<Vec<AdmissionDelta>>, _>("ceiling_exceedances")
+                .map_err(database_error)?
+                .0;
             if template_id.as_deref() != request.template_id
                 || template_revision != request.template_revision
                 || requested_envelope != *request.requested_envelope
+                || justification.as_deref() != request.justification
+                || ceiling_exceedances != request.ceiling_exceedances
             {
                 return Err(StoreError::EnvelopeRequestIdempotencyConflict);
             }
@@ -4874,8 +4902,9 @@ impl PgStore {
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO envelope_requests \
-             (id, owner_user_id, template_id, template_revision, requested_envelope, idempotency_key) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             (id, owner_user_id, template_id, template_revision, requested_envelope, \
+              idempotency_key, justification, ceiling_exceedances) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(id)
         .bind(request.owner_user_id.as_str())
@@ -4883,6 +4912,8 @@ impl PgStore {
         .bind(request.template_revision)
         .bind(Json(request.requested_envelope))
         .bind(request.idempotency_key)
+        .bind(request.justification)
+        .bind(Json(request.ceiling_exceedances))
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -4906,6 +4937,27 @@ impl PgStore {
             inserted: true,
             record,
         })
+    }
+
+    /// Read the immutable request already bound to one owner-scoped idempotency key.
+    pub async fn envelope_request_by_idempotency_key(
+        &self,
+        owner_user_id: &CanonicalUserId,
+        idempotency_key: &str,
+    ) -> Result<Option<EnvelopeRequestRecord>, StoreError> {
+        let request_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM envelope_requests \
+             WHERE owner_user_id = $1 AND idempotency_key = $2",
+        )
+        .bind(owner_user_id.as_str())
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        match request_id {
+            Some(request_id) => self.envelope_request(owner_user_id, request_id).await,
+            None => Ok(None),
+        }
     }
 
     /// Provision one exact catalog-backed User Envelope for a canonical user through the same
@@ -4954,6 +5006,8 @@ impl PgStore {
                 template_revision: Some(request.template_revision),
                 requested_envelope: request.requested_envelope,
                 idempotency_key: request.idempotency_key,
+                justification: None,
+                ceiling_exceedances: &[],
                 actor: request.actor,
             })
             .await?;
@@ -5410,8 +5464,7 @@ impl PgStore {
     ) -> Result<Vec<AdminEnvelopeRequestRecord>, StoreError> {
         let statement = format!(
             "SELECT records.*, users.display_email AS owner_display_email, \
-                    templates.display_name AS template_display_name, \
-                    templates.spec AS template_spec \
+                    templates.display_name AS template_display_name \
              FROM ({ENVELOPE_REQUEST_COLUMNS}) records \
              JOIN canonical_users users ON users.user_id = records.owner_user_id \
              LEFT JOIN envelope_template_revisions templates \
@@ -5430,20 +5483,10 @@ impl PgStore {
                 let template_display_name = row
                     .try_get("template_display_name")
                     .map_err(database_error)?;
-                let template_revision = row
-                    .try_get::<Option<i64>, _>("template_revision")
-                    .map_err(database_error)?;
-                let template_envelope = template_revision
-                    .zip(
-                        row.try_get::<Option<Json<EnvelopeSpec>>, _>("template_spec")
-                            .map_err(database_error)?,
-                    )
-                    .map(|(revision, spec)| Envelope {
-                        revision,
-                        spec: spec.0,
-                    });
+                let request = envelope_request_record(row)?;
+                let template_envelope = request.template_envelope.clone();
                 Ok(AdminEnvelopeRequestRecord {
-                    request: envelope_request_record(row)?,
+                    request,
                     owner_display_email,
                     template_display_name,
                     template_envelope,
@@ -10961,6 +11004,9 @@ pub struct EnvelopeRequestRecord {
     pub template_id: Option<String>,
     pub template_revision: Option<i64>,
     pub requested_envelope: Envelope,
+    pub template_envelope: Option<Envelope>,
+    pub justification: Option<String>,
+    pub ceiling_exceedances: Vec<AdmissionDelta>,
     pub approved_envelope: Option<Envelope>,
     pub status: EnvelopeRequestStatus,
     pub approval_id: Option<Uuid>,
@@ -11021,6 +11067,8 @@ pub struct EnvelopeRequestReservationRequest<'a> {
     pub template_revision: Option<i64>,
     pub requested_envelope: &'a Envelope,
     pub idempotency_key: &'a str,
+    pub justification: Option<&'a str>,
+    pub ceiling_exceedances: &'a [AdmissionDelta],
     pub actor: &'a str,
 }
 
@@ -14309,6 +14357,8 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
 // when concurrent provisioners wait on the same user-level lock.
 const ENVELOPE_REQUEST_COLUMNS: &str = "SELECT requests.id, requests.owner_user_id, requests.template_id, \
             requests.template_revision, requests.requested_envelope, \
+            requests.justification, requests.ceiling_exceedances, \
+            request_template.spec AS template_spec, \
             status.status, \
             CASE WHEN status.status = 'stale' THEN provisioned.approval_id ELSE status.approval_id END AS approval_id, \
             CASE WHEN status.status = 'stale' THEN provisioned.envelope_instance_id ELSE status.envelope_instance_id END AS envelope_instance_id, \
@@ -14333,6 +14383,9 @@ const ENVELOPE_REQUEST_COLUMNS: &str = "SELECT requests.id, requests.owner_user_
             to_char(status.at AT TIME ZONE 'UTC', \
                     'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS status_at \
      FROM envelope_requests requests \
+     LEFT JOIN envelope_template_revisions request_template \
+       ON request_template.template_id = requests.template_id \
+      AND request_template.revision = requests.template_revision \
      JOIN LATERAL ( \
          SELECT events.status, events.approval_id, events.envelope_instance_id, \
                 events.envelope_digest, events.reason, events.approved_envelope, \
@@ -14578,6 +14631,22 @@ fn envelope_request_record(
         template_revision: row.try_get("template_revision").map_err(database_error)?,
         requested_envelope: row
             .try_get::<Json<Envelope>, _>("requested_envelope")
+            .map_err(database_error)?
+            .0,
+        template_envelope: row
+            .try_get::<Option<i64>, _>("template_revision")
+            .map_err(database_error)?
+            .zip(
+                row.try_get::<Option<Json<EnvelopeSpec>>, _>("template_spec")
+                    .map_err(database_error)?,
+            )
+            .map(|(revision, spec)| Envelope {
+                revision,
+                spec: spec.0,
+            }),
+        justification: row.try_get("justification").map_err(database_error)?,
+        ceiling_exceedances: row
+            .try_get::<Json<Vec<AdmissionDelta>>, _>("ceiling_exceedances")
             .map_err(database_error)?
             .0,
         approved_envelope: row

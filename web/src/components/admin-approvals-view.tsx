@@ -23,6 +23,7 @@ import {
 } from "@/api-client";
 import { DataTable, FilterChips, GrantChipList, Meter, SectionCard, grantKindForAction } from "@/components/hs";
 import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
+import { EnvelopeExceedanceSummary, envelopeDeltaSummary } from "@/components/envelope-exceedance-summary";
 import { DefinitionList, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -36,11 +37,11 @@ type EnvelopeActionState = "idle" | "approving" | "rejecting" | "provisioned" | 
 function actionMessage(status: Exclude<UnifiedRequestActionState, "idle" | "filing" | "approving" | "rejecting">): string {
   return {
     filed: "Decision reference filed through the server-owned channel.",
-    approved: "Approval applied through the governed Rust admission path.",
-    "rejection-complete": "The envelope request was rejected through the governed Rust admission path.",
+    approved: "The approval was applied.",
+    "rejection-complete": "The envelope request was rejected.",
     conflict: "This approval or its runtime is stale. Reload the authoritative queue.",
     rejected: "The approval evidence or expiry is invalid.",
-    forbidden: "The Rust authorization boundary rejected this mutation.",
+    forbidden: "You are not allowed to make this change.",
     unavailable: "The approval authority is unavailable.",
     error: "The approval response could not be accepted.",
   }[status];
@@ -69,7 +70,7 @@ export function AdminApprovalsView() {
   const state = useApiResource<AdminRequestsResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Requests above a template’s auto-approval threshold, custom authority requests, and runs that exhaust a cumulative limit wait here for a decision." title="Requests" />
+      <PageHeader description="Requests above a template ceiling, custom authority requests, and runs that exhaust a cumulative limit wait here for a decision." title="Requests" />
       <ResourceBoundary state={state}>{({ requests }) => {
         if (requests.length === 0) return <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">Nothing needs action.</p>;
         const counts = {
@@ -177,7 +178,7 @@ function numericDelta(delta: AdminRequestView["deltas"][number]): string | null 
 
 function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>) {
   if (request.kind === "custom" && request.requestedEnvelope) return <SectionCard title="Requested authority"><DefinitionList items={envelopeAuthorityItems(request.requestedEnvelope.spec)} /><p className="mt-4 rounded-control bg-notice p-4 text-sm">This custom request has no governing template and always requires administrator approval.</p></SectionCard>;
-  if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">This request is within the configured ceiling but above its automatic approval threshold.</p>;
+  if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">This pending request is within the template ceiling.</p>;
   return (
     <SectionCard title="Requested vs template ceiling">
       <div className="overflow-x-auto">
@@ -324,6 +325,8 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
 
   return (
     <li className="space-y-5">
+      {request.justification ? <SectionCard title="Requester justification"><p className="whitespace-pre-wrap text-sm">{request.justification}</p></SectionCard> : null}
+      {request.kind === "ceiling_exceeded" ? <EnvelopeExceedanceSummary values={request.deltas.map(envelopeDeltaSummary)} /> : null}
       <RequestComparison request={request} />
       {terminal ? <RequestHistory request={request} /> : <SectionCard title="Decision"><div className="grid gap-5"><div className="grid grid-cols-[24px_minmax(0,1fr)] gap-3"><span className="grid size-6 place-items-center rounded-full bg-line-soft font-mono text-xs font-semibold">1</span><div><h3 className="text-sm font-semibold">File a decision reference</h3><p className="mt-1 text-[13px] text-muted-ink">Creates the governed record that serves as evidence for the exception.</p>{reference ? <div className="mt-3"><DefinitionList items={[["Decision key", reference.decisionKey], ["Evidence URL", reference.evidenceUrl]]} /></div> : <button className="mt-3 min-h-10 rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={status === "filing"} onClick={() => void fileDecision()} type="button">{status === "filing" ? "Filing…" : "File reference"}</button>}</div></div><div className={`grid grid-cols-[24px_minmax(0,1fr)] gap-3 ${reference ? "" : "opacity-55"}`}><span className="grid size-6 place-items-center rounded-full bg-line-soft font-mono text-xs font-semibold">2</span><div><h3 className="text-sm font-semibold">Approve or reject</h3><form className="mt-3 grid gap-4 sm:grid-cols-2" onSubmit={approve}>
         <label className="grid gap-2 text-sm font-semibold sm:col-span-2">Rationale<textarea className="min-h-24 rounded-md border p-3 font-normal" name="rationale" required /></label>
@@ -449,7 +452,7 @@ export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnve
       ) : null}
       {status !== "idle" && status !== "approving" && status !== "rejecting" ? (
         <p className={status === "provisioned" || status === "rejection-complete" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "provisioned" || status === "rejection-complete" ? "status" : "alert"}>
-          {status === "provisioned" ? "The exact requested envelope was provisioned." : status === "rejection-complete" ? "The envelope request was rejected without creating an envelope." : status === "rejected" ? "The rejection reason is invalid." : status === "conflict" ? "This request or its template revision is stale. Reload the authoritative queue." : status === "forbidden" ? "The Rust authorization boundary rejected this mutation." : status === "unavailable" ? "The envelope request authority is unavailable." : "The envelope request response could not be accepted."}
+          {status === "provisioned" ? "The exact requested envelope was provisioned." : status === "rejection-complete" ? "The envelope request was rejected without creating an envelope." : status === "rejected" ? "The rejection reason is invalid." : status === "conflict" ? "This request or its template revision is stale. Reload the authoritative queue." : status === "forbidden" ? "You are not allowed to make this change." : status === "unavailable" ? "The envelope request authority is unavailable." : "The envelope request response could not be accepted."}
         </p>
       ) : null}
     </li>

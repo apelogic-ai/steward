@@ -26,7 +26,10 @@ use crate::browser_auth::{
     protect_browser_admin_routes,
 };
 use crate::user_envelopes::{
-    BrowserEnvelope, BrowserEnvelopeSpec, envelope_content_digest, envelope_instance_id,
+    BrowserEnvelope, BrowserEnvelopeSpec, EnvelopeRequestErrorResponse, EnvelopeRequestField,
+    capability_catalog_violation_fields, envelope_content_digest, envelope_instance_id,
+    envelope_request_error_response, envelope_request_field_list,
+    envelope_request_fields_for_deltas,
 };
 use crate::{
     AdminContext, AdmissionLedger, ApiError, ApprovalRequest, DecisionChannel, RuntimeRepository,
@@ -855,6 +858,7 @@ pub(crate) struct AdminRequestView {
     state_actor: String,
     #[schema(value_type = Vec<DirectAdmissionDelta>)]
     deltas: Vec<AdmissionDelta>,
+    justification: Option<String>,
     requested_envelope: Option<BrowserEnvelope>,
     template_envelope: Option<BrowserEnvelope>,
     escalation: Option<EscalationView>,
@@ -1087,7 +1091,7 @@ where
         (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Envelope request was not found"),
         (status = 409, description = "Envelope request or template revision is stale or already decided differently"),
-        (status = 422, description = "Approval rationale or decision metadata is invalid"),
+        (status = 422, body = EnvelopeRequestErrorResponse, description = "Approval rationale, requested capabilities, or platform safety boundary is invalid"),
         (status = 503, description = "Envelope request authority is unavailable")
     ),
     security(("browserSession" = []))
@@ -1108,7 +1112,14 @@ where
         Some(value) if !value.trim().is_empty() && value.trim().len() <= 2_000 => {
             Some(value.trim())
         }
-        Some(_) => return StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+        Some(_) => {
+            return envelope_request_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_rationale",
+                "Rationale must contain between 1 and 2,000 characters when supplied.",
+                vec![EnvelopeRequestField::Rationale],
+            );
+        }
         None => None,
     };
     let request = match state.ledger.envelope_request_for_admin(request_id).await {
@@ -1116,52 +1127,76 @@ where
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return ApiError::Store(error).into_response(),
     };
-    if request.status == EnvelopeRequestStatus::Pending && request.template_id.is_none() {
-        let capabilities_valid = !state.capabilities.models.is_empty()
-            && request
-                .requested_envelope
-                .spec
-                .llms
-                .iter()
-                .all(|model| state.capabilities.models.contains(model))
-            && request.requested_envelope.spec.tools.iter().all(|tool| {
-                state
-                    .capabilities
-                    .tools
-                    .iter()
-                    .any(|available| available.grants(tool))
-            });
-        let within_platform_safety =
-            state
-                .custom_envelope_safety_ceiling
-                .as_ref()
-                .is_some_and(|ceiling| {
-                    matches!(
-                        envelope_is_within(&request.requested_envelope, ceiling),
-                        Ok(AdmissionDecision::Admit)
-                    )
-                });
-        if !capabilities_valid || !within_platform_safety {
-            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
-        }
-    }
-    if request.status == EnvelopeRequestStatus::Pending && rationale.is_none() {
-        let (Some(template_id), Some(template_revision)) =
-            (request.template_id.as_deref(), request.template_revision)
-        else {
-            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
-        };
-        let template = match state.ledger.latest_envelope_template(template_id).await {
-            Ok(Some(template)) if template.ceiling.revision == template_revision => template,
-            Ok(_) => return StatusCode::CONFLICT.into_response(),
-            Err(error) => return ApiError::Store(error).into_response(),
-        };
-        match envelope_is_within(&request.requested_envelope, &template.ceiling) {
-            Ok(AdmissionDecision::Admit) => {}
-            Ok(AdmissionDecision::Reject { .. }) => {
-                return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    if request.status == EnvelopeRequestStatus::Pending {
+        if request.template_id.is_some() && request.template_revision.is_some() {
+            let Some(template_envelope) = request.template_envelope.as_ref() else {
+                return StatusCode::CONFLICT.into_response();
+            };
+            match envelope_is_within(&request.requested_envelope, template_envelope) {
+                Ok(AdmissionDecision::Admit) if request.ceiling_exceedances.is_empty() => {}
+                Ok(AdmissionDecision::Reject { deltas })
+                    if deltas == request.ceiling_exceedances => {}
+                Ok(_) => return StatusCode::CONFLICT.into_response(),
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        } else if request.template_id.is_some() || request.template_revision.is_some() {
+            return StatusCode::CONFLICT.into_response();
+        }
+
+        let requires_review =
+            request.template_id.is_none() || !request.ceiling_exceedances.is_empty();
+        if requires_review {
+            if rationale.is_none() {
+                return envelope_request_error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "rationale_required",
+                    "Rationale is required to approve this request.",
+                    vec![EnvelopeRequestField::Rationale],
+                );
+            }
+            let capability_fields = capability_catalog_violation_fields(
+                &state.capabilities,
+                &request.requested_envelope,
+            );
+            if !capability_fields.is_empty() {
+                return envelope_request_error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "capability_not_available",
+                    format!(
+                        "The requested {} are not available in this deployment.",
+                        envelope_request_field_list(&capability_fields)
+                    ),
+                    capability_fields,
+                );
+            }
+            match state.custom_envelope_safety_ceiling.as_ref() {
+                Some(ceiling) => match envelope_is_within(&request.requested_envelope, ceiling) {
+                    Ok(AdmissionDecision::Admit) => {}
+                    Ok(AdmissionDecision::Reject { deltas }) => {
+                        return envelope_request_error_response(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "platform_safety_ceiling_exceeded",
+                            {
+                                let fields = envelope_request_fields_for_deltas(&deltas);
+                                format!(
+                                    "The requested {} exceed the platform safety ceiling.",
+                                    envelope_request_field_list(&fields)
+                                )
+                            },
+                            envelope_request_fields_for_deltas(&deltas),
+                        );
+                    }
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                },
+                None => {
+                    return envelope_request_error_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "platform_safety_ceiling_unconfigured",
+                        "This deployment does not accept requests outside a template ceiling.",
+                        vec![EnvelopeRequestField::RequestedEnvelope],
+                    );
+                }
+            }
         }
     }
     if body
@@ -1177,7 +1212,12 @@ where
         .as_deref()
         .or(request.evidence_url.as_deref());
     if evidence_url.is_some_and(|value| !valid_https_url(value)) {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return envelope_request_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_evidence_url",
+            "Evidence URL must be a valid HTTPS URL.",
+            vec![EnvelopeRequestField::EvidenceUrl],
+        );
     }
     if request.status == EnvelopeRequestStatus::Pending
         && rationale.is_none()
@@ -1186,7 +1226,31 @@ where
             || request.decision_key.is_some()
             || request.evidence_url.is_some())
     {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        return envelope_request_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "rationale_required",
+            "Rationale is required when approval metadata is supplied.",
+            vec![EnvelopeRequestField::Rationale],
+        );
+    }
+    if request.status == EnvelopeRequestStatus::Provisioned {
+        if rationale.is_some_and(|value| request.rationale.as_deref() != Some(value))
+            || body
+                .evidence_url
+                .as_deref()
+                .is_some_and(|value| request.evidence_url.as_deref() != Some(value))
+            || body
+                .expires_at
+                .as_deref()
+                .is_some_and(|value| request.expires_at.as_deref() != Some(value))
+        {
+            return StatusCode::CONFLICT.into_response();
+        }
+        return Json(BrowserEnvelopeRequestDecisionResponse {
+            api_version: BROWSER_ADMIN_API_VERSION,
+            request: request.into(),
+        })
+        .into_response();
     }
     let instance_id = envelope_instance_id(request.id);
     let digest = match envelope_content_digest(&request.requested_envelope) {
@@ -1238,6 +1302,18 @@ where
             })
             .into_response()
         }
+        Err(StoreError::InvalidGrantExpiry) => envelope_request_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_expiry",
+            "Expiry must be a valid future timestamp.",
+            vec![EnvelopeRequestField::ExpiresAt],
+        ),
+        Err(StoreError::InvalidEnvelopeRequest) => envelope_request_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_approval",
+            "The approval metadata or requested envelope is invalid.",
+            vec![EnvelopeRequestField::RequestedEnvelope],
+        ),
         Err(error) => ApiError::Store(error).into_response(),
     }
 }
@@ -2097,16 +2173,20 @@ fn decision(
 fn envelope_admin_request(record: AdminEnvelopeRequestRecord) -> AdminRequestView {
     let automatic = record.request.status == EnvelopeRequestStatus::Provisioned
         && record.request.status_actor == "system:auto";
-    let deltas = record
-        .template_envelope
-        .as_ref()
-        .map(
-            |template| match envelope_is_within(&record.request.requested_envelope, template) {
-                Ok(AdmissionDecision::Reject { deltas }) => deltas,
-                Ok(AdmissionDecision::Admit) | Err(_) => Vec::new(),
-            },
-        )
-        .unwrap_or_default();
+    let deltas = if record.request.ceiling_exceedances.is_empty() {
+        record
+            .template_envelope
+            .as_ref()
+            .map(|template| {
+                match envelope_is_within(&record.request.requested_envelope, template) {
+                    Ok(AdmissionDecision::Reject { deltas }) => deltas,
+                    Ok(AdmissionDecision::Admit) | Err(_) => Vec::new(),
+                }
+            })
+            .unwrap_or_default()
+    } else {
+        record.request.ceiling_exceedances.clone()
+    };
     let state = envelope_request_state(record.request.status, automatic);
     let state_actor = if automatic {
         "system:auto".to_owned()
@@ -2137,6 +2217,7 @@ fn envelope_admin_request(record: AdminEnvelopeRequestRecord) -> AdminRequestVie
         state_at: record.request.status_at.clone(),
         state_actor: state_actor.clone(),
         deltas,
+        justification: record.request.justification,
         requested_envelope: Some(record.request.requested_envelope.into()),
         template_envelope: record.template_envelope.map(Into::into),
         escalation: None,
@@ -2214,6 +2295,7 @@ fn approval_admin_request(record: AdminApprovalRecord) -> AdminRequestView {
         state_at: record.state_at.clone(),
         state_actor: record.state_actor.clone(),
         deltas: record.deltas,
+        justification: None,
         requested_envelope: Some(requested),
         template_envelope: Some(record.template_envelope.into()),
         escalation: None,
@@ -2289,6 +2371,7 @@ fn escalation_admin_request(record: CumulativeEscalationRecord) -> AdminRequestV
         state_at: state_at.clone(),
         state_actor: state_actor.clone(),
         deltas: Vec::new(),
+        justification: None,
         requested_envelope: None,
         template_envelope: None,
         escalation: Some(EscalationView {
@@ -2807,14 +2890,82 @@ where
 
 #[cfg(test)]
 mod request_projection_tests {
-    use steward_admission::{Envelope, EnvelopeSpec};
-    use steward_store::AdminApprovalRecord;
+    use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
+    use steward_store::{
+        AdminApprovalRecord, AdminEnvelopeRequestRecord, EnvelopeRequestRecord,
+        EnvelopeRequestStatus,
+    };
     use steward_types::{
-        AgentRuntimeSpec, AgentType, Budget, Duration, Email, Principal, RunnerRequirements,
+        AgentRuntimeSpec, AgentType, Budget, CanonicalUserId, Duration, Email, Principal,
+        RunnerRequirements,
     };
     use uuid::Uuid;
 
-    use super::approval_admin_request;
+    use super::{AdminRequestKind, approval_admin_request, envelope_admin_request};
+
+    #[test]
+    fn envelope_review_projection_preserves_the_recorded_request_context() -> Result<(), String> {
+        let template = Envelope {
+            revision: 3,
+            spec: EnvelopeSpec {
+                llms: Vec::new(),
+                tools: Vec::new(),
+                budget: Budget {
+                    monthly_limit: "100.00".to_owned(),
+                    single_run_limit: Some("10.00".to_owned()),
+                    currency: "USD".to_owned(),
+                },
+                runtime_minutes_limit: Some("60".to_owned()),
+                workspace: None,
+                ttl: Duration("1h".to_owned()),
+                runner: RunnerRequirements::default(),
+            },
+        };
+        let mut requested = template.clone();
+        requested.spec.budget.monthly_limit = "125.00".to_owned();
+        let delta = AdmissionDelta::Budget {
+            requested: "125.00".to_owned(),
+            ceiling: "100.00".to_owned(),
+            currency: "USD".to_owned(),
+        };
+        let projected = envelope_admin_request(AdminEnvelopeRequestRecord {
+            request: EnvelopeRequestRecord {
+                id: Uuid::nil(),
+                owner_user_id: CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")?,
+                template_id: Some("engineer".to_owned()),
+                template_revision: Some(3),
+                requested_envelope: requested,
+                template_envelope: Some(template.clone()),
+                justification: Some("Need a larger monthly limit".to_owned()),
+                ceiling_exceedances: vec![delta.clone()],
+                approved_envelope: None,
+                status: EnvelopeRequestStatus::Pending,
+                approval_id: None,
+                envelope_instance_id: None,
+                envelope_digest: None,
+                reason: None,
+                rationale: None,
+                evidence_url: None,
+                decision_key: None,
+                expires_at: None,
+                status_actor: "usr_0123456789abcdef0123456789abcdef".to_owned(),
+                status_template_revision: Some(3),
+                created_at: "2026-10-10T00:00:00.000000Z".to_owned(),
+                status_at: "2026-10-10T00:00:00.000000Z".to_owned(),
+            },
+            owner_display_email: "alice@example.com".to_owned(),
+            template_display_name: Some("Engineer".to_owned()),
+            template_envelope: Some(template),
+        });
+
+        assert_eq!(projected.kind, AdminRequestKind::CeilingExceeded);
+        assert_eq!(projected.deltas, vec![delta]);
+        assert_eq!(
+            projected.justification.as_deref(),
+            Some("Need a larger monthly limit")
+        );
+        Ok(())
+    }
 
     #[test]
     fn runtime_approval_decision_preserves_grant_expiry() -> Result<(), String> {

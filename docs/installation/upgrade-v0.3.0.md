@@ -61,9 +61,9 @@ After every apiserver and controller runs 0.3.0:
    detail, typed stage/log data, and connection status.
 2. Exercise the supported RBAC CLI against a reserved test identity, including
    idempotent grant/revoke and JSON `effective-access` output.
-3. Publish or apply an exact template revision and verify the configured
-   automatic threshold: at-threshold auto-provisions, within-ceiling excess
-   remains pending, and above-ceiling authority is rejected.
+3. Publish or apply an exact template revision and verify a within-ceiling
+   request auto-provisions while an above-template request within deployment
+   safety remains pending and can be approved.
 4. Provision two different templates with different content for one user.
    Submit one digest-qualified Task for each and verify an unqualified Task
    returns conflict while both remain active.
