@@ -908,11 +908,12 @@ async fn browser_application_router(
             starter_task,
             auth.clone(),
         ))
-        .merge(browser_admin::protected_router_with_custom_envelope_safety(
+        .merge(browser_admin::protected_router_with_workspace_capabilities(
             runtimes.clone(),
             store.clone(),
             decisions,
             capability_catalog,
+            task_api_config.workspace_deployment_capabilities(),
             custom_envelope_safety_ceiling,
             auth.clone(),
         ))

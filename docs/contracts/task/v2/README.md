@@ -138,11 +138,13 @@ records every exact repository/commit and content digest, plus one combined work
 digest, in Task evidence. The sandbox receives the same resolved inventory at
 `/sandbox/workspace/.steward-workspace.json`.
 
-The selected User Envelope must contain a `workspace` authority object with
-`allowedTypes`, `maxTotalSize`, `maxFiles`, `maxHistoryDepth`, and
-`maxSubmoduleDepth`. No object means no workspace authority. Task admission applies
-the minimum of the deployment, approved User Envelope, and per-entry limits before
-any runtime reservation.
+The selected User Envelope must contain a `workspace` authority object with required
+`allowedTypes` and optional `maxTotalSize`. No object means no workspace authority.
+When `maxTotalSize` is omitted, the deployment ceiling applies. The legacy
+`maxFiles`, `maxHistoryDepth`, and `maxSubmoduleDepth` fields remain accepted on
+existing authority objects and narrow the deployment limits when they are stricter.
+Task admission applies the minimum of the deployment, approved User Envelope, and
+per-entry limits before any runtime reservation.
 
 Omitted `requires` means the resolved Envelope's entire approved authority values
 become effective. A present `requires` object is a complete narrower candidate: its

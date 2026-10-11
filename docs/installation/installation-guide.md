@@ -202,8 +202,9 @@ web or apiserver image rebuild is needed.
 
 Set the chart's top-level `workspace` values to choose the enabled `git` and `scratch`
 entry types and the deployment ceilings for total bytes, files, Git history depth, and
-submodule recursion. `scratchVolumeSize` must match OpenShell's
-`workspace_default_storage_size`; this is the filesystem-enforced scratch capacity.
+submodule recursion, submodule fan-out, and tree reads. `scratchVolumeSize` is the
+filesystem-enforced scratch capacity supplied by OpenShell; a Task may request no more
+than that capacity.
 Git workspaces use only repositories admitted by stable ID in `githubSource.bindings`.
 Steward fetches exact objects through the source GitHub App, strips credentials and
 remotes before the agent starts, and records the pinned commit in Task evidence.
@@ -214,15 +215,16 @@ authority ceiling. Omitting it grants no workspace entry types. For example:
 ```json
 {
   "allowedTypes": ["git", "scratch"],
-  "maxTotalSize": "2Gi",
-  "maxFiles": 100000,
-  "maxHistoryDepth": 1000,
-  "maxSubmoduleDepth": 4,
-  "maxSubmodulesPerEntry": 32,
-  "maxTotalSubmodules": 64,
-  "maxTreeReads": 64
+  "maxTotalSize": "2Gi"
 }
 ```
+
+`allowedTypes` is required. `maxTotalSize` is optional and limits the total physical
+workspace size for that Envelope; when omitted, the deployment ceiling applies.
+`maxFiles`, `maxHistoryDepth`, and `maxSubmoduleDepth` remain accepted on existing
+Envelopes and templates as deprecated, stricter limits. New Envelopes should leave
+file count, Git history depth, submodule depth and fan-out, tree reads, and scratch
+capacity to the chart's `workspace.*` deployment values.
 
 Template approval bounds the provisioned User Envelope through the ordinary Envelope
 subset check. At Task admission, Steward intersects that approved User Envelope with

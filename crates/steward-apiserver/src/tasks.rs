@@ -259,6 +259,20 @@ struct WorkspaceDeploymentPolicy {
     max_tree_reads: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDeploymentCapabilities {
+    pub enabled_types: Vec<String>,
+    pub max_total_bytes: u64,
+    pub scratch_volume_bytes: u64,
+    pub max_files: u64,
+    pub max_history_depth: u32,
+    pub max_submodule_depth: usize,
+    pub max_submodules_per_entry: usize,
+    pub max_total_submodules: usize,
+    pub max_tree_reads: usize,
+}
+
 #[derive(Clone)]
 struct WorkspaceAdmissionPolicy {
     allowed_types: BTreeSet<WorkspaceEntryType>,
@@ -586,6 +600,25 @@ impl TaskApiConfig {
             .map_err(|_| "workspace deployment policy is invalid".to_owned())?;
         self.workspace_policy = document.try_into()?;
         Ok(self)
+    }
+
+    pub fn workspace_deployment_capabilities(&self) -> WorkspaceDeploymentCapabilities {
+        WorkspaceDeploymentCapabilities {
+            enabled_types: self
+                .workspace_policy
+                .enabled_types
+                .iter()
+                .cloned()
+                .collect(),
+            max_total_bytes: self.workspace_policy.max_total_bytes,
+            scratch_volume_bytes: self.workspace_policy.scratch_volume_bytes,
+            max_files: self.workspace_policy.max_files,
+            max_history_depth: self.workspace_policy.max_history_depth,
+            max_submodule_depth: self.workspace_policy.max_submodule_depth,
+            max_submodules_per_entry: self.workspace_policy.max_submodules_per_entry,
+            max_total_submodules: self.workspace_policy.max_total_submodules,
+            max_tree_reads: self.workspace_policy.max_tree_reads,
+        }
     }
 
     fn source_repository_is_authorized(
@@ -3548,18 +3581,31 @@ fn workspace_admission_policy(
 ) -> Result<WorkspaceAdmissionPolicy, ApiError> {
     let authority = authority
         .ok_or_else(|| ApiError::Admission("workspace is not enabled for this Task".to_owned()))?;
-    let authority_bytes = parse_workspace_size_bytes(authority.max_total_size.as_str())
-        .ok_or_else(|| ApiError::Admission("workspace size limit is invalid".to_owned()))?;
+    let authority_bytes = authority
+        .max_total_size
+        .as_ref()
+        .map(|value| {
+            parse_workspace_size_bytes(value.as_str())
+                .ok_or_else(|| ApiError::Admission("workspace size limit is invalid".to_owned()))
+        })
+        .transpose()?
+        .unwrap_or(deployment.max_total_bytes);
     Ok(WorkspaceAdmissionPolicy {
         allowed_types: authority.allowed_types.iter().copied().collect(),
         max_total_bytes: deployment.max_total_bytes.min(authority_bytes),
-        max_files: deployment.max_files.min(authority.max_files),
-        max_history_depth: deployment
+        max_files: authority.max_files.map_or(deployment.max_files, |limit| {
+            deployment.max_files.min(limit)
+        }),
+        max_history_depth: authority
             .max_history_depth
-            .min(authority.max_history_depth),
-        max_submodule_depth: deployment
+            .map_or(deployment.max_history_depth, |limit| {
+                deployment.max_history_depth.min(limit)
+            }),
+        max_submodule_depth: authority
             .max_submodule_depth
-            .min(authority.max_submodule_depth as usize),
+            .map_or(deployment.max_submodule_depth, |limit| {
+                deployment.max_submodule_depth.min(limit as usize)
+            }),
         max_submodules_per_entry: deployment.max_submodules_per_entry,
         max_total_submodules: deployment.max_total_submodules,
         max_tree_reads: deployment.max_tree_reads,
@@ -6589,6 +6635,7 @@ pub(crate) fn stable_task_runtime_name(operation_id: Uuid) -> String {
 
 #[cfg(test)]
 mod workflow_request_tests {
+    use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
 
     use super::{
@@ -6617,7 +6664,7 @@ mod workflow_request_tests {
     use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
     use steward_types::direct_package::{
         DirectTaskDefinition, ExactGitCommit, RepositoryUrl, StableProviderId, WorkspaceAuthority,
-        WorkspaceEntry, WorkspaceEvidence, WorkspacePath,
+        WorkspaceEntry, WorkspaceEntryType, WorkspaceEvidence, WorkspacePath,
     };
     use steward_types::{
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
@@ -6784,6 +6831,83 @@ mod workflow_request_tests {
             Err(ApiError::Admission(ref reason))
                 if reason == "history depth 21 exceeds the effective ceiling 20"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_policy_uses_deployment_limits_when_legacy_caps_are_absent() -> Result<(), String> {
+        let config = TaskApiConfig::default().with_workspace_policy_json(Some(
+            &serde_json::json!({
+                "enabledTypes": ["git", "scratch"],
+                "maxTotalSize": "3Gi",
+                "scratchVolumeSize": "2Gi",
+                "maxFiles": 321,
+                "maxHistoryDepth": 42,
+                "maxSubmoduleDepth": 3,
+                "maxSubmodulesPerEntry": 7,
+                "maxTotalSubmodules": 9,
+                "maxTreeReads": 11
+            })
+            .to_string(),
+        ))?;
+        let authority: WorkspaceAuthority = serde_json::from_value(serde_json::json!({
+            "allowedTypes": ["git"]
+        }))
+        .map_err(|error| error.to_string())?;
+
+        let policy = workspace_admission_policy(&config.workspace_policy, Some(&authority))
+            .map_err(|error| format!("derive workspace admission policy: {error:?}"))?;
+
+        assert_eq!(
+            policy.allowed_types,
+            BTreeSet::from([WorkspaceEntryType::Git])
+        );
+        assert_eq!(policy.max_total_bytes, 3 * 1024 * 1024 * 1024);
+        assert_eq!(policy.max_files, 321);
+        assert_eq!(policy.max_history_depth, 42);
+        assert_eq!(policy.max_submodule_depth, 3);
+        assert_eq!(policy.max_submodules_per_entry, 7);
+        assert_eq!(policy.max_total_submodules, 9);
+        assert_eq!(policy.max_tree_reads, 11);
+
+        let git: WorkspaceEntry = serde_json::from_value(serde_json::json!({
+            "git": {"history": {"depth": 42}}
+        }))
+        .map_err(|error| error.to_string())?;
+        validate_workspace_policy(&config.workspace_policy, &policy, &git)
+            .map_err(|error| format!("git workspace should be admitted: {error:?}"))?;
+
+        let scratch: WorkspaceEntry = serde_json::from_value(serde_json::json!({
+            "scratch": {"size": "1Gi"}
+        }))
+        .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            validate_workspace_policy(&config.workspace_policy, &policy, &scratch),
+            Err(ApiError::Admission(ref reason))
+                if reason == "workspace type scratch is not allowed; effective choices: git"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_policy_keeps_legacy_caps_when_they_are_stricter() -> Result<(), String> {
+        let config = TaskApiConfig::default();
+        let authority: WorkspaceAuthority = serde_json::from_value(serde_json::json!({
+            "allowedTypes": ["git"],
+            "maxTotalSize": "1Gi",
+            "maxFiles": 123,
+            "maxHistoryDepth": 12,
+            "maxSubmoduleDepth": 1
+        }))
+        .map_err(|error| error.to_string())?;
+
+        let policy = workspace_admission_policy(&config.workspace_policy, Some(&authority))
+            .map_err(|error| format!("derive legacy workspace admission policy: {error:?}"))?;
+
+        assert_eq!(policy.max_total_bytes, 1024 * 1024 * 1024);
+        assert_eq!(policy.max_files, 123);
+        assert_eq!(policy.max_history_depth, 12);
+        assert_eq!(policy.max_submodule_depth, 1);
         Ok(())
     }
 
