@@ -9,9 +9,13 @@ import { authStartPath } from "@/session/auth-redirect";
 
 type ExecutionLogState =
   | { status: "loading" }
-  | { status: "ready"; complete: boolean; text: string }
+  | { status: "ready"; complete: boolean; partial: boolean; text: string }
   | { status: "unavailable" }
   | { status: "error" };
+
+export function shouldPollExecutionLog(chunk: Pick<BrowserExecutionLogResponse, "complete" | "truncated">) {
+  return !chunk.complete || chunk.truncated;
+}
 
 export function RunLogView({
   admin = false,
@@ -62,8 +66,8 @@ export function RunLogView({
         offset = chunk.truncated
           ? offset + new TextEncoder().encode(chunk.content).byteLength
           : chunk.sizeBytes;
-        if (active) setState({ status: "ready", complete: chunk.complete, text: content });
-        if (active && (!chunk.complete || chunk.truncated)) timer = setTimeout(() => void load(), chunk.truncated ? 0 : 2000);
+        if (active) setState({ status: "ready", complete: chunk.complete, partial: chunk.partial, text: content });
+        if (active && shouldPollExecutionLog(chunk)) timer = setTimeout(() => void load(), chunk.truncated ? 0 : 2000);
       } catch (error) {
         if (active && !(error instanceof DOMException && error.name === "AbortError")) {
           setState({ status: "error" });
@@ -101,7 +105,7 @@ export function RunLogView({
   );
 }
 
-function ExecutionLogContent({ state, stream, warning = false }: Readonly<{
+export function ExecutionLogContent({ state, stream, warning = false }: Readonly<{
   state: ExecutionLogState;
   stream: ExecutionLogStream;
   warning?: boolean;
@@ -109,12 +113,14 @@ function ExecutionLogContent({ state, stream, warning = false }: Readonly<{
   if (state.status === "loading") return <p className="text-sm text-muted-ink" role="status">Loading {stream} log…</p>;
   if (state.status === "unavailable") return <div className="space-y-1 text-sm text-muted-ink" role="status"><p className="font-semibold text-ink">No execution log was captured for this run.</p><p>Enable <strong>Capture execution log</strong> when starting a run to retain stdout and stderr.</p></div>;
   if (state.status === "error") return <p className="text-sm text-err" role="alert">The {stream} log could not be loaded.</p>;
-  if (state.complete && state.text === "") return <p className="text-sm text-muted-ink" role="status">The captured {stream} log is empty.</p>;
+  const partialNote = state.partial ? <p className="text-xs text-muted-ink" role="status">The run ended before the full log was saved. This is the output captured while it ran.</p> : null;
+  if (state.complete && state.text === "") return <div className="space-y-1"><p className="text-sm text-muted-ink" role="status">The captured {stream} log is empty.</p>{partialNote}</div>;
   const lines = state.text.match(/[^\n]*\n|[^\n]+$/g) ?? [state.text];
   return (
     <>
       {warning ? <div className="rounded-control border border-warn/30 bg-warn-soft p-3 text-sm"><p className="font-semibold text-warn">Sensitive output warning</p><p className="mt-1 text-muted-ink">Execution logs may reproduce arbitrary user, tool, or agent output.</p></div> : null}
       <pre aria-label={`${stream} log lines`} className="max-h-[70vh] min-w-0 overflow-auto rounded-control border border-line bg-[#111318] py-3 font-mono text-xs leading-5 text-[#e8eaf0] [counter-reset:line]">{lines.map((line, index) => <span className="grid min-w-max grid-cols-[3.5rem_minmax(0,1fr)] [counter-increment:line] before:select-none before:border-r before:border-white/10 before:px-3 before:text-right before:text-white/35 before:content-[counter(line)]" key={`${index}:${line}`}><span className="whitespace-pre-wrap break-words px-3">{line || " "}</span></span>)}</pre>
+      {partialNote}
       {!state.complete ? <p className="text-xs text-muted-ink" role="status">Live log · polling for new output…</p> : null}
     </>
   );
@@ -144,8 +150,8 @@ export function ExecutionLogPanel({ admin = false, stream, taskUid }: Readonly<{
         const chunk = await response.json() as BrowserExecutionLogResponse;
         content += chunk.content;
         offset = chunk.truncated ? offset + new TextEncoder().encode(chunk.content).byteLength : chunk.sizeBytes;
-        setState({ status: "ready", complete: chunk.complete, text: content });
-        if (!chunk.complete || chunk.truncated) timer = setTimeout(() => void load(), chunk.truncated ? 0 : 2000);
+        setState({ status: "ready", complete: chunk.complete, partial: chunk.partial, text: content });
+        if (shouldPollExecutionLog(chunk)) timer = setTimeout(() => void load(), chunk.truncated ? 0 : 2000);
       } catch (error) {
         if (active && !(error instanceof DOMException && error.name === "AbortError")) setState({ status: "error" });
       }

@@ -1,6 +1,7 @@
 # Execution bindings
 
-Status: current installation contract
+Status: current Steward 0.3.15 installation contract, with unreleased 0.3.16
+requirements marked below
 
 Execution bindings are public deployment metadata that connect an opaque Workflow `agentRef` to
 one immutable runtime contract. They contain no credentials. Steward owns parsing, binding
@@ -67,6 +68,14 @@ executable on each architecture, return the exact configured stdout for the conf
 arguments, and implement the Codex-compatible configuration, `exec`, model, MCP, output-file, and
 termination behavior used by the adapter. Obtain or build the image through the operator's normal
 source, scanning, signing, and promotion process, then configure its immutable manifest digest.
+
+Every compatible Agent image must expose Linux procfs at `/proc` and provide `/bin/sh`, `awk`,
+`date`, `sleep`, `kill`, `mv`, `mkdir`, `cat`, `rm`, and `tar`. Steward uses those facilities for
+the common execution wrapper, liveness heartbeat, cancellation, and input/output staging. Full
+execution logging also requires `wc` for its existing terminal transcript size checks. Beginning
+with Steward 0.3.16, full execution logging additionally requires `setsid`, `head`, and `tail` to
+launch the attempt in its own process group and read bounded live streams. An image that omits any
+of those three additions is not compatible with the Steward 0.3.16 full-log Agent contract.
 
 `claude-code-v1` likewise identifies stable execution behavior rather than a Claude Code release.
 A compatible image must implement unattended `--print` execution, bare configuration isolation,

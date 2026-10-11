@@ -2,8 +2,8 @@
 
 Priority: post-P0
 
-Status: bounded successful-run transcript is owned by DP-S01 and DP-R01; complete
-diagnostics are deferred
+Status: bounded stdout/stderr for started OpenShell Agent attempts is implemented;
+structured provider activity and pre-execution diagnostics remain deferred
 
 ## Goal
 
@@ -13,13 +13,13 @@ as execution logs or weakening Steward's credential boundary.
 
 ## Why this is separate
 
-OpenShell currently receives and buffers the coding-agent process's stdout and stderr,
-but Steward persists only successful declared outputs and a bounded terminal failure
-reason. Tool calls and model activity are not durable Task records. Complete logs
-therefore require a retention and authorization contract, not only GHA formatting.
-
-P0 avoids this migration by returning opted-in stdout/stderr inside the successful
-Task output archive. This ticket generalizes the behavior safely.
+Steward retains bounded stdout and stderr for started OpenShell Agent attempts, exposes
+live snapshots through owner/admin Run-log routes, and persists terminal streams for
+successful and failed attempts. Cancelled or outcome-unknown Tasks can expose their
+last live snapshot explicitly marked as partial. Rejected Tasks have no process attempt.
+Tool calls and model activity are not durable Task records, so complete diagnostics
+still require a retention and authorization contract beyond process output and GHA
+formatting.
 
 ## Scope
 

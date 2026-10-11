@@ -5,7 +5,8 @@ contract for the Agent Runs dashboard. It deliberately distinguishes
 recorded facts from desired configuration and from data Steward does not
 persist. The browser must never fill an unavailable field from a heuristic.
 
-Applies to Steward 0.3.3.
+Applies to Steward 0.3.3, with the execution-log additions beginning in
+Steward 0.3.16 marked below.
 
 ## Authority and privacy boundary
 
@@ -110,11 +111,18 @@ the atomic stream snapshot reports `Succeeded`.
 
 ### Execution logs
 
+Beginning with Steward 0.3.16, a live OpenShell transcript is readable before
+the Task becomes terminal, and terminal captured output remains readable
+afterward.
+
 `GET .../{taskUid}/logs/{stream}?after={byteOffset}` accepts only `stdout` or
-`stderr`. It returns `{ stream, content, truncated, sizeBytes, complete }` and
-at most 64 KiB per read. A live OpenShell transcript is readable before the
-Task becomes terminal; terminal captured output remains readable afterward.
-The owner/admin scope of the parent route applies unchanged.
+`stderr`. It returns
+`{ stream, content, truncated, sizeBytes, complete, partial }` and at most 64
+KiB per read. `complete` becomes true when the Task is terminal and no more
+bytes can arrive. `partial` is true when that terminal Task has no saved final
+transcript and the response is the last bounded live snapshot; clients stop
+polling but label that output as partial. The owner/admin scope of the parent
+route applies unchanged.
 
 For compatibility with the original endpoint, a request that omits `after`
 receives the complete captured stream as `text/plain; charset=utf-8`. Both

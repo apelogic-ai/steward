@@ -384,6 +384,7 @@ export type BrowserEnvelopeTemplateResponse = {
 export type BrowserExecutionLogResponse = {
     complete: boolean;
     content: string;
+    partial: boolean;
     sizeBytes: number;
     stream: string;
     truncated: boolean;
