@@ -36,6 +36,7 @@ import {
   inlineFiles,
   runNowFailureMessage,
 } from "@/components/browser-run-now-view";
+import { DiagnosticDetails } from "@/components/diagnostic-details";
 import { parseRunEventData } from "@/components/run-views";
 import { formatDuration, formatMoney } from "@/components/presentation-values";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
@@ -514,7 +515,7 @@ function RepositoryPicker({ emptyMessage, onSelect, selected }: Readonly<{
   const { refresh, state } = useGithubRepositories();
   return <RepositoryResource onRetry={refresh} state={state}>{({ repositories: available }) => <div className="grid gap-2">{available.length
     ? <label className="grid gap-2 text-sm font-semibold">Repository<select className={fieldClass} onChange={(event) => onSelect(event.target.value)} value={selected?.repositoryId ?? ""}>{available.map((repository) => <option key={repository.repositoryId} value={repository.repositoryId}>{repositoryOptionLabel(repository)}</option>)}</select></label>
-    : <p className="text-sm font-normal text-muted-ink">{emptyMessage}</p>}<button className="justify-self-start text-xs font-semibold text-brand" onClick={refresh} type="button">Refresh repositories</button></div>}</RepositoryResource>;
+    : <p className="text-sm font-normal text-muted-ink">{emptyMessage}</p>}<DiagnosticDetails items={[{ label: "Reason", value: selected?.missingPrerequisite }]} /><button className="justify-self-start text-xs font-semibold text-brand" onClick={refresh} type="button">Refresh repositories</button></div>}</RepositoryResource>;
 }
 
 function Preview({ copied, onCopy, title, value }: Readonly<{ copied: boolean; onCopy: () => void; title: string; value: string }>) {

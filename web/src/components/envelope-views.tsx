@@ -20,9 +20,10 @@ import {
   type UserEnvelopeRequest,
 } from "@/api-client";
 import { RunCards } from "@/components/run-views";
+import { DiagnosticDetails, type DiagnosticItem } from "@/components/diagnostic-details";
 import { EnvelopeExceedanceSummary, type EnvelopeExceedanceSummaryValue, envelopeDeltaSummary } from "@/components/envelope-exceedance-summary";
 import { CodeBlock, DataTable, FilterTabs, GrantChipList, Meter, SectionCard, StatStrip, TagSelect, grantKindForAction } from "@/components/hs";
-import { DurationInput, MoneyInput, formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
+import { DurationInput, MoneyInput, durationUnit, formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
 import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { loadAllEnvelopeRequests } from "@/data/paginated-api";
@@ -126,8 +127,8 @@ export function templateRequestReviewSummary({ budget, models, runtimeMinutes, s
   const exceedances = [
     decimalExceeds(budget, template.ceiling.spec.budget.monthlyLimit) ? { ceiling: formatMoney(template.ceiling.spec.budget.monthlyLimit, template.ceiling.spec.budget.currency), label: "Monthly limit", requested: formatMoney(budget, template.ceiling.spec.budget.currency) } : null,
     template.ceiling.spec.budget.singleRunLimit && singleRunLimit.trim() && decimalExceeds(singleRunLimit.trim(), template.ceiling.spec.budget.singleRunLimit) ? { ceiling: formatMoney(template.ceiling.spec.budget.singleRunLimit, template.ceiling.spec.budget.currency), label: "Limit per run", requested: formatMoney(singleRunLimit.trim(), template.ceiling.spec.budget.currency) } : null,
-    template.ceiling.spec.runtimeMinutesLimit && runtimeMinutes.trim() && decimalExceeds(runtimeMinutes.trim(), template.ceiling.spec.runtimeMinutesLimit) ? { ceiling: formatDuration(template.ceiling.spec.runtimeMinutesLimit, "minutes"), label: "Runtime limit per month", requested: formatDuration(runtimeMinutes.trim(), "minutes") } : null,
-    durationExceeds(ttl, template.ceiling.spec.ttl) ? { ceiling: formatDuration(template.ceiling.spec.ttl), label: "Time-to-live limit", requested: formatDuration(ttl) } : null,
+    template.ceiling.spec.runtimeMinutesLimit && runtimeMinutes.trim() && decimalExceeds(runtimeMinutes.trim(), template.ceiling.spec.runtimeMinutesLimit) ? { ceiling: formatDuration(template.ceiling.spec.runtimeMinutesLimit, "minutes", "m"), label: "Runtime limit per month", requested: formatDuration(runtimeMinutes.trim(), "minutes", "m") } : null,
+    durationExceeds(ttl, template.ceiling.spec.ttl) ? { ceiling: formatDuration(template.ceiling.spec.ttl, "wire", durationUnit(ttl)), label: "Time-to-live limit", requested: formatDuration(ttl, "wire", durationUnit(ttl)) } : null,
     [...models].some((model) => !template.ceiling.spec.llms.some((allowed) => `${allowed.provider}\u0000${allowed.model}` === model)) ? {
       ceiling: template.ceiling.spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") || "None",
       label: "Models",
@@ -257,11 +258,13 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template }: Readonly<
   const [justification, setJustification] = useState("");
   const [submission, setSubmission] = useState<"idle" | "submitting" | MutationFailureState>("idle");
   const [rejectedFields, setRejectedFields] = useState<Array<EnvelopeRequestField>>([]);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticItem[]>([]);
 
   function clearRejectedSubmission() {
     if (submission === "idle" || submission === "submitting") return;
     setSubmission("idle");
     setRejectedFields([]);
+    setDiagnostics([]);
   }
 
   const singleRunValue = singleRunLimit.trim();
@@ -311,6 +314,7 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template }: Readonly<
     }
     const problem = envelopeRequestProblem(result.error);
     setRejectedFields(problem?.fields ?? []);
+    setDiagnostics(problem ? [{ label: "Code", value: problem.error }, { label: "Reason", value: problem.failureReason }] : []);
     setSubmission(classifyMutationFailure(result.response?.status));
     onSubmittingChange(false);
   }
@@ -337,7 +341,14 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template }: Readonly<
   return (
     <form className="flex flex-wrap items-start gap-5" onSubmit={submit}>
       <div className="min-w-0 flex-[1_1_520px] space-y-4">
-        <SectionCard title={stepTitle("01", "Budget and lifetime")}><div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Monthly limit<MoneyInput className={fieldClass(exceededFields.has("Monthly limit"))} currency={template.ceiling.spec.budget.currency} disabled={submission === "submitting"} onChange={(value) => { setBudget(value); clearRejectedSubmission(); }} required value={budget} />{ceilingHint(exceededFields.has("Monthly limit"), formatMoney(template.ceiling.spec.budget.monthlyLimit, template.ceiling.spec.budget.currency))}</label><label className="grid gap-2 text-sm font-semibold">Limit per run<MoneyInput aria-invalid={Boolean(singleRunError) || exceededFields.has("Limit per run")} className={fieldClass(exceededFields.has("Limit per run") || Boolean(singleRunError))} currency={template.ceiling.spec.budget.currency} disabled={submission === "submitting"} onChange={(value) => { setSingleRunLimit(value); clearRejectedSubmission(); }} required={Boolean(template.ceiling.spec.budget.singleRunLimit)} value={singleRunLimit} />{template.ceiling.spec.budget.singleRunLimit ? ceilingHint(exceededFields.has("Limit per run"), formatMoney(template.ceiling.spec.budget.singleRunLimit, template.ceiling.spec.budget.currency)) : <span className="text-xs font-normal text-muted-ink">Optional · cannot exceed the monthly limit</span>}{singleRunError ? <span className="text-xs font-normal text-err" role="alert">{singleRunError}</span> : null}</label><label className="grid gap-2 text-sm font-semibold">Time-to-live limit<DurationInput className={fieldClass(exceededFields.has("Time-to-live limit"))} disabled={submission === "submitting"} onChange={(value) => { setTtl(value); clearRejectedSubmission(); }} required unitAriaLabel="Time-to-live unit" value={ttl} />{ceilingHint(exceededFields.has("Time-to-live limit"), formatDuration(template.ceiling.spec.ttl))}</label>{template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime limit per month<DurationInput className={fieldClass(exceededFields.has("Runtime limit per month"))} disabled={submission === "submitting"} mode="minutes" onChange={(value) => { setRuntimeMinutes(value); clearRejectedSubmission(); }} required value={runtimeMinutes} />{ceilingHint(exceededFields.has("Runtime limit per month"), formatDuration(template.ceiling.spec.runtimeMinutesLimit, "minutes"))}</label> : null}</div></SectionCard>
+        <SectionCard title={stepTitle("01", "Budget and lifetime")}>
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            <label className="grid gap-2 text-sm font-semibold">Monthly limit<MoneyInput aria-invalid={exceededFields.has("Monthly limit") || undefined} className={fieldClass(exceededFields.has("Monthly limit"))} currency={template.ceiling.spec.budget.currency} disabled={submission === "submitting"} onChange={(value) => { setBudget(value); clearRejectedSubmission(); }} required value={budget} />{ceilingHint(exceededFields.has("Monthly limit"), formatMoney(template.ceiling.spec.budget.monthlyLimit, template.ceiling.spec.budget.currency))}</label>
+            <label className="grid gap-2 text-sm font-semibold">Limit per run<MoneyInput aria-invalid={Boolean(singleRunError) || exceededFields.has("Limit per run")} className={fieldClass(exceededFields.has("Limit per run") || Boolean(singleRunError))} currency={template.ceiling.spec.budget.currency} disabled={submission === "submitting"} onChange={(value) => { setSingleRunLimit(value); clearRejectedSubmission(); }} required={Boolean(template.ceiling.spec.budget.singleRunLimit)} value={singleRunLimit} />{template.ceiling.spec.budget.singleRunLimit ? ceilingHint(exceededFields.has("Limit per run"), formatMoney(template.ceiling.spec.budget.singleRunLimit, template.ceiling.spec.budget.currency)) : <span className="text-xs font-normal text-muted-ink">Optional · cannot exceed the monthly limit</span>}{singleRunError ? <span className="text-xs font-normal text-err" role="alert">{singleRunError}</span> : null}</label>
+            <label className="grid gap-2 text-sm font-semibold">Time-to-live limit<DurationInput aria-invalid={exceededFields.has("Time-to-live limit") || undefined} className={fieldClass(exceededFields.has("Time-to-live limit"))} disabled={submission === "submitting"} onChange={(value) => { setTtl(value); clearRejectedSubmission(); }} required unitAriaLabel="Time-to-live unit" value={ttl} />{ceilingHint(exceededFields.has("Time-to-live limit"), formatDuration(template.ceiling.spec.ttl, "wire", durationUnit(ttl)))}</label>
+            {template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime limit per month<DurationInput aria-invalid={exceededFields.has("Runtime limit per month") || undefined} className={fieldClass(exceededFields.has("Runtime limit per month"))} disabled={submission === "submitting"} mode="minutes" onChange={(value) => { setRuntimeMinutes(value); clearRejectedSubmission(); }} required value={runtimeMinutes} />{ceilingHint(exceededFields.has("Runtime limit per month"), formatDuration(template.ceiling.spec.runtimeMinutesLimit, "minutes", "m"))}</label> : null}
+          </div>
+        </SectionCard>
         <SectionCard className={exceededFields.has("Models") || rejectedFields.includes("llms") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("02", "Models")}><TagSelect addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" onChange={(next) => { setModels(new Set(next)); clearRejectedSubmission(); }} options={modelOptions} value={[...models]} /></SectionCard>
         <SectionCard className={exceededFields.has("Tools") || rejectedFields.includes("tools") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("03", "Tools")}><TagSelect addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search GitHub tools…" label="Tools" onChange={(next) => { setTools(new Set(next)); clearRejectedSubmission(); }} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools in the template ceiling are offered.</p></SectionCard>
         <SectionCard title={stepTitle("04", "Request note")}><label className="grid gap-2 text-sm font-semibold">Justification (optional)<textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); clearRejectedSubmission(); }} placeholder="Explain why these limits or capabilities are needed." value={justification} /></label></SectionCard>
@@ -345,6 +356,7 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template }: Readonly<
       <SectionCard className="sticky top-7 flex-[1_1_280px] lg:max-w-[380px]" title="Summary">
         <dl className="space-y-3 text-sm">{summary.map(([label, value]) => <div className={`flex justify-between gap-4 ${exceededFields.has(label) ? "text-warn" : ""}`} key={label}><dt className={exceededFields.has(label) ? undefined : "text-muted-ink"}>{label}</dt><dd className="text-right font-medium">{value}</dd></div>)}</dl>
         {submission !== "idle" && submission !== "submitting" ? <p className="mt-4 text-sm text-err" role="alert">{{ conflict: "The template revision changed. Reload before retrying.", rejected: "Some values are outside the platform limits or available capabilities. Check the highlighted fields and try again.", forbidden: "You are not allowed to submit this request.", unavailable: "HyperShell couldn't reach the request service. Try again in a moment.", error: "The request could not be accepted. Try again." }[submission]}</p> : null}
+        <DiagnosticDetails className="mt-2" items={diagnostics} />
         {exceedances.length ? <div className="mt-4"><EnvelopeExceedanceSummary values={exceedances} /></div> : null}
         <button className="mt-5 min-h-10 w-full rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting" || Boolean(singleRunError)} type="submit">{submission === "submitting" ? "Submitting…" : requiresApproval ? "Submit for approval" : "Submit request"}</button>
         <p className="mt-3 text-xs leading-5 text-muted-ink">{requiresApproval ? exceedances.length ? `${exceedances.length} ${exceedances.length === 1 ? "value exceeds" : "values exceed"} the template ceiling and need admin approval.` : "This request is above the automatic approval limit and needs admin approval." : "This request will be provisioned immediately."}</p>
@@ -377,6 +389,7 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
   const [envelopeJson, setEnvelopeJson] = useState("");
   const [justification, setJustification] = useState("");
   const [submission, setSubmission] = useState<"idle" | "submitting" | "invalid" | MutationFailureState>("idle");
+  const [diagnostics, setDiagnostics] = useState<DiagnosticItem[]>([]);
   const idempotencyKey = useRef<string | null>(null);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -404,6 +417,8 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
       return;
     }
     setSubmission(classifyMutationFailure(result.response?.status));
+    const problem = envelopeRequestProblem(result.error);
+    setDiagnostics(problem ? [{ label: "Code", value: problem.error }, { label: "Reason", value: problem.failureReason }] : []);
     onSubmittingChange(false);
   }
 
@@ -429,7 +444,7 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
         <textarea
           className="min-h-80 rounded-md border bg-canvas p-4 font-mono text-xs font-normal"
           disabled={submission === "submitting"}
-          onChange={(event) => { setEnvelopeJson(event.target.value); idempotencyKey.current = null; setSubmission("idle"); }}
+          onChange={(event) => { setEnvelopeJson(event.target.value); idempotencyKey.current = null; setSubmission("idle"); setDiagnostics([]); }}
           placeholder="Paste envelope JSON."
           required
           spellCheck={false}
@@ -440,6 +455,7 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
         <textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); idempotencyKey.current = null; setSubmission("idle"); }} placeholder="Explain why this envelope is needed." value={justification} />
       </label>
       {failure ? <p className="text-sm text-red-800" role="alert">{failure}</p> : null}
+      <DiagnosticDetails items={diagnostics} />
       <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
     </form>
   );
@@ -475,7 +491,7 @@ function EnvelopeDetail({ request }: Readonly<{ request: UserEnvelopeRequest }>)
         { label: "Time-to-live limit", value: <span className="font-mono">{formatDuration(envelope.spec.ttl)}</span> },
         { label: "Envelope instance", value: <span className="font-mono text-sm">{request.envelopeInstanceId ?? "Not assigned"}</span> },
       ]} />
-      {request.reason ? <details className="rounded-card bg-notice p-4 text-sm"><summary className="cursor-pointer font-semibold">Details</summary><p className="mt-2 text-muted-ink">{request.reason}</p></details> : null}
+      {request.reason ? <p className="rounded-card bg-notice p-4 text-sm"><strong>Reason:</strong> {request.reason}</p> : null}
       {request.status === "pending" ? <SectionCard title="Pending administrator approval">
         <EnvelopeExceedanceSummary values={request.ceilingExceedances.map(envelopeDeltaSummary)} />
         {!request.ceilingExceedances.length ? <p className="text-sm">{request.templateId ? "This request is within the template ceiling but above its automatic approval limit." : "This custom envelope request needs administrator approval."}</p> : null}
@@ -490,7 +506,7 @@ function EnvelopeDetail({ request }: Readonly<{ request: UserEnvelopeRequest }>)
         </SectionCard>
         <SectionCard title="History">
           {request.history.length ? <ol className="space-y-4 border-s ps-5">{request.history.map((event, index) => (
-            <li className="relative" key={`${event.at}-${index}`}><span aria-hidden="true" className="absolute -start-[1.58rem] top-1.5 size-2.5 rounded-full border-2 border-brand bg-panel" /><div className="flex flex-wrap items-center gap-2"><StatusBadge value={event.status} /><span className="text-sm text-muted-ink">by {event.actor} · {dateTime(event.at)}</span></div>{event.reason ? <details className="mt-1 text-sm text-muted-ink"><summary className="cursor-pointer">Details</summary><p className="mt-1">{event.reason}</p></details> : null}</li>
+            <li className="relative" key={`${event.at}-${index}`}><span aria-hidden="true" className="absolute -start-[1.58rem] top-1.5 size-2.5 rounded-full border-2 border-brand bg-panel" /><div className="flex flex-wrap items-center gap-2"><StatusBadge value={event.status} /><span className="text-sm text-muted-ink">by {event.actor} · {dateTime(event.at)}</span></div>{event.reason ? <p className="mt-1 text-sm text-muted-ink">{event.reason}</p> : null}</li>
           ))}</ol> : <EmptyState title="No history" />}
         </SectionCard>
       </div>

@@ -21,6 +21,7 @@ import {
   type GithubRepositoryView,
   type StarterTaskSetting,
 } from "@/api-client";
+import { DiagnosticDetails, type DiagnosticItem } from "@/components/diagnostic-details";
 import { PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { RepositoryResource, useGithubRepositories } from "@/data/github-repositories";
 import { useApiResource } from "@/data/use-api-resource";
@@ -153,6 +154,15 @@ export function runNowFailureMessage(error: unknown): string {
     return hint ? `The run request was rejected. ${hint}` : genericRunNowFailure;
   }
   return genericRunNowFailure;
+}
+
+function runNowDiagnostics(error: unknown): DiagnosticItem[] {
+  if (!error || typeof error !== "object") return [];
+  const value = error as Record<string, unknown>;
+  return [
+    { label: "Code", value: value.error },
+    { label: "Reason", value: value.failureReason ?? value.message },
+  ];
 }
 
 export function inlineFiles(
@@ -293,6 +303,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
   const [historyDepth, setHistoryDepth] = useState("");
   const [status, setStatus] = useState<"idle" | "submitting" | "error">("idle");
   const [failure, setFailure] = useState<string | null>(null);
+  const [failureDetails, setFailureDetails] = useState<DiagnosticItem[]>([]);
   const selectedEnvelope = active.find((request) => request.id === envelopeId);
   const selectedTemplate = data.templates.templates.find((template) => template.id === selectedEnvelope?.templateId && template.revision === selectedEnvelope?.templateRevision);
   const inlineAllowed = selectedTemplate?.allowInlineBrowserTasks !== false;
@@ -362,6 +373,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
       ? selectedEnvelope.envelopeDigest
       : `steward:${selectedEnvelope.envelopeDigest}`;
     setFailure(null);
+    setFailureDetails([]);
     setStatus("submitting");
     const result = await submitBrowserRun({
       body: {
@@ -379,6 +391,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
       return;
     }
     setFailure(runNowFailureMessage(result.error));
+    setFailureDetails(runNowDiagnostics(result.error));
     setStatus("error");
   }
 
@@ -396,7 +409,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
     {!exactTask && sourceKind === "registry" ? <label className="grid gap-2 text-sm font-semibold">Published workflow<select className={fieldClass} onChange={(event) => setWorkflowRef(event.target.value)} value={workflowRef}>{data.workflows.workflows.map((workflow) => <option key={`${workflow.name}@${workflow.version}`} value={`${workflow.name}@${workflow.version}`}>{workflow.displayName} · {workflow.name}@{workflow.version}</option>)}</select></label> : null}
     <label className="grid gap-2 text-sm font-semibold">Inputs (JSON object)<span className="text-xs font-normal text-muted-ink">Optional JSON (up to 16 KiB), available to the agent as <code>in/inputs.json</code>. Reference it in your prompt; it cannot change the agent, model, tools, or Envelope. Example: <code>{'{"release":"v1.2.3"}'}</code>.</span><textarea className="min-h-28 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setInputs(event.target.value)} spellCheck={false} value={inputs} /></label>
     <label className="flex items-start gap-3 rounded-control border border-warn/30 bg-warn-soft p-4 text-sm"><input checked={captureExecutionLog} className="mt-1 size-4" onChange={(event) => setCaptureExecutionLog(event.target.checked)} type="checkbox" /><span><strong className="block font-semibold text-warn">Capture execution log</strong><span className="mt-1 block text-muted-ink">Retain stdout and stderr for this run. Execution logs may reproduce arbitrary user, tool, or agent output.</span></span></label>
-    {status === "error" ? <p className="text-sm text-err" role="alert">{failure ?? genericRunNowFailure}</p> : null}
+    {status === "error" ? <div className="text-sm text-err" role="alert"><p>{failure ?? genericRunNowFailure}</p><DiagnosticDetails className="mt-1" items={failureDetails} /></div> : null}
     <div className="flex justify-end"><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "submitting" || (!exactTask && sourceKind === "inline" && (!inlineAllowed || !selectedModel || (checkoutRepository && (!selectedWorkspaceRepository?.ready || !historyDepthValid))))} type="submit">{status === "submitting" ? "Starting…" : "Run now"}</button></div>
   </form>;
 }

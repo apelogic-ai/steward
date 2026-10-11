@@ -24,7 +24,7 @@ import {
 import { DataTable, FilterChips, GrantChipList, Meter, SectionCard, grantKindForAction } from "@/components/hs";
 import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
 import { EnvelopeExceedanceSummary, envelopeDeltaSummary } from "@/components/envelope-exceedance-summary";
-import { DurationInput, MoneyInput, formatDuration, formatMoney } from "@/components/presentation-values";
+import { DurationInput, MoneyInput, durationUnit, formatDuration, formatMoney } from "@/components/presentation-values";
 import { DefinitionList, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -110,7 +110,7 @@ function triggerLabel(request: AdminRequestView): [string, string] {
     const meter = request.escalation?.meters[0];
     return ["Cumulative limit reached", meter ? meter.dimension === "llm_spend"
       ? `${formatMoney(meter.used, meter.unit)} / ${formatMoney(meter.limit, meter.unit)}`
-      : `${formatDuration(meter.used, "minutes")} / ${formatDuration(meter.limit, "minutes")}` : "Limit exhausted"];
+      : `${formatDuration(meter.used, "minutes", "m")} / ${formatDuration(meter.limit, "minutes", "m")}` : "Limit exhausted"];
   }
   if (request.kind === "within_ceiling") return ["Within ceiling", "Fits the template ceiling"];
   return ["Custom request", "No governing template"];
@@ -177,9 +177,9 @@ function deltaSide(delta: AdminRequestView["deltas"][number], side: "ceiling" | 
   }
   if (delta.dimension === "runtimeMinutes") {
     const value = delta[side];
-    return <span className="font-mono text-sm">{value === null || value === undefined ? "Not set" : formatDuration(value, "minutes")}</span>;
+    return <span className="font-mono text-sm">{value === null || value === undefined ? "Not set" : formatDuration(value, "minutes", "m")}</span>;
   }
-  if (delta.dimension === "ttl") return <span className="font-mono text-sm">{formatDuration(delta[side])}</span>;
+  if (delta.dimension === "ttl") return <span className="font-mono text-sm">{formatDuration(delta[side], "wire", durationUnit(delta.requested))}</span>;
   const value = delta[side];
   return <span className="font-mono text-sm">{deltaValue(value)}</span>;
 }
@@ -190,7 +190,7 @@ function numericDelta(delta: AdminRequestView["deltas"][number]): string | null 
   const difference = Number(delta.requested) - Number(delta.ceiling);
   if (!Number.isFinite(difference) || difference <= 0) return null;
   if ("currency" in delta) return `+${formatMoney(difference, delta.currency)}`;
-  return `+${formatDuration(String(difference), "minutes")}`;
+  return `+${formatDuration(String(difference), "minutes", "m")}`;
 }
 
 function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>) {
@@ -212,7 +212,7 @@ function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>)
 }
 
 function RequestHistory({ request }: Readonly<{ request: AdminRequestView }>) {
-  return <SectionCard title="History"><ol className="space-y-4">{request.history.map((event, index) => <li className="relative ps-5" key={`${event.at}-${index}`}><span aria-hidden="true" className={`absolute start-0 top-1 size-2.5 rounded-full border-2 ${event.state === "rejected" || event.state === "expired" ? "border-err" : event.state === "approved" || event.state === "auto_approved" ? "border-ok" : "border-faint-ink"}`} /><p className="text-sm font-semibold">{event.state.replaceAll("_", " ")}</p><p className="mt-0.5 text-[13px] text-muted-ink">by {event.actor} · {new Date(event.at).toLocaleString()}</p>{event.reason ? <details className="mt-1 text-[13px] text-muted-ink"><summary className="cursor-pointer">Details</summary><p className="mt-1">{event.reason}</p></details> : null}</li>)}</ol></SectionCard>;
+  return <SectionCard title="History"><ol className="space-y-4">{request.history.map((event, index) => <li className="relative ps-5" key={`${event.at}-${index}`}><span aria-hidden="true" className={`absolute start-0 top-1 size-2.5 rounded-full border-2 ${event.state === "rejected" || event.state === "expired" ? "border-err" : event.state === "approved" || event.state === "auto_approved" ? "border-ok" : "border-faint-ink"}`} /><p className="text-sm font-semibold">{event.state.replaceAll("_", " ")}</p><p className="mt-0.5 text-[13px] text-muted-ink">by {event.actor} · {new Date(event.at).toLocaleString()}</p>{event.reason ? <p className="mt-1 text-[13px] text-muted-ink">{event.reason}</p> : null}</li>)}</ol></SectionCard>;
 }
 
 export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequestView }>) {
@@ -326,7 +326,7 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
     return (
       <li className="space-y-5">
         <SectionCard title="Cumulative usage this period">
-          <ul className="space-y-5">{request.escalation.meters.map((meter) => <li key={meter.dimension}><Meter label={meter.dimension === "llm_spend" ? "LLM spend" : "Runtime limit per month"} limit={Number(meter.limit)} limitLabel={meter.dimension === "llm_spend" ? formatMoney(meter.limit, meter.unit) : formatDuration(meter.limit, "minutes")} used={Number(meter.used)} usedLabel={meter.dimension === "llm_spend" ? formatMoney(meter.used, meter.unit) : formatDuration(meter.used, "minutes")} /><p className="mt-1 text-xs text-muted-ink">Observed {new Date(meter.observedAt).toLocaleString()}</p></li>)}</ul>
+          <ul className="space-y-5">{request.escalation.meters.map((meter) => <li key={meter.dimension}><Meter label={meter.dimension === "llm_spend" ? "LLM spend" : "Runtime limit per month"} limit={Number(meter.limit)} limitLabel={meter.dimension === "llm_spend" ? formatMoney(meter.limit, meter.unit) : formatDuration(meter.limit, "minutes", "m")} used={Number(meter.used)} usedLabel={meter.dimension === "llm_spend" ? formatMoney(meter.used, meter.unit) : formatDuration(meter.used, "minutes", "m")} /><p className="mt-1 text-xs text-muted-ink">Observed {new Date(meter.observedAt).toLocaleString()}</p></li>)}</ul>
           <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-line-soft pt-4 text-sm text-muted-ink"><span>Blocked run <span className="font-mono text-ink">{request.escalation.blockedTaskUid}</span> · parked since {new Date(request.escalation.parkedAt).toLocaleString()}</span><Link className="font-semibold text-ink" href={`/admin/runs/${encodeURIComponent(request.escalation.blockedTaskUid)}`}>Open run →</Link></div>
         </SectionCard>
         {terminal ? <RequestHistory request={request} /> : <SectionCard title="Decision"><form className="grid gap-3 sm:grid-cols-2" onSubmit={topUp}>

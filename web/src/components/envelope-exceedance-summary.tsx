@@ -1,5 +1,5 @@
 import type { DirectAdmissionDelta } from "@/api-client";
-import { formatDuration, formatMoney } from "@/components/presentation-values";
+import { durationUnit, formatDuration, formatMoney } from "@/components/presentation-values";
 
 export type EnvelopeExceedanceSummaryValue = {
   ceiling: string;
@@ -30,9 +30,11 @@ export function envelopeDeltaSummary(delta: DirectAdmissionDelta): EnvelopeExcee
     case "singleRunBudget":
       return { ceiling: formatMoney(delta.ceiling, delta.currency), label: "Limit per run", requested: delta.requested ? formatMoney(delta.requested, delta.currency) : "Unbounded" };
     case "runtimeMinutes":
-      return { ceiling: formatDuration(delta.ceiling, "minutes"), label: "Runtime limit per month", requested: delta.requested ? formatDuration(delta.requested, "minutes") : "Unbounded" };
-    case "ttl":
-      return { ceiling: formatDuration(delta.ceiling), label: "Time-to-live limit", requested: formatDuration(delta.requested) };
+      return { ceiling: formatDuration(delta.ceiling, "minutes", "m"), label: "Runtime limit per month", requested: delta.requested ? formatDuration(delta.requested, "minutes", "m") : "Unbounded" };
+    case "ttl": {
+      const unit = durationUnit(delta.requested);
+      return { ceiling: formatDuration(delta.ceiling, "wire", unit), label: "Time-to-live limit", requested: formatDuration(delta.requested, "wire", unit) };
+    }
     case "models":
       return { ceiling: listOrNone(delta.ceiling.map((model) => `${model.provider}/${model.model}`)), label: "Models", requested: listOrNone(delta.requested.map((model) => `${model.provider}/${model.model}`)) };
     case "tools":

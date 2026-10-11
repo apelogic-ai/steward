@@ -28,6 +28,7 @@ import {
   type WorkspaceEvidence,
   type WorkflowDetectionResponse,
 } from "@/api-client";
+import { DiagnosticDetails } from "@/components/diagnostic-details";
 import { DataTable, FilterChips } from "@/components/hs";
 import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
 import { classifyConnectionMutationFailure, type ConnectionMutationState } from "@/components/connection-mutation-state";
@@ -603,6 +604,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
               }} type="button">{rerunState === "working" ? "Starting…" : "Re-run"}</button>{!isTerminalPhase(run.phase) ? <details className="relative"><summary aria-label="More run actions" className="grid min-h-10 min-w-10 cursor-pointer list-none place-items-center rounded-control border bg-panel px-3 text-lg font-semibold">···</summary><div className="absolute right-0 z-10 mt-1 min-w-40 rounded-control border bg-panel p-1 shadow-lg"><button className="w-full rounded-control px-3 py-2 text-left text-sm font-semibold text-err hover:bg-err-soft" disabled={cancelState === "working" || cancelState === "cancelled"} onClick={() => setCancelOpen(true)} type="button">{cancelState === "working" ? "Cancelling…" : cancelState === "cancelled" ? "Cancellation requested" : "Cancel run"}</button></div></details> : null}</div> : null}
             </header>
             {rerunState !== "idle" && rerunState !== "working" ? <p className="text-sm text-err" role="alert">{rerunFailureMessage(rerunState)}{rerunState === "inference-key-missing" ? <> <Link className="font-semibold underline" href="/connections">Open Connections</Link></> : null}</p> : null}
+            {!run.rerunSupported ? <DiagnosticDetails items={[{ label: "Reason", value: run.rerunUnavailableReason }]} /> : null}
             {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="text-sm text-err" role="alert">{cancelFailureMessage(cancelState)}</p> : null}
             {inferenceGuidance ? <p className="rounded-control border border-err/30 bg-err-soft px-4 py-3 text-sm text-err" role="alert">{inferenceGuidance} <Link className="font-semibold underline" href="/connections">Open Connections</Link></p> : null}
             <ConfirmationDialog cancelLabel="Keep running" confirmLabel="Cancel run" description="The agent will stop and its temporary credentials will be revoked. This cannot be undone." onConfirm={() => void cancelRun()} onOpenChange={setCancelOpen} open={cancelOpen} pending={cancelState === "working"} title="Cancel this run?" />

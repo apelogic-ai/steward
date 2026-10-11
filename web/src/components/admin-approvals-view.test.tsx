@@ -93,6 +93,17 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("200.00 USD");
   });
 
+  test("shows a human-written history reason without hiding it as a diagnostic", () => {
+    const html = renderToStaticMarkup(<UnifiedRequestCard request={{
+      ...unifiedRequest,
+      history: [{ actor: "alice", at: "2026-08-30T12:01:00Z", reason: "Needed for the release review", state: "requested" }],
+      state: "rejected",
+    }} />);
+
+    expect(html).toContain("Needed for the release review");
+    expect(html).not.toContain("<summary");
+  });
+
   test("shows the full requested access for a template-free custom request", () => {
     const custom: AdminRequestView = {
       ...unifiedRequest,

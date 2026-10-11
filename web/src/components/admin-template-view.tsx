@@ -16,6 +16,7 @@ import {
   type ToolGrant,
   type WorkspaceAuthority,
 } from "@/api-client";
+import { DiagnosticDetails, type DiagnosticItem } from "@/components/diagnostic-details";
 import { DataTable, FormSection, GrantChipList, SectionCard, TagSelect, grantKindForAction } from "@/components/hs";
 import { DurationInput, MoneyInput, formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
 import { ToolPicker, dedupeToolGrants, toolKey } from "@/components/tool-picker";
@@ -634,6 +635,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
   const toolCatalog = capabilities.tools;
   const allowedTools = new Set(toolCatalog.map(toolKey));
   const [status, setStatus] = useState<TemplateMutationState>("idle");
+  const [diagnostics, setDiagnostics] = useState<DiagnosticItem[]>([]);
   const [fieldErrors, setFieldErrors] = useState<TemplateFieldErrors>({});
   const [currentRevision, setCurrentRevision] = useState(template.revision);
   const [models, setModels] = useState<Array<ModelRef>>(template.spec.llms);
@@ -755,6 +757,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       return;
     }
     setStatus("saving");
+    setDiagnostics([]);
     const result = await putAdminEnvelopeTemplate({
       body: {
         displayName: name.trim(),
@@ -778,6 +781,11 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       return;
     }
     setStatus(classifyMutationFailure(result.response?.status));
+    const problem = result.error && typeof result.error === "object" ? result.error as Record<string, unknown> : {};
+    setDiagnostics([
+      { label: "Code", value: problem.error ?? problem.code },
+      { label: "Reason", value: problem.failureReason ?? problem.reason ?? problem.message },
+    ]);
   }
 
   const runner = template.spec.runner;
@@ -841,7 +849,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner">
           <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset>
         </FormSection>
-        {status !== "idle" && status !== "saving" ? <p className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status)}</p> : null}
+        {status !== "idle" && status !== "saving" ? <div className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}><p>{mutationMessage(status)}</p><DiagnosticDetails className="mt-1" items={diagnostics} /></div> : null}
         <footer className="sticky bottom-0 flex flex-wrap items-center justify-between gap-4 border-t bg-subtle px-6 py-4"><p className="text-sm text-muted-ink">{formatCount(models.length, "model")} · {formatCount(tools.length, "tool")} · Limit per run: {singleRunLimit && currency ? formatMoney(singleRunLimit, currency) : "—"}</p><div className="flex gap-3"><Link className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold" href="/admin/envelopes/templates">Cancel</Link><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="create">{status === "saving" ? "Saving…" : "Create template"}</button></div></footer>
       </form>
     );
@@ -876,7 +884,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
 
       {status !== "idle" && status !== "saving" ? (
-        <p className={status === "saved" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status)}</p>
+        <div className={status === "saved" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "saved" ? "status" : "alert"}><p>{mutationMessage(status)}</p><DiagnosticDetails className="mt-1" items={diagnostics} /></div>
       ) : null}
 
       <div className="flex flex-wrap items-end gap-3 border-t pt-5">

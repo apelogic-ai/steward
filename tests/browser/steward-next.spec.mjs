@@ -2442,8 +2442,10 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     ]);
     await expect(template).toHaveValue("template:analyst");
     await expect(developer.page.getByRole("spinbutton", { name: /^Monthly limit/ })).toHaveValue("10.00");
+    await expect(developer.page.getByRole("spinbutton", { name: /^Monthly limit/ })).toHaveAccessibleDescription("USD");
     await expect(developer.page.getByRole("spinbutton", { name: /^Limit per run/ })).toHaveValue("1.00");
     await expect(developer.page.getByRole("spinbutton", { name: /^Time-to-live limit/ })).toHaveValue("2");
+    await expect(developer.page.getByRole("spinbutton", { name: /^Time-to-live limit/ })).toHaveAccessibleDescription("h");
     await expect(developer.page.getByRole("combobox", { name: "Time-to-live unit" })).toHaveValue("h");
     await template.selectOption("template:developer");
     await expect(developer.page.getByRole("spinbutton", { name: /^Monthly limit/ })).toHaveValue("25.00");
@@ -2512,7 +2514,12 @@ test("a value above the template ceiling is submitted for administrator approval
     await developer.page.goto(`${origin}/envelopes/new`);
     await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("template:developer");
     const timeToLive = developer.page.getByRole("spinbutton", { name: /^Time-to-live limit/ });
-    await timeToLive.fill("5");
+    const timeToLiveUnit = developer.page.getByRole("combobox", { name: "Time-to-live unit" });
+    await expect(timeToLiveUnit).toHaveValue("h");
+    await timeToLive.fill("");
+    await expect(timeToLiveUnit).toHaveValue("h");
+    await timeToLive.pressSequentially("5");
+    await expect(timeToLiveUnit).toHaveValue("h");
 
     const summary = developer.page.getByText("Needs admin approval: 1 value above the template ceiling", { exact: true });
     await expect(summary).toBeVisible();
@@ -2535,6 +2542,31 @@ test("a value above the template ceiling is submitted for administrator approval
     expectInterceptedMutationProof(mutation);
     expect(mutation.body.justification).toBe("Needed for a bounded release review.");
     expect(mutation.body.requestedEnvelope.spec.ttl).toBe("5h");
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("duration fields reject non-whole values without rewriting them", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  try {
+    await developer.page.goto(`${origin}/envelopes/new?template=developer`);
+    const timeToLive = developer.page.getByRole("spinbutton", { name: /^Time-to-live limit/ });
+    const timeToLiveUnit = developer.page.getByRole("combobox", { name: "Time-to-live unit" });
+    await timeToLive.fill("");
+    await timeToLiveUnit.selectOption("d");
+    await timeToLive.pressSequentially("2");
+    await expect(timeToLiveUnit).toHaveValue("d");
+    await expect(timeToLive).toHaveValue("2");
+    const mutationCount = developer.mutations.length;
+    for (const invalid of ["1.5", "1e3", "-5"]) {
+      await timeToLive.fill(invalid);
+      await expect(timeToLive).toHaveValue(invalid);
+      await expect(timeToLive).toHaveAttribute("aria-invalid", "true");
+      await expect(developer.page.getByRole("alert").filter({ hasText: "Enter a whole number." })).toBeVisible();
+    }
+    await developer.page.getByRole("button", { name: "Submit request" }).click();
+    expect(developer.mutations).toHaveLength(mutationCount);
   } finally {
     await closeGuardedPage(developer);
   }
@@ -2586,12 +2618,17 @@ test("a field-specific envelope rejection identifies the field and clears after 
 
     const failureAlert = developer.page.getByRole("alert").filter({ hasText: "Some values are outside the platform limits" });
     await expect(failureAlert).toHaveText("Some values are outside the platform limits or available capabilities. Check the highlighted fields and try again.");
-    await expect(developer.page.getByText(failureReason, { exact: true })).toHaveCount(0);
+    await expect(developer.page.getByText(failureReason, { exact: true })).toBeHidden();
+    await developer.page.getByText("Details", { exact: true }).click();
+    await expect(developer.page.getByText("platform_safety_ceiling_exceeded", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText(failureReason, { exact: true })).toBeVisible();
     await expect(monthlyLimit.locator("..")).toHaveClass(/border-warn/);
+    await expect(monthlyLimit).toHaveAttribute("aria-invalid", "true");
 
     await monthlyLimit.fill("25.00");
     await expect(failureAlert).toHaveCount(0);
     await expect(monthlyLimit.locator("..")).not.toHaveClass(/border-warn/);
+    await expect(monthlyLimit).not.toHaveAttribute("aria-invalid", "true");
     await expect(developer.page.getByRole("button", { name: "Submit request" })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
@@ -2820,6 +2857,8 @@ test("Get started explains unsupported releases and repository prerequisites", a
     await testRun.getByRole("button").first().click();
     await testRun.getByLabel("Repository").selectOption("repo_not_admitted");
     await expect(testRun.getByText("example-org/not-admitted is not approved for runs on this installation. Ask an administrator to add it.", { exact: true })).toBeVisible();
+    await testRun.getByText("Details", { exact: true }).click();
+    await expect(testRun.getByText("source_repository_not_admitted", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -3934,6 +3973,8 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await administrator.page.getByRole("button", { name: "Create template" }).click();
 
     await expect(administrator.page.getByText("The template couldn't be saved. Check the fields and try again.")).toBeVisible();
+    await administrator.page.getByText("Details", { exact: true }).click();
+    await expect(administrator.page.getByText("template_invalid", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -4408,7 +4449,7 @@ test("connection OAuth polling keeps a bounded terminal failure explicit", async
     await expect(failure.getByText("GitHub authorization couldn't be completed. Retry once. If it continues, ask an administrator to check the connection.", { exact: true })).toBeVisible();
     await failure.getByText("Details", { exact: true }).click();
     await expect(failure.getByText("gateway_http_error", { exact: true })).toBeVisible();
-    await expect(developer.page.getByText("provider temporarily unavailable", { exact: true })).toHaveCount(0);
+    await expect(failure.getByText("provider temporarily unavailable", { exact: true })).toBeVisible();
     expectMutationProof(developer.mutations.find((mutation) => mutation.path.endsWith("/start")));
   } finally {
     await closeGuardedPage(developer);

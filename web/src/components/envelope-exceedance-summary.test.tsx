@@ -42,7 +42,7 @@ describe("envelope ceiling-exceedance summaries", () => {
     expect(html).toContain("Needs admin approval: 11 values above the template ceiling");
     expect(html).toContain("Monthly limit: <strong>125.00 USD</strong> (ceiling 100.00 USD)");
     expect(html).toContain("Limit per run: <strong>5.00 USD</strong> (ceiling 2.00 USD)");
-    expect(html).toContain("Runtime limit per month: <strong>1 h 30 min</strong> (ceiling 1 h)");
+    expect(html).toContain("Runtime limit per month: <strong>90 min</strong> (ceiling 60 min)");
     expect(html).toContain("Time-to-live limit: <strong>2 h</strong> (ceiling 1 h)");
     expect(html).toContain("Models: <strong>provider-a/model-b</strong> (ceiling provider-a/model-a)");
     expect(html).toContain("Tools: <strong>github:issues_update:write</strong> (ceiling github:issues_get:read)");
