@@ -121,6 +121,7 @@ fn ci() -> TaskResult {
     require_ci_tool_versions()?;
     quality_after_tool_checks()?;
     run("bash", &["scripts/test-core-install-chart.sh"])?;
+    run("bash", &["scripts/test-ci-change-class.sh"])?;
     conformance(&["--pinned".to_owned()])
 }
 
@@ -2738,7 +2739,7 @@ mod tests {
 
         for required in [
             "timeout-minutes: 40",
-            "needs: quality",
+            "    needs:\n      - changes\n      - quality\n",
             "runs-on: ubuntu-24.04",
             "actions/download-artifact@",
             "governed-connections-${{ github.sha }}",
@@ -3499,6 +3500,544 @@ mod tests {
                 "{job_name} must install the Bun version required by cargo xtask conformance"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn ci_lanes_are_gated_by_the_tested_change_class() -> Result<(), String> {
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        check_ci_change_class_contract(&ci)
+    }
+
+    // Each edit below neutralises the classifier, a lane, or the verdict
+    // while leaving the workflow valid. The contract must reject every one.
+    #[test]
+    fn ci_change_class_contract_rejects_neutralising_workflow_edits() -> Result<(), String> {
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let classify_run = "          class=\"$(bash scripts/ci-change-class.sh detect)\"\n";
+        let classify_shell = "        id: classify\n        shell: bash\n";
+        let verdict_shell =
+            "      - name: Require every lane the change class runs\n        shell: bash\n";
+        let edits = [
+            (
+                "class overwritten after detect",
+                classify_run,
+                "          class=\"$(bash scripts/ci-change-class.sh detect)\"\n          class=docs\n"
+                    .to_owned(),
+            ),
+            (
+                "detect result discarded",
+                classify_run,
+                "          class=\"$(bash scripts/ci-change-class.sh detect || true)\"\n".to_owned(),
+            ),
+            (
+                "shell that ignores the verdict script",
+                verdict_shell,
+                "      - name: Require every lane the change class runs\n        shell: \"true {0}\"\n"
+                    .to_owned(),
+            ),
+            (
+                "verdict without an explicit shell",
+                verdict_shell,
+                "      - name: Require every lane the change class runs\n".to_owned(),
+            ),
+            (
+                "shell that writes the class itself",
+                classify_shell,
+                "        id: classify\n        shell: \"bash -c 'echo class=docs >> $GITHUB_OUTPUT' {0}\"\n"
+                    .to_owned(),
+            ),
+            (
+                "workflow-level override variable",
+                "env:\n  CARGO_TERM_COLOR: always\n",
+                "env:\n  CARGO_TERM_COLOR: always\n  CI_TARGET_REF: HEAD\n".to_owned(),
+            ),
+            (
+                "workflow-level git redirection",
+                "env:\n  CARGO_TERM_COLOR: always\n",
+                "env:\n  CARGO_TERM_COLOR: always\n  GIT_DIR: /tmp/elsewhere\n".to_owned(),
+            ),
+            (
+                "workflow-level default shell",
+                "env:\n  CARGO_TERM_COLOR: always\n",
+                "defaults:\n  run:\n    shell: \"true {0}\"\n\nenv:\n  CARGO_TERM_COLOR: always\n"
+                    .to_owned(),
+            ),
+            (
+                "job-level environment on the classifier",
+                "    name: changes\n",
+                "    name: changes\n    env:\n      BASH_ENV: scripts/override.sh\n".to_owned(),
+            ),
+            (
+                "job-level environment on the aggregate",
+                "    name: pinned\n",
+                "    name: pinned\n    env:\n      BASH_ENV: scripts/override.sh\n".to_owned(),
+            ),
+            (
+                "job-level default shell on a lane",
+                "    name: e2e / browser user journeys\n",
+                "    name: e2e / browser user journeys\n    defaults:\n      run:\n        shell: \"true {0}\"\n"
+                    .to_owned(),
+            ),
+            (
+                "extra environment on the classify step",
+                "          CI_HEAD_SHA: ${{ github.sha }}\n",
+                "          CI_HEAD_SHA: ${{ github.sha }}\n          BASH_ENV: scripts/override.sh\n"
+                    .to_owned(),
+            ),
+            (
+                "continue-on-error on a lane",
+                "    name: e2e / browser user journeys\n",
+                "    name: e2e / browser user journeys\n    continue-on-error: true\n".to_owned(),
+            ),
+            (
+                "continue-on-error on a lane step",
+                "      - name: Install release-candidate artifacts in a clean cluster\n",
+                "      - name: Install release-candidate artifacts in a clean cluster\n        continue-on-error: true\n"
+                    .to_owned(),
+            ),
+            (
+                "lane result taken from another lane",
+                "POSTGRES_TLS: ${{ needs.postgres-tls.result }}",
+                "POSTGRES_TLS: ${{ needs.conformance-pinned.result }}".to_owned(),
+            ),
+            (
+                "condition that always holds",
+                "    if: needs.changes.outputs.class == 'full' || needs.changes.outputs.class == 'web'\n",
+                "    if: needs.changes.outputs.class == 'full' || needs.changes.outputs.class == 'web' || always()\n"
+                    .to_owned(),
+            ),
+            (
+                "reduced lane command made non-fatal",
+                "        run: bash scripts/test-ci-change-class.sh\n",
+                "        run: bash scripts/test-ci-change-class.sh || true\n".to_owned(),
+            ),
+            (
+                "reduced lane exits before its last command",
+                "          bash scripts/test-validate-release-version.sh\n",
+                "          exit 0\n          bash scripts/test-validate-release-version.sh\n".to_owned(),
+            ),
+        ];
+
+        for (name, original, replacement) in edits {
+            if ci.matches(original).count() != 1 {
+                return Err(format!(
+                    "the workflow edit '{name}' no longer applies to exactly one place"
+                ));
+            }
+            let edited = ci.replacen(original, &replacement, 1);
+            let outcome = std::panic::catch_unwind(|| check_ci_change_class_contract(&edited));
+            if matches!(outcome, Ok(Ok(()))) {
+                return Err(format!("the contract accepted a workflow with: {name}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_ci_change_class_contract(ci: &str) -> Result<(), String> {
+        use serde_json::Value;
+
+        fn text<'a>(value: &'a Value, key: &str, context: &str) -> Result<&'a str, String> {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{context} must set `{key}` to a string"))
+        }
+
+        // `needs` is a string or a list of strings.
+        fn needs(job: &Value, context: &str) -> Result<BTreeSet<String>, String> {
+            match job.get("needs") {
+                None => Ok(BTreeSet::new()),
+                Some(Value::String(one)) => Ok(BTreeSet::from([one.clone()])),
+                Some(Value::Array(many)) => many
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .as_str()
+                            .map(str::to_owned)
+                            .ok_or_else(|| format!("{context} has a non-string `needs` entry"))
+                    })
+                    .collect(),
+                Some(_) => Err(format!("{context} has a malformed `needs`")),
+            }
+        }
+
+        fn steps<'a>(job: &'a Value, context: &str) -> Result<&'a Vec<Value>, String> {
+            job.get("steps")
+                .and_then(Value::as_array)
+                .ok_or_else(|| format!("{context} must have steps"))
+        }
+
+        fn squeeze(expression: &str) -> String {
+            expression.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
+        // A lane that feeds the aggregate must report its real outcome and
+        // run every step: no `continue-on-error`, and no conditional step.
+        fn require_blocking(job: &Value, context: &str) -> Result<(), String> {
+            if job.get("continue-on-error").is_some() {
+                return Err(format!("{context} must not set continue-on-error"));
+            }
+            for (index, step) in steps(job, context)?.iter().enumerate() {
+                for forbidden in ["continue-on-error", "if"] {
+                    if step.get(forbidden).is_some() {
+                        return Err(format!("{context} step {index} must not set `{forbidden}`"));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        let script = fs::read_to_string(root().join("scripts/ci-change-class.sh"))
+            .map_err(|error| format!("CI change classifier is required: {error}"))?;
+        let xtask_source = include_str!("main.rs");
+
+        // The workflow is parsed, so a comment or a string that merely
+        // mentions a condition cannot satisfy this test.
+        let workflow: Value = serde_saphyr::from_str(ci)
+            .map_err(|error| format!("CI workflow is not valid YAML: {error}"))?;
+        let jobs = workflow
+            .get("jobs")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "CI workflow must define jobs".to_owned())?;
+        let job = |name: &str| {
+            jobs.get(name)
+                .ok_or_else(|| format!("CI job {name} is required"))
+        };
+
+        // Nothing outside a step may change how the classifier or the
+        // verdict runs: no default shell, and no environment the scripts or
+        // git would read.
+        assert!(
+            workflow.get("defaults").is_none(),
+            "the CI workflow must not set `defaults`"
+        );
+        assert_eq!(
+            workflow.get("env"),
+            Some(&serde_json::json!({ "CARGO_TERM_COLOR": "always" })),
+            "the CI workflow environment must stay exactly CARGO_TERM_COLOR"
+        );
+        for (name, definition) in jobs {
+            assert!(
+                definition.get("defaults").is_none(),
+                "CI job {name} must not set `defaults`"
+            );
+        }
+        let checkout = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd";
+
+        // The lane table in the classifier script is the single definition of
+        // what each class runs.
+        let table = script
+            .split_once("\nLANES='\n")
+            .and_then(|(_before, after)| after.split_once("\n'\n"))
+            .map(|(table, _after)| table)
+            .ok_or_else(|| "the classifier lane table could not be isolated".to_owned())?;
+        let classes = ["full", "web", "docs"];
+        let mut lanes = Vec::new();
+        for row in table.lines() {
+            let columns = row.split_whitespace().collect::<Vec<_>>();
+            let [lane, expectations @ ..] = columns.as_slice() else {
+                return Err(format!("malformed lane table row: {row}"));
+            };
+            if expectations.len() != classes.len()
+                || expectations
+                    .iter()
+                    .any(|expectation| !matches!(*expectation, "run" | "skip"))
+            {
+                return Err(format!("malformed lane table row: {row}"));
+            }
+            let running = classes
+                .iter()
+                .zip(expectations)
+                .filter(|(_class, expectation)| **expectation == "run")
+                .map(|(class, _expectation)| *class)
+                .collect::<Vec<_>>();
+            if running.is_empty() {
+                return Err(format!("lane {lane} runs for no class"));
+            }
+            lanes.push((*lane, running));
+        }
+        let lane_names = lanes
+            .iter()
+            .map(|(lane, _running)| (*lane).to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(lane_names.len(), lanes.len(), "lane table repeats a lane");
+
+        // Every job is the classifier, the aggregate, the informational
+        // nightly lane, or a lane the table describes. A new job cannot be
+        // added without deciding which classes run it.
+        let mut expected_jobs = lane_names.clone();
+        expected_jobs.extend(["changes", "pinned", "latest-nightly"].map(str::to_owned));
+        assert_eq!(
+            jobs.keys().cloned().collect::<BTreeSet<_>>(),
+            expected_jobs,
+            "every CI job must appear in the classifier lane table"
+        );
+        let first_job = ci
+            .split_once("\njobs:\n")
+            .map(|(_before, after)| after)
+            .and_then(|after| {
+                after
+                    .lines()
+                    .find(|line| line.starts_with("  ") && !line.trim_start().starts_with('#'))
+            })
+            .ok_or_else(|| "CI workflow jobs could not be isolated".to_owned())?;
+        assert_eq!(
+            first_job, "  changes:",
+            "the change classifier must be the first CI job"
+        );
+
+        // The classifier runs unconditionally and passes event data to the
+        // script only through the environment.
+        let changes = job("changes")?;
+        for forbidden in [
+            "if",
+            "needs",
+            "continue-on-error",
+            "env",
+            "container",
+            "services",
+            "strategy",
+        ] {
+            assert!(
+                changes.get(forbidden).is_none(),
+                "the change classifier must not set `{forbidden}`"
+            );
+        }
+        require_blocking(changes, "the change classifier")?;
+        assert_eq!(
+            changes.pointer("/outputs/class").and_then(Value::as_str),
+            Some("${{ steps.classify.outputs.class }}"),
+            "the change classifier must publish the class"
+        );
+        let change_steps = steps(changes, "the change classifier")?;
+        assert_eq!(change_steps.len(), 2, "the change classifier has two steps");
+        // The full history makes the base commit reachable.
+        assert_eq!(
+            change_steps[0],
+            serde_json::json!({
+                "name": "Check out repository",
+                "uses": checkout,
+                "with": { "fetch-depth": 0, "persist-credentials": false },
+            }),
+            "the change classifier must check out the full history with the pinned action"
+        );
+        let classify = &change_steps[1];
+        assert_eq!(
+            classify
+                .as_object()
+                .map(|step| step.keys().map(String::as_str).collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from(["name", "id", "shell", "env", "run"])),
+            "the classify step must set exactly its name, id, shell, environment, and script"
+        );
+        assert_eq!(text(classify, "id", "the classify step")?, "classify");
+        assert_eq!(
+            text(classify, "shell", "the classify step")?,
+            "bash",
+            "the classify step must run under bash"
+        );
+        let expected_environment = [
+            ("CI_EVENT_NAME", "${{ github.event_name }}"),
+            (
+                "CI_BASE_REF",
+                "${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}",
+            ),
+            (
+                "CI_BASE_SHA",
+                "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}",
+            ),
+            ("CI_HEAD_SHA", "${{ github.sha }}"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), Value::from(value)))
+        .collect::<serde_json::Map<_, _>>();
+        assert_eq!(
+            classify.get("env"),
+            Some(&Value::Object(expected_environment)),
+            "the classify step must pass exactly the event name, base, and head"
+        );
+        assert_eq!(
+            text(classify, "run", "the classify step")?,
+            "set -euo pipefail\n\
+             class=\"$(bash scripts/ci-change-class.sh detect)\"\n\
+             echo \"class=${class}\" >> \"${GITHUB_OUTPUT}\"\n\
+             echo \"Change class: \\`${class}\\`\" >> \"${GITHUB_STEP_SUMMARY}\"\n",
+            "the classify step must take the class from the classifier script and nothing else"
+        );
+
+        // Each lane waits for the classifier and carries exactly the
+        // condition the table implies.
+        let class_condition = |class: &str| format!("needs.changes.outputs.class == '{class}'");
+        let table_condition = |running: &[&str]| {
+            running
+                .iter()
+                .map(|class| class_condition(class))
+                .collect::<Vec<_>>()
+                .join(" || ")
+        };
+        for (lane, running) in &lanes {
+            let lane_job = job(lane)?;
+            let context = format!("CI job {lane}");
+            assert!(
+                needs(lane_job, &context)?.contains("changes"),
+                "{lane} must wait for the change classifier"
+            );
+            require_blocking(lane_job, &context)?;
+            let condition = squeeze(text(lane_job, "if", &context)?);
+            let expected = if *lane == "release-candidate" {
+                // `full` still waits for a green quality gate. `web` skips
+                // that gate, so the lane must not inherit the skip.
+                assert_eq!(running.as_slice(), ["full", "web"]);
+                "${{ !cancelled() && ( (needs.changes.outputs.class == 'full' && \
+                 needs.quality.result == 'success') || \
+                 needs.changes.outputs.class == 'web' ) }}"
+                    .to_owned()
+            } else {
+                table_condition(running)
+            };
+            assert_eq!(
+                condition, expected,
+                "{lane} must run exactly for the classes in the lane table"
+            );
+        }
+        assert_eq!(
+            needs(job("governed-connections")?, "governed-connections")?,
+            BTreeSet::from(["changes".to_owned(), "quality".to_owned()]),
+            "governed connections must wait for the quality gate's artifacts"
+        );
+        assert_eq!(
+            needs(job("release-candidate")?, "release-candidate")?,
+            BTreeSet::from(["changes".to_owned(), "quality".to_owned()]),
+            "the release-candidate lane must wait for the quality gate"
+        );
+        let nightly = job("latest-nightly")?;
+        assert_eq!(
+            squeeze(text(nightly, "if", "latest-nightly")?),
+            class_condition("full"),
+            "the informational nightly lane runs only for the full class"
+        );
+
+        // The reduced lane runs every gate that reads documentation or
+        // browser-presentation sources, including the classifier tests.
+        let reduced = job("quality-reduced")?;
+        assert!(
+            reduced.get("env").is_none() && reduced.get("container").is_none(),
+            "the reduced quality lane must not set a job environment or container"
+        );
+        let mut reduced_commands = Vec::new();
+        for step in steps(reduced, "quality-reduced")? {
+            assert!(
+                step.get("shell").is_none() && step.get("env").is_none(),
+                "the reduced quality lane steps must use the default shell and environment"
+            );
+            if let Some(command) = step.get("run").and_then(Value::as_str) {
+                reduced_commands.push(command);
+            }
+        }
+        assert_eq!(
+            reduced_commands,
+            [
+                "rustup toolchain install 1.95.0 --profile minimal",
+                "cargo xtask workflow-lint",
+                "cargo xtask check-neutrality",
+                "cargo xtask check-secrets",
+                "cargo test -p xtask",
+                "bash scripts/test-validate-release-version.sh\n\
+                 bash scripts/validate-release-version.sh\n",
+                "bash scripts/test-ci-change-class.sh",
+            ],
+            "the reduced quality lane must run exactly these commands"
+        );
+
+        // The aggregate always reports, waits for exactly the classifier and
+        // the lanes, and hands each lane's own result to the verdict.
+        let pinned = job("pinned")?;
+        assert_eq!(
+            text(pinned, "if", "pinned")?,
+            "always()",
+            "the pinned aggregate must report for every run"
+        );
+        require_blocking(pinned, "pinned")?;
+        for forbidden in ["env", "container", "services", "strategy"] {
+            assert!(
+                pinned.get(forbidden).is_none(),
+                "the pinned aggregate must not set `{forbidden}`"
+            );
+        }
+        let mut expected_needs = lane_names.clone();
+        expected_needs.insert("changes".to_owned());
+        assert_eq!(
+            needs(pinned, "pinned")?,
+            expected_needs,
+            "the pinned aggregate must wait for the classifier and every lane, and nothing else"
+        );
+        let variable = |lane: &str| match lane {
+            "conformance-pinned" => "CONFORMANCE".to_owned(),
+            other => other.replace('-', "_").to_uppercase(),
+        };
+        let mut expected_environment = serde_json::Map::new();
+        expected_environment.insert(
+            "CHANGE_CLASS".to_owned(),
+            Value::from("${{ needs.changes.outputs.class }}"),
+        );
+        expected_environment.insert(
+            "CHANGES".to_owned(),
+            Value::from("${{ needs.changes.result }}"),
+        );
+        let mut expected_run = String::from(
+            "set -euo pipefail\nbash scripts/ci-change-class.sh verdict \"${CHANGE_CLASS}\" \"${CHANGES}\"",
+        );
+        for (lane, _running) in &lanes {
+            let name = variable(lane);
+            expected_environment.insert(
+                name.clone(),
+                Value::from(format!("${{{{ needs.{lane}.result }}}}")),
+            );
+            expected_run.push_str(&format!(" \\\n  \"{lane}=${{{name}}}\""));
+        }
+        expected_run.push('\n');
+        let [pinned_checkout, verdict] = steps(pinned, "pinned")?.as_slice() else {
+            return Err("the pinned aggregate must be a checkout and one script step".to_owned());
+        };
+        assert_eq!(
+            *pinned_checkout,
+            serde_json::json!({
+                "name": "Check out repository",
+                "uses": checkout,
+                "with": { "persist-credentials": false },
+            }),
+            "the pinned aggregate must check out with the pinned action"
+        );
+        assert_eq!(
+            verdict
+                .as_object()
+                .map(|step| step.keys().map(String::as_str).collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from(["name", "shell", "env", "run"])),
+            "the verdict step must set exactly its name, shell, environment, and script"
+        );
+        assert_eq!(
+            text(verdict, "shell", "the pinned verdict step")?,
+            "bash",
+            "the verdict step must run under bash"
+        );
+        assert_eq!(
+            verdict.get("env"),
+            Some(&Value::Object(expected_environment)),
+            "the pinned aggregate must read each lane's own result, and nothing else"
+        );
+        assert_eq!(
+            text(verdict, "run", "the pinned verdict step")?,
+            expected_run,
+            "the pinned aggregate must pass every lane's own result to the verdict"
+        );
+
+        assert!(
+            xtask_source.contains("run(\"bash\", &[\"scripts/test-ci-change-class.sh\"])?;"),
+            "cargo xtask ci must run the change classifier tests"
+        );
+
         Ok(())
     }
 

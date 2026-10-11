@@ -222,13 +222,19 @@ Documentation-only means Markdown and static images anywhere in the repository,
 wherever they live: `docs/`, the root `README.md` and `CHANGELOG.md`, and
 Markdown beside code. Location does not decide the gate; content does.
 
+Agent-instruction files — `AGENTS.md`, `CLAUDE.md`, every nested equivalent,
+and the agent and skill definitions under `.claude/` — use the documentation
+gate. The gate is not the approval: changing them still requires the maintainer
+request in "Authority and rule changes".
+
 These are Markdown and still use the full gate:
 
-- agent-instruction files — `AGENTS.md`, `CLAUDE.md`, and every nested
-  equivalent;
 - `docs/contracts/`, which is normative wire contract rather than prose;
-- executable or generated Markdown, and any Markdown a script or CI job
-  consumes as input.
+- executable or generated Markdown;
+- any Markdown compiled or bundled into a product artifact, or read by a
+  script or CI job the documentation gate does not run: a document included
+  with `include_str!`, the chart README, a configuration bundle README, a
+  document copied into an image or a release bundle.
 
 Everything that is not Markdown or a static image uses the full gate: source,
 tests, scripts, dependencies, policy, build, deployment, CI, hooks, schemas,
@@ -250,6 +256,33 @@ Never hand off warnings. Repository Clippy policy treats warnings as errors.
 
 Whatever the gate, check the diff against "Product rules every change must
 satisfy" before every push; PR review blocks on them.
+
+### CI change classes
+
+CI applies the same selection to pull requests and merge-queue groups. The
+`changes` job classifies the diff, and each lane runs only for the classes
+that need it:
+
+- `docs`: every changed file is on the documentation allowlist.
+- `web`: every changed file is under `web/` or `tests/browser/`, or is
+  documentation.
+- `full`: anything else, and every push to `main`, scheduled run, and manual
+  run. The release workflow does not use classes.
+
+`scripts/ci-change-class.sh` is the source of truth: its path rules define the
+classes, and its lane table defines which lanes each class runs. Do not repeat
+either here. A contract test ties the workflow to that table.
+
+- The classifier is an allowlist and fails safe: a path no rule names, and any
+  failure or ambiguity, is `full`. Its documentation allowlist is narrower
+  than the local definition above, so some Markdown beside code is `full` in
+  CI.
+- `pinned` stays the only required check. It requires `success` from every
+  lane the class runs and `skipped` from every lane the class skips, and fails
+  on anything else.
+- When a document becomes an input to a build, bundle, or test, classify it by
+  that consumer in the script in the same change. The classifier tests catch
+  the common cases, not every way a file can be read, so check by hand too.
 
 ### Documentation currency
 
