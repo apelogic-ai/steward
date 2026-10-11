@@ -4370,6 +4370,22 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         .ok_or(StoreError::TaskNotFound)?;
     assert!(cancelled_task.finalized);
     assert_eq!(cancelled_task.phase, TaskPhase::Cancelled);
+    let cancelled_log = store
+        .agent_run_execution_log(
+            cancelled_task_uid,
+            Some(identity.user_id.as_str()),
+            AgentRunLogStream::Stdout,
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("cancelled execution log status is absent"))?;
+    assert!(
+        cancelled_log.complete,
+        "a cancelled run must stop log polling"
+    );
+    assert!(
+        cancelled_log.partial,
+        "a cancelled run without a final transcript must identify its log as partial"
+    );
     assert!(
         kubernetes
             .runtime

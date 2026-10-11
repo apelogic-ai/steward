@@ -10,7 +10,7 @@ use steward_adapter_openshell::{
     OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
 };
 use steward_ports::{
-    SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
+    PortError, SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
     SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
 use steward_types::direct_package::{
@@ -454,7 +454,7 @@ async fn verify_attempt_failure_semantics(
             SandboxTaskObservation::FailedWithTranscript {
                 reason, transcript, ..
             } => {
-                if reason != "Task execution transcript exceeded its bounded archive contract" {
+                if reason != "The execution log exceeded the 4 MiB limit per stream." {
                     return Err(format!(
                         "oversized transcript had unsafe reason: {reason:?}"
                     ));
@@ -491,18 +491,72 @@ async fn verify_attempt_failure_semantics(
 
     let launch_failure_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000004".to_owned());
     let launch_failure_task = SandboxTaskRequest {
-        command: Vec::new(),
+        command: vec!["/bin/sh".to_owned(), "-c".to_owned(), "x".repeat(1_100_000)],
         ..task.clone()
     };
-    if runtime
+    let launch_error = runtime
         .start_task(&launch_failure_attempt, &launch_failure_task, input_archive)
         .await
-        .is_ok()
-    {
-        return Err("a detached wrapper syntax failure was reported as accepted".to_owned());
+        .expect_err("an oversized launcher request was reported as accepted");
+    if !matches!(launch_error, PortError::Failed { .. }) {
+        return Err(format!(
+            "a real launcher failure had the wrong category: {launch_error:?}"
+        ));
+    }
+    let launch_retry = runtime
+        .start_task(&launch_failure_attempt, &task, input_archive)
+        .await
+        .map_err(|error| format!("launch failure retry could not observe its claim: {error:?}"))?;
+    if !matches!(launch_retry, SandboxTaskObservation::Accepted { .. }) {
+        return Err(format!("a failed launch was restarted: {launch_retry:?}"));
     }
 
-    let synchronous_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000005".to_owned());
+    let orphan_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000005".to_owned());
+    let orphan_task = SandboxTaskRequest {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "exec </dev/null >/dev/null 2>&1; kill -KILL \"$(cat /sandbox/.steward-attempts/{}/pid)\"; sleep 40",
+                orphan_attempt.0
+            ),
+        ],
+        ..task.clone()
+    };
+    let _ = runtime
+        .start_task(&orphan_attempt, &orphan_task, input_archive)
+        .await;
+    let orphan_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match runtime.observe_task(&orphan_attempt, &orphan_task).await {
+            Ok(SandboxTaskObservation::OutcomeUnknown { .. }) => break,
+            Ok(
+                SandboxTaskObservation::Accepted { .. }
+                | SandboxTaskObservation::Running { .. }
+                | SandboxTaskObservation::RunningWithTranscript { .. },
+            ) => {}
+            other => {
+                return Err(format!(
+                    "orphaned full-log wrapper produced false terminal evidence: {other:?}"
+                ));
+            }
+        }
+        if Instant::now() >= orphan_deadline {
+            return Err("orphaned full-log wrapper remained live indefinitely".to_owned());
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    let orphan_retry = runtime
+        .start_task(&orphan_attempt, &orphan_task, input_archive)
+        .await
+        .map_err(|error| format!("orphan retry could not observe its marker: {error:?}"))?;
+    if !matches!(orphan_retry, SandboxTaskObservation::OutcomeUnknown { .. }) {
+        return Err(format!(
+            "an orphaned full-log attempt was restarted: {orphan_retry:?}"
+        ));
+    }
+
+    let synchronous_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000006".to_owned());
     let synchronous_task = SandboxTaskRequest {
         command: vec![
             "/bin/sh".to_owned(),

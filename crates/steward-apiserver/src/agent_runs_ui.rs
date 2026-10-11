@@ -816,6 +816,7 @@ pub(crate) struct BrowserExecutionLogResponse {
     truncated: bool,
     size_bytes: usize,
     complete: bool,
+    partial: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -2531,6 +2532,7 @@ fn execution_log_body(
         truncated: end < size_bytes,
         size_bytes,
         complete: log.complete,
+        partial: log.partial,
     })
     .into_response();
     response
@@ -3457,6 +3459,7 @@ mod tests {
                     .map(|content| AgentRunExecutionLog {
                         content,
                         complete: true,
+                        partial: false,
                     }))
             })
         }
@@ -4471,6 +4474,7 @@ mod tests {
         assert_eq!(body["content"], "completed\n");
         assert_eq!(body["sizeBytes"], 10);
         assert_eq!(body["complete"], true);
+        assert_eq!(body["partial"], false);
         assert_eq!(body["truncated"], false);
 
         let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;

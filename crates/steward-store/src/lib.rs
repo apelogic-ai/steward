@@ -4779,19 +4779,22 @@ impl PgStore {
             .and_then(|row| {
                 row.map(|row| {
                     let phase = task_phase_from_row(&row, "phase")?;
+                    let complete = matches!(
+                        phase,
+                        steward_types::TaskPhase::Succeeded
+                            | steward_types::TaskPhase::Failed
+                            | steward_types::TaskPhase::Cancelled
+                    );
+                    let terminal_content = row
+                        .try_get::<bool, _>("terminal_content")
+                        .map_err(database_error)?;
                     Ok(AgentRunExecutionLog {
                         content: row
                             .try_get::<Option<Vec<u8>>, _>("content")
                             .map_err(database_error)?
                             .unwrap_or_default(),
-                        complete: matches!(
-                            phase,
-                            steward_types::TaskPhase::Succeeded
-                                | steward_types::TaskPhase::Failed
-                                | steward_types::TaskPhase::Cancelled
-                        ) && row
-                            .try_get::<bool, _>("terminal_content")
-                            .map_err(database_error)?,
+                        complete,
+                        partial: complete && !terminal_content,
                     })
                 })
                 .transpose()
@@ -11049,6 +11052,7 @@ pub enum AgentRunLogStream {
 pub struct AgentRunExecutionLog {
     pub content: Vec<u8>,
     pub complete: bool,
+    pub partial: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

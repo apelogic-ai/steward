@@ -2754,7 +2754,10 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             }
             "failed" => {
                 let reason = if payload == b"transcript_too_large" {
-                    "Task execution transcript exceeded its bounded archive contract".to_owned()
+                    format!(
+                        "The execution log exceeded the {} MiB limit per stream.",
+                        MAX_EXECUTION_STREAM_BYTES / (1024 * 1024)
+                    )
                 } else {
                     transcript.as_ref().map_or_else(
                         || {
