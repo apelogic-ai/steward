@@ -3183,10 +3183,10 @@ mod tests {
         let mut requested = base;
         let outside_workspace = WorkspaceAuthority {
             allowed_types: vec![WorkspaceEntryType::Git],
-            max_total_size: ResourceQuantity::parse("1Gi")?,
-            max_files: 1_000,
-            max_history_depth: 100,
-            max_submodule_depth: 1,
+            max_total_size: Some(ResourceQuantity::parse("1Gi")?),
+            max_files: Some(1_000),
+            max_history_depth: Some(100),
+            max_submodule_depth: Some(1),
         };
         requested.spec.workspace = Some(outside_workspace.clone());
         cases.push((

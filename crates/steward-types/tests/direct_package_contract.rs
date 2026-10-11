@@ -8,11 +8,12 @@ use steward_types::direct_package::{
     DirectTaskDefinition, DirectTaskStatusResponse, DirectTaskSubmission, Duration, ExactGitCommit,
     ExecutionLogMode, InstructionSkill, InvocationManifest, PackageClosure, RelativePath,
     RepositoryUrl, SOURCE_PROVENANCE_JWT_CLAIM, Slug, SourceProvenance, StableProviderId, Uuid,
-    WorkspaceGitNamedRef, WorkspaceGitRepositoryName, WorkspaceName, WorkspacePath,
-    canonical_json_bytes,
+    WorkspaceAuthority, WorkspaceGitNamedRef, WorkspaceGitRepositoryName, WorkspaceName,
+    WorkspacePath, canonical_json_bytes,
 };
 
 const CONTRACT_ROOT: &str = "../../docs/contracts/task/v2";
+const INSTALLATION_GUIDE: &str = "../../docs/installation/installation-guide.md";
 
 fn fixture(path: &str) -> Result<String, String> {
     std::fs::read_to_string(
@@ -36,6 +37,55 @@ fn contract_path(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(CONTRACT_ROOT)
         .join(path)
+}
+
+#[test]
+fn workspace_authority_accepts_role_fields_and_preserves_legacy_limits() -> Result<(), String> {
+    let role_scoped: WorkspaceAuthority = serde_json::from_value(serde_json::json!({
+        "allowedTypes": ["git"]
+    }))
+    .map_err(|error| format!("role-scoped workspace authority must parse: {error}"))?;
+    assert_eq!(
+        serde_json::to_value(role_scoped)
+            .map_err(|error| format!("role-scoped workspace authority must serialize: {error}"))?,
+        serde_json::json!({"allowedTypes": ["git"]})
+    );
+
+    let legacy = serde_json::json!({
+        "allowedTypes": ["git", "scratch"],
+        "maxTotalSize": "2Gi",
+        "maxFiles": 100000,
+        "maxHistoryDepth": 1000,
+        "maxSubmoduleDepth": 4
+    });
+    let parsed: WorkspaceAuthority = serde_json::from_value(legacy.clone())
+        .map_err(|error| format!("legacy workspace authority must parse: {error}"))?;
+    assert_eq!(
+        serde_json::to_value(parsed)
+            .map_err(|error| format!("legacy workspace authority must serialize: {error}"))?,
+        legacy,
+        "legacy authority serialization is digest-sensitive"
+    );
+    Ok(())
+}
+
+#[test]
+fn installation_guide_workspace_authority_example_matches_the_contract() -> Result<(), String> {
+    let guide =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(INSTALLATION_GUIDE))
+            .map_err(|error| format!("installation guide must be readable: {error}"))?;
+    let section = guide
+        .split_once("### Governed Task workspaces")
+        .map(|(_, section)| section)
+        .ok_or_else(|| "installation guide must contain the workspace section".to_owned())?;
+    let example = section
+        .split_once("```json\n")
+        .and_then(|(_, tail)| tail.split_once("\n```").map(|(example, _)| example))
+        .ok_or_else(|| "workspace section must contain a JSON authority example".to_owned())?;
+
+    serde_json::from_str::<WorkspaceAuthority>(example)
+        .map_err(|error| format!("workspace authority example must match the contract: {error}"))?;
+    Ok(())
 }
 
 fn collect_json_paths(

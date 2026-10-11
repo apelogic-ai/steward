@@ -287,6 +287,10 @@ export type BrowserApprovalsResponse = {
     envelopeRequests: Array<BrowserEnvelopeRequestView>;
 };
 
+export type BrowserCapabilityCatalogResponse = CapabilityCatalog & {
+    workspace?: null | WorkspaceDeploymentCapabilities;
+};
+
 export type BrowserDecisionReferenceResponse = {
     apiVersion: string;
     approvalId: string;
@@ -1881,10 +1885,22 @@ export type WorkspaceAccess = 'read-only' | 'copy';
 
 export type WorkspaceAuthority = {
     allowedTypes: Array<WorkspaceEntryType>;
+    maxFiles?: number | null;
+    maxHistoryDepth?: number | null;
+    maxSubmoduleDepth?: number | null;
+    maxTotalSize?: null | ResourceQuantity;
+};
+
+export type WorkspaceDeploymentCapabilities = {
+    enabledTypes: Array<string>;
     maxFiles: number;
     maxHistoryDepth: number;
     maxSubmoduleDepth: number;
-    maxTotalSize: ResourceQuantity;
+    maxSubmodulesPerEntry: number;
+    maxTotalBytes: number;
+    maxTotalSubmodules: number;
+    maxTreeReads: number;
+    scratchVolumeBytes: number;
 };
 
 export type WorkspaceEntry = WorkspaceGitEntry | WorkspaceScratchEntry;
@@ -2243,7 +2259,7 @@ export type GetAdminCapabilitiesErrors = {
 };
 
 export type GetAdminCapabilitiesResponses = {
-    200: CapabilityCatalog;
+    200: BrowserCapabilityCatalogResponse;
 };
 
 export type GetAdminCapabilitiesResponse = GetAdminCapabilitiesResponses[keyof GetAdminCapabilitiesResponses];

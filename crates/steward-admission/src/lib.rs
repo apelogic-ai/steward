@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 
 use serde::{Deserialize, Serialize};
-use steward_types::direct_package::{WorkspaceAuthority, WorkspaceEntryType};
+use steward_types::direct_package::{ResourceQuantity, WorkspaceAuthority, WorkspaceEntryType};
 use steward_types::{
     AgentRuntimeSpec, Budget, Duration, KubernetesQuantity, ModelRef, RunnerPlatform,
     RunnerRequirements, SpendSummary, ToolGrant,
@@ -685,10 +685,19 @@ fn workspace_authority_summary(authority: &WorkspaceAuthority) -> String {
         .join(",");
     format!(
         "types=[{types}], total={}, files={}, history={}, submodules={}",
-        authority.max_total_size.as_str(),
-        authority.max_files,
-        authority.max_history_depth,
-        authority.max_submodule_depth
+        authority
+            .max_total_size
+            .as_ref()
+            .map_or("deployment limit", |value| value.as_str()),
+        authority
+            .max_files
+            .map_or_else(|| "deployment limit".to_owned(), |value| value.to_string()),
+        authority
+            .max_history_depth
+            .map_or_else(|| "deployment limit".to_owned(), |value| value.to_string()),
+        authority
+            .max_submodule_depth
+            .map_or_else(|| "deployment limit".to_owned(), |value| value.to_string())
     )
 }
 
@@ -705,17 +714,19 @@ fn validate_workspace_authority(authority: &WorkspaceAuthority) -> Result<(), Ad
             });
         }
     }
-    if authority.max_files == 0 {
+    if authority.max_files == Some(0) {
         return Err(AdmissionError::InvalidWorkspaceAuthority {
             reason: "maxFiles must be positive".to_owned(),
         });
     }
-    if authority.max_history_depth == 0 {
+    if authority.max_history_depth == Some(0) {
         return Err(AdmissionError::InvalidWorkspaceAuthority {
             reason: "maxHistoryDepth must be positive".to_owned(),
         });
     }
-    workspace_quantity(authority.max_total_size.as_str())?;
+    if let Some(max_total_size) = authority.max_total_size.as_ref() {
+        workspace_quantity(max_total_size.as_str())?;
+    }
     Ok(())
 }
 
@@ -732,11 +743,40 @@ fn workspace_authority_is_within(
         .allowed_types
         .iter()
         .all(|entry_type| ceiling.allowed_types.contains(entry_type))
-        && workspace_quantity(requested.max_total_size.as_str())?
-            <= workspace_quantity(ceiling.max_total_size.as_str())?
-        && requested.max_files <= ceiling.max_files
-        && requested.max_history_depth <= ceiling.max_history_depth
-        && requested.max_submodule_depth <= ceiling.max_submodule_depth)
+        && optional_workspace_quantity_is_within(
+            requested.max_total_size.as_ref(),
+            ceiling.max_total_size.as_ref(),
+        )?
+        && optional_workspace_limit_is_within(requested.max_files, ceiling.max_files)
+        && optional_workspace_limit_is_within(
+            requested.max_history_depth,
+            ceiling.max_history_depth,
+        )
+        && optional_workspace_limit_is_within(
+            requested.max_submodule_depth,
+            ceiling.max_submodule_depth,
+        ))
+}
+
+fn optional_workspace_limit_is_within<T: Ord>(requested: Option<T>, ceiling: Option<T>) -> bool {
+    match (requested, ceiling) {
+        (_, None) => true,
+        (Some(requested), Some(ceiling)) => requested <= ceiling,
+        (None, Some(_)) => false,
+    }
+}
+
+fn optional_workspace_quantity_is_within(
+    requested: Option<&ResourceQuantity>,
+    ceiling: Option<&ResourceQuantity>,
+) -> Result<bool, AdmissionError> {
+    match (requested, ceiling) {
+        (_, None) => Ok(true),
+        (Some(requested), Some(ceiling)) => {
+            Ok(workspace_quantity(requested.as_str())? <= workspace_quantity(ceiling.as_str())?)
+        }
+        (None, Some(_)) => Ok(false),
+    }
 }
 
 fn workspace_quantity(value: &str) -> Result<u128, AdmissionError> {
@@ -1171,7 +1211,7 @@ mod tests {
     use super::{
         AdmissionDecision, AdmissionDelta, AdmissionError, Envelope, EnvelopeSpec,
         add_budget_amount, envelope_is_within, evaluate, evaluate_authority_request,
-        evaluate_with_grants, validate_envelope,
+        evaluate_with_grants, validate_envelope, workspace_authority_is_within,
     };
 
     fn assert_request_relation(
@@ -1290,10 +1330,10 @@ mod tests {
     ) -> Result<WorkspaceAuthority, String> {
         Ok(WorkspaceAuthority {
             allowed_types,
-            max_total_size: ResourceQuantity::parse(max_total_size)?,
-            max_files,
-            max_history_depth,
-            max_submodule_depth,
+            max_total_size: Some(ResourceQuantity::parse(max_total_size)?),
+            max_files: Some(max_files),
+            max_history_depth: Some(max_history_depth),
+            max_submodule_depth: Some(max_submodule_depth),
         })
     }
 
@@ -1323,6 +1363,59 @@ mod tests {
             AdmissionDecision::Reject { deltas }
                 if matches!(deltas.as_slice(), [AdmissionDelta::Workspace { .. }])
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_authority_optional_limits_preserve_subset_semantics() -> Result<(), String> {
+        let deployment_limited = WorkspaceAuthority {
+            allowed_types: vec![WorkspaceEntryType::Git, WorkspaceEntryType::Scratch],
+            max_total_size: None,
+            max_files: None,
+            max_history_depth: None,
+            max_submodule_depth: None,
+        };
+        let narrowed = WorkspaceAuthority {
+            allowed_types: vec![WorkspaceEntryType::Git],
+            max_total_size: Some(ResourceQuantity::parse("2Gi")?),
+            max_files: Some(100),
+            max_history_depth: Some(20),
+            max_submodule_depth: Some(2),
+        };
+        assert!(
+            workspace_authority_is_within(&narrowed, Some(&deployment_limited))
+                .map_err(|error| format!("compare deployment-limited authority: {error:?}"))?
+        );
+
+        for ceiling in [
+            WorkspaceAuthority {
+                allowed_types: vec![WorkspaceEntryType::Git],
+                max_total_size: Some(ResourceQuantity::parse("2Gi")?),
+                max_files: None,
+                max_history_depth: None,
+                max_submodule_depth: None,
+            },
+            WorkspaceAuthority {
+                allowed_types: vec![WorkspaceEntryType::Git],
+                max_total_size: None,
+                max_files: Some(100),
+                max_history_depth: None,
+                max_submodule_depth: None,
+            },
+        ] {
+            let requested = WorkspaceAuthority {
+                allowed_types: vec![WorkspaceEntryType::Git],
+                max_total_size: None,
+                max_files: None,
+                max_history_depth: None,
+                max_submodule_depth: None,
+            };
+            assert!(
+                !workspace_authority_is_within(&requested, Some(&ceiling))
+                    .map_err(|error| format!("compare legacy-narrowed authority: {error:?}"))?,
+                "omitting a limit must not widen a stricter parent Envelope"
+            );
+        }
         Ok(())
     }
 
@@ -1518,10 +1611,10 @@ mod tests {
                 .as_mut()
                 .ok_or_else(|| "workspace ceiling must exist".to_owned())?;
             match dimension {
-                "size" => workspace.max_total_size = ResourceQuantity::parse("5Gi")?,
-                "files" => workspace.max_files = 101,
-                "history depth" => workspace.max_history_depth = 21,
-                _ => workspace.max_submodule_depth = 3,
+                "size" => workspace.max_total_size = Some(ResourceQuantity::parse("5Gi")?),
+                "files" => workspace.max_files = Some(101),
+                "history depth" => workspace.max_history_depth = Some(21),
+                _ => workspace.max_submodule_depth = Some(3),
             }
             assert!(
                 matches!(

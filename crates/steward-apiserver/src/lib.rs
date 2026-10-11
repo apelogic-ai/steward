@@ -491,6 +491,8 @@ pub struct GrantRevocationRequest {
         browser_admin::BrowserFederatedSubjectAuditResponse,
         browser_admin::AssociateFederatedSubjectBody,
         browser_admin::DisableFederatedSubjectBody,
+        browser_admin::BrowserCapabilityCatalogResponse,
+        tasks::WorkspaceDeploymentCapabilities,
         browser_members::BrowserMemberView,
         browser_members::BrowserMemberIdentityView,
         browser_members::BrowserMemberDetailView,
@@ -5049,6 +5051,31 @@ mod tests {
     }
 
     #[test]
+    fn admin_capabilities_openapi_publishes_deployment_workspace_limits() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        assert_eq!(
+            document.pointer(
+                "/paths/~1admin~1api~1v1~1capabilities/get/responses/200/content/application~1json/schema/$ref"
+            ),
+            Some(&serde_json::json!(
+                "#/components/schemas/BrowserCapabilityCatalogResponse"
+            )),
+            "the capabilities route must publish its workspace-aware response"
+        );
+        assert_eq!(
+            document.pointer(
+                "/components/schemas/BrowserCapabilityCatalogResponse/allOf/1/properties/workspace/oneOf/1/$ref"
+            ),
+            Some(&serde_json::json!(
+                "#/components/schemas/WorkspaceDeploymentCapabilities"
+            )),
+            "generated clients must receive the deployment workspace limits"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn browser_session_is_published_as_an_opaque_cookie_openapi_contract() -> Result<(), String> {
         let document = serde_json::to_value(ApiDoc::openapi())
             .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
@@ -5402,11 +5429,28 @@ mod tests {
             StatusCode::OK,
             "a pre-redesign client can still approve an unfiled request with an empty object"
         );
-        let admin_app = browser_admin::protected_router_with_custom_envelope_safety(
+        let workspace_capabilities = TaskApiConfig::default()
+            .with_workspace_policy_json(Some(
+                &serde_json::json!({
+                    "enabledTypes": ["scratch"],
+                    "maxTotalSize": "3Gi",
+                    "scratchVolumeSize": "2Gi",
+                    "maxFiles": 321,
+                    "maxHistoryDepth": 42,
+                    "maxSubmoduleDepth": 3,
+                    "maxSubmodulesPerEntry": 7,
+                    "maxTotalSubmodules": 9,
+                    "maxTreeReads": 11
+                })
+                .to_string(),
+            ))?
+            .workspace_deployment_capabilities();
+        let admin_app = browser_admin::protected_router_with_workspace_capabilities(
             runtime_repository,
             admin_ledger.clone(),
             admin_decisions.clone(),
             browser_capability_catalog(),
+            workspace_capabilities,
             Some(admin_safety_ceiling),
             admin_auth,
         );
@@ -5519,6 +5563,25 @@ mod tests {
             Some(&serde_json::json!({
                 "provider": "provider-a",
                 "model": "model-a"
+            }))
+        );
+        assert_eq!(
+            capabilities.pointer("/workspace/enabledTypes"),
+            Some(&serde_json::json!(["scratch"])),
+            "workspace types must come from the deployment policy"
+        );
+        assert_eq!(
+            capabilities.pointer("/workspace"),
+            Some(&serde_json::json!({
+                "enabledTypes": ["scratch"],
+                "maxTotalBytes": 3_u64 * 1024 * 1024 * 1024,
+                "scratchVolumeBytes": 2_u64 * 1024 * 1024 * 1024,
+                "maxFiles": 321,
+                "maxHistoryDepth": 42,
+                "maxSubmoduleDepth": 3,
+                "maxSubmodulesPerEntry": 7,
+                "maxTotalSubmodules": 9,
+                "maxTreeReads": 11
             }))
         );
 
@@ -6858,10 +6921,10 @@ mod tests {
                 runtime_minutes_limit: None,
                 workspace: Some(WorkspaceAuthority {
                     allowed_types: vec![WorkspaceEntryType::Git],
-                    max_total_size: ResourceQuantity::parse("2Gi")?,
-                    max_files: 100_000,
-                    max_history_depth: 1_000,
-                    max_submodule_depth: 4,
+                    max_total_size: Some(ResourceQuantity::parse("2Gi")?),
+                    max_files: Some(100_000),
+                    max_history_depth: Some(1_000),
+                    max_submodule_depth: Some(4),
                 }),
                 ttl: Duration("8h".to_owned()),
                 runner: steward_types::RunnerRequirements::default(),
@@ -9890,10 +9953,10 @@ mod tests {
                 runtime_minutes_limit: None,
                 workspace: Some(WorkspaceAuthority {
                     allowed_types: vec![WorkspaceEntryType::Git, WorkspaceEntryType::Scratch],
-                    max_total_size: ResourceQuantity::parse("2Gi")?,
-                    max_files: 100_000,
-                    max_history_depth: 1_000,
-                    max_submodule_depth: 4,
+                    max_total_size: Some(ResourceQuantity::parse("2Gi")?),
+                    max_files: Some(100_000),
+                    max_history_depth: Some(1_000),
+                    max_submodule_depth: Some(4),
                 }),
                 ttl: Duration("4h".to_owned()),
                 runner: steward_types::RunnerRequirements {
@@ -9951,10 +10014,10 @@ mod tests {
                 runtime_minutes_limit: None,
                 workspace: Some(WorkspaceAuthority {
                     allowed_types: vec![WorkspaceEntryType::Git, WorkspaceEntryType::Scratch],
-                    max_total_size: ResourceQuantity::parse("4Gi")?,
-                    max_files: 200_000,
-                    max_history_depth: 2_000,
-                    max_submodule_depth: 8,
+                    max_total_size: Some(ResourceQuantity::parse("4Gi")?),
+                    max_files: Some(200_000),
+                    max_history_depth: Some(2_000),
+                    max_submodule_depth: Some(8),
                 }),
                 ttl: Duration("24h".to_owned()),
                 runner: steward_types::RunnerRequirements {
@@ -14643,7 +14706,7 @@ mod tests {
                 spec.workspace
                     .as_mut()
                     .ok_or_else(|| "fixture requires workspace authority".to_owned())?
-                    .max_history_depth = 4;
+                    .max_history_depth = Some(4);
             }
         }
         let mut definition = direct_definition_no_skills()?;

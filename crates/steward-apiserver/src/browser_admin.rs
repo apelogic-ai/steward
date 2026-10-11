@@ -25,6 +25,7 @@ use crate::browser_auth::{
     BrowserAdminAuthority, BrowserAuthService, BrowserMutationProof, BrowserMutationRequest,
     protect_browser_admin_routes,
 };
+use crate::tasks::WorkspaceDeploymentCapabilities;
 use crate::user_envelopes::{
     BrowserEnvelope, BrowserEnvelopeSpec, EnvelopeRequestErrorResponse, EnvelopeRequestField,
     capability_catalog_violation_fields, envelope_content_digest, envelope_instance_id,
@@ -215,6 +216,7 @@ pub(crate) struct BrowserAdminState<R, L, D> {
     ledger: L,
     decisions: D,
     capabilities: CapabilityCatalog,
+    workspace_capabilities: Option<WorkspaceDeploymentCapabilities>,
     custom_envelope_safety_ceiling: Option<Envelope>,
 }
 
@@ -225,6 +227,15 @@ pub struct CapabilityCatalog {
     pub models: Vec<ModelRef>,
     pub tools: Vec<CapabilityTool>,
     pub catalogs: Vec<CapabilityProviderCatalog>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserCapabilityCatalogResponse {
+    #[serde(flatten)]
+    catalog: CapabilityCatalog,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<WorkspaceDeploymentCapabilities>,
 }
 
 impl CapabilityCatalog {
@@ -917,6 +928,7 @@ fn inner_router<R, L, D>(
     ledger: L,
     decisions: D,
     capabilities: CapabilityCatalog,
+    workspace_capabilities: Option<WorkspaceDeploymentCapabilities>,
     custom_envelope_safety_ceiling: Option<Envelope>,
 ) -> Router
 where
@@ -989,6 +1001,7 @@ where
             ledger,
             decisions,
             capabilities,
+            workspace_capabilities,
             custom_envelope_safety_ceiling,
         })
 }
@@ -998,7 +1011,7 @@ where
     operation_id = "getAdminCapabilities",
     path = "/admin/api/v1/capabilities",
     responses(
-        (status = 200, body = CapabilityCatalog),
+        (status = 200, body = BrowserCapabilityCatalogResponse),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Administrator role is required")
     ),
@@ -1013,7 +1026,11 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    Json(state.capabilities).into_response()
+    Json(BrowserCapabilityCatalogResponse {
+        catalog: state.capabilities,
+        workspace: state.workspace_capabilities,
+    })
+    .into_response()
 }
 
 #[utoipa::path(
@@ -1648,7 +1665,7 @@ where
     D: DecisionChannel + Clone,
 {
     protect_browser_admin_routes(
-        inner_router(runtimes, ledger, decisions, capabilities, None),
+        inner_router(runtimes, ledger, decisions, capabilities, None, None),
         browser_auth,
     )
 }
@@ -1673,6 +1690,35 @@ where
             ledger,
             decisions,
             capabilities,
+            None,
+            custom_envelope_safety_ceiling,
+        ),
+        browser_auth,
+    )
+}
+
+/// Mount administrator routes with the deployment-owned workspace capability view.
+pub fn protected_router_with_workspace_capabilities<R, L, D>(
+    runtimes: R,
+    ledger: L,
+    decisions: D,
+    capabilities: CapabilityCatalog,
+    workspace_capabilities: WorkspaceDeploymentCapabilities,
+    custom_envelope_safety_ceiling: Option<Envelope>,
+    browser_auth: BrowserAuthService,
+) -> Router
+where
+    R: RuntimeRepository,
+    L: AdmissionLedger,
+    D: DecisionChannel + Clone,
+{
+    protect_browser_admin_routes(
+        inner_router(
+            runtimes,
+            ledger,
+            decisions,
+            capabilities,
+            Some(workspace_capabilities),
             custom_envelope_safety_ceiling,
         ),
         browser_auth,

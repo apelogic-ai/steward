@@ -1352,10 +1352,14 @@ pub enum WorkspaceEntryType {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceAuthority {
     pub allowed_types: Vec<WorkspaceEntryType>,
-    pub max_total_size: ResourceQuantity,
-    pub max_files: u64,
-    pub max_history_depth: u32,
-    pub max_submodule_depth: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_size: Option<ResourceQuantity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_files: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_history_depth: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_submodule_depth: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
