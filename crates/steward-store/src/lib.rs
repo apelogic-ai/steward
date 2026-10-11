@@ -9223,7 +9223,8 @@ impl PgStore {
                     "UPDATE task_execution_attempts \
                      SET state = 'running', generation = generation + 1, \
                          adapter_observation_id = $3, \
-                         live_execution_stdout = $4, live_execution_stderr = $5, \
+                         live_execution_stdout = COALESCE($4, live_execution_stdout), \
+                         live_execution_stderr = COALESCE($5, live_execution_stderr), \
                          started_at = COALESCE(started_at, now()), \
                          retry_at = NULL, last_error_code = NULL, updated_at = now() \
                      WHERE attempt_id = $1 AND generation = $2 \

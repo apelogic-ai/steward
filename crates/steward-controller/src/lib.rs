@@ -696,7 +696,7 @@ async fn run_task_controller<R: SandboxTaskRuntime>(
             }
             Err(error) => eprintln!("task queue read failed: {error}"),
         }
-        tokio::time::sleep(StdDuration::from_secs(1)).await;
+        tokio::time::sleep(TASK_CONTROLLER_POLL_INTERVAL).await;
     }
 }
 
@@ -719,6 +719,7 @@ const TASK_OPERATION_ANNOTATION: &str = "agents.apelogic.ai/orchestration-id";
 const TASK_MANIFEST_DIGEST_ANNOTATION: &str = "agents.apelogic.ai/manifest-digest";
 const TASK_RUNTIME_MODE_ANNOTATION: &str = "agents.apelogic.ai/runtime-mode";
 const TASK_ORCHESTRATOR_ACTOR: &str = "task-orchestrator";
+const TASK_CONTROLLER_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 
 #[derive(Debug)]
 pub enum ApprovalDispatcherError {
@@ -5524,19 +5525,24 @@ mod tests {
     use super::{
         Action, AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ManagedInferencePlane,
         ReconcileDecision, ReconcileIntent, RuntimeCreateErrorClass, SERVICE_PRINCIPAL_ANNOTATION,
-        TaskRuntimeAction, TaskRuntimeBinding, TaskRuntimeBindingStore, authority_action,
-        authority_application_action, classify_runtime_create_status, cleanup_runtime,
-        connection_operation_authority_action, connection_operation_failure_log_line,
-        create_task_runtime_inner, ensure_managed_mode_has_no_stock_credential,
-        exhausted_spend_to_preserve, failed_runtime_status, inference_action,
-        provider_control_bindings_match, reconcile_once, replace_as_controller,
-        runtime_authority_action, runtime_start_failed, runtime_ttl_action,
+        TASK_CONTROLLER_POLL_INTERVAL, TaskRuntimeAction, TaskRuntimeBinding,
+        TaskRuntimeBindingStore, authority_action, authority_application_action,
+        classify_runtime_create_status, cleanup_runtime, connection_operation_authority_action,
+        connection_operation_failure_log_line, create_task_runtime_inner,
+        ensure_managed_mode_has_no_stock_credential, exhausted_spend_to_preserve,
+        failed_runtime_status, inference_action, provider_control_bindings_match, reconcile_once,
+        replace_as_controller, runtime_authority_action, runtime_start_failed, runtime_ttl_action,
         runtime_with_spend_top_up, sandbox_execution_class, sandbox_task_diagnostics,
         server_task_runtime_manifest, status_merge_patch, suspend_runtime,
         suspend_runtime_with_inference_cleanup, task_output_archive_failure,
         task_output_archive_size_failure, task_runtime, task_runtime_action,
         task_runtime_observation_is_failed, ttl_action,
     };
+
+    #[test]
+    fn task_controller_poll_interval_keeps_live_logs_current() {
+        assert!(TASK_CONTROLLER_POLL_INTERVAL <= StdDuration::from_secs(15));
+    }
 
     #[test]
     fn runtime_create_errors_preserve_ambiguity_only_when_effects_are_uncertain() {

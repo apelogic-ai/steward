@@ -1011,6 +1011,48 @@ struct TaskProcessResult {
 }
 
 #[cfg(feature = "runtime")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskProcessLaunchMode {
+    Synchronous,
+    Detached,
+}
+
+#[cfg(feature = "runtime")]
+#[derive(Debug, Eq, PartialEq)]
+enum TaskProcessLaunchOutcome {
+    Detached,
+    Completed(Result<TaskProcessResult, PortError>),
+}
+
+#[cfg(feature = "runtime")]
+fn task_process_launch_mode(
+    execution_class: SandboxExecutionClass,
+    execution_log: ExecutionLogMode,
+) -> TaskProcessLaunchMode {
+    if execution_class == SandboxExecutionClass::Agent && execution_log == ExecutionLogMode::Full {
+        TaskProcessLaunchMode::Detached
+    } else {
+        TaskProcessLaunchMode::Synchronous
+    }
+}
+
+#[cfg(feature = "runtime")]
+async fn launch_task_process<F>(mode: TaskProcessLaunchMode, process: F) -> TaskProcessLaunchOutcome
+where
+    F: Future<Output = Result<TaskProcessResult, PortError>> + Send + 'static,
+{
+    match mode {
+        TaskProcessLaunchMode::Synchronous => TaskProcessLaunchOutcome::Completed(process.await),
+        TaskProcessLaunchMode::Detached => {
+            drop(tokio::spawn(async move {
+                let _ = process.await;
+            }));
+            TaskProcessLaunchOutcome::Detached
+        }
+    }
+}
+
+#[cfg(feature = "runtime")]
 #[derive(Clone, Copy)]
 struct TaskProcessLogContext<'a> {
     runtime_uid: &'a str,
@@ -2551,19 +2593,40 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             output_archive_command,
             task_transcript_requested(request.execution_class, request.diagnostics.execution_log),
         );
-        let executed = self
-            .exec_task_process(
-                &sandbox_id,
-                &["/bin/sh".to_owned(), "-c".to_owned(), wrapped_command],
-                environment,
-                request.execution_class,
-                TaskProcessLogContext {
-                    runtime_uid: &request.runtime.0,
-                    workspace,
-                    sandbox,
-                },
-            )
-            .await;
+        let process_runtime = self.clone();
+        let process_runtime_uid = request.runtime.0.clone();
+        let process_workspace = workspace.to_owned();
+        let process_sandbox = sandbox.to_owned();
+        let process_command = vec!["/bin/sh".to_owned(), "-c".to_owned(), wrapped_command];
+        let execution_class = request.execution_class;
+        let process = async move {
+            process_runtime
+                .exec_task_process(
+                    &sandbox_id,
+                    &process_command,
+                    environment,
+                    execution_class,
+                    TaskProcessLogContext {
+                        runtime_uid: &process_runtime_uid,
+                        workspace: &process_workspace,
+                        sandbox: &process_sandbox,
+                    },
+                )
+                .await
+        };
+        let executed = match launch_task_process(
+            task_process_launch_mode(request.execution_class, request.diagnostics.execution_log),
+            process,
+        )
+        .await
+        {
+            TaskProcessLaunchOutcome::Detached => {
+                return Ok(SandboxTaskObservation::Accepted {
+                    adapter_observation_id: attempt_id.0.clone(),
+                });
+            }
+            TaskProcessLaunchOutcome::Completed(executed) => executed,
+        };
         let execution_error = match executed {
             Ok(executed) => {
                 return self
@@ -3147,18 +3210,18 @@ mod tests {
     use super::{
         CONNECTIONS_BRIDGE_AGENT_TYPE, INFERENCE_PROVIDER, OpenShellConnectionConfig,
         OpenShellTaskLogMode, ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES,
-        SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream, TaskProcessLogContext,
-        TaskProcessLogSink, TaskProcessStream, WorkloadExchangeTokenProvider,
-        attach_task_agent_failure_category, collect_task_process_stream, delete_owned_sandbox,
-        deletion_names, load_source_credential, output_archive_command, project_request,
-        provider_reconciliation, provider_reconciliation_plan, provider_reconciliation_targets,
-        sandbox_spec, sanitized_provider_control_transcript, staging_append_command,
-        staging_archive_chunks, staging_extract_command, staging_prepare_command,
-        task_agent_failure_category, task_attempt_directory, task_attempt_execution_command,
-        task_attempt_observation_command, task_attempt_transcript_stream_command,
-        task_failure_category, task_process_log_record, task_transcript_requested,
-        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
-        workspace_materialization_command,
+        SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream, TaskProcessLaunchMode,
+        TaskProcessLaunchOutcome, TaskProcessLogContext, TaskProcessLogSink, TaskProcessResult,
+        TaskProcessStream, WorkloadExchangeTokenProvider, attach_task_agent_failure_category,
+        collect_task_process_stream, delete_owned_sandbox, deletion_names, launch_task_process,
+        load_source_credential, output_archive_command, project_request, provider_reconciliation,
+        provider_reconciliation_plan, provider_reconciliation_targets, sandbox_spec,
+        sanitized_provider_control_transcript, staging_append_command, staging_archive_chunks,
+        staging_extract_command, staging_prepare_command, task_agent_failure_category,
+        task_attempt_directory, task_attempt_execution_command, task_attempt_observation_command,
+        task_attempt_transcript_stream_command, task_failure_category, task_process_launch_mode,
+        task_process_log_record, task_transcript_requested, validate_raw_sandbox_binding,
+        validate_workload_exchange_endpoint, workspace_materialization_command,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -3698,6 +3761,44 @@ mod tests {
         );
         assert_eq!(log_sink.records.len(), 1);
         Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn full_diagnostics_agent_launch_returns_before_process_completion() {
+        assert_eq!(
+            task_process_launch_mode(SandboxExecutionClass::Agent, ExecutionLogMode::Full),
+            TaskProcessLaunchMode::Detached
+        );
+        assert_eq!(
+            task_process_launch_mode(SandboxExecutionClass::Agent, ExecutionLogMode::Off),
+            TaskProcessLaunchMode::Synchronous
+        );
+        assert_eq!(
+            task_process_launch_mode(
+                SandboxExecutionClass::ProviderControl,
+                ExecutionLogMode::Full,
+            ),
+            TaskProcessLaunchMode::Synchronous
+        );
+
+        let (_release, blocked) = tokio::sync::oneshot::channel::<()>();
+        let launched = tokio::time::timeout(
+            Duration::from_millis(25),
+            launch_task_process(TaskProcessLaunchMode::Detached, async move {
+                let _ = blocked.await;
+                Ok(TaskProcessResult {
+                    exit_code: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }),
+        )
+        .await;
+        assert!(
+            matches!(launched, Ok(TaskProcessLaunchOutcome::Detached)),
+            "full-diagnostics execution must detach so the controller can observe its transcript while it runs"
+        );
     }
 
     #[cfg(feature = "runtime")]

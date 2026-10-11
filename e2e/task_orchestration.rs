@@ -1243,6 +1243,7 @@ struct AmbiguousTaskRuntime {
     deletes: Arc<AtomicUsize>,
     fail_next_ensure: Arc<AtomicBool>,
     succeed_next_start: Arc<AtomicBool>,
+    progressive_success_stage: Arc<AtomicUsize>,
     terminal_observed: Arc<AtomicBool>,
     fail_next_observation: Arc<AtomicBool>,
     provider_control_bindings: Option<ProviderControlExecutionBindings>,
@@ -1333,7 +1334,7 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
 
     async fn start_task(
         &self,
-        _attempt_id: &TaskAttemptId,
+        attempt_id: &TaskAttemptId,
         request: &SandboxTaskRequest,
         _input_archive: &[u8],
     ) -> Result<SandboxTaskObservation, PortError> {
@@ -1345,15 +1346,9 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
                         .to_owned(),
                 });
             }
-            return Ok(SandboxTaskObservation::SucceededWithTranscript {
-                adapter_observation_id: "successful-task-execution".to_owned(),
-                output: SandboxTaskOutput {
-                    archive: task_output_archive(&[("out/result.txt", b"successful task output")]),
-                },
-                transcript: SandboxTaskTranscript {
-                    stdout: b"successful task stdout".to_vec(),
-                    stderr: b"successful task stderr".to_vec(),
-                },
+            self.progressive_success_stage.store(1, Ordering::SeqCst);
+            return Ok(SandboxTaskObservation::Accepted {
+                adapter_observation_id: attempt_id.0.clone(),
             });
         }
         Err(PortError::Failed {
@@ -1364,11 +1359,63 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
     async fn observe_task(
         &self,
         attempt_id: &TaskAttemptId,
-        _request: &SandboxTaskRequest,
+        request: &SandboxTaskRequest,
     ) -> Result<SandboxTaskObservation, PortError> {
         if self.fail_next_observation.swap(false, Ordering::SeqCst) {
             return Err(PortError::Failed {
                 reason: "temporary observation transport failure".to_owned(),
+            });
+        }
+        loop {
+            let stage = self.progressive_success_stage.load(Ordering::SeqCst);
+            if stage == 0 {
+                break;
+            }
+            if request.diagnostics.execution_log != ExecutionLogMode::Full {
+                return Err(PortError::Failed {
+                    reason: "progressive fixture did not retain full execution diagnostics"
+                        .to_owned(),
+                });
+            }
+            let next = if stage >= 4 { 0 } else { stage + 1 };
+            if self
+                .progressive_success_stage
+                .compare_exchange(stage, next, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                continue;
+            }
+            return Ok(match stage {
+                1 => SandboxTaskObservation::RunningWithTranscript {
+                    adapter_observation_id: attempt_id.0.clone(),
+                    transcript: SandboxTaskTranscript {
+                        stdout: b"successful".to_vec(),
+                        stderr: b"successful".to_vec(),
+                    },
+                },
+                2 => SandboxTaskObservation::Running {
+                    adapter_observation_id: attempt_id.0.clone(),
+                },
+                3 => SandboxTaskObservation::RunningWithTranscript {
+                    adapter_observation_id: attempt_id.0.clone(),
+                    transcript: SandboxTaskTranscript {
+                        stdout: b"successful task".to_vec(),
+                        stderr: b"successful task".to_vec(),
+                    },
+                },
+                _ => SandboxTaskObservation::SucceededWithTranscript {
+                    adapter_observation_id: attempt_id.0.clone(),
+                    output: SandboxTaskOutput {
+                        archive: task_output_archive(&[(
+                            "out/result.txt",
+                            b"successful task output",
+                        )]),
+                    },
+                    transcript: SandboxTaskTranscript {
+                        stdout: b"successful task stdout".to_vec(),
+                        stderr: b"successful task stderr".to_vec(),
+                    },
+                },
             });
         }
         if self.terminal_observed.load(Ordering::SeqCst) {
@@ -3736,6 +3783,54 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         starts_before_success + 1,
         "successful execution must cross the Task adapter exactly once"
     );
+    assert_eq!(
+        operation(&store, successful_task_uid).await?.state,
+        TaskOrchestrationState::Active,
+        "an accepted execution must remain observable before it becomes terminal"
+    );
+
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+    let first_live_log = store
+        .agent_run_execution_log(
+            successful_task_uid,
+            Some(identity.user_id.as_str()),
+            AgentRunLogStream::Stdout,
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("first live execution transcript is absent"))?;
+    assert_eq!(first_live_log.content, b"successful");
+    assert!(!first_live_log.complete);
+
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+    let preserved_live_log = store
+        .agent_run_execution_log(
+            successful_task_uid,
+            Some(identity.user_id.as_str()),
+            AgentRunLogStream::Stdout,
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("preserved live execution transcript is absent"))?;
+    assert_eq!(
+        preserved_live_log.content, first_live_log.content,
+        "an observation without a transcript must not erase the last live snapshot"
+    );
+    assert!(!preserved_live_log.complete);
+
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
+    let grown_live_log = store
+        .agent_run_execution_log(
+            successful_task_uid,
+            Some(identity.user_id.as_str()),
+            AgentRunLogStream::Stdout,
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("grown live execution transcript is absent"))?;
+    assert_eq!(grown_live_log.content, b"successful task");
+    assert!(grown_live_log.content.starts_with(&first_live_log.content));
+    assert!(grown_live_log.content.len() > first_live_log.content.len());
+    assert!(!grown_live_log.complete);
+
+    reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
     assert_eq!(
         operation(&store, successful_task_uid).await?.state,
         TaskOrchestrationState::CleanupPending,
