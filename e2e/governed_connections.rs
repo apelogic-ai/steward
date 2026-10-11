@@ -1,6 +1,7 @@
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::future::Future;
 use std::hash::Hash;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -56,6 +57,30 @@ const AGENTGATEWAY_ORIGIN: &str =
     "http://mcp-gw-agentgateway.steward-system.svc.cluster.local:8080";
 const AGENTGATEWAY_MCP_URL: &str =
     "http://mcp-gw-agentgateway.steward-system.svc.cluster.local:8080/mcp";
+const AGENTGATEWAY_INITIALIZE_PROBE: &str = r#"
+headers="$(mktemp)"
+trap 'rm -f "$headers"' EXIT HUP INT TERM
+curl -fsS --max-time 20 \
+  -D "$headers" \
+  -o /dev/null \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
+  --data "$1" \
+  "$2"
+session="$(
+  sed -n \
+    's/^[Mm][Cc][Pp]-[Ss][Ee][Ss][Ss][Ii][Oo][Nn]-[Ii][Dd]:[[:space:]]*//p' \
+    "$headers" | sed -n '1{s/\r$//;p;}'
+)"
+test -n "$session"
+curl -fsS --max-time 20 \
+  -X DELETE \
+  -o /dev/null \
+  -H 'MCP-Protocol-Version: 2025-06-18' \
+  -H "Mcp-Session-Id: $session" \
+  "$2" || :
+"#;
 
 #[derive(Clone, Copy)]
 struct NoInference;
@@ -600,6 +625,84 @@ impl Harness {
         ))
     }
 
+    fn agentgateway_initialize_once(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<bool, Box<dyn Error>> {
+        let workspace = self.runtime_ref(namespace, name, "workspace")?;
+        let sandbox = self.runtime_ref(namespace, name, "sandbox")?;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "steward-agentgateway-readiness",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "steward-agentgateway-readiness",
+                    "version": "1.0.0"
+                }
+            }
+        })
+        .to_string();
+        let output = Command::new(&self.openshell)
+            .args(["--gateway-endpoint"])
+            .arg(required("STEWARD_OPENSHELL_ENDPOINT")?)
+            .args([
+                "--workspace",
+                &workspace,
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox,
+            ])
+            .args([
+                "--no-tty",
+                "--",
+                "sh",
+                "-ceu",
+                AGENTGATEWAY_INITIALIZE_PROBE,
+                "steward-agentgateway-readiness",
+                &request,
+                AGENTGATEWAY_MCP_URL,
+            ])
+            .output()?;
+        Ok(output.status.success())
+    }
+
+    fn wait_agentgateway_initialize(
+        &self,
+        namespace: &str,
+        name: &str,
+        timeout: Duration,
+    ) -> Result<Duration, Box<dyn Error>> {
+        let started = Instant::now();
+        let mut attempt = 1_u32;
+        loop {
+            if self.agentgateway_initialize_once(namespace, name)? {
+                let elapsed = started.elapsed();
+                eprintln!(
+                    "agentgateway readiness: authenticated initialize completed after {attempt} attempt(s) in {} ms",
+                    elapsed.as_millis()
+                );
+                return Ok(elapsed);
+            }
+            if started.elapsed() >= timeout {
+                return Err(io::Error::other(format!(
+                    "agentgateway did not complete an authenticated initialize within {} seconds",
+                    timeout.as_secs()
+                ))
+                .into());
+            }
+            eprintln!(
+                "agentgateway readiness: authenticated initialize attempt {attempt} did not complete; retrying in 500 ms"
+            );
+            attempt += 1;
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     fn assert_agentgateway_requires_a_session(
         &self,
         namespace: &str,
@@ -927,6 +1030,139 @@ fn connection_result<T>(result: Result<T, ConnectionBrokerError>) -> Result<T, i
     result.map_err(|error| io::Error::other(format!("connection operation failed: {error:?}")))
 }
 
+fn should_retry_first_gateway_transport(
+    error: &ConnectionBrokerError,
+    attempt: usize,
+    max_attempts: usize,
+) -> bool {
+    matches!(error, ConnectionBrokerError::GatewayTransportFailed) && attempt < max_attempts
+}
+
+async fn retry_first_gateway_transport_operation<F, Fut>(
+    operation: &str,
+    max_attempts: usize,
+    delay: Duration,
+    mut execute: F,
+) -> Result<serde_json::Value, ConnectionBrokerError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<serde_json::Value, ConnectionBrokerError>>,
+{
+    for attempt in 1..=max_attempts {
+        match execute().await {
+            Err(error) if should_retry_first_gateway_transport(&error, attempt, max_attempts) => {
+                eprintln!(
+                    "agentgateway first operation retry: operation={operation} attempt={attempt}/{max_attempts} category=bridge-gateway-transport delay_ms={}",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+            }
+            other => return other,
+        }
+    }
+    Err(ConnectionBrokerError::GatewayTransportFailed)
+}
+
+#[tokio::test]
+async fn first_gateway_transport_retry_is_bounded() {
+    let attempts = std::cell::Cell::new(0_usize);
+    let recovered =
+        retry_first_gateway_transport_operation("repository-search", 3, Duration::ZERO, || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            std::future::ready(if attempt < 3 {
+                Err(ConnectionBrokerError::GatewayTransportFailed)
+            } else {
+                Ok(json!({"repositories": []}))
+            })
+        })
+        .await;
+    assert_eq!(recovered, Ok(json!({"repositories": []})));
+    assert_eq!(attempts.get(), 3);
+
+    let non_transport_attempts = std::cell::Cell::new(0_usize);
+    let rejected =
+        retry_first_gateway_transport_operation("repository-search", 3, Duration::ZERO, || {
+            non_transport_attempts.set(non_transport_attempts.get() + 1);
+            std::future::ready(Err(ConnectionBrokerError::GatewaySessionFailed))
+        })
+        .await;
+    assert_eq!(rejected, Err(ConnectionBrokerError::GatewaySessionFailed));
+    assert_eq!(non_transport_attempts.get(), 1);
+
+    let exhausted_attempts = std::cell::Cell::new(0_usize);
+    let exhausted =
+        retry_first_gateway_transport_operation("repository-search", 3, Duration::ZERO, || {
+            exhausted_attempts.set(exhausted_attempts.get() + 1);
+            std::future::ready(Err(ConnectionBrokerError::GatewayTransportFailed))
+        })
+        .await;
+    assert_eq!(
+        exhausted,
+        Err(ConnectionBrokerError::GatewayTransportFailed)
+    );
+    assert_eq!(exhausted_attempts.get(), 3);
+}
+
+#[test]
+fn agentgateway_initialize_probe_validates_and_closes_the_issued_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture_directory =
+        env::temp_dir().join(format!("steward-agentgateway-readiness-{}", Uuid::new_v4()));
+    fs::create_dir_all(&fixture_directory).expect("fixture directory must be created");
+    let curl = fixture_directory.join("curl");
+    fs::write(
+        &curl,
+        r#"#!/bin/sh
+headers=
+method=POST
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -D) headers="$2"; shift 2 ;;
+    -X) method="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ "$method" = DELETE ]; then
+  exit 0
+fi
+test -n "$headers"
+printf 'HTTP/1.1 200 OK\r\nMcp-Session-Id: fixture-session\r\n\r\n' >"$headers"
+"#,
+    )
+    .expect("fixture curl must be written");
+    let mut permissions = fs::metadata(&curl)
+        .expect("fixture curl metadata must be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&curl, permissions).expect("fixture curl must be executable");
+    let inherited_path = env::var("PATH").expect("test PATH must be set");
+    let output = Command::new("sh")
+        .args([
+            "-ceu",
+            AGENTGATEWAY_INITIALIZE_PROBE,
+            "steward-agentgateway-readiness-test",
+            "{}",
+            "https://gateway.example.test/mcp",
+        ])
+        .env(
+            "PATH",
+            format!("{}:{inherited_path}", fixture_directory.display()),
+        )
+        .output()
+        .expect("readiness fixture must execute");
+    fs::remove_dir_all(&fixture_directory).expect("fixture directory must be removed");
+
+    assert!(
+        output.status.success(),
+        "readiness fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-session"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-session"));
+}
+
 async fn wait_start_operation<B>(
     broker: &GovernedConnectionsBroker<B>,
     session: &ConnectionSession<B>,
@@ -978,6 +1214,33 @@ where
     }
 }
 
+async fn execute_first_agentgateway_repository_search(
+    broker: &GovernedConnectionsBroker<()>,
+    session: &ConnectionSession<()>,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, ConnectionBrokerError> {
+    retry_first_gateway_transport_operation(
+        "repository-search",
+        3,
+        Duration::from_millis(500),
+        || {
+            let identity = GithubAutomationIdentity::fresh("agentgateway-repositories");
+            let request = request.clone();
+            async move {
+                GithubAutomationBroker::execute(
+                    broker,
+                    session,
+                    steward_apiserver::governed_connections::ConnectionOperationKind::Repositories,
+                    request,
+                    &identity,
+                )
+                .await
+            }
+        },
+    )
+    .await
+}
+
 async fn exercise_agentgateway_automation(
     harness: &mut Harness,
     session: &ConnectionSession<()>,
@@ -997,28 +1260,28 @@ async fn exercise_agentgateway_automation(
     harness
         .switch_execution_binding("github-attestation", AGENTGATEWAY_ORIGIN)
         .await?;
+    harness.wait_agentgateway_initialize(
+        ALICE_NAMESPACE,
+        ALICE_RUNTIME,
+        Duration::from_secs(30),
+    )?;
     let broker = harness.agentgateway_broker()?;
 
     let user_id = &session.subject.canonical_user_id;
     let repositories_count = harness.operation_count(user_id, "repositories").await?;
+    let repositories_request = json!({
+        "query": "repo:example-org/example-repo",
+        "page": 1,
+        "perPage": 10
+    });
     let repositories = harness
         .automation_result(
             user_id,
             "repositories",
             repositories_count,
             "agentgateway repository search",
-            GithubAutomationBroker::execute(
-                &broker,
-                session,
-                steward_apiserver::governed_connections::ConnectionOperationKind::Repositories,
-                json!({
-                    "query": "repo:example-org/example-repo",
-                    "page": 1,
-                    "perPage": 10
-                }),
-                &GithubAutomationIdentity::fresh("agentgateway-repositories"),
-            )
-            .await,
+            execute_first_agentgateway_repository_search(&broker, session, &repositories_request)
+                .await,
         )
         .await?;
     assert_eq!(repositories["repositories"][0]["owner"], "example-org");
