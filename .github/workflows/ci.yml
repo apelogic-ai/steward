@@ -101,6 +101,12 @@ jobs:
           bash scripts/test-validate-release-version.sh
           bash scripts/validate-release-version.sh
 
+      # Includes the guard that keeps a file in the docs class only while
+      # nothing compiles or bundles it. A web or docs change can add such a
+      # consumer, so the guard must run here and not only in the full gate.
+      - name: Run the change classifier tests
+        run: bash scripts/test-ci-change-class.sh
+
   quality:
     name: quality
     needs: changes

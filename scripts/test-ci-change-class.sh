@@ -60,7 +60,7 @@ expect_class docs "agent definition" .claude/agents/x.md
 expect_class docs "skill definition" .claude/skills/review/SKILL.md
 expect_class docs "codex skill definition" .codex/skills/review/SKILL.md
 expect_class docs "root README" README.md
-expect_class docs "nested READMEs" migrations/README.md crates/steward-mint/README.md third_party/mcp-gw-patches/c2af10d9/README.md
+expect_class docs "READMEs below source roots" crates/steward-mint/README.md adapters/openshell/README.md bins/steward-apiserver/README.md e2e/README.md xtask/README.md conformance/README.md docs/v2/README.md
 expect_class docs "changelog only" CHANGELOG.md
 expect_class docs "prose under docs" docs/README.md docs/v2/overview.md docs/installation/upgrade-v0.3.0.md
 expect_class docs "static image under docs" docs/diagrams/overview.png
@@ -87,6 +87,15 @@ expect_class full "workflow file" .github/workflows/ci.yml
 expect_class full "docs plus a workflow file" docs/README.md .github/workflows/release.yml
 expect_class full "composite action" .github/actions/setup-tools/action.yml
 expect_class full "README beside workflows" .github/workflows/README.md
+expect_class full "README beside migrations" migrations/README.md
+expect_class full "README beside manifests" manifests/README.md
+expect_class full "README beside a vendored patch" third_party/mcp-gw-patches/c2af10d9/README.md
+expect_class full "README beside scripts" scripts/README.md
+expect_class full "agent instructions in an unlisted root" build/AGENTS.md
+expect_class full "README in a new root" packaging/README.md
+expect_class full "README in a bundle below a new root" dist/bundle/README.md
+expect_class docs "mode-only change is classified by path" "M 100644 100644 docs/README.md"
+expect_class web "mode-only change under web" "M 100644 100755 web/scripts/build.sh"
 expect_class full "git hook" .githooks/pre-push
 expect_class full "root lockfile" bun.lock
 expect_class full "web plus root lockfile" web/package.json bun.lock
@@ -136,7 +145,43 @@ expect_class full "rename record" "R 100644 100644 web/src/app/page.tsx"
 expect_class full "path with a control character" "$(printf 'docs/a\tb.md')"
 expect_class full "path with a newline" "$(printf 'docs/a\nREADME.md')"
 expect_class full "parent traversal" docs/../scripts/x.md
+expect_class full "path with a space" "docs/release notes.md"
+expect_class full "path with a workflow command marker" "docs/::notice::x.md"
+expect_class full "path with a quote" "web/src/it's.ts"
+expect_class full "path with a non-ASCII character" "docs/überblick.md"
+expect_class web "route directory with brackets" "web/src/app/runs/[id]/logs/[stream]/page.tsx"
+expect_class web "route group with parentheses" "web/src/app/(admin)/page.tsx"
 expect_class full "absolute path" /docs/README.md
+
+# Changed paths are untrusted. A file name that carries a runner workflow
+# command must be `full`, and no line of output may start with `::` or repeat
+# the name.
+hostile_names=(
+  "$(printf 'docs/a\n::add-mask::README.md')"
+  "$(printf 'docs/a\n::stop-commands::token\n.md')"
+  "$(printf 'web/src/a\r::error::spoofed.ts')"
+  "$(printf 'crates/x\n::set-output name=class::docs')"
+  'docs/::add-mask::x.md'
+  'crates/a b::error::x.rs'
+  "$(printf 'docs/\033[2K.md')"
+)
+for hostile in "${hostile_names[@]}"; do
+  for status in M U; do
+    output="$(raw_record "${status}" 100644 100644 "${hostile}" | bash "${script}" classify 2>&1)"
+    [[ "$(tail -n 1 <<<"${output}")" == full ]] || fail "hostile path must be full"
+    if grep -Eq '(^|[[:cntrl:]])::|add-mask|stop-commands|spoofed|set-output' <<<"${output}"; then
+      fail "a hostile path reached the log: $(printf '%q' "${output}")"
+    fi
+    if [[ "$(wc -l <<<"${output}" | tr -d ' ')" != 2 ]]; then
+      fail "a hostile path added log lines: $(printf '%q' "${output}")"
+    fi
+  done
+done
+output="$(bash "${script}" verdict "$(printf 'docs\n::add-mask::x')" "$(printf 'success\n::error::y')" \
+  "$(printf 'quality=success\n::stop-commands::z')" 2>&1)" && fail "a hostile verdict input must fail"
+if grep -Eq '(^|[[:cntrl:]])::|add-mask|stop-commands' <<<"${output}"; then
+  fail "a hostile verdict input reached the log"
+fi
 
 # An empty diff, malformed input, and an oversized change set.
 if [[ "$(printf '' | bash "${script}" classify 2>/dev/null)" != full ]]; then
@@ -245,6 +290,11 @@ ln -s ../../crates/steward-types/src/a.rs "${repository}/web/src/link.ts"
 symlink_head="$(fixture_commit 'symlink under web')"
 
 scenario
+hostile_file="$(printf 'docs/a\n::add-mask::README.md')"
+echo '# hostile' >"${repository}/${hostile_file}"
+hostile_head="$(fixture_commit 'file name with a workflow command')"
+
+scenario
 mkdir -p "${repository}/.github/workflows"
 echo 'name: ci' >"${repository}/.github/workflows/ci.yml"
 workflow_head="$(fixture_commit 'workflow change')"
@@ -302,6 +352,19 @@ expect_detect full "pull request, Rust" pull_request main "${base}" "${rust_head
 expect_detect full "pull request, rename from web to crates" pull_request main "${base}" "${rename_head}"
 expect_detect full "pull request, deleted Rust file" pull_request main "${base}" "${delete_head}"
 expect_detect full "pull request, symlink under web" pull_request main "${base}" "${symlink_head}"
+expect_detect full "pull request, hostile file name" pull_request main "${base}" "${hostile_head}"
+output="$(cd "${repository}" && env -u GIT_DIR -u GIT_WORK_TREE \
+  CI_EVENT_NAME=pull_request CI_BASE_REF=main CI_BASE_SHA="${base}" CI_HEAD_SHA="${hostile_head}" \
+  bash "${script}" detect 2>&1)"
+if grep -Eq '(^|[[:cntrl:]])::|add-mask' <<<"${output}"; then
+  fail "a hostile file name reached the detect log"
+fi
+output="$(cd "${repository}" && env -u GIT_DIR -u GIT_WORK_TREE \
+  CI_EVENT_NAME="$(printf 'push\n::add-mask::x')" CI_BASE_REF="$(printf 'main\n::error::x')" \
+  CI_BASE_SHA="${base}" CI_HEAD_SHA="${web_head}" bash "${script}" detect 2>&1)"
+if grep -Eq '(^|[[:cntrl:]])::|add-mask' <<<"${output}"; then
+  fail "a hostile event name reached the detect log"
+fi
 expect_detect full "pull request, workflow file" pull_request main "${base}" "${workflow_head}"
 expect_detect full "pull request, lockfile" pull_request main "${base}" "${lockfile_head}"
 expect_detect full "pull request, oversized" pull_request main "${base}" "${large_head}"
@@ -520,14 +583,30 @@ if repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     done < <(grep -E -- "^$(printf '%s' "${candidate}" | sed 's/[][\.*^$+?(){}|/]/\\&/g')(/|$)" "${tracked}" || true)
   }
 
-  # 1. Rust sources outside xtask: every string literal that could name a
-  #    document, resolved against the source directory, its crate root, and
-  #    the repository root. This covers include_str!, include_bytes!, and
-  #    files read at test time. xtask is exempt because the reduced lanes run
-  #    its tests.
+  # 1. Rust sources: every string literal that could name a document,
+  #    resolved against the source directory, its crate root, and the
+  #    repository root. This covers include_str!, include_bytes!, and files
+  #    read at test time. Only the test modules of xtask are exempt, because
+  #    the reduced lanes run `cargo test -p xtask`; the xtask commands
+  #    themselves run only in the full gate.
+  xtask_test_start() {
+    local line
+    line="$(grep -n '^#\[cfg(test)\]' "${root}/$1" | tail -n 1 | cut -d: -f1)"
+    echo "${line:-0}"
+  }
   while IFS= read -r match; do
     source_file="${match%%:*}"
+    match="${match#*:}"
+    line_number="${match%%:*}"
     literal="${match#*:}"
+    in_xtask=0
+    if [[ "${source_file}" == xtask/* ]]; then
+      in_xtask=1
+      test_start="$(xtask_test_start "${source_file}")"
+      if ((test_start > 0 && line_number >= test_start)); then
+        continue
+      fi
+    fi
     literal="${literal#\"}"
     literal="${literal%\"}"
     case "${literal}" in
@@ -544,32 +623,93 @@ if repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     if [[ -n "${crate}" ]]; then
       reject_docs_consumer "${source_file}" "$(normalize "${crate}/${literal}")"
     fi
-    if [[ "${literal}" == */* ]]; then
+    if [[ "${literal}" == */* || "${in_xtask}" == 1 ]]; then
       reject_docs_consumer "${source_file}" "$(normalize "${literal}")"
     fi
-  done < <(repo_git grep -oE '"[^"]*(docs/|\.md|\.txt|\.rst|README|AGENTS|CLAUDE|CHANGELOG|\.png|\.jpe?g|\.gif|\.svg|\.webp)[^"]*"' \
-    -- '*.rs' ':!xtask/' || true)
+  done < <(repo_git grep -noE '"[^"]*(docs/|\.md|\.txt|\.rst|README|AGENTS|CLAUDE|CHANGELOG|\.png|\.jpe?g|\.gif|\.svg|\.webp)[^"]*"' \
+    -- '*.rs' || true)
+  for xtask_source in xtask/src/main.rs xtask/src/lib.rs; do
+    (($(xtask_test_start "${xtask_source}") > 0)) ||
+      fail "${xtask_source} has no test module marker; the xtask exemption cannot be scoped"
+  done
 
-  # 2. Image builds: a document copied from the build context into the final
-  #    stage of an image is part of that image. Earlier stages only feed the
-  #    compiler, which check 1 covers.
+  # 2. Packaged directories, derived from the build definitions: everything
+  #    the final stage of an image copies, from the build context or from an
+  #    earlier stage that holds the repository, and every chart directory
+  #    passed to `helm package`. No docs-class file may live in one, so a new
+  #    packaged directory fails here until its files are classified. Earlier
+  #    image stages only feed the compiler, which check 1 covers.
+  packaged="${scratch}/packaged"
+  : >"${packaged}"
+  packaged_candidate() {
+    local consumer="$1" candidate="$2"
+    [[ -n "${candidate}" ]] || return 0
+    if grep -Eq -- "^$(printf '%s' "${candidate}" | sed 's/[][\.*^$+?(){}|/]/\\&/g')(/|$)" "${tracked}"; then
+      echo "${candidate}" >>"${packaged}"
+      reject_docs_consumer "${consumer}" "${candidate}"
+    fi
+  }
   while IFS= read -r dockerfile; do
     while IFS= read -r instruction; do
       read -r -a tokens <<<"${instruction}"
       token_count="${#tokens[@]}"
+      from_stage=0
       for ((index = 1; index < token_count - 1; index++)); do
         token="${tokens[index]}"
         case "${token}" in
-          --*|.|./) continue ;;
+          --from=*) from_stage=1; continue ;;
+          --*) continue ;;
         esac
-        reject_docs_consumer "${dockerfile}" "$(normalize "${token}")"
+        if ((from_stage == 0)); then
+          case "${token}" in
+            .|./|'*'|./'*')
+              fail "${dockerfile} copies the whole build context into its final image"
+              continue
+              ;;
+          esac
+          packaged_candidate "${dockerfile}" "$(normalize "${token}")"
+        else
+          # A path inside an earlier stage: try each suffix as a repository
+          # path, so /workspace/web/public is recognised as web/public.
+          suffix="${token#/}"
+          while [[ -n "${suffix}" ]]; do
+            packaged_candidate "${dockerfile}" "$(normalize "${suffix}")"
+            if [[ "${suffix}" == */* ]]; then suffix="${suffix#*/}"; else suffix=""; fi
+          done
+        fi
       done
     done < <(awk '
       /^FROM[[:space:]]/ { count = 0; next }
-      /^(COPY|ADD)[[:space:]]/ && $0 !~ /--from=/ { lines[count++] = $0 }
+      toupper($1) == "COPY" || toupper($1) == "ADD" { lines[count++] = $0 }
       END { for (i = 0; i < count; i++) print lines[i] }
     ' "${root}/${dockerfile}")
+    if grep -Eq '^(COPY|ADD)[[:space:]].*\\$' "${root}/${dockerfile}"; then
+      fail "${dockerfile} continues a COPY across lines, which this guard does not parse"
+    fi
   done < <(grep -E '(^|/)[^/]*Dockerfile[^/]*$' "${tracked}" || true)
+
+  while IFS= read -r match; do
+    consumer="${match%%:*}"
+    arguments="${match#*helm package}"
+    read -r -a tokens <<<"${arguments}"
+    token="${tokens[0]:-}"
+    token="${token//\"/}"
+    token="${token#\$\{root\}/}"
+    token="${token#\$root/}"
+    token="${token#\$\{ROOT\}/}"
+    candidate="$(normalize "${token}")"
+    if [[ -z "${candidate}" ]] || ! grep -q -- "^${candidate}/" "${tracked}"; then
+      fail "${consumer} packages a chart directory this guard cannot resolve: ${token}"
+      continue
+    fi
+    packaged_candidate "${consumer}" "${candidate}"
+  done < <(repo_git grep -E 'helm package' -- '*.sh' '.github' ':!scripts/test-ci-change-class.sh' || true)
+
+  # The derivation must see the directories known to be packaged today.
+  for expected in charts/steward web/public; do
+    grep -Fxq -- "${expected}" "${packaged}" ||
+      fail "the packaged-directory derivation no longer finds ${expected}"
+  done
 
   # 3. Scripts, workflows, and chart sources that name a docs-class path.
   #    Root-level names such as README.md are too common to match as text;
@@ -614,11 +754,17 @@ if repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   repo_git grep -qF 'include_str!("../../../docs/task-submission-api.md")' -- crates ||
     fail "the include_str! consumer the guard is calibrated against has moved; re-check the consumed list"
 
-  # Every tracked agent-instruction file, README, and the changelog is docs
-  # unless it sits in a consumed location.
+  # Every tracked agent-instruction file and README at the root or below a
+  # listed source root is docs, as is the changelog.
   while IFS= read -r path; do
     case "${path}" in
-      web/*|tests/browser/*|charts/*|config/*|docs/contracts/*|.github/*|.githooks/*) continue ;;
+      docs/contracts/*) continue ;;
+      */*)
+        case "${path}" in
+          adapters/*|bins/*|conformance/*|crates/*|docs/*|e2e/*|xtask/*) ;;
+          *) continue ;;
+        esac
+        ;;
     esac
     case "${path##*/}" in
       AGENTS.md|CLAUDE.md|README.md)

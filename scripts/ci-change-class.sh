@@ -11,6 +11,16 @@
 #
 # Every rule is an allowlist. A path is `docs` or `web` only when a rule below
 # names it; everything else, and every failure or ambiguity, is `full`.
+#
+# A change is classified by path, whatever the change is. Deleting a `docs` or
+# `web` file is a `docs` or `web` change, and so is a mode-only change, because
+# the lanes that class runs are the ones that read the file. Two modes are
+# never reduced: a symlink or submodule on either side, and an executable
+# documentation file.
+#
+# Changed paths come from a pull request and are untrusted. They are read
+# NUL-delimited and are never written to the log unless they consist only of
+# ordinary path characters.
 set -euo pipefail
 
 # A larger change set is not worth reasoning about path by path.
@@ -40,6 +50,16 @@ usage: ci-change-class.sh classify < raw-diff
        ci-change-class.sh verdict <class> <classifier-result> <lane>=<result>...
 USAGE
   exit 2
+}
+
+# Succeeds for a path made only of ordinary path characters: letters, digits,
+# and the punctuation tracked files use, including the brackets and
+# parentheses of route directories. Whitespace, control characters, quotes,
+# and `::` are not ordinary.
+is_plain_path() {
+  local LC_ALL=C
+  local plain='^[]A-Za-z0-9._/@+=,()[-]+$'
+  [[ "$1" =~ ${plain} && "$1" != *::* && ${#1} -le 240 ]]
 }
 
 # Prints the class of one repository-relative path, ignoring its file mode.
@@ -74,10 +94,22 @@ path_class() {
     docs/installation/platform-preflight.md) echo full; return ;;
   esac
 
-  # Agent instructions and READMEs, wherever they live.
+  # Agent instructions and READMEs, at the repository root and below the
+  # source roots listed here. No image or bundle includes one of these roots
+  # wholesale; the classifier tests derive the packaged directories and fail
+  # if that changes. A new root is `full` until it is added.
   case "${name}" in
     AGENTS.md|CLAUDE.md|README|README.md|README.txt|README.rst)
-      echo docs
+      case "${path}" in
+        */*)
+          case "${path}" in
+            adapters/*|bins/*|conformance/*|crates/*|docs/*|e2e/*|xtask/*) echo docs ;;
+            .claude/*|.codex/*) echo docs ;;
+            *) echo full ;;
+          esac
+          ;;
+        *) echo docs ;;
+      esac
       return
       ;;
   esac
@@ -115,6 +147,10 @@ entry_class() {
       return
       ;;
   esac
+  if ! is_plain_path "${path}"; then
+    echo full
+    return
+  fi
 
   class="$(path_class "${path}")"
   if [[ "${class}" == docs && ( "${old_mode}" == 100755 || "${new_mode}" == 100755 ) ]]; then
@@ -124,12 +160,23 @@ entry_class() {
   echo "${class}"
 }
 
+# Prints a path for the log only when every character is an ordinary path
+# character. Anything else, including whitespace, control characters, and the
+# `::` that starts a runner workflow command, is replaced by a fixed phrase.
+printable_path() {
+  if is_plain_path "$1"; then
+    echo "$1"
+  else
+    echo "a path with unusual characters"
+  fi
+}
+
 # Reads `git diff --raw -z --no-renames` records and prints the class of the
 # whole change set. With --no-renames a rename is a deletion plus an addition,
 # so both of its paths are classified.
 classify() {
   local class=docs count=0
-  local meta="" path="" old_mode new_mode status entry
+  local meta="" path="" old_mode new_mode status entry shown
 
   while IFS= read -r -d '' meta; do
     path=""
@@ -148,10 +195,11 @@ classify() {
     esac
     old_mode="" new_mode="" status=""
     read -r old_mode new_mode _ _ status <<<"${meta#:}" || true
+    shown="$(printable_path "${path}")"
     case "${status}" in
       A|D|M) ;;
       *)
-        echo "change class: full (status '${status}' for ${path})" >&2
+        echo "change class: full (unsupported change status for ${shown})" >&2
         echo full
         return
         ;;
@@ -169,7 +217,7 @@ classify() {
       docs) ;;
       web) class=web ;;
       *)
-        echo "change class: full (${path})" >&2
+        echo "change class: full (${shown})" >&2
         echo full
         return
         ;;
@@ -218,18 +266,18 @@ detect_unchecked() {
   case "${event}" in
     pull_request)
       if [[ "${base_ref}" != main ]]; then
-        full_because "pull request targets '${base_ref}', not main"
+        full_because "pull request does not target main"
         return
       fi
       ;;
     merge_group)
       if [[ "${base_ref}" != refs/heads/main ]]; then
-        full_because "merge group targets '${base_ref}', not main"
+        full_because "merge group is not for main"
         return
       fi
       ;;
     *)
-      full_because "event '${event}' always runs the full gate"
+      full_because "event '$(printable_path "${event:-none}")' always runs the full gate"
       return
       ;;
   esac
@@ -314,13 +362,13 @@ verdict() {
   local lane in_full in_web in_docs expected required result argument found known
 
   if [[ "${classifier}" != success ]]; then
-    echo "pinned: the change classifier ended with: ${classifier}" >&2
+    echo "pinned: the change classifier ended with: $(printable_path "${classifier:-nothing}")" >&2
     failed=1
   fi
   case "${class}" in
     full|web|docs) ;;
     *)
-      echo "pinned: unknown change class: '${class}'" >&2
+      echo "pinned: unknown change class: $(printable_path "${class:-none}")" >&2
       exit 1
       ;;
   esac
@@ -334,7 +382,7 @@ verdict() {
       fi
     done <<<"${LANES}"
     if ((known == 0)); then
-      echo "pinned: unknown lane result: ${argument}" >&2
+      echo "pinned: unknown lane result: $(printable_path "${argument:-none}")" >&2
       failed=1
     fi
   done
@@ -371,7 +419,7 @@ verdict() {
     if [[ "${result}" == "${required}" ]]; then
       echo "pinned: ${lane} ${result} (class ${class})"
     else
-      echo "pinned: ${lane} must be ${required} for class ${class}, but ended with: ${result}" >&2
+      echo "pinned: ${lane} must be ${required} for class ${class}, but ended with: $(printable_path "${result:-nothing}")" >&2
       failed=1
     fi
   done <<<"${LANES}"
