@@ -7,6 +7,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Signed-in users can read the deployment's enabled workspace types and
+  numeric workspace limits from `/app/api/v1/capabilities`. The response does
+  not expose administrator configuration or other users' data.
+
 ### Changed
 
 - OpenShell Agent Tasks with `diagnostics.executionLog: full` now run in a
@@ -40,6 +46,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   reads. New template revisions omit it, and browser or operator writes that set
   it are rejected with an actionable error. To retain the old behavior of
   reviewing anything above 50 USD, set the template's monthly limit to 50 USD.
+- Admission failures now name limits and units in user-readable language,
+  including readable binary workspace sizes, without exposing internal field
+  paths or debug formatting.
 
 ### Upgrade and rollback
 
@@ -53,10 +62,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   `config.apiserver.defaultLlmTemplate.enabled` before rolling back to v0.3.15;
   the previous binary will not start with that setting enabled against the
   threshold-free revision. In addition, v0.3.16 Task evidence records requested
-  authority, runtime minutes, and the effective full-history depth under the existing
-  evidence schema. After v0.3.16 creates a Task, do not downgrade to v0.3.15: that
-  binary cannot read the added evidence fields. Do not delete generated revisions or
-  rewrite pending requests and provisioned Envelope history.
+  Task requirements, runtime minutes, and the effective full-history depth
+  under the existing evidence schema. After v0.3.16 creates a Task, do not
+  downgrade to v0.3.15: that binary cannot read the added evidence fields. Do
+  not delete generated revisions or rewrite pending requests and provisioned
+  Envelope history.
 
 ## [0.3.15] - 2026-10-09
 

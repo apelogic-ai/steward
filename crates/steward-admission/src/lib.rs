@@ -367,11 +367,17 @@ impl AdmissionDelta {
                 ),
                 format_money(ceiling, currency)
             ),
-            Self::RuntimeMinutes { requested, ceiling } => format!(
-                "Runtime allowance: requested {}, limit {ceiling} minutes",
-                requested
-                    .as_deref()
-                    .map_or_else(|| "no limit".to_owned(), |value| format!("{value} minutes"))
+            Self::RuntimeMinutes {
+                requested: Some(requested),
+                ceiling,
+            } => {
+                format!("Runtime allowance: requested {requested} minutes, limit {ceiling} minutes")
+            }
+            Self::RuntimeMinutes {
+                requested: None,
+                ceiling,
+            } => format!(
+                "Runtime allowance: requested without a limit, but this Envelope allows at most {ceiling} minutes"
             ),
             Self::Ttl { requested, ceiling } => {
                 format!("Maximum run duration: requested {requested}, limit {ceiling}")
@@ -407,33 +413,29 @@ impl AdmissionDelta {
                 format_runner_platforms(requested),
                 format_runner_platforms(ceiling)
             ),
-            Self::RunnerMemory { requested, ceiling } => format!(
-                "Runner memory: requested {}, limit {}",
-                requested.0,
-                ceiling
-                    .as_ref()
-                    .map_or("not allowed", |value| value.0.as_str())
-            ),
-            Self::RunnerCompute { requested, ceiling } => format!(
-                "Runner compute: requested {}, limit {}",
-                requested.0,
-                ceiling
-                    .as_ref()
-                    .map_or("not allowed", |value| value.0.as_str())
-            ),
-            Self::RunnerStorage { requested, ceiling } => format!(
-                "Runner storage: requested {}, limit {}",
-                requested.0,
-                ceiling
-                    .as_ref()
-                    .map_or("not allowed", |value| value.0.as_str())
-            ),
-            Self::Workspace { requested, ceiling } => format!(
-                "Workspace access: requested {}, allowed {}",
+            Self::RunnerMemory { requested, ceiling } => {
+                runner_resource_message("memory", requested, ceiling.as_ref())
+            }
+            Self::RunnerCompute { requested, ceiling } => {
+                runner_resource_message("compute", requested, ceiling.as_ref())
+            }
+            Self::RunnerStorage { requested, ceiling } => {
+                runner_resource_message("storage", requested, ceiling.as_ref())
+            }
+            Self::Workspace {
+                requested,
+                ceiling: Some(ceiling),
+            } => format!(
+                "Workspace access: requested {}; allowed {}",
                 workspace_authority_summary(requested),
-                ceiling
-                    .as_ref()
-                    .map_or_else(|| "none".to_owned(), workspace_authority_summary)
+                workspace_authority_summary(ceiling)
+            ),
+            Self::Workspace {
+                requested,
+                ceiling: None,
+            } => format!(
+                "Workspace access: requested {}, but this Envelope does not allow workspace access",
+                workspace_authority_summary(requested)
             ),
         }
     }
@@ -457,6 +459,32 @@ fn format_runner_platforms(platforms: &[RunnerPlatform]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn runner_resource_message(
+    resource: &str,
+    requested: &KubernetesQuantity,
+    ceiling: Option<&KubernetesQuantity>,
+) -> String {
+    let requested = format_binary_quantity(requested.0.as_str());
+    match ceiling {
+        Some(ceiling) => format!(
+            "Runner {resource}: requested {requested}, limit {}",
+            format_binary_quantity(ceiling.0.as_str())
+        ),
+        None => format!(
+            "Runner {resource}: requested {requested}, but this Envelope does not allow a {resource} request"
+        ),
+    }
+}
+
+fn format_binary_quantity(value: &str) -> String {
+    for (suffix, label) in [("Ti", "TiB"), ("Gi", "GiB"), ("Mi", "MiB"), ("Ki", "KiB")] {
+        if let Some(number) = value.strip_suffix(suffix) {
+            return format!("{number} {label}");
+        }
+    }
+    value.to_owned()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -716,23 +744,31 @@ fn workspace_authority_summary(authority: &WorkspaceAuthority) -> String {
             WorkspaceEntryType::Git => "git",
             WorkspaceEntryType::Scratch => "scratch",
         })
-        .collect::<Vec<_>>()
-        .join(",");
+        .collect::<Vec<_>>();
+    let types = match types.as_slice() {
+        [] => "no workspace types".to_owned(),
+        [only] => (*only).to_owned(),
+        [first, second] => format!("{first} and {second}"),
+        _ => types.join(", "),
+    };
     format!(
-        "types=[{types}], total={}, files={}, history={}, submodules={}",
-        authority
-            .max_total_size
-            .as_ref()
-            .map_or("deployment limit", |value| value.as_str()),
-        authority
-            .max_files
-            .map_or_else(|| "deployment limit".to_owned(), |value| value.to_string()),
-        authority
-            .max_history_depth
-            .map_or_else(|| "deployment limit".to_owned(), |value| value.to_string()),
-        authority
-            .max_submodule_depth
-            .map_or_else(|| "deployment limit".to_owned(), |value| value.to_string())
+        "{types}; total size {}; {} files; {} history generations; {} submodule levels",
+        authority.max_total_size.as_ref().map_or_else(
+            || "up to the deployment limit".to_owned(),
+            |value| { format_binary_quantity(value.as_str()) }
+        ),
+        authority.max_files.map_or_else(
+            || "up to the deployment limit".to_owned(),
+            |value| format!("up to {value}")
+        ),
+        authority.max_history_depth.map_or_else(
+            || "up to the deployment limit".to_owned(),
+            |value| format!("up to {value}")
+        ),
+        authority.max_submodule_depth.map_or_else(
+            || "up to the deployment limit".to_owned(),
+            |value| format!("up to {value}")
+        )
     )
 }
 
@@ -1756,7 +1792,9 @@ mod tests {
                 .map_err(|error| format!("evaluate envelope request: {error:?}"))?
                 .counterexample()
                 .as_deref(),
-            Some("Runtime allowance: requested no limit, limit 120 minutes")
+            Some(
+                "Runtime allowance: requested without a limit, but this Envelope allows at most 120 minutes"
+            )
         );
         Ok(())
     }
@@ -1977,6 +2015,38 @@ mod tests {
             decision.counterexample(),
             Some("Runner platforms: requested windows, allowed linux".to_owned())
         );
+    }
+
+    #[test]
+    fn rejection_messages_explain_absent_runner_and_workspace_authority() -> Result<(), String> {
+        let requested_workspace = WorkspaceAuthority {
+            allowed_types: vec![WorkspaceEntryType::Git, WorkspaceEntryType::Scratch],
+            max_total_size: Some(ResourceQuantity::parse("2Gi")?),
+            max_files: Some(100),
+            max_history_depth: Some(20),
+            max_submodule_depth: Some(2),
+        };
+        let decision = AdmissionDecision::Reject {
+            deltas: vec![
+                AdmissionDelta::RunnerMemory {
+                    requested: KubernetesQuantity("8Gi".to_owned()),
+                    ceiling: None,
+                },
+                AdmissionDelta::Workspace {
+                    requested: requested_workspace,
+                    ceiling: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            decision.counterexample(),
+            Some(
+                "Runner memory: requested 8 GiB, but this Envelope does not allow a memory request; Workspace access: requested git and scratch; total size 2 GiB; up to 100 files; up to 20 history generations; up to 2 submodule levels, but this Envelope does not allow workspace access"
+                    .to_owned()
+            )
+        );
+        Ok(())
     }
 
     #[test]

@@ -2119,6 +2119,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deployment_workspace_capabilities_require_a_signed_in_user() -> Result<(), String> {
+        let response = inner_router_with_capabilities(
+            TestBroker::default(),
+            Vec::new(),
+            crate::tasks::TaskApiConfig::default().workspace_deployment_capabilities(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/capabilities")
+                .body(Body::empty())
+                .map_err(|error| format!("build unauthenticated capabilities request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("request unauthenticated capabilities: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn signed_in_users_can_read_deployment_workspace_capabilities() -> Result<(), String> {
         let workspace = crate::tasks::TaskApiConfig::default()
             .with_workspace_policy_json(Some(

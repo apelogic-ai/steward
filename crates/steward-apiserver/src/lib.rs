@@ -3935,6 +3935,27 @@ mod tests {
             .map_err(|error| format!("parse v0.3.15 browser evidence fixture: {error}"))
     }
 
+    #[test]
+    fn checked_in_v0_3_15_direct_evidence_remains_readable() -> Result<(), String> {
+        let fixture = include_str!("../testdata/direct-task-evidence-v0.3.15.json");
+        let value: serde_json::Value = serde_json::from_str(fixture)
+            .map_err(|error| format!("parse checked-in v0.3.15 evidence JSON: {error}"))?;
+        assert!(value.get("requestedRequirements").is_none());
+        assert!(value.get("requestedDiagnostics").is_none());
+        assert!(value.get("requestedWorkspace").is_none());
+        assert!(
+            value
+                .pointer("/effectiveRequirements/authority/runtimeMinutesLimit")
+                .is_none()
+        );
+        let evidence: steward_types::direct_package::DirectTaskBindingEvidence =
+            serde_json::from_value(value)
+                .map_err(|error| format!("read checked-in v0.3.15 evidence: {error}"))?;
+        evidence
+            .validate()
+            .map_err(|error| format!("validate checked-in v0.3.15 evidence: {error}"))
+    }
+
     #[tokio::test]
     async fn kubernetes_runtime_writes_use_the_apiserver_service_account_identity()
     -> Result<(), String> {

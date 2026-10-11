@@ -44,7 +44,6 @@ use steward_store::{
 };
 #[cfg(test)]
 use steward_types::RuntimeOwnership;
-use steward_types::direct_package::DirectRequirements;
 use steward_types::task_output_archive::{
     InvalidTaskOutputArchive, TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputArchiveCompatibility,
     task_output_archive_entries,
@@ -187,34 +186,6 @@ fn ttl_action(
     Ok(TtlAction::Continue {
         requeue_after: StdDuration::from_secs(remaining.min(60)),
     })
-}
-
-fn task_runtime_minutes_limit(task: &TaskRecord) -> Option<String> {
-    effective_task_runtime_minutes_limit(
-        task.direct_task_evidence
-            .as_ref()
-            .map(|evidence| &evidence.effective_requirements),
-        task.browser_task_evidence
-            .as_ref()
-            .and_then(|evidence| evidence.effective_requirements.as_ref()),
-        task.user_envelope_snapshot
-            .as_ref()
-            .and_then(|envelope| envelope.spec.runtime_minutes_limit.as_deref()),
-    )
-}
-
-fn effective_task_runtime_minutes_limit(
-    direct: Option<&DirectRequirements>,
-    browser: Option<&DirectRequirements>,
-    envelope: Option<&str>,
-) -> Option<String> {
-    direct
-        .and_then(|requirements| requirements.authority.runtime_minutes_limit.as_ref())
-        .or_else(|| {
-            browser.and_then(|requirements| requirements.authority.runtime_minutes_limit.as_ref())
-        })
-        .map(|limit| limit.as_str().to_owned())
-        .or_else(|| envelope.map(str::to_owned))
 }
 
 fn runtime_ttl_action(runtime: &AgentRuntime) -> Result<TtlAction, ReconcileError> {
@@ -3935,7 +3906,9 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 true,
                                 admission.task.user_envelope_instance_id.clone(),
                                 Some(admission.task.task_uid),
-                                task_runtime_minutes_limit(&admission.task),
+                                admission.task.user_envelope_snapshot.as_ref().and_then(
+                                    |envelope| envelope.spec.runtime_minutes_limit.clone(),
+                                ),
                             )
                         }
                         TaskRuntimeReconciliationAction::WaitForTaskOrchestrator => {
@@ -5599,7 +5572,7 @@ mod tests {
         TaskRecord,
     };
     use steward_types::direct_package::{
-        BrowserTaskEvidence, DirectRequirements, DirectTaskBindingEvidence, ExecutionLogMode,
+        BrowserTaskEvidence, DirectTaskBindingEvidence, ExecutionLogMode,
     };
     use steward_types::{
         AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
@@ -5617,61 +5590,15 @@ mod tests {
         authority_action, authority_application_action, classify_runtime_create_status,
         cleanup_runtime, connection_operation_authority_action,
         connection_operation_failure_log_line, create_task_runtime_inner,
-        effective_task_runtime_minutes_limit, ensure_managed_mode_has_no_stock_credential,
-        exhausted_spend_to_preserve, failed_runtime_status, inference_action,
-        provider_control_bindings_match, reconcile_once, replace_as_controller,
-        runtime_authority_action, runtime_start_failed, runtime_ttl_action,
+        ensure_managed_mode_has_no_stock_credential, exhausted_spend_to_preserve,
+        failed_runtime_status, inference_action, provider_control_bindings_match, reconcile_once,
+        replace_as_controller, runtime_authority_action, runtime_start_failed, runtime_ttl_action,
         runtime_with_spend_top_up, sandbox_execution_class, sandbox_task_diagnostics,
         server_task_runtime_manifest, status_merge_patch, suspend_runtime,
         suspend_runtime_with_inference_cleanup, task_output_archive_failure,
         task_output_archive_size_failure, task_runtime, task_runtime_action,
         task_runtime_observation_is_failed, ttl_action,
     };
-
-    fn runtime_requirements(limit: Option<&str>) -> Result<DirectRequirements, String> {
-        serde_json::from_value(serde_json::json!({
-            "authority": {
-                "llms": [],
-                "tools": [],
-                "budget": {
-                    "monthlyLimit": "100.00",
-                    "singleRunLimit": null,
-                    "currency": "USD"
-                },
-                "runtimeMinutesLimit": limit,
-                "ttl": "1h",
-                "runner": {
-                    "platforms": [],
-                    "memory": null,
-                    "compute": null,
-                    "storage": null
-                }
-            }
-        }))
-        .map_err(|error| format!("parse runtime requirements fixture: {error}"))
-    }
-
-    #[test]
-    fn task_runtime_minutes_use_effective_task_authority_before_envelope_ceiling()
-    -> Result<(), String> {
-        let direct = runtime_requirements(Some("30"))?;
-        let browser = runtime_requirements(Some("40"))?;
-        let historical = runtime_requirements(None)?;
-
-        assert_eq!(
-            effective_task_runtime_minutes_limit(Some(&direct), Some(&browser), Some("60")),
-            Some("30".to_owned())
-        );
-        assert_eq!(
-            effective_task_runtime_minutes_limit(None, Some(&browser), Some("60")),
-            Some("40".to_owned())
-        );
-        assert_eq!(
-            effective_task_runtime_minutes_limit(Some(&historical), None, Some("60")),
-            Some("60".to_owned())
-        );
-        Ok(())
-    }
 
     #[tokio::test]
     async fn blocked_task_start_does_not_hide_another_tasks_ready_observation() -> Result<(), String>

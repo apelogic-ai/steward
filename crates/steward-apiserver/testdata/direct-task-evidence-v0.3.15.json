@@ -1,0 +1,98 @@
+{
+  "closure": {
+    "contractVersion": "steward.package-closure/v1",
+    "entries": [
+      {
+        "digest": "steward:sha256:bb10eb4818a59d921fa1f7df5d4a433f132c1c3f6e48510b336c4b122d894486",
+        "kind": "prompt",
+        "path": "catalog/release-summary/v1/prompt.md",
+        "sizeBytes": 44
+      },
+      {
+        "digest": "steward:sha256:c3fb14aa5e05c51526453868fb7f42648815b6ca24dce5b1bf79512529cec0cb",
+        "kind": "task_definition",
+        "path": "catalog/release-summary/v1/task-definition.json",
+        "sizeBytes": 211
+      }
+    ],
+    "entryPoint": "catalog/release-summary/v1/task-definition.json"
+  },
+  "closureDigest": "steward:sha256:0b279c67224397175fea1a9c2245955b17538f17480ca77eac842e96a1a77189",
+  "diagnostics": {
+    "executionLog": "full"
+  },
+  "effectiveRequirements": {
+    "authority": {
+      "budget": {
+        "currency": "USD",
+        "monthlyLimit": "25.00",
+        "singleRunLimit": "5.00"
+      },
+      "llms": [
+        {
+          "model": "gpt-5.4",
+          "provider": "openai"
+        }
+      ],
+      "runner": {
+        "compute": "500m",
+        "memory": "1Gi",
+        "platforms": [
+          "linux"
+        ],
+        "storage": "2Gi"
+      },
+      "tools": [],
+      "ttl": "4h"
+    }
+  },
+  "envelope": {
+    "digest": "steward:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "revision": 4,
+    "uid": "00000000-0000-0000-0000-000000000029"
+  },
+  "invocation": {
+    "commit": "git:sha1:cccccccccccccccccccccccccccccccccccccccc",
+    "contentDigest": "steward:sha256:15adf84da62b41fa80c57904c705c847d5d02c5fc9b4e10fcebe47b2c49fdb17",
+    "path": ".steward/tasks/release-summary.json",
+    "repository": "https://github.com/example-org/caller.git",
+    "repositoryId": "123456",
+    "repositoryOwnerId": "7890"
+  },
+  "package": {
+    "commit": "git:sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "contentDigest": "steward:sha256:c3fb14aa5e05c51526453868fb7f42648815b6ca24dce5b1bf79512529cec0cb",
+    "path": "catalog/release-summary/v1/task-definition.json",
+    "repository": "https://github.com/example-org/agentic-ops.git",
+    "repositoryId": "654321",
+    "repositoryOwnerId": "7890"
+  },
+  "schemaVersion": "steward.task/source-authority-evidence/v1",
+  "sourceProvenance": {
+    "actor": "alice",
+    "actorId": "24680",
+    "callerWorkflow": {
+      "ref": "example-org/caller/.github/workflows/review.yml@refs/heads/main",
+      "sha": "git:sha1:dddddddddddddddddddddddddddddddddddddddd"
+    },
+    "contractVersion": "steward.source-provenance/v1",
+    "event": "workflow_dispatch",
+    "provider": "github",
+    "ref": "refs/heads/main",
+    "repository": {
+      "id": "123456",
+      "name": "example-org/caller",
+      "ownerId": "7890"
+    },
+    "reusableWorkflow": {
+      "ref": "example-org/steward-run/.github/workflows/steward-task.yml@refs/tags/v1.0.0",
+      "sha": "git:sha1:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "run": {
+      "attempt": 1,
+      "id": "900001"
+    },
+    "triggeredSha": "git:sha1:cccccccccccccccccccccccccccccccccccccccc"
+  },
+  "taskUid": "00000000-0000-0000-0000-00000000002a"
+}

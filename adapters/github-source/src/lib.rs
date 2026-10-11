@@ -852,14 +852,13 @@ impl GitHostingPlane for GitHubSourceAdapter {
             .max_bytes
             .checked_add(GIT_UPLOAD_PACK_OVERHEAD_BYTES)
             .ok_or_else(|| rejected("Git pack bounds are invalid"))?;
-        let response = read_bounded(response, response_bound, "read exact Git pack")
-            .await
-            .map_err(|error| match error {
-                PortError::LimitExceeded { .. } => PortError::LimitExceeded {
-                    resource: "Git pack bytes",
-                },
-                error => error,
-            })?;
+        let response = read_bounded(
+            response,
+            response_bound,
+            "read exact Git pack",
+            Some("Git pack bytes"),
+        )
+        .await?;
         let (bytes, shallow) = decode_upload_pack_result(&response, request.max_bytes)?;
         self.revalidate_repository(&coordinates, &authorized)
             .await?;
@@ -1323,7 +1322,7 @@ async fn decode_response<T: DeserializeOwned>(
             return Err(throttled(operation));
         }
         if status == StatusCode::FORBIDDEN {
-            let bytes = read_bounded(response, ERROR_RESPONSE_BYTES, operation).await?;
+            let bytes = read_bounded(response, ERROR_RESPONSE_BYTES, operation, None).await?;
             if String::from_utf8_lossy(&bytes)
                 .to_ascii_lowercase()
                 .contains("secondary rate limit")
@@ -1342,7 +1341,7 @@ async fn decode_response<T: DeserializeOwned>(
         }
         return Err(failed(operation));
     }
-    let bytes = read_bounded(response, max_bytes, operation).await?;
+    let bytes = read_bounded(response, max_bytes, operation, None).await?;
     serde_json::from_slice(&bytes).map_err(|_| rejected("GitHub returned malformed JSON"))
 }
 
@@ -1356,14 +1355,13 @@ async fn read_bounded(
     mut response: Response,
     max_bytes: u64,
     operation: &'static str,
+    limit_resource: Option<&'static str>,
 ) -> Result<Vec<u8>, PortError> {
     if response
         .content_length()
         .is_some_and(|length| length > max_bytes)
     {
-        return Err(PortError::LimitExceeded {
-            resource: "GitHub response bytes",
-        });
+        return Err(response_limit_error(limit_resource));
     }
     let capacity = usize::try_from(max_bytes.min(64 * 1024)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(capacity);
@@ -1371,17 +1369,20 @@ async fn read_bounded(
         let next_len = bytes
             .len()
             .checked_add(chunk.len())
-            .ok_or(PortError::LimitExceeded {
-                resource: "GitHub response bytes",
-            })?;
+            .ok_or_else(|| response_limit_error(limit_resource))?;
         if next_len as u64 > max_bytes {
-            return Err(PortError::LimitExceeded {
-                resource: "GitHub response bytes",
-            });
+            return Err(response_limit_error(limit_resource));
         }
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+fn response_limit_error(resource: Option<&'static str>) -> PortError {
+    resource.map_or_else(
+        || rejected("GitHub response exceeds the configured byte bound"),
+        |resource| PortError::LimitExceeded { resource },
+    )
 }
 
 fn validate_origin(origin: &str, allow_loopback_http: bool) -> Result<(), PortError> {
@@ -1511,6 +1512,32 @@ mod tests {
             )
         );
         assert!(decode_upload_pack_result(&response, 8).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn exact_depth_without_a_shallow_boundary_is_complete_history() -> Result<(), String> {
+        fn packet(payload: &[u8]) -> Vec<u8> {
+            let mut encoded = format!("{:04x}", payload.len() + 4).into_bytes();
+            encoded.extend_from_slice(payload);
+            encoded
+        }
+
+        let commit = ExactGitCommit::parse(format!("git:sha1:{COMMIT}"))?;
+        let request = encode_upload_pack_request(&commit, Some(20))
+            .map_err(|error| format!("encode exact-depth request: {error:?}"))?;
+        assert!(String::from_utf8_lossy(&request).contains("deepen 20\n"));
+
+        let mut response = packet(b"NAK\n");
+        response.extend(packet(b"\x01PACKtwenty-generations"));
+        response.extend_from_slice(b"0000");
+        let (pack, shallow) = decode_upload_pack_result(&response, 64)
+            .map_err(|error| format!("decode exact-depth response: {error:?}"))?;
+        assert_eq!(pack, b"PACKtwenty-generations");
+        assert!(
+            shallow.is_empty(),
+            "a repository ending at the requested generation limit is complete"
+        );
         Ok(())
     }
 
@@ -2131,7 +2158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bounded_response_reports_a_typed_limit_error() -> Result<(), String> {
+    async fn bounded_response_preserves_each_callers_error_class() -> Result<(), String> {
         let mock = MockGitHub::start(vec![ResponseSpec::status(200, "oversized")])?;
         let response = reqwest::Client::new()
             .get(&mock.origin)
@@ -2139,9 +2166,22 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         assert!(matches!(
-            read_bounded(response, 4, "read fixture").await,
+            read_bounded(response, 4, "read fixture", None).await,
+            Err(PortError::Rejected { ref reason })
+                if reason == "GitHub response exceeds the configured byte bound"
+        ));
+        mock.finish()?;
+
+        let mock = MockGitHub::start(vec![ResponseSpec::status(200, "oversized")])?;
+        let response = reqwest::Client::new()
+            .get(&mock.origin)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            read_bounded(response, 4, "read fixture", Some("Git pack bytes")).await,
             Err(PortError::LimitExceeded {
-                resource: "GitHub response bytes"
+                resource: "Git pack bytes"
             })
         ));
         mock.finish()?;

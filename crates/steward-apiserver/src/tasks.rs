@@ -3739,19 +3739,21 @@ const fn workspace_entry_type_label(entry_type: WorkspaceEntryType) -> &'static 
 }
 
 fn format_workspace_bytes(bytes: u64) -> String {
-    [
+    for (suffix, divisor) in [
         ("TiB", 1024_u64.pow(4)),
         ("GiB", 1024_u64.pow(3)),
         ("MiB", 1024_u64.pow(2)),
         ("KiB", 1024_u64),
-    ]
-    .into_iter()
-    .find_map(|(suffix, divisor)| {
-        bytes
-            .is_multiple_of(divisor)
-            .then(|| format!("{} {suffix}", bytes / divisor))
-    })
-    .unwrap_or_else(|| format!("{bytes} bytes"))
+    ] {
+        if bytes >= divisor {
+            if bytes.is_multiple_of(divisor) {
+                return format!("{} {suffix}", bytes / divisor);
+            }
+            let tenths = (u128::from(bytes) * 10 + u128::from(divisor / 2)) / u128::from(divisor);
+            return format!("{}.{:01} {suffix}", tenths / 10, tenths % 10);
+        }
+    }
+    format!("{bytes} bytes")
 }
 
 fn format_workspace_quantity(bytes: u64) -> String {
@@ -6148,16 +6150,14 @@ fn direct_effective_requirements(
 ) -> Result<DirectRequirements, ApiError> {
     let mut effective = requested.clone();
     effective.authority.llms = vec![selected_model];
-    if effective.authority.runtime_minutes_limit.is_none() {
-        effective.authority.runtime_minutes_limit = ceiling
-            .runtime_minutes_limit
-            .as_deref()
-            .map(|value| {
-                steward_types::direct_package::Decimal::parse(value.to_owned())
-                    .map_err(ApiError::Admission)
-            })
-            .transpose()?;
-    }
+    effective.authority.runtime_minutes_limit = ceiling
+        .runtime_minutes_limit
+        .as_deref()
+        .map(|value| {
+            steward_types::direct_package::Decimal::parse(value.to_owned())
+                .map_err(ApiError::Admission)
+        })
+        .transpose()?;
     Ok(effective)
 }
 
@@ -6669,12 +6669,13 @@ mod workflow_request_tests {
         WorkspaceResolutionBudget, append_workspace_git_pack, browser_input_retry_matches,
         browser_inputs_archive, browser_inputs_from_archive, browser_rerun_submission,
         browser_workspace_trigger_commit, default_workspace_name, direct_authority_spec,
-        direct_effective_requirements, direct_requirements_for_task, prepare_task_input_archive,
-        resolve_scratch_workspace_entry, resolve_versioned_task_plan, source_port_error,
-        source_port_error_with_reporter, stable_task_runtime_name, task_orchestration_reservation,
-        validate_workspace_policy, versioned_workflow_reference, workspace_admission_policy,
-        workspace_git_materialized_budget, workspace_submodule_is_selected,
-        workspace_submodule_repository_url, workspace_tree_inventory,
+        direct_effective_requirements, direct_requirements_for_task, format_workspace_bytes,
+        prepare_task_input_archive, resolve_scratch_workspace_entry, resolve_versioned_task_plan,
+        source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
+        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
+        workspace_admission_policy, workspace_git_materialized_budget,
+        workspace_submodule_is_selected, workspace_submodule_repository_url,
+        workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -6695,6 +6696,13 @@ mod workflow_request_tests {
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn workspace_byte_messages_use_readable_rounded_units() {
+        assert_eq!(format_workspace_bytes(2 * 1024 * 1024 * 1024), "2 GiB");
+        assert_eq!(format_workspace_bytes(1_400_000_000), "1.3 GiB");
+        assert_eq!(format_workspace_bytes(900), "900 bytes");
+    }
 
     #[test]
     fn source_size_limit_is_a_user_actionable_admission_error() {
@@ -6873,6 +6881,11 @@ mod workflow_request_tests {
             request: &'a GitPackRequest,
         ) -> futures::future::BoxFuture<'a, Result<GitPack, PortError>> {
             Box::pin(async move {
+                assert_eq!(
+                    request.depth,
+                    Some(20),
+                    "full-history admission must probe exactly the configured generation limit"
+                );
                 Ok(GitPack {
                     repository: request.repository.clone(),
                     commit: request.commit.clone(),
@@ -7112,8 +7125,8 @@ mod workflow_request_tests {
                 .runtime_minutes_limit
                 .as_ref()
                 .map(|value| value.as_str()),
-            Some("30"),
-            "runtime enforcement must preserve the admitted Task request"
+            Some("60"),
+            "effective evidence records the Envelope's cumulative runtime allowance"
         );
 
         let definition: DirectTaskDefinition = serde_json::from_value(definition_json(Some("61")))
