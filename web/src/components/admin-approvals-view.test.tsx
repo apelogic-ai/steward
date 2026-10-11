@@ -193,7 +193,35 @@ describe("envelope request approval controls", () => {
   });
 
   test("shows the requested access beside its exact governing template revision", () => {
-    const html = renderToStaticMarkup(<EnvelopeRequestCard request={request} />);
+    const html = renderToStaticMarkup(<EnvelopeRequestCard request={{
+      ...request,
+      requestedEnvelope: {
+        ...request.requestedEnvelope,
+        spec: {
+          ...request.requestedEnvelope.spec,
+          workspace: {
+            allowedTypes: ["git", "scratch"],
+            maxFiles: 1000,
+            maxHistoryDepth: 100,
+            maxSubmoduleDepth: 2,
+            maxTotalSize: "2Gi",
+          },
+        },
+      },
+      templateEnvelope: request.templateEnvelope ? {
+        ...request.templateEnvelope,
+        spec: {
+          ...request.templateEnvelope.spec,
+          workspace: {
+            allowedTypes: ["git"],
+            maxFiles: 500,
+            maxHistoryDepth: 50,
+            maxSubmoduleDepth: 1,
+            maxTotalSize: "1Gi",
+          },
+        },
+      } : null,
+    }} />);
 
     expect(html).toContain("Requested access");
     expect(html).toContain("Governing template");
@@ -215,8 +243,21 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("Runner storage");
     expect(html).toContain("20Gi");
     expect(html).toContain("10Gi");
+    expect(html).toContain("Workspace");
+    expect(html).toContain("Total size limit");
+    expect(html).toContain("2Gi");
+    expect(html).toContain("1Gi");
+    expect(html).toContain("File limit");
+    expect(html).toContain("1000 files");
+    expect(html).toContain("500 files");
+    expect(html).toContain("History depth limit");
+    expect(html).toContain("Submodule depth limit");
     expect(html).toContain("Template revision");
     expect(html).toContain(">7<");
+  });
+
+  test("shows no workspace access when an envelope does not grant it", () => {
+    expect(renderToStaticMarkup(<EnvelopeRequestCard request={request} />)).toContain("No workspace access");
   });
 
   test("labels an absent requested per-run limit as unbounded authority", () => {

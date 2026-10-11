@@ -24,6 +24,7 @@ import { DiagnosticDetails, type DiagnosticItem } from "@/components/diagnostic-
 import { EnvelopeExceedanceSummary, type EnvelopeExceedanceSummaryValue, envelopeDeltaSummary } from "@/components/envelope-exceedance-summary";
 import { CodeBlock, DataTable, FilterTabs, GrantChipList, Meter, SectionCard, StatStrip, TagSelect, grantKindForAction } from "@/components/hs";
 import { DurationInput, MoneyInput, durationUnit, formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
+import { WorkspaceAuthorityDetails } from "@/components/workspace-authority-details";
 import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { loadAllEnvelopeRequests } from "@/data/paginated-api";
@@ -227,7 +228,7 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template }: Readonly<
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (session.status !== "authenticated" || singleRunError) return;
+    if (session.status !== "authenticated" || singleRunError || models.size === 0) return;
     setSubmission("submitting");
     setRejectedFields([]);
     onSubmittingChange(true);
@@ -298,8 +299,8 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template }: Readonly<
             {template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime limit per month<DurationInput aria-invalid={exceededFields.has("Runtime limit per month") || undefined} className={fieldClass(exceededFields.has("Runtime limit per month"))} disabled={submission === "submitting"} mode="minutes" onChange={(value) => { setRuntimeMinutes(value); clearRejectedSubmission(); }} required value={runtimeMinutes} />{limitHint(exceededFields.has("Runtime limit per month"), formatDuration(template.ceiling.spec.runtimeMinutesLimit, "minutes", "m"))}</label> : null}
           </div>
         </SectionCard>
-        <SectionCard className={exceededFields.has("Models") || rejectedFields.includes("llms") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("02", "Models")}><TagSelect addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" onChange={(next) => { setModels(new Set(next)); clearRejectedSubmission(); }} options={modelOptions} value={[...models]} /></SectionCard>
-        <SectionCard className={exceededFields.has("Tools") || rejectedFields.includes("tools") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("03", "Tools")}><TagSelect addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search GitHub tools…" label="Tools" onChange={(next) => { setTools(new Set(next)); clearRejectedSubmission(); }} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools allowed by the template are offered.</p></SectionCard>
+        <SectionCard className={models.size === 0 || exceededFields.has("Models") || rejectedFields.includes("llms") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("02", "Models")}><TagSelect aria-invalid={models.size === 0 || undefined} addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" noResultsMessage={(query) => `No models in this template match “${query}”`} onChange={(next) => { setModels(new Set(next)); clearRejectedSubmission(); }} options={modelOptions} value={[...models]} />{models.size === 0 ? <p className="mt-2 text-sm text-err" role="alert">Select at least one model.</p> : null}</SectionCard>
+        <SectionCard className={exceededFields.has("Tools") || rejectedFields.includes("tools") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("03", "Tools")}><TagSelect addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search GitHub tools…" label="Tools" noResultsMessage={(query) => `No tools in this template match “${query}”`} onChange={(next) => { setTools(new Set(next)); clearRejectedSubmission(); }} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools allowed by the template are offered.</p></SectionCard>
         <SectionCard title={stepTitle("04", "Request note")}><label className="grid gap-2 text-sm font-semibold">Justification (optional)<textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); clearRejectedSubmission(); }} placeholder="Explain why these limits or capabilities are needed." value={justification} /></label></SectionCard>
       </div>
       <SectionCard className="sticky top-7 flex-[1_1_280px] lg:max-w-[380px]" title="Summary">
@@ -307,7 +308,7 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template }: Readonly<
         {submission !== "idle" && submission !== "submitting" ? <p className="mt-4 text-sm text-err" role="alert">{{ conflict: "The template revision changed. Reload before retrying.", rejected: "Some values are outside the platform limits or available capabilities. Check the highlighted fields and try again.", forbidden: "You are not allowed to submit this request.", unavailable: "HyperShell couldn't reach the request service. Try again in a moment.", error: "The request could not be accepted. Try again." }[submission]}</p> : null}
         <DiagnosticDetails className="mt-2" items={diagnostics} />
         {exceedances.length ? <div className="mt-4"><EnvelopeExceedanceSummary values={exceedances} /></div> : null}
-        <button className="mt-5 min-h-10 w-full rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting" || Boolean(singleRunError)} type="submit">{submission === "submitting" ? "Submitting…" : requiresApproval ? "Submit for approval" : "Submit request"}</button>
+        <button className="mt-5 min-h-10 w-full rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting" || Boolean(singleRunError) || models.size === 0} type="submit">{submission === "submitting" ? "Submitting…" : requiresApproval ? "Submit for approval" : "Submit request"}</button>
         <p className="mt-3 text-xs leading-5 text-muted-ink">{requiresApproval ? `${exceedances.length} ${exceedances.length === 1 ? "value exceeds" : "values exceed"} the template limits and need admin approval.` : "This request is within the template limits and will be provisioned immediately."}</p>
       </SectionCard>
     </form>
@@ -447,10 +448,11 @@ function EnvelopeDetail({ request }: Readonly<{ request: UserEnvelopeRequest }>)
         {request.justification ? <p className="mt-4 text-sm"><strong>Justification:</strong> {request.justification}</p> : null}
       </SectionCard> : null}
       <div className="grid gap-5 lg:grid-cols-2">
-        <SectionCard title="Approved access">
+        <SectionCard title={request.approvedEnvelope ? "Approved access" : "Requested access"}>
           <div className="space-y-5">
             <div><p className="mb-2 text-xs font-semibold text-muted-ink">Models</p><GrantChipList grants={envelope.spec.llms.map((model) => ({ kind: "model", name: `${model.provider}/${model.model}` }))} /></div>
             <div><p className="mb-2 text-xs font-semibold text-muted-ink">Tools</p><GrantChipList grants={envelope.spec.tools.map((tool) => ({ kind: grantKindForAction(tool.action), name: `${tool.provider}:${tool.resource}:${tool.action}` }))} /></div>
+            <div><p className="mb-2 text-xs font-semibold text-muted-ink">Workspace</p><WorkspaceAuthorityDetails workspace={envelope.spec.workspace} /></div>
           </div>
         </SectionCard>
         <SectionCard title="History">
