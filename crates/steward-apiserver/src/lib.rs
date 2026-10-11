@@ -5177,6 +5177,31 @@ mod tests {
     }
 
     #[test]
+    fn task_openapi_publishes_named_workspace_repository_and_ref_selectors() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        for (schema, named_selector) in [
+            ("WorkspaceGitRepositorySchema", "WorkspaceGitRepositoryName"),
+            ("WorkspaceGitRefSchema", "WorkspaceGitNamedRef"),
+        ] {
+            let alternatives = document
+                .pointer(&format!("/components/schemas/{schema}/oneOf"))
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| format!("{schema} must publish oneOf alternatives"))?;
+            assert!(
+                alternatives.iter().any(|alternative| {
+                    alternative.get("$ref")
+                        == Some(&serde_json::json!(format!(
+                            "#/components/schemas/{named_selector}"
+                        )))
+                }),
+                "{schema} must publish the server-accepted {named_selector} form"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn browser_session_is_published_as_an_opaque_cookie_openapi_contract() -> Result<(), String> {
         let document = serde_json::to_value(ApiDoc::openapi())
             .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;

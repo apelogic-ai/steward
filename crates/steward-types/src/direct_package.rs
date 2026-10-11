@@ -1079,11 +1079,13 @@ pub struct GitWorkspace {
     pub limits: Option<WorkspaceLimits>,
 }
 
-/// OpenAPI projection of the custom `"self" | { ownerId, repositoryId }` wire shape.
+/// OpenAPI projection of the custom `"self" | "owner/repository" | { ownerId, repositoryId }`
+/// wire shape.
 #[derive(utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum WorkspaceGitRepositorySchema {
     SelfRepository(WorkspaceSelfRepositorySchema),
+    Named(WorkspaceGitRepositoryName),
     Explicit(WorkspaceGitRepositoryIdentity),
 }
 
@@ -1093,12 +1095,14 @@ pub enum WorkspaceSelfRepositorySchema {
     SelfRepository,
 }
 
-/// OpenAPI projection of the custom `"trigger" | "git:sha1:..."` wire shape.
+/// OpenAPI projection of the custom `"trigger" | "git:sha1:..." | "branch-or-tag" |
+/// "git:ref:branch-or-tag"` wire shape.
 #[derive(utoipa::ToSchema)]
 #[serde(untagged)]
 pub enum WorkspaceGitRefSchema {
     Trigger(WorkspaceTriggerRefSchema),
     Exact(ExactGitCommit),
+    Named(WorkspaceGitNamedRef),
 }
 
 #[derive(utoipa::ToSchema)]

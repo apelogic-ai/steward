@@ -20,6 +20,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- The published Task API schema and generated web client now include the
+  `owner/repository`, plain branch or tag, and `git:ref:<name>` workspace
+  selectors already accepted by the server.
 - OpenShell Agent Tasks with `diagnostics.executionLog: full` now run in a
   restart-safe, attempt-scoped process group. Steward persists bounded stdout
   and stderr snapshots while the Task runs, refreshes Run detail before the
