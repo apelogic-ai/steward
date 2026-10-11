@@ -1706,6 +1706,14 @@ mod tests {
                 "governed sandbox probe must execute {required} --version"
             );
         }
+        let workspace = governed_probe
+            .lines()
+            .find_map(|line| line.strip_prefix("workspace=\"")?.strip_suffix('"'))
+            .ok_or_else(|| "governed sandbox probe must declare its workspace".to_owned())?;
+        assert!(
+            workspace.len() <= 19,
+            "governed sandbox probe workspace must fit OpenShell's 19-character limit"
+        );
         Ok(())
     }
 

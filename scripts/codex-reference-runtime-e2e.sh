@@ -3,7 +3,7 @@ set -euo pipefail
 
 release="${STEWARD_OPEN_SHELL_RELEASE:?STEWARD_OPEN_SHELL_RELEASE is required}"
 image="${STEWARD_CODEX_REFERENCE_IMAGE:?STEWARD_CODEX_REFERENCE_IMAGE is required}"
-workspace="codex-reference-runtime"
+workspace="codex-runtime"
 sandbox="tool-check"
 cli="${STEWARD_RUN_DIR:?STEWARD_RUN_DIR is required}/openshell"
 
