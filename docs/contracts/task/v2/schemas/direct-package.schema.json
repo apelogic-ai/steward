@@ -360,6 +360,11 @@
       "oneOf": [
         { "const": "self" },
         {
+          "type": "string",
+          "maxLength": 512,
+          "pattern": "^(?:(?!\\.{1,2}/)(?![A-Za-z0-9._-]+/\\.{1,2}(?:\\.git)?$)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\\.git)?|https://(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\\.)+[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/(?!\\.{1,2}/)(?![A-Za-z0-9._-]+/(?:\\.{1,2}|\\.git|\\.{1,2}\\.git)$)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\\.git)?)$"
+        },
+        {
           "type": "object",
           "required": ["ownerId", "repositoryId"],
           "properties": {
@@ -373,7 +378,21 @@
     "workspaceGitRef": {
       "oneOf": [
         { "const": "trigger" },
-        { "$ref": "#/$defs/exactGitCommit" }
+        { "$ref": "#/$defs/exactGitCommit" },
+        {
+          "oneOf": [
+            {
+              "type": "string",
+              "maxLength": 512,
+              "pattern": "^(?!trigger$)(?!HEAD$)(?![0-9A-Fa-f]{7,40}$)(?!git:)(?!-)(?!.*(?:\\.\\.|\\x40\\{|\\\\|[\\u0000-\\u0020\\u007F]))(?!.*\\/$).+$"
+            },
+            {
+              "type": "string",
+              "maxLength": 520,
+              "pattern": "^git:ref:(?!-)(?!.*(?:\\.\\.|\\x40\\{|\\\\|[\\u0000-\\u0020\\u007F]))(?!.*\\/$).+$"
+            }
+          ]
+        }
       ]
     },
     "workspaceGitHistory": {

@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use steward_types::direct_package::{
-    AgentRef, ContentDigest, Decimal, DirectTaskBindingEvidence, DirectTaskDefinition,
-    DirectTaskStatusResponse, DirectTaskSubmission, Duration, ExactGitCommit, ExecutionLogMode,
-    InstructionSkill, InvocationManifest, PackageClosure, RelativePath, RepositoryUrl,
-    SOURCE_PROVENANCE_JWT_CLAIM, Slug, SourceProvenance, StableProviderId, Uuid, WorkspaceName,
-    WorkspacePath, canonical_json_bytes,
+    AgentRef, BrowserPackageLocator, ContentDigest, Decimal, DirectTaskBindingEvidence,
+    DirectTaskDefinition, DirectTaskStatusResponse, DirectTaskSubmission, Duration, ExactGitCommit,
+    ExecutionLogMode, InstructionSkill, InvocationManifest, PackageClosure, RelativePath,
+    RepositoryUrl, SOURCE_PROVENANCE_JWT_CLAIM, Slug, SourceProvenance, StableProviderId, Uuid,
+    WorkspaceGitNamedRef, WorkspaceGitRepositoryName, WorkspaceName, WorkspacePath,
+    canonical_json_bytes,
 };
 
 const CONTRACT_ROOT: &str = "../../docs/contracts/task/v2";
@@ -282,6 +283,17 @@ fn matches_schema_pattern(pattern: &str, value: &str) -> Result<bool, String> {
         "^[a-z0-9-]{1,40}$" => WorkspaceName::parse(value).is_ok(),
         "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*/?$" => {
             WorkspacePath::parse(value).is_ok()
+        }
+        "^(?:(?!\\.{1,2}/)(?![A-Za-z0-9._-]+/\\.{1,2}(?:\\.git)?$)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\\.git)?|https://(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\\.)+[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/(?!\\.{1,2}/)(?![A-Za-z0-9._-]+/(?:\\.{1,2}|\\.git|\\.{1,2}\\.git)$)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\\.git)?)$" => {
+            WorkspaceGitRepositoryName::parse(value).is_ok()
+        }
+        "^(?!trigger$)(?!HEAD$)(?![0-9A-Fa-f]{7,40}$)(?!git:)(?!-)(?!.*(?:\\.\\.|\\x40\\{|\\\\|[\\u0000-\\u0020\\u007F]))(?!.*\\/$).+$" => {
+            value != "trigger"
+                && !value.starts_with("git:")
+                && WorkspaceGitNamedRef::parse(value).is_ok()
+        }
+        "^git:ref:(?!-)(?!.*(?:\\.\\.|\\x40\\{|\\\\|[\\u0000-\\u0020\\u007F]))(?!.*\\/$).+$" => {
+            value.starts_with("git:ref:") && WorkspaceGitNamedRef::parse(value).is_ok()
         }
         "^\\S(?:.*\\S)?$" => {
             !value.is_empty()
@@ -592,7 +604,116 @@ fn task_definition_accepts_typed_workspace_entries() -> Result<(), String> {
     validate_schema_instance(&schema, definition_schema, &definition, "$task")?;
     let definition: DirectTaskDefinition = serde_json::from_value(definition)
         .map_err(|error| format!("workspace TaskDefinition must parse: {error}"))?;
-    definition.validate()
+    definition.validate()?;
+    let serialized = serde_json::to_value(definition)
+        .map_err(|error| format!("workspace TaskDefinition must serialize: {error}"))?;
+    assert_eq!(
+        serialized.pointer("/workspace/1/git/repository"),
+        Some(&serde_json::json!({
+            "ownerId": "1000001",
+            "repositoryId": "2000001"
+        })),
+        "the existing stable-ID wire form must remain byte-shape compatible"
+    );
+    Ok(())
+}
+
+#[test]
+fn task_definition_accepts_named_workspace_repositories_and_refs() -> Result<(), String> {
+    let schema = parse_value("schemas/direct-package.schema.json")?;
+    let definition_schema = schema
+        .pointer("/$defs/taskDefinition")
+        .ok_or_else(|| "TaskDefinition schema must exist".to_owned())?;
+
+    for (repository, git_ref, normalized_repository, normalized_ref) in [
+        (
+            "example-org/repository",
+            "main",
+            "example-org/repository",
+            "git:ref:main",
+        ),
+        (
+            "https://github.com/example-org/repository",
+            "git:ref:release-v1",
+            "https://github.com/example-org/repository",
+            "git:ref:release-v1",
+        ),
+        (
+            "https://source.example.test/Example-Org/Repository.git",
+            "main",
+            "https://source.example.test/Example-Org/Repository",
+            "git:ref:main",
+        ),
+        (
+            "Example-Org/Repository.git",
+            "main",
+            "Example-Org/Repository",
+            "git:ref:main",
+        ),
+        (
+            "example-org/repository",
+            "v1.2.3",
+            "example-org/repository",
+            "git:ref:v1.2.3",
+        ),
+        (
+            "example-org/repository",
+            "git:ref:HEAD",
+            "example-org/repository",
+            "git:ref:HEAD",
+        ),
+        (
+            "example-org/repository",
+            "git:ref:20261010",
+            "example-org/repository",
+            "git:ref:20261010",
+        ),
+    ] {
+        let definition = serde_json::json!({
+            "schemaVersion": "steward.task-definition/v2",
+            "name": "repository-review",
+            "version": 1,
+            "runtime": { "agentRef": "example-agent@1.2.3" },
+            "promptText": "Review the repository and write out/report.md.",
+            "workspace": [{
+                "git": {
+                    "repository": repository,
+                    "ref": git_ref
+                }
+            }],
+            "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+        });
+        validate_schema_instance(&schema, definition_schema, &definition, "$task")?;
+        let definition: DirectTaskDefinition = serde_json::from_value(definition)
+            .map_err(|error| format!("named workspace TaskDefinition must parse: {error}"))?;
+        definition.validate()?;
+        let serialized = serde_json::to_value(definition)
+            .map_err(|error| format!("named workspace TaskDefinition must serialize: {error}"))?;
+        assert_eq!(
+            serialized.pointer("/workspace/0/git/repository"),
+            Some(&serde_json::json!(normalized_repository))
+        );
+        assert_eq!(
+            serialized.pointer("/workspace/0/git/ref"),
+            Some(&serde_json::json!(normalized_ref))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn repository_package_revisions_keep_explicit_git_ref_compatibility() -> Result<(), String> {
+    for revision in ["git:ref:HEAD", "git:ref:1234567", "git:ref:20261010"] {
+        BrowserPackageLocator {
+            source: "https://source.example.test/example-org/package.git".to_owned(),
+            revision: Some(revision.to_owned()),
+            path: RelativePath::parse("catalog/task-definition.json")?,
+            files: None,
+        }
+        .validate()
+        .map_err(|error| format!("previously valid revision {revision} was rejected: {error}"))?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -617,6 +738,19 @@ fn task_definition_rejects_malformed_workspace_entries() -> Result<(), String> {
         serde_json::json!([{ "artifact": {} }]),
         serde_json::json!([{ "git": {}, "scratch": { "size": "1Gi" } }]),
         serde_json::json!([{ "git": { "history": { "depth": 0 } } }]),
+        serde_json::json!([{ "git": { "repository": "example-org" } }]),
+        serde_json::json!([{ "git": { "repository": "example-org/repository/extra" } }]),
+        serde_json::json!([{ "git": { "repository": "https://github.com/example-org/repository/extra" } }]),
+        serde_json::json!([{ "git": { "repository": "../repository" } }]),
+        serde_json::json!([{ "git": { "repository": "example-org/.." } }]),
+        serde_json::json!([{ "git": { "repository": "https://github.com/example-org/.git" } }]),
+        serde_json::json!([{ "git": { "ref": "git:branch:main" } }]),
+        serde_json::json!([{ "git": { "ref": "HEAD" } }]),
+        serde_json::json!([{ "git": { "ref": "abcdef0" } }]),
+        serde_json::json!([{ "git": { "ref": "0123456789abcdef0123456789abcdef01234567" } }]),
+        serde_json::json!([{ "git": { "ref": "refs/heads/../secret" } }]),
+        serde_json::json!([{ "git": { "ref": "-main" } }]),
+        serde_json::json!([{ "git": { "ref": "release/" } }]),
         serde_json::json!([{ "scratch": {} }]),
     ] {
         let definition = definition_with(workspace);
@@ -828,7 +962,7 @@ fn binding_evidence_rejects_tampered_source_and_package_relationships() -> Resul
         ),
         (
             "/invocation/repository",
-            serde_json::json!("https://git.example.com/example-org/caller.git"),
+            serde_json::json!("https://attacker.example.test/example-org/caller.git"),
         ),
         ("/envelope/revision", serde_json::json!(0)),
     ];
@@ -845,6 +979,21 @@ fn binding_evidence_rejects_tampered_source_and_package_relationships() -> Resul
         assert!(tampered.validate().is_err(), "tampering at {pointer}");
     }
     Ok(())
+}
+
+#[test]
+fn binding_evidence_accepts_the_server_selected_source_host() -> Result<(), String> {
+    let evidence: DirectTaskBindingEvidence =
+        parse("fixtures/positive/task-binding-evidence.json")?;
+    let mut value = serde_json::to_value(evidence)
+        .map_err(|error| format!("evidence must serialize: {error}"))?;
+    value["invocation"]["repository"] =
+        serde_json::json!("https://source.example.test/example-org/caller.git");
+    value["package"]["repository"] =
+        serde_json::json!("https://source.example.test/example-org/agentic-ops.git");
+    let evidence: DirectTaskBindingEvidence = serde_json::from_value(value)
+        .map_err(|error| format!("alternate-host evidence must parse: {error}"))?;
+    evidence.validate()
 }
 
 #[test]

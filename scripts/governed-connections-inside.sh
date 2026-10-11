@@ -46,9 +46,33 @@ KUBECTL=(
 )
 postgres_forward_pid=""
 mcp_forward_pid=""
+capture_agentgateway_failure_log() {
+  log="${STEWARD_RUN_DIR}/agentgateway-failure.log"
+  if "${KUBECTL[@]}" -n steward-system logs \
+    deployment/mcp-gw-agentgateway \
+    --all-containers=true \
+    --prefix=true \
+    2>&1 |
+    sed -E \
+      -e 's/([Aa]uthorization: *[Bb]earer +)[^[:space:]]+/\1[REDACTED]/g' \
+      -e 's/([Mm][Cc][Pp]-[Ss]ession-[Ii][Dd]: *)[^[:space:]]+/\1[REDACTED]/g' \
+      -e 's/(mcp\.session\.id=)[^[:space:]]+/\1[REDACTED]/g' \
+      -e 's/("(access_token|id_token|refresh_token|token)"[[:space:]]*:[[:space:]]*")[^"]+/\1[REDACTED]/g' \
+      >"${log}"
+  then
+    printf '\nagentgateway failure log (credentials and session IDs redacted):\n' >&2
+    sed -n '1,2000p' "${log}" >&2
+    printf 'end agentgateway failure log\n\n' >&2
+  else
+    printf 'agentgateway failure log was unavailable\n' >&2
+  fi
+}
 cleanup() {
   status="$1"
   trap - EXIT INT TERM
+  if [[ "${status}" != "0" ]]; then
+    capture_agentgateway_failure_log
+  fi
   for pid in "${postgres_forward_pid}" "${mcp_forward_pid}"; do
     if [[ -n "${pid}" ]]; then
       kill "${pid}" >/dev/null 2>&1 || true
