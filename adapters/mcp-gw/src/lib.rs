@@ -752,6 +752,7 @@ impl GithubMcpGateway {
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
+            .pool_max_idle_per_host(0)
             .build()
             .map_err(|_| unavailable("build MCP-GW client"))?;
         Ok(Self {
@@ -4633,6 +4634,84 @@ mod tests {
         stream
             .write_all(reply.as_bytes())
             .map_err(|error| format!("write captured reply: {error}"))
+    }
+
+    /// Writes a complete response without instructing the client to close the
+    /// connection. The provider boundary may stop forwarding that connection
+    /// after the response, so the next MCP message must not depend on reusing it.
+    fn write_captured_keepalive(stream: &mut TcpStream, raw: &str) -> Result<(), String> {
+        let (status, headers, body) = split_captured(raw)?;
+        let chunked = headers
+            .iter()
+            .any(|line| line.eq_ignore_ascii_case("transfer-encoding: chunked"));
+        let mut reply = format!("HTTP/1.1 {status}\r\n");
+        for line in &headers {
+            reply.push_str(line);
+            reply.push_str("\r\n");
+        }
+        reply.push_str("\r\n");
+        if chunked {
+            reply.push_str(&format!("{:x}\r\n{body}\r\n0\r\n\r\n", body.len()));
+        } else {
+            reply.push_str(&body);
+        }
+        stream
+            .write_all(reply.as_bytes())
+            .map_err(|error| format!("write keepalive captured reply: {error}"))
+    }
+
+    #[tokio::test]
+    async fn lifecycle_messages_do_not_reuse_provider_connections() -> Result<(), String> {
+        let session = captured_session_id(AGENTGATEWAY_INITIALIZE)?;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind provider-boundary fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read provider-boundary fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let mut held_connections = Vec::new();
+            for (expected_method, reply) in [
+                ("initialize", AGENTGATEWAY_INITIALIZE),
+                ("notifications/initialized", AGENTGATEWAY_INITIALIZED),
+                ("tools/call", AGENTGATEWAY_TOOLS_CALL),
+            ] {
+                let request = read_http_request(&listener)?;
+                assert_eq!(
+                    request
+                        .body
+                        .as_ref()
+                        .and_then(|body| body["method"].as_str()),
+                    Some(expected_method)
+                );
+                let mut stream = request.stream;
+                write_captured_keepalive(&mut stream, reply)?;
+                held_connections.push(stream);
+            }
+
+            let request = read_http_request(&listener)?;
+            assert_eq!(request.request_line, "DELETE /mcp HTTP/1.1");
+            assert_eq!(request.header("mcp-session-id"), Some(session.as_str()));
+            let mut stream = request.stream;
+            write_captured_keepalive(&mut stream, AGENTGATEWAY_DELETE)?;
+            held_connections.push(stream);
+            Ok(())
+        });
+
+        let gateway = GithubMcpGateway::new(&McpFixture::origin(address), "0.4.9")
+            .map_err(|error| format!("build provider-boundary gateway: {error:?}"))?;
+        let mut mcp = McpSession::new(&gateway);
+        let result = mcp
+            .call_tool("steward-github-me", "get_me", serde_json::json!({}))
+            .await;
+        mcp.close().await;
+        server
+            .join()
+            .map_err(|_| "provider-boundary fixture panicked".to_owned())??;
+        assert_eq!(
+            result,
+            Ok(serde_json::json!({"login": "alice", "id": 1000001}))
+        );
+        Ok(())
     }
 
     /// The bridge against the replies the pinned agentgateway really sends: an SSE
