@@ -15,6 +15,8 @@ executable: /usr/bin/codex
 versionProbe:
   arguments: [--version]
   expectedStdout: codex-cli 0.140.0
+models:
+  providers: [openai]
 ```
 
 Install the provider-profile bundle from the same Steward release and record the rendered profile

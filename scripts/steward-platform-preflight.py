@@ -700,11 +700,24 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
         if selected not in profile_ids:
             raise ValidationError(f"execution.binding.{key} must select one providerProfiles name")
 
+    capability_catalog = require_object(data, "capabilityCatalog", "input")
     validate_capability_catalog(
-        require_object(data, "capabilityCatalog", "input"),
+        capability_catalog,
         requires_inference="inferenceProfile" in binding,
         requires_tools="toolsProfile" in binding,
     )
+    uncovered_model_providers = sorted(
+        {
+            model["provider"]
+            for model in capability_catalog["models"]
+            if model["provider"] not in model_providers
+        }
+    )
+    if uncovered_model_providers:
+        raise ValidationError(
+            "execution.binding.modelProviders must cover every capabilityCatalog.models provider; "
+            f"missing: {', '.join(uncovered_model_providers)}"
+        )
     validate_steward_run_release(
         require_object(data, "stewardRunRelease", "input")
     )

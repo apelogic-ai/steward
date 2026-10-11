@@ -707,6 +707,7 @@ export type BrowserTaskEvidence = {
     promptSource?: PromptSourceKind;
     requestedDiagnostics?: null | DiagnosticsRequest;
     requestedRequirements?: null | DirectRequirements;
+    requestedRevision?: string | null;
     requestedWorkspace?: Array<WorkspaceEntry>;
     revision: string;
     source: string;

@@ -880,6 +880,7 @@ fn browser_direct_package_evidence(
     let evidence = BrowserTaskEvidence {
         source: source.to_owned(),
         revision: repository_revision.unwrap_or_else(|| closure_digest.as_str().to_owned()),
+        requested_revision: None,
         path,
         closure: Some(closure),
         closure_digest,

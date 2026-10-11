@@ -2215,6 +2215,7 @@ mod tests {
         let evidence = BrowserTaskEvidence {
             source: "inline".to_owned(),
             revision: closure_digest.as_str().to_owned(),
+            requested_revision: None,
             path: entry_point.clone(),
             closure: Some(closure),
             closure_digest,

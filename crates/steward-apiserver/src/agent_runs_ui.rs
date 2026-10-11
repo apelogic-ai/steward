@@ -3912,6 +3912,7 @@ mod tests {
         record.browser_task_evidence = Some(BrowserTaskEvidence {
             source: "inline".to_owned(),
             revision: format!("steward:sha256:{}", "d".repeat(64)),
+            requested_revision: None,
             path: RelativePath::parse("task-definition.json")?,
             closure: None,
             closure_digest: ContentDigest::parse(format!("steward:sha256:{}", "d".repeat(64)))?,
@@ -4659,6 +4660,7 @@ mod tests {
         let evidence = BrowserTaskEvidence {
             source: "inline".to_owned(),
             revision: digest.clone(),
+            requested_revision: None,
             path: RelativePath::parse("task-definition.json")?,
             closure: None,
             closure_digest: ContentDigest::parse(digest)?,
@@ -4747,6 +4749,7 @@ mod tests {
         let evidence = BrowserTaskEvidence {
             source: "inline".to_owned(),
             revision: digest.clone(),
+            requested_revision: None,
             path: RelativePath::parse("task-definition.json")?,
             closure: None,
             closure_digest: ContentDigest::parse(digest.clone())?,
@@ -4837,6 +4840,7 @@ mod tests {
         hidden.browser_task_evidence = Some(BrowserTaskEvidence {
             source: "inline".to_owned(),
             revision: hidden_digest.clone(),
+            requested_revision: None,
             path: RelativePath::parse("task-definition.json")?,
             closure: None,
             closure_digest: ContentDigest::parse(hidden_digest.clone())?,
@@ -4876,6 +4880,7 @@ mod tests {
         registry_run.browser_task_evidence = Some(BrowserTaskEvidence {
             source: "steward:registry/release-summary".to_owned(),
             revision: "steward:version:2".to_owned(),
+            requested_revision: None,
             path: RelativePath::parse("task-definition.json")?,
             closure: None,
             closure_digest: ContentDigest::parse(registry_digest.clone())?,
@@ -4895,6 +4900,7 @@ mod tests {
         malformed_run.browser_task_evidence = Some(BrowserTaskEvidence {
             source: "https://github.com/example-org/example-repo.git".to_owned(),
             revision: format!("git:sha1:{}", "a".repeat(40)),
+            requested_revision: None,
             path: RelativePath::parse("task-definition.json")?,
             closure: None,
             closure_digest: ContentDigest::parse(format!("steward:sha256:{}", "d".repeat(64)))?,
@@ -5141,6 +5147,7 @@ mod tests {
         source.browser_task_evidence = Some(BrowserTaskEvidence {
             source: "inline".to_owned(),
             revision: format!("steward:sha256:{}", "d".repeat(64)),
+            requested_revision: None,
             path: RelativePath::parse("task-definition.json")?,
             closure: None,
             closure_digest: ContentDigest::parse(format!("steward:sha256:{}", "d".repeat(64)))?,

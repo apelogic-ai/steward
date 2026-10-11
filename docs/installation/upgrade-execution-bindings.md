@@ -10,21 +10,48 @@ An installation already using `steward.execution-bindings/v1` must migrate the c
 the binary rollout. The new parser and Helm schema reject v1 catalogs; changing only the image or
 only the catalog leaves one side unable to start.
 
+Before:
+
+```json
+{
+  "apiVersion": "steward.execution-bindings/v1",
+  "bindings": [{
+    "agentRef": "codex@0.140.0",
+    "adapter": "codex-v1"
+  }]
+}
+```
+
+After, preserving the omitted immutable execution and provider-profile fields exactly:
+
+```json
+{
+  "apiVersion": "steward.execution-bindings/v2",
+  "bindings": [{
+    "agentRef": "codex@0.140.0",
+    "adapter": "codex-v1",
+    "models": {"providers": ["openai"]}
+  }]
+}
+```
+
 1. Pause Task submission and Workflow publication.
 2. Add `models.providers` to every binding. List only providers supported by that exact agent image
    and adapter deployment. Keep every other binding field unchanged.
 3. Change the catalog `apiVersion` to `steward.execution-bindings/v2` and validate the complete Helm
-   values against the new chart.
+   values against the new chart. If deployment preflight is used, also add
+   `execution.binding.modelProviders`; it must cover every provider named by
+   `capabilityCatalog.models`.
 4. Roll out the new apiserver and controller images with that v2 catalog. Existing Tasks carrying a
    persisted v1 binding remain readable and continue from their immutable snapshot.
 5. Wait until every old apiserver and controller pod is gone, then resume submission and
    publication. This prevents an old controller from claiming a newly admitted v2-bound Task.
 
-To roll back, pause submission again and use the new controller to drain and finalize every Task
-admitted with a v2 binding. Restore the previous binaries and the exact v1 catalog together, then
-resume only after all pods are on the previous version. Previous binaries cannot read v2 binding
-snapshots, while new binaries cannot start with a v1 catalog. Do not run a mixed controller fleet
-while v2-bound Tasks are claimable.
+The `models.providers` field changes each binding's content-bound digest. Once any Task has been
+created with a v2 binding snapshot, downgrade to a binary that understands only v1 bindings is not
+supported. Before the first such Task exists, restore the previous binaries and exact v1 catalog
+together while submission remains paused. Do not run a mixed controller fleet while v2-bound Tasks
+are claimable.
 
 ## Installations without an explicit catalog
 

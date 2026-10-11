@@ -702,6 +702,17 @@ class PlatformPreflightTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("execution.binding.modelProviders", result.stderr)
 
+    def test_rejects_capability_model_provider_missing_from_execution_binding(self) -> None:
+        self.input["capabilityCatalog"]["models"].append(
+            {"provider": "example", "model": "model-x"}
+        )
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "modelProviders must cover every capabilityCatalog.models provider; missing: example",
+            result.stderr,
+        )
+
     def test_allows_catalog_category_omitted_by_binding(self) -> None:
         del self.input["execution"]["binding"]["toolsProfile"]
         self.input["capabilityCatalog"]["tools"] = []

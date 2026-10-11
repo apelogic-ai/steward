@@ -619,6 +619,8 @@ impl TaskOrigin {
 pub struct BrowserTaskEvidence {
     pub source: String,
     pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_revision: Option<String>,
     pub path: RelativePath,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closure: Option<PackageClosure>,
@@ -651,6 +653,15 @@ impl BrowserTaskEvidence {
             files: self.inline_files.clone(),
         };
         locator.validate()?;
+        if let Some(requested_revision) = &self.requested_revision {
+            BrowserPackageLocator {
+                source: self.source.clone(),
+                revision: Some(requested_revision.clone()),
+                path: self.path.clone(),
+                files: self.inline_files.clone(),
+            }
+            .validate()?;
+        }
         if self.source == "inline" && self.revision != self.closure_digest.as_str() {
             return Err("inline package revision differs from its closure digest".to_owned());
         }

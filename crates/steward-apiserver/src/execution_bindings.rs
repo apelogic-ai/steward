@@ -88,11 +88,19 @@ impl ExecutionBindingCatalog {
         if value.len() > MAX_EXECUTION_BINDING_CATALOG_BYTES {
             return Err("execution binding catalog exceeds 1048576 bytes".to_owned());
         }
-        let document = serde_json::from_str::<CatalogDocument>(value)
+        let raw = serde_json::from_str::<serde_json::Value>(value)
             .map_err(|error| format!("execution binding catalog is invalid: {error}"))?;
-        if document.api_version != EXECUTION_BINDING_CATALOG_API_VERSION {
-            return Err("unsupported execution binding catalog API version".to_owned());
+        let api_version = raw
+            .get("apiVersion")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        if api_version != EXECUTION_BINDING_CATALOG_API_VERSION {
+            return Err(format!(
+                "execution binding catalog API version is {api_version}; expected {EXECUTION_BINDING_CATALOG_API_VERSION}; follow docs/installation/upgrade-execution-bindings.md"
+            ));
         }
+        let document = serde_json::from_value::<CatalogDocument>(raw)
+            .map_err(|error| format!("execution binding catalog is invalid: {error}"))?;
         if document.bindings.len() > MAX_EXECUTION_BINDINGS {
             return Err("execution binding catalog exceeds 128 bindings".to_owned());
         }
@@ -278,6 +286,39 @@ mod tests {
     fn empty_versioned_catalog_is_valid_and_advertises_no_agents() -> Result<(), String> {
         let catalog = ExecutionBindingCatalog::from_json(&catalog_json(Vec::new())?)?;
         assert!(catalog.agent_refs().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_v1_catalog_before_parsing_v2_binding_fields() -> Result<(), String> {
+        let catalog = serde_json::json!({
+            "apiVersion": "steward.execution-bindings/v1",
+            "bindings": [{
+                "agentRef": "agent@1.0.0",
+                "adapter": "example-v1",
+                "image": format!(
+                    "registry.example.test/agents/example@sha256:{}",
+                    "a".repeat(64)
+                ),
+                "executable": "/opt/example/bin/agent",
+                "versionProbe": {
+                    "arguments": ["--version"],
+                    "expectedStdout": "example-agent 1.0.0"
+                },
+                "providerProfiles": {}
+            }]
+        })
+        .to_string();
+
+        let error = match ExecutionBindingCatalog::from_json(&catalog) {
+            Ok(_) => return Err("a v1 execution binding catalog was accepted".to_owned()),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "execution binding catalog API version is steward.execution-bindings/v1; expected steward.execution-bindings/v2; follow docs/installation/upgrade-execution-bindings.md"
+        );
+        assert!(!error.contains("missing field"));
         Ok(())
     }
 
