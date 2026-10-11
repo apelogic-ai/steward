@@ -22,6 +22,7 @@ import {
   type StarterTaskSetting,
 } from "@/api-client";
 import { DiagnosticDetails, type DiagnosticItem } from "@/components/diagnostic-details";
+import { canonicalWorkspaceRef, workspaceRepositoryName } from "@/components/workspace-repository-controls";
 import { PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { RepositoryResource, useGithubRepositories } from "@/data/github-repositories";
 import { useApiResource } from "@/data/use-api-resource";
@@ -140,7 +141,7 @@ function failureHint(code: string | null, reason: string): string | null {
   return null;
 }
 
-export function runNowFailureMessage(error: unknown): string {
+export function runNowFailureMessage(error: unknown, workspaceRepository?: string): string {
   if (!error || typeof error !== "object") return genericRunNowFailure;
   const value = error as Record<string, unknown>;
   const code = typeof value.error === "string" && value.error.trim() ? value.error : null;
@@ -150,6 +151,10 @@ export function runNowFailureMessage(error: unknown): string {
       ? value.message
       : null;
   if (reason) {
+    const workspaceRejected = code?.includes("workspace") || reason.toLocaleLowerCase("en-US").includes("workspace repository");
+    if (workspaceRepository && workspaceRejected) {
+      return `The run request was rejected. ${workspaceRepository} could not be used as the workspace repository. Choose an approved repository and branch or tag, or ask an administrator to check its access.`;
+    }
     const hint = failureHint(code, reason);
     return hint ? `The run request was rejected. ${hint}` : genericRunNowFailure;
   }
@@ -169,7 +174,12 @@ export function inlineFiles(
   starterTask: StarterTaskSetting,
   agentRef: string,
   model: { provider: string; model: string },
-  checkout?: { repository: Pick<GithubRepositoryView, "ownerId" | "repositoryId">; historyDepth?: number },
+  checkout?: ({
+    repository: Pick<GithubRepositoryView, "name" | "owner">;
+    ref: string;
+  } | {
+    repository: Pick<GithubRepositoryView, "ownerId" | "repositoryId">;
+  }) & { historyDepth?: number },
 ): Record<string, string> {
   const taskDefinition: DirectTaskDefinition = {
     ...starterTask.taskDefinition,
@@ -178,11 +188,13 @@ export function inlineFiles(
       ? {
           workspace: [{
             git: {
-              repository: {
-                ownerId: checkout.repository.ownerId,
-                repositoryId: checkout.repository.repositoryId,
-              },
-              ref: "trigger",
+              repository: ("ref" in checkout
+                ? workspaceRepositoryName(checkout.repository)
+                : {
+                    ownerId: checkout.repository.ownerId,
+                    repositoryId: checkout.repository.repositoryId,
+                  }) as never,
+              ref: ("ref" in checkout ? canonicalWorkspaceRef(checkout.ref) : "trigger") as never,
               ...(checkout.historyDepth ? { history: { depth: checkout.historyDepth } } : {}),
             },
           }] as unknown as DirectTaskDefinition["workspace"],
@@ -300,6 +312,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
   const [captureExecutionLog, setCaptureExecutionLog] = useState(!exactTask && starterTask.executionLog === "full");
   const [checkoutRepository, setCheckoutRepository] = useState(false);
   const [workspaceRepositoryId, setWorkspaceRepositoryId] = useState("");
+  const [workspaceRef, setWorkspaceRef] = useState("");
   const [historyDepth, setHistoryDepth] = useState("");
   const [status, setStatus] = useState<"idle" | "submitting" | "error">("idle");
   const [failure, setFailure] = useState<string | null>(null);
@@ -322,18 +335,27 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
     envelope?.spec.llms ?? [],
   );
   const workspaceRepositories = repositoryState.status === "ready" ? repositoryState.value.repositories : [];
-  const selectedWorkspaceRepository = workspaceRepositories.find((candidate) => candidate.repositoryId === workspaceRepositoryId)
-    ?? workspaceRepositories.find((candidate) => candidate.ready);
+  const defaultWorkspaceRepository = workspaceRepositories.find((candidate) => candidate.ready);
+  const selectedWorkspaceRepository = workspaceRepositories.find((candidate) => candidate.repositoryId === workspaceRepositoryId);
+  const effectiveWorkspaceRef = workspaceRef || selectedWorkspaceRepository?.defaultBranch || "";
+  const workspaceRefValid = !selectedWorkspaceRepository || effectiveWorkspaceRef.trim().length > 0;
   const parsedHistoryDepth = historyDepth.trim() === "" ? undefined : Number(historyDepth);
   const historyDepthValid = parsedHistoryDepth === undefined || (Number.isSafeInteger(parsedHistoryDepth) && parsedHistoryDepth > 0);
+  const workspaceCheckout = checkoutRepository && historyDepthValid
+    ? selectedWorkspaceRepository?.ready && workspaceRefValid
+      ? { repository: selectedWorkspaceRepository, ref: effectiveWorkspaceRef, historyDepth: parsedHistoryDepth }
+      : defaultWorkspaceRepository?.ready
+        ? { repository: defaultWorkspaceRepository, historyDepth: parsedHistoryDepth }
+        : undefined
+    : undefined;
+  const workspaceCheckoutReady = !checkoutRepository || Boolean(workspaceCheckout);
+  const failureWorkspaceRepository = selectedWorkspaceRepository ?? defaultWorkspaceRepository;
   const files = selectedModel
     ? inlineFiles(
         { ...starterTask, taskDefinition: { ...starterTask.taskDefinition, promptText: prompt } },
         effectiveAgentRef,
         selectedModel,
-        checkoutRepository && selectedWorkspaceRepository?.ready && historyDepthValid
-          ? { repository: selectedWorkspaceRepository, historyDepth: parsedHistoryDepth }
-          : undefined,
+        workspaceCheckout,
       )
     : null;
 
@@ -390,7 +412,12 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
       onCreated(result.data.taskUid);
       return;
     }
-    setFailure(runNowFailureMessage(result.error));
+    setFailure(runNowFailureMessage(
+      result.error,
+      checkoutRepository && failureWorkspaceRepository
+        ? workspaceRepositoryName(failureWorkspaceRepository)
+        : undefined,
+    ));
     setFailureDetails(runNowDiagnostics(result.error));
     setStatus("error");
   }
@@ -404,12 +431,12 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
     </div>
     {exactTask ? <p className="text-sm text-muted-ink">The exact immutable package is locked. Choose an Envelope and optional inputs for this run.</p> : null}
     {!exactTask && sourceKind === "inline" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Coding agent<select className={`${fieldClass} font-mono`} onChange={(event) => setAgentRef(event.target.value)} value={effectiveAgentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.agentRef}{agent.compatible ? ` · ${agent.model?.provider}/${agent.model?.model}` : ` · ${agent.reason}`}</option>)}</select></label>{agentWarning ?? modelWarning ? <p className="text-sm text-warn" role="status">{agentWarning ?? modelWarning}</p> : null}<label className="grid gap-2 text-sm font-semibold">Prompt<span className="text-xs font-normal text-muted-ink">Write results under <code>$STEWARD_OUTPUT_DIR/out/</code>. Only those files are collected; a run with no <code>out/</code> file fails.</span><textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label><p className="text-xs text-muted-ink">This inline task uses one compatible model and {starterTask.taskDefinition.requires ? "uses its saved access requirements" : "inherits the selected Envelope's approved tools, budget, time-to-live limit, and runner limits"}. Open the Task from the completed Run to reuse or publish the exact package.</p></div> : null}
-    {!exactTask && sourceKind === "inline" ? <div className="space-y-3 rounded-control border p-4"><label className="flex items-center gap-3 text-sm font-semibold"><input checked={checkoutRepository} onChange={(event) => setCheckoutRepository(event.target.checked)} type="checkbox" />Check out this repository</label>{checkoutRepository ? <RepositoryResource onRetry={refreshRepositories} state={repositoryState}>{({ repositories }) => <div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Workspace repository<select className={fieldClass} onChange={(event) => setWorkspaceRepositoryId(event.target.value)} value={selectedWorkspaceRepository?.repositoryId ?? ""}>{repositories.map((candidate) => <option disabled={!candidate.ready} key={candidate.repositoryId} value={candidate.repositoryId}>{candidate.owner}/{candidate.name}{candidate.ready ? "" : " · not approved"}</option>)}</select></label><label className="grid gap-2 text-sm font-semibold">History depth (optional)<input className={fieldClass} min={1} onChange={(event) => setHistoryDepth(event.target.value)} placeholder="Files only" step={1} type="number" value={historyDepth} /></label></div>}</RepositoryResource> : null}{checkoutRepository && !historyDepthValid ? <p className="text-sm text-err" role="alert">History depth must be a positive whole number.</p> : null}{checkoutRepository && repositoryState.status === "ready" && !selectedWorkspaceRepository?.ready ? <p className="text-sm text-warn">Choose an approved repository before starting the run.</p> : null}</div> : null}
+    {!exactTask && sourceKind === "inline" ? <div className="space-y-3 rounded-control border p-4"><label className="flex items-center gap-3 text-sm font-semibold"><input checked={checkoutRepository} onChange={(event) => setCheckoutRepository(event.target.checked)} type="checkbox" />Check out this repository</label>{checkoutRepository ? <RepositoryResource onRetry={refreshRepositories} state={repositoryState}>{({ repositories }) => <div className="grid gap-4 md:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Workspace repository<select className={fieldClass} onChange={(event) => { const nextId = event.target.value; const next = repositories.find((candidate) => candidate.repositoryId === nextId); setWorkspaceRepositoryId(nextId); setWorkspaceRef(next?.defaultBranch ?? ""); }} value={workspaceRepositoryId}><option value="">Default repository at trigger revision</option>{repositories.map((candidate) => <option disabled={!candidate.ready} key={candidate.repositoryId} value={candidate.repositoryId}>{workspaceRepositoryName(candidate)}{candidate.ready ? "" : " · not approved"}</option>)}</select></label><label className="grid gap-2 text-sm font-semibold">Branch or tag<input className={`${fieldClass} font-mono`} disabled={!selectedWorkspaceRepository} onChange={(event) => setWorkspaceRef(event.target.value)} placeholder={selectedWorkspaceRepository?.defaultBranch ?? "Choose a named repository first"} value={effectiveWorkspaceRef} /></label><label className="grid gap-2 text-sm font-semibold">History depth (optional)<input className={fieldClass} min={1} onChange={(event) => setHistoryDepth(event.target.value)} placeholder="Files only" step={1} type="number" value={historyDepth} /></label><p className="text-xs text-muted-ink md:col-span-3">Choose a named repository to pin a branch or tag. The default keeps the repository and revision supplied by the trigger.</p></div>}</RepositoryResource> : null}{checkoutRepository && !workspaceRefValid ? <p className="text-sm text-err" role="alert">Enter a branch or tag.</p> : null}{checkoutRepository && !historyDepthValid ? <p className="text-sm text-err" role="alert">History depth must be a positive whole number.</p> : null}{checkoutRepository && repositoryState.status === "ready" && !defaultWorkspaceRepository?.ready ? <p className="text-sm text-warn">No approved repository is available for this workspace.</p> : null}</div> : null}
     {!exactTask && sourceKind === "repository" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Repository<input className={`${fieldClass} font-mono`} onChange={(event) => setRepository(event.target.value)} value={repository} /></label><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Ref or immutable commit<input className={`${fieldClass} font-mono`} onChange={(event) => setRevision(event.target.value)} value={revision} /></label><label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} value={path} /></label></div><p className="text-xs text-muted-ink">The repository must be in the operator&apos;s allowed source list. Steward resolves a ref to an exact commit and validates the package&apos;s declared requirements before execution.</p></div> : null}
     {!exactTask && sourceKind === "registry" ? <label className="grid gap-2 text-sm font-semibold">Published workflow<select className={fieldClass} onChange={(event) => setWorkflowRef(event.target.value)} value={workflowRef}>{data.workflows.workflows.map((workflow) => <option key={`${workflow.name}@${workflow.version}`} value={`${workflow.name}@${workflow.version}`}>{workflow.displayName} · {workflow.name}@{workflow.version}</option>)}</select></label> : null}
     <label className="grid gap-2 text-sm font-semibold">Inputs (JSON object)<span className="text-xs font-normal text-muted-ink">Optional JSON (up to 16 KiB), available to the agent as <code>in/inputs.json</code>. Reference it in your prompt; it cannot change the agent, model, tools, or Envelope. Example: <code>{'{"release":"v1.2.3"}'}</code>.</span><textarea className="min-h-28 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setInputs(event.target.value)} spellCheck={false} value={inputs} /></label>
     <label className="flex items-start gap-3 rounded-control border border-warn/30 bg-warn-soft p-4 text-sm"><input checked={captureExecutionLog} className="mt-1 size-4" onChange={(event) => setCaptureExecutionLog(event.target.checked)} type="checkbox" /><span><strong className="block font-semibold text-warn">Capture execution log</strong><span className="mt-1 block text-muted-ink">Retain stdout and stderr for this run. Execution logs may reproduce arbitrary user, tool, or agent output.</span></span></label>
     {status === "error" ? <div className="text-sm text-err" role="alert"><p>{failure ?? genericRunNowFailure}</p><DiagnosticDetails className="mt-1" items={failureDetails} /></div> : null}
-    <div className="flex justify-end"><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "submitting" || (!exactTask && sourceKind === "inline" && (!inlineAllowed || !selectedModel || (checkoutRepository && (!selectedWorkspaceRepository?.ready || !historyDepthValid))))} type="submit">{status === "submitting" ? "Starting…" : "Run now"}</button></div>
+    <div className="flex justify-end"><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "submitting" || (!exactTask && sourceKind === "inline" && (!inlineAllowed || !selectedModel || !workspaceCheckoutReady))} type="submit">{status === "submitting" ? "Starting…" : "Run now"}</button></div>
   </form>;
 }

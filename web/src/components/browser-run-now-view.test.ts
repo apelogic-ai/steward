@@ -41,18 +41,25 @@ test("inline Run now packages keep the prompt in the single TaskDefinition file"
   });
 });
 
-test("inline Run now pins the selected repository and optional history in workspace", () => {
+test("inline Run now authors the selected repository name and named ref", () => {
   const files = inlineFiles(
     starterTask,
     "codex@0.140.0",
     { provider: "openai", model: "gpt-5.4" },
-    { repository: { ownerId: "1000", repositoryId: "1001" }, historyDepth: 25 },
+    {
+      repository: {
+        name: "repository",
+        owner: "example-org",
+      },
+      ref: "release-v1",
+      historyDepth: 25,
+    },
   );
 
   expect(JSON.parse(files[starterTask.packagePath] ?? "{}").workspace).toEqual([{
     git: {
-      repository: { ownerId: "1000", repositoryId: "1001" },
-      ref: "trigger",
+      repository: "example-org/repository",
+      ref: "git:ref:release-v1",
       history: { depth: 25 },
     },
   }]);
@@ -148,6 +155,16 @@ describe("Run now failures", () => {
       error: "task.direct_package_source_disabled",
       failureReason: "Direct package source resolution is disabled.",
     })).toBe("The run request was rejected. Choose an inline task or ask an administrator to enable GitHub source packages.");
+  });
+
+  test("names the selected workspace repository in its actionable rejection", () => {
+    const message = (runNowFailureMessage as unknown as (error: unknown, repository: string) => string)({
+      error: "task.workspace_rejected",
+      failureReason: "The requested workspace repository is unavailable.",
+    }, "example-org/repository");
+
+    expect(message).toContain("example-org/repository");
+    expect(message).not.toContain("task.workspace_rejected");
   });
 });
 
