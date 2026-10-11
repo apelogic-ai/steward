@@ -380,6 +380,18 @@ jobs:
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    # Step conditions select the image scope from the change class, and from
+    # nothing else. A step without a condition runs for both classes. A step
+    # that needs the images compiled from the Rust workspace, or that brings
+    # up a cluster the web image is never deployed to, runs for every class
+    # except `web`, so an unexpected class value gets the full lane. A `web`
+    # change set cannot alter what those steps check. The clean-cluster
+    # install is one of them: it installs the core profile, which does not
+    # deploy the web image, and otherwise only publishes that image to a
+    # disposable registry and pulls it back by digest, which does not depend
+    # on the image's content. The scopes are defined in
+    # scripts/validate-release-artifacts.sh, and the workflow contract test
+    # pins every step and condition below.
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -399,7 +411,12 @@ jobs:
         run: bash scripts/customer-core-install-e2e.sh --lint-source-chart charts/steward
 
       - name: Render the chart and build all component images
+        if: needs.changes.outputs.class != 'web'
         run: scripts/validate-release-artifacts.sh --build-images
+
+      - name: Render the chart and build the web image
+        if: needs.changes.outputs.class == 'web'
+        run: scripts/validate-release-artifacts.sh --build-images --scope web
 
       - name: Prepare chart vulnerability scan
         run: |
@@ -412,9 +429,11 @@ jobs:
             -C target/release-candidate/chart
 
       - name: Verify Gateway API backend TLS with Envoy Gateway
+        if: needs.changes.outputs.class != 'web'
         run: scripts/steward-gateway-backend-tls-e2e.sh
 
       - name: Enforce critical apiserver image policy
+        if: needs.changes.outputs.class != 'web'
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           image-ref: steward-apiserver:release-validation
@@ -423,6 +442,7 @@ jobs:
           severity: CRITICAL
 
       - name: Enforce critical controller image policy
+        if: needs.changes.outputs.class != 'web'
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           image-ref: steward-controller:release-validation
@@ -431,6 +451,7 @@ jobs:
           severity: CRITICAL
 
       - name: Enforce critical mint image policy
+        if: needs.changes.outputs.class != 'web'
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           image-ref: steward-mint:release-validation
@@ -439,6 +460,7 @@ jobs:
           severity: CRITICAL
 
       - name: Enforce critical connections bridge image policy
+        if: needs.changes.outputs.class != 'web'
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
         with:
           image-ref: steward-bridge:release-validation
@@ -464,6 +486,7 @@ jobs:
           severity: CRITICAL
 
       - name: Install release-candidate artifacts in a clean cluster
+        if: needs.changes.outputs.class != 'web'
         run: bash scripts/release-candidate-acceptance.sh
 
   # The only required status check. Each lane must end the way the change
