@@ -12,8 +12,9 @@ here as part of a larger change — split it out.
    payload.** Not at debug level. Not in an error message. The type wrapping key
    material must not implement `Debug` or `Display` in a way that reveals it.
    The private signing key never touches the working tree — not as a fixture,
-   not as a test artifact, not temporarily (root §11.1). Tests generate an
-   ephemeral key at runtime and drop it with the guard that created it.
+   not as a test artifact, not temporarily (root "Secrets and confidential
+   information"). Tests generate an ephemeral key at runtime and drop it with
+   the guard that created it.
 2. **Never widen the claim set without updating the claim contract doc** and
    every consumer that keys off it — `mcp-gw` HOP-1 config, the git gateway, the
    notification block. Re-cutting this contract is expensive and has already
@@ -31,6 +32,7 @@ here as part of a larger change — split it out.
 6. **Revocation is not eventual.** A change that makes revocation take effect
    "on next refresh" breaks G-4 and the S5 exit criterion.
 
-7. **Root §13 applies here with force.** If a rule in this file blocks a change,
-   that is the file working. Escalate; do not edit it.
+7. **Root "Authority and rule changes" applies here with force.** If a rule in
+   this file blocks a change, that is the file working. Escalate; do not edit
+   it.
 <!-- END:mint-agent-rules -->
