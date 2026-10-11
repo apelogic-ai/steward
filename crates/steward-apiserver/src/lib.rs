@@ -13288,6 +13288,14 @@ mod tests {
                 .ok_or_else(|| "initial browser Task was not reserved".to_owned())?;
             task.input_archive = None;
             task.execute_requested = false;
+            let evidence = task
+                .browser_task_evidence
+                .as_mut()
+                .ok_or_else(|| "initial browser Task omitted its evidence".to_owned())?;
+            evidence.requested_diagnostics = None;
+            evidence.requested_requirements = None;
+            evidence.effective_requirements = None;
+            evidence.requested_workspace.clear();
         }
 
         let recovered = app
@@ -15284,6 +15292,67 @@ mod tests {
                 .map_err(|_| "fake task-operation ledger lock was poisoned")?
                 .len(),
             1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_package_retry_accepts_pre_upgrade_evidence() -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "direct-pre-upgrade-retry")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "contractVersion": "steward.task/v2",
+                        "invocationPath": ".steward/tasks/release-summary.json",
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build direct-package retry: {error}"))
+        };
+
+        let first = app
+            .clone()
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("submit initial direct package: {error}"))?;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        {
+            let mut tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            let evidence = tasks
+                .first_mut()
+                .and_then(|task| task.direct_task_evidence.as_mut())
+                .ok_or_else(|| "initial direct Task omitted its evidence".to_owned())?;
+            evidence.requested_requirements = None;
+            evidence.requested_diagnostics = None;
+            evidence.requested_workspace.clear();
+            evidence
+                .effective_requirements
+                .authority
+                .runtime_minutes_limit = None;
+        }
+
+        let retry = app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("retry direct package with historical evidence: {error}"))?;
+        assert_eq!(
+            retry.status(),
+            StatusCode::OK,
+            "a retry must accept evidence persisted before requested/effective fields existed"
         );
         Ok(())
     }

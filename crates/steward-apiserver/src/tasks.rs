@@ -2487,7 +2487,11 @@ where
                 .map_err(|error| self.browser_task_persistence_error(error))?
         };
         let caller_input_archive = browser_inputs_archive(&request.inputs)?;
-        if record.browser_task_evidence.as_ref() != Some(&evidence) {
+        if !record
+            .browser_task_evidence
+            .as_ref()
+            .is_some_and(|stored| browser_task_evidence_matches(stored, &evidence))
+        {
             return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
         }
         match record.input_archive.as_deref() {
@@ -3456,10 +3460,12 @@ where
     let workspace_digest = workspace_entry_digest(&serde_json::json!({
         "entries": &resolved,
         "maxMaterializedBytes": git_materialized_budget,
+        "maxHistoryDepth": policy.max_history_depth,
     }))?;
     let evidence = WorkspaceEvidence {
         entries: resolved,
         max_materialized_bytes: git_materialized_budget,
+        max_history_depth: Some(policy.max_history_depth),
         workspace_digest,
     };
     evidence.validate().map_err(ApiError::Admission)?;
@@ -3571,7 +3577,14 @@ fn validate_workspace_policy(
                         entry.scratch.size.as_str()
                     ))
                 })?;
-            let ceiling = policy.max_total_bytes.min(deployment.scratch_volume_bytes);
+            if deployment.scratch_volume_bytes > policy.max_total_bytes {
+                return Err(ApiError::Admission(format!(
+                    "This deployment provides scratch space in a fixed {} volume, which is more than the {} this Envelope allows.",
+                    format_workspace_bytes(deployment.scratch_volume_bytes),
+                    format_workspace_bytes(policy.max_total_bytes)
+                )));
+            }
+            let ceiling = deployment.scratch_volume_bytes;
             if size > ceiling {
                 return Err(ApiError::Admission(format!(
                     "scratch size {} exceeds the effective ceiling {}",
@@ -4718,10 +4731,17 @@ async fn prepare_task_input_archive(
                 "workspace_git_source_resolver_unavailable".to_owned(),
             )
         })?;
-        let depth = match history {
-            WorkspaceGitHistory::None => Some(1),
-            WorkspaceGitHistory::Depth(depth) => Some(*depth),
-            WorkspaceGitHistory::Full => None,
+        let (depth, full_history_limit) = match history {
+            WorkspaceGitHistory::None => (Some(1), None),
+            WorkspaceGitHistory::Depth(depth) => (Some(*depth), None),
+            WorkspaceGitHistory::Full => {
+                let limit = workspace.max_history_depth.ok_or_else(|| {
+                    ApiError::Admission(
+                        "full Git history evidence is missing its effective depth".to_owned(),
+                    )
+                })?;
+                (Some(limit), Some(limit))
+            }
         };
         let mut entry_pack_bytes = append_workspace_git_pack(
             git.as_ref(),
@@ -4739,7 +4759,10 @@ async fn prepare_task_input_archive(
                 depth,
                 max_bytes: 1,
             },
-            (*max_materialized_bytes).min(total_pack_limit),
+            WorkspaceGitPackLimits {
+                materialized_bytes: (*max_materialized_bytes).min(total_pack_limit),
+                full_history_depth: full_history_limit,
+            },
         )
         .await?;
         total_pack_bytes = total_pack_bytes
@@ -4788,7 +4811,10 @@ async fn prepare_task_input_archive(
                     depth: Some(1),
                     max_bytes: 1,
                 },
-                remaining_entry.min(remaining_total),
+                WorkspaceGitPackLimits {
+                    materialized_bytes: remaining_entry.min(remaining_total),
+                    full_history_depth: None,
+                },
             )
             .await?;
             entry_pack_bytes = entry_pack_bytes
@@ -4817,7 +4843,7 @@ async fn append_workspace_git_pack(
     pack_path: &str,
     shallow_path: &str,
     mut request: GitPackRequest,
-    materialized_limit: u64,
+    limits: WorkspaceGitPackLimits,
 ) -> Result<u64, ApiError> {
     let reserved = caller_archive_len
         .checked_add(material.len())
@@ -4827,11 +4853,17 @@ async fn append_workspace_git_pack(
         .checked_sub(reserved)
         .filter(|value| *value > 0)
         .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
-    request.max_bytes = (remaining as u64).min(materialized_limit);
+    request.max_bytes = (remaining as u64).min(limits.materialized_bytes);
     if request.max_bytes == 0 {
         return Err(ApiError::Admission("workspace_limit_exceeded".to_owned()));
     }
-    let pack = git.read_pack(&request).await.map_err(source_port_error)?;
+    let pack = git.read_pack(&request).await.map_err(|error| match error {
+        steward_ports::PortError::LimitExceeded { .. } => ApiError::Admission(format!(
+            "workspace materialized size exceeds the effective ceiling {} bytes",
+            request.max_bytes
+        )),
+        error => source_port_error(error),
+    })?;
     if pack.repository != request.repository || pack.commit != request.commit {
         return Err(ApiError::Admission(
             "workspace_git_pack_identity_mismatch".to_owned(),
@@ -4842,6 +4874,13 @@ async fn append_workspace_git_pack(
             "workspace materialized size {} bytes exceeds the effective ceiling {} bytes",
             pack.bytes.len(),
             request.max_bytes
+        )));
+    }
+    if let Some(limit) = limits.full_history_depth
+        && !pack.shallow.is_empty()
+    {
+        return Err(ApiError::Admission(format!(
+            "The repository history has more than {limit} generations, which is the limit this Envelope allows. Request a depth of {limit} or less."
         )));
     }
     append_workspace_tar_file(material, pack_path, &pack.bytes)?;
@@ -4860,6 +4899,12 @@ async fn append_workspace_git_pack(
         append_workspace_tar_file(material, shallow_path, format!("{shallow}\n").as_bytes())?;
     }
     Ok(pack.bytes.len() as u64)
+}
+
+#[derive(Clone, Copy)]
+struct WorkspaceGitPackLimits {
+    materialized_bytes: u64,
+    full_history_depth: Option<u32>,
 }
 
 fn append_workspace_tar_file(
@@ -5376,11 +5421,42 @@ fn validate_direct_task_retry(
         || record.workflow_name.is_some()
         || record.workflow_version.is_some()
         || record.workflow_digest.is_some()
-        || record.direct_task_evidence.as_ref() != Some(evidence)
+        || !record
+            .direct_task_evidence
+            .as_ref()
+            .is_some_and(|stored| direct_task_evidence_matches(stored, evidence))
     {
         return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
     }
     Ok(())
+}
+
+fn direct_task_evidence_matches(
+    stored: &DirectTaskBindingEvidence,
+    resolved: &DirectTaskBindingEvidence,
+) -> bool {
+    let mut comparable = resolved.clone();
+    if stored.requested_requirements.is_none() {
+        comparable.requested_requirements = None;
+    }
+    if stored.requested_diagnostics.is_none() {
+        comparable.requested_diagnostics = None;
+    }
+    if stored.requested_workspace.is_empty() {
+        comparable.requested_workspace.clear();
+    }
+    if stored
+        .effective_requirements
+        .authority
+        .runtime_minutes_limit
+        .is_none()
+    {
+        comparable
+            .effective_requirements
+            .authority
+            .runtime_minutes_limit = None;
+    }
+    stored == &comparable
 }
 
 fn validate_browser_task_retry(
@@ -5403,11 +5479,34 @@ fn validate_browser_task_retry(
         || record.runtime_ownership != RuntimeOwnership::Provisioned
         || record.task_origin != TaskOrigin::Browser
         || record.user_envelope_digest.as_deref() != Some(envelope_digest)
-        || record.browser_task_evidence.as_ref() != Some(evidence)
+        || !record
+            .browser_task_evidence
+            .as_ref()
+            .is_some_and(|stored| browser_task_evidence_matches(stored, evidence))
     {
         return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
     }
     Ok(())
+}
+
+fn browser_task_evidence_matches(
+    stored: &BrowserTaskEvidence,
+    resolved: &BrowserTaskEvidence,
+) -> bool {
+    let mut comparable = resolved.clone();
+    if stored.requested_diagnostics.is_none() {
+        comparable.requested_diagnostics = None;
+    }
+    if stored.requested_requirements.is_none() {
+        comparable.requested_requirements = None;
+    }
+    if stored.effective_requirements.is_none() {
+        comparable.effective_requirements = None;
+    }
+    if stored.requested_workspace.is_empty() {
+        comparable.requested_workspace.clear();
+    }
+    stored == &comparable
 }
 
 async fn resolve_package_closure(
@@ -6472,16 +6571,16 @@ mod workflow_request_tests {
 
     use super::{
         DirectGitResolver, MAX_WORKSPACE_MATERIALIZED_BYTES, TaskApiConfig, TaskCreateRequest,
-        TaskSubmissionRequest, WorkspaceAdmissionPolicy, WorkspaceResolutionBudget,
-        append_workspace_git_pack, browser_input_retry_matches, browser_inputs_archive,
-        browser_inputs_from_archive, browser_rerun_submission, browser_workspace_trigger_commit,
-        default_workspace_name, direct_authority_spec, direct_effective_requirements,
-        direct_requirements_for_task, prepare_task_input_archive, resolve_scratch_workspace_entry,
-        resolve_versioned_task_plan, source_port_error_with_reporter, stable_task_runtime_name,
-        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
-        workspace_admission_policy, workspace_git_materialized_budget,
-        workspace_submodule_is_selected, workspace_submodule_repository_url,
-        workspace_tree_inventory,
+        TaskSubmissionRequest, WorkspaceAdmissionPolicy, WorkspaceGitPackLimits,
+        WorkspaceResolutionBudget, append_workspace_git_pack, browser_input_retry_matches,
+        browser_inputs_archive, browser_inputs_from_archive, browser_rerun_submission,
+        browser_workspace_trigger_commit, default_workspace_name, direct_authority_spec,
+        direct_effective_requirements, direct_requirements_for_task, prepare_task_input_archive,
+        resolve_scratch_workspace_entry, resolve_versioned_task_plan,
+        source_port_error_with_reporter, stable_task_runtime_name, task_orchestration_reservation,
+        validate_workspace_policy, versioned_workflow_reference, workspace_admission_policy,
+        workspace_git_materialized_budget, workspace_submodule_is_selected,
+        workspace_submodule_repository_url, workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -6597,10 +6696,18 @@ mod workflow_request_tests {
             request: &'a GitPackRequest,
         ) -> futures::future::BoxFuture<'a, Result<GitPack, PortError>> {
             Box::pin(async move {
+                if request.max_bytes < 9 {
+                    return Err(PortError::LimitExceeded {
+                        resource: "Git pack bytes",
+                    });
+                }
                 Ok(GitPack {
                     repository: request.repository.clone(),
                     commit: request.commit.clone(),
-                    shallow: Vec::new(),
+                    shallow: (request.depth == Some(20))
+                        .then(|| request.commit.clone())
+                        .into_iter()
+                        .collect(),
                     bytes: vec![0; 9],
                 })
             })
@@ -6838,6 +6945,44 @@ mod workflow_request_tests {
             Err(ApiError::Admission(ref reason))
                 if reason == "scratch size 4Gi exceeds the effective ceiling 2Gi"
         ));
+
+        let narrower_authority: WorkspaceAuthority = serde_json::from_value(serde_json::json!({
+            "allowedTypes": ["scratch"],
+            "maxTotalSize": "1Gi",
+            "maxFiles": 100,
+            "maxHistoryDepth": 20,
+            "maxSubmoduleDepth": 2
+        }))
+        .map_err(|error| error.to_string())?;
+        let narrower_policy =
+            workspace_admission_policy(&config.workspace_policy, Some(&narrower_authority))
+                .map_err(|error| format!("derive narrower scratch policy: {error:?}"))?;
+        let one_gib: WorkspaceEntry = serde_json::from_value(serde_json::json!({
+            "scratch": {"size": "1Gi"}
+        }))
+        .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            validate_workspace_policy(&config.workspace_policy, &narrower_policy, &one_gib),
+            Err(ApiError::Admission(ref reason))
+                if reason == "This deployment provides scratch space in a fixed 2Gi volume, which is more than the 1Gi this Envelope allows."
+        ));
+
+        let smaller_volume = TaskApiConfig::default().with_workspace_policy_json(Some(
+            &serde_json::json!({
+                "enabledTypes": ["scratch"],
+                "maxTotalSize": "2Gi",
+                "scratchVolumeSize": "1Gi",
+                "maxFiles": 100,
+                "maxHistoryDepth": 20,
+                "maxSubmoduleDepth": 2
+            })
+            .to_string(),
+        ))?;
+        let wider_policy =
+            workspace_admission_policy(&smaller_volume.workspace_policy, Some(&authority))
+                .map_err(|error| format!("derive wider scratch policy: {error:?}"))?;
+        validate_workspace_policy(&smaller_volume.workspace_policy, &wider_policy, &one_gib)
+            .map_err(|error| format!("admit fixed 1Gi volume under 2Gi Envelope: {error:?}"))?;
         Ok(())
     }
 
@@ -7107,13 +7252,16 @@ mod workflow_request_tests {
                 depth: Some(1),
                 max_bytes: 1,
             },
-            8,
+            WorkspaceGitPackLimits {
+                materialized_bytes: 8,
+                full_history_depth: None,
+            },
         )
         .await;
         assert!(matches!(
             result,
             Err(ApiError::Admission(ref reason))
-                if reason == "workspace materialized size 9 bytes exceeds the effective ceiling 8 bytes"
+                if reason == "workspace materialized size exceeds the effective ceiling 8 bytes"
         ));
         Ok(())
     }
@@ -7138,13 +7286,70 @@ mod workflow_request_tests {
                 depth: None,
                 max_bytes: 1,
             },
-            8,
+            WorkspaceGitPackLimits {
+                materialized_bytes: 8,
+                full_history_depth: Some(20),
+            },
         )
         .await;
         assert!(matches!(
             result,
             Err(ApiError::Admission(ref reason))
-                if reason == "workspace materialized size 9 bytes exceeds the effective ceiling 8 bytes"
+                if reason == "workspace materialized size exceeds the effective ceiling 8 bytes"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_history_fails_when_the_repository_exceeds_the_effective_depth()
+    -> Result<(), String> {
+        use sha2::{Digest, Sha256};
+        use steward_types::direct_package::{
+            ContentDigest, ResolvedWorkspaceEntry, WorkspaceAccess, WorkspaceGitHistory,
+            WorkspaceName, canonical_json_bytes,
+        };
+
+        let repository =
+            RepositoryUrl::parse("https://github.example.test/example-org/source.git")?;
+        let commit = ExactGitCommit::parse(format!("git:sha1:{}", "a".repeat(40)))?;
+        let entries = vec![ResolvedWorkspaceEntry::Git {
+            name: WorkspaceName::parse("source")?,
+            access: WorkspaceAccess::Copy,
+            repository,
+            repository_id: StableProviderId::parse("123")?,
+            repository_owner_id: StableProviderId::parse("456")?,
+            commit,
+            history: WorkspaceGitHistory::Full,
+            paths: Vec::new(),
+            submodules: Vec::new(),
+            max_materialized_bytes: 64,
+            content_digest: ContentDigest::parse(format!("steward:sha256:{}", "b".repeat(64)))?,
+        }];
+        let max_materialized_bytes = 64_u64;
+        let digest = Sha256::digest(
+            canonical_json_bytes(&serde_json::json!({
+                "entries": &entries,
+                "maxMaterializedBytes": max_materialized_bytes,
+                "maxHistoryDepth": 20,
+            }))
+            .map_err(|error| error.to_string())?,
+        );
+        let evidence = WorkspaceEvidence {
+            entries,
+            max_materialized_bytes,
+            max_history_depth: Some(20),
+            workspace_digest: ContentDigest::parse(format!("steward:sha256:{digest:x}"))?,
+        };
+        let config = TaskApiConfig {
+            direct_git_resolver: Some(Arc::new(OversizedPackResolver)),
+            ..TaskApiConfig::default()
+        };
+
+        let result = prepare_task_input_archive(&config, b"caller", Some(&evidence)).await;
+        assert!(matches!(
+            result,
+            Err(ApiError::Admission(ref reason))
+                if reason == "The repository history has more than 20 generations, which is the limit this Envelope allows. Request a depth of 20 or less."
         ));
         Ok(())
     }

@@ -548,6 +548,7 @@
           "items": { "$ref": "#/$defs/resolvedWorkspaceEntry" }
         },
         "maxMaterializedBytes": { "type": "integer", "minimum": 0 },
+        "maxHistoryDepth": { "type": "integer", "minimum": 1 },
         "workspaceDigest": { "$ref": "#/$defs/stewardDigest" }
       },
       "additionalProperties": false

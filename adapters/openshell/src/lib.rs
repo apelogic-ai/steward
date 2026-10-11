@@ -3841,6 +3841,7 @@ mod tests {
         let evidence = WorkspaceEvidence {
             entries,
             max_materialized_bytes,
+            max_history_depth: None,
             workspace_digest: ContentDigest::parse(format!("steward:sha256:{digest:x}"))?,
         };
         let command = workspace_materialization_command(&evidence)
@@ -3875,6 +3876,7 @@ mod tests {
         let evidence = WorkspaceEvidence {
             entries,
             max_materialized_bytes,
+            max_history_depth: None,
             workspace_digest: ContentDigest::parse(format!("steward:sha256:{digest:x}"))?,
         };
         let command = workspace_materialization_command(&evidence)
