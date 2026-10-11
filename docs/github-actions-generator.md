@@ -103,3 +103,5 @@ The golden contract is
 Changing the renderer shape requires updating its tests. Changing deployment
 coordinates requires a newly verified installation BOM, not a Steward source
 change. No live workflow is dispatched by this renderer slice.
+
+This guide describes the renderer only; deployment steps are covered in the installation guides.
