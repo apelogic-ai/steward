@@ -43,11 +43,11 @@ export function ResourceBoundary<T>({ children, state }: Readonly<{
 }>) {
   if (state.status === "ready") return children(state.value);
   const messages = {
-    loading: ["Loading authoritative data", "HyperShell is reading the current server-owned record."],
-    "not-found": ["Not found", "The requested record does not exist in your server-authorized scope."],
-    forbidden: ["Forbidden", "You are not allowed to view this resource."],
-    unavailable: ["Authoritative data unavailable", "The source of truth could not be reached. No placeholder data is shown."],
-    error: ["Data could not be accepted", "HyperShell received an unexpected response and has not inferred a successful state."],
+    loading: ["Loading…", "HyperShell is loading the latest information."],
+    "not-found": ["Not found", "You don't have access to this item, or it no longer exists."],
+    forbidden: ["Access denied", "You don't have permission to view this page."],
+    unavailable: ["Couldn't load this page", "HyperShell couldn't reach the server. Try again in a moment."],
+    error: ["Couldn't load this page", "HyperShell received an unexpected response. Reload the page or try again later."],
   } as const;
   const [title, detail] = messages[state.status];
   return <EmptyState title={title}><p role="status">{detail}</p></EmptyState>;

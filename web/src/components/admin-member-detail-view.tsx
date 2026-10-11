@@ -57,11 +57,11 @@ async function loadMember(userId: string, refresh: number): Promise<{ data?: Mem
 }
 
 function mutationMessage(status: number | undefined): string {
-  if (status === 409) return "This authority changed before the operation completed. Reload and try again.";
+  if (status === 409) return "This member changed before the operation completed. Reload and try again.";
   if (status === 401 || status === 403) return "Your administrator session no longer permits this action.";
   if (status === 404) return "This member or identity is no longer available.";
   if (status === 422) return "The requested member change is not valid.";
-  if (status === 503) return "The member service is unavailable. No change was confirmed.";
+  if (status === 503) return "HyperShell couldn't update this member. No change was confirmed. Try again in a moment.";
   return "The change could not be completed.";
 }
 
@@ -72,7 +72,7 @@ export function AdminMemberDetailView({ userId }: Readonly<{ userId: string }>) 
   const state = useApiResource(load);
 
   if (session.status !== "authenticated") {
-    return <section aria-labelledby="page-title"><EmptyState title="Session unavailable"><p>The authoritative administrator session is not available.</p></EmptyState></section>;
+    return <section aria-labelledby="page-title"><EmptyState title="Session unavailable"><p>Sign in again, then retry.</p></EmptyState></section>;
   }
   return (
     <section aria-labelledby="page-title" className="max-w-5xl space-y-5">
@@ -295,7 +295,7 @@ function MemberDetail({ csrf, currentUserId, data, onChanged }: Readonly<{
             {member.memberRoles.filter((role) => !data.roleOptions.includes(role)).map((role) => <p className="text-xs text-warn" key={role}><span className="font-mono">{role}</span> · No template currently publishes this role.</p>)}
           </div>
         </DetailSection>
-        <DetailSection description="External identities that resolve to this member, such as a GitHub Actions actor. Link one only after verifying its owner." title="Federated identities">
+        <DetailSection description="External identities linked to this member, such as a GitHub Actions identity. Link one only after verifying who or what uses it." title="Federated identities">
           <div className="space-y-2.5">
             {member.identities.map((identity) => <div className="flex items-center gap-3 rounded-[10px] border px-3.5 py-3" key={identity.subjectId}>
               <div className="min-w-0 flex-1 space-y-0.5"><p className="truncate font-mono text-[15px] font-semibold">{identity.subject}</p><p className="truncate font-mono text-[13px] text-muted-ink">{identity.issuer}</p><p className="text-xs text-faint-ink">Linked {relativeDate(identity.linkedAt)} by {identity.linkedBy}</p></div>

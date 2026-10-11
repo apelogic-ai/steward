@@ -49,7 +49,7 @@ function relativeDate(value: string | null | undefined): string {
   const days = Math.floor((Date.now() - timestamp) / 86_400_000);
   if (days <= 0) return "Today";
   if (days === 1) return "Yesterday";
-  if (days < 30) return `${days}d ago`;
+  if (days < 30) return `${days} days ago`;
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(timestamp);
 }
 
@@ -61,7 +61,7 @@ export function AdminMembersView() {
   const state = useApiResource(load);
 
   if (session.status !== "authenticated") {
-    return <section aria-labelledby="page-title"><EmptyState title="Session unavailable"><p>The authoritative administrator session is not available.</p></EmptyState></section>;
+    return <section aria-labelledby="page-title"><EmptyState title="Session unavailable"><p>Sign in again, then retry.</p></EmptyState></section>;
   }
   return (
     <section aria-labelledby="page-title" className="space-y-5">

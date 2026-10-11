@@ -2012,7 +2012,7 @@ test("administrators get live prerequisite reasons and can restore the hidden se
     administrator.useAdminSetupStatus({ httpStatus: 503 });
     await administrator.page.getByRole("button", { name: "Refresh status" }).click();
     await expect(administrator.page.getByRole("heading", { name: "Setup status is unavailable" })).toBeVisible();
-    await expect(administrator.page.getByText("No prerequisite has been inferred. Retry when the authoritative service is available.", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByText("HyperShell couldn't check the prerequisites. Try again in a moment.", { exact: true })).toBeVisible();
     await expect(administrator.page.getByText("Orchestration and one resolvable execution binding are active.")).toHaveCount(0);
 
     const requestsBeforeSlowRefresh = administrator.setupStatusRequests.length;
@@ -2054,7 +2054,7 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
     for (const label of ["All", "Provisioned", "Pending", "Rejected"]) {
       await expect(developer.page.getByRole("tab", { name: new RegExp(`^${label}\\s+\\d+$`) })).toBeVisible();
     }
-    for (const label of ["Template", "Status", "Spend this month", "Limit per run", "TTL", "Tools"]) {
+    for (const label of ["Template", "Status", "Spend this month", "Limit per run", "Time-to-live limit", "Tools"]) {
       await expect(developer.page.getByRole("columnheader", { name: label })).toBeVisible();
     }
 
@@ -2211,7 +2211,8 @@ test("a user session cannot enter the administrator workspace", async ({ browser
   const developer = await guardedPage(browser);
   try {
     await developer.page.goto(`${origin}/admin/runs`);
-    await expect(developer.page.getByRole("heading", { name: "Forbidden", exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("heading", { name: "Administrator access required", exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Forbidden", { exact: true })).toHaveCount(0);
     await expect(developer.page.getByRole("navigation", { name: "Primary navigation" })).toHaveCount(0);
     await expect(developer.page.getByRole("link", { name: "Templates", exact: true })).toHaveCount(0);
     await expect(developer.page.getByRole("heading", { name: "All runs", exact: true })).toHaveCount(0);
@@ -2406,9 +2407,9 @@ test("empty entity collections show contextual product copy", async ({ browser }
       ["/envelopes", "No envelopes yet."],
       [`/envelopes/${envelopeId}/runs`, "No runs yet."],
       ["/runs", "No runs yet."],
-      [`/runs/${taskUid}`, "The Task was admitted under the selected Envelope."],
+      [`/runs/${taskUid}`, "The run was accepted under the selected Envelope."],
       ["/admin/runs", "No runs yet."],
-      [`/admin/runs/${taskUid}`, "The Task was admitted under the selected Envelope."],
+      [`/admin/runs/${taskUid}`, "The run was accepted under the selected Envelope."],
       ["/admin/envelopes/templates", "No templates yet."],
       ["/admin/envelopes/provision", "No templates"],
       ["/admin/workflows", "No workflows yet"],
@@ -2434,19 +2435,23 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await developer.page.goto(`${origin}/envelopes/new`);
     const template = developer.page.getByRole("combobox", { name: "Template", exact: true });
     await expect(template.locator("option")).toHaveText([
-      "Analyst · rev 2 — 10.00 USD/month · TTL 2h · 1 tool",
-      "Developer · rev 4 — 25.00 USD/month · TTL 4h · 1 tool",
+      "Analyst · rev 2 — monthly limit 10.00 USD · time-to-live limit 2 h · 1 tool",
+      "Developer · rev 4 — monthly limit 25.00 USD · time-to-live limit 4 h · 1 tool",
       "Custom envelope",
     ]);
     await expect(template).toHaveValue("template:analyst");
-    await expect(developer.page.getByLabel("Monthly limit (USD)")).toHaveValue("10.00");
-    await expect(developer.page.getByLabel("Limit per run (USD)")).toHaveValue("1.00");
-    await expect(developer.page.getByLabel("Time to live")).toHaveValue("2h");
+    await expect(developer.page.getByRole("spinbutton", { name: /^Monthly limit/ })).toHaveValue("10.00");
+    await expect(developer.page.getByRole("spinbutton", { name: /^Monthly limit/ })).toHaveAccessibleDescription("USD");
+    await expect(developer.page.getByRole("spinbutton", { name: /^Limit per run/ })).toHaveValue("1.00");
+    await expect(developer.page.getByRole("spinbutton", { name: /^Time-to-live limit/ })).toHaveValue("2");
+    await expect(developer.page.getByRole("spinbutton", { name: /^Time-to-live limit/ })).toHaveAccessibleDescription("h");
+    await expect(developer.page.getByRole("combobox", { name: "Time-to-live unit" })).toHaveValue("h");
     await template.selectOption("template:developer");
-    await expect(developer.page.getByLabel("Monthly limit (USD)")).toHaveValue("25.00");
-    await expect(developer.page.getByLabel("Limit per run (USD)")).toHaveValue("5.00");
-    await expect(developer.page.getByLabel("Time to live")).toHaveValue("4h");
-    await developer.page.getByLabel("Limit per run (USD)").fill("4.00");
+    await expect(developer.page.getByRole("spinbutton", { name: /^Monthly limit/ })).toHaveValue("25.00");
+    await expect(developer.page.getByRole("spinbutton", { name: /^Limit per run/ })).toHaveValue("5.00");
+    await expect(developer.page.getByRole("spinbutton", { name: /^Time-to-live limit/ })).toHaveValue("4");
+    await expect(developer.page.getByRole("combobox", { name: "Time-to-live unit" })).toHaveValue("h");
+    await developer.page.getByRole("spinbutton", { name: /^Limit per run/ }).fill("4.00");
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
     const provisioned = developer.page.locator("#page-title").getByText("provisioned", { exact: true });
@@ -2507,23 +2512,29 @@ test("a value above the template limits is submitted for administrator approval"
   try {
     await developer.page.goto(`${origin}/envelopes/new`);
     await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("template:developer");
-    await developer.page.getByLabel("Time to live").fill("5h");
+    const timeToLive = developer.page.getByRole("spinbutton", { name: /^Time-to-live limit/ });
+    const timeToLiveUnit = developer.page.getByRole("combobox", { name: "Time-to-live unit" });
+    await expect(timeToLiveUnit).toHaveValue("h");
+    await timeToLive.fill("");
+    await expect(timeToLiveUnit).toHaveValue("h");
+    await timeToLive.pressSequentially("5");
+    await expect(timeToLiveUnit).toHaveValue("h");
 
     const summary = developer.page.getByText("Needs admin approval: 1 value above the template's limits", { exact: true });
     await expect(summary).toBeVisible();
-    await expect(developer.page.getByText("Time to live: 5h (limit 4h)", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Time-to-live limit: 5 h (limit 4 h)", { exact: true })).toBeVisible();
     await expect(developer.page.getByRole("button", { name: "Submit for approval" })).toBeVisible();
 
-    await developer.page.getByLabel("Time to live").fill("4h");
+    await timeToLive.fill("4");
     await expect(summary).toHaveCount(0);
     await expect(developer.page.getByRole("button", { name: "Submit request" })).toBeVisible();
-    await developer.page.getByLabel("Time to live").fill("5h");
+    await timeToLive.fill("5");
 
     await developer.page.getByLabel("Justification (optional)").fill("Needed for a bounded release review.");
     await developer.page.getByRole("button", { name: "Submit for approval" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
     await expect(developer.page.getByText("Pending administrator approval", { exact: true })).toBeVisible();
-    await expect(developer.page.getByText("Time to live: 5h (limit 4h)", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Time-to-live limit: 5 h (limit 4 h)", { exact: true })).toBeVisible();
     await expect(developer.page.getByText("Justification: Needed for a bounded release review.", { exact: true })).toBeVisible();
 
     const mutation = developer.mutations.find((entry) => entry.path === "/app/api/v1/envelope-requests");
@@ -2535,20 +2546,45 @@ test("a value above the template limits is submitted for administrator approval"
   }
 });
 
+test("duration fields reject non-whole values without rewriting them", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  try {
+    await developer.page.goto(`${origin}/envelopes/new?template=developer`);
+    const timeToLive = developer.page.getByRole("spinbutton", { name: /^Time-to-live limit/ });
+    const timeToLiveUnit = developer.page.getByRole("combobox", { name: "Time-to-live unit" });
+    await timeToLive.fill("");
+    await timeToLiveUnit.selectOption("d");
+    await timeToLive.pressSequentially("2");
+    await expect(timeToLiveUnit).toHaveValue("d");
+    await expect(timeToLive).toHaveValue("2");
+    const mutationCount = developer.mutations.length;
+    for (const invalid of ["1.5", "1e3", "-5"]) {
+      await timeToLive.fill(invalid);
+      await expect(timeToLive).toHaveValue(invalid);
+      await expect(timeToLive).toHaveAttribute("aria-invalid", "true");
+      await expect(developer.page.getByRole("alert").filter({ hasText: "Enter a whole number." })).toBeVisible();
+    }
+    await developer.page.getByRole("button", { name: "Submit request" }).click();
+    expect(developer.mutations).toHaveLength(mutationCount);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("the per-run limit reports template-limit exceptions and cannot exceed the monthly limit", async ({ browser }) => {
   const developer = await guardedPage(browser);
   try {
     await developer.page.goto(`${origin}/envelopes/new?template=developer`);
     await expect(developer.page.getByRole("combobox", { name: "Template", exact: true })).toHaveValue("template:developer");
-    const singleRunLimit = developer.page.getByLabel("Limit per run (USD)");
+    const singleRunLimit = developer.page.getByRole("spinbutton", { name: /^Limit per run/ });
     await singleRunLimit.fill("6.00");
 
-    await expect(singleRunLimit).toHaveClass(/border-warn/);
+    await expect(singleRunLimit.locator("..")).toHaveClass(/border-warn/);
     await expect(developer.page.getByText("Above limit 5.00 USD", { exact: true })).toBeVisible();
     await expect(developer.page.getByText("Limit per run: 6.00 USD (limit 5.00 USD)", { exact: true })).toBeVisible();
     await expect(developer.page.getByRole("button", { name: "Submit for approval" })).toBeEnabled();
 
-    await developer.page.getByLabel("Monthly limit (USD)").fill("5.00");
+    await developer.page.getByRole("spinbutton", { name: /^Monthly limit/ }).fill("5.00");
     await expect(developer.page.getByRole("alert").filter({ hasText: "Limit per run cannot exceed the monthly limit." })).toBeVisible();
     await expect(developer.page.getByRole("button", { name: "Submit for approval" })).toBeDisabled();
   } finally {
@@ -2575,17 +2611,23 @@ test("a field-specific envelope rejection identifies the field and clears after 
   try {
     await developer.page.goto(`${origin}/envelopes/new`);
     await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("template:developer");
-    const monthlyLimit = developer.page.getByLabel("Monthly limit (USD)");
+    const monthlyLimit = developer.page.getByRole("spinbutton", { name: /^Monthly limit/ });
     await monthlyLimit.fill("999.00");
     await developer.page.getByRole("button", { name: "Submit for approval" }).click();
 
-    const failureAlert = developer.page.getByRole("alert").filter({ hasText: failureReason });
-    await expect(failureAlert).toHaveText(failureReason);
-    await expect(monthlyLimit).toHaveClass(/border-warn/);
+    const failureAlert = developer.page.getByRole("alert").filter({ hasText: "Some values are outside the platform limits" });
+    await expect(failureAlert).toHaveText("Some values are outside the platform limits or available capabilities. Check the highlighted fields and try again.");
+    await expect(developer.page.getByText(failureReason, { exact: true })).toBeHidden();
+    await developer.page.getByText("Details", { exact: true }).click();
+    await expect(developer.page.getByText("platform_safety_ceiling_exceeded", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText(failureReason, { exact: true })).toBeVisible();
+    await expect(monthlyLimit.locator("..")).toHaveClass(/border-warn/);
+    await expect(monthlyLimit).toHaveAttribute("aria-invalid", "true");
 
     await monthlyLimit.fill("25.00");
     await expect(failureAlert).toHaveCount(0);
-    await expect(monthlyLimit).not.toHaveClass(/border-warn/);
+    await expect(monthlyLimit.locator("..")).not.toHaveClass(/border-warn/);
+    await expect(monthlyLimit).not.toHaveAttribute("aria-invalid", "true");
     await expect(developer.page.getByRole("button", { name: "Submit request" })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
@@ -2608,7 +2650,7 @@ test("users can request a custom envelope without selecting a template", async (
       expect(developer.page.getByLabel("Complete envelope JSON")).toBeDisabled(),
       expect(developer.page.locator('button[type="submit"]')).toBeDisabled(),
     ]);
-    await expect(developer.page.getByRole("alert").filter({ hasText: "unavailable" })).toBeVisible();
+    await expect(developer.page.getByRole("alert").filter({ hasText: "HyperShell couldn't submit the request" })).toBeVisible();
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
 
@@ -2636,7 +2678,7 @@ test("administrators can provision a template envelope directly to a user", asyn
     await administrator.page.getByRole("link", { name: "Provision envelope" }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/envelopes/provision`);
 
-    await administrator.page.getByLabel("Canonical user ID").fill(developerSession.principal.userId);
+    await administrator.page.getByLabel("User ID").fill(developerSession.principal.userId);
     const template = administrator.page.getByLabel("Template");
     await expect(template.locator("option")).toHaveText([
       "Analyst · revision 4",
@@ -2645,11 +2687,11 @@ test("administrators can provision a template envelope directly to a user", asyn
     await template.selectOption("developer");
     await administrator.page.getByRole("button", { name: "Provision envelope" }).click();
     await Promise.all([
-      expect(administrator.page.getByLabel("Canonical user ID")).toBeDisabled(),
+      expect(administrator.page.getByLabel("User ID")).toBeDisabled(),
       expect(template).toBeDisabled(),
       expect(administrator.page.locator('button[type="submit"]')).toBeDisabled(),
     ]);
-    await expect(administrator.page.getByRole("alert").filter({ hasText: "unavailable" })).toBeVisible();
+    await expect(administrator.page.getByRole("alert").filter({ hasText: "HyperShell couldn't reach the Envelope service" })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Provision envelope" }).click();
     await expect(administrator.page.getByRole("status")).toContainText("Envelope provisioned");
 
@@ -2674,7 +2716,7 @@ test("onboarding starts with configured server defaults and preserves dismissal"
     const runStep = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
     await expect(runStep.getByLabel("Repository").locator("option")).toHaveText([
       "example-org/agentic-ops · Ready",
-      "example-org/not-admitted · Not admitted",
+      "example-org/not-admitted · Not approved",
     ]);
     await expect(runStep.getByLabel("Coding agent")).toHaveValue(starterTaskFixture.taskDefinition.runtime.agentRef);
     await expect(runStep.getByLabel("Prompt")).toHaveValue(starterTaskFixture.taskDefinition.promptText);
@@ -2803,7 +2845,7 @@ test("Get started explains unsupported releases and repository prerequisites", a
   });
   try {
     await developer.page.goto(`${origin}/get-started`);
-    await expect(developer.page.getByText("The reviewed steward-run release is below 0.8.0. Copy the Task definition manually; workflow generation and detection require steward-run 0.8.0 or later.").first()).toBeVisible();
+    await expect(developer.page.getByText("This installation cannot generate a workflow for the selected task. Copy the task definition manually, or ask an administrator to update the workflow tools.").first()).toBeVisible();
     const publicationStep = developer.page.getByRole("listitem").filter({ hasText: "Publish the task definition" });
     if (await publicationStep.getByRole("button").first().getAttribute("aria-expanded") !== "true") {
       await publicationStep.getByRole("button").first().click();
@@ -2813,7 +2855,9 @@ test("Get started explains unsupported releases and repository prerequisites", a
     const testRun = developer.page.getByRole("listitem").filter({ hasText: "Try a test run" });
     await testRun.getByRole("button").first().click();
     await testRun.getByLabel("Repository").selectOption("repo_not_admitted");
-    await expect(testRun.getByText("example-org/not-admitted is not admitted as a governed source on this deployment; ask an administrator to add it.", { exact: true })).toBeVisible();
+    await expect(testRun.getByText("example-org/not-admitted is not approved for runs on this installation. Ask an administrator to add it.", { exact: true })).toBeVisible();
+    await testRun.getByText("Details", { exact: true }).click();
+    await expect(testRun.getByText("source_repository_not_admitted", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -2850,16 +2894,16 @@ test("Get started step 4 chooses the repository that publication, detection, and
     await expect(picker.locator("option")).toHaveText([
       "example-org/agentic-ops · Ready",
       "example-org/second-ops · Ready",
-      "example-org/not-admitted · Not admitted",
+      "example-org/not-admitted · Not approved",
     ]);
     await expect(picker).toHaveValue("repo_agentic_ops");
 
     await picker.selectOption("repo_not_admitted");
-    await expect(publicationStep.getByText("example-org/not-admitted is not admitted as a governed source on this deployment; ask an administrator to add it. Copy the generated files into the repository manually.", { exact: true })).toBeVisible();
+    await expect(publicationStep.getByText("example-org/not-admitted is not approved for runs on this installation. Ask an administrator to add it. Copy the generated files into the repository manually.", { exact: true })).toBeVisible();
     await expect(publicationStep.getByRole("button", { name: "Open pull request" })).toBeDisabled();
 
     await picker.selectOption("repo_second_ops");
-    await expect(publicationStep.getByText(/is not admitted as a governed source/)).toHaveCount(0);
+    await expect(publicationStep.getByText(/is not approved for runs/)).toHaveCount(0);
     await publicationStep.getByRole("button", { name: "Open pull request" }).click();
     await expect(publicationStep.getByRole("link", { name: "View pull request ↗" })).toBeVisible();
     const publication = developer.mutations.find((mutation) => mutation.path.endsWith("/github/publish"));
@@ -2935,10 +2979,10 @@ test("Get started states plainly when no repository is admitted", async ({ brows
       await publicationStep.getByRole("button").first().click();
     }
     await expect(publicationStep.getByLabel("Repository").locator("option")).toHaveText([
-      "example-org/not-admitted · Not admitted",
-      "example-org/legacy · Not admitted",
+      "example-org/not-admitted · Not approved",
+      "example-org/legacy · Not approved",
     ]);
-    await expect(publicationStep.getByText("None of your repositories is admitted as a governed source on this deployment; ask an administrator to add it. Copy the generated files into the repository manually.", { exact: true })).toBeVisible();
+    await expect(publicationStep.getByText("None of your repositories is approved for runs on this installation. Ask an administrator to add one. Copy the generated files into the repository manually.", { exact: true })).toBeVisible();
     await expect(publicationStep.getByRole("button", { name: "Open pull request" })).toBeDisabled();
   } finally {
     await closeGuardedPage(developer);
@@ -3041,7 +3085,11 @@ test("Get started exposes repository failures with retry without hiding the test
   try {
     await developer.page.goto(`${origin}/get-started`);
     await expect(developer.page.getByRole("listitem").filter({ hasText: "Try a test run" })).toBeVisible();
-    await expect(developer.page.getByRole("alert").filter({ hasText: "github_automation_unavailable" })).toContainText("bridge_contract");
+    const repositoryFailure = developer.page.getByText("GitHub repositories couldn't be loaded. Try again.", { exact: true }).first().locator("..");
+    await expect(repositoryFailure.getByRole("alert")).toBeVisible();
+    await repositoryFailure.getByText("Details", { exact: true }).click();
+    await expect(repositoryFailure.getByText("github_automation_unavailable", { exact: true })).toBeVisible();
+    await expect(repositoryFailure.getByText("bridge_contract", { exact: true })).toBeVisible();
 
     const publicationStep = developer.page.getByRole("listitem").filter({ hasText: "Publish the task definition" });
     if (await publicationStep.getByRole("button").first().getAttribute("aria-expanded") !== "true") {
@@ -3326,8 +3374,10 @@ test("the run publish panel exposes repository failures and retries them", async
   try {
     await developer.page.goto(`${origin}/tasks/${encodeURIComponent(browserTaskDigest)}`);
     const panel = developer.page.getByLabel("Publish this task to GitHub");
-    await expect(panel.getByRole("alert")).toContainText("github_automation_unavailable");
-    await expect(panel.getByRole("alert")).toContainText("bridge_contract");
+    await expect(panel.getByRole("alert")).toHaveText("GitHub repositories couldn't be loaded. Try again.");
+    await panel.getByText("Details", { exact: true }).click();
+    await expect(panel.getByText("github_automation_unavailable", { exact: true })).toBeVisible();
+    await expect(panel.getByText("bridge_contract", { exact: true })).toBeVisible();
     await panel.getByRole("button", { name: "Retry repositories" }).click();
     await expect(panel.getByLabel("Repository").locator("option")).toHaveCount(2);
   } finally {
@@ -3750,13 +3800,14 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(administrator.page).toHaveURL(`${origin}/admin/envelopes/templates/analyst`);
     await expect(administrator.page.getByText("Current revision 4")).toBeVisible();
     await expect(administrator.page.getByRole("combobox", { name: "Limit type" })).toHaveCount(0);
-    await expect(administrator.page.getByRole("textbox", { name: "Limit per run (USD)" })).toHaveValue("2.50");
+    await expect(administrator.page.getByRole("spinbutton", { name: /^Limit per run/ })).toHaveValue("2.50");
+    await expect(administrator.page.getByRole("spinbutton", { name: /^Monthly limit/ })).toHaveValue("25.00");
     await expect(administrator.page.getByText("Requests within these limits are approved automatically. Anything above goes to the approval queue.", { exact: true })).toBeVisible();
     await expect(administrator.page.getByRole("heading", { name: "Auto-approval" })).toHaveCount(0);
-    await expect(administrator.page.getByRole("textbox", { name: "Monthly limit (USD)" })).toHaveValue("25.00");
-    await administrator.page.getByRole("textbox", { name: "Monthly limit (USD)" }).fill("30.00");
-    await administrator.page.getByRole("textbox", { name: "Limit per run (USD)" }).fill("3.00");
-    await expect(administrator.page.getByRole("textbox", { name: "Time-to-live limit" })).toHaveValue("4h");
+    await administrator.page.getByRole("spinbutton", { name: /^Monthly limit/ }).fill("30.00");
+    await administrator.page.getByRole("spinbutton", { name: /^Limit per run/ }).fill("3.00");
+    await expect(administrator.page.getByRole("spinbutton", { name: /^Time-to-live limit/ })).toHaveValue("4");
+    await expect(administrator.page.getByRole("combobox", { name: "Time-to-live unit" })).toHaveValue("h");
     const model = administrator.page.getByRole("combobox", { name: "Models" });
     await expect(model).toBeVisible();
     await expect(administrator.page.getByText("provider-a/model-a", { exact: true })).toBeVisible();
@@ -3869,9 +3920,9 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await administrator.page.getByRole("button", { name: "Remove analyst" }).click();
     await administrator.page.getByRole("button", { name: "Remove reviewer" }).click();
     await templateId.fill("not valid");
-    await administrator.page.getByRole("textbox", { name: "Limit per run (USD)" }).fill("not-a-decimal");
-    await administrator.page.getByRole("textbox", { name: "Monthly limit (USD)" }).fill("");
-    await administrator.page.getByRole("textbox", { name: "Time-to-live limit" }).fill("");
+    await administrator.page.getByRole("spinbutton", { name: /^Limit per run/ }).fill("-1");
+    await administrator.page.getByRole("spinbutton", { name: /^Monthly limit/ }).fill("");
+    await administrator.page.getByRole("spinbutton", { name: /^Time-to-live limit/ }).fill("");
     await administrator.page.getByRole("button", { name: "Remove provider-a/model-a" }).click();
     await administrator.page.getByRole("button", { name: "Create template" }).click();
 
@@ -3879,8 +3930,8 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await expect(administrator.page.getByText("Enter a display name.")).toBeVisible();
     await expect(administrator.page.getByText("Add at least one eligible member role.")).toBeVisible();
     await expect(administrator.page.getByText("Enter a non-negative decimal.")).toBeVisible();
-    await expect(administrator.page.getByText("Enter a monthly budget.")).toBeVisible();
-    await expect(administrator.page.getByText("Enter a TTL.")).toBeVisible();
+    await expect(administrator.page.getByText("Enter a monthly limit.")).toBeVisible();
+    await expect(administrator.page.getByText("Enter a time-to-live limit.")).toBeVisible();
     await expect(administrator.page.getByText("Select at least one model.")).toBeVisible();
     await expect(administrator.page.getByText(/The server rejected the template/)).toHaveCount(0);
     expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
@@ -3889,15 +3940,17 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await administrator.page.getByRole("textbox", { name: "Display name" }).fill("Operator");
     await roles.fill("operator");
     await roles.press("Enter");
-    await administrator.page.getByRole("textbox", { name: "Limit per run (USD)" }).fill("1.00");
-    await administrator.page.getByRole("textbox", { name: "Monthly limit (USD)" }).fill("10.00");
-    await administrator.page.getByRole("textbox", { name: "Time-to-live limit" }).fill("15m");
+    await administrator.page.getByRole("spinbutton", { name: /^Limit per run/ }).fill("1.00");
+    await administrator.page.getByRole("spinbutton", { name: /^Monthly limit/ }).fill("10.00");
+    await administrator.page.getByRole("spinbutton", { name: /^Time-to-live limit/ }).fill("15");
     const models = administrator.page.getByRole("combobox", { name: "Models" });
     await models.fill("provider-a/model-a");
     await models.press("Enter");
     await administrator.page.getByRole("button", { name: "Create template" }).click();
 
-    await expect(administrator.page.getByText("The server rejected the template, so no authority was changed. Error code: template_invalid.")).toBeVisible();
+    await expect(administrator.page.getByText("The template couldn't be saved. Check the fields and try again.")).toBeVisible();
+    await administrator.page.getByText("Details", { exact: true }).click();
+    await expect(administrator.page.getByText("template_invalid", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -3964,7 +4017,7 @@ test("administrator template model controls fail closed when the capability cata
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const model = administrator.page.getByRole("combobox", { name: "Models" });
     await expect(model).toBeDisabled();
-    await expect(administrator.page.getByText("1 selected model is not listed in the deployment capability catalog. Remove or replace before saving.", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByText("1 selected model is not available in this installation. Remove or replace before saving.", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -4009,9 +4062,9 @@ test("administrator can replace a template tool absent from the capability catal
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
-    await expect(tools.getByText("Not listed in the deployment capability catalog")).toBeVisible();
+    await expect(tools.getByText("1 selected tool is not available in this installation. Remove or replace before saving.", { exact: true })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
-    await expect(tools.getByText("Remove or replace every tool not listed in the capability catalog.")).toBeVisible();
+    await expect(tools.getByText("Remove or replace every tool that is not available in this installation.")).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
 
     await tools.getByRole("button", { name: "Remove unavailable github:repository:get_file_contents" }).click();
@@ -4036,7 +4089,7 @@ test("administrator template tool controls offer no fallback when the capability
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const tools = administrator.page.getByRole("group", { name: "Tools" });
     await expect(tools.getByRole("searchbox", { name: "Search tools" })).toBeDisabled();
-    await expect(tools.getByText("No tools are listed in the deployment capability catalog.")).toBeVisible();
+    await expect(tools.getByText("No tools are available in this installation.")).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     expect(administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst").body.envelope.spec.tools).toEqual([]);
@@ -4105,7 +4158,7 @@ test("successive template saves diff tools against the accepted prior revision",
     await issuesRead.check();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.filter((mutation) => mutation.path === "/admin/api/v1/envelope-templates/developer").length).toBe(1);
-    await expect(changes.getByText("No tool authority changes.", { exact: true })).toBeVisible();
+    await expect(changes.getByText("No tool access changes.", { exact: true })).toBeVisible();
 
     await issuesRead.uncheck();
     await repositoryRead.check();
@@ -4168,7 +4221,7 @@ test("administrator template authoring rejects models absent from the capability
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
-    await expect(administrator.page.getByText("Remove or replace every model not listed in the capability catalog.", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByText("Remove or replace every model that is not available in this installation.", { exact: true })).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
   } finally {
     await closeGuardedPage(administrator);
@@ -4185,9 +4238,9 @@ test("administrator can replace a template model absent from the capability cata
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const models = administrator.page.getByRole("group", { name: "Models" });
     await expect(models.getByText("openai/gpt-5.4", { exact: true })).toBeVisible();
-    await expect(models.getByText("Not listed in the deployment capability catalog")).toBeVisible();
+    await expect(models.getByText("1 selected model is not available in this installation. Remove or replace before saving.", { exact: true })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
-    await expect(models.getByText("Remove or replace every model not listed in the capability catalog.", { exact: true })).toBeVisible();
+    await expect(models.getByText("Remove or replace every model that is not available in this installation.", { exact: true })).toBeVisible();
     expect(administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBe(false);
 
     await models.getByRole("button", { name: "Remove openai/gpt-5.4" }).click();
@@ -4238,7 +4291,7 @@ test("administrator template model identity does not collide across provider and
   try {
     await stale.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     const models = stale.page.getByRole("group", { name: "Models" });
-    await expect(models.getByText("Not listed in the deployment capability catalog")).toHaveCount(1);
+    await expect(models.getByText("1 selected model is not available in this installation. Remove or replace before saving.", { exact: true })).toHaveCount(1);
     await models.getByRole("button", { name: "Remove Provider: provider-a · Model: part/model-a" }).click();
     await expect(models.getByRole("button", { name: /^Remove / })).toHaveCount(1);
     await stale.page.getByRole("button", { name: "Save new version" }).click();
@@ -4293,7 +4346,7 @@ test("an incomplete successful template response fails closed instead of crashin
   });
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
-    await expect(administrator.page.getByRole("heading", { name: "Data could not be accepted" })).toBeVisible();
+    await expect(administrator.page.getByRole("heading", { name: "Couldn't load this page" })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -4307,7 +4360,7 @@ test("the deployed admin template contract is accepted during the rolling Next c
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     await expect(administrator.page.getByText("Current revision 4")).toBeVisible();
-    await expect(administrator.page.getByRole("textbox", { name: "Monthly limit (USD)" })).toHaveValue("25.00");
+    await expect(administrator.page.getByRole("spinbutton", { name: /^Monthly limit/ })).toHaveValue("25.00");
     await expect(administrator.page.getByText("provider-a/model-a", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
@@ -4333,7 +4386,7 @@ test("managed inference keys can be added, replaced, and removed without redispl
   try {
     await developer.page.goto(`${origin}/connections`);
     await expect(developer.page.getByRole("heading", { name: "Tools / MCP servers" })).toBeVisible();
-    await expect(developer.page.getByRole("heading", { name: "Inference / LLMs" })).toBeVisible();
+    await expect(developer.page.getByRole("heading", { name: "Models" }).first()).toBeVisible();
     await developer.page.getByRole("button", { name: "Add API key" }).click();
     await developer.page.getByLabel("Inference API key").fill(firstKey);
     await developer.page.getByRole("button", { name: "Save API key" }).click();
@@ -4368,10 +4421,11 @@ test("connection OAuth polling keeps a bounded terminal failure explicit", async
   try {
     await developer.page.goto(`${origin}/connections`);
     await developer.page.getByRole("button", { name: "Connect GitHub" }).click();
-    await expect(developer.page.getByText(
-      "GitHub authorization failed (gateway_http_error): provider temporarily unavailable",
-      { exact: true },
-    )).toBeVisible();
+    const failure = developer.page.getByRole("alert");
+    await expect(failure.getByText("GitHub authorization couldn't be completed. Retry once. If it continues, ask an administrator to check the connection.", { exact: true })).toBeVisible();
+    await failure.getByText("Details", { exact: true }).click();
+    await expect(failure.getByText("gateway_http_error", { exact: true })).toBeVisible();
+    await expect(failure.getByText("provider temporarily unavailable", { exact: true })).toBeVisible();
     expectMutationProof(developer.mutations.find((mutation) => mutation.path.endsWith("/start")));
   } finally {
     await closeGuardedPage(developer);

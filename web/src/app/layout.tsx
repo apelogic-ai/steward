@@ -24,7 +24,7 @@ export const metadata: Metadata = {
     default: "HyperShell",
     template: "%s · HyperShell",
   },
-  description: "Governed agent runtimes and authority envelopes.",
+  description: "Governed agent runs and access envelopes.",
   icons: { icon: "/brand/logo" },
 };
 

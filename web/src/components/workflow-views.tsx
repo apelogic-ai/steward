@@ -26,7 +26,7 @@ export function AdminWorkflowsView() {
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader actions={<PrimaryLink href="/admin/workflows/new">Create workflow</PrimaryLink>} description="Publish immutable, versioned agent definitions." title="Workflows" />
       <ResourceBoundary state={state}>{({ workflows }) => workflows.length === 0 ? (
-        <EmptyState title="No workflows yet"><p>Publish the first immutable workflow definition to make it available for governed runs.</p></EmptyState>
+        <EmptyState title="No workflows yet"><p>Publish the first workflow definition to make it available for runs.</p></EmptyState>
       ) : (
         <ul className="grid gap-4 lg:grid-cols-2">
           {workflows.map((workflow) => (
@@ -107,8 +107,8 @@ function WorkflowForm({ agents, from }: Readonly<{ agents: WorkflowListResponse[
         <label className="grid gap-2 text-sm font-semibold">Name<input className="min-h-11 rounded-md border px-3 font-normal" defaultValue={from?.name ?? ""} disabled={Boolean(from)} name="name" pattern="[a-z](?:[a-z0-9]|-)*[a-z0-9]" required /></label>
         <label className="grid gap-2 text-sm font-semibold">Display name<input className="min-h-11 rounded-md border px-3 font-normal" defaultValue={from?.displayName ?? ""} name="displayName" required /></label>
         <label className="grid gap-2 text-sm font-semibold">Agent<select className="min-h-11 rounded-md border bg-panel px-3 font-normal" defaultValue={from?.agent ?? agents[0].agentRef} name="agent" required>{agents.map((agent) => <option key={agent.agentRef} value={agent.agentRef}>{agent.displayName ?? agent.agentRef} · {agent.agentRef}</option>)}</select></label>
-        <label className="grid gap-2 text-sm font-semibold">Prompt<textarea aria-describedby="workflow-output-guidance" className="min-h-52 rounded-md border p-3 font-normal" defaultValue={from?.prompt ?? ""} name="prompt" required /><span className="font-normal text-muted-ink" id="workflow-output-guidance">Write every result file under <code>out/</code>. Only files under that directory are returned as governed output.</span></label>
-        {submission !== "idle" && submission !== "submitting" ? <p className="text-sm text-red-800" role="alert">{{ conflict: "This Workflow name or version was published concurrently.", rejected: "The Workflow content was rejected.", forbidden: "The authorization boundary rejected publication.", unavailable: "The Workflow service is unavailable.", error: "The Workflow could not be published." }[submission]}</p> : null}
+        <label className="grid gap-2 text-sm font-semibold">Prompt<textarea aria-describedby="workflow-output-guidance" className="min-h-52 rounded-md border p-3 font-normal" defaultValue={from?.prompt ?? ""} name="prompt" required /><span className="font-normal text-muted-ink" id="workflow-output-guidance">Write every result file under <code>out/</code>. Only files under that directory are returned as run output.</span></label>
+        {submission !== "idle" && submission !== "submitting" ? <p className="text-sm text-red-800" role="alert">{{ conflict: "This Workflow name or version was published at the same time. Reload and try again.", rejected: "The Workflow content could not be accepted. Check it and try again.", forbidden: "You don't have permission to publish this Workflow.", unavailable: "HyperShell couldn't publish the Workflow. Try again in a moment.", error: "The Workflow could not be published. Try again." }[submission]}</p> : null}
         <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Publishing…" : from ? "Publish new version" : "Publish workflow"}</button>
       </form>
     </section>

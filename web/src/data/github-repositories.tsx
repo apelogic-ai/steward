@@ -95,5 +95,5 @@ export function RepositoryResource({ children, onRetry, state }: Readonly<{
 }>) {
   if (state.status === "ready") return children(state.value);
   if (state.status === "loading") return <p className="text-sm text-muted-ink" role="status">Loading GitHub repositories…</p>;
-  return <div className="space-y-2"><p className="text-sm text-err" role="alert">Repository listing failed: <code>{state.error}</code>{state.reason ? <> · <code>{state.reason}</code></> : null}</p><button className="rounded-control border px-3 py-2 text-sm font-semibold" onClick={onRetry} type="button">Retry repositories</button></div>;
+  return <div className="space-y-2"><p className="text-sm text-err" role="alert">GitHub repositories couldn&apos;t be loaded. Try again.</p><details className="text-xs text-muted-ink"><summary className="cursor-pointer">Details</summary><dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-2"><dt>Category</dt><dd><code>{state.error}</code></dd>{state.reason ? <><dt>Reason</dt><dd><code>{state.reason}</code></dd></> : null}</dl></details><button className="rounded-control border px-3 py-2 text-sm font-semibold" onClick={onRetry} type="button">Retry repositories</button></div>;
 }

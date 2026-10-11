@@ -36,7 +36,9 @@ import {
   inlineFiles,
   runNowFailureMessage,
 } from "@/components/browser-run-now-view";
+import { DiagnosticDetails } from "@/components/diagnostic-details";
 import { parseRunEventData } from "@/components/run-views";
+import { formatDuration, formatMoney } from "@/components/presentation-values";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { RepositoryResource, useGithubRepositories } from "@/data/github-repositories";
 import { defaultOnboardingRepository, deriveOnboardingProgress, loadOnboardingEvidence, ONBOARDING_PROGRESS_EVENT, type OnboardingEvidence } from "@/data/onboarding-progress";
@@ -58,10 +60,7 @@ function runDuration(createdAt: string, updatedAt: string): string {
   const end = new Date(updatedAt).valueOf();
   if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "duration unavailable";
   const seconds = Math.round((end - start) / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainder = seconds % 60;
-  return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+  return formatDuration(`${seconds}s`);
 }
 
 function inputRows(value: unknown): InputRow[] {
@@ -99,21 +98,19 @@ function repositoryName(repository: GithubRepositoryView): string {
 }
 
 export function repositoryOptionLabel(repository: GithubRepositoryView): string {
-  const state = repository.ready ? "Ready" : repository.missingPrerequisite === NOT_ADMITTED ? "Not admitted" : "Not ready";
+  const state = repository.ready ? "Ready" : repository.missingPrerequisite === NOT_ADMITTED ? "Not approved" : "Not ready";
   return `${repositoryName(repository)} · ${state}`;
 }
 
 export function repositoryReadinessMessage(repositories: readonly GithubRepositoryView[], selected: GithubRepositoryView | undefined): string | null {
   if (!selected || selected.ready) return null;
   if (repositories.length && repositories.every((repository) => !repository.ready && repository.missingPrerequisite === NOT_ADMITTED)) {
-    return "None of your repositories is admitted as a governed source on this deployment; ask an administrator to add it.";
+    return "None of your repositories is approved for runs on this installation. Ask an administrator to add one.";
   }
   if (selected.missingPrerequisite === NOT_ADMITTED) {
-    return `${repositoryName(selected)} is not admitted as a governed source on this deployment; ask an administrator to add it.`;
+    return `${repositoryName(selected)} is not approved for runs on this installation. Ask an administrator to add it.`;
   }
-  return selected.missingPrerequisite
-    ? `${repositoryName(selected)} is not ready for governed automation: ${selected.missingPrerequisite}.`
-    : `${repositoryName(selected)} is not ready for governed automation.`;
+  return `${repositoryName(selected)} is not ready for runs. Ask an administrator to check its workflow access.`;
 }
 
 export { browserHelloWorldRun } from "@/data/onboarding-progress";
@@ -276,13 +273,13 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
         failure: bundleResult.data && bundleResult.response?.ok
           ? null
           : problem?.error === "steward_run_release_unsupported"
-            ? "The reviewed steward-run release is below 0.8.0. Copy the Task definition manually; workflow generation and detection require steward-run 0.8.0 or later."
-            : "Steward could not render the exact tested package and workflow.",
+            ? "This installation cannot generate a workflow for the selected task. Copy the task definition manually, or ask an administrator to update the workflow tools."
+            : "HyperShell couldn't prepare the tested package and workflow.",
         manualFiles: problem?.manualFiles ?? {},
         taskUid,
       });
     }).catch(() => {
-      if (active) setBundleResource({ bundle: null, failure: "Steward could not render the exact tested package and workflow.", manualFiles: {}, taskUid });
+      if (active) setBundleResource({ bundle: null, failure: "HyperShell couldn't prepare the tested package and workflow.", manualFiles: {}, taskUid });
     });
     return () => { active = false; };
   }, [session.status, taskUid]);
@@ -462,12 +459,12 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
     },
     {
       title: "Get your first envelope",
-      status: done[1] ? `${provisionedRequest?.templateId ?? "Custom"} envelope ${provisionedRequest?.envelopeInstanceId} provisioned` : "Choose the authority for this run",
-      body: <div className="space-y-4"><p className="text-sm text-muted-ink">Requests within a template&apos;s limits are approved and provisioned right away. Anything above goes to the approval queue.</p><div className="grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">{data.templates.templates.map((template) => <button aria-pressed={template.id === selectedTemplateId} className={`rounded-tile border p-4 text-left ${template.id === selectedTemplateId ? "border-brand bg-brand-soft" : "hover:bg-subtle"}`} key={template.id} onClick={() => setSelectedTemplateId(template.id)} type="button"><span className="flex justify-between gap-3"><strong className="text-sm">{template.displayName}</strong><span className="font-mono text-xs text-muted-ink">rev {template.revision}</span></span><span className="mt-2 block text-xs text-muted-ink">Up to {template.ceiling.spec.budget.monthlyLimit} {template.ceiling.spec.budget.currency}/mo · {template.ceiling.spec.ttl}</span></button>)}</div><div className="flex flex-wrap gap-3"><Link className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href={`/envelopes/new?template=${encodeURIComponent(selectedTemplateId)}`}>Request {data.templates.templates.find((template) => template.id === selectedTemplateId)?.displayName ?? "an"} envelope</Link><Link className="self-center text-sm font-semibold" href="/envelopes/new?type=custom">Customize limits instead</Link></div></div>,
+      status: done[1] ? `${provisionedRequest?.templateId ?? "Custom"} envelope ${provisionedRequest?.envelopeInstanceId} provisioned` : "Choose the envelope for this run",
+      body: <div className="space-y-4"><p className="text-sm text-muted-ink">Requests within a template&apos;s limits are approved and provisioned right away. Anything above goes to the approval queue.</p><div className="grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">{data.templates.templates.map((template) => <button aria-pressed={template.id === selectedTemplateId} className={`rounded-tile border p-4 text-left ${template.id === selectedTemplateId ? "border-brand bg-brand-soft" : "hover:bg-subtle"}`} key={template.id} onClick={() => setSelectedTemplateId(template.id)} type="button"><span className="flex justify-between gap-3"><strong className="text-sm">{template.displayName}</strong><span className="font-mono text-xs text-muted-ink">rev {template.revision}</span></span><span className="mt-2 block text-xs text-muted-ink">Monthly limit {formatMoney(template.ceiling.spec.budget.monthlyLimit, template.ceiling.spec.budget.currency)} · time-to-live limit {formatDuration(template.ceiling.spec.ttl)}</span></button>)}</div><div className="flex flex-wrap gap-3"><Link className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href={`/envelopes/new?template=${encodeURIComponent(selectedTemplateId)}`}>Request {data.templates.templates.find((template) => template.id === selectedTemplateId)?.displayName ?? "an"} envelope</Link><Link className="self-center text-sm font-semibold" href="/envelopes/new?type=custom">Customize limits instead</Link></div></div>,
     },
     {
       title: "Try a test run",
-      status: successfulTestRun ? `Test run succeeded in ${runDuration(successfulTestRun.createdAt, successfulTestRun.updatedAt)} · ${successfulTestRun.observedSpend?.observedAmount ?? "—"} ${successfulTestRun.observedSpend?.currency ?? ""}` : testRun ? `${testRun.phase} · ${testRun.taskUid}` : "Check the combination before wiring it into CI",
+      status: successfulTestRun ? `Test run succeeded in ${runDuration(successfulTestRun.createdAt, successfulTestRun.updatedAt)} · ${successfulTestRun.observedSpend ? formatMoney(successfulTestRun.observedSpend.observedAmount, successfulTestRun.observedSpend.currency) : "spend not reported"}` : testRun ? `${testRun.phase} · ${testRun.taskUid}` : "Check the combination before wiring it into CI",
       body: <form className="space-y-4" onSubmit={(event) => void submitTestRun(event)}>
         <p className="text-sm text-muted-ink">Check the combination before wiring it into CI. This run is governed exactly like one started from GitHub.</p>
         <div className="grid gap-4 md:grid-cols-3">
@@ -480,7 +477,7 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
         <div className="space-y-3 rounded-control border p-4"><label className="flex items-center gap-3 text-sm font-semibold"><input aria-label="Include checkout in task workspace" checked={checkoutRepository} onChange={(event) => setCheckoutRepository(event.target.checked)} type="checkbox" />Check out this repository</label>{checkoutRepository ? <label className="grid max-w-sm gap-2 text-sm font-semibold">History depth (optional)<input className={fieldClass} min={1} onChange={(event) => setHistoryDepth(event.target.value)} placeholder="Files only" step={1} type="number" value={historyDepth} /></label> : null}{checkoutRepository && !historyDepthValid ? <p className="text-sm text-err" role="alert">History depth must be a positive whole number.</p> : null}<p className="text-xs text-muted-ink">The selected repository is pinned at its default-branch HEAD and materialized read-only.</p></div>
         <label className="grid gap-2 text-sm font-semibold">Prompt<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-sm font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label>
         <div className="space-y-3"><div className="flex items-center justify-between gap-3"><strong className="text-sm">Inputs</strong><button className="rounded-control border px-3 py-1.5 text-sm font-semibold" onClick={() => setInputs((rows) => [...rows, { id: crypto.randomUUID(), name: "", value: "" }])} type="button">+ Add input</button></div>{inputs.map((row) => <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]" key={row.id}><input aria-label="Input name" className={fieldClass} onChange={(event) => setInputs((rows) => rows.map((candidate) => candidate.id === row.id ? { ...candidate, name: event.target.value } : candidate))} placeholder="name" value={row.name} /><input aria-label={`Input value for ${row.name || "new input"}`} className={fieldClass} onChange={(event) => setInputs((rows) => rows.map((candidate) => candidate.id === row.id ? { ...candidate, value: event.target.value } : candidate))} placeholder="value" value={row.value} /><button aria-label={`Remove input ${row.name || "row"}`} className="rounded-control border px-3 text-sm" onClick={() => setInputs((rows) => rows.filter((candidate) => candidate.id !== row.id))} type="button">Remove</button></div>)}<p className="text-xs text-muted-ink">Inputs are passed to the agent as <code>in/inputs.json</code>.</p></div>
-        <div className="flex flex-wrap items-center gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={runState === "submitting" || !selectedEnvelope || !effectiveFiles || (checkoutRepository && (!selectedRepository?.ready || !historyDepthValid))} type="submit">{runState === "submitting" ? "Starting…" : "Run test"}</button><span className="text-xs text-muted-ink">Spends from this envelope. Typically under 0.05 USD.</span></div>
+        <div className="flex flex-wrap items-center gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={runState === "submitting" || !selectedEnvelope || !effectiveFiles || (checkoutRepository && (!selectedRepository?.ready || !historyDepthValid))} type="submit">{runState === "submitting" ? "Starting…" : "Run test"}</button><span className="text-xs text-muted-ink">This test run spends from the selected Envelope.</span></div>
         {runFailure ? <p className="text-sm text-err" role="alert">{runFailure}</p> : null}
         {createdRunUid ? <LiveRunCard onTerminal={onRefresh} taskUid={createdRunUid} /> : testRun ? <RunSummary run={testRun} /> : null}
       </form>,
@@ -498,11 +495,11 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
     {
       title: "Trigger a test run",
       status: dispatch ? `GitHub run ${dispatch.runId} accepted` : automationRun ? `GitHub-origin Task ${automationRun.taskUid} observed` : "Dispatch the verified workflow on GitHub",
-      body: taskUid && selectedRepository ? <div className="space-y-4">{selectedRepositoryLine}<p className="text-sm text-muted-ink">Dispatch the workflow on GitHub through your connection, or start it yourself. HyperShell picks the run up at admission.</p>{readinessFailure ? <p className="text-sm text-warn">{readinessFailure} Governed dispatch is unavailable until it is ready.</p> : null}{bundleFailure ? <p className="text-sm text-warn">{bundleFailure}</p> : null}<div className="flex flex-wrap gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!workflow?.compatible || !selectedRepository.ready || automationState === "dispatching"} onClick={() => void dispatchWorkflow()} type="button">{automationState === "dispatching" ? "Starting…" : "Run on GitHub"}</button><a className="rounded-control border px-4 py-2 text-sm font-semibold" href={githubRunUrl ?? `${selectedRepository.url}/actions`} rel="noreferrer" target="_blank">Open in GitHub Actions ↗</a></div>{bundle?.workflowPath ? <pre className="overflow-auto rounded-control bg-code p-3 text-xs text-code-ink">gh workflow run {bundle.workflowPath.split("/").at(-1)} -f task-inputs=&apos;{JSON.stringify(inputObject(inputs))}&apos;</pre> : null}{statusRunId && !githubStatus ? <p className="text-sm text-muted-ink">Waiting for GitHub to start the job…</p> : null}</div> : <p className="text-sm text-muted-ink">Complete the tested package and workflow first.</p>,
+      body: taskUid && selectedRepository ? <div className="space-y-4">{selectedRepositoryLine}<p className="text-sm text-muted-ink">Start the workflow through your GitHub connection, or start it yourself. HyperShell links the GitHub job to a run.</p>{readinessFailure ? <p className="text-sm text-warn">{readinessFailure} Automatic start is unavailable until the repository is ready.</p> : null}{bundleFailure ? <p className="text-sm text-warn">{bundleFailure}</p> : null}<div className="flex flex-wrap gap-3"><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!workflow?.compatible || !selectedRepository.ready || automationState === "dispatching"} onClick={() => void dispatchWorkflow()} type="button">{automationState === "dispatching" ? "Starting…" : "Run on GitHub"}</button><a className="rounded-control border px-4 py-2 text-sm font-semibold" href={githubRunUrl ?? `${selectedRepository.url}/actions`} rel="noreferrer" target="_blank">Open in GitHub Actions ↗</a></div>{bundle?.workflowPath ? <pre className="overflow-auto rounded-control bg-code p-3 text-xs text-code-ink">gh workflow run {bundle.workflowPath.split("/").at(-1)} -f task-inputs=&apos;{JSON.stringify(inputObject(inputs))}&apos;</pre> : null}{statusRunId && !githubStatus ? <p className="text-sm text-muted-ink">Waiting for GitHub to start the job…</p> : null}</div> : <p className="text-sm text-muted-ink">Complete the tested package and workflow first.</p>,
     },
     {
       title: "See the result",
-      status: resultPhase ? `${resultPhase.charAt(0).toUpperCase()}${resultPhase.slice(1)}${automationRun ? ` in ${runDuration(automationRun.createdAt, automationRun.updatedAt)} · ${automationRun.observedSpend?.observedAmount ?? "—"} ${automationRun.observedSpend?.currency ?? ""}` : ""}` : "The run appears here as soon as GitHub starts it",
+      status: resultPhase ? `${resultPhase.charAt(0).toUpperCase()}${resultPhase.slice(1)}${automationRun ? ` in ${runDuration(automationRun.createdAt, automationRun.updatedAt)} · ${automationRun.observedSpend ? formatMoney(automationRun.observedSpend.observedAmount, automationRun.observedSpend.currency) : "spend not reported"}` : ""}` : "The run appears here as soon as GitHub starts it",
       body: dispatch || automationRun ? <div className="grid gap-4 lg:grid-cols-2"><div className="rounded-tile border p-4"><h3 className="text-sm font-semibold">HyperShell run</h3>{automationRun ? <RunSummary linkLabel="Open in HyperShell" run={automationRun} showLogExcerpt /> : githubStatus?.linkedTaskUid ? <div className="mt-3 space-y-2"><StatusBadge value={githubStatus.linkedTaskPhase ?? "queued"} /><p className="font-mono text-xs">{githubStatus.linkedTaskUid}</p><Link className="inline-block font-semibold text-brand" href={`/runs/${githubStatus.linkedTaskUid}`}>Open in HyperShell</Link></div> : <p className="mt-3 text-sm text-muted-ink">The governed Task appears here as soon as GitHub starts it.</p>}</div><div className="rounded-tile border p-4"><h3 className="text-sm font-semibold">GitHub run</h3>{githubStatus ? <div className="mt-3 space-y-3"><div className="flex items-center gap-3"><StatusBadge value={githubStatus.conclusion ?? githubStatus.phase} /><a className="font-semibold text-brand" href={githubStatus.url} rel="noreferrer" target="_blank">Run {githubStatus.runId} ↗</a></div>{githubStatus.jobs.length ? <ul className="space-y-1 text-sm">{githubStatus.jobs.map((job) => <li className="flex justify-between gap-3" key={job.id}><a href={job.url} rel="noreferrer" target="_blank">{job.name}</a><span>{job.conclusion ?? job.status}</span></li>)}</ul> : null}{githubStatus.failureLog ? <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-control bg-code p-3 text-xs text-code-ink">{githubStatus.failureLog}</pre> : null}</div> : githubRunUrl ? <a className="mt-3 inline-block font-semibold text-brand" href={githubRunUrl} rel="noreferrer" target="_blank">View on GitHub ↗</a> : null}</div></div> : <p className="text-sm text-muted-ink">The run appears here as soon as GitHub starts it.</p>,
     },
   ];
@@ -518,7 +515,7 @@ function RepositoryPicker({ emptyMessage, onSelect, selected }: Readonly<{
   const { refresh, state } = useGithubRepositories();
   return <RepositoryResource onRetry={refresh} state={state}>{({ repositories: available }) => <div className="grid gap-2">{available.length
     ? <label className="grid gap-2 text-sm font-semibold">Repository<select className={fieldClass} onChange={(event) => onSelect(event.target.value)} value={selected?.repositoryId ?? ""}>{available.map((repository) => <option key={repository.repositoryId} value={repository.repositoryId}>{repositoryOptionLabel(repository)}</option>)}</select></label>
-    : <p className="text-sm font-normal text-muted-ink">{emptyMessage}</p>}<button className="justify-self-start text-xs font-semibold text-brand" onClick={refresh} type="button">Refresh repositories</button></div>}</RepositoryResource>;
+    : <p className="text-sm font-normal text-muted-ink">{emptyMessage}</p>}<DiagnosticDetails items={[{ label: "Reason", value: selected?.missingPrerequisite }]} /><button className="justify-self-start text-xs font-semibold text-brand" onClick={refresh} type="button">Refresh repositories</button></div>}</RepositoryResource>;
 }
 
 function Preview({ copied, onCopy, title, value }: Readonly<{ copied: boolean; onCopy: () => void; title: string; value: string }>) {
@@ -526,7 +523,7 @@ function Preview({ copied, onCopy, title, value }: Readonly<{ copied: boolean; o
 }
 
 function RunSummary({ linkLabel = "Open run details", run, showLogExcerpt = false }: Readonly<{ linkLabel?: string; run: BrowserRunView; showLogExcerpt?: boolean }>) {
-  return <div className="mt-3 space-y-3"><div className="flex flex-wrap items-center gap-3"><StatusBadge value={run.phase} /><span className="text-sm">{run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "Spend not reported"}</span></div><p className="font-mono text-xs text-muted-ink">{run.taskUid}</p>{showLogExcerpt ? <RunLogExcerpt run={run} /> : <div className="rounded-control bg-code p-3 font-mono text-xs leading-5 text-code-ink">admission complete<br />runtime provisioned<br />agent execution {run.phase}</div>}<Link className="inline-block font-semibold text-brand" href={`/runs/${run.taskUid}`}>{linkLabel}</Link></div>;
+  return <div className="mt-3 space-y-3"><div className="flex flex-wrap items-center gap-3"><StatusBadge value={run.phase} /><span className="text-sm">{run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : "Spend not reported"}</span></div><p className="font-mono text-xs text-muted-ink">{run.taskUid}</p>{showLogExcerpt ? <RunLogExcerpt run={run} /> : <div className="rounded-control bg-code p-3 font-mono text-xs leading-5 text-code-ink">request accepted<br />run environment ready<br />agent run {run.phase}</div>}<Link className="inline-block font-semibold text-brand" href={`/runs/${run.taskUid}`}>{linkLabel}</Link></div>;
 }
 
 function RunLogExcerpt({ run }: Readonly<{ run: BrowserRunView }>) {

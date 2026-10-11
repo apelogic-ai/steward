@@ -132,22 +132,22 @@ test("exact Tasks preserve inline bytes but use only immutable locators for Git 
 });
 
 describe("Run now failures", () => {
-  test("shows a bounded server message before a generic fallback", () => {
+  test("uses a plain generic message without exposing server text or codes", () => {
     expect(runNowFailureMessage({
       error: "task.persistence_failed",
       message: "Steward could not record this run.",
-    })).toBe("task.persistence_failed: Steward could not record this run.");
+    })).toBe("The run request was rejected. Check the package, inputs, and selected Envelope limits, then try again.");
     expect(runNowFailureMessage({ error: "task.persistence_failed" }))
-      .toBe("Run request failed (task.persistence_failed).");
+      .toBe("The run request was rejected. Check the package, inputs, and selected Envelope limits, then try again.");
     expect(runNowFailureMessage(undefined))
-      .toBe("The run request was rejected. Check the package locator, inputs, and Envelope authority.");
+      .toBe("The run request was rejected. Check the package, inputs, and selected Envelope limits, then try again.");
   });
 
-  test("shows the API code, failure reason, and an actionable known-code hint", () => {
+  test("replaces a known server reason with an actionable next step", () => {
     expect(runNowFailureMessage({
       error: "task.direct_package_source_disabled",
       failureReason: "Direct package source resolution is disabled.",
-    })).toBe("task.direct_package_source_disabled: Direct package source resolution is disabled. Choose an inline task or ask an administrator to enable GitHub source packages.");
+    })).toBe("The run request was rejected. Choose an inline task or ask an administrator to enable GitHub source packages.");
   });
 });
 

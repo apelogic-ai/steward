@@ -67,11 +67,11 @@ function TaskContent({ task }: Readonly<{ task: BrowserTaskView }>) {
         ["Path", <code key="path">{task.path}</code>],
         ["Coding agent", <code key="agent">{task.runtime.agentRef}</code>],
         ["Model", <code key="model">{model}</code>],
-        ["Authority", task.requires ? "Declared by this Task" : "Inherits the Envelope’s authority"],
+        ["Access", task.requires ? "Declared by this Task" : "Inherits the Envelope's approved access"],
         ["Ownership", task.owned ? "Owned by you" : "Shared"],
         ["Shared roles", task.sharedRoles.length > 0 ? task.sharedRoles.join(", ") : "None"],
       ]} />
-      {task.requires ? <details className="mt-5"><summary className="cursor-pointer text-sm font-semibold">Required authority</summary><pre className="mt-3 overflow-auto rounded-control border bg-subtle p-4 text-xs">{JSON.stringify(task.requires, null, 2)}</pre></details> : null}
+      {task.requires ? <details className="mt-5"><summary className="cursor-pointer text-sm font-semibold">Required access</summary><pre className="mt-3 overflow-auto rounded-control border bg-subtle p-4 text-xs">{JSON.stringify(task.requires, null, 2)}</pre></details> : null}
     </section>
     <section aria-labelledby="task-files-title" className="space-y-3">
       <h2 className="text-lg font-semibold" id="task-files-title">Files</h2>

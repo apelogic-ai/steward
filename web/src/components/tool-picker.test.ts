@@ -47,7 +47,7 @@ describe("tool picker authority helpers", () => {
       resources: group.tools.map((tool) => tool.resource),
     }))).toEqual([
       { authoritative: true, kind: "toolset", name: "Ungrouped", resources: ["authoritative"] },
-      { authoritative: false, kind: "fallback", name: "No authoritative toolset", resources: ["legacy"] },
+      { authoritative: false, kind: "fallback", name: "No tools available", resources: ["legacy"] },
     ]);
   });
 

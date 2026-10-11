@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { renderToStaticMarkup } from "react-dom/server";
 
 import type { GithubRepositoriesResponse } from "@/api-client";
 
@@ -6,6 +7,7 @@ import {
   GITHUB_REPOSITORIES_KEY,
   githubRepositoriesSwrOptions,
   RepositoryListingError,
+  RepositoryResource,
   repositoryResourceState,
 } from "./github-repositories";
 
@@ -41,4 +43,19 @@ test("repository resource state keeps the loading, ready, and error shapes", () 
     .toEqual({ status: "error", error: "github_automation_unavailable", reason: "bridge_contract" });
   expect(repositoryResourceState({ data: undefined, error: new Error("network"), isValidating: false }))
     .toEqual({ status: "error", error: "repository_query_failed", reason: null });
+});
+
+test("repository failures keep internal codes behind Details", () => {
+  const html = renderToStaticMarkup(RepositoryResource({
+    children: () => null,
+    onRetry: () => undefined,
+    state: { status: "error", error: "github_automation_unavailable", reason: "bridge_contract" },
+  }));
+
+  expect(html).toContain("GitHub repositories couldn&#x27;t be loaded. Try again.");
+  expect(html).toContain("<summary");
+  expect(html).toContain("Details");
+  expect(html).toContain("github_automation_unavailable");
+  expect(html).toContain("bridge_contract");
+  expect(html.indexOf('role="alert"')).toBeLessThan(html.indexOf("github_automation_unavailable"));
 });

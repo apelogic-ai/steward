@@ -11,18 +11,18 @@ describe("governed provider connection controls", () => {
     expect(source).not.toContain("server-owned connection action");
   });
 
-  test("warns that disconnect affects every present and future runtime", () => {
-    expect(source).toContain("every current and future runtime");
-    expect(source).toContain("using your identity");
+  test("warns that disconnect affects every present and future run", () => {
+    expect(source).toContain("every current and future run");
+    expect(source).toContain("using your account");
   });
 
   test("distinguishes an outstanding OAuth flow from an ordinary conflict", () => {
     expect(source).toContain("Finish or wait for the pending GitHub authorization");
   });
 
-  test("explains that staged orchestration deliberately disables connection mutations", () => {
+  test("explains that connections stay disabled until task runs are enabled", () => {
     expect(source).toContain("orchestration-not-active");
-    expect(source).toContain("Connections are disabled until task orchestration is active (stage 2).");
+    expect(source).toContain("Connections are disabled until task runs are enabled for this installation.");
   });
 
   test("polls an accepted connection start and aborts it when the view unmounts", () => {
@@ -43,38 +43,42 @@ describe("governed provider connection controls", () => {
   });
 
   test("shows the bounded terminal connection failure category", () => {
-    expect(source).toContain("GitHub authorization failed");
-    expect(source).toContain("failure.error");
-    expect(source).toContain("failure.detail");
+    expect(source).toContain("GitHub authorization couldn't be completed");
+    expect(source).toContain("<summary className=\"cursor-pointer\">Details</summary>");
+    expect(source).toContain("{startFailure.error}");
+    expect(source).toContain("{startFailure.code}");
     expect(source).toContain("runtime_authentication_failed");
-    expect(source).toContain("verify runtime credential injection");
+    expect(source).toContain("Re-authorize GitHub");
     expect(source).toContain("proxy_policy_denied");
-    expect(source).toContain("verify the runtime's GitHub proxy policy");
+    expect(source).toContain("current connection settings");
     expect(source).toContain("provider_authorization_failed");
-    expect(source).toContain("verify the runtime authority and MCP-GW configuration");
+    expect(source).toContain("review its access");
     expect(source).toContain("token_grant_failed");
-    expect(source).toContain("inspect MCP-GW token grants");
+    expect(source).toContain("GitHub access couldn't be prepared");
     expect(source).toContain("provider_response_invalid");
-    expect(source).toContain("verify the MCP-GW connection contract");
+    expect(source).toContain("GitHub returned an unexpected response");
     expect(source).toContain("gateway_transport_failed");
-    expect(source).toContain("verify the gateway route and transport health");
+    expect(source).toContain("Steward couldn't reach GitHub");
     expect(source).toContain("gateway_status_invalid");
-    expect(source).toContain("verify the deployed Steward and MCP-GW versions");
+    expect(source).toContain("installed connection services");
     expect(source).toContain("gateway_body_unavailable");
     expect(source).toContain("gateway_unavailable");
     expect(source).toContain("gateway_session_failed");
-    expect(source).toContain("establish an MCP session with MCP-GW");
+    expect(source).toContain("GitHub connection couldn't be started");
     expect(source).toContain("runtime_create_failed");
-    expect(source).toContain("inspect Steward runtime admission and controller events");
+    expect(source).toContain("temporary GitHub connection couldn't be created");
     expect(source).toContain("runtime_start_failed");
-    expect(source).toContain("inspect the AgentRuntime and OpenShell sandbox status");
+    expect(source).toContain("temporary GitHub connection couldn't start");
     expect(source).toContain("connection_deadline_exceeded");
-    expect(source).toContain("inspect runtime health");
+    expect(source).toContain("did not become ready in time");
     expect(source).toContain("bridge_result_too_large");
-    expect(source).toContain("larger than Steward accepts for this operation");
+    expect(source).toContain("more data than this operation can process");
     expect(source).toContain("oauth_redirect_target_not_allowed");
-    expect(source).toContain("githubWrapper.oauth.redirectAfterAllowedOrigins");
+    expect(source).toContain("connection's return address");
     expect(source).toContain("code: operation.data.code");
+    expect(source).not.toContain("verify runtime credential injection");
+    expect(source).not.toContain("inspect MCP-GW token grants");
+    expect(source).not.toContain("githubWrapper.oauth.redirectAfterAllowedOrigins");
   });
 
   test("clears a stale authorization failure before disconnecting", () => {
@@ -107,18 +111,18 @@ describe("governed provider connection controls", () => {
 
   test("separates tool connections from deployment-mode-aware inference custody", () => {
     expect(source).toContain("Tools / MCP servers");
-    expect(source).toContain("Inference / LLMs");
+    expect(source).toContain("<h2 className=\"text-lg font-semibold\">Models</h2>");
     expect(source).toContain("getInferenceConnection");
     expect(source).toContain('value?.mode === "stock"');
-    expect(source).toContain("Inference credentials are managed by your Steward administrator");
+    expect(source).toContain("API keys are managed by your Steward administrator");
     expect(source).toContain('type="password"');
     expect(source).toContain("Add API key");
     expect(source).toContain("Replace API key");
     expect(source).toContain("Remove API key…");
     expect(source).toContain("Remove stored API key…");
-    expect(source).toContain("A managed-mode key saved");
-    expect(source).toContain("GitHub Actions runs admitted as you use this same saved key");
-    expect(source).toContain("It does not revoke or delete the key at the upstream inference service.");
+    expect(source).toContain("A saved key from");
+    expect(source).toContain("Runs started here or from GitHub Actions use this key");
+    expect(source).toContain("It does not revoke or delete the key at the model provider.");
   });
 
   test("never renders the submitted inference credential", () => {

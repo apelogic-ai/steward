@@ -119,7 +119,7 @@ describe("envelope request approval controls", () => {
 
     expect(triggerLabel(aboveLimits)).toEqual([
       "Above limits",
-      "Monthly limit 150.00 EUR > 50.00 EUR · Runtime minutes 90 minutes > 60 minutes · TTL 3h > 2h",
+      "Monthly limit: 150.00 EUR > 50.00 EUR · Runtime limit per month: 90 min > 60 min · Time-to-live limit: 3 h > 2 h",
     ]);
   });
 
@@ -140,7 +140,18 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("200.00 USD");
   });
 
-  test("shows the full requested authority for a template-free custom request", () => {
+  test("shows a human-written history reason without hiding it as a diagnostic", () => {
+    const html = renderToStaticMarkup(<UnifiedRequestCard request={{
+      ...unifiedRequest,
+      history: [{ actor: "alice", at: "2026-08-30T12:01:00Z", reason: "Needed for the release review", state: "requested" }],
+      state: "rejected",
+    }} />);
+
+    expect(html).toContain("Needed for the release review");
+    expect(html).not.toContain("<summary");
+  });
+
+  test("shows the full requested access for a template-free custom request", () => {
     const custom: AdminRequestView = {
       ...unifiedRequest,
       kind: "custom",
@@ -150,10 +161,10 @@ describe("envelope request approval controls", () => {
 
     const html = renderToStaticMarkup(<UnifiedRequestCard request={custom} />);
 
-    expect(html).toContain("Requested authority");
+    expect(html).toContain("Requested access");
     expect(html).toContain("300.00 USD");
     expect(html).toContain("provider-a/model-b");
-    expect(html).toContain("36h");
+    expect(html).toContain("1 d 12 h");
   });
 
   test("offer governed approve and reject mutations with an optional rejection reason", () => {
@@ -181,10 +192,10 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("not auto-provisioned");
   });
 
-  test("show the requested authority beside its exact governing template revision", () => {
+  test("shows the requested access beside its exact governing template revision", () => {
     const html = renderToStaticMarkup(<EnvelopeRequestCard request={request} />);
 
-    expect(html).toContain("Requested authority");
+    expect(html).toContain("Requested access");
     expect(html).toContain("Governing template");
     expect(html).toContain("300.00 USD");
     expect(html).toContain("200.00 USD");
