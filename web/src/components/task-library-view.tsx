@@ -12,7 +12,9 @@ import {
   type BrowserTasksResponse,
   type BrowserTaskView,
 } from "@/api-client";
+import { WorkspaceRepositoryControls } from "@/components/workspace-repository-controls";
 import { PageHeader, ResourceBoundary } from "@/components/workspace-ui";
+import { RepositoryResource, useGithubRepositories } from "@/data/github-repositories";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 import { listPublishedWorkflows, type PublishedWorkflowListResponse } from "@/workflows/api";
@@ -88,6 +90,7 @@ function jsonText(value: unknown, fallback: unknown): string {
 function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
   const router = useRouter();
   const session = useSession();
+  const { refresh: refreshRepositories, state: repositoryState } = useGithubRepositories();
   const existing = data.task;
   const definition = useMemo(() => parseDefinition(existing), [existing]);
   const existingRuntime = definition?.runtime && typeof definition.runtime === "object" ? definition.runtime as Record<string, unknown> : null;
@@ -175,7 +178,8 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
       <div className="grid gap-4 sm:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Model provider<input className={fieldClass} onChange={(event) => setModelProvider(event.target.value)} placeholder="Optional" value={modelProvider} /></label><label className="grid gap-2 text-sm font-semibold">Model<input className={fieldClass} onChange={(event) => setModelName(event.target.value)} placeholder="Optional" value={modelName} /></label></div>
       <label className="grid gap-2 text-sm font-semibold md:col-span-2">Prompt<textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} required value={prompt} /></label>
       <label className="grid gap-2 text-sm font-semibold">Skills (JSON array)<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setSkills(event.target.value)} spellCheck={false} value={skills} /></label>
-      <label className="grid gap-2 text-sm font-semibold">Workspace (JSON array)<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setWorkspace(event.target.value)} placeholder={'[{"git": {}}, {"scratch": {"size": "2Gi"}}]'} spellCheck={false} value={workspace} /></label>
+      <div className="space-y-3 rounded-control border p-4 md:col-span-2"><div><h2 className="text-sm font-semibold">Repository checkout</h2><p className="mt-1 text-xs text-muted-ink">Choose an approved repository and a branch or tag. Steward pins the selected revision before the run starts.</p></div><RepositoryResource onRetry={refreshRepositories} state={repositoryState}>{({ repositories }) => <WorkspaceRepositoryControls onChange={setWorkspace} repositories={repositories} value={workspace} />}</RepositoryResource></div>
+      <label className="grid gap-2 text-sm font-semibold">Workspace (advanced JSON array)<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setWorkspace(event.target.value)} placeholder={'[{"git": {}}, {"scratch": {"size": "2Gi"}}]'} spellCheck={false} value={workspace} /></label>
       <label className="grid gap-2 text-sm font-semibold">Outputs (JSON array)<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setOutputs(event.target.value)} spellCheck={false} value={outputs} /></label>
       <label className="grid gap-2 text-sm font-semibold">Requirements (optional JSON)<textarea className="min-h-36 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setRequires(event.target.value)} placeholder="Omitted: use the selected Envelope maximum" spellCheck={false} value={requires} /></label>
       <label className="grid gap-2 text-sm font-semibold">Additional package files (JSON object)<textarea className="min-h-36 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setAdditionalFiles(event.target.value)} spellCheck={false} value={additionalFiles} /></label>

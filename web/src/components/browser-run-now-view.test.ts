@@ -41,18 +41,25 @@ test("inline Run now packages keep the prompt in the single TaskDefinition file"
   });
 });
 
-test("inline Run now pins the selected repository and optional history in workspace", () => {
+test("inline Run now authors the selected repository name and named ref", () => {
   const files = inlineFiles(
     starterTask,
     "codex@0.140.0",
     { provider: "openai", model: "gpt-5.4" },
-    { repository: { ownerId: "1000", repositoryId: "1001" }, historyDepth: 25 },
+    {
+      repository: {
+        name: "repository",
+        owner: "example-org",
+      },
+      ref: "release-v1",
+      historyDepth: 25,
+    },
   );
 
   expect(JSON.parse(files[starterTask.packagePath] ?? "{}").workspace).toEqual([{
     git: {
-      repository: { ownerId: "1000", repositoryId: "1001" },
-      ref: "trigger",
+      repository: "example-org/repository",
+      ref: "git:ref:release-v1",
       history: { depth: 25 },
     },
   }]);
@@ -148,6 +155,27 @@ describe("Run now failures", () => {
       error: "task.direct_package_source_disabled",
       failureReason: "Direct package source resolution is disabled.",
     })).toBe("The run request was rejected. Choose an inline task or ask an administrator to enable GitHub source packages.");
+  });
+
+  test("shows a repository rejection reason and names the selected repository", () => {
+    const message = runNowFailureMessage({
+      error: "task.workspace_rejected",
+      failureReason: "The requested workspace repository was not approved.",
+    }, "example-org/repository");
+
+    expect(message).toContain("The requested workspace repository was not approved.");
+    expect(message).toContain("example-org/repository");
+    expect(message).not.toContain("task.workspace_rejected");
+  });
+
+  test("shows a non-repository workspace rejection without blaming the selected repository", () => {
+    const message = runNowFailureMessage({
+      error: "task.workspace_rejected",
+      failureReason: "Workspace history depth 25 exceeds the effective ceiling 10.",
+    }, "example-org/repository");
+
+    expect(message).toBe("The run request was rejected. Workspace history depth 25 exceeds the effective ceiling 10.");
+    expect(message).not.toContain("example-org/repository");
   });
 });
 

@@ -98,8 +98,12 @@ test("run details show pinned Git and skipped submodule workspace evidence", () 
   const html = renderToStaticMarkup(<WorkspaceEvidencePanel workspace={workspace} />);
 
   expect(html).toContain("Workspace");
-  expect(html).toContain("example-org/source.git");
+  expect(html).toContain("example-org/source");
   expect(html).toContain("depth 25");
+  expect(html).toContain("Repository details");
+  expect(html).toContain("1000");
+  expect(html).toContain("1001");
+  expect(html).toContain(`git:sha1:${"a".repeat(40)}`);
   expect(html).toContain("vendor/optional");
   expect(html).toContain("repository_not_admitted");
   expect(html).toContain("<summary");
