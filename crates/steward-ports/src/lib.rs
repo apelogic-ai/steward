@@ -650,6 +650,14 @@ pub struct GitRepositoryDescription {
 }
 
 pub trait GitHostingPlane: Send + Sync + 'static {
+    /// Canonical HTTPS origin used for human-facing repository links.
+    ///
+    /// Adapters that accept repository links expose their configured origin so core can
+    /// reject links for a different hosting plane before resolving any repository.
+    fn repository_web_origin(&self) -> Option<String> {
+        None
+    }
+
     /// Resolves display metadata for each stable repository reference.
     ///
     /// Yields `(index, result)` pairs in completion order, at most one per request entry,

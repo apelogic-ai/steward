@@ -119,8 +119,9 @@ It never probes an unbound repository name.
 
 `ref` accepts an ordinary branch or tag name, its explicit `git:ref:<name>` form,
 `"trigger"`, or an exact `git:sha1:<40-hex>` commit. `HEAD` and SHA-shaped bare
-values are rejected; use the typed exact-commit form instead. Avoid giving a branch
-and tag the same name because the provider commit resolver owns that ambiguous lookup.
+values are rejected; prefix those values with `git:ref:` when they intentionally name
+a tag, or use the typed exact-commit form for a commit. Avoid giving a branch and tag
+the same name because the provider commit resolver owns that ambiguous lookup.
 Named refs are resolved before runtime reservation. An idempotent retry reuses the
 commit already recorded for the Task even if the name later moves. `history` is
 `"none"`, `{"depth": N}`, or `"full"` when

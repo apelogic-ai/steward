@@ -117,6 +117,12 @@ impl WorkspaceGitRepositoryName {
     pub fn web_url(&self) -> Option<&str> {
         self.0.starts_with("https://").then_some(self.0.as_str())
     }
+
+    pub fn web_origin(&self) -> Option<&str> {
+        self.0
+            .strip_prefix("https://")
+            .and_then(|rest| rest.split_once('/').map(|(host, _)| host))
+    }
 }
 
 impl<'de> Deserialize<'de> for WorkspaceGitRepositoryName {
@@ -135,14 +141,19 @@ pub struct WorkspaceGitNamedRef(String);
 impl WorkspaceGitNamedRef {
     pub fn parse(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
-        let normalized = if value.starts_with("git:ref:") {
-            value
+        let (normalized, was_bare) = if value.starts_with("git:ref:") {
+            (value, false)
         } else if value.starts_with("git:") {
             return Err("WorkspaceGitNamedRef is invalid".to_owned());
         } else {
-            format!("git:ref:{value}")
+            (format!("git:ref:{value}"), true)
         };
-        if valid_git_ref(&normalized) {
+        if valid_git_ref(&normalized)
+            && (!was_bare
+                || normalized
+                    .strip_prefix("git:ref:")
+                    .is_some_and(valid_bare_workspace_git_ref))
+        {
             Ok(Self(normalized))
         } else {
             Err("WorkspaceGitNamedRef is invalid".to_owned())
@@ -559,15 +570,18 @@ fn valid_git_ref(value: &str) -> bool {
     !reference.is_empty()
         && reference.len() <= 512
         && reference.trim() == reference
-        && reference != "HEAD"
-        && !((7..=40).contains(&reference.len())
-            && reference.bytes().all(|byte| byte.is_ascii_hexdigit()))
         && !reference.starts_with('-')
         && !reference.ends_with('/')
         && !["..", "@{", "\\", " "]
             .iter()
             .any(|forbidden| reference.contains(forbidden))
         && !reference.chars().any(char::is_control)
+}
+
+fn valid_bare_workspace_git_ref(reference: &str) -> bool {
+    reference != "HEAD"
+        && !((7..=40).contains(&reference.len())
+            && reference.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -1764,11 +1778,14 @@ impl DirectTaskBindingEvidence {
         {
             return Err("invocation source differs from its signed source provenance".to_owned());
         }
-        let expected_invocation_repository = format!(
-            "https://github.com/{}.git",
-            self.source_provenance.repository.name.as_str()
-        );
-        if self.invocation.repository.as_str() != expected_invocation_repository {
+        let invocation_repository_name = self
+            .invocation
+            .repository
+            .as_str()
+            .strip_prefix("https://")
+            .and_then(|value| value.split_once('/').map(|(_, path)| path))
+            .and_then(|path| path.strip_suffix(".git"));
+        if invocation_repository_name != Some(self.source_provenance.repository.name.as_str()) {
             return Err(
                 "invocation repository differs from its signed source provenance".to_owned(),
             );

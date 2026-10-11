@@ -694,6 +694,10 @@ impl GitHubSourceAdapter {
 }
 
 impl GitHostingPlane for GitHubSourceAdapter {
+    fn repository_web_origin(&self) -> Option<String> {
+        Some(self.clone_origin.clone())
+    }
+
     fn describe_repositories<'a>(
         &'a self,
         repositories: &'a [GitRepositoryReference],
@@ -1258,6 +1262,12 @@ async fn decode_response<T: DeserializeOwned>(
         return Err(rejected("GitHub API redirects are forbidden"));
     }
     if !status.is_success() {
+        if matches!(
+            status,
+            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+        ) {
+            return Err(failed(operation));
+        }
         if status == StatusCode::NOT_FOUND && matches!(authentication, Authentication::App) {
             return Err(rejected(
                 "GitHub App is not installed on the requested repository",
@@ -2050,6 +2060,25 @@ mod tests {
         assert!(!rendered.contains("fixture-app-assertion"));
         assert!(!rendered.contains("fixture-installation-value"));
         mock.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_throttling_is_retryable() -> Result<(), String> {
+        for status in [403, 429] {
+            let mock = MockGitHub::start(vec![ResponseSpec::status(
+                status,
+                r#"{"message":"rate limited"}"#,
+            )])?;
+            let result = adapter(&mock)?
+                .resolve_repository(&repository_url(REPOSITORY)?)
+                .await;
+            assert!(
+                matches!(result, Err(PortError::Failed { ref reason }) if reason == "resolve GitHub App installation"),
+                "status {status} must be retryable, got {result:?}"
+            );
+            mock.finish()?;
+        }
         Ok(())
     }
 

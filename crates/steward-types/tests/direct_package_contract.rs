@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use steward_types::direct_package::{
-    AgentRef, ContentDigest, Decimal, DirectTaskBindingEvidence, DirectTaskDefinition,
-    DirectTaskStatusResponse, DirectTaskSubmission, Duration, ExactGitCommit, ExecutionLogMode,
-    InstructionSkill, InvocationManifest, PackageClosure, RelativePath, RepositoryUrl,
-    SOURCE_PROVENANCE_JWT_CLAIM, Slug, SourceProvenance, StableProviderId, Uuid,
+    AgentRef, BrowserPackageLocator, ContentDigest, Decimal, DirectTaskBindingEvidence,
+    DirectTaskDefinition, DirectTaskStatusResponse, DirectTaskSubmission, Duration, ExactGitCommit,
+    ExecutionLogMode, InstructionSkill, InvocationManifest, PackageClosure, RelativePath,
+    RepositoryUrl, SOURCE_PROVENANCE_JWT_CLAIM, Slug, SourceProvenance, StableProviderId, Uuid,
     WorkspaceGitNamedRef, WorkspaceGitRepositoryName, WorkspaceName, WorkspacePath,
     canonical_json_bytes,
 };
@@ -292,7 +292,7 @@ fn matches_schema_pattern(pattern: &str, value: &str) -> Result<bool, String> {
                 && !value.starts_with("git:")
                 && WorkspaceGitNamedRef::parse(value).is_ok()
         }
-        "^git:ref:(?!HEAD$)(?![0-9A-Fa-f]{7,40}$)(?!-)(?!.*(?:\\.\\.|\\x40\\{|\\\\|[\\u0000-\\u0020\\u007F]))(?!.*\\/$).+$" => {
+        "^git:ref:(?!-)(?!.*(?:\\.\\.|\\x40\\{|\\\\|[\\u0000-\\u0020\\u007F]))(?!.*\\/$).+$" => {
             value.starts_with("git:ref:") && WorkspaceGitNamedRef::parse(value).is_ok()
         }
         "^\\S(?:.*\\S)?$" => {
@@ -656,6 +656,18 @@ fn task_definition_accepts_named_workspace_repositories_and_refs() -> Result<(),
             "example-org/repository",
             "git:ref:v1.2.3",
         ),
+        (
+            "example-org/repository",
+            "git:ref:HEAD",
+            "example-org/repository",
+            "git:ref:HEAD",
+        ),
+        (
+            "example-org/repository",
+            "git:ref:20261010",
+            "example-org/repository",
+            "git:ref:20261010",
+        ),
     ] {
         let definition = serde_json::json!({
             "schemaVersion": "steward.task-definition/v2",
@@ -685,6 +697,21 @@ fn task_definition_accepts_named_workspace_repositories_and_refs() -> Result<(),
             serialized.pointer("/workspace/0/git/ref"),
             Some(&serde_json::json!(normalized_ref))
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn repository_package_revisions_keep_explicit_git_ref_compatibility() -> Result<(), String> {
+    for revision in ["git:ref:HEAD", "git:ref:1234567", "git:ref:20261010"] {
+        BrowserPackageLocator {
+            source: "https://source.example.test/example-org/package.git".to_owned(),
+            revision: Some(revision.to_owned()),
+            path: RelativePath::parse("catalog/task-definition.json")?,
+            files: None,
+        }
+        .validate()
+        .map_err(|error| format!("previously valid revision {revision} was rejected: {error}"))?;
     }
     Ok(())
 }
@@ -933,10 +960,6 @@ fn binding_evidence_rejects_tampered_source_and_package_relationships() -> Resul
             "/invocation/repository",
             serde_json::json!("https://github.com/example-org/other.git"),
         ),
-        (
-            "/invocation/repository",
-            serde_json::json!("https://git.example.com/example-org/caller.git"),
-        ),
         ("/envelope/revision", serde_json::json!(0)),
     ];
 
@@ -952,6 +975,19 @@ fn binding_evidence_rejects_tampered_source_and_package_relationships() -> Resul
         assert!(tampered.validate().is_err(), "tampering at {pointer}");
     }
     Ok(())
+}
+
+#[test]
+fn binding_evidence_accepts_the_server_selected_source_host() -> Result<(), String> {
+    let evidence: DirectTaskBindingEvidence =
+        parse("fixtures/positive/task-binding-evidence.json")?;
+    let mut value = serde_json::to_value(evidence)
+        .map_err(|error| format!("evidence must serialize: {error}"))?;
+    value["invocation"]["repository"] =
+        serde_json::json!("https://source.example.test/example-org/caller.git");
+    let evidence: DirectTaskBindingEvidence = serde_json::from_value(value)
+        .map_err(|error| format!("alternate-host evidence must parse: {error}"))?;
+    evidence.validate()
 }
 
 #[test]

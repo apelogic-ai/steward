@@ -185,6 +185,8 @@ pub(crate) type DescribedRepositories<'a> = std::pin::Pin<
 >;
 
 trait DirectGitResolver: Send + Sync {
+    fn repository_web_origin(&self) -> Option<String>;
+
     fn describe_repositories<'a>(
         &'a self,
         repositories: &'a [GitRepositoryReference],
@@ -334,6 +336,10 @@ impl<G> DirectGitResolver for G
 where
     G: GitHostingPlane,
 {
+    fn repository_web_origin(&self) -> Option<String> {
+        GitHostingPlane::repository_web_origin(self)
+    }
+
     fn describe_repositories<'a>(
         &'a self,
         repositories: &'a [GitRepositoryReference],
@@ -3151,6 +3157,43 @@ where
     let mut materialized_bytes = scratch_reserved_bytes;
     let mut materialized_files = 0_u64;
     let mut resolution_budget = WorkspaceResolutionBudget::default();
+    let named_repositories = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            WorkspaceEntry::Git(entry) => match &entry.git.repository {
+                WorkspaceGitRepository::Named(name) => Some(name),
+                _ => None,
+            },
+            WorkspaceEntry::Scratch(_) => None,
+        })
+        .collect::<Vec<_>>();
+    for requested in &named_repositories {
+        let git = git.ok_or_else(|| {
+            ApiError::TaskRuntimeContractUnavailable(
+                "workspace_git_source_resolver_unavailable".to_owned(),
+            )
+        })?;
+        validate_named_workspace_repository_origin(config, git.as_ref(), requested)?;
+    }
+    let named_repository_catalog = if named_repositories.is_empty() {
+        None
+    } else {
+        let git = git.ok_or_else(|| {
+            ApiError::TaskRuntimeContractUnavailable(
+                "workspace_git_source_resolver_unavailable".to_owned(),
+            )
+        })?;
+        Some(
+            load_named_workspace_repository_catalog(
+                config,
+                git.as_ref(),
+                context.caller,
+                context.browser,
+                &mut resolution_budget,
+            )
+            .await?,
+        )
+    };
     for entry in entries {
         validate_workspace_policy(&config.workspace_policy, &policy, entry)?;
         let resolved_entry = match entry {
@@ -3160,37 +3203,39 @@ where
                         "workspace_git_source_resolver_unavailable".to_owned(),
                     )
                 })?;
-                let (repository, description, is_self, authorized_by_resolution) =
-                    match &entry.git.repository {
-                        WorkspaceGitRepository::SelfRepository => (
-                            context.self_repository.cloned().ok_or_else(|| {
-                                ApiError::Admission("workspace_git_self_unavailable".to_owned())
-                            })?,
-                            None,
-                            true,
-                            true,
-                        ),
-                        WorkspaceGitRepository::Named(name) => {
-                            let (repository, description) = resolve_named_workspace_repository(
-                                config,
-                                git.as_ref(),
-                                name,
-                                context.caller,
-                                context.browser,
-                            )
-                            .await?;
-                            (repository, Some(description), false, true)
-                        }
-                        WorkspaceGitRepository::Explicit(reference) => {
-                            let reference = GitRepositoryReference {
-                                repository_owner_id: reference.owner_id.clone(),
-                                repository_id: reference.repository_id.clone(),
-                            };
-                            let (repository, description) =
-                                describe_workspace_repository(git.as_ref(), &reference).await?;
-                            (repository, Some(description), false, false)
-                        }
-                    };
+                let (repository, description, is_self, authorized_by_resolution) = match &entry
+                    .git
+                    .repository
+                {
+                    WorkspaceGitRepository::SelfRepository => (
+                        context.self_repository.cloned().ok_or_else(|| {
+                            ApiError::Admission("workspace_git_self_unavailable".to_owned())
+                        })?,
+                        None,
+                        true,
+                        true,
+                    ),
+                    WorkspaceGitRepository::Named(name) => {
+                        let catalog = named_repository_catalog.as_ref().ok_or_else(|| {
+                                ApiError::TaskRuntimeContractUnavailable(
+                                    "Steward could not verify the workspace repository. Retry the request; if it persists, contact a Steward administrator."
+                                        .to_owned(),
+                                )
+                            })?;
+                        let (repository, description) =
+                            resolve_named_workspace_repository(config, name, catalog)?;
+                        (repository, Some(description), false, true)
+                    }
+                    WorkspaceGitRepository::Explicit(reference) => {
+                        let reference = GitRepositoryReference {
+                            repository_owner_id: reference.owner_id.clone(),
+                            repository_id: reference.repository_id.clone(),
+                        };
+                        let (repository, description) =
+                            describe_workspace_repository(git.as_ref(), &reference).await?;
+                        (repository, Some(description), false, false)
+                    }
+                };
                 if !is_self
                     && !authorized_by_resolution
                     && !workspace_repository_is_authorized(
@@ -3562,11 +3607,27 @@ const MAX_GITMODULES_BYTES: u64 = 1024 * 1024;
 
 #[derive(Default)]
 struct WorkspaceResolutionBudget {
+    repository_descriptions: usize,
     submodules: usize,
     tree_reads: usize,
 }
 
 impl WorkspaceResolutionBudget {
+    fn consume_repository_descriptions(&mut self, count: usize) -> Result<(), ApiError> {
+        self.repository_descriptions =
+            self.repository_descriptions
+                .checked_add(count)
+                .ok_or_else(|| {
+                    ApiError::Admission("workspace_git_resolution_limit_exceeded".to_owned())
+                })?;
+        if self.repository_descriptions > MAX_SOURCE_REPOSITORY_BINDINGS {
+            return Err(ApiError::Admission(
+                "workspace_git_resolution_limit_exceeded".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn consume_tree_read(&mut self, policy: &WorkspaceAdmissionPolicy) -> Result<(), ApiError> {
         self.tree_reads = self.tree_reads.checked_add(1).ok_or_else(|| {
             ApiError::Admission("workspace_git_resolution_limit_exceeded".to_owned())
@@ -4802,8 +4863,14 @@ where
             "direct package Git source resolver is unavailable".to_owned(),
         )
     })?;
+    let source_origin = git.repository_web_origin().ok_or_else(|| {
+        ApiError::TaskRuntimeContractUnavailable(
+            "direct package Git source host is unavailable".to_owned(),
+        )
+    })?;
     let invocation_repository = RepositoryUrl::parse(format!(
-        "https://github.com/{}.git",
+        "{}/{}.git",
+        source_origin.trim_end_matches('/'),
         provenance.repository.name.as_str()
     ))
     .map_err(|_| ApiError::TaskAuthentication)?;
@@ -5450,19 +5517,65 @@ fn git_reference(reference: &str) -> Result<String, ApiError> {
     Ok(format!("git:ref:{reference}"))
 }
 
-async fn resolve_named_workspace_repository(
+struct NamedWorkspaceRepositoryCatalog {
+    repositories: Vec<(GitRepositoryIdentity, GitRepositoryDescription)>,
+}
+
+fn validate_named_workspace_repository_origin(
     config: &TaskApiConfig,
     git: &dyn DirectGitResolver,
     requested: &WorkspaceGitRepositoryName,
+) -> Result<(), ApiError> {
+    let Some(requested_host) = requested.web_origin() else {
+        return Ok(());
+    };
+    let configured_origin = git.repository_web_origin().ok_or_else(|| {
+        ApiError::TaskRuntimeContractUnavailable(
+            "Steward could not verify the configured source host. Retry the request; if it persists, contact a Steward administrator."
+                .to_owned(),
+        )
+    })?;
+    let configured_host = configured_origin
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| {
+            ApiError::TaskRuntimeContractUnavailable(
+                "Steward could not verify the configured source host. Retry the request; if it persists, contact a Steward administrator."
+                    .to_owned(),
+            )
+        })?;
+    if requested_host.eq_ignore_ascii_case(configured_host) {
+        return Ok(());
+    }
+    config.report_source_port_failure(
+        "resolve_named_repository",
+        "rejected",
+        "source_host_mismatch",
+    );
+    Err(ApiError::Admission(format!(
+        "Workspace repository links must use the configured source host {configured_host}."
+    )))
+}
+
+async fn load_named_workspace_repository_catalog(
+    config: &TaskApiConfig,
+    git: &dyn DirectGitResolver,
     caller: Option<&TriggerRepository>,
     browser: bool,
-) -> Result<(GitRepositoryIdentity, GitRepositoryDescription), ApiError> {
+    budget: &mut WorkspaceResolutionBudget,
+) -> Result<NamedWorkspaceRepositoryCatalog, ApiError> {
     let references = config.workspace_source_repository_references(caller, browser);
+    budget.consume_repository_descriptions(references.len())?;
     let mut descriptions = git.describe_repositories(&references);
-    let mut unavailable = None;
-    let mut matched = None;
+    let mut repositories = Vec::with_capacity(references.len());
     while let Some((index, result)) = descriptions.next().await {
         let Some(reference) = references.get(index) else {
+            config.report_source_port_failure(
+                "describe_repositories",
+                "failed",
+                "source_metadata_invalid",
+            );
             return Err(ApiError::TaskRuntimeContractUnavailable(
                 "Steward could not verify the workspace repository. Retry the request; if it persists, contact a Steward administrator."
                     .to_owned(),
@@ -5470,63 +5583,95 @@ async fn resolve_named_workspace_repository(
         };
         let description = match result {
             Ok(description) => description,
-            Err(steward_ports::PortError::Rejected { .. }) => continue,
-            Err(error) => {
-                unavailable.get_or_insert(error);
+            Err(steward_ports::PortError::Rejected { .. }) => {
+                config.report_source_port_failure(
+                    "describe_repositories",
+                    "rejected",
+                    "source_rejected",
+                );
                 continue;
+            }
+            Err(error) => {
+                return Err(source_port_error_with_reporter(
+                    config,
+                    "describe_repositories",
+                    error,
+                ));
             }
         };
         if description.repository_owner_id != reference.repository_owner_id
             || description.repository_id != reference.repository_id
         {
+            config.report_source_port_failure(
+                "describe_repositories",
+                "failed",
+                "source_metadata_invalid",
+            );
             return Err(ApiError::TaskRuntimeContractUnavailable(
                 "Steward could not verify the workspace repository. Retry the request; if it persists, contact a Steward administrator."
                     .to_owned(),
             ));
         }
-        let full_name = format!("{}/{}", description.owner, description.name);
-        let name_matches = requested.full_name().eq_ignore_ascii_case(&full_name);
-        let origin_matches = requested
-            .web_url()
-            .is_none_or(|url| url.eq_ignore_ascii_case(&description.web_url));
-        if name_matches && origin_matches {
-            if matched.is_some() {
-                return Err(ApiError::TaskRuntimeContractUnavailable(
-                    "More than one allowed workspace repository matched that name. Ask a Steward administrator to correct the repository list."
+        let repository =
+            RepositoryUrl::parse(format!("{}.git", description.web_url)).map_err(|_| {
+                config.report_source_port_failure(
+                    "describe_repositories",
+                    "failed",
+                    "source_metadata_invalid",
+                );
+                ApiError::TaskRuntimeContractUnavailable(
+                    "Steward could not verify the workspace repository. Retry the request; if it persists, contact a Steward administrator."
                         .to_owned(),
-                ));
-            }
-            let repository =
-                RepositoryUrl::parse(format!("{}.git", description.web_url)).map_err(|_| {
-                    ApiError::TaskRuntimeContractUnavailable(
-                        "Steward could not verify the workspace repository. Retry the request; if it persists, contact a Steward administrator."
-                            .to_owned(),
-                    )
-                })?;
-            matched = Some((
-                GitRepositoryIdentity {
-                    repository,
-                    repository_id: description.repository_id.clone(),
-                    repository_owner_id: description.repository_owner_id.clone(),
-                },
-                description,
-            ));
-        }
-    }
-    if let Some(matched) = matched {
-        return Ok(matched);
-    }
-    if let Some(error) = unavailable {
-        return Err(source_port_error_with_reporter(
-            config,
-            "describe_repositories",
-            error,
+                )
+            })?;
+        repositories.push((
+            GitRepositoryIdentity {
+                repository,
+                repository_id: description.repository_id.clone(),
+                repository_owner_id: description.repository_owner_id.clone(),
+            },
+            description,
         ));
     }
-    Err(ApiError::Admission(
-        "The requested workspace repository is unavailable. Ask a Steward administrator to verify that it is allowed and accessible."
-            .to_owned(),
-    ))
+    Ok(NamedWorkspaceRepositoryCatalog { repositories })
+}
+
+fn resolve_named_workspace_repository(
+    config: &TaskApiConfig,
+    requested: &WorkspaceGitRepositoryName,
+    catalog: &NamedWorkspaceRepositoryCatalog,
+) -> Result<(GitRepositoryIdentity, GitRepositoryDescription), ApiError> {
+    let mut matches = catalog.repositories.iter().filter(|(_, description)| {
+        requested
+            .full_name()
+            .eq_ignore_ascii_case(&format!("{}/{}", description.owner, description.name))
+            && requested
+                .web_url()
+                .is_none_or(|url| url.eq_ignore_ascii_case(&description.web_url))
+    });
+    let Some(matched) = matches.next() else {
+        config.report_source_port_failure(
+            "resolve_named_repository",
+            "rejected",
+            "source_not_bound",
+        );
+        return Err(ApiError::Admission(
+            "The requested workspace repository is unavailable. Ask a Steward administrator to verify that it is allowed and accessible."
+                .to_owned(),
+        ));
+    };
+    if matches.next().is_some() {
+        config.report_source_port_failure(
+            "resolve_named_repository",
+            "failed",
+            "source_binding_ambiguous",
+        );
+        return Err(ApiError::TaskRuntimeContractUnavailable(
+            "More than one allowed workspace repository matched that name. Ask a Steward administrator to correct the repository list."
+                .to_owned(),
+        ));
+    }
+    Ok(matched.clone())
 }
 
 fn source_port_error_with_reporter(
@@ -6186,6 +6331,10 @@ mod workflow_request_tests {
     }
 
     impl DirectGitResolver for OversizedPackResolver {
+        fn repository_web_origin(&self) -> Option<String> {
+            None
+        }
+
         fn describe_repositories<'a>(
             &'a self,
             _repositories: &'a [GitRepositoryReference],

@@ -4092,6 +4092,8 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeDirectGit {
+        source_origin: String,
+        describe_calls: Arc<AtomicUsize>,
         repositories: Arc<BTreeMap<String, GitRepositoryIdentity>>,
         files: Arc<BTreeMap<(String, String, String), Vec<u8>>>,
         trees: Arc<BTreeMap<(String, String), Vec<GitTreeEntry>>>,
@@ -4101,11 +4103,16 @@ mod tests {
     }
 
     impl GitHostingPlane for FakeDirectGit {
+        fn repository_web_origin(&self) -> Option<String> {
+            Some(self.source_origin.clone())
+        }
+
         fn describe_repositories<'a>(
             &'a self,
             repositories: &'a [GitRepositoryReference],
         ) -> impl futures::Stream<Item = (usize, Result<GitRepositoryDescription, PortError>)> + Send + 'a
         {
+            self.describe_calls.fetch_add(1, Ordering::SeqCst);
             futures::stream::iter(repositories.iter().enumerate().map(|(index, reference)| {
                 let resolved = self
                     .repositories
@@ -4259,8 +4266,22 @@ mod tests {
         definition: serde_json::Value,
         wrong_object_path: Option<&str>,
     ) -> Result<FakeDirectGit, String> {
-        let caller = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
-        let source = RepositoryUrl::parse("https://github.com/example-org/agentic-ops.git")?;
+        direct_git_fixture_at_origin(
+            "https://github.com",
+            manifest,
+            definition,
+            wrong_object_path,
+        )
+    }
+
+    fn direct_git_fixture_at_origin(
+        source_origin: &str,
+        manifest: serde_json::Value,
+        definition: serde_json::Value,
+        wrong_object_path: Option<&str>,
+    ) -> Result<FakeDirectGit, String> {
+        let caller = RepositoryUrl::parse(format!("{source_origin}/example-org/caller.git"))?;
+        let source = RepositoryUrl::parse(format!("{source_origin}/example-org/agentic-ops.git"))?;
         let caller_identity = GitRepositoryIdentity {
             repository: caller.clone(),
             repository_id: StableProviderId::parse("123456")?,
@@ -4275,6 +4296,8 @@ mod tests {
         let definition_path = "catalog/release-summary/v1/task-definition.json";
         let prompt_path = "catalog/release-summary/v1/prompt.md";
         Ok(FakeDirectGit {
+            source_origin: source_origin.to_owned(),
+            describe_calls: Arc::new(AtomicUsize::new(0)),
             repositories: Arc::new(BTreeMap::from([
                 (caller.as_str().to_owned(), caller_identity),
                 (source.as_str().to_owned(), source_identity),
@@ -12166,6 +12189,8 @@ mod tests {
             })
             .collect();
         Ok(FakeDirectGit {
+            source_origin: "https://github.com".to_owned(),
+            describe_calls: Arc::new(AtomicUsize::new(0)),
             repositories: Arc::new(BTreeMap::from([(
                 source.as_str().to_owned(),
                 source_identity,
@@ -12353,6 +12378,8 @@ mod tests {
                 }),
         );
         Ok(FakeDirectGit {
+            source_origin: "https://github.com".to_owned(),
+            describe_calls: Arc::new(AtomicUsize::new(0)),
             repositories: Arc::new(BTreeMap::from([(repository.as_str().to_owned(), identity)])),
             files: Arc::new(files),
             trees: Arc::new(BTreeMap::new()),
@@ -13867,6 +13894,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_workspace_uses_the_configured_non_default_source_host() -> Result<(), String> {
+        const SOURCE_ORIGIN: &str = "https://source.example.test";
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut manifest = direct_manifest()?;
+        manifest["package"]["repository"] =
+            serde_json::json!(format!("{SOURCE_ORIGIN}/example-org/agentic-ops.git"));
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([
+            {
+                "git": {
+                    "name": "short-name",
+                    "repository": "example-org/agentic-ops",
+                    "ref": "main"
+                }
+            },
+            {
+                "git": {
+                    "name": "full-link",
+                    "repository": "https://source.example.test/Example-Org/Agentic-Ops.git",
+                    "ref": "main"
+                }
+            }
+        ]);
+        let git = direct_git_fixture_at_origin(SOURCE_ORIGIN, manifest, definition, None)?;
+        let describe_calls = git.describe_calls.clone();
+        let response = task_router(
+            ledger,
+            FakeTaskIdentityResolver,
+            task_api_config()?
+                .with_git_hosting_plane(git)
+                .with_source_repository_bindings_json(Some(&direct_source_bindings_json(
+                    "654321",
+                )))?,
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "non-default-source")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "contractVersion": "steward.task/v2",
+                        "invocationPath": ".steward/tasks/release-summary.json",
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build non-default source request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("submit non-default source request: {error}"))?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(|error| format!("read non-default source response: {error}"))?;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            describe_calls.load(Ordering::SeqCst),
+            1,
+            "all named entries must reuse one admitted-repository catalog"
+        );
+
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut manifest = direct_manifest()?;
+        manifest["package"]["repository"] =
+            serde_json::json!(format!("{SOURCE_ORIGIN}/example-org/agentic-ops.git"));
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "repository": "https://github.com/example-org/agentic-ops",
+                "ref": "main"
+            }
+        }]);
+        let git = direct_git_fixture_at_origin(SOURCE_ORIGIN, manifest, definition, None)?;
+        let failure_lines = Arc::new(Mutex::new(Vec::new()));
+        let captured_failure_lines = failure_lines.clone();
+        let app = task_router(
+            ledger.clone(),
+            FakeTaskIdentityResolver,
+            task_api_config()?
+                .with_failure_reporter(Arc::new(move |line| {
+                    if let Ok(mut lines) = captured_failure_lines.lock() {
+                        lines.push(line.to_owned());
+                    }
+                }))
+                .with_git_hosting_plane(git)
+                .with_source_repository_bindings_json(Some(&direct_source_bindings_json(
+                    "654321",
+                )))?,
+        );
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "non-default-source-wrong-host",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Workspace repository links must use the configured source host source.example.test.",
+        )
+        .await?;
+        assert_eq!(
+            *failure_lines
+                .lock()
+                .map_err(|_| "source failure reporter lock was poisoned")?,
+            vec![
+                "task source operation failed operation=resolve_named_repository category=rejected diagnostic=source_host_mismatch"
+                    .to_owned()
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn direct_workspace_rejects_unadmitted_repository_name_before_reservation()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
@@ -13911,11 +14059,16 @@ mod tests {
     #[tokio::test]
     async fn direct_workspace_reports_unresolved_repository_name_before_reservation()
     -> Result<(), String> {
-        for (idempotency_key, repository) in [
-            ("direct-workspace-unresolved-name", "example-org/missing"),
+        for (idempotency_key, repository, expected_reason) in [
+            (
+                "direct-workspace-unresolved-name",
+                "example-org/missing",
+                "The requested workspace repository is unavailable. Ask a Steward administrator to verify that it is allowed and accessible.",
+            ),
             (
                 "direct-workspace-wrong-source-host",
                 "https://source.example.test/example-org/agentic-ops",
+                "Workspace repository links must use the configured source host github.com.",
             ),
         ] {
             let ledger = versioned_task_ledger()?;
@@ -13943,7 +14096,7 @@ mod tests {
                 app,
                 idempotency_key,
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "The requested workspace repository is unavailable. Ask a Steward administrator to verify that it is allowed and accessible.",
+                expected_reason,
             )
             .await?;
         }
