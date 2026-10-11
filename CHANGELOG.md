@@ -20,6 +20,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- Envelope template and custom-request forms now offer deployment-configured
+  workspace types as checkboxes with an optional total-size limit. Template
+  requests and Envelope details show omitted operational limits from the
+  deployment when available, without rendering missing values. Existing
+  narrower file, history, and submodule limits remain unchanged when those
+  forms are edited.
 - OpenShell Agent Tasks with `diagnostics.executionLog: full` now run in a
   restart-safe, attempt-scoped process group. Steward persists bounded stdout
   and stderr snapshots while the Task runs, refreshes Run detail before the

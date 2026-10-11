@@ -1,5 +1,6 @@
 import type { DirectAdmissionDelta } from "@/api-client";
 import { durationUnit, formatDuration, formatMoney } from "@/components/presentation-values";
+import { formatWorkspaceQuantity } from "@/components/workspace-authority-controls";
 
 export type EnvelopeExceedanceSummaryValue = {
   ceiling: string;
@@ -16,11 +17,11 @@ function workspace(value: DirectAdmissionDelta & { dimension: "workspace" }, sid
   if (!authority) return "Not set";
   return [
     `types ${listOrNone(authority.allowedTypes)}`,
-    `size ${authority.maxTotalSize}`,
-    `files ${authority.maxFiles}`,
-    `history ${authority.maxHistoryDepth}`,
-    `submodules ${authority.maxSubmoduleDepth}`,
-  ].join(" · ");
+    authority.maxTotalSize ? `size ${formatWorkspaceQuantity(authority.maxTotalSize)}` : null,
+    authority.maxFiles === null || authority.maxFiles === undefined ? null : `${authority.maxFiles.toLocaleString("en-US")} files`,
+    authority.maxHistoryDepth === null || authority.maxHistoryDepth === undefined ? null : `${authority.maxHistoryDepth.toLocaleString("en-US")} generations`,
+    authority.maxSubmoduleDepth === null || authority.maxSubmoduleDepth === undefined ? null : `${authority.maxSubmoduleDepth.toLocaleString("en-US")} ${authority.maxSubmoduleDepth === 1 ? "level" : "levels"}`,
+  ].filter((entry): entry is string => entry !== null).join(" · ");
 }
 
 export function envelopeDeltaSummary(delta: DirectAdmissionDelta): EnvelopeExceedanceSummaryValue {

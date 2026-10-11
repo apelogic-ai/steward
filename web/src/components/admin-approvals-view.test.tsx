@@ -245,13 +245,13 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("10Gi");
     expect(html).toContain("Workspace");
     expect(html).toContain("Total size limit");
-    expect(html).toContain("2Gi");
-    expect(html).toContain("1Gi");
+    expect(html).toContain("2 GiB");
+    expect(html).toContain("1 GiB");
     expect(html).toContain("File limit");
-    expect(html).toContain("1000 files");
+    expect(html).toContain("1,000 files");
     expect(html).toContain("500 files");
-    expect(html).toContain("History depth limit");
-    expect(html).toContain("Submodule depth limit");
+    expect(html).toContain("History depth");
+    expect(html).toContain("Submodule depth");
     expect(html).toContain("Template revision");
     expect(html).toContain(">7<");
   });

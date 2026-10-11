@@ -50,6 +50,23 @@ describe("envelope ceiling-exceedance summaries", () => {
     expect(html).toContain("Runner memory: <strong>1Gi</strong> (limit Not set)");
     expect(html).toContain("Runner compute: <strong>1</strong> (limit 500m)");
     expect(html).toContain("Runner storage: <strong>10Gi</strong> (limit 5Gi)");
-    expect(html).toContain("Workspace: <strong>types git · size 1Gi · files 1000 · history 100 · submodules 1</strong> (limit Not set)");
+    expect(html).toContain("Workspace: <strong>types git · size 1 GiB · 1,000 files · 100 generations · 1 level</strong> (limit Not set)");
+  });
+
+  test("renders the two-field workspace shape without absent legacy limits", () => {
+    const delta: DirectAdmissionDelta = {
+      ceiling: { allowedTypes: ["git"], maxTotalSize: "2Gi" },
+      dimension: "workspace",
+      requested: { allowedTypes: ["git"] },
+    };
+
+    const summary = envelopeDeltaSummary(delta);
+
+    expect(summary).toEqual({
+      ceiling: "types git · size 2 GiB",
+      label: "Workspace",
+      requested: "types git",
+    });
+    expect(JSON.stringify(summary)).not.toContain("undefined");
   });
 });

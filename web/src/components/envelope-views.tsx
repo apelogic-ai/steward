@@ -7,6 +7,7 @@ import { useCallback, useRef, useState, type FormEvent } from "react";
 import {
   createRequest,
   getRequest,
+  getUserCapabilities,
   listTemplates,
   myRuns,
   type AvailableEnvelopeTemplate,
@@ -17,7 +18,10 @@ import {
   type EnvelopeTemplatesResponse,
   type GithubActionsWorkflowResponse,
   type MyRunsResponse,
+  type UserCapabilitiesResponse,
   type UserEnvelopeRequest,
+  type WorkspaceAuthority,
+  type WorkspaceDeploymentCapabilities,
 } from "@/api-client";
 import { RunCards } from "@/components/run-views";
 import { DiagnosticDetails, type DiagnosticItem } from "@/components/diagnostic-details";
@@ -25,6 +29,7 @@ import { EnvelopeExceedanceSummary, type EnvelopeExceedanceSummaryValue, envelop
 import { CodeBlock, DataTable, FilterTabs, GrantChipList, Meter, SectionCard, StatStrip, TagSelect, grantKindForAction } from "@/components/hs";
 import { DurationInput, MoneyInput, durationUnit, formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
 import { WorkspaceAuthorityDetails } from "@/components/workspace-authority-details";
+import { WorkspaceAuthorityControls, workspaceAuthorityDraft, workspaceAuthorityFromDraft } from "@/components/workspace-authority-controls";
 import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { loadAllEnvelopeRequests } from "@/data/paginated-api";
@@ -164,17 +169,20 @@ function EnvelopeTable({ names, requests }: Readonly<{ names: ReadonlyMap<string
 }
 
 export function NewEnvelopeView() {
-  const load = useCallback(() => listTemplates({ cache: "no-store", credentials: "same-origin" }), []);
-  const state = useApiResource<EnvelopeTemplatesResponse>(load);
+  const loadTemplates = useCallback(() => listTemplates({ cache: "no-store", credentials: "same-origin" }), []);
+  const loadCapabilities = useCallback(() => getUserCapabilities({ cache: "no-store", credentials: "same-origin" }), []);
+  const state = useApiResource<EnvelopeTemplatesResponse>(loadTemplates);
+  const capabilitiesState = useApiResource<UserCapabilitiesResponse>(loadCapabilities);
+  const workspaceCapabilities = capabilitiesState.status === "ready" ? capabilitiesState.value.workspace : undefined;
   return (
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader description="Pick an existing template and adjust it, or create your own envelope request." title="Request an envelope" />
-      <ResourceBoundary state={state}>{({ templates }) => <EnvelopeRequestForm templates={templates} />}</ResourceBoundary>
+      <ResourceBoundary state={state}>{({ templates }) => <EnvelopeRequestForm templates={templates} workspaceCapabilities={workspaceCapabilities} />}</ResourceBoundary>
     </section>
   );
 }
 
-function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<AvailableEnvelopeTemplate> }>) {
+function EnvelopeRequestForm({ templates, workspaceCapabilities }: Readonly<{ templates: Array<AvailableEnvelopeTemplate>; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
   const searchParams = useSearchParams();
   const requestedTemplate = searchParams.get("template");
   const initialTemplate = templates.find((template) => template.id === requestedTemplate) ?? templates[0];
@@ -190,13 +198,13 @@ function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<Availabl
         </select>
       </label>
       {template
-        ? <TemplateEnvelopeRequestForm key={template.id} onSubmittingChange={setSubmitting} template={template} />
-        : <CustomEnvelopeRequestForm onSubmittingChange={setSubmitting} />}
+        ? <TemplateEnvelopeRequestForm key={template.id} onSubmittingChange={setSubmitting} template={template} workspaceCapabilities={workspaceCapabilities} />
+        : <CustomEnvelopeRequestForm onSubmittingChange={setSubmitting} workspaceCapabilities={workspaceCapabilities} />}
     </div>
   );
 }
 
-function TemplateEnvelopeRequestForm({ onSubmittingChange, template }: Readonly<{ onSubmittingChange: (submitting: boolean) => void; template: AvailableEnvelopeTemplate }>) {
+function TemplateEnvelopeRequestForm({ onSubmittingChange, template, workspaceCapabilities }: Readonly<{ onSubmittingChange: (submitting: boolean) => void; template: AvailableEnvelopeTemplate; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
   const router = useRouter();
   const session = useSession();
   const [budget, setBudget] = useState(template.ceiling.spec.budget.monthlyLimit);
@@ -301,7 +309,8 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template }: Readonly<
         </SectionCard>
         <SectionCard className={models.size === 0 || exceededFields.has("Models") || rejectedFields.includes("llms") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("02", "Models")}><TagSelect aria-invalid={models.size === 0 || undefined} addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" noResultsMessage={(query) => `No models in this template match “${query}”`} onChange={(next) => { setModels(new Set(next)); clearRejectedSubmission(); }} options={modelOptions} value={[...models]} />{models.size === 0 ? <p className="mt-2 text-sm text-err" role="alert">Select at least one model.</p> : null}</SectionCard>
         <SectionCard className={exceededFields.has("Tools") || rejectedFields.includes("tools") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("03", "Tools")}><TagSelect addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search GitHub tools…" label="Tools" noResultsMessage={(query) => `No tools in this template match “${query}”`} onChange={(next) => { setTools(new Set(next)); clearRejectedSubmission(); }} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools allowed by the template are offered.</p></SectionCard>
-        <SectionCard title={stepTitle("04", "Request note")}><label className="grid gap-2 text-sm font-semibold">Justification (optional)<textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); clearRejectedSubmission(); }} placeholder="Explain why these limits or capabilities are needed." value={justification} /></label></SectionCard>
+        <SectionCard title={stepTitle("04", "Workspace access")}><WorkspaceAuthorityDetails deployment={workspaceCapabilities} workspace={template.ceiling.spec.workspace} /></SectionCard>
+        <SectionCard title={stepTitle("05", "Request note")}><label className="grid gap-2 text-sm font-semibold">Justification (optional)<textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); clearRejectedSubmission(); }} placeholder="Explain why these limits or capabilities are needed." value={justification} /></label></SectionCard>
       </div>
       <SectionCard className="sticky top-7 flex-[1_1_280px] lg:max-w-[380px]" title="Summary">
         <dl className="space-y-3 text-sm">{summary.map(([label, value]) => <div className={`flex justify-between gap-4 ${exceededFields.has(label) ? "text-warn" : ""}`} key={label}><dt className={exceededFields.has(label) ? undefined : "text-muted-ink"}>{label}</dt><dd className="text-right font-medium">{value}</dd></div>)}</dl>
@@ -333,22 +342,48 @@ function parseCustomEnvelope(value: string): BrowserEnvelope | null {
   return parsed as BrowserEnvelope;
 }
 
-function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmittingChange: (submitting: boolean) => void }>) {
+export function withWorkspaceAuthority(envelope: BrowserEnvelope, workspace: WorkspaceAuthority | undefined): BrowserEnvelope {
+  const spec = { ...envelope.spec };
+  delete spec.workspace;
+  return { ...envelope, spec: { ...spec, ...(workspace ? { workspace } : {}) } };
+}
+
+function CustomEnvelopeRequestForm({ onSubmittingChange, workspaceCapabilities }: Readonly<{ onSubmittingChange: (submitting: boolean) => void; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
   const router = useRouter();
   const session = useSession();
   const [envelopeJson, setEnvelopeJson] = useState("");
+  const [workspaceDraft, setWorkspaceDraft] = useState(() => workspaceAuthorityDraft());
   const [justification, setJustification] = useState("");
-  const [submission, setSubmission] = useState<"idle" | "submitting" | "invalid" | MutationFailureState>("idle");
+  const [submission, setSubmission] = useState<"idle" | "submitting" | "invalid" | "invalid-workspace" | MutationFailureState>("idle");
   const [diagnostics, setDiagnostics] = useState<DiagnosticItem[]>([]);
   const idempotencyKey = useRef<string | null>(null);
+  const attemptEnvelope = useRef<BrowserEnvelope | null>(null);
+
+  function resetAttempt() {
+    idempotencyKey.current = null;
+    attemptEnvelope.current = null;
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (session.status !== "authenticated") return;
-    const requestedEnvelope = parseCustomEnvelope(envelopeJson);
+    let requestedEnvelope = attemptEnvelope.current;
     if (!requestedEnvelope) {
-      setSubmission("invalid");
-      return;
+      const parsedEnvelope = parseCustomEnvelope(envelopeJson);
+      if (!parsedEnvelope) {
+        setSubmission("invalid");
+        return;
+      }
+      requestedEnvelope = parsedEnvelope;
+      if (workspaceCapabilities) {
+        const workspace = workspaceAuthorityFromDraft(workspaceDraft, workspaceCapabilities.enabledTypes);
+        if (workspace === null) {
+          setSubmission("invalid-workspace");
+          return;
+        }
+        requestedEnvelope = withWorkspaceAuthority(parsedEnvelope, workspace);
+      }
+      attemptEnvelope.current = requestedEnvelope;
     }
     setSubmission("submitting");
     onSubmittingChange(true);
@@ -372,8 +407,12 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
     onSubmittingChange(false);
   }
 
+  const workspace = workspaceCapabilities ? workspaceAuthorityFromDraft(workspaceDraft, workspaceCapabilities.enabledTypes) : undefined;
+  const workspaceError = workspace === null ? "Enter a positive whole-number total size, or leave it blank." : undefined;
   const failure = submission === "invalid"
     ? "Enter a complete envelope JSON object with its revision, limits, models, tools, and time-to-live limit."
+    : submission === "invalid-workspace"
+      ? workspaceError
     : submission !== "idle" && submission !== "submitting"
       ? {
           conflict: "An equivalent envelope request already exists. Reload before retrying.",
@@ -394,34 +433,43 @@ function CustomEnvelopeRequestForm({ onSubmittingChange }: Readonly<{ onSubmitti
         <textarea
           className="min-h-80 rounded-md border bg-canvas p-4 font-mono text-xs font-normal"
           disabled={submission === "submitting"}
-          onChange={(event) => { setEnvelopeJson(event.target.value); idempotencyKey.current = null; setSubmission("idle"); setDiagnostics([]); }}
+          onChange={(event) => { const next = event.target.value; setEnvelopeJson(next); const parsed = parseCustomEnvelope(next); if (parsed) setWorkspaceDraft(workspaceAuthorityDraft(parsed.spec.workspace, workspaceCapabilities?.enabledTypes)); resetAttempt(); setSubmission("idle"); setDiagnostics([]); }}
           placeholder="Paste envelope JSON."
           required
           spellCheck={false}
           value={envelopeJson}
         />
       </label>
+      <section className="space-y-3 rounded-control border p-4" aria-labelledby="custom-workspace-title">
+        <div><h3 className="font-semibold" id="custom-workspace-title">Workspace access</h3><p className="mt-1 text-sm text-muted-ink">These controls update workspace types and total size. Existing file, history, and submodule limits are preserved.</p></div>
+        {workspaceCapabilities
+          ? <WorkspaceAuthorityControls deployment={workspaceCapabilities} disabled={submission === "submitting"} draft={workspaceDraft} error={workspaceError} onChange={(next) => { setWorkspaceDraft(next); resetAttempt(); setSubmission("idle"); setDiagnostics([]); }} />
+          : <p className="text-sm text-muted-ink">Workspace controls are unavailable. Any workspace access in the envelope JSON will be preserved.</p>}
+      </section>
       <label className="grid gap-2 text-sm font-semibold">Justification (optional)
-        <textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); idempotencyKey.current = null; setSubmission("idle"); }} placeholder="Explain why this envelope is needed." value={justification} />
+        <textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); resetAttempt(); setSubmission("idle"); }} placeholder="Explain why this envelope is needed." value={justification} />
       </label>
       {failure ? <p className="text-sm text-red-800" role="alert">{failure}</p> : null}
       <DiagnosticDetails items={diagnostics} />
-      <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
+      <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting" || Boolean(workspaceError)} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
     </form>
   );
 }
 
 export function EnvelopeDetailView({ requestId }: Readonly<{ requestId: string }>) {
-  const load = useCallback(() => getRequest({ cache: "no-store", credentials: "same-origin", path: { request_id: requestId } }), [requestId]);
-  const state = useApiResource<EnvelopeRequestResponse>(load);
+  const loadRequest = useCallback(() => getRequest({ cache: "no-store", credentials: "same-origin", path: { request_id: requestId } }), [requestId]);
+  const loadCapabilities = useCallback(() => getUserCapabilities({ cache: "no-store", credentials: "same-origin" }), []);
+  const state = useApiResource<EnvelopeRequestResponse>(loadRequest);
+  const capabilitiesState = useApiResource<UserCapabilitiesResponse>(loadCapabilities);
+  const workspaceCapabilities = capabilitiesState.status === "ready" ? capabilitiesState.value.workspace : undefined;
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <ResourceBoundary state={state}>{({ request }) => <EnvelopeDetail request={request} />}</ResourceBoundary>
+      <ResourceBoundary state={state}>{({ request }) => <EnvelopeDetail request={request} workspaceCapabilities={workspaceCapabilities} />}</ResourceBoundary>
     </section>
   );
 }
 
-function EnvelopeDetail({ request }: Readonly<{ request: UserEnvelopeRequest }>) {
+function EnvelopeDetail({ request, workspaceCapabilities }: Readonly<{ request: UserEnvelopeRequest; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
   const envelope = request.approvedEnvelope ?? request.requestedEnvelope;
   const usage = request.usage?.spend;
   return (
@@ -452,7 +500,7 @@ function EnvelopeDetail({ request }: Readonly<{ request: UserEnvelopeRequest }>)
           <div className="space-y-5">
             <div><p className="mb-2 text-xs font-semibold text-muted-ink">Models</p><GrantChipList grants={envelope.spec.llms.map((model) => ({ kind: "model", name: `${model.provider}/${model.model}` }))} /></div>
             <div><p className="mb-2 text-xs font-semibold text-muted-ink">Tools</p><GrantChipList grants={envelope.spec.tools.map((tool) => ({ kind: grantKindForAction(tool.action), name: `${tool.provider}:${tool.resource}:${tool.action}` }))} /></div>
-            <div><p className="mb-2 text-xs font-semibold text-muted-ink">Workspace</p><WorkspaceAuthorityDetails workspace={envelope.spec.workspace} /></div>
+            <div><p className="mb-2 text-xs font-semibold text-muted-ink">Workspace</p><WorkspaceAuthorityDetails deployment={workspaceCapabilities} workspace={envelope.spec.workspace} /></div>
           </div>
         </SectionCard>
         <SectionCard title="History">
