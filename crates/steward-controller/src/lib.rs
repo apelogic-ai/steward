@@ -779,7 +779,7 @@ const TASK_OPERATION_ANNOTATION: &str = "agents.apelogic.ai/orchestration-id";
 const TASK_MANIFEST_DIGEST_ANNOTATION: &str = "agents.apelogic.ai/manifest-digest";
 const TASK_RUNTIME_MODE_ANNOTATION: &str = "agents.apelogic.ai/runtime-mode";
 const TASK_ORCHESTRATOR_ACTOR: &str = "task-orchestrator";
-const TASK_CONTROLLER_POLL_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const TASK_CONTROLLER_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const MAX_CONCURRENT_TASK_RECONCILES: usize = 32;
 
 #[derive(Debug)]
