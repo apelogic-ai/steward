@@ -2223,6 +2223,10 @@ mod tests {
                 content.to_owned(),
             )])),
             diagnostics: Default::default(),
+            requested_diagnostics: None,
+            requested_requirements: None,
+            effective_requirements: None,
+            requested_workspace: Vec::new(),
             workspace: None,
             prompt_source: PromptSourceKind::Inline,
         };

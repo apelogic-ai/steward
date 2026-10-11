@@ -629,6 +629,14 @@ pub struct BrowserTaskEvidence {
     #[serde(default)]
     pub diagnostics: DiagnosticsRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_diagnostics: Option<DiagnosticsRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_requirements: Option<DirectRequirements>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_requirements: Option<DirectRequirements>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_workspace: Vec<WorkspaceEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceEvidence>,
     #[serde(default, skip_serializing_if = "PromptSourceKind::is_path")]
     pub prompt_source: PromptSourceKind,
@@ -658,6 +666,26 @@ impl BrowserTaskEvidence {
             .ok_or_else(|| "browser package closure is missing".to_owned())?;
         closure.validate()?;
         validate_prompt_source(self.prompt_source, closure)?;
+        if let Some(requirements) = &self.requested_requirements {
+            requirements.validate()?;
+        }
+        if let Some(requirements) = &self.effective_requirements {
+            requirements.validate()?;
+        }
+        if self
+            .requested_diagnostics
+            .is_some_and(|requested| requested != self.diagnostics)
+        {
+            return Err("requested and effective Task diagnostics differ".to_owned());
+        }
+        if self.requested_workspace.len() > 32 {
+            return Err(
+                "Task evidence must record at most 32 requested workspace entries".to_owned(),
+            );
+        }
+        for entry in &self.requested_workspace {
+            entry.validate()?;
+        }
         if let Some(workspace) = &self.workspace {
             workspace.validate()?;
         }
@@ -1437,6 +1465,8 @@ pub struct AuthorityRequirements {
     pub llms: Vec<ModelRequirement>,
     pub tools: Vec<ToolRequirement>,
     pub budget: BudgetRequirement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_minutes_limit: Option<Decimal>,
     pub ttl: Duration,
     pub runner: RunnerRequirement,
 }
@@ -1747,8 +1777,14 @@ pub struct DirectTaskBindingEvidence {
     pub closure: PackageClosure,
     pub closure_digest: ContentDigest,
     pub envelope: EnvelopeEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_requirements: Option<DirectRequirements>,
     pub effective_requirements: DirectRequirements,
     pub diagnostics: DiagnosticsRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_diagnostics: Option<DiagnosticsRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_workspace: Vec<WorkspaceEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceEvidence>,
     #[serde(default, skip_serializing_if = "PromptSourceKind::is_path")]
@@ -1765,10 +1801,27 @@ impl DirectTaskBindingEvidence {
         self.source_provenance.validate()?;
         self.closure.validate()?;
         validate_prompt_source(self.prompt_source, &self.closure)?;
+        if self.requested_workspace.len() > 32 {
+            return Err(
+                "Task evidence must record at most 32 requested workspace entries".to_owned(),
+            );
+        }
+        for entry in &self.requested_workspace {
+            entry.validate()?;
+        }
         if let Some(workspace) = &self.workspace {
             workspace.validate()?;
         }
+        if let Some(requirements) = &self.requested_requirements {
+            requirements.validate()?;
+        }
         self.effective_requirements.validate()?;
+        if self
+            .requested_diagnostics
+            .is_some_and(|requested| requested != self.diagnostics)
+        {
+            return Err("requested and effective Task diagnostics differ".to_owned());
+        }
         if self.envelope.revision == 0 {
             return Err("Envelope evidence revision must be positive".to_owned());
         }
@@ -1840,6 +1893,8 @@ fn repository_url_origin(repository: &RepositoryUrl) -> Option<&str> {
 pub struct WorkspaceEvidence {
     pub entries: Vec<ResolvedWorkspaceEntry>,
     pub max_materialized_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_history_depth: Option<u32>,
     pub workspace_digest: ContentDigest,
 }
 
@@ -1856,6 +1911,22 @@ impl WorkspaceEvidence {
         {
             return Err("workspace materialized-byte limit must be positive".to_owned());
         }
+        if self.max_history_depth == Some(0)
+            || (self.max_history_depth.is_none()
+                && self.entries.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        ResolvedWorkspaceEntry::Git {
+                            history: WorkspaceGitHistory::Full,
+                            ..
+                        }
+                    )
+                }))
+        {
+            return Err(
+                "workspace full-history evidence requires a positive depth limit".to_owned(),
+            );
+        }
         let mut names = BTreeSet::new();
         for entry in &self.entries {
             entry.validate()?;
@@ -1866,10 +1937,14 @@ impl WorkspaceEvidence {
                 ));
             }
         }
-        let digest = Sha256::digest(canonical_json_bytes(&serde_json::json!({
+        let mut digest_value = serde_json::json!({
             "entries": &self.entries,
             "maxMaterializedBytes": self.max_materialized_bytes,
-        }))?);
+        });
+        if let Some(max_history_depth) = self.max_history_depth {
+            digest_value["maxHistoryDepth"] = serde_json::json!(max_history_depth);
+        }
+        let digest = Sha256::digest(canonical_json_bytes(&digest_value)?);
         if self.workspace_digest.as_str() != format!("steward:sha256:{digest:x}") {
             return Err("workspace digest does not match its resolved entries".to_owned());
         }

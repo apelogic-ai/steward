@@ -141,9 +141,13 @@ fn append_pack_bytes(target: &mut Vec<u8>, bytes: &[u8], max_bytes: u64) -> Resu
     let next = target
         .len()
         .checked_add(bytes.len())
-        .ok_or_else(|| rejected("Git pack exceeds the requested byte bound"))?;
+        .ok_or(PortError::LimitExceeded {
+            resource: "Git pack bytes",
+        })?;
     if next as u64 > max_bytes {
-        return Err(rejected("Git pack exceeds the requested byte bound"));
+        return Err(PortError::LimitExceeded {
+            resource: "Git pack bytes",
+        });
     }
     target.extend_from_slice(bytes);
     Ok(())
@@ -840,7 +844,18 @@ impl GitHostingPlane for GitHubSourceAdapter {
             .max_bytes
             .checked_add(GIT_UPLOAD_PACK_OVERHEAD_BYTES)
             .ok_or_else(|| rejected("Git pack bounds are invalid"))?;
-        let response = read_bounded(response, response_bound, "read exact Git pack").await?;
+        let response = read_bounded(response, response_bound, "read exact Git pack")
+            .await
+            .map_err(|error| match error {
+                PortError::Rejected { ref reason }
+                    if reason == "GitHub response exceeds the configured byte bound" =>
+                {
+                    PortError::LimitExceeded {
+                        resource: "Git pack bytes",
+                    }
+                }
+                error => error,
+            })?;
         let (bytes, shallow) = decode_upload_pack_result(&response, request.max_bytes)?;
         self.revalidate_repository(&coordinates, &authorized)
             .await?;

@@ -243,6 +243,7 @@ export type AuthorityRequirements = {
     budget: BudgetRequirement;
     llms: Array<ModelRequirement>;
     runner: RunnerRequirement;
+    runtimeMinutesLimit?: null | Decimal;
     tools: Array<ToolRequirement>;
     ttl: Duration;
 };
@@ -694,11 +695,15 @@ export type BrowserTaskEvidence = {
     closure?: null | PackageClosure;
     closureDigest: ContentDigest;
     diagnostics?: DiagnosticsRequest;
+    effectiveRequirements?: null | DirectRequirements;
     inlineFiles?: {
         [key: string]: unknown;
     } | null;
     path: RelativePath;
     promptSource?: PromptSourceKind;
+    requestedDiagnostics?: null | DiagnosticsRequest;
+    requestedRequirements?: null | DirectRequirements;
+    requestedWorkspace?: Array<WorkspaceEntry>;
     revision: string;
     source: string;
     workspace?: null | WorkspaceEvidence;
@@ -983,6 +988,9 @@ export type DirectTaskBindingEvidence = {
     invocationKind?: InvocationKind;
     package: ResolvedSource;
     promptSource?: PromptSourceKind;
+    requestedDiagnostics?: null | DiagnosticsRequest;
+    requestedRequirements?: null | DirectRequirements;
+    requestedWorkspace?: Array<WorkspaceEntry>;
     schemaVersion: string;
     sourceProvenance: SourceProvenance;
     taskUid: Uuid;
@@ -1885,6 +1893,7 @@ export type WorkspaceEntryType = 'git' | 'scratch';
 
 export type WorkspaceEvidence = {
     entries: Array<ResolvedWorkspaceEntry>;
+    maxHistoryDepth?: number | null;
     maxMaterializedBytes: number;
     workspaceDigest: ContentDigest;
 };

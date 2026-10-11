@@ -67,6 +67,29 @@
     "revision": 3,
     "digest": "steward:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
   },
+  "requestedRequirements": {
+    "authority": {
+      "llms": [
+        { "provider": "litellm", "model": "review-model" }
+      ],
+      "tools": [
+        { "provider": "github", "resource": "actions", "action": "read" }
+      ],
+      "budget": {
+        "monthlyLimit": "50.00",
+        "singleRunLimit": null,
+        "currency": "USD"
+      },
+      "runtimeMinutesLimit": "30",
+      "ttl": "1h",
+      "runner": {
+        "platforms": ["linux"],
+        "memory": null,
+        "compute": null,
+        "storage": null
+      }
+    }
+  },
   "effectiveRequirements": {
     "authority": {
       "llms": [
@@ -80,6 +103,7 @@
         "singleRunLimit": null,
         "currency": "USD"
       },
+      "runtimeMinutesLimit": "30",
       "ttl": "1h",
       "runner": {
         "platforms": ["linux"],
@@ -90,6 +114,9 @@
     }
   },
   "diagnostics": {
+    "executionLog": "full"
+  },
+  "requestedDiagnostics": {
     "executionLog": "full"
   }
 }

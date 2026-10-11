@@ -663,6 +663,16 @@ fn evaluate_envelope_spec(
     }
 }
 
+/// Compare a Task's complete authority request with its effective Envelope ceiling.
+/// Unlike [`evaluate`], this includes authority dimensions that are not represented on
+/// `AgentRuntimeSpec`, such as the cumulative runtime-minutes limit and workspace authority.
+pub fn evaluate_authority_request(
+    request: &EnvelopeSpec,
+    envelope: &Envelope,
+) -> Result<AdmissionDecision, AdmissionError> {
+    evaluate_envelope_spec(request, envelope)
+}
+
 fn workspace_authority_summary(authority: &WorkspaceAuthority) -> String {
     let types = authority
         .allowed_types
@@ -1160,8 +1170,38 @@ mod tests {
 
     use super::{
         AdmissionDecision, AdmissionDelta, AdmissionError, Envelope, EnvelopeSpec,
-        add_budget_amount, envelope_is_within, evaluate, evaluate_with_grants, validate_envelope,
+        add_budget_amount, envelope_is_within, evaluate, evaluate_authority_request,
+        evaluate_with_grants, validate_envelope,
     };
+
+    fn assert_request_relation(
+        label: &str,
+        below: EnvelopeSpec,
+        equal: EnvelopeSpec,
+        above: EnvelopeSpec,
+        ceiling: &Envelope,
+    ) -> Result<(), String> {
+        assert_eq!(
+            evaluate_authority_request(&below, ceiling)
+                .map_err(|error| format!("evaluate {label} below ceiling: {error:?}"))?,
+            AdmissionDecision::Admit,
+            "{label} below the ceiling must be admitted"
+        );
+        assert_eq!(
+            evaluate_authority_request(&equal, ceiling)
+                .map_err(|error| format!("evaluate {label} at ceiling: {error:?}"))?,
+            AdmissionDecision::Admit,
+            "{label} at the ceiling must be admitted"
+        );
+        assert!(
+            matches!(
+                evaluate_authority_request(&above, ceiling),
+                Ok(AdmissionDecision::Reject { .. })
+            ),
+            "{label} above the ceiling must be rejected"
+        );
+        Ok(())
+    }
 
     #[test]
     fn malformed_envelopes_are_rejected_before_they_become_authority() {
@@ -1283,6 +1323,215 @@ mod tests {
             AdmissionDecision::Reject { deltas }
                 if matches!(deltas.as_slice(), [AdmissionDelta::Workspace { .. }])
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_task_authority_dimension_uses_request_at_or_below_ceiling() -> Result<(), String> {
+        let first_model = ModelRef {
+            provider: "provider-a".to_owned(),
+            model: "model-a".to_owned(),
+        };
+        let second_model = ModelRef {
+            provider: "provider-b".to_owned(),
+            model: "model-b".to_owned(),
+        };
+        let outside_model = ModelRef {
+            provider: "provider-c".to_owned(),
+            model: "model-c".to_owned(),
+        };
+        let first_tool = ToolGrant {
+            provider: "tool-a".to_owned(),
+            resource: "issues".to_owned(),
+            action: "read".to_owned(),
+        };
+        let second_tool = ToolGrant {
+            provider: "tool-b".to_owned(),
+            resource: "pull-requests".to_owned(),
+            action: "read".to_owned(),
+        };
+        let outside_tool = ToolGrant {
+            provider: "tool-c".to_owned(),
+            resource: "releases".to_owned(),
+            action: "write".to_owned(),
+        };
+        let ceiling = Envelope {
+            revision: 1,
+            spec: EnvelopeSpec {
+                llms: vec![first_model.clone(), second_model.clone()],
+                tools: vec![first_tool.clone(), second_tool.clone()],
+                budget: budget_with_single_run_limit("100.00", "10.00"),
+                runtime_minutes_limit: Some("60".to_owned()),
+                ttl: Duration("2h".to_owned()),
+                runner: RunnerRequirements {
+                    platforms: vec![RunnerPlatform::Linux, RunnerPlatform::Mac],
+                    memory: Some(KubernetesQuantity("4Gi".to_owned())),
+                    compute: Some(KubernetesQuantity("2000m".to_owned())),
+                    storage: Some(KubernetesQuantity("20Gi".to_owned())),
+                },
+                workspace: Some(workspace_authority(
+                    vec![WorkspaceEntryType::Git, WorkspaceEntryType::Scratch],
+                    "4Gi",
+                    100,
+                    20,
+                    2,
+                )?),
+            },
+        };
+
+        let mut below = ceiling.spec.clone();
+        below.llms = vec![first_model];
+        let equal = ceiling.spec.clone();
+        let mut above = equal.clone();
+        above.llms.push(outside_model);
+        assert_request_relation("models", below, equal, above, &ceiling)?;
+
+        let mut below = ceiling.spec.clone();
+        below.tools = vec![first_tool];
+        let equal = ceiling.spec.clone();
+        let mut above = equal.clone();
+        above.tools.push(outside_tool);
+        assert_request_relation("tools", below, equal, above, &ceiling)?;
+
+        for (label, below_value, equal_value, above_value, apply) in [
+            ("monthly budget", "50.00", "100.00", "101.00", 0_u8),
+            ("single-run budget", "5.00", "10.00", "11.00", 1_u8),
+            ("runtime minutes", "30", "60", "61", 2_u8),
+        ] {
+            let mut below = ceiling.spec.clone();
+            let mut equal = ceiling.spec.clone();
+            let mut above = ceiling.spec.clone();
+            match apply {
+                0 => {
+                    below.budget.monthly_limit = below_value.to_owned();
+                    equal.budget.monthly_limit = equal_value.to_owned();
+                    above.budget.monthly_limit = above_value.to_owned();
+                }
+                1 => {
+                    below.budget.single_run_limit = Some(below_value.to_owned());
+                    equal.budget.single_run_limit = Some(equal_value.to_owned());
+                    above.budget.single_run_limit = Some(above_value.to_owned());
+                }
+                _ => {
+                    below.runtime_minutes_limit = Some(below_value.to_owned());
+                    equal.runtime_minutes_limit = Some(equal_value.to_owned());
+                    above.runtime_minutes_limit = Some(above_value.to_owned());
+                }
+            }
+            assert_request_relation(label, below, equal, above, &ceiling)?;
+        }
+
+        let mut below = ceiling.spec.clone();
+        below.ttl = Duration("1h".to_owned());
+        let equal = ceiling.spec.clone();
+        let mut above = equal.clone();
+        above.ttl = Duration("3h".to_owned());
+        assert_request_relation("TTL", below, equal, above, &ceiling)?;
+
+        let mut below = ceiling.spec.clone();
+        below.runner.platforms = vec![RunnerPlatform::Linux];
+        let equal = ceiling.spec.clone();
+        let mut above = equal.clone();
+        above.runner.platforms.push(RunnerPlatform::Windows);
+        assert_request_relation("runner platforms", below, equal, above, &ceiling)?;
+
+        for (label, below_value, equal_value, above_value, resource) in [
+            ("runner memory", "2Gi", "4Gi", "5Gi", 0_u8),
+            ("runner compute", "1000m", "2000m", "2001m", 1_u8),
+            ("runner storage", "10Gi", "20Gi", "21Gi", 2_u8),
+        ] {
+            let mut below = ceiling.spec.clone();
+            let mut equal = ceiling.spec.clone();
+            let mut above = ceiling.spec.clone();
+            let below_value = Some(KubernetesQuantity(below_value.to_owned()));
+            let equal_value = Some(KubernetesQuantity(equal_value.to_owned()));
+            let above_value = Some(KubernetesQuantity(above_value.to_owned()));
+            match resource {
+                0 => {
+                    below.runner.memory = below_value;
+                    equal.runner.memory = equal_value;
+                    above.runner.memory = above_value;
+                }
+                1 => {
+                    below.runner.compute = below_value;
+                    equal.runner.compute = equal_value;
+                    above.runner.compute = above_value;
+                }
+                _ => {
+                    below.runner.storage = below_value;
+                    equal.runner.storage = equal_value;
+                    above.runner.storage = above_value;
+                }
+            }
+            assert_request_relation(label, below, equal, above, &ceiling)?;
+        }
+
+        let mut type_ceiling = ceiling.clone();
+        type_ceiling.spec.workspace = Some(workspace_authority(
+            vec![WorkspaceEntryType::Git],
+            "4Gi",
+            100,
+            20,
+            2,
+        )?);
+        let mut no_workspace = type_ceiling.spec.clone();
+        no_workspace.workspace = None;
+        let equal_type = type_ceiling.spec.clone();
+        let mut outside_type = equal_type.clone();
+        outside_type.workspace = Some(workspace_authority(
+            vec![WorkspaceEntryType::Git, WorkspaceEntryType::Scratch],
+            "4Gi",
+            100,
+            20,
+            2,
+        )?);
+        assert_request_relation(
+            "workspace entry types",
+            no_workspace,
+            equal_type,
+            outside_type,
+            &type_ceiling,
+        )?;
+
+        let mut below_workspace = ceiling.spec.clone();
+        below_workspace.workspace = Some(workspace_authority(
+            vec![WorkspaceEntryType::Git],
+            "2Gi",
+            50,
+            10,
+            1,
+        )?);
+        assert_eq!(
+            evaluate_authority_request(&below_workspace, &ceiling)
+                .map_err(|error| format!("evaluate workspace below ceiling: {error:?}"))?,
+            AdmissionDecision::Admit
+        );
+        assert_eq!(
+            evaluate_authority_request(&ceiling.spec, &ceiling)
+                .map_err(|error| format!("evaluate workspace at ceiling: {error:?}"))?,
+            AdmissionDecision::Admit
+        );
+        for dimension in ["size", "files", "history depth", "submodule depth"] {
+            let mut above = ceiling.spec.clone();
+            let workspace = above
+                .workspace
+                .as_mut()
+                .ok_or_else(|| "workspace ceiling must exist".to_owned())?;
+            match dimension {
+                "size" => workspace.max_total_size = ResourceQuantity::parse("5Gi")?,
+                "files" => workspace.max_files = 101,
+                "history depth" => workspace.max_history_depth = 21,
+                _ => workspace.max_submodule_depth = 3,
+            }
+            assert!(
+                matches!(
+                    evaluate_authority_request(&above, &ceiling),
+                    Ok(AdmissionDecision::Reject { .. })
+                ),
+                "workspace {dimension} above the ceiling must be rejected"
+            );
+        }
+
         Ok(())
     }
 

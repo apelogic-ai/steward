@@ -554,6 +554,12 @@ fn positive_wire_fixtures_parse_and_validate() -> Result<(), String> {
     let evidence: DirectTaskBindingEvidence =
         parse("fixtures/positive/task-binding-evidence.json")?;
     evidence.validate()?;
+    assert_eq!(
+        evidence.requested_diagnostics,
+        Some(evidence.diagnostics),
+        "execution-log mode has no separate ceiling and must be enforced as requested"
+    );
+    assert!(evidence.requested_requirements.is_some());
     let evidence_json = serde_json::to_value(&evidence)
         .map_err(|error| format!("evidence must serialize: {error}"))?;
     for path in [
@@ -614,6 +620,28 @@ fn task_definition_accepts_typed_workspace_entries() -> Result<(), String> {
             "repositoryId": "2000001"
         })),
         "the existing stable-ID wire form must remain byte-shape compatible"
+    );
+    Ok(())
+}
+
+#[test]
+fn task_definition_accepts_a_runtime_minutes_request() -> Result<(), String> {
+    let mut definition = parse_value("fixtures/positive/task-definition-with-requires.json")?;
+    definition["requires"]["authority"]["runtimeMinutesLimit"] = serde_json::json!("30");
+    let schema = parse_value("schemas/direct-package.schema.json")?;
+    let definition_schema = schema
+        .pointer("/$defs/taskDefinition")
+        .ok_or_else(|| "TaskDefinition schema must exist".to_owned())?;
+    validate_schema_instance(&schema, definition_schema, &definition, "$task")?;
+
+    let definition: DirectTaskDefinition = serde_json::from_value(definition)
+        .map_err(|error| format!("runtime-minutes TaskDefinition must parse: {error}"))?;
+    definition.validate()?;
+    let serialized = serde_json::to_value(definition)
+        .map_err(|error| format!("runtime-minutes TaskDefinition must serialize: {error}"))?;
+    assert_eq!(
+        serialized.pointer("/requires/authority/runtimeMinutesLimit"),
+        Some(&serde_json::json!("30"))
     );
     Ok(())
 }
@@ -815,9 +843,23 @@ fn binding_evidence_records_resolved_workspace_identity_and_digest() -> Result<(
         "maxMaterializedBytes": max_materialized_bytes,
         "workspaceDigest": workspace_digest
     });
+    evidence["requestedWorkspace"] = serde_json::json!([
+        { "scratch": { "name": "scratch", "size": "1Gi" } }
+    ]);
     let evidence: DirectTaskBindingEvidence = serde_json::from_value(evidence)
         .map_err(|error| format!("workspace evidence must parse: {error}"))?;
-    evidence.validate()
+    evidence.validate()?;
+    let evidence = serde_json::to_value(evidence)
+        .map_err(|error| format!("workspace evidence must serialize: {error}"))?;
+    assert_eq!(
+        evidence.pointer("/requestedWorkspace/0/scratch/size"),
+        Some(&serde_json::json!("1Gi"))
+    );
+    assert_eq!(
+        evidence.pointer("/workspace/entries/1/size"),
+        Some(&serde_json::json!("2Gi"))
+    );
+    Ok(())
 }
 
 #[test]

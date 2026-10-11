@@ -228,10 +228,12 @@ fn make_workspace_archive(
     let digest = Sha256::digest(canonical_json_bytes(&serde_json::json!({
         "entries": &entries,
         "maxMaterializedBytes": max_materialized_bytes,
+        "maxHistoryDepth": 2,
     }))?);
     let evidence = WorkspaceEvidence {
         entries,
         max_materialized_bytes,
+        max_history_depth: Some(2),
         workspace_digest: ContentDigest::parse(format!("steward:sha256:{digest:x}"))?,
     };
     evidence.validate()?;

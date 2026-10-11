@@ -13288,6 +13288,14 @@ mod tests {
                 .ok_or_else(|| "initial browser Task was not reserved".to_owned())?;
             task.input_archive = None;
             task.execute_requested = false;
+            let evidence = task
+                .browser_task_evidence
+                .as_mut()
+                .ok_or_else(|| "initial browser Task omitted its evidence".to_owned())?;
+            evidence.requested_diagnostics = None;
+            evidence.requested_requirements = None;
+            evidence.effective_requirements = None;
+            evidence.requested_workspace.clear();
         }
 
         let recovered = app
@@ -14569,7 +14577,7 @@ mod tests {
             app,
             "direct-workspace-tree-over-cap",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "workspace_limit_exceeded",
+            "workspace materialized file count 2 exceeds the effective ceiling 1",
         )
         .await
     }
@@ -14606,7 +14614,7 @@ mod tests {
             app,
             "direct-workspace-envelope-type",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "workspace_entry_type_not_allowed",
+            "workspace type git is not allowed; effective choices: none",
         )
         .await
     }
@@ -14651,7 +14659,7 @@ mod tests {
             app,
             "direct-workspace-envelope-cap",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "workspace_limit_exceeded",
+            "history depth 5 exceeds the effective ceiling 4",
         )
         .await
     }
@@ -14821,7 +14829,7 @@ mod tests {
             app,
             "direct-over-authority",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "exceed the resolved Envelope",
+            "envelope exceeded: budget.monthlyLimit requested 50.00 USD, ceiling 25.00 USD",
         )
         .await
     }
@@ -15285,6 +15293,201 @@ mod tests {
                 .len(),
             1
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_package_retry_accepts_pre_upgrade_evidence() -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "direct-pre-upgrade-retry")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "contractVersion": "steward.task/v2",
+                        "invocationPath": ".steward/tasks/release-summary.json",
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build direct-package retry: {error}"))
+        };
+
+        let first = app
+            .clone()
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("submit initial direct package: {error}"))?;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        {
+            let mut tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            let evidence = tasks
+                .first_mut()
+                .and_then(|task| task.direct_task_evidence.as_mut())
+                .ok_or_else(|| "initial direct Task omitted its evidence".to_owned())?;
+            evidence.requested_requirements = None;
+            evidence.requested_diagnostics = None;
+            evidence.requested_workspace.clear();
+            evidence
+                .effective_requirements
+                .authority
+                .runtime_minutes_limit = None;
+        }
+
+        let retry = app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("retry direct package with historical evidence: {error}"))?;
+        assert_eq!(
+            retry.status(),
+            StatusCode::OK,
+            "a retry must accept evidence persisted before requested/effective fields existed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_git_workspace_retry_accepts_pre_upgrade_evidence() -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {"history": {"depth": 1}, "access": "copy"}
+        }]);
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "direct-git-pre-upgrade-retry")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "contractVersion": "steward.task/v2",
+                        "invocationPath": ".steward/tasks/release-summary.json",
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build direct Git retry: {error}"))
+        };
+
+        let first = app
+            .clone()
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("submit initial direct Git package: {error}"))?;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        {
+            let mut tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            let evidence = tasks
+                .first_mut()
+                .and_then(|task| task.direct_task_evidence.as_mut())
+                .ok_or_else(|| "initial direct Git Task omitted its evidence".to_owned())?;
+            let workspace = evidence
+                .workspace
+                .as_ref()
+                .ok_or_else(|| "initial direct Git Task omitted workspace evidence".to_owned())?;
+            assert_eq!(workspace.max_history_depth, None);
+            evidence.requested_requirements = None;
+            evidence.requested_diagnostics = None;
+            evidence.requested_workspace.clear();
+            evidence
+                .effective_requirements
+                .authority
+                .runtime_minutes_limit = None;
+        }
+
+        let retry = app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("retry direct Git package: {error}"))?;
+        assert_eq!(retry.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_scratch_workspace_retry_accepts_pre_upgrade_quantity() -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "scratch": {"size": "2048Mi"}
+        }]);
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer github-assertion")
+                .header("idempotency-key", "direct-scratch-pre-upgrade-retry")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "contractVersion": "steward.task/v2",
+                        "invocationPath": ".steward/tasks/release-summary.json",
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build direct scratch retry: {error}"))
+        };
+
+        let first = app
+            .clone()
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("submit initial direct scratch package: {error}"))?;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        {
+            let mut tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            let evidence = tasks
+                .first_mut()
+                .and_then(|task| task.direct_task_evidence.as_mut())
+                .ok_or_else(|| "initial direct scratch Task omitted its evidence".to_owned())?;
+            let workspace = evidence.workspace.as_ref().ok_or_else(|| {
+                "initial direct scratch Task omitted workspace evidence".to_owned()
+            })?;
+            assert_eq!(workspace.max_history_depth, None);
+            assert!(matches!(
+                workspace.entries.first(),
+                Some(steward_types::direct_package::ResolvedWorkspaceEntry::Scratch { size, .. })
+                    if size.as_str() == "2048Mi"
+            ));
+            evidence.requested_requirements = None;
+            evidence.requested_diagnostics = None;
+            evidence.requested_workspace.clear();
+            evidence
+                .effective_requirements
+                .authority
+                .runtime_minutes_limit = None;
+        }
+
+        let retry = app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("retry direct scratch package: {error}"))?;
+        assert_eq!(retry.status(), StatusCode::OK);
         Ok(())
     }
 
