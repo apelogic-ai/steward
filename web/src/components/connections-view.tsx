@@ -45,11 +45,11 @@ export function ConnectionsView() {
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader description="Accounts your agents act through. HyperShell holds the credentials; agents never see them." title="Connections" />
       <div className="space-y-3">
-        <div className="flex items-center justify-between gap-4"><div><h2 className="text-lg font-semibold">Tools / MCP servers</h2><p className="text-sm text-muted-ink">Authorize tool providers used by governed agents.</p></div><button className="h-10 rounded-control bg-brand px-4 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-40" disabled={!canAdd} type="button">+ Add connection</button></div>
+        <div className="flex items-center justify-between gap-4"><div><h2 className="text-lg font-semibold">Tools / MCP servers</h2><p className="text-sm text-muted-ink">Connect the tools your tasks can use.</p></div><button className="h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-40" disabled={!canAdd} type="button">+ Add connection</button></div>
         {state.status === "ready" ? state.value.connections.map((connection) => <ProviderConnection connection={connection} key={connection.provider} refresh={() => setGeneration((value) => value + 1)} />) : <ProviderConnection metadataState={state.status} refresh={() => setGeneration((value) => value + 1)} />}
       </div>
       <div className="space-y-3">
-        <div><h2 className="text-lg font-semibold">Inference / LLMs</h2><p className="text-sm text-muted-ink">Configure how governed agents authenticate to the inference gateway.</p></div>
+        <div><h2 className="text-lg font-semibold">Models</h2><p className="text-sm text-muted-ink">Manage the API key used by tasks that call a model.</p></div>
         <InferenceConnectionCard state={inferenceState} refresh={() => setGeneration((value) => value + 1)} />
       </div>
     </section>
@@ -112,19 +112,19 @@ function InferenceConnectionCard({ state, refresh }: Readonly<{
   }
 
   if (state.status !== "ready") {
-    return <SectionCard actions={<StatusBadge value={state.status === "loading" ? "Checking" : "Unavailable"} />} title="Inference gateway"><p className="text-sm text-muted-ink">Inference connection metadata is not currently available.</p></SectionCard>;
+    return <SectionCard actions={<StatusBadge value={state.status === "loading" ? "Checking" : "Unavailable"} />} title="Models"><p className="text-sm text-muted-ink">Model connection details are not currently available.</p></SectionCard>;
   }
   const credential = value?.credential;
   if (value?.mode === "stock") {
-    return <SectionCard actions={<StatusBadge value="Administrator managed" />} title="Inference gateway"><div className="space-y-4"><p className="text-sm text-muted-ink">Inference credentials are managed by your Steward administrator. No personal API key is required.</p>{credential ? <><p className="text-sm">A managed-mode key saved {new Date(credential.savedAt).toLocaleString()} remains stored · key ending in <span className="font-mono">{credential.lastFour}</span></p><button className="h-10 rounded-control border border-err px-4 text-sm font-semibold text-err" onClick={() => setRemoving(true)} type="button">Remove stored API key…</button><ConfirmationDialog cancelLabel="Keep key" confirmLabel="Remove API key" description="This removes Steward's encrypted copy. It does not revoke or delete the key at the upstream inference service." onConfirm={() => void remove()} onOpenChange={setRemoving} open={removing} pending={action === "working"} title="Remove stored inference API key?" /></> : null}{action === "error" ? <p className="text-sm text-err" role="alert">The inference key operation failed. Retry the removal.</p> : null}</div></SectionCard>;
+    return <SectionCard actions={<StatusBadge value="Administrator managed" />} title="Models"><div className="space-y-4"><p className="text-sm text-muted-ink">API keys are managed by your Steward administrator. No personal API key is required.</p>{credential ? <><p className="text-sm">A saved key from {new Date(credential.savedAt).toLocaleString()} remains stored · key ending in <span className="font-mono">{credential.lastFour}</span></p><button className="h-10 rounded-control border border-err px-4 text-sm font-semibold text-err" onClick={() => setRemoving(true)} type="button">Remove stored API key…</button><ConfirmationDialog cancelLabel="Keep key" confirmLabel="Remove API key" description="This removes Steward's encrypted copy. It does not revoke or delete the key at the model provider." onConfirm={() => void remove()} onOpenChange={setRemoving} open={removing} pending={action === "working"} title="Remove stored model API key?" /></> : null}{action === "error" ? <p className="text-sm text-err" role="alert">The API key could not be removed. Try again.</p> : null}</div></SectionCard>;
   }
   return (
-    <SectionCard actions={<StatusBadge value={credential ? "Configured" : "Key required"} />} title="Inference gateway">
+    <SectionCard actions={<StatusBadge value={credential ? "Configured" : "Key required"} />} title="Models">
       <div className="space-y-4">
-        {credential ? <p className="text-sm">Saved {new Date(credential.savedAt).toLocaleString()} · key ending in <span className="font-mono">{credential.lastFour}</span></p> : <p className="text-sm text-muted-ink">Add your inference gateway API key before starting a task that uses a model. Browser and GitHub Actions runs admitted as you use this same saved key.</p>}
+        {credential ? <p className="text-sm">Saved {new Date(credential.savedAt).toLocaleString()} · key ending in <span className="font-mono">{credential.lastFour}</span></p> : <p className="text-sm text-muted-ink">Add your model API key before starting a task that uses a model. Runs started here or from GitHub Actions use this key.</p>}
         {editing ? <div className="space-y-3"><label className="block text-sm font-semibold" htmlFor="inference-api-key">Inference API key</label><input autoComplete="off" className="h-10 w-full max-w-xl rounded-control border bg-panel px-3 font-mono text-sm" id="inference-api-key" onChange={(event) => setKey(event.target.value)} type="password" value={key} /><div className="flex gap-2"><button className="h-10 rounded-control bg-brand px-4 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working" || key.length < 4} onClick={() => void save()} type="button">Save API key</button><button className="h-10 rounded-control border px-4 text-sm font-semibold" disabled={action === "working"} onClick={() => { setKey(""); setEditing(false); setAction("idle"); }} type="button">Cancel</button></div></div> : <div className="flex gap-2"><button className="h-10 rounded-control bg-brand px-4 text-sm font-semibold text-on-brand" onClick={() => setEditing(true)} type="button">{credential ? "Replace API key" : "Add API key"}</button>{credential ? <button className="h-10 rounded-control border border-err px-4 text-sm font-semibold text-err" onClick={() => setRemoving(true)} type="button">Remove API key…</button> : null}</div>}
-        {action === "error" ? <p className="text-sm text-err" role="alert">The inference key operation failed. Check the key and retry.</p> : null}
-        <ConfirmationDialog cancelLabel="Keep key" confirmLabel="Remove API key" description="This removes Steward's encrypted copy and blocks new model tasks. It does not revoke or delete the key at the upstream inference service." onConfirm={() => void remove()} onOpenChange={setRemoving} open={removing} pending={action === "working"} title="Remove inference API key?" />
+        {action === "error" ? <p className="text-sm text-err" role="alert">The API key could not be saved. Check the key and try again.</p> : null}
+        <ConfirmationDialog cancelLabel="Keep key" confirmLabel="Remove API key" description="This removes Steward's encrypted copy and blocks new model tasks. It does not revoke or delete the key at the model provider." onConfirm={() => void remove()} onOpenChange={setRemoving} open={removing} pending={action === "working"} title="Remove model API key?" />
       </div>
     </SectionCard>
   );
@@ -275,12 +275,12 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
 
   const footer = status?.phase === "connected" ? (
     <div className="flex flex-wrap items-center justify-between gap-4">
-      <p className="max-w-2xl text-[13px] text-muted-ink">Disconnecting revokes this connection for every current and future runtime using your identity.</p>
+      <p className="max-w-2xl text-[13px] text-muted-ink">Disconnecting removes GitHub access from every current and future run using your account.</p>
       <div className="flex gap-2">
         <button className="h-9 rounded-control border bg-panel px-3 text-sm font-semibold disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">Reconnect</button>
         <button className="h-9 rounded-control border border-err px-3 text-sm font-semibold text-err hover:bg-err-soft" onClick={() => setDisconnectOpen(true)} type="button">Disconnect…</button>
       </div>
-      <ConfirmationDialog cancelLabel="Keep connection" confirmLabel="Disconnect GitHub" description="This revokes the shared connection for every current and future runtime using your identity." onConfirm={() => void disconnect()} onOpenChange={setDisconnectOpen} open={disconnectOpen} pending={action === "working"} title={`Disconnect ${connection?.displayName ?? "GitHub"}?`} />
+      <ConfirmationDialog cancelLabel="Keep connection" confirmLabel="Disconnect GitHub" description="This removes GitHub access from every current and future run using your account." onConfirm={() => void disconnect()} onOpenChange={setDisconnectOpen} open={disconnectOpen} pending={action === "working"} title={`Disconnect ${connection?.displayName ?? "GitHub"}?`} />
     </div>
   ) : null;
 
@@ -293,7 +293,7 @@ function ProviderConnection({ connection, metadataState = "ready", refresh }: Re
         <dl className="grid gap-3 text-sm sm:grid-cols-2"><div><dt className="text-xs font-semibold text-muted-ink">Active credential expires</dt><dd className="mt-1">{status?.activeCredentialExpiresAt ?? "Not reported"}</dd></div><div><dt className="text-xs font-semibold text-muted-ink">Renewal credential expires</dt><dd className="mt-1">{status?.renewalCredentialExpiresAt ?? "Not reported"}</dd></div></dl>
         {!status ? <p className="text-sm text-muted-ink">Connection metadata is not currently available. Authorization can still be started safely.</p> : null}
         {status?.phase === "connected" ? reauthorizationRecommended ? <button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">Re-authorize GitHub</button> : null : <button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">{!status ? "Authorize / re-authorize GitHub" : status.phase === "reauth_required" || status.phase === "unavailable" ? "Re-authorize GitHub" : "Connect GitHub"}</button>}
-        {action !== "idle" && action !== "working" ? <p className="text-sm text-err" role="alert">{action !== "orchestration-not-active" && startFailure ? connectionFailureMessage(startFailure) : { "orchestration-not-active": "Connections are disabled until task orchestration is active (stage 2).", "oauth-pending": "Finish or wait for the pending GitHub authorization before disconnecting.", "poll-expired": "The connection operation did not finish in time. Retry it; if it continues, contact an administrator.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "The connection action was rejected.", forbidden: "You are not allowed to manage this connection.", unavailable: "Connections are unavailable. Try again.", error: "The connection action could not be completed." }[action]}</p> : null}
+        {action !== "idle" && action !== "working" ? <div className="text-sm text-err" role="alert"><p>{action !== "orchestration-not-active" && startFailure ? connectionFailureMessage(startFailure) : { "orchestration-not-active": "Connections are disabled until task runs are enabled for this installation.", "oauth-pending": "Finish or wait for the pending GitHub authorization before disconnecting.", "poll-expired": "The connection operation did not finish in time. Retry it; if it continues, contact an administrator.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "The connection action was rejected.", forbidden: "You are not allowed to manage this connection.", unavailable: "Connections are unavailable. Try again.", error: "The connection action could not be completed." }[action]}</p>{action !== "orchestration-not-active" && startFailure ? <details className="mt-1 text-xs"><summary className="cursor-pointer">Details</summary><dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-2"><dt>Category</dt><dd><code>{startFailure.error}</code></dd>{startFailure.code ? <><dt>Code</dt><dd><code>{startFailure.code}</code></dd></> : null}</dl></details> : null}</div> : null}
       </div>
     </SectionCard>
   );
@@ -328,25 +328,25 @@ function connectionOperationError(value: unknown): ConnectionOperationErrorRespo
 
 function connectionFailureMessage(failure: ConnectionOperationErrorResponse): string {
   if (failure.code === "oauth_redirect_target_not_allowed") {
-    return "MCP-GW rejected Steward's OAuth return origin. Add Steward's exact public origin to MCP-GW githubWrapper.oauth.redirectAfterAllowedOrigins.";
+    return "GitHub couldn't return to this page. Ask an administrator to check the connection's return address.";
   }
   const messages: Record<string, string> = {
-    runtime_authentication_failed: "The governed runtime could not authenticate to GitHub. Re-authorize GitHub; if it continues, ask an administrator to verify runtime credential injection.",
-    proxy_policy_denied: "OpenShell policy denied the governed GitHub request. Ask an administrator to verify the runtime's GitHub proxy policy.",
-    provider_authorization_failed: "MCP-GW rejected the governed runtime's authority. Ask an administrator to verify the runtime authority and MCP-GW configuration.",
-    token_grant_failed: "The governed runtime could not receive its GitHub credential. Retry once; if it continues, ask an administrator to inspect MCP-GW token grants.",
-    provider_response_invalid: "The provider returned a response Steward could not validate. Ask an administrator to verify the MCP-GW connection contract.",
-    gateway_transport_failed: "The governed runtime could not reach MCP-GW. Ask an administrator to verify the gateway route and transport health.",
-    gateway_status_invalid: "An older connection bridge reported an unexpected successful MCP-GW response. Ask an administrator to verify the deployed Steward and MCP-GW versions.",
-    gateway_body_unavailable: "The governed runtime could not read MCP-GW's response body. Retry once; if it continues, ask an administrator to inspect gateway health.",
-    gateway_unavailable: "MCP-GW is unavailable. Retry once; if it continues, ask an administrator to inspect the gateway service.",
-    gateway_session_failed: "The governed runtime could not establish an MCP session with MCP-GW. Retry once; if it continues, ask an administrator to verify the bridge's MCP-GW origin and the gateway's session support.",
-    runtime_create_failed: "The governed connection runtime could not be created. Ask an administrator to inspect Steward runtime admission and controller events.",
-    runtime_start_failed: "The governed connection runtime failed to start. Ask an administrator to inspect the AgentRuntime and OpenShell sandbox status.",
-    connection_deadline_exceeded: "The governed connection did not become ready before its deadline. Retry once; if it continues, ask an administrator to inspect runtime health.",
-    bridge_result_too_large: "The governed connection returned a result larger than Steward accepts for this operation. Ask an administrator to inspect the connection operation's failure category.",
+    runtime_authentication_failed: "GitHub couldn't verify this connection. Re-authorize GitHub. If it continues, ask an administrator to check the connection.",
+    proxy_policy_denied: "This GitHub request isn't allowed by the current connection settings. Ask an administrator to review them.",
+    provider_authorization_failed: "This connection doesn't permit the requested action. Ask an administrator to review its access.",
+    token_grant_failed: "GitHub access couldn't be prepared. Retry once. If it continues, ask an administrator to check the connection.",
+    provider_response_invalid: "GitHub returned an unexpected response. Retry once. If it continues, ask an administrator to check the connection.",
+    gateway_transport_failed: "Steward couldn't reach GitHub. Retry once. If it continues, ask an administrator to check the connection.",
+    gateway_status_invalid: "The connection returned an unexpected result. Ask an administrator to check the installed connection services.",
+    gateway_body_unavailable: "Steward couldn't read GitHub's response. Retry once. If it continues, ask an administrator to check the connection.",
+    gateway_unavailable: "GitHub connections are temporarily unavailable. Retry once. If it continues, ask an administrator to check the connection.",
+    gateway_session_failed: "The GitHub connection couldn't be started. Retry once. If it continues, ask an administrator to check the connection.",
+    runtime_create_failed: "The temporary GitHub connection couldn't be created. Retry once. If it continues, ask an administrator to check the connection.",
+    runtime_start_failed: "The temporary GitHub connection couldn't start. Retry once. If it continues, ask an administrator to check the connection.",
+    connection_deadline_exceeded: "The GitHub connection did not become ready in time. Retry once. If it continues, ask an administrator to check the connection.",
+    bridge_result_too_large: "GitHub returned more data than this operation can process. Narrow the request and try again.",
   };
   const actionable = messages[failure.error];
   if (actionable) return actionable;
-  return `GitHub authorization failed (${failure.error})${failure.detail ? `: ${failure.detail}` : "."}`;
+  return "GitHub authorization couldn't be completed. Retry once. If it continues, ask an administrator to check the connection.";
 }

@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BrowserRunView, WorkspaceEvidence } from "@/api-client";
 
-import { inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards, WorkspaceEvidencePanel } from "./run-views";
+import { cancelFailureMessage, inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards, WorkspaceEvidencePanel } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -102,6 +102,8 @@ test("run details show pinned Git and skipped submodule workspace evidence", () 
   expect(html).toContain("depth 25");
   expect(html).toContain("vendor/optional");
   expect(html).toContain("repository_not_admitted");
+  expect(html).toContain("<summary");
+  expect(html).toContain("Details");
 });
 
 test("managed inference failures direct the user to replace the saved key", () => {
@@ -156,7 +158,7 @@ describe("GitHub reruns", () => {
 
     expect(outcome).toEqual({ failure: "orchestration-not-active" });
     expect(rerunFailureMessage("orchestration-not-active"))
-      .toBe("Re-run is disabled until task orchestration is active (stage 2).");
+      .toBe("Re-run is disabled until task runs are enabled for this installation.");
   });
 
   test("directs a rerun with no managed key to Connections", async () => {
@@ -170,7 +172,7 @@ describe("GitHub reruns", () => {
 
     expect(outcome).toEqual({ failure: "inference-key-missing" });
     expect(rerunFailureMessage("inference-key-missing"))
-      .toContain("Add an inference API key in Connections");
+      .toContain("Add a model API key in Connections");
   });
 
   test("bounds server-controlled retry delays and times out as unavailable", async () => {
@@ -183,5 +185,11 @@ describe("GitHub reruns", () => {
 
     expect(outcome).toEqual({ failure: "unavailable" });
     expect(waits).toEqual([5_000]);
+  });
+
+  test("uses plain action messages without exposing failure state codes", () => {
+    expect(rerunFailureMessage("conflict")).toBe("This run changed before it could be started again. Reload and try again.");
+    expect(rerunFailureMessage("oauth-pending")).toBe("Finish the pending GitHub authorization, then retry the run.");
+    expect(cancelFailureMessage("unavailable")).toBe("HyperShell couldn't cancel the run. Try again in a moment.");
   });
 });

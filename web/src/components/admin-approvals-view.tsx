@@ -24,6 +24,7 @@ import {
 import { DataTable, FilterChips, GrantChipList, Meter, SectionCard, grantKindForAction } from "@/components/hs";
 import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
 import { EnvelopeExceedanceSummary, envelopeDeltaSummary } from "@/components/envelope-exceedance-summary";
+import { DurationInput, MoneyInput, formatDuration, formatMoney } from "@/components/presentation-values";
 import { DefinitionList, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -43,7 +44,7 @@ function actionMessage(status: Exclude<UnifiedRequestActionState, "idle" | "fili
     rejected: "The approval evidence or expiry is invalid.",
     forbidden: "You are not allowed to make this change.",
     unavailable: "Approvals are unavailable. Try again.",
-    error: "The approval response could not be accepted.",
+    error: "The approval could not be saved. Try again.",
   }[status];
 }
 
@@ -52,11 +53,12 @@ function envelopeAuthorityItems(spec: BrowserEnvelopeSpec): [string, string][] {
   return [
     ["Models", spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") || "None"],
     ["Tools", spec.tools.map((tool) => `${tool.provider}/${tool.resource}:${tool.action}`).join(", ") || "None"],
-    ["Monthly limit", `${spec.budget.monthlyLimit} ${spec.budget.currency}`],
+    ["Monthly limit", formatMoney(spec.budget.monthlyLimit, spec.budget.currency)],
     ["Limit per run", spec.budget.singleRunLimit
-      ? `${spec.budget.singleRunLimit} ${spec.budget.currency}`
+      ? formatMoney(spec.budget.singleRunLimit, spec.budget.currency)
       : "Unbounded"],
-    ["TTL", spec.ttl],
+    ["Time-to-live limit", formatDuration(spec.ttl)],
+    ["Runtime limit per month", spec.runtimeMinutesLimit ? formatDuration(spec.runtimeMinutesLimit, "minutes") : "Unbounded"],
     ["Runner platforms", runner?.platforms?.join(", ") || "None"],
     ["Runner memory", runner?.memory ?? "Not set"],
     ["Runner compute", runner?.compute ?? "Not set"],
@@ -100,10 +102,15 @@ function requestReason(request: AdminRequestView): string {
 }
 
 function triggerLabel(request: AdminRequestView): [string, string] {
-  if (request.kind === "ceiling_exceeded") return ["Above ceiling", request.deltas.map((delta) => `${delta.dimension} ${deltaValue(delta.requested)} > ${deltaValue(delta.ceiling)}`).join(" · ")];
+  if (request.kind === "ceiling_exceeded") return ["Above ceiling", request.deltas.map((delta) => {
+    const summary = envelopeDeltaSummary(delta);
+    return `${summary.label}: ${summary.requested} > ${summary.ceiling}`;
+  }).join(" · ")];
   if (request.kind === "cumulative_exhausted") {
     const meter = request.escalation?.meters[0];
-    return ["Cumulative limit reached", meter ? `${meter.used} / ${meter.limit} ${meter.unit}` : "Limit exhausted"];
+    return ["Cumulative limit reached", meter ? meter.dimension === "llm_spend"
+      ? `${formatMoney(meter.used, meter.unit)} / ${formatMoney(meter.limit, meter.unit)}`
+      : `${formatDuration(meter.used, "minutes")} / ${formatDuration(meter.limit, "minutes")}` : "Limit exhausted"];
   }
   if (request.kind === "within_ceiling") return ["Within ceiling", "Fits the template ceiling"];
   return ["Custom request", "No governing template"];
@@ -111,11 +118,11 @@ function triggerLabel(request: AdminRequestView): [string, string] {
 
 function requestAge(createdAt: string): string {
   const seconds = Math.max(0, Math.round((Date.now() - new Date(createdAt).valueOf()) / 1000));
-  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 60) return formatDuration(`${seconds}s`);
   const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 60) return formatDuration(`${minutes}m`);
   const hours = Math.round(minutes / 60);
-  return hours < 24 ? `${hours}h` : `${Math.round(hours / 24)}d`;
+  return hours < 24 ? formatDuration(`${hours}h`) : formatDuration(`${Math.round(hours / 24)}d`);
 }
 
 function RequestTable({ requests }: Readonly<{ requests: Array<AdminRequestView> }>) {
@@ -145,8 +152,8 @@ function deltaLabel(dimension: AdminRequestView["deltas"][number]["dimension"]):
   return {
     budget: "Monthly limit",
     singleRunBudget: "Limit per run",
-    runtimeMinutes: "Runtime minutes",
-    ttl: "TTL",
+    runtimeMinutes: "Runtime limit per month",
+    ttl: "Time-to-live limit",
     models: "Models",
     tools: "Tools",
     runnerPlatforms: "Platforms",
@@ -164,20 +171,30 @@ function deltaSide(delta: AdminRequestView["deltas"][number], side: "ceiling" | 
   if (delta.dimension === "tools") {
     return <GrantChipList grants={delta[side].map((tool) => ({ kind: grantKindForAction(tool.action), name: `${tool.resource}:${tool.action}` }))} />;
   }
+  if (delta.dimension === "budget" || delta.dimension === "singleRunBudget") {
+    const value = delta[side];
+    return <span className="font-mono text-sm">{value === null || value === undefined ? "Not set" : formatMoney(value, delta.currency)}</span>;
+  }
+  if (delta.dimension === "runtimeMinutes") {
+    const value = delta[side];
+    return <span className="font-mono text-sm">{value === null || value === undefined ? "Not set" : formatDuration(value, "minutes")}</span>;
+  }
+  if (delta.dimension === "ttl") return <span className="font-mono text-sm">{formatDuration(delta[side])}</span>;
   const value = delta[side];
-  const suffix = "currency" in delta ? ` ${delta.currency}` : delta.dimension === "runtimeMinutes" ? " minutes" : "";
-  return <span className="font-mono text-sm">{deltaValue(value)}{value === null || value === undefined ? "" : suffix}</span>;
+  return <span className="font-mono text-sm">{deltaValue(value)}</span>;
 }
 
 function numericDelta(delta: AdminRequestView["deltas"][number]): string | null {
   if (!(delta.dimension === "budget" || delta.dimension === "singleRunBudget" || delta.dimension === "runtimeMinutes")) return null;
   if (delta.requested === null || delta.requested === undefined) return null;
   const difference = Number(delta.requested) - Number(delta.ceiling);
-  return Number.isFinite(difference) && difference > 0 ? `+${difference.toFixed(2).replace(/\.00$/, "")}` : null;
+  if (!Number.isFinite(difference) || difference <= 0) return null;
+  if ("currency" in delta) return `+${formatMoney(difference, delta.currency)}`;
+  return `+${formatDuration(String(difference), "minutes")}`;
 }
 
 function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>) {
-  if (request.kind === "custom" && request.requestedEnvelope) return <SectionCard title="Requested authority"><DefinitionList items={envelopeAuthorityItems(request.requestedEnvelope.spec)} /><p className="mt-4 rounded-control bg-notice p-4 text-sm">This custom request has no governing template and always requires administrator approval.</p></SectionCard>;
+  if (request.kind === "custom" && request.requestedEnvelope) return <SectionCard title="Requested access"><DefinitionList items={envelopeAuthorityItems(request.requestedEnvelope.spec)} /><p className="mt-4 rounded-control bg-notice p-4 text-sm">This custom request has no governing template and always requires administrator approval.</p></SectionCard>;
   if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">This request is within the template ceiling but above its automatic approval limit.</p>;
   return (
     <SectionCard title="Requested vs template ceiling">
@@ -195,7 +212,7 @@ function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>)
 }
 
 function RequestHistory({ request }: Readonly<{ request: AdminRequestView }>) {
-  return <SectionCard title="History"><ol className="space-y-4">{request.history.map((event, index) => <li className="relative ps-5" key={`${event.at}-${index}`}><span aria-hidden="true" className={`absolute start-0 top-1 size-2.5 rounded-full border-2 ${event.state === "rejected" || event.state === "expired" ? "border-err" : event.state === "approved" || event.state === "auto_approved" ? "border-ok" : "border-faint-ink"}`} /><p className="text-sm font-semibold">{event.state.replaceAll("_", " ")}</p><p className="mt-0.5 text-[13px] text-muted-ink">by {event.actor} · {new Date(event.at).toLocaleString()}{event.reason ? ` · “${event.reason}”` : ""}</p></li>)}</ol></SectionCard>;
+  return <SectionCard title="History"><ol className="space-y-4">{request.history.map((event, index) => <li className="relative ps-5" key={`${event.at}-${index}`}><span aria-hidden="true" className={`absolute start-0 top-1 size-2.5 rounded-full border-2 ${event.state === "rejected" || event.state === "expired" ? "border-err" : event.state === "approved" || event.state === "auto_approved" ? "border-ok" : "border-faint-ink"}`} /><p className="text-sm font-semibold">{event.state.replaceAll("_", " ")}</p><p className="mt-0.5 text-[13px] text-muted-ink">by {event.actor} · {new Date(event.at).toLocaleString()}</p>{event.reason ? <details className="mt-1 text-[13px] text-muted-ink"><summary className="cursor-pointer">Details</summary><p className="mt-1">{event.reason}</p></details> : null}</li>)}</ol></SectionCard>;
 }
 
 export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequestView }>) {
@@ -207,6 +224,7 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
   const [status, setStatus] = useState<UnifiedRequestActionState>("idle");
   const [denial, setDenial] = useState<string | null>(null);
   const [rejection, setRejection] = useState<string | null>(null);
+  const [topUpAmount, setTopUpAmount] = useState("");
   const terminal = request.state === "approved" || request.state === "auto_approved" || request.state === "rejected" || request.state === "expired";
 
   async function fileDecision() {
@@ -278,7 +296,7 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
     const result = await topUpAdminEscalation({
       body: {
         dimension: meter.dimension,
-        amount: String(fields.get("amount") ?? "").trim(),
+        amount: topUpAmount.trim(),
         validUntil: String(fields.get("validUntil") ?? "").trim(),
         rationale: String(fields.get("rationale") ?? "").trim(),
       },
@@ -308,13 +326,13 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
     return (
       <li className="space-y-5">
         <SectionCard title="Cumulative usage this period">
-          <ul className="space-y-5">{request.escalation.meters.map((meter) => <li key={meter.dimension}><Meter label={meter.dimension === "llm_spend" ? "LLM spend" : "Runtime minutes"} limit={Number(meter.limit)} limitLabel={meter.limit} unit={meter.unit} used={Number(meter.used)} usedLabel={meter.used} /><p className="mt-1 text-xs text-muted-ink">Observed {new Date(meter.observedAt).toLocaleString()}</p></li>)}</ul>
+          <ul className="space-y-5">{request.escalation.meters.map((meter) => <li key={meter.dimension}><Meter label={meter.dimension === "llm_spend" ? "LLM spend" : "Runtime limit per month"} limit={Number(meter.limit)} limitLabel={meter.dimension === "llm_spend" ? formatMoney(meter.limit, meter.unit) : formatDuration(meter.limit, "minutes")} used={Number(meter.used)} usedLabel={meter.dimension === "llm_spend" ? formatMoney(meter.used, meter.unit) : formatDuration(meter.used, "minutes")} /><p className="mt-1 text-xs text-muted-ink">Observed {new Date(meter.observedAt).toLocaleString()}</p></li>)}</ul>
           <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-line-soft pt-4 text-sm text-muted-ink"><span>Blocked run <span className="font-mono text-ink">{request.escalation.blockedTaskUid}</span> · parked since {new Date(request.escalation.parkedAt).toLocaleString()}</span><Link className="font-semibold text-ink" href={`/admin/runs/${encodeURIComponent(request.escalation.blockedTaskUid)}`}>Open run →</Link></div>
         </SectionCard>
         {terminal ? <RequestHistory request={request} /> : <SectionCard title="Decision"><form className="grid gap-3 sm:grid-cols-2" onSubmit={topUp}>
-          <label className="grid gap-2 text-sm font-semibold">Top-up amount ({request.escalation.meters[0]?.unit ?? "units"})<input className="min-h-11 rounded-md border px-3 font-normal" inputMode="decimal" name="amount" required /></label>
+          <label className="grid gap-2 text-sm font-semibold">Top-up amount{request.escalation.meters[0]?.dimension === "llm_spend" ? <MoneyInput currency={request.escalation.meters[0].unit} onChange={setTopUpAmount} required value={topUpAmount} /> : <DurationInput mode="minutes" onChange={setTopUpAmount} required value={topUpAmount} />}</label>
           <label className="grid gap-2 text-sm font-semibold">Valid until (RFC 3339)<input className="min-h-11 rounded-md border px-3 font-normal" name="validUntil" placeholder="2026-08-25T17:00:00Z" required /></label>
-          <label className="grid gap-2 text-sm font-semibold sm:col-span-2">Rationale<textarea className="min-h-20 rounded-md border p-3 font-normal" name="rationale" placeholder="Why is additional authority appropriate?" required /></label>
+          <label className="grid gap-2 text-sm font-semibold sm:col-span-2">Rationale<textarea className="min-h-20 rounded-md border p-3 font-normal" name="rationale" placeholder="Why is this additional access appropriate?" required /></label>
           <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50 sm:justify-self-end" disabled={status === "approving" || status === "approved" || status === "rejected"} type="submit">Approve top-up and resume</button>
         </form>
         <form className="mt-4 grid gap-3 border-t border-line-soft pt-4" onSubmit={(event) => { event.preventDefault(); const fields = new FormData(event.currentTarget); setDenial(String(fields.get("denyRationale") ?? "").trim()); }}><label className="grid gap-2 text-sm font-semibold">Denial rationale<textarea className="min-h-20 rounded-md border p-3 font-normal" name="denyRationale" required /></label><button className="min-h-11 rounded-md border border-danger-line px-4 py-2 text-sm font-semibold text-err disabled:opacity-50 sm:justify-self-start" disabled={status === "approving" || status === "approved" || status === "rejected"} type="submit">Deny and cancel run</button></form>
@@ -337,7 +355,7 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
         <label className="grid gap-2 text-sm font-semibold">Rejection reason (optional)<textarea className="min-h-20 rounded-md border p-3 font-normal" maxLength={2000} name="reason" /></label>
         <button className="min-h-11 rounded-md border border-danger-line px-4 py-2 text-sm font-semibold text-err disabled:opacity-50 sm:justify-self-start" disabled={!reference || status === "approving" || status === "rejecting" || status === "approved" || status === "rejection-complete"} type="submit">{status === "rejecting" ? "Rejecting…" : "Reject"}</button>
       </form> : null}</div></div></div>
-      <ConfirmationDialog cancelLabel="Keep pending" confirmLabel="Reject request" description="The requested authority will not be provisioned. The decision and optional reason will remain in the request history." onConfirm={() => void rejectEnvelope(rejection ?? "")} onOpenChange={(open) => { if (!open) setRejection(null); }} open={rejection !== null} pending={status === "rejecting"} title="Reject this request?" /></SectionCard>}
+      <ConfirmationDialog cancelLabel="Keep pending" confirmLabel="Reject request" description="The requested access will not be provisioned. The decision and optional reason will remain in the request history." onConfirm={() => void rejectEnvelope(rejection ?? "")} onOpenChange={(open) => { if (!open) setRejection(null); }} open={rejection !== null} pending={status === "rejecting"} title="Reject this request?" /></SectionCard>}
       {status !== "idle" && status !== "filing" && status !== "approving" && status !== "rejecting" ? <p className={status === "approved" || status === "filed" || status === "rejection-complete" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "approved" || status === "filed" || status === "rejection-complete" ? "status" : "alert"}>{actionMessage(status)}</p> : null}
     </li>
   );
@@ -410,8 +428,8 @@ export function EnvelopeRequestCard({ request }: Readonly<{ request: BrowserEnve
         ["Created", request.createdAt],
       ]} />
       <div className="grid gap-5 border-t pt-5 lg:grid-cols-2">
-        <section aria-label="Requested authority" className="space-y-3">
-          <h3 className="font-semibold">Requested authority</h3>
+        <section aria-label="Requested access" className="space-y-3">
+          <h3 className="font-semibold">Requested access</h3>
           <DefinitionList items={envelopeAuthorityItems(requested)} />
         </section>
         {governing ? <section aria-label="Governing template" className="space-y-3">
@@ -521,16 +539,16 @@ export function ApprovalCard({ approval }: Readonly<{ approval: BrowserApprovalV
         ["Runtime UID", approval.runtimeUid],
         ["Requested by", approval.actor],
         ["Envelope revision", approval.envelopeRevision],
-        ["Budget", `${spec.budget.monthlyLimit} ${spec.budget.currency}`],
-        ["TTL", spec.ttl],
+        ["Monthly limit", formatMoney(spec.budget.monthlyLimit, spec.budget.currency)],
+        ["Time-to-live limit", formatDuration(spec.ttl)],
         ["Agent type", spec.agentType.name],
       ]} />
-      <p className="rounded-md bg-notice p-4 text-sm"><strong>Admission counterexample:</strong> {approval.counterexample}</p>
+      <details className="rounded-md bg-notice p-4 text-sm"><summary className="cursor-pointer font-semibold">Why approval is required</summary><p className="mt-2">{approval.counterexample}</p></details>
       {reference ? (
         <DefinitionList items={[["Decision key", reference.decisionKey], ["Evidence URL", reference.evidenceUrl]]} />
       ) : (
         <div className="space-y-2 border-t pt-5">
-          <p className="text-sm text-muted-ink">This exception has no server-recorded decision reference yet.</p>
+          <p className="text-sm text-muted-ink">This exception does not have a decision reference yet.</p>
           <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={status === "filing"} onClick={() => void fileDecision()} type="button">{status === "filing" ? "Filing…" : "File decision reference"}</button>
         </div>
       )}

@@ -33,7 +33,7 @@ export function dedupeToolGrants(tools: ReadonlyArray<ToolGrant>): Array<ToolGra
 
 function fallbackGroupName(authoritativeNames: ReadonlySet<string>): string {
   if (!authoritativeNames.has("Ungrouped")) return "Ungrouped";
-  const base = "No authoritative toolset";
+  const base = "No tools available";
   if (!authoritativeNames.has(base)) return base;
   let suffix = 2;
   while (authoritativeNames.has(`${base} (${suffix})`)) suffix += 1;
@@ -171,13 +171,13 @@ export function ToolPicker({ catalog, missingTools, onChange, previousTools, too
         {catalog.length > 0 && visibleGroups.length === 0 ? <p className="rounded-control border px-3 py-4 text-center text-sm text-muted-ink">No tools match “{query}”.</p> : null}
       </div>
       {missingTools.length > 0 ? <div className="rounded-control border border-warn px-3 py-3 text-sm text-warn">
-        <p>{missingTools.length} selected tool{missingTools.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p>
+        <p>{missingTools.length} selected tool{missingTools.length === 1 ? " is" : "s are"} not available in this installation. Remove or replace before saving.</p>
         <ul className="mt-2 space-y-1 font-mono text-xs">{missingTools.map((tool) => <li className="flex items-center justify-between gap-3" key={toolKey(tool)}><span>{toolLabel(tool)}</span><button className="font-sans font-semibold" onClick={() => onChange(tools.filter((candidate) => toolKey(candidate) !== toolKey(tool)))} type="button">Remove unavailable {toolLabel(tool)}</button></li>)}</ul>
-      </div> : catalog.length === 0 ? <p className="text-sm text-muted-ink">No tools are listed in the deployment capability catalog.</p> : null}
+      </div> : catalog.length === 0 ? <p className="text-sm text-muted-ink">No tools are available in this installation.</p> : null}
       <p className="text-sm font-semibold" aria-label="Selected tool access counts">{counts.read} read · {counts.write} write · {counts.destructive} destructive</p>
       {diff ? <section aria-label="Tool changes in next revision" className="rounded-control border bg-subtle px-3 py-3 text-sm">
         <h3 className="font-semibold">Tool changes in next revision</h3>
-        {diff.added.length === 0 && diff.removed.length === 0 ? <p className="mt-1 text-muted-ink">No tool authority changes.</p> : <div className="mt-2 grid gap-2 sm:grid-cols-2">
+        {diff.added.length === 0 && diff.removed.length === 0 ? <p className="mt-1 text-muted-ink">No tool access changes.</p> : <div className="mt-2 grid gap-2 sm:grid-cols-2">
           <div><p className="font-semibold text-ok">Added ({diff.added.length})</p><ul className="mt-1 list-inside list-disc font-mono text-xs">{diff.added.map((tool) => <li key={toolKey(tool)}>{toolLabel(tool)}</li>)}</ul></div>
           <div><p className="font-semibold text-err">Removed ({diff.removed.length})</p><ul className="mt-1 list-inside list-disc font-mono text-xs">{diff.removed.map((tool) => <li key={toolKey(tool)}>{toolLabel(tool)}</li>)}</ul></div>
         </div>}

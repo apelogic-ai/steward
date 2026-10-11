@@ -17,6 +17,7 @@ import {
   type WorkspaceAuthority,
 } from "@/api-client";
 import { DataTable, FormSection, GrantChipList, SectionCard, TagSelect, grantKindForAction } from "@/components/hs";
+import { DurationInput, MoneyInput, formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
 import { ToolPicker, dedupeToolGrants, toolKey } from "@/components/tool-picker";
 import { EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
@@ -25,7 +26,7 @@ import { useSession } from "@/session/session-context";
 
 type TemplateMutationState = "idle" | "saving" | "saved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
 
-type TemplateField = "templateId" | "displayName" | "memberRoles" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "memory" | "compute" | "storage" | "models" | "tools" | "workspace" | "threshold";
+type TemplateField = "templateId" | "displayName" | "memberRoles" | "currency" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "memory" | "compute" | "storage" | "models" | "tools" | "workspace" | "threshold";
 
 export type TemplateFieldErrors = Partial<Record<TemplateField, string>>;
 
@@ -52,14 +53,14 @@ export const initialEnvelopeTemplate: BrowserEnvelope = {
   revision: 1,
   spec: {
     budget: {
-      currency: "USD",
-      monthlyLimit: "0.10",
-      singleRunLimit: "0.10",
+      currency: "",
+      monthlyLimit: "",
+      singleRunLimit: "",
     },
     llms: [],
     tools: [],
-    runtimeMinutesLimit: "60",
-    ttl: "15m",
+    runtimeMinutesLimit: "",
+    ttl: "",
     runner: { platforms: ["linux"] },
   },
 };
@@ -288,12 +289,13 @@ export function validateTemplateFields({
   if (memberRoles.length === 0) errors.memberRoles = "Add at least one eligible member role.";
   else if (memberRoles.length > 64) errors.memberRoles = "Use at most 64 eligible member roles.";
   else if (memberRoles.some((role) => !validTemplateIdentifier(role))) errors.memberRoles = "Use a valid identifier for every eligible member role.";
+  if (!/^[A-Z]{3}$/.test(envelope.spec.budget.currency)) errors.currency = "Enter a three-letter currency code.";
   if (!singleRunLimit.trim()) errors.singleRunLimit = "Enter a limit per run.";
   else if (!validDecimal(singleRunLimit.trim())) errors.singleRunLimit = decimalMessage;
-  if (!monthlyLimit.trim()) errors.monthlyLimit = "Enter a monthly budget.";
+  if (!monthlyLimit.trim()) errors.monthlyLimit = "Enter a monthly limit.";
   else if (!validDecimal(monthlyLimit.trim())) errors.monthlyLimit = decimalMessage;
-  if (!envelope.spec.ttl) errors.ttl = "Enter a TTL.";
-  else if (durationSeconds(envelope.spec.ttl) === null) errors.ttl = "Use a duration such as 15m, 2h, or 1d.";
+  if (!envelope.spec.ttl) errors.ttl = "Enter a time-to-live limit.";
+  else if (durationSeconds(envelope.spec.ttl) === null) errors.ttl = "Choose a non-negative number and unit.";
   if (envelope.spec.runtimeMinutesLimit && !validDecimal(envelope.spec.runtimeMinutesLimit)) errors.runtimeMinutes = decimalMessage;
   for (const resource of ["memory", "compute", "storage"] as const) {
     const value = envelope.spec.runner?.[resource];
@@ -302,9 +304,9 @@ export function validateTemplateFields({
       : "Use a positive binary quantity, such as 2Gi or 512Mi.";
   }
   if (models.length === 0) errors.models = "Select at least one model.";
-  else if (models.some((model) => !allowedModels.has(modelKey(model)))) errors.models = "Remove or replace every model not listed in the capability catalog.";
-  if (tools.some((tool) => !allowedTools.has(toolKey(tool)))) errors.tools = "Remove or replace every tool not listed in the capability catalog.";
-  if (workspaceAuthorityFromJson(workspaceJson) === null) errors.workspace = "Enter a complete valid workspace authority object or leave it blank.";
+  else if (models.some((model) => !allowedModels.has(modelKey(model)))) errors.models = "Remove or replace every model that is not available in this installation.";
+  if (tools.some((tool) => !allowedTools.has(toolKey(tool)))) errors.tools = "Remove or replace every tool that is not available in this installation.";
+  if (workspaceAuthorityFromJson(workspaceJson) === null) errors.workspace = "Enter complete valid workspace limits or leave this blank.";
   if (!autoApproveToCeiling) {
     try {
       const threshold = JSON.parse(thresholdJson) as unknown;
@@ -314,15 +316,6 @@ export function validateTemplateFields({
     }
   }
   return errors;
-}
-
-function serverErrorCode(error: unknown): string | null {
-  if (!isRecord(error)) return null;
-  for (const key of ["code", "error"]) {
-    const value = error[key];
-    if (typeof value === "string" && /^[a-z][a-z0-9._-]{0,63}$/i.test(value)) return value;
-  }
-  return null;
 }
 
 function normalizeEnvelopeTemplateResponse(value: unknown, templateId: string): BrowserEnvelopeTemplateResponse | null {
@@ -463,14 +456,14 @@ function toolValue(tool: ToolGrant): string {
   return `${tool.provider}:${tool.resource}:${tool.action}`;
 }
 
-function mutationMessage(status: Exclude<TemplateMutationState, "idle" | "saving">, rejectionCode: string | null): string {
+function mutationMessage(status: Exclude<TemplateMutationState, "idle" | "saving">): string {
   return {
     saved: "Template revision saved.",
     conflict: "A newer template revision already exists. Load it before authoring another revision.",
-    rejected: `The server rejected the template, so no authority was changed.${rejectionCode ? ` Error code: ${rejectionCode}.` : ""}`,
+    rejected: "The template couldn't be saved. Check the fields and try again.",
     forbidden: "You are not allowed to change this template.",
-    unavailable: "The authoritative template service is unavailable.",
-    error: "The template response could not be accepted.",
+    unavailable: "HyperShell couldn't reach the template service. Try again in a moment.",
+    error: "The template could not be saved. Try again.",
   }[status];
 }
 
@@ -481,7 +474,7 @@ function FieldError({ message }: Readonly<{ message?: string }>) {
 export function AdminEnvelopeTemplatesView() {
   const session = useSession();
   if (session.status !== "authenticated") {
-    return <EmptyState title="Session unavailable"><p>The authoritative administrator session is not available.</p></EmptyState>;
+    return <EmptyState title="Session unavailable"><p>Sign in again, then retry.</p></EmptyState>;
   }
   return <AuthenticatedTemplateList />;
 }
@@ -513,9 +506,9 @@ function AuthenticatedTemplateList() {
           columns={[
             { key: "template", label: "Member role", className: "font-semibold", render: (template) => <span><span className="block truncate">{template.displayName}</span><span className="mt-0.5 block truncate font-mono text-xs font-normal text-muted-ink">{template.id}</span></span> },
             { key: "revision", label: "Revision", className: "font-mono text-muted-ink", render: (template) => `rev ${template.envelope.revision}` },
-            { key: "monthly", label: "Monthly", className: "tabular-nums", render: (template) => `${template.envelope.spec.budget.monthlyLimit} ${template.envelope.spec.budget.currency}` },
-            { key: "per-run", label: "Limit per run", className: "tabular-nums", render: (template) => template.envelope.spec.budget.singleRunLimit ? `${template.envelope.spec.budget.singleRunLimit} ${template.envelope.spec.budget.currency}` : "—" },
-            { key: "ttl", label: "TTL", className: "font-mono text-muted-ink", render: (template) => template.envelope.spec.ttl },
+            { key: "monthly", label: "Monthly limit", className: "tabular-nums", render: (template) => formatMoney(template.envelope.spec.budget.monthlyLimit, template.envelope.spec.budget.currency) },
+            { key: "per-run", label: "Limit per run", className: "tabular-nums", render: (template) => template.envelope.spec.budget.singleRunLimit ? formatMoney(template.envelope.spec.budget.singleRunLimit, template.envelope.spec.budget.currency) : "—" },
+            { key: "ttl", label: "Time-to-live limit", className: "font-mono text-muted-ink", render: (template) => formatDuration(template.envelope.spec.ttl) },
             { key: "tools", label: "Tools", render: (template) => <GrantChipList grants={template.envelope.spec.tools.map((tool) => ({ kind: grantKindForAction(tool.action), name: toolValue(tool) }))} limit={2} /> },
             { key: "open", label: "", className: "text-right text-lg text-faint-ink", render: () => "›" },
           ]}
@@ -533,7 +526,7 @@ function AuthenticatedTemplateList() {
 export function AdminEnvelopeTemplateDetailView({ memberRole }: Readonly<{ memberRole: string }>) {
   const session = useSession();
   if (session.status !== "authenticated") {
-    return <EmptyState title="Session unavailable"><p>The authoritative administrator session is not available.</p></EmptyState>;
+    return <EmptyState title="Session unavailable"><p>Sign in again, then retry.</p></EmptyState>;
   }
   return <AuthenticatedTemplateDetail csrf={session.value.csrf} memberRole={memberRole} />;
 }
@@ -593,7 +586,7 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
 export function AdminNewEnvelopeTemplateView() {
   const session = useSession();
   if (session.status !== "authenticated") {
-    return <EmptyState title="Session unavailable"><p>The authoritative administrator session is not available.</p></EmptyState>;
+    return <EmptyState title="Session unavailable"><p>Sign in again, then retry.</p></EmptyState>;
   }
   return <AuthenticatedNewTemplate csrf={session.value.csrf} />;
 }
@@ -641,7 +634,6 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
   const toolCatalog = capabilities.tools;
   const allowedTools = new Set(toolCatalog.map(toolKey));
   const [status, setStatus] = useState<TemplateMutationState>("idle");
-  const [rejectionCode, setRejectionCode] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<TemplateFieldErrors>({});
   const [currentRevision, setCurrentRevision] = useState(template.revision);
   const [models, setModels] = useState<Array<ModelRef>>(template.spec.llms);
@@ -654,6 +646,8 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
   const [monthlyLimit, setMonthlyLimit] = useState(template.spec.budget.monthlyLimit);
   const [singleRunLimit, setSingleRunLimit] = useState(template.spec.budget.singleRunLimit ?? "");
   const [runtimeMinutesLimit, setRuntimeMinutesLimit] = useState(template.spec.runtimeMinutesLimit ?? "");
+  const [ttl, setTtl] = useState(template.spec.ttl);
+  const [currency, setCurrency] = useState(template.spec.budget.currency);
   const [name, setName] = useState(templateDisplayName);
   const [roles, setRoles] = useState(memberRoles.join(", "));
   const [rolesEdited, setRolesEdited] = useState(!create);
@@ -671,7 +665,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
     key: modelKey(model),
     kind: "model" as const,
     label: modelLabel(model, [...modelCatalog, ...missingModels]),
-    note: allowedModels.has(modelKey(model)) ? undefined : "Not listed in the deployment capability catalog",
+    note: allowedModels.has(modelKey(model)) ? undefined : "Not available in this installation",
   }));
   const roleOptions = selectedRoles.map((role) => ({ key: role, kind: "neutral" as const, label: role }));
 
@@ -708,7 +702,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       revision: create || saveAsNew ? 1 : currentRevision + 1,
       spec: {
         budget: {
-          currency: "USD",
+          currency,
           monthlyLimit: monthlyLimit.trim(),
           singleRunLimit: singleRunLimit.trim(),
         },
@@ -716,7 +710,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         tools,
         ...(runtimeMinutesLimit.trim() ? { runtimeMinutesLimit: runtimeMinutesLimit.trim() } : {}),
         ...(workspace ? { workspace } : {}),
-        ttl: String(fields.get("ttl") ?? "").trim(),
+        ttl,
         runner: {
           platforms,
           ...(memory ? { memory } : {}),
@@ -756,7 +750,6 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       workspaceJson,
     });
     setFieldErrors(errors);
-    setRejectionCode(null);
     if (Object.keys(errors).length > 0) {
       setStatus("idle");
       return;
@@ -784,9 +777,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       if (create || saveAsNew) router.push(`/admin/envelopes/templates/${encodeURIComponent(templateId)}`);
       return;
     }
-    const failure = classifyMutationFailure(result.response?.status);
-    setRejectionCode(failure === "rejected" ? serverErrorCode(result.error) : null);
-    setStatus(failure);
+    setStatus(classifyMutationFailure(result.response?.status));
   }
 
   const runner = template.spec.runner;
@@ -808,15 +799,16 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
             <label className="grid gap-2 text-sm font-semibold">Eligible member roles<TagSelect addPlaceholder="Add another role…" allowCreate emptyPlaceholder="Add member role…" label="Eligible member roles" onChange={updateRoles} options={roleOptions} value={selectedRoles} /><FieldError message={fieldErrors.memberRoles} /></label>
           </div>
         </FormSection>
-        <FormSection description="Inference spend limits in USD and how long an envelope stays valid." title="Budget and lifetime">
-          <div className="grid gap-4 sm:grid-cols-4">
-            <label className="grid gap-2 text-sm font-semibold">Limit per run (USD)<input aria-invalid={Boolean(fieldErrors.singleRunLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setSingleRunLimit(event.target.value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label>
-            <label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input aria-invalid={Boolean(fieldErrors.monthlyLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setMonthlyLimit(event.target.value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label>
-            <label className="grid gap-2 text-sm font-semibold">TTL<input aria-invalid={Boolean(fieldErrors.ttl)} className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" onChange={() => clearFieldError("ttl")} required /><FieldError message={fieldErrors.ttl} /></label>
-            <label className="grid gap-2 text-sm font-semibold">Runtime minutes<input aria-invalid={Boolean(fieldErrors.runtimeMinutes)} className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => { setRuntimeMinutesLimit(event.target.value); clearFieldError("runtimeMinutes"); }} placeholder="60" value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label>
+        <FormSection description="Set the currency, spend limits, and how long an Envelope stays valid." title="Budget and lifetime">
+          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+            <label className="grid gap-2 text-sm font-semibold">Currency<input aria-invalid={Boolean(fieldErrors.currency)} className={`${fieldClass} font-mono uppercase`} maxLength={3} onChange={(event) => { setCurrency(event.target.value.toUpperCase()); clearFieldError("currency"); }} required value={currency} /><FieldError message={fieldErrors.currency} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Limit per run<MoneyInput aria-invalid={Boolean(fieldErrors.singleRunLimit)} currency={currency} onChange={(value) => { setSingleRunLimit(value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Monthly limit<MoneyInput aria-invalid={Boolean(fieldErrors.monthlyLimit)} currency={currency} onChange={(value) => { setMonthlyLimit(value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Time-to-live limit<DurationInput aria-invalid={Boolean(fieldErrors.ttl)} onChange={(value) => { setTtl(value); clearFieldError("ttl"); }} required unitAriaLabel="Time-to-live unit" value={ttl} /><FieldError message={fieldErrors.ttl} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Runtime limit per month<DurationInput aria-invalid={Boolean(fieldErrors.runtimeMinutes)} mode="minutes" onChange={(value) => { setRuntimeMinutesLimit(value); clearFieldError("runtimeMinutes"); }} value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label>
           </div>
         </FormSection>
-        <FormSection description="Only models supported by the inference gateway can be selected." title="Models">
+        <FormSection description="Only models available in this installation can be selected." title="Models">
           <TagSelect
             addPlaceholder="Add…"
             emptyPlaceholder="Search models…"
@@ -833,14 +825,14 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
             value={models.map(modelKey)}
           />
           <FieldError message={fieldErrors.models} />
-          {missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}
+          {missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not available in this installation. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are available in this installation.</p> : null}
         </FormSection>
-        <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Groups appear only when supplied as authoritative catalog metadata.`} title="Tools">
+        <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Available tools"}. Tool groups appear when this installation provides them.`} title="Tools">
           <ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} tools={tools} />
           <FieldError message={fieldErrors.tools} />
         </FormSection>
-        <FormSection description="Optional ceiling for typed Task workspaces. Blank means this template grants no workspace entries." title="Workspace authority">
-          <label className="grid gap-2 text-sm font-semibold">Workspace authority (JSON)<textarea aria-invalid={Boolean(fieldErrors.workspace)} className="min-h-44 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setWorkspaceJson(event.target.value); clearFieldError("workspace"); }} placeholder={'{"allowedTypes":["git","scratch"],"maxTotalSize":"2Gi","maxFiles":100000,"maxHistoryDepth":1000,"maxSubmoduleDepth":4}'} spellCheck={false} value={workspaceJson} /><FieldError message={fieldErrors.workspace} /></label>
+        <FormSection description="Optional limits for typed Task workspaces. Blank means this template grants no workspace entries." title="Workspace limits">
+          <label className="grid gap-2 text-sm font-semibold">Workspace limits (JSON)<textarea aria-invalid={Boolean(fieldErrors.workspace)} className="min-h-44 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setWorkspaceJson(event.target.value); clearFieldError("workspace"); }} placeholder="Paste workspace limits JSON or leave blank." spellCheck={false} value={workspaceJson} /><FieldError message={fieldErrors.workspace} /></label>
         </FormSection>
         {autoApprovalSection}
         <FormSection description="Repository packages remain available when inline authoring is disabled." title="Browser execution">
@@ -849,8 +841,8 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner">
           <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset>
         </FormSection>
-        {status !== "idle" && status !== "saving" ? <p className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status, rejectionCode)}</p> : null}
-        <footer className="sticky bottom-0 flex flex-wrap items-center justify-between gap-4 border-t bg-subtle px-6 py-4"><p className="text-sm text-muted-ink">{models.length} model{models.length === 1 ? "" : "s"} · {tools.length} tool{tools.length === 1 ? "" : "s"} · Limit per run: {singleRunLimit || "—"} USD</p><div className="flex gap-3"><Link className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold" href="/admin/envelopes/templates">Cancel</Link><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="create">{status === "saving" ? "Saving…" : "Create template"}</button></div></footer>
+        {status !== "idle" && status !== "saving" ? <p className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status)}</p> : null}
+        <footer className="sticky bottom-0 flex flex-wrap items-center justify-between gap-4 border-t bg-subtle px-6 py-4"><p className="text-sm text-muted-ink">{formatCount(models.length, "model")} · {formatCount(tools.length, "tool")} · Limit per run: {singleRunLimit && currency ? formatMoney(singleRunLimit, currency) : "—"}</p><div className="flex gap-3"><Link className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold" href="/admin/envelopes/templates">Cancel</Link><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="create">{status === "saving" ? "Saving…" : "Create template"}</button></div></footer>
       </form>
     );
   }
@@ -869,22 +861,22 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={allowInlineBrowserTasks} onChange={(event) => setAllowInlineBrowserTasks(event.target.checked)} type="checkbox" />Allow inline browser-authored packages</label>
       </FormSection>
 
-      <FormSection description="Inference spend limits in USD and how long an envelope stays valid." title="Budget and lifetime">
-        <div className="grid gap-4 sm:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Limit per run (USD)<input aria-invalid={Boolean(fieldErrors.singleRunLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setSingleRunLimit(event.target.value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label><label className="grid gap-2 text-sm font-semibold">Monthly (USD)<input aria-invalid={Boolean(fieldErrors.monthlyLimit)} className={fieldClass} inputMode="decimal" onChange={(event) => { setMonthlyLimit(event.target.value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label><label className="grid gap-2 text-sm font-semibold">TTL<input aria-invalid={Boolean(fieldErrors.ttl)} className={`${fieldClass} font-mono`} defaultValue={template.spec.ttl} name="ttl" onChange={() => clearFieldError("ttl")} required /><FieldError message={fieldErrors.ttl} /></label><label className="grid gap-2 text-sm font-semibold">Runtime minutes<input aria-invalid={Boolean(fieldErrors.runtimeMinutes)} className={`${fieldClass} font-mono`} inputMode="decimal" onChange={(event) => { setRuntimeMinutesLimit(event.target.value); clearFieldError("runtimeMinutes"); }} placeholder="60" value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label></div>
+      <FormSection description={`Inference spend limits in ${currency} and how long an Envelope stays valid.`} title="Budget and lifetime">
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Limit per run<MoneyInput aria-invalid={Boolean(fieldErrors.singleRunLimit)} currency={currency} onChange={(value) => { setSingleRunLimit(value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label><label className="grid gap-2 text-sm font-semibold">Monthly limit<MoneyInput aria-invalid={Boolean(fieldErrors.monthlyLimit)} currency={currency} onChange={(value) => { setMonthlyLimit(value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label><label className="grid gap-2 text-sm font-semibold">Time-to-live limit<DurationInput aria-invalid={Boolean(fieldErrors.ttl)} onChange={(value) => { setTtl(value); clearFieldError("ttl"); }} required unitAriaLabel="Time-to-live unit" value={ttl} /><FieldError message={fieldErrors.ttl} /></label><label className="grid gap-2 text-sm font-semibold">Runtime limit per month<DurationInput aria-invalid={Boolean(fieldErrors.runtimeMinutes)} mode="minutes" onChange={(value) => { setRuntimeMinutesLimit(value); clearFieldError("runtimeMinutes"); }} value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label></div>
       </FormSection>
 
-      <FormSection description="Only models supported by the inference gateway can be selected." title="Models"><fieldset><legend className="sr-only">Models</legend><TagSelect addPlaceholder="Add…" emptyPlaceholder="Search models…" inputDisabled={modelCatalog.length === 0} label="Models" onChange={(keys) => { setModels(keys.flatMap((key) => { const model = [...modelCatalog, ...missingModels].find((candidate) => modelKey(candidate) === key); return model ? [model] : []; })); clearFieldError("models"); }} options={modelOptions} value={models.map(modelKey)} /><FieldError message={fieldErrors.models} />{missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not listed in the deployment capability catalog. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are listed in the deployment capability catalog.</p> : null}</fieldset></FormSection>
+      <FormSection description="Only models available in this installation can be selected." title="Models"><fieldset><legend className="sr-only">Models</legend><TagSelect addPlaceholder="Add…" emptyPlaceholder="Search models…" inputDisabled={modelCatalog.length === 0} label="Models" onChange={(keys) => { setModels(keys.flatMap((key) => { const model = [...modelCatalog, ...missingModels].find((candidate) => modelKey(candidate) === key); return model ? [model] : []; })); clearFieldError("models"); }} options={modelOptions} value={models.map(modelKey)} /><FieldError message={fieldErrors.models} />{missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not available in this installation. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are available in this installation.</p> : null}</fieldset></FormSection>
 
-      <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Tool catalog"}. Groups appear only when supplied as authoritative catalog metadata.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} previousTools={previousTools} tools={tools} /><FieldError message={fieldErrors.tools} /></fieldset></FormSection>
+      <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Available tools"}. Tool groups appear when this installation provides them.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} previousTools={previousTools} tools={tools} /><FieldError message={fieldErrors.tools} /></fieldset></FormSection>
 
-      <FormSection description="Optional ceiling for typed Task workspaces. Blank means this template grants no workspace entries." title="Workspace authority"><label className="grid gap-2 text-sm font-semibold">Workspace authority (JSON)<textarea aria-invalid={Boolean(fieldErrors.workspace)} className="min-h-44 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setWorkspaceJson(event.target.value); clearFieldError("workspace"); }} placeholder={'{"allowedTypes":["git","scratch"],"maxTotalSize":"2Gi","maxFiles":100000,"maxHistoryDepth":1000,"maxSubmoduleDepth":4}'} spellCheck={false} value={workspaceJson} /><FieldError message={fieldErrors.workspace} /></label></FormSection>
+      <FormSection description="Optional limits for typed Task workspaces. Blank means this template grants no workspace entries." title="Workspace limits"><label className="grid gap-2 text-sm font-semibold">Workspace limits (JSON)<textarea aria-invalid={Boolean(fieldErrors.workspace)} className="min-h-44 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setWorkspaceJson(event.target.value); clearFieldError("workspace"); }} placeholder="Paste workspace limits JSON or leave blank." spellCheck={false} value={workspaceJson} /><FieldError message={fieldErrors.workspace} /></label></FormSection>
 
       {autoApprovalSection}
 
       <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
 
       {status !== "idle" && status !== "saving" ? (
-        <p className={status === "saved" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status, rejectionCode)}</p>
+        <p className={status === "saved" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "saved" ? "status" : "alert"}>{mutationMessage(status)}</p>
       ) : null}
 
       <div className="flex flex-wrap items-end gap-3 border-t pt-5">

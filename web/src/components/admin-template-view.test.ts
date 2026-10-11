@@ -21,12 +21,12 @@ describe("first envelope template", () => {
     expect(initialEnvelopeTemplate).toEqual({
       revision: 1,
       spec: {
-        budget: { currency: "USD", monthlyLimit: "0.10", singleRunLimit: "0.10" },
+        budget: { currency: "", monthlyLimit: "", singleRunLimit: "" },
         llms: [],
         tools: [],
-        ttl: "15m",
+        ttl: "",
         runner: { platforms: ["linux"] },
-        runtimeMinutesLimit: "60",
+        runtimeMinutesLimit: "",
       },
     });
   });
@@ -58,10 +58,10 @@ describe("first envelope template", () => {
       templateId: "Use 1–128 letters, numbers, periods, underscores, hyphens, or colons; start with a letter or number.",
       displayName: "Enter a display name.",
       memberRoles: "Add at least one eligible member role.",
-      monthlyLimit: "Enter a monthly budget.",
+      monthlyLimit: "Enter a monthly limit.",
       singleRunLimit: "Enter a non-negative decimal.",
       models: "Select at least one model.",
-      tools: "Remove or replace every tool not listed in the capability catalog.",
+      tools: "Remove or replace every tool that is not available in this installation.",
       threshold: "Enter a complete valid envelope as JSON.",
     });
   });
@@ -113,7 +113,7 @@ describe("first envelope template", () => {
       ...common,
       workspaceJson: JSON.stringify({ allowedTypes: ["git"], maxTotalSize: "2GB" }),
     })).toEqual({
-      workspace: "Enter a complete valid workspace authority object or leave it blank.",
+      workspace: "Enter complete valid workspace limits or leave this blank.",
     });
   });
 
@@ -165,7 +165,7 @@ describe("first envelope template", () => {
       tools: [],
       workspaceJson: "",
     })).toEqual({
-      ttl: "Enter a TTL.",
+      ttl: "Enter a time-to-live limit.",
       runtimeMinutes: "Enter a non-negative decimal.",
       memory: "Use a positive binary quantity, such as 2Gi or 512Mi.",
       compute: "Use positive cores or millicores, such as 1 or 500m.",

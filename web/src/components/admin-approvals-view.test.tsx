@@ -93,7 +93,7 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("200.00 USD");
   });
 
-  test("shows the full requested authority for a template-free custom request", () => {
+  test("shows the full requested access for a template-free custom request", () => {
     const custom: AdminRequestView = {
       ...unifiedRequest,
       kind: "custom",
@@ -103,10 +103,10 @@ describe("envelope request approval controls", () => {
 
     const html = renderToStaticMarkup(<UnifiedRequestCard request={custom} />);
 
-    expect(html).toContain("Requested authority");
+    expect(html).toContain("Requested access");
     expect(html).toContain("300.00 USD");
     expect(html).toContain("provider-a/model-b");
-    expect(html).toContain("36h");
+    expect(html).toContain("1 d 12 h");
   });
 
   test("offer governed approve and reject mutations with an optional rejection reason", () => {
@@ -134,10 +134,10 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("not auto-provisioned");
   });
 
-  test("show the requested authority beside its exact governing template revision", () => {
+  test("shows the requested access beside its exact governing template revision", () => {
     const html = renderToStaticMarkup(<EnvelopeRequestCard request={request} />);
 
-    expect(html).toContain("Requested authority");
+    expect(html).toContain("Requested access");
     expect(html).toContain("Governing template");
     expect(html).toContain("300.00 USD");
     expect(html).toContain("200.00 USD");

@@ -94,11 +94,11 @@ export function AdminSetupView() {
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader
         actions={<div className="flex gap-2"><button className="rounded-control border px-3 py-2 text-sm font-semibold disabled:opacity-50" disabled={refreshing} onClick={() => void refresh()} type="button">{refreshing ? "Refreshing…" : "Refresh status"}</button><button className="rounded-control border px-3 py-2 text-sm font-semibold" onClick={() => setAdminSetupDismissed(true)} type="button">Hide this guide</button></div>}
-        description="Live, read-only checks for the prerequisites behind governed agent runs. Optional checks do not broaden authority."
+        description="Live, read-only checks for the systems needed to start agent runs. Optional checks do not grant more access."
         title="Get started"
       />
-      {status.value === "unavailable" ? <EmptyState title="Setup status is unavailable"><p role="alert">No prerequisite has been inferred. Retry when the authoritative service is available.</p></EmptyState> : null}
-      {status.value === "loading" ? <EmptyState title="Loading setup status"><p role="status">Reading current server-owned prerequisites…</p></EmptyState> : null}
+      {status.value === "unavailable" ? <EmptyState title="Setup status is unavailable"><p role="alert">HyperShell couldn&apos;t check the prerequisites. Try again in a moment.</p></EmptyState> : null}
+      {status.value === "loading" ? <EmptyState title="Loading setup status"><p role="status">Checking current prerequisites…</p></EmptyState> : null}
       {status.value === "ready" ? (
         <ol className="grid gap-4 md:grid-cols-2">
           {status.checks.map((item) => (
@@ -112,7 +112,7 @@ export function AdminSetupView() {
           ))}
         </ol>
       ) : null}
-      <p className="text-xs leading-5 text-muted-ink">Hiding this guide is a presentation preference stored only in this browser. It does not change server state or authority.</p>
+      <p className="text-xs leading-5 text-muted-ink">Hiding this guide is a display preference stored only in this browser. It does not change your access.</p>
     </section>
   );
 }

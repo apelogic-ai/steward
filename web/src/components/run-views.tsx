@@ -32,6 +32,7 @@ import { DataTable, FilterChips } from "@/components/hs";
 import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
 import { classifyConnectionMutationFailure, type ConnectionMutationState } from "@/components/connection-mutation-state";
 import { ExecutionLogPanel } from "@/components/run-log-view";
+import { formatDuration, formatMoney } from "@/components/presentation-values";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import type { ExecutionLogStream } from "@/data/execution-log";
 import { RepositoryResource, useGithubRepositories } from "@/data/github-repositories";
@@ -53,7 +54,7 @@ function workspaceHistoryLabel(value: unknown): string {
 }
 
 export function WorkspaceEvidencePanel({ workspace }: Readonly<{ workspace: WorkspaceEvidence }>) {
-  return <section className="rounded-card border bg-panel p-5"><div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-semibold">Workspace</h2><p className="mt-1 text-xs text-muted-ink">Resolved and pinned before the runtime was created.</p></div><code className="max-w-full break-all text-xs text-muted-ink">{workspace.workspaceDigest}</code></div><div className="mt-4 grid gap-3">{workspace.entries.map((entry) => entry.type === "git" ? <div className="rounded-control border p-4" key={entry.name}><div className="flex flex-wrap items-center justify-between gap-2"><strong>{entry.name}</strong><span className="rounded-full border px-2 py-0.5 text-xs">Git · {entry.access}</span></div><p className="mt-2 break-all font-mono text-xs">{entry.repository}</p><p className="mt-1 break-all font-mono text-xs text-muted-ink">{entry.commit} · {workspaceHistoryLabel(entry.history)}</p>{entry.paths?.length ? <p className="mt-2 text-xs text-muted-ink">Paths: {entry.paths.join(", ")}</p> : null}{entry.submodules?.length ? <ul className="mt-3 space-y-1 text-xs">{entry.submodules.map((submodule) => <li key={submodule.path}><code>{submodule.path}</code> · {submodule.status}{submodule.commit ? ` · ${submodule.commit}` : ""}{submodule.reason ? ` · ${submodule.reason}` : ""}</li>)}</ul> : null}</div> : <div className="rounded-control border p-4" key={entry.name}><div className="flex flex-wrap items-center justify-between gap-2"><strong>{entry.name}</strong><span className="rounded-full border px-2 py-0.5 text-xs">Scratch</span></div><p className="mt-2 text-xs text-muted-ink">Writable · capped at {entry.size}</p></div>)}</div></section>;
+  return <section className="rounded-card border bg-panel p-5"><div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="font-semibold">Workspace</h2><p className="mt-1 text-xs text-muted-ink">Resolved and pinned before the run started.</p></div><code className="max-w-full break-all text-xs text-muted-ink">{workspace.workspaceDigest}</code></div><div className="mt-4 grid gap-3">{workspace.entries.map((entry) => entry.type === "git" ? <div className="rounded-control border p-4" key={entry.name}><div className="flex flex-wrap items-center justify-between gap-2"><strong>{entry.name}</strong><span className="rounded-full border px-2 py-0.5 text-xs">Git · {entry.access}</span></div><p className="mt-2 break-all font-mono text-xs">{entry.repository}</p><p className="mt-1 break-all font-mono text-xs text-muted-ink">{entry.commit} · {workspaceHistoryLabel(entry.history)}</p>{entry.paths?.length ? <p className="mt-2 text-xs text-muted-ink">Paths: {entry.paths.join(", ")}</p> : null}{entry.submodules?.length ? <ul className="mt-3 space-y-1 text-xs">{entry.submodules.map((submodule) => <li key={submodule.path}><code>{submodule.path}</code> · {submodule.status}{submodule.commit ? ` · ${submodule.commit}` : ""}{submodule.reason ? <details className="mt-1 text-muted-ink"><summary className="cursor-pointer">Details</summary><code>{submodule.reason}</code></details> : null}</li>)}</ul> : null}</div> : <div className="rounded-control border p-4" key={entry.name}><div className="flex flex-wrap items-center justify-between gap-2"><strong>{entry.name}</strong><span className="rounded-full border px-2 py-0.5 text-xs">Scratch</span></div><p className="mt-2 text-xs text-muted-ink">Writable · capped at {entry.size}</p></div>)}</div></section>;
 }
 
 function runUpdatedAt(value: BrowserRunView): number {
@@ -69,7 +70,7 @@ function relativeTime(value: string): string {
   const milliseconds = new Date(value).valueOf();
   if (!Number.isFinite(milliseconds)) return value;
   const seconds = Math.max(0, Math.round((Date.now() - milliseconds) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 60) return `${formatDuration(`${seconds}s`)} ago`;
   const minutes = Math.round(seconds / 60);
   if (minutes < 60) return `${minutes} min ago`;
   const hours = Math.round(minutes / 60);
@@ -83,10 +84,7 @@ function durationLabel(createdAt: string, updatedAt: string): string {
   const end = new Date(updatedAt).valueOf();
   if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "Not reported";
   const seconds = Math.round((end - start) / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainder = seconds % 60;
-  return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+  return formatDuration(`${seconds}s`);
 }
 
 function durationBetween(start: string | undefined, end: string | undefined): string {
@@ -108,10 +106,10 @@ function isTerminalPhase(phase: string): boolean {
 
 export function inferenceFailureGuidance(errorCategory: string | null | undefined): string | null {
   if (errorCategory === "inference-key-rejected") {
-    return "The inference gateway rejected your saved API key. Replace it in Connections, then retry the run.";
+    return "The model service rejected your saved API key. Replace it in Connections, then retry the run.";
   }
   if (errorCategory === "inference-budget-exhausted") {
-    return "The saved inference key has exhausted its upstream budget. Replace it in Connections or ask the gateway administrator to increase its budget.";
+    return "The saved API key has no remaining budget. Replace it in Connections or ask an administrator to increase its budget.";
   }
   return null;
 }
@@ -143,10 +141,10 @@ export function parseRunEventData(data: string): RunEventSnapshot | null {
 }
 
 function stageSummary(stage: BrowserRunView["stages"][number]): string {
-  if (stage.id === "admission") return "The Task was admitted under the selected Envelope.";
+  if (stage.id === "admission") return "The run was accepted under the selected Envelope.";
   if (stage.id === "provision_runtime") return stage.state === "succeeded"
-    ? "The governed runtime was provisioned."
-    : "Steward is preparing the governed runtime.";
+    ? "The run environment is ready."
+    : "HyperShell is preparing the run environment.";
   if (stage.id === "finalize") return stage.state === "succeeded"
     ? "The Task and its evidence were finalized."
     : "Steward will finalize the Task after execution ends.";
@@ -171,11 +169,27 @@ function errorCode(error: unknown): string | null {
 
 export function rerunFailureMessage(state: RerunFailureState): string {
   if (state === "inference-key-missing") {
-    return "Add an inference API key in Connections, then retry the run.";
+    return "Add a model API key in Connections, then retry the run.";
   }
-  return state === "orchestration-not-active"
-    ? "Re-run is disabled until task orchestration is active (stage 2)."
-    : `The run could not be re-run (${state}).`;
+  return {
+    "orchestration-not-active": "Re-run is disabled until task runs are enabled for this installation.",
+    "oauth-pending": "Finish the pending GitHub authorization, then retry the run.",
+    conflict: "This run changed before it could be started again. Reload and try again.",
+    rejected: "This run cannot be started again with its current settings.",
+    forbidden: "You don't have permission to start this run again.",
+    unavailable: "HyperShell couldn't start the run again. Try again in a moment.",
+    error: "The run could not be started again. Try again.",
+  }[state];
+}
+
+export function cancelFailureMessage(state: MutationFailureState): string {
+  return {
+    conflict: "This run changed before it could be cancelled. Reload and try again.",
+    rejected: "This run can no longer be cancelled.",
+    forbidden: "You don't have permission to cancel this run.",
+    unavailable: "HyperShell couldn't cancel the run. Try again in a moment.",
+    error: "The run could not be cancelled. Try again.",
+  }[state];
 }
 
 function wait(milliseconds: number): Promise<void> {
@@ -301,7 +315,7 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
       setWorkflow(detected);
       setWorkflowRepository(effectiveRepository);
       setState(detected ? "idle" : "error");
-      if (!detected) setFailure("Steward could not inspect the generated workflow in this repository.");
+      if (!detected) setFailure("HyperShell couldn't check this repository for the generated workflow.");
     });
     return () => { active = false; };
   }, [checkWorkflow, effectiveRepository, selected]);
@@ -358,7 +372,7 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
       path: { task_uid: taskUid },
     });
     if (!result.data || !result.response?.ok) {
-      setFailure("Steward could not open the publication pull request.");
+      setFailure("HyperShell couldn't open the pull request. Try again.");
       setState("error");
       return;
     }
@@ -383,7 +397,7 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
       path: { task_uid: taskUid },
     });
     if (!result.data || !result.response?.ok) {
-      setFailure("Steward could not dispatch the exact published workflow.");
+      setFailure("HyperShell couldn't start the published workflow. Try again.");
       setState("error");
       return;
     }
@@ -395,11 +409,11 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
   return (
     <section className="mt-5 rounded-card border p-4" aria-labelledby="publish-task-title">
       <h3 className="text-sm font-semibold" id="publish-task-title">Publish this task to GitHub</h3>
-      <p className="mt-2 text-sm text-muted-ink">Steward publishes the exact tested package and its pinned caller workflow on a new branch, then opens a pull request. It never writes to the default branch.</p>
+      <p className="mt-2 text-sm text-muted-ink">HyperShell publishes the tested package and workflow on a new branch, then opens a pull request. It never writes to the default branch.</p>
       <RepositoryResource onRetry={repositories.refresh} state={repositories.state}>{({ repositories: available }) => available.length ? <>
         <label className="mt-4 grid gap-2 text-sm font-semibold">Repository<select className="min-h-11 w-full rounded-control border bg-panel px-3 font-mono font-normal" onChange={(event) => { setSelectedRepository(event.target.value); setPublication(null); setGithubRun(null); setRunStatus(null); setState("checking"); setFailure(null); }} value={effectiveRepository}>{available.map((repository) => <option key={repository.repositoryId} value={`${repository.owner}/${repository.name}`}>{repository.owner}/{repository.name}{repository.ready ? " · Ready" : " · Not ready"}</option>)}</select></label>
         <button className="mt-3 rounded-control border px-3 py-1.5 text-xs font-semibold" onClick={repositories.refresh} type="button">Refresh repositories</button>
-        {selected && !selected.ready ? <p className="mt-3 text-sm text-warn" role="status">This repository is visible through GitHub but is not admitted as a governed source. Ask an administrator to add its stable owner and repository IDs.</p> : null}
+        {selected && !selected.ready ? <p className="mt-3 text-sm text-warn" role="status">This repository is visible through GitHub but is not approved as a source. Ask an administrator to add it.</p> : null}
         {selected?.ready ? <p className="mt-3 text-sm text-muted-ink" role="status">{workflowRepository !== effectiveRepository || state === "checking" ? "Checking the default branch…" : selectedWorkflow?.compatible ? "The exact generated workflow is present on the default branch." : publication ? "Pull request opened. Merge it to enable Run on GitHub; Steward will detect the merge automatically." : "No matching generated workflow is present yet."}</p> : null}
         <div className="mt-4 flex flex-wrap gap-2">
           <button className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={!selected?.ready || state === "publishing" || state === "checking"} onClick={() => void publish()} type="button">{state === "publishing" ? "Publishing…" : publication ? "Reopen publication" : "Publish as pull request"}</button>
@@ -423,7 +437,7 @@ export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; ru
     { key: "envelope", label: "Envelope", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => run.userEnvelopeRevision ? `rev ${run.userEnvelopeRevision}` : "—" },
     { key: "status", label: "Status", render: (run: BrowserRunView) => <StatusBadge value={run.phase} /> },
     { key: "runtime", label: "Runtime", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => <span className={run.runtimeUid ? "text-ink" : "text-faint-ink"}>{runtimeLabel(run.runtimeUid)}</span> },
-    { key: "spend", label: "Spend", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "—" },
+    { key: "spend", label: "Spend", className: "text-right tabular-nums", render: (run: BrowserRunView) => run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : "—" },
     { key: "updated", label: "Updated", className: "text-right text-muted-ink", render: (run: BrowserRunView) => relativeTime(run.updatedAt) },
   ];
   return <DataTable
@@ -579,7 +593,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 {run.trigger ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.trigger.actor}</strong> via {run.trigger.event} · <a href={run.trigger.runUrl} rel="noreferrer" target="_blank">{run.trigger.repository}@{run.trigger.ref} ({run.trigger.sha.slice(0, 7)})</a> · {durationLabel(run.createdAt, run.updatedAt)}</div> : <div className="mt-2 text-sm text-muted-ink">Started {dateTime(run.createdAt)} · {durationLabel(run.createdAt, run.updatedAt)}</div>}
                 <div className="mt-1 text-sm text-muted-ink">Origin: {run.origin}{run.package ? ` · Package: ${run.package.source} @ ${run.package.revision} · ${run.package.path} · Prompt: ${run.package.promptSource}` : ""}</div>
               </div>
-              {!admin ? <div className="flex flex-wrap gap-2"><button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={rerunState === "working" || !run.rerunSupported} title={run.rerunSupported ? undefined : run.rerunUnavailableReason ?? "This run cannot be re-run."} onClick={async () => {
+              {!admin ? <div className="flex flex-wrap gap-2"><button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={rerunState === "working" || !run.rerunSupported} title={run.rerunSupported ? undefined : "This run cannot be re-run."} onClick={async () => {
                 if (session.status !== "authenticated") return;
                 setRerunState("working");
                 const idempotencyKey = crypto.randomUUID();
@@ -589,9 +603,9 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
               }} type="button">{rerunState === "working" ? "Starting…" : "Re-run"}</button>{!isTerminalPhase(run.phase) ? <details className="relative"><summary aria-label="More run actions" className="grid min-h-10 min-w-10 cursor-pointer list-none place-items-center rounded-control border bg-panel px-3 text-lg font-semibold">···</summary><div className="absolute right-0 z-10 mt-1 min-w-40 rounded-control border bg-panel p-1 shadow-lg"><button className="w-full rounded-control px-3 py-2 text-left text-sm font-semibold text-err hover:bg-err-soft" disabled={cancelState === "working" || cancelState === "cancelled"} onClick={() => setCancelOpen(true)} type="button">{cancelState === "working" ? "Cancelling…" : cancelState === "cancelled" ? "Cancellation requested" : "Cancel run"}</button></div></details> : null}</div> : null}
             </header>
             {rerunState !== "idle" && rerunState !== "working" ? <p className="text-sm text-err" role="alert">{rerunFailureMessage(rerunState)}{rerunState === "inference-key-missing" ? <> <Link className="font-semibold underline" href="/connections">Open Connections</Link></> : null}</p> : null}
-            {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="text-sm text-err" role="alert">The run could not be cancelled ({cancelState}).</p> : null}
+            {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="text-sm text-err" role="alert">{cancelFailureMessage(cancelState)}</p> : null}
             {inferenceGuidance ? <p className="rounded-control border border-err/30 bg-err-soft px-4 py-3 text-sm text-err" role="alert">{inferenceGuidance} <Link className="font-semibold underline" href="/connections">Open Connections</Link></p> : null}
-            <ConfirmationDialog cancelLabel="Keep running" confirmLabel="Cancel run" description="The agent will stop and its runtime credentials will be revoked. This cannot be undone." onConfirm={() => void cancelRun()} onOpenChange={setCancelOpen} open={cancelOpen} pending={cancelState === "working"} title="Cancel this run?" />
+            <ConfirmationDialog cancelLabel="Keep running" confirmLabel="Cancel run" description="The agent will stop and its temporary credentials will be revoked. This cannot be undone." onConfirm={() => void cancelRun()} onOpenChange={setCancelOpen} open={cancelOpen} pending={cancelState === "working"} title="Cancel this run?" />
             {run.workspace ? <WorkspaceEvidencePanel workspace={run.workspace} /> : null}
             <div className="grid min-h-[540px] overflow-hidden rounded-panel border bg-panel lg:grid-cols-[260px_minmax(0,1fr)]">
               <nav aria-label="Run jobs" className="border-b border-line lg:border-b-0 lg:border-r">
@@ -604,7 +618,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                   ["Workflow version", pinnedWorkflow],
                   ["User envelope revision", admitted?.kind === "admitted" ? admitted.envelopeRevision ?? "—" : run.userEnvelopeRevision ?? "—"],
                   ["Runtime", runtimeBound?.kind === "runtimeBound" ? runtimeBound.runtimeUid : run.runtimeUid ?? "unassigned"],
-                  ["Spend", run.observedSpend ? `${run.observedSpend.observedAmount} ${run.observedSpend.currency}` : "—"],
+                  ["Spend", run.observedSpend ? formatMoney(run.observedSpend.observedAmount, run.observedSpend.currency) : "—"],
                   ["Agent", run.codingAgentRuntime],
                 ].map(([label, value]) => <div className="min-w-0 border-b border-line-soft px-4 py-3 last:border-b-0 sm:border-r xl:border-b-0" key={label}><p className="text-xs text-muted-ink">{label}</p><p className="mt-1 truncate font-mono text-sm font-medium">{value}</p></div>)}</div>
                 <section aria-labelledby="selected-stage" className="p-5">

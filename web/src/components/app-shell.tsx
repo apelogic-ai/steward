@@ -502,16 +502,16 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
         {mobileMenuOpen && session.status === "authenticated" && workspaceAuthorized ? <div aria-label="Navigation" aria-modal="true" className="fixed inset-0 z-50 flex bg-black/30 md:hidden" id="mobile-navigation" ref={mobileNavigationRef} role="dialog"><AppSidebar adminGuideDismissed={adminGuideDismissed} adminMode={adminMode} mobile needsAction={needsAction} onNavigate={closeMobileMenu} onboardingCompleted={onboardingCompleted} onboardingDismissed={onboardingDismissed} session={session} /><button aria-label="Close navigation" className="flex-1" onClick={closeMobileMenu} type="button" /></div> : null}
         <main className="min-w-0 px-4 pt-[18px] pb-16 sm:px-7" id="workspace">
           <div className="mx-auto max-w-[1180px]">
-            {session.status === "loading" ? <StatePanel title="Loading HyperShell"><p>Checking the server-owned session…</p></StatePanel> : null}
+            {session.status === "loading" ? <StatePanel title="Loading HyperShell"><p>Checking your session…</p></StatePanel> : null}
             {session.status === "unauthorized" ? (
               <StatePanel title="Sign in required">
                 <p>Your browser does not have a valid HyperShell session.</p>
                 <a className="mt-5 inline-flex h-10 items-center rounded-control bg-brand px-4 text-sm font-semibold text-on-brand hover:bg-brand-hover" href={authStartPath(pathname)}>Continue with Google</a>
               </StatePanel>
             ) : null}
-            {session.status === "unavailable" ? <StatePanel title="Session unavailable"><p>HyperShell could not reach the authoritative session service. Try again shortly.</p></StatePanel> : null}
-            {session.status === "error" ? <StatePanel title="Session error"><p>The session response was not accepted. No workspace data has been loaded.</p></StatePanel> : null}
-            {session.status === "authenticated" && adminMode && session.value.role !== "admin" ? <StatePanel title="Forbidden"><p>Your server-owned session does not grant administrator access.</p></StatePanel> : null}
+            {session.status === "unavailable" ? <StatePanel title="Session unavailable"><p>HyperShell couldn&apos;t check your session. Try again shortly.</p></StatePanel> : null}
+            {session.status === "error" ? <StatePanel title="Session error"><p>HyperShell couldn&apos;t verify your session. Sign in again or try later.</p></StatePanel> : null}
+            {session.status === "authenticated" && adminMode && session.value.role !== "admin" ? <StatePanel title="Administrator access required"><p>You don&apos;t have permission to open this page.</p></StatePanel> : null}
             {session.status === "authenticated" && accessPending ? <AccessPendingPanel email={session.value.principal.displayEmail} userId={session.value.principal.userId} /> : null}
             {session.status === "authenticated" && workspaceAuthorized ? (
               <>

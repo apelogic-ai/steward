@@ -128,7 +128,7 @@ function repository(overrides: Partial<GithubRepositoryView>): GithubRepositoryV
 test("repository options name each repository and its admission state", () => {
   expect(repositoryOptionLabel(repository({}))).toBe("example-org/agentic-ops · Ready");
   expect(repositoryOptionLabel(repository({ name: "not-admitted", ready: false, missingPrerequisite: "source_repository_not_admitted" })))
-    .toBe("example-org/not-admitted · Not admitted");
+    .toBe("example-org/not-admitted · Not approved");
   expect(repositoryOptionLabel(repository({ name: "other", ready: false, missingPrerequisite: "workflow_scope_missing" })))
     .toBe("example-org/other · Not ready");
 });
@@ -142,11 +142,11 @@ test("repository readiness names the selected repository or states that none is 
   expect(repositoryReadinessMessage([ready, notAdmitted], ready)).toBeNull();
   expect(repositoryReadinessMessage([ready, notAdmitted], undefined)).toBeNull();
   expect(repositoryReadinessMessage([ready, notAdmitted], notAdmitted))
-    .toBe("example-org/not-admitted is not admitted as a governed source on this deployment; ask an administrator to add it.");
+    .toBe("example-org/not-admitted is not approved for runs on this installation. Ask an administrator to add it.");
   expect(repositoryReadinessMessage([ready, missingScope], missingScope))
-    .toBe("example-org/scoped is not ready for governed automation: workflow_scope_missing.");
+    .toBe("example-org/scoped is not ready for runs. Ask an administrator to check its workflow access.");
   expect(repositoryReadinessMessage([notAdmitted, otherNotAdmitted], otherNotAdmitted))
-    .toBe("None of your repositories is admitted as a governed source on this deployment; ask an administrator to add it.");
+    .toBe("None of your repositories is approved for runs on this installation. Ask an administrator to add one.");
   expect(repositoryReadinessMessage([notAdmitted, missingScope], missingScope))
-    .toBe("example-org/scoped is not ready for governed automation: workflow_scope_missing.");
+    .toBe("example-org/scoped is not ready for runs. Ask an administrator to check its workflow access.");
 });

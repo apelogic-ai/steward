@@ -8,6 +8,7 @@ import {
   provisionAdminEnvelope,
   type BrowserEnvelopeTemplateListItem,
 } from "@/api-client";
+import { formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
 import { DefinitionList, EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -35,14 +36,14 @@ export function AdminEnvelopeProvisionView() {
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader
         actions={<Link className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas" href="/admin/envelopes/templates">View templates</Link>}
-        description="Provision an exact template revision directly to an existing canonical user."
+        description="Provision an exact template revision directly to an existing user."
         title="Provision envelope"
       />
       {session.status !== "authenticated" ? (
-        <EmptyState title="Session unavailable"><p>The authoritative administrator session is not available.</p></EmptyState>
+        <EmptyState title="Session unavailable"><p>Sign in again, then retry.</p></EmptyState>
       ) : (
         <ResourceBoundary state={state}>{(options) => options.templates.length === 0 ? (
-          <EmptyState title="No templates"><p>Create an envelope template before provisioning authority directly to a user.</p></EmptyState>
+          <EmptyState title="No templates"><p>Create an envelope template before provisioning an Envelope directly to a user.</p></EmptyState>
         ) : <ProvisionForm csrf={session.value.csrf} options={options} />}</ResourceBoundary>
       )}
     </section>
@@ -81,17 +82,17 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
   }
 
   const failure = status !== "idle" && status !== "submitting" && status !== "provisioned" ? {
-    conflict: "The selected envelope conflicts with the user's active authority. Reload before retrying.",
+    conflict: "The selected Envelope conflicts with the user's active Envelope. Reload before retrying.",
     rejected: "The user is not eligible for this template or the requested envelope is invalid.",
     forbidden: "You are not allowed to provision this envelope.",
-    unavailable: "The authoritative envelope service is unavailable.",
+    unavailable: "HyperShell couldn't reach the Envelope service. Try again in a moment.",
     error: "The user or exact template revision could not be provisioned.",
   }[status] : null;
 
   return (
     <form className="space-y-6 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
       <div className="grid gap-5 md:grid-cols-2">
-        <label className="grid gap-2 text-sm font-semibold">Canonical user ID
+        <label className="grid gap-2 text-sm font-semibold">User ID
           <input className="min-h-11 min-w-0 rounded-md border bg-panel px-3 font-mono font-normal" disabled={status === "submitting"} onChange={(event) => { setOwnerUserId(event.target.value); idempotencyKey.current = null; setStatus("idle"); }} placeholder="usr_…" required value={ownerUserId} />
         </label>
         <label className="grid gap-2 text-sm font-semibold">Template
@@ -101,17 +102,18 @@ function ProvisionForm({ csrf, options }: Readonly<{ csrf: string; options: Prov
         </label>
       </div>
       <section aria-labelledby="provision-summary-title" className="space-y-3 rounded-md border bg-canvas p-4">
-        <h2 className="font-semibold" id="provision-summary-title">Authority to provision</h2>
+        <h2 className="font-semibold" id="provision-summary-title">Envelope to provision</h2>
         <DefinitionList items={[
           ["Eligible roles", template.memberRoles.join(", ")],
-          ["Monthly limit", `${template.envelope.spec.budget.monthlyLimit} ${template.envelope.spec.budget.currency}`],
-          ["Runtime minutes", template.envelope.spec.runtimeMinutesLimit ? `${template.envelope.spec.runtimeMinutesLimit} min / month` : "Unlimited"],
-          ["TTL", template.envelope.spec.ttl],
-          ["Models", template.envelope.spec.llms.length.toString()],
-          ["Tools", template.envelope.spec.tools.length.toString()],
+          ["Monthly limit", formatMoney(template.envelope.spec.budget.monthlyLimit, template.envelope.spec.budget.currency)],
+          ["Limit per run", template.envelope.spec.budget.singleRunLimit ? formatMoney(template.envelope.spec.budget.singleRunLimit, template.envelope.spec.budget.currency) : "Unlimited"],
+          ["Runtime limit per month", template.envelope.spec.runtimeMinutesLimit ? formatDuration(template.envelope.spec.runtimeMinutesLimit, "minutes") : "Unlimited"],
+          ["Time-to-live limit", formatDuration(template.envelope.spec.ttl)],
+          ["Models", formatCount(template.envelope.spec.llms.length, "model")],
+          ["Tools", formatCount(template.envelope.spec.tools.length, "tool")],
         ]} />
       </section>
-      <p className="text-sm text-muted-ink">The selected user remains the immutable owner. Your canonical administrator identity is recorded as the actor.</p>
+      <p className="text-sm text-muted-ink">The selected user remains the owner. Your administrator identity is recorded as the person who made this change.</p>
       {status === "provisioned" ? <p className="rounded-md bg-notice p-4 text-sm" role="status"><strong>Envelope provisioned.</strong>{provisionedId ? ` Instance ${provisionedId}.` : ""}</p> : null}
       {failure ? <p className="text-sm text-red-800" role="alert">{failure}</p> : null}
       <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={status === "submitting"} type="submit">{status === "submitting" ? "Provisioning…" : "Provision envelope"}</button>

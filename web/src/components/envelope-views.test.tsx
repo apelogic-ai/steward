@@ -15,7 +15,8 @@ describe("envelope run history", () => {
   test("uses the approved request copy and explicit units", () => {
     expect(source).toContain("Pick an existing template and adjust it, or create your own envelope request.");
     expect(source).toContain("Limit per run");
-    expect(source).toContain("`${template.ceiling.spec.runtimeMinutesLimit} minutes`");
+    expect(source).toContain("formatDuration(template.ceiling.spec.runtimeMinutesLimit, \"minutes\")");
+    expect(source).toContain("formatMoney(spend.observed, spend.currency)");
     expect(source).toContain("Workflow rendering is unavailable. Try again.");
     expect(source).not.toContain("authoritative workflow service");
   });
@@ -64,8 +65,8 @@ describe("envelope request review summary", () => {
       exceedances: [
         { ceiling: "100.00 USD", label: "Monthly limit", requested: "101.00 USD" },
         { ceiling: "10.00 USD", label: "Limit per run", requested: "11.00 USD" },
-        { ceiling: "60 minutes", label: "Runtime minutes", requested: "61 minutes" },
-        { ceiling: "1h", label: "Time to live", requested: "61m" },
+        { ceiling: "1 h", label: "Runtime limit per month", requested: "1 h 1 min" },
+        { ceiling: "1 h", label: "Time-to-live limit", requested: "1 h 1 min" },
       ],
       requiresApproval: true,
     });
