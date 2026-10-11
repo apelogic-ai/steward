@@ -229,6 +229,25 @@ subset check. At Task admission, Steward intersects that approved User Envelope 
 the chart deployment ceiling and any per-entry Task limits before reserving a runtime.
 
 Developers can declare `workspace` directly in a `steward.task-definition/v2` package.
+Use the repository name and a branch or tag name; Steward resolves both through the
+source GitHub App and authorizes the resulting stable repository ID before reserving a
+Task:
+
+```json
+{
+  "workspace": [
+    {
+      "git": {
+        "repository": "example-org/repository",
+        "ref": "main"
+      }
+    }
+  ]
+}
+```
+
+The older stable-ID selector remains accepted for existing package digests. Evidence
+and `.steward-workspace.json` always record the resolved stable IDs and exact commit.
 For an inline browser run, **Check out this repository** writes the equivalent entry
 using the selected admitted repository and resolves its default-branch HEAD at
 submission. Tasks that omit `workspace` retain their existing behavior.

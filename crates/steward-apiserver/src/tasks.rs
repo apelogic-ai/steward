@@ -27,8 +27,9 @@ use steward_admission::{
 };
 use steward_ports::{
     GitFile, GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
-    GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree, GitTreeRequest,
-    MAX_TASK_INPUT_ARCHIVE_BYTES, TaskExecutionAdapter, TaskExecutionPlanRequest,
+    GitRepositoryDescriptionFailure, GitRepositoryIdentity, GitRepositoryReference,
+    GitRevisionRequest, GitTree, GitTreeRequest, MAX_TASK_INPUT_ARCHIVE_BYTES,
+    TaskExecutionAdapter, TaskExecutionPlanRequest,
 };
 use steward_store::{
     EnvelopeRequestRecord, FederatedSubjectObservation, FederatedSubjectRecord,
@@ -46,8 +47,8 @@ use steward_types::direct_package::{
     ResolvedWorkspaceEntry, ResolvedWorkspaceSubmodule, SourceProvenance, StableProviderId,
     TASK_BINDING_EVIDENCE_SCHEMA, TaskOrigin, TriggerRepository, WorkspaceAuthority,
     WorkspaceEntry, WorkspaceEntryType, WorkspaceEvidence, WorkspaceGitHistory,
-    WorkspaceGitRepository, WorkspaceName, WorkspacePath, WorkspaceSubmoduleMode,
-    WorkspaceSubmoduleStatus, canonical_json_bytes,
+    WorkspaceGitRepository, WorkspaceGitRepositoryName, WorkspaceName, WorkspacePath,
+    WorkspaceSubmoduleMode, WorkspaceSubmoduleStatus, canonical_json_bytes,
 };
 use steward_types::task_input_archive::{frame_task_input_archive, split_task_input_archive};
 use steward_types::task_output_archive::{
@@ -185,6 +186,13 @@ pub(crate) type DescribedRepositories<'a> = std::pin::Pin<
 >;
 
 trait DirectGitResolver: Send + Sync {
+    fn repository_web_origin(&self) -> Option<String>;
+
+    fn classify_repository_description_failure(
+        &self,
+        error: &steward_ports::PortError,
+    ) -> GitRepositoryDescriptionFailure;
+
     fn describe_repositories<'a>(
         &'a self,
         repositories: &'a [GitRepositoryReference],
@@ -334,6 +342,17 @@ impl<G> DirectGitResolver for G
 where
     G: GitHostingPlane,
 {
+    fn repository_web_origin(&self) -> Option<String> {
+        GitHostingPlane::repository_web_origin(self)
+    }
+
+    fn classify_repository_description_failure(
+        &self,
+        error: &steward_ports::PortError,
+    ) -> GitRepositoryDescriptionFailure {
+        GitHostingPlane::classify_repository_description_failure(self, error)
+    }
+
     fn describe_repositories<'a>(
         &'a self,
         repositories: &'a [GitRepositoryReference],
@@ -601,6 +620,31 @@ impl TaskApiConfig {
                 Some(GitRepositoryReference {
                     repository_owner_id: StableProviderId::parse(source_owner_id.as_str()).ok()?,
                     repository_id: StableProviderId::parse(source_repository_id.as_str()).ok()?,
+                })
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn workspace_source_repository_references(
+        &self,
+        caller: Option<&TriggerRepository>,
+        browser: bool,
+    ) -> Vec<GitRepositoryReference> {
+        self.source_repository_bindings
+            .iter()
+            .filter(|(caller_owner_id, caller_repository_id, _, _)| {
+                browser
+                    || caller.is_some_and(|caller| {
+                        caller_owner_id == caller.owner_id.as_str()
+                            && caller_repository_id == caller.id.as_str()
+                    })
+            })
+            .filter_map(|(_, _, source_owner_id, source_repository_id)| {
+                Some(GitRepositoryReference {
+                    repository_owner_id: StableProviderId::parse(source_owner_id).ok()?,
+                    repository_id: StableProviderId::parse(source_repository_id).ok()?,
                 })
             })
             .collect::<BTreeSet<_>>()
@@ -2574,9 +2618,18 @@ where
             )
             .await
             .map_err(ApiError::Store)?;
-        let resolved =
-            resolve_browser_package_pre_admission(&self.ledger, &self.config, &identity, request)
-                .await?;
+        let persisted_workspace = existing
+            .as_ref()
+            .and_then(|record| record.browser_task_evidence.as_ref())
+            .and_then(|evidence| evidence.workspace.as_ref());
+        let resolved = resolve_browser_package_pre_admission(
+            &self.ledger,
+            &self.config,
+            &identity,
+            request,
+            persisted_workspace,
+        )
+        .await?;
         if let Some(record) = existing {
             let envelope_digest = resolved
                 .envelope
@@ -2710,9 +2763,18 @@ where
         let task_uid = existing
             .as_ref()
             .map_or_else(Uuid::new_v4, |record| record.task_uid);
-        let pre_admission =
-            resolve_direct_task_pre_admission(&self.ledger, &self.config, &identity, request)
-                .await?;
+        let persisted_workspace = existing
+            .as_ref()
+            .and_then(|record| record.direct_task_evidence.as_ref())
+            .and_then(|evidence| evidence.workspace.as_ref());
+        let pre_admission = resolve_direct_task_pre_admission(
+            &self.ledger,
+            &self.config,
+            &identity,
+            request,
+            persisted_workspace,
+        )
+        .await?;
         let evidence = direct_task_evidence(
             task_uid,
             identity
@@ -3108,6 +3170,43 @@ where
     let mut materialized_bytes = scratch_reserved_bytes;
     let mut materialized_files = 0_u64;
     let mut resolution_budget = WorkspaceResolutionBudget::default();
+    let named_repositories = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            WorkspaceEntry::Git(entry) => match &entry.git.repository {
+                WorkspaceGitRepository::Named(name) => Some(name),
+                _ => None,
+            },
+            WorkspaceEntry::Scratch(_) => None,
+        })
+        .collect::<Vec<_>>();
+    for requested in &named_repositories {
+        let git = git.ok_or_else(|| {
+            ApiError::TaskRuntimeContractUnavailable(
+                "workspace_git_source_resolver_unavailable".to_owned(),
+            )
+        })?;
+        validate_named_workspace_repository_origin(config, git.as_ref(), requested)?;
+    }
+    let named_repository_catalog = if named_repositories.is_empty() {
+        None
+    } else {
+        let git = git.ok_or_else(|| {
+            ApiError::TaskRuntimeContractUnavailable(
+                "workspace_git_source_resolver_unavailable".to_owned(),
+            )
+        })?;
+        Some(
+            load_named_workspace_repository_catalog(
+                config,
+                git.as_ref(),
+                context.caller,
+                context.browser,
+                &mut resolution_budget,
+            )
+            .await?,
+        )
+    };
     for entry in entries {
         validate_workspace_policy(&config.workspace_policy, &policy, entry)?;
         let resolved_entry = match entry {
@@ -3117,27 +3216,41 @@ where
                         "workspace_git_source_resolver_unavailable".to_owned(),
                     )
                 })?;
-                let (repository, is_self) = match &entry.git.repository {
+                let (repository, description, is_self, authorized_by_resolution) = match &entry
+                    .git
+                    .repository
+                {
                     WorkspaceGitRepository::SelfRepository => (
                         context.self_repository.cloned().ok_or_else(|| {
                             ApiError::Admission("workspace_git_self_unavailable".to_owned())
                         })?,
+                        None,
+                        true,
                         true,
                     ),
+                    WorkspaceGitRepository::Named(name) => {
+                        let catalog = named_repository_catalog.as_ref().ok_or_else(|| {
+                                ApiError::TaskRuntimeContractUnavailable(
+                                    "Steward could not verify the workspace repository. Retry the request; if it persists, contact a Steward administrator."
+                                        .to_owned(),
+                                )
+                            })?;
+                        let (repository, description) =
+                            resolve_named_workspace_repository(config, name, catalog)?;
+                        (repository, Some(description), false, true)
+                    }
                     WorkspaceGitRepository::Explicit(reference) => {
                         let reference = GitRepositoryReference {
                             repository_owner_id: reference.owner_id.clone(),
                             repository_id: reference.repository_id.clone(),
                         };
-                        (
-                            describe_workspace_repository(git.as_ref(), &reference)
-                                .await?
-                                .0,
-                            false,
-                        )
+                        let (repository, description) =
+                            describe_workspace_repository(git.as_ref(), &reference).await?;
+                        (repository, Some(description), false, false)
                     }
                 };
                 if !is_self
+                    && !authorized_by_resolution
                     && !workspace_repository_is_authorized(
                         ledger,
                         config,
@@ -3151,20 +3264,35 @@ where
                         "workspace_git_repository_not_admitted".to_owned(),
                     ));
                 }
-                let (_, description) = describe_workspace_repository(
-                    git.as_ref(),
-                    &GitRepositoryReference {
-                        repository_owner_id: repository.repository_owner_id.clone(),
-                        repository_id: repository.repository_id.clone(),
-                    },
-                )
-                .await?;
+                let description = match description {
+                    Some(description) => description,
+                    None => {
+                        describe_workspace_repository(
+                            git.as_ref(),
+                            &GitRepositoryReference {
+                                repository_owner_id: repository.repository_owner_id.clone(),
+                                repository_id: repository.repository_id.clone(),
+                            },
+                        )
+                        .await?
+                        .1
+                    }
+                };
                 let name = match &entry.git.name {
                     Some(name) => name.clone(),
                     None => default_workspace_name(&description.name)?,
                 };
                 let commit = match &entry.git.git_ref {
                     steward_types::direct_package::WorkspaceGitRef::Exact(commit) => commit.clone(),
+                    steward_types::direct_package::WorkspaceGitRef::Named(reference) => git
+                        .resolve_revision(&GitRevisionRequest {
+                            repository: repository.clone(),
+                            reference: reference.as_str().to_owned(),
+                        })
+                        .await
+                        .map_err(|error| {
+                            source_port_error_with_reporter(config, "resolve_revision", error)
+                        })?,
                     steward_types::direct_package::WorkspaceGitRef::Trigger
                         if is_self && context.trigger_commit.is_some() =>
                     {
@@ -3492,11 +3620,27 @@ const MAX_GITMODULES_BYTES: u64 = 1024 * 1024;
 
 #[derive(Default)]
 struct WorkspaceResolutionBudget {
+    repository_descriptions: usize,
     submodules: usize,
     tree_reads: usize,
 }
 
 impl WorkspaceResolutionBudget {
+    fn consume_repository_descriptions(&mut self, count: usize) -> Result<(), ApiError> {
+        self.repository_descriptions =
+            self.repository_descriptions
+                .checked_add(count)
+                .ok_or_else(|| {
+                    ApiError::Admission("workspace_git_resolution_limit_exceeded".to_owned())
+                })?;
+        if self.repository_descriptions > MAX_SOURCE_REPOSITORY_BINDINGS {
+            return Err(ApiError::Admission(
+                "workspace_git_resolution_limit_exceeded".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn consume_tree_read(&mut self, policy: &WorkspaceAdmissionPolicy) -> Result<(), ApiError> {
         self.tree_reads = self.tree_reads.checked_add(1).ok_or_else(|| {
             ApiError::Admission("workspace_git_resolution_limit_exceeded".to_owned())
@@ -4034,6 +4178,7 @@ async fn resolve_browser_package_pre_admission<L>(
     config: &TaskApiConfig,
     identity: &TaskIdentity,
     request: &BrowserTaskSubmission,
+    persisted_workspace: Option<&WorkspaceEvidence>,
 ) -> Result<BrowserTaskPreAdmission, ApiError>
 where
     L: TaskSubmissionLedger,
@@ -4223,19 +4368,24 @@ where
         resolve_direct_execution_plan(config, &definition, &prompt, &spec, &model)?;
     let workspace_trigger_commit =
         browser_workspace_trigger_commit(workspace_self_repository.as_ref(), &revision)?;
-    let workspace = resolve_workspace_evidence(
-        ledger,
-        config,
-        &definition.workspace,
-        approved.spec.workspace.as_ref(),
-        WorkspaceResolutionContext {
-            self_repository: workspace_self_repository.as_ref(),
-            trigger_commit: workspace_trigger_commit.as_ref(),
-            caller: None,
-            browser: true,
-        },
-    )
-    .await?;
+    let workspace = match persisted_workspace {
+        Some(workspace) => Some(workspace.clone()),
+        None => {
+            resolve_workspace_evidence(
+                ledger,
+                config,
+                &definition.workspace,
+                approved.spec.workspace.as_ref(),
+                WorkspaceResolutionContext {
+                    self_repository: workspace_self_repository.as_ref(),
+                    trigger_commit: workspace_trigger_commit.as_ref(),
+                    caller: None,
+                    browser: true,
+                },
+            )
+            .await?
+        }
+    };
     let evidence = BrowserTaskEvidence {
         source: request.package.source.clone(),
         revision,
@@ -4709,6 +4859,7 @@ async fn resolve_direct_task_pre_admission<L>(
     config: &TaskApiConfig,
     identity: &TaskIdentity,
     request: &DirectTaskSubmission,
+    persisted_workspace: Option<&WorkspaceEvidence>,
 ) -> Result<DirectTaskPreAdmission, ApiError>
 where
     L: TaskSubmissionLedger,
@@ -4725,8 +4876,14 @@ where
             "direct package Git source resolver is unavailable".to_owned(),
         )
     })?;
+    let source_origin = git.repository_web_origin().ok_or_else(|| {
+        ApiError::TaskRuntimeContractUnavailable(
+            "direct package Git source host is unavailable".to_owned(),
+        )
+    })?;
     let invocation_repository = RepositoryUrl::parse(format!(
-        "https://github.com/{}.git",
+        "{}/{}.git",
+        source_origin.trim_end_matches('/'),
         provenance.repository.name.as_str()
     ))
     .map_err(|_| ApiError::TaskAuthentication)?;
@@ -4919,19 +5076,24 @@ where
     let (command, execution_binding) =
         resolve_direct_execution_plan(config, &definition, &prompt, &spec, &model)?;
     let prompt_source = PromptSourceKind::for_definition(&definition);
-    let workspace = resolve_workspace_evidence(
-        ledger,
-        config,
-        &definition.workspace,
-        approved.spec.workspace.as_ref(),
-        WorkspaceResolutionContext {
-            self_repository: Some(&invocation_identity),
-            trigger_commit: Some(&provenance.triggered_sha),
-            caller: Some(&provenance.repository),
-            browser: false,
-        },
-    )
-    .await?;
+    let workspace = match persisted_workspace {
+        Some(workspace) => Some(workspace.clone()),
+        None => {
+            resolve_workspace_evidence(
+                ledger,
+                config,
+                &definition.workspace,
+                approved.spec.workspace.as_ref(),
+                WorkspaceResolutionContext {
+                    self_repository: Some(&invocation_identity),
+                    trigger_commit: Some(&provenance.triggered_sha),
+                    caller: Some(&provenance.repository),
+                    browser: false,
+                },
+            )
+            .await?
+        }
+    };
     Ok(DirectTaskPreAdmission {
         definition,
         invocation_kind,
@@ -5366,6 +5528,167 @@ fn git_reference(reference: &str) -> Result<String, ApiError> {
         ));
     }
     Ok(format!("git:ref:{reference}"))
+}
+
+struct NamedWorkspaceRepositoryCatalog {
+    repositories: Vec<(GitRepositoryIdentity, GitRepositoryDescription)>,
+    had_transient_failure: bool,
+}
+
+fn validate_named_workspace_repository_origin(
+    config: &TaskApiConfig,
+    git: &dyn DirectGitResolver,
+    requested: &WorkspaceGitRepositoryName,
+) -> Result<(), ApiError> {
+    let Some(requested_host) = requested.web_origin() else {
+        return Ok(());
+    };
+    let configured_origin = git.repository_web_origin().ok_or_else(|| {
+        ApiError::TaskRuntimeContractUnavailable(
+            "Steward could not verify the configured source host. Retry the request; if it persists, contact a Steward administrator."
+                .to_owned(),
+        )
+    })?;
+    let configured_host = configured_origin
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| {
+            ApiError::TaskRuntimeContractUnavailable(
+                "Steward could not verify the configured source host. Retry the request; if it persists, contact a Steward administrator."
+                    .to_owned(),
+            )
+        })?;
+    if requested_host.eq_ignore_ascii_case(configured_host) {
+        return Ok(());
+    }
+    config.report_source_port_failure(
+        "resolve_named_repository",
+        "rejected",
+        "source_host_mismatch",
+    );
+    Err(ApiError::Admission(format!(
+        "Workspace repository links must use the configured source host {configured_host}."
+    )))
+}
+
+async fn load_named_workspace_repository_catalog(
+    config: &TaskApiConfig,
+    git: &dyn DirectGitResolver,
+    caller: Option<&TriggerRepository>,
+    browser: bool,
+    budget: &mut WorkspaceResolutionBudget,
+) -> Result<NamedWorkspaceRepositoryCatalog, ApiError> {
+    let references = config.workspace_source_repository_references(caller, browser);
+    budget.consume_repository_descriptions(references.len())?;
+    let mut descriptions = git.describe_repositories(&references);
+    let mut repositories = Vec::with_capacity(references.len());
+    let mut had_transient_failure = false;
+    while let Some((index, result)) = descriptions.next().await {
+        let Some(reference) = references.get(index) else {
+            config.report_source_port_failure(
+                "describe_repositories",
+                "failed",
+                "source_unavailable",
+            );
+            had_transient_failure = true;
+            continue;
+        };
+        let description = match result {
+            Ok(description) => description,
+            Err(error) => {
+                let (category, diagnostic, transient) =
+                    match git.classify_repository_description_failure(&error) {
+                        GitRepositoryDescriptionFailure::Throttled => ("failed", "throttled", true),
+                        GitRepositoryDescriptionFailure::SourceUnavailable => {
+                            ("failed", "source_unavailable", true)
+                        }
+                        GitRepositoryDescriptionFailure::NotInstalled => {
+                            ("rejected", "not_installed", false)
+                        }
+                        GitRepositoryDescriptionFailure::MetadataInvalid => {
+                            ("rejected", "metadata_invalid", false)
+                        }
+                    };
+                config.report_source_port_failure("describe_repositories", category, diagnostic);
+                had_transient_failure |= transient;
+                continue;
+            }
+        };
+        if description.repository_owner_id != reference.repository_owner_id
+            || description.repository_id != reference.repository_id
+        {
+            config.report_source_port_failure(
+                "describe_repositories",
+                "rejected",
+                "metadata_invalid",
+            );
+            continue;
+        }
+        let repository = match RepositoryUrl::parse(format!("{}.git", description.web_url)) {
+            Ok(repository) => repository,
+            Err(_) => {
+                config.report_source_port_failure(
+                    "describe_repositories",
+                    "rejected",
+                    "metadata_invalid",
+                );
+                continue;
+            }
+        };
+        repositories.push((
+            GitRepositoryIdentity {
+                repository,
+                repository_id: description.repository_id.clone(),
+                repository_owner_id: description.repository_owner_id.clone(),
+            },
+            description,
+        ));
+    }
+    Ok(NamedWorkspaceRepositoryCatalog {
+        repositories,
+        had_transient_failure,
+    })
+}
+
+fn resolve_named_workspace_repository(
+    config: &TaskApiConfig,
+    requested: &WorkspaceGitRepositoryName,
+    catalog: &NamedWorkspaceRepositoryCatalog,
+) -> Result<(GitRepositoryIdentity, GitRepositoryDescription), ApiError> {
+    let mut matches = catalog.repositories.iter().filter(|(_, description)| {
+        requested
+            .full_name()
+            .eq_ignore_ascii_case(&format!("{}/{}", description.owner, description.name))
+            && requested
+                .web_url()
+                .is_none_or(|url| url.eq_ignore_ascii_case(&description.web_url))
+    });
+    let Some(matched) = matches.next() else {
+        if catalog.had_transient_failure {
+            return Err(ApiError::TaskRuntimeContractUnavailable(
+                "Steward could not verify the workspace repository. Retry the request; if it persists, contact a Steward administrator."
+                    .to_owned(),
+            ));
+        }
+        config.report_source_port_failure("resolve_named_repository", "rejected", "not_bound");
+        return Err(ApiError::Admission(
+            "The requested workspace repository is unavailable. Ask a Steward administrator to verify that it is allowed and accessible."
+                .to_owned(),
+        ));
+    };
+    if matches.next().is_some() {
+        config.report_source_port_failure(
+            "resolve_named_repository",
+            "failed",
+            "source_binding_ambiguous",
+        );
+        return Err(ApiError::TaskRuntimeContractUnavailable(
+            "More than one allowed workspace repository matched that name. Ask a Steward administrator to correct the repository list."
+                .to_owned(),
+        ));
+    }
+    Ok(matched.clone())
 }
 
 fn source_port_error_with_reporter(
@@ -5960,9 +6283,9 @@ mod workflow_request_tests {
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{Envelope, EnvelopeSpec};
     use steward_ports::{
-        GitFile, GitFileRequest, GitPack, GitPackRequest, GitRepositoryIdentity,
-        GitRepositoryReference, GitRevisionRequest, GitTree, GitTreeEntry, GitTreePath,
-        GitTreeRequest, PortError, TaskExecutionAdapter, TaskExecutionPlan,
+        GitFile, GitFileRequest, GitPack, GitPackRequest, GitRepositoryDescriptionFailure,
+        GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree, GitTreeEntry,
+        GitTreePath, GitTreeRequest, PortError, TaskExecutionAdapter, TaskExecutionPlan,
         TaskExecutionPlanRequest,
     };
     use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
@@ -6025,6 +6348,17 @@ mod workflow_request_tests {
     }
 
     impl DirectGitResolver for OversizedPackResolver {
+        fn repository_web_origin(&self) -> Option<String> {
+            None
+        }
+
+        fn classify_repository_description_failure(
+            &self,
+            _error: &PortError,
+        ) -> GitRepositoryDescriptionFailure {
+            GitRepositoryDescriptionFailure::SourceUnavailable
+        }
+
         fn describe_repositories<'a>(
             &'a self,
             _repositories: &'a [GitRepositoryReference],
