@@ -506,7 +506,9 @@ impl GitHubSourceAdapter {
             return Err(rejected("GitHub returned an inconsistent Git blob"));
         }
         if blob.size > max_bytes {
-            return Err(rejected("Git file exceeds the requested byte bound"));
+            return Err(PortError::LimitExceeded {
+                resource: "Git file bytes",
+            });
         }
         let compact: String = blob
             .content
@@ -517,7 +519,13 @@ impl GitHubSourceAdapter {
             .decode(compact.as_bytes())
             .map_err(|_| rejected("GitHub returned invalid blob encoding"))?;
         if bytes.len() as u64 != blob.size || bytes.len() as u64 > max_bytes {
-            return Err(rejected("GitHub returned an inconsistent Git blob size"));
+            return Err(if bytes.len() as u64 > max_bytes {
+                PortError::LimitExceeded {
+                    resource: "Git file bytes",
+                }
+            } else {
+                rejected("GitHub returned an inconsistent Git blob size")
+            });
         }
         Ok(bytes)
     }
@@ -847,13 +855,9 @@ impl GitHostingPlane for GitHubSourceAdapter {
         let response = read_bounded(response, response_bound, "read exact Git pack")
             .await
             .map_err(|error| match error {
-                PortError::Rejected { ref reason }
-                    if reason == "GitHub response exceeds the configured byte bound" =>
-                {
-                    PortError::LimitExceeded {
-                        resource: "Git pack bytes",
-                    }
-                }
+                PortError::LimitExceeded { .. } => PortError::LimitExceeded {
+                    resource: "Git pack bytes",
+                },
                 error => error,
             })?;
         let (bytes, shallow) = decode_upload_pack_result(&response, request.max_bytes)?;
@@ -1357,9 +1361,9 @@ async fn read_bounded(
         .content_length()
         .is_some_and(|length| length > max_bytes)
     {
-        return Err(rejected(
-            "GitHub response exceeds the configured byte bound",
-        ));
+        return Err(PortError::LimitExceeded {
+            resource: "GitHub response bytes",
+        });
     }
     let capacity = usize::try_from(max_bytes.min(64 * 1024)).unwrap_or(0);
     let mut bytes = Vec::with_capacity(capacity);
@@ -1367,11 +1371,13 @@ async fn read_bounded(
         let next_len = bytes
             .len()
             .checked_add(chunk.len())
-            .ok_or_else(|| rejected("GitHub response exceeds the configured byte bound"))?;
+            .ok_or(PortError::LimitExceeded {
+                resource: "GitHub response bytes",
+            })?;
         if next_len as u64 > max_bytes {
-            return Err(rejected(
-                "GitHub response exceeds the configured byte bound",
-            ));
+            return Err(PortError::LimitExceeded {
+                resource: "GitHub response bytes",
+            });
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -1459,7 +1465,7 @@ mod tests {
 
     use super::{
         ACCESS_REJECTED_REASON, GitHubSourceAdapter, decode_upload_pack_result,
-        encode_upload_pack_request,
+        encode_upload_pack_request, read_bounded,
     };
 
     const CLONE_ORIGIN: &str = "https://github.example.test";
@@ -2114,11 +2120,31 @@ mod tests {
             })),
         ]);
         let oversized = MockGitHub::start(responses)?;
-        assert_rejected(
+        assert!(matches!(
             adapter(&oversized)?.read_file(&request()?).await,
-            "Git file exceeds the requested byte bound",
-        );
+            Err(PortError::LimitExceeded {
+                resource: "Git file bytes"
+            })
+        ));
         oversized.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_response_reports_a_typed_limit_error() -> Result<(), String> {
+        let mock = MockGitHub::start(vec![ResponseSpec::status(200, "oversized")])?;
+        let response = reqwest::Client::new()
+            .get(&mock.origin)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            read_bounded(response, 4, "read fixture").await,
+            Err(PortError::LimitExceeded {
+                resource: "GitHub response bytes"
+            })
+        ));
+        mock.finish()?;
         Ok(())
     }
 

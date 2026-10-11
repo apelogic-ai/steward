@@ -576,9 +576,11 @@ Steward release namespace also creates `steward-workflows`.
   `enabledTypes` selects `git` and/or `scratch`; `maxTotalSize`, `maxFiles`,
   `maxHistoryDepth`, `maxSubmoduleDepth`, `maxSubmodulesPerEntry`,
   `maxTotalSubmodules`, and `maxTreeReads` are deployment ceilings.
-  `scratchVolumeSize` is the real OpenShell workspace backing capacity; a Task may
-  request no more than that capacity. Git source access still comes only from stable
-  `githubSource.bindings`; no Git credential enters the sandbox.
+  `scratchVolumeSize` is the fixed OpenShell workspace backing capacity. A Task may
+  request a smaller scratch size, but receives the whole fixed volume. Steward rejects
+  scratch when that volume is larger than the selected Envelope allows. Git source
+  access still comes only from stable `githubSource.bindings`; no Git credential enters
+  the sandbox.
 - `config.apiserver.starterTask` is the optional deployment-owned default shown by
   **Get started** and **Run now**. It is a complete inline TaskDefinition plus its
   default inputs, execution-log choice, repository package path, and optional Git and

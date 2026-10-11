@@ -468,9 +468,7 @@ mod tests {
             template_id: None,
             eligibility_member_role: Some("engineer".to_owned()),
             member_role: Some("engineer".to_owned()),
-            counterexample:
-                "envelope exceeded: budget.monthlyLimit requested 220.00 USD, ceiling 200.00 USD"
-                    .to_owned(),
+            counterexample: "Monthly budget: requested $220.00, limit $200.00".to_owned(),
         };
 
         let reference = adapter
@@ -497,7 +495,7 @@ mod tests {
             "runtime-a",
             "bob@example.org",
             "engineer",
-            "requested 220.00 USD",
+            "requested $220.00",
         ] {
             assert!(
                 create.contains(expected),

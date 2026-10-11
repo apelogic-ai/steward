@@ -52,8 +52,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   one-boundary binary creates a default-template revision, disable
   `config.apiserver.defaultLlmTemplate.enabled` before rolling back to v0.3.15;
   the previous binary will not start with that setting enabled against the
-  threshold-free revision. Do not delete generated revisions or rewrite pending
-  requests and provisioned Envelope history.
+  threshold-free revision. In addition, v0.3.16 Task evidence records requested
+  authority, runtime minutes, and the effective full-history depth under the existing
+  evidence schema. After v0.3.16 creates a Task, do not downgrade to v0.3.15: that
+  binary cannot read the added evidence fields. Do not delete generated revisions or
+  rewrite pending requests and provisioned Envelope history.
 
 ## [0.3.15] - 2026-10-09
 

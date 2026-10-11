@@ -359,6 +359,7 @@ pub struct GrantRevocationRequest {
         task_delete_contract,
         browser_auth::session,
         admin_setup::get_setup_status,
+        user_envelopes::user_capabilities,
         user_envelopes::list_templates,
         user_envelopes::list_requests,
         user_envelopes::get_request,
@@ -493,6 +494,7 @@ pub struct GrantRevocationRequest {
         browser_admin::DisableFederatedSubjectBody,
         browser_admin::BrowserCapabilityCatalogResponse,
         tasks::WorkspaceDeploymentCapabilities,
+        user_envelopes::UserCapabilitiesResponse,
         browser_members::BrowserMemberView,
         browser_members::BrowserMemberIdentityView,
         browser_members::BrowserMemberDetailView,
@@ -3889,6 +3891,50 @@ mod tests {
         submit_budget_increase, submit_runtime_request, task_router, token_review_request,
     };
 
+    fn evidence_value_without_v0_3_16_fields<T: serde::Serialize>(
+        evidence: &T,
+        browser: bool,
+    ) -> Result<serde_json::Value, String> {
+        let mut value = serde_json::to_value(evidence)
+            .map_err(|error| format!("serialize v0.3.15 evidence fixture: {error}"))?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| "evidence fixture must be an object".to_owned())?;
+        object.remove("requestedRequirements");
+        object.remove("requestedDiagnostics");
+        object.remove("requestedWorkspace");
+        if browser {
+            object.remove("effectiveRequirements");
+        } else if let Some(authority) = object
+            .get_mut("effectiveRequirements")
+            .and_then(|requirements| requirements.get_mut("authority"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            authority.remove("runtimeMinutesLimit");
+        }
+        if let Some(workspace) = object
+            .get_mut("workspace")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            workspace.remove("maxHistoryDepth");
+        }
+        Ok(value)
+    }
+
+    fn direct_evidence_v0_3_15(
+        evidence: &steward_types::direct_package::DirectTaskBindingEvidence,
+    ) -> Result<steward_types::direct_package::DirectTaskBindingEvidence, String> {
+        serde_json::from_value(evidence_value_without_v0_3_16_fields(evidence, false)?)
+            .map_err(|error| format!("parse v0.3.15 direct evidence fixture: {error}"))
+    }
+
+    fn browser_evidence_v0_3_15(
+        evidence: &steward_types::direct_package::BrowserTaskEvidence,
+    ) -> Result<steward_types::direct_package::BrowserTaskEvidence, String> {
+        serde_json::from_value(evidence_value_without_v0_3_16_fields(evidence, true)?)
+            .map_err(|error| format!("parse v0.3.15 browser evidence fixture: {error}"))
+    }
+
     #[tokio::test]
     async fn kubernetes_runtime_writes_use_the_apiserver_service_account_identity()
     -> Result<(), String> {
@@ -5071,6 +5117,28 @@ mod tests {
                 "#/components/schemas/WorkspaceDeploymentCapabilities"
             )),
             "generated clients must receive the deployment workspace limits"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn user_capabilities_openapi_publishes_deployment_workspace_limits() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        assert_eq!(
+            document.pointer(
+                "/paths/~1app~1api~1v1~1capabilities/get/responses/200/content/application~1json/schema/$ref"
+            ),
+            Some(&serde_json::json!(
+                "#/components/schemas/UserCapabilitiesResponse"
+            ))
+        );
+        assert_eq!(
+            document
+                .pointer("/components/schemas/UserCapabilitiesResponse/properties/workspace/$ref"),
+            Some(&serde_json::json!(
+                "#/components/schemas/WorkspaceDeploymentCapabilities"
+            ))
         );
         Ok(())
     }
@@ -10175,9 +10243,7 @@ mod tests {
                 template_id: None,
                 eligibility_member_role: Some("engineer".to_owned()),
                 member_role: Some("engineer".to_owned()),
-                counterexample:
-                    "envelope exceeded: budget.monthlyLimit requested 220.00 USD, ceiling 200.00 USD"
-                        .to_owned(),
+                counterexample: "Monthly budget: requested $220.00, limit $200.00".to_owned(),
             }],
             "a parked over-envelope request must be filed with its structured counterexample"
         );
@@ -12021,7 +12087,7 @@ mod tests {
             response
                 .get("counterexample")
                 .and_then(|value| value.as_str()),
-            Some("envelope exceeded: budget.monthlyLimit requested 220.00 USD, ceiling 200.00 USD")
+            Some("Monthly budget: requested $220.00, limit $200.00")
         );
         assert_eq!(
             response.pointer("/proposedSpec/budget/monthlyLimit"),
@@ -13355,10 +13421,7 @@ mod tests {
                 .browser_task_evidence
                 .as_mut()
                 .ok_or_else(|| "initial browser Task omitted its evidence".to_owned())?;
-            evidence.requested_diagnostics = None;
-            evidence.requested_requirements = None;
-            evidence.effective_requirements = None;
-            evidence.requested_workspace.clear();
+            *evidence = browser_evidence_v0_3_15(evidence)?;
         }
 
         let recovered = app
@@ -14490,6 +14553,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_workspace_enforces_submodule_mode_recursion_and_depth_at_the_task_api()
+    -> Result<(), String> {
+        async fn submit_case(
+            mode: &str,
+            recursive: bool,
+            chain_depth: usize,
+            idempotency_key: &str,
+        ) -> Result<(StatusCode, String), String> {
+            let ledger = versioned_task_ledger()?;
+            authorize_direct_source(&ledger)?;
+            let mut definition = direct_definition_no_skills()?;
+            definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+            definition["workspace"] = serde_json::json!([{
+                "git": {
+                    "submodules": {
+                        "mode": mode,
+                        "recursive": recursive
+                    }
+                }
+            }]);
+            let mut git = direct_git_fixture(direct_manifest()?, definition, None)?;
+            let owner_id = "7890";
+            let caller = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
+            let mut parent_repository = caller;
+            let mut parent_commit = format!("git:sha1:{}", "c".repeat(40));
+            for index in 1..=chain_depth {
+                let child = RepositoryUrl::parse(format!(
+                    "https://github.com/example-org/module-{index}.git"
+                ))?;
+                let repository_id = format!("88{index:04}");
+                let object = char::from_digit((index as u32 % 10).max(1), 10)
+                    .ok_or_else(|| "submodule fixture digit is invalid".to_owned())?
+                    .to_string()
+                    .repeat(40);
+                let child_commit = format!("git:sha1:{object}");
+                Arc::make_mut(&mut git.repositories).insert(
+                    child.as_str().to_owned(),
+                    GitRepositoryIdentity {
+                        repository: child.clone(),
+                        repository_id: StableProviderId::parse(&repository_id)?,
+                        repository_owner_id: StableProviderId::parse(owner_id)?,
+                    },
+                );
+                ledger
+                    .source_repository_bindings
+                    .lock()
+                    .map_err(|_| "fake source-repository binding lock was poisoned".to_owned())?
+                    .push((
+                        "7890".to_owned(),
+                        "123456".to_owned(),
+                        owner_id.to_owned(),
+                        repository_id,
+                    ));
+                let module_path = format!("vendor/module-{index}");
+                Arc::make_mut(&mut git.files).insert(
+                    (
+                        parent_repository.as_str().to_owned(),
+                        parent_commit.clone(),
+                        ".gitmodules".to_owned(),
+                    ),
+                    format!(
+                        "[submodule \"module-{index}\"]\n  path = {module_path}\n  url = {}\n",
+                        child.as_str()
+                    )
+                    .into_bytes(),
+                );
+                Arc::make_mut(&mut git.trees).insert(
+                    (parent_repository.as_str().to_owned(), parent_commit.clone()),
+                    vec![
+                        GitTreeEntry {
+                            path: steward_ports::GitTreePath::parse(".gitmodules")?,
+                            mode: "100644".to_owned(),
+                            kind: "blob".to_owned(),
+                            object: "b".repeat(40),
+                            size: Some(128),
+                        },
+                        GitTreeEntry {
+                            path: steward_ports::GitTreePath::parse(&module_path)?,
+                            mode: "160000".to_owned(),
+                            kind: "commit".to_owned(),
+                            object,
+                            size: None,
+                        },
+                    ],
+                );
+                parent_repository = child;
+                parent_commit = child_commit;
+            }
+            Arc::make_mut(&mut git.trees)
+                .entry((parent_repository.as_str().to_owned(), parent_commit))
+                .or_default();
+
+            let response = direct_test_app(ledger, git)?
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/tasks")
+                        .header("authorization", "Bearer github-assertion")
+                        .header("idempotency-key", idempotency_key)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "contractVersion": "steward.task/v2",
+                                "invocationPath": ".steward/tasks/release-summary.json",
+                            })
+                            .to_string(),
+                        ))
+                        .map_err(|error| format!("build submodule boundary request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("submit submodule boundary request: {error}"))?;
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .map_err(|error| format!("read submodule boundary response: {error}"))?;
+            Ok((status, String::from_utf8_lossy(&body).into_owned()))
+        }
+
+        for (mode, recursive, depth, key) in [
+            ("none", false, 5, "submodule-mode-none"),
+            ("admitted", false, 5, "submodule-recursion-disabled"),
+            ("admitted", true, 4, "submodule-depth-equal"),
+        ] {
+            let (status, body) = submit_case(mode, recursive, depth, key).await?;
+            assert_eq!(status, StatusCode::ACCEPTED, "{key}: {body}");
+        }
+        let (status, body) = submit_case("admitted", true, 5, "submodule-depth-above").await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body.contains("Git submodule depth 5 is more than the 4 levels this Envelope allows."),
+            "unexpected over-depth response: {body}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn direct_workspace_rejects_required_unadmitted_submodule_before_reservation()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
@@ -14640,7 +14839,7 @@ mod tests {
             app,
             "direct-workspace-tree-over-cap",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "workspace materialized file count 2 exceeds the effective ceiling 1",
+            "Workspace file count 2 is more than the 1 this Envelope allows.",
         )
         .await
     }
@@ -14722,7 +14921,7 @@ mod tests {
             app,
             "direct-workspace-envelope-cap",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "history depth 5 exceeds the effective ceiling 4",
+            "Git history depth 5 is more than the 4 generations this Envelope allows.",
         )
         .await
     }
@@ -14892,7 +15091,7 @@ mod tests {
             app,
             "direct-over-authority",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "envelope exceeded: budget.monthlyLimit requested 50.00 USD, ceiling 25.00 USD",
+            "Monthly budget: requested $50.00, limit $25.00",
         )
         .await
     }
@@ -15399,13 +15598,7 @@ mod tests {
                 .first_mut()
                 .and_then(|task| task.direct_task_evidence.as_mut())
                 .ok_or_else(|| "initial direct Task omitted its evidence".to_owned())?;
-            evidence.requested_requirements = None;
-            evidence.requested_diagnostics = None;
-            evidence.requested_workspace.clear();
-            evidence
-                .effective_requirements
-                .authority
-                .runtime_minutes_limit = None;
+            *evidence = direct_evidence_v0_3_15(evidence)?;
         }
 
         let retry = app
@@ -15468,13 +15661,7 @@ mod tests {
                 .as_ref()
                 .ok_or_else(|| "initial direct Git Task omitted workspace evidence".to_owned())?;
             assert_eq!(workspace.max_history_depth, None);
-            evidence.requested_requirements = None;
-            evidence.requested_diagnostics = None;
-            evidence.requested_workspace.clear();
-            evidence
-                .effective_requirements
-                .authority
-                .runtime_minutes_limit = None;
+            *evidence = direct_evidence_v0_3_15(evidence)?;
         }
 
         let retry = app
@@ -15537,13 +15724,7 @@ mod tests {
                 Some(steward_types::direct_package::ResolvedWorkspaceEntry::Scratch { size, .. })
                     if size.as_str() == "2048Mi"
             ));
-            evidence.requested_requirements = None;
-            evidence.requested_diagnostics = None;
-            evidence.requested_workspace.clear();
-            evidence
-                .effective_requirements
-                .authority
-                .runtime_minutes_limit = None;
+            *evidence = direct_evidence_v0_3_15(evidence)?;
         }
 
         let retry = app

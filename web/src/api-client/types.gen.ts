@@ -1814,6 +1814,11 @@ export type UpdateBrowserPreferences = {
     workflowAcknowledged?: boolean | null;
 };
 
+export type UserCapabilitiesResponse = {
+    apiVersion: string;
+    workspace: WorkspaceDeploymentCapabilities;
+};
+
 export type UserEnvelopeRequest = {
     approvalId?: string | null;
     approvedEnvelope?: null | BrowserEnvelope;
@@ -3938,6 +3943,26 @@ export type GetOperatorEffectiveAccessResponses = {
 };
 
 export type GetOperatorEffectiveAccessResponse = GetOperatorEffectiveAccessResponses[keyof GetOperatorEffectiveAccessResponses];
+
+export type GetUserCapabilitiesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/app/api/v1/capabilities';
+};
+
+export type GetUserCapabilitiesErrors = {
+    /**
+     * Browser session is absent or invalid
+     */
+    401: unknown;
+};
+
+export type GetUserCapabilitiesResponses = {
+    200: UserCapabilitiesResponse;
+};
+
+export type GetUserCapabilitiesResponse = GetUserCapabilitiesResponses[keyof GetUserCapabilitiesResponses];
 
 export type ListProviderConnectionsData = {
     body?: never;
