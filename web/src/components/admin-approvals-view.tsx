@@ -18,6 +18,7 @@ import {
   type BrowserEnvelopeRequestDecisionResponse,
   type BrowserEnvelopeRequestView,
   type AdminRequestView,
+  type AdminRequestState,
   type AdminRequestResponse,
   type AdminRequestsResponse,
 } from "@/api-client";
@@ -72,7 +73,7 @@ export function AdminApprovalsView() {
   const state = useApiResource<AdminRequestsResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Requests above a template ceiling, custom envelope requests, and runs that reach a cumulative limit wait here for review." title="Requests" />
+      <PageHeader description="Requests above template limits, custom envelope requests, and runs that reach a cumulative limit wait here for review." title="Requests" />
       <ResourceBoundary state={state}>{({ requests }) => {
         if (requests.length === 0) return <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">Nothing needs action.</p>;
         const counts = {
@@ -95,14 +96,53 @@ export function AdminApprovalsView() {
   );
 }
 
-function requestReason(request: AdminRequestView): string {
-  return request.kind === "ceiling_exceeded" ? "above ceiling"
+const requestStateCopy = {
+  requested: {
+    detail: "Pending administrator approval",
+    label: "Awaiting review",
+    message: "This request is awaiting administrator approval.",
+    reason: "awaiting review",
+  },
+  escalated: {
+    detail: "Pending administrator action",
+    label: "Escalated",
+    message: "This request is awaiting administrator action.",
+    reason: "escalated",
+  },
+  auto_approved: {
+    detail: "Provisioned automatically",
+    label: "Auto-approved",
+    message: "This request was provisioned automatically.",
+    reason: "auto-approved",
+  },
+  approved: {
+    detail: "Approved by an administrator",
+    label: "Approved",
+    message: "This request was approved by an administrator.",
+    reason: "approved",
+  },
+  rejected: {
+    detail: "Request was rejected",
+    label: "Rejected",
+    message: "This request was rejected.",
+    reason: "rejected",
+  },
+  expired: {
+    detail: "Request expired",
+    label: "Expired",
+    message: "This request expired before approval.",
+    reason: "expired",
+  },
+} satisfies Record<AdminRequestState, { detail: string; label: string; message: string; reason: string }>;
+
+export function requestReason(request: AdminRequestView): string {
+  return request.kind === "ceiling_exceeded" ? "above limits"
     : request.kind === "cumulative_exhausted" ? "cumulative limit"
-      : request.kind === "within_ceiling" ? "within ceiling" : "custom";
+      : request.kind === "within_ceiling" ? requestStateCopy[request.state].reason : "custom";
 }
 
-function triggerLabel(request: AdminRequestView): [string, string] {
-  if (request.kind === "ceiling_exceeded") return ["Above ceiling", request.deltas.map((delta) => {
+export function triggerLabel(request: AdminRequestView): [string, string] {
+  if (request.kind === "ceiling_exceeded") return ["Above limits", request.deltas.map((delta) => {
     const summary = envelopeDeltaSummary(delta);
     return `${summary.label}: ${summary.requested} > ${summary.ceiling}`;
   }).join(" · ")];
@@ -112,7 +152,10 @@ function triggerLabel(request: AdminRequestView): [string, string] {
       ? `${formatMoney(meter.used, meter.unit)} / ${formatMoney(meter.limit, meter.unit)}`
       : `${formatDuration(meter.used, "minutes", "m")} / ${formatDuration(meter.limit, "minutes", "m")}` : "Limit exhausted"];
   }
-  if (request.kind === "within_ceiling") return ["Within ceiling", "Fits the template ceiling"];
+  if (request.kind === "within_ceiling") {
+    const copy = requestStateCopy[request.state];
+    return [copy.label, copy.detail];
+  }
   return ["Custom request", "No governing template"];
 }
 
@@ -139,7 +182,7 @@ function RequestTable({ requests }: Readonly<{ requests: Array<AdminRequestView>
 export function AdminRequestDetailView({ requestId }: Readonly<{ requestId: string }>) {
   const load = useCallback(() => getAdminRequest({ cache: "no-store", credentials: "same-origin", path: { request_id: requestId } }), [requestId]);
   const state = useApiResource<AdminRequestResponse>(load);
-  return <ResourceBoundary state={state}>{({ request }) => <section aria-labelledby="page-title" className="mx-auto max-w-[980px] space-y-5"><PageHeader description={`${request.requester.displayEmail} · requested ${new Date(request.createdAt).toLocaleString()}`} title={<span className="inline-flex flex-wrap items-center gap-3">{request.template.displayName ?? "Custom envelope"} · {requestReason(request)} <StatusBadge value={request.state} /></span>} />{request.kind === "ceiling_exceeded" ? <div className="rounded-[10px] bg-warn-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-warn">Requested above the template ceiling</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : request.kind === "cumulative_exhausted" ? <div className="rounded-[10px] bg-err-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-err">Escalated: a cumulative limit was reached and the run is parked</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : null}<ul><UnifiedRequestCard request={request} /></ul><Link className="inline-flex text-sm font-semibold" href="/admin/approvals">← Back to requests</Link></section>}</ResourceBoundary>;
+  return <ResourceBoundary state={state}>{({ request }) => <section aria-labelledby="page-title" className="mx-auto max-w-[980px] space-y-5"><PageHeader description={`${request.requester.displayEmail} · requested ${new Date(request.createdAt).toLocaleString()}`} title={<span className="inline-flex flex-wrap items-center gap-3">{request.template.displayName ?? "Custom envelope"} · {requestReason(request)} <StatusBadge value={request.state} /></span>} />{request.kind === "ceiling_exceeded" ? <div className="rounded-[10px] bg-warn-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-warn">Requested above the template limits</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : request.kind === "cumulative_exhausted" ? <div className="rounded-[10px] bg-err-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-err">Escalated: a cumulative limit was reached and the run is parked</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : null}<ul><UnifiedRequestCard request={request} /></ul><Link className="inline-flex text-sm font-semibold" href="/admin/approvals">← Back to requests</Link></section>}</ResourceBoundary>;
 }
 
 function deltaValue(value: unknown): string {
@@ -195,12 +238,12 @@ function numericDelta(delta: AdminRequestView["deltas"][number]): string | null 
 
 function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>) {
   if (request.kind === "custom" && request.requestedEnvelope) return <SectionCard title="Requested access"><DefinitionList items={envelopeAuthorityItems(request.requestedEnvelope.spec)} /><p className="mt-4 rounded-control bg-notice p-4 text-sm">This custom request has no governing template and always requires administrator approval.</p></SectionCard>;
-  if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">This request is within the template ceiling but above its automatic approval limit.</p>;
+  if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">{requestStateCopy[request.state].message}</p>;
   return (
-    <SectionCard title="Requested vs template ceiling">
+    <SectionCard title="Requested vs template limits">
       <div className="overflow-x-auto">
         <div className="min-w-[520px]">
-          <div className="grid grid-cols-[minmax(90px,130px)_1fr_1fr] gap-4 border-b border-line-soft pb-2 text-xs font-medium text-muted-ink"><span>Field</span><span>Requested</span><span>{request.template.id ? `${request.template.id} rev ${request.template.revision ?? "—"}` : "Ceiling"}</span></div>
+          <div className="grid grid-cols-[minmax(90px,130px)_1fr_1fr] gap-4 border-b border-line-soft pb-2 text-xs font-medium text-muted-ink"><span>Field</span><span>Requested</span><span>{request.template.id ? `${request.template.id} rev ${request.template.revision ?? "—"}` : "Limit"}</span></div>
           {request.deltas.map((delta, index) => {
             const over = numericDelta(delta);
             return <div className="grid grid-cols-[minmax(90px,130px)_1fr_1fr] gap-4 border-b border-line-soft py-3 last:border-0" key={`${delta.dimension}-${index}`}><strong className="text-sm">{deltaLabel(delta.dimension)}</strong><div className={over ? "font-semibold text-err" : ""}>{deltaSide(delta, "requested")}{over ? <span className="ms-2 rounded-full bg-err-soft px-2 py-0.5 text-xs font-semibold text-err">{over}</span> : null}</div><div className="opacity-80">{deltaSide(delta, "ceiling")}</div></div>;

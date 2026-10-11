@@ -29,7 +29,7 @@ describe("envelope run history", () => {
 
 const template: AvailableEnvelopeTemplate = {
   allowInlineBrowserTasks: true,
-  autoProvisionThreshold: {
+  ceiling: {
     revision: 3,
     spec: {
       budget: { currency: "USD", monthlyLimit: "50.00", singleRunLimit: "5.00" },
@@ -40,71 +40,54 @@ const template: AvailableEnvelopeTemplate = {
       runtimeMinutesLimit: "30",
     },
   },
-  ceiling: {
-    revision: 3,
-    spec: {
-      budget: { currency: "USD", monthlyLimit: "100.00", singleRunLimit: "10.00" },
-      llms: [{ provider: "provider-a", model: "model-a" }],
-      tools: [],
-      ttl: "1h",
-      runner: {},
-      runtimeMinutesLimit: "60",
-    },
-  },
   displayName: "Engineer",
   id: "engineer",
   revision: 3,
 };
 
 describe("envelope request review summary", () => {
-  test("names every visible value above the template ceiling", () => {
+  test("names every visible value above the template limits", () => {
     expect(templateRequestReviewSummary({
-      budget: "101.00",
+      budget: "150.00",
       models: new Set(["provider-a\u0000model-a"]),
       singleRunLimit: "11.00",
-      runtimeMinutes: "61",
+      runtimeMinutes: "90",
       template,
       tools: new Set(),
-      ttl: "61m",
+      ttl: "2h",
     })).toEqual({
       exceedances: [
-        { ceiling: "100.00 USD", label: "Monthly limit", requested: "101.00 USD" },
-        { ceiling: "10.00 USD", label: "Limit per run", requested: "11.00 USD" },
-        { ceiling: "60 min", label: "Runtime limit per month", requested: "61 min" },
-        { ceiling: "60 min", label: "Time-to-live limit", requested: "61 min" },
+        { ceiling: "50.00 USD", label: "Monthly limit", requested: "150.00 USD" },
+        { ceiling: "5.00 USD", label: "Limit per run", requested: "11.00 USD" },
+        { ceiling: "30 min", label: "Runtime limit per month", requested: "90 min" },
+        { ceiling: "0.5 h", label: "Time-to-live limit", requested: "2 h" },
       ],
       requiresApproval: true,
     });
   });
 
-  test("requires review above a narrower automatic approval threshold", () => {
+  test("requires review above the template limits", () => {
     expect(templateRequestReviewSummary({
-      budget: "75.00",
+      budget: "150.00",
       models: new Set(["provider-a\u0000model-a"]),
-      singleRunLimit: "7.50",
+      singleRunLimit: "5.00",
       runtimeMinutes: "30",
       template,
       tools: new Set(),
       ttl: "30m",
-    })).toEqual({ exceedances: [], requiresApproval: true });
+    })).toEqual({
+      exceedances: [{ ceiling: "50.00 USD", label: "Monthly limit", requested: "150.00 USD" }],
+      requiresApproval: true,
+    });
   });
 
-  test("returns to automatic submission inside the automatic approval threshold", () => {
+  test("provisions automatically within the template limits", () => {
     expect(templateRequestReviewSummary({
-      budget: "25.00",
+      budget: "40.00",
       models: new Set(["provider-a\u0000model-a"]),
       singleRunLimit: "2.50",
       runtimeMinutes: "20",
-      template: {
-        ...template,
-        autoProvisionThreshold: {
-          ...template.autoProvisionThreshold!,
-          spec: {
-            ...template.autoProvisionThreshold!.spec,
-            budget: { ...template.ceiling.spec.budget, monthlyLimit: "50.00" },
-          },
-        },
-      },
+      template,
       tools: new Set(),
       ttl: "20m",
     })).toEqual({ exceedances: [], requiresApproval: false });

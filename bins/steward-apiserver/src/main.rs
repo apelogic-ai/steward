@@ -35,7 +35,8 @@ use steward_apiserver::{
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
-    EnvelopeTemplatePublication, ManagedInferenceKeyCipher, PgStore, TaskOrchestrationMode,
+    EnvelopeTemplatePublication, ManagedInferenceKeyCipher, PgStore,
+    RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE, TaskOrchestrationMode,
 };
 use steward_types::{CanonicalUserId, InferenceMode, OrganizationId};
 use tokio::net::{TcpListener, TcpStream};
@@ -1576,10 +1577,7 @@ async fn ensure_default_llm_template(store: &PgStore) -> Result<(), Box<dyn Erro
         .into());
     }
     if document.auto_provision_threshold.is_some() {
-        return Err(io::Error::other(
-            "default LLM smoke template threshold is fixed to its ceiling",
-        )
-        .into());
+        return Err(io::Error::other(RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE).into());
     }
     if let Some(existing) = store
         .envelope_template_revision(&document.template_id, ceiling.revision)
@@ -1588,7 +1586,10 @@ async fn ensure_default_llm_template(store: &PgStore) -> Result<(), Box<dyn Erro
         if existing.display_name != document.display_name
             || existing.member_roles != document.member_roles
             || existing.ceiling != ceiling
-            || existing.auto_provision_threshold.as_ref() != Some(&ceiling)
+            || !default_template_threshold_is_rollback_compatible(
+                existing.auto_provision_threshold.as_ref(),
+                &ceiling,
+            )
         {
             return Err(io::Error::other(
                 "default LLM smoke template revision exists with different content",
@@ -1603,12 +1604,19 @@ async fn ensure_default_llm_template(store: &PgStore) -> Result<(), Box<dyn Erro
             display_name: &document.display_name,
             member_roles: &document.member_roles,
             ceiling: &ceiling,
-            auto_provision_threshold: Some(&ceiling),
+            auto_provision_threshold: None,
             allow_inline_browser_tasks: true,
             authored_by: "system:install",
         })
         .await?;
     Ok(())
+}
+
+fn default_template_threshold_is_rollback_compatible(
+    threshold: Option<&steward_admission::Envelope>,
+    ceiling: &steward_admission::Envelope,
+) -> bool {
+    threshold.is_none_or(|threshold| threshold == ceiling)
 }
 
 async fn templates_command(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
@@ -1627,6 +1635,9 @@ async fn templates_command(arguments: Vec<String>) -> Result<(), Box<dyn Error>>
     }
     let path = required_option(&options, "file")?;
     let mut document = parse_template_document(&fs::read(path)?)?;
+    if document.auto_provision_threshold.is_some() {
+        return Err(io::Error::other(RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE).into());
+    }
     document.member_roles.sort();
     if document
         .member_roles
@@ -1650,7 +1661,7 @@ async fn templates_command(arguments: Vec<String>) -> Result<(), Box<dyn Error>>
                 display_name: document.display_name,
                 member_roles: document.member_roles,
                 ceiling: document.ceiling,
-                auto_provision_threshold: document.auto_provision_threshold,
+                auto_provision_threshold: None,
                 allow_inline_browser_tasks: true,
             }),
         )
@@ -1919,14 +1930,39 @@ mod tests {
         OPERATOR_EXIT_FORBIDDEN, OPERATOR_EXIT_NOT_FOUND, OPERATOR_EXIT_UNAVAILABLE,
         OPERATOR_EXIT_USAGE, OperatorCommandError, TaskApiConfig, TlsListener,
         bootstrap_rbac_arguments, connection_auto_association_issuer, decode_tls_material,
-        format_effective_access_human, github_source_adapter_from_values,
-        install_rustls_crypto_provider, kubernetes_token_review_audience, operator_exit_code,
-        parse_custom_envelope_safety_ceiling, parse_execution_bindings_mode, parse_inference_mode,
-        parse_template_document, stable_bridge_configuration_from_values,
-        validate_execution_bindings, with_claude_code_execution_adapter,
+        default_template_threshold_is_rollback_compatible, format_effective_access_human,
+        github_source_adapter_from_values, install_rustls_crypto_provider,
+        kubernetes_token_review_audience, operator_exit_code, parse_custom_envelope_safety_ceiling,
+        parse_execution_bindings_mode, parse_inference_mode, parse_template_document,
+        stable_bridge_configuration_from_values, templates_command, validate_execution_bindings,
+        with_claude_code_execution_adapter,
     };
 
     static NEXT_PREFLIGHT_CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn default_template_accepts_an_equal_legacy_threshold_without_republishing()
+    -> Result<(), String> {
+        let ceiling: steward_admission::Envelope = serde_json::from_str(
+            r#"{"revision":3,"spec":{"llms":[{"provider":"provider-a","model":"model-a"}],"tools":[],"budget":{"monthlyLimit":"50.00","currency":"USD"},"ttl":"1h","runner":{"platforms":["linux"],"architectures":[]}}}"#,
+        )
+        .map_err(|error| format!("fixture must be a valid envelope: {error}"))?;
+        let mut narrower = ceiling.clone();
+        narrower.spec.budget.monthly_limit = "25.00".to_owned();
+
+        assert!(default_template_threshold_is_rollback_compatible(
+            None, &ceiling
+        ));
+        assert!(default_template_threshold_is_rollback_compatible(
+            Some(&ceiling),
+            &ceiling
+        ));
+        assert!(!default_template_threshold_is_rollback_compatible(
+            Some(&narrower),
+            &ceiling
+        ));
+        Ok(())
+    }
 
     #[test]
     fn managed_inference_mode_is_accepted_by_apiserver_startup() {
@@ -2166,6 +2202,66 @@ autoProvisionThreshold: null
                 b"templateId: default\ntemplateId: duplicate\ndisplayName: Default\nmemberRoles: []\n"
             )
             .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn template_apply_rejects_the_retired_threshold_before_contacting_the_api()
+    -> Result<(), String> {
+        let directory = OwnedTestDirectory(std::env::temp_dir().join(format!(
+            "steward-template-retired-threshold-{}-{}",
+            std::process::id(),
+            NEXT_PREFLIGHT_CONFIG_TEST_ID.fetch_add(1, Ordering::Relaxed),
+        )));
+        fs::create_dir_all(&directory.0)
+            .map_err(|error| format!("create template fixture directory: {error}"))?;
+        let template = directory.0.join("template.yaml");
+        fs::write(
+            &template,
+            br#"templateId: default
+displayName: Default
+memberRoles:
+  - engineer
+ceiling:
+  revision: 1
+  spec:
+    llms:
+      - provider: provider-a
+        model: model-a
+    tools: []
+    budget:
+      monthlyLimit: "50.00"
+      currency: USD
+    ttl: 10m
+autoProvisionThreshold:
+  revision: 1
+  spec:
+    llms:
+      - provider: provider-a
+        model: model-a
+    tools: []
+    budget:
+      monthlyLimit: "25.00"
+      currency: USD
+    ttl: 10m
+"#,
+        )
+        .map_err(|error| format!("write template fixture: {error}"))?;
+
+        let error = match templates_command(vec![
+            "apply".to_owned(),
+            "--file".to_owned(),
+            template.to_string_lossy().into_owned(),
+        ])
+        .await
+        {
+            Ok(()) => return Err("the CLI accepted a non-null autoProvisionThreshold".to_owned()),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE
         );
         Ok(())
     }

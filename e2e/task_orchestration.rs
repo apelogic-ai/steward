@@ -386,7 +386,7 @@ async fn concurrent_provisioning_enforces_active_digest_uniqueness_transactional
                 display_name: template_id,
                 member_roles: std::slice::from_ref(template_id),
                 ceiling: &envelope,
-                auto_provision_threshold: Some(&envelope),
+                auto_provision_threshold: None,
                 allow_inline_browser_tasks: true,
                 authored_by: "test-bootstrap",
             })
@@ -549,7 +549,7 @@ async fn operator_rbac_and_provisioning_preserve_distinct_active_authority()
                 display_name: template_id,
                 member_roles: std::slice::from_ref(&role),
                 ceiling,
-                auto_provision_threshold: Some(ceiling),
+                auto_provision_threshold: None,
                 allow_inline_browser_tasks: true,
                 authored_by: "test-bootstrap",
             })
@@ -707,7 +707,7 @@ async fn operator_rbac_and_provisioning_preserve_distinct_active_authority()
             display_name: &template_a,
             member_roles: std::slice::from_ref(&role),
             ceiling: &envelope_a2,
-            auto_provision_threshold: Some(&envelope_a2),
+            auto_provision_threshold: None,
             allow_inline_browser_tasks: true,
             authored_by: OPERATOR_USERNAME,
         })
@@ -1059,7 +1059,7 @@ async fn browser_task_rows_persist_and_concurrency_is_bounded_without_breaking_e
             display_name: "Browser limit",
             member_roles: std::slice::from_ref(&template_id),
             ceiling: &envelope,
-            auto_provision_threshold: Some(&envelope),
+            auto_provision_threshold: None,
             allow_inline_browser_tasks: true,
             authored_by: "test-bootstrap",
         })
@@ -1870,7 +1870,7 @@ async fn multiple_named_envelope_templates_coexist_for_one_role_and_pin_requests
                 display_name,
                 member_roles: std::slice::from_ref(&role),
                 ceiling: &envelope,
-                auto_provision_threshold: Some(&envelope),
+                auto_provision_threshold: None,
                 allow_inline_browser_tasks: true,
                 authored_by: "test-bootstrap",
             })
@@ -2034,7 +2034,7 @@ async fn multiple_named_envelope_templates_coexist_for_one_role_and_pin_requests
             display_name: "Develop",
             member_roles: std::slice::from_ref(&role),
             ceiling: &replacement,
-            auto_provision_threshold: Some(&replacement),
+            auto_provision_threshold: None,
             allow_inline_browser_tasks: true,
             authored_by: "test-revision-author",
         })
@@ -2153,7 +2153,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             display_name: "Develop",
             member_roles: std::slice::from_ref(&template_id),
             ceiling: &envelope,
-            auto_provision_threshold: Some(&envelope),
+            auto_provision_threshold: None,
             allow_inline_browser_tasks: true,
             authored_by: "test-bootstrap",
         })
@@ -2686,7 +2686,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             display_name: &member_role,
             member_roles: std::slice::from_ref(&member_role),
             ceiling: &envelope,
-            auto_provision_threshold: Some(&envelope),
+            auto_provision_threshold: None,
             allow_inline_browser_tasks: true,
             authored_by: "admin@example.com",
         })

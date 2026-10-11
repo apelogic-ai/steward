@@ -24,10 +24,10 @@ use steward_apiserver::governed_connections::{
 use steward_store::{
     BrowserMemberInvitation, BrowserMemberInvitationOutcome, BrowserMemberStateAction,
     BrowserMemberStateChange, BrowserRbacAssignment, BrowserRbacAssignmentAction,
-    BrowserRbacAssignmentChange, BrowserTaskVersionPublication, FederatedSubjectAssociation,
-    FederatedSubjectAssociationMethod, FederatedSubjectAuditAction, FederatedSubjectDisable,
-    FederatedSubjectObservation, FederatedSubjectState, FederatedSubjectUnlink,
-    ManagedInferenceKeyCipher, PgStore, StoreError,
+    BrowserRbacAssignmentChange, BrowserTaskVersionPublication, EnvelopeRequestStatus,
+    EnvelopeRequestStatusUpdate, FederatedSubjectAssociation, FederatedSubjectAssociationMethod,
+    FederatedSubjectAuditAction, FederatedSubjectDisable, FederatedSubjectObservation,
+    FederatedSubjectState, FederatedSubjectUnlink, ManagedInferenceKeyCipher, PgStore, StoreError,
 };
 use steward_types::direct_package::SourceProvenance;
 use steward_types::{
@@ -342,9 +342,18 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM canonical_users")
             .fetch_one(store.pool())
             .await?;
+    migration_set(Some(69))
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward pre-template-boundary migrations must complete over the required TLS session: {error}"
+            ))
+        })?;
+    seed_template_one_boundary_upgrade_fixture(&store).await?;
     migration_set(None).run(store.pool()).await.map_err(|error| {
         io::Error::other(format!(
-            "Steward managed-inference migration must complete over the required TLS session: {error}"
+            "Steward template-boundary migration must complete over the required TLS session: {error}"
         ))
     })?;
     assert_eq!(
@@ -367,6 +376,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         "migration 0068 must not invent credentials for existing users"
     );
     verify_managed_inference_reader_grant(&store, &verified_tls_url).await?;
+    assert_template_one_boundary_upgrade_result(&store).await?;
     assert_connection_failure_detail_upgrade_result(&store).await?;
     assert_github_repository_automation_upgrade_result(&store).await?;
     assert_maximum_source_provenance_upgrade_result(&store, &maximum_direct_source_provenance)
@@ -2622,6 +2632,482 @@ async fn assert_template_catalog_upgrade_result(store: &PgStore) -> Result<(), B
     .await?;
     assert_eq!(preserved_request, ("engineer".to_owned(), 7));
 
+    Ok(())
+}
+
+async fn seed_template_one_boundary_upgrade_fixture(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let ceiling = serde_json::json!({
+        "revision": 3,
+        "spec": {
+            "llms": [{"provider": "provider-a", "model": "model-a"}],
+            "tools": [],
+            "budget": {"monthlyLimit": "200.00", "currency": "USD"},
+            "ttl": "24h",
+            "runner": {"platforms": ["linux"], "architectures": []}
+        }
+    });
+    let threshold = serde_json::json!({
+        "revision": 3,
+        "spec": {
+            "llms": [{"provider": "provider-a", "model": "model-a"}],
+            "tools": [],
+            "budget": {"monthlyLimit": "50.00", "currency": "USD"},
+            "ttl": "24h",
+            "runner": {"platforms": ["linux"], "architectures": []}
+        }
+    });
+    let equal = serde_json::json!({
+        "revision": 2,
+        "spec": {
+            "llms": [{"provider": "provider-a", "model": "model-a"}],
+            "tools": [],
+            "budget": {"monthlyLimit": "75.00", "currency": "USD"},
+            "ttl": "12h",
+            "runner": {"platforms": ["linux"], "architectures": []}
+        }
+    });
+    let without_threshold = serde_json::json!({
+        "revision": 5,
+        "spec": {
+            "llms": [{"provider": "provider-a", "model": "model-a"}],
+            "tools": [],
+            "budget": {"monthlyLimit": "100.00", "currency": "USD"},
+            "ttl": "8h",
+            "runner": {"platforms": ["linux"], "architectures": []}
+        }
+    });
+    sqlx::query(
+        "INSERT INTO envelope_template_revisions \
+         (template_id, revision, display_name, member_roles, spec, \
+          auto_provision_threshold, allow_inline_browser_tasks, authored_by) \
+         VALUES \
+         ('template-stricter', 1, 'Superseded template', ARRAY['analyst'], \
+          $1, NULL, true, 'alice'), \
+         ('template-stricter', 3, 'Stricter template', ARRAY['analyst', 'engineer'], \
+          $1, $2, false, 'alice'), \
+         ('template-equal', 2, 'Equal template', ARRAY['engineer'], $3, $4, true, 'alice'), \
+         ('template-without-threshold', 5, 'No threshold template', ARRAY['engineer'], \
+          $5, NULL, true, 'alice'), \
+         ('template-latest-without-threshold', 6, 'Historical threshold template', \
+          ARRAY['analyst'], $1, $2, false, 'alice'), \
+         ('template-latest-without-threshold', 7, 'Current no-threshold template', \
+          ARRAY['engineer'], $5, NULL, true, 'alice')",
+    )
+    .bind(&ceiling["spec"])
+    .bind(&threshold)
+    .bind(&equal["spec"])
+    .bind(&equal)
+    .bind(&without_threshold["spec"])
+    .execute(store.pool())
+    .await?;
+
+    let pending_request = serde_json::json!({
+        "revision": 3,
+        "spec": {
+            "llms": [{"provider": "provider-a", "model": "model-a"}],
+            "tools": [],
+            "budget": {"monthlyLimit": "150.00", "currency": "USD"},
+            "ttl": "24h",
+            "runner": {"platforms": ["linux"], "architectures": []}
+        }
+    });
+    for (request_id, idempotency_key) in [
+        (
+            "00000000-0000-0000-0000-000000000200",
+            "template-boundary-pending",
+        ),
+        (
+            "00000000-0000-0000-0000-000000000201",
+            "template-boundary-provisioned",
+        ),
+        (
+            "00000000-0000-0000-0000-000000000202",
+            "template-boundary-filing",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO envelope_requests \
+             (id, owner_user_id, template_id, template_revision, requested_envelope, \
+              idempotency_key) \
+             VALUES ($1::text::uuid, 'usr_0123456789abcdef0123456789abcdef', \
+                     'template-stricter', 3, $2, $3)",
+        )
+        .bind(request_id)
+        .bind(&pending_request)
+        .bind(idempotency_key)
+        .execute(store.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO envelope_request_events \
+         (request_id, status, actor, template_revision) \
+         VALUES ('00000000-0000-0000-0000-000000000200', 'pending', 'alice', 3)",
+    )
+    .execute(store.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO envelope_request_events \
+         (request_id, status, actor, template_revision) \
+         VALUES ('00000000-0000-0000-0000-000000000202', 'pending', 'alice', 3)",
+    )
+    .execute(store.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO envelope_request_events \
+         (request_id, status, envelope_instance_id, envelope_digest, approved_envelope, \
+          actor, template_revision) \
+         VALUES ('00000000-0000-0000-0000-000000000201', 'provisioned', \
+                 'env_template_boundary', $1, $2, 'alice', 3)",
+    )
+    .bind(format!("sha256:{}", "9".repeat(64)))
+    .bind(&pending_request)
+    .execute(store.pool())
+    .await?;
+    Ok(())
+}
+
+async fn assert_template_one_boundary_upgrade_result(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let revisions = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            Vec<String>,
+            serde_json::Value,
+            Option<serde_json::Value>,
+            bool,
+            String,
+        ),
+    >(
+        "SELECT revision, display_name, member_roles, spec, auto_provision_threshold, \
+                allow_inline_browser_tasks, authored_by \
+         FROM envelope_template_revisions \
+         WHERE template_id = 'template-stricter' ORDER BY revision",
+    )
+    .fetch_all(store.pool())
+    .await?;
+    assert_eq!(revisions.len(), 3);
+    assert_eq!(revisions[0].0, 1);
+    assert_eq!(revisions[1].0, 3);
+    assert_eq!(revisions[1].3["budget"]["monthlyLimit"], "200.00");
+    assert_eq!(
+        revisions[1]
+            .4
+            .as_ref()
+            .and_then(|value| value.pointer("/spec/budget/monthlyLimit")),
+        Some(&serde_json::json!("50.00")),
+        "the historical threshold-bearing revision must remain unchanged"
+    );
+    assert_eq!(revisions[2].0, 4, "the successor must be latest + 1");
+    assert_eq!(revisions[2].1, "Stricter template");
+    assert_eq!(revisions[2].2, ["analyst", "engineer"]);
+    assert_eq!(revisions[2].3["budget"]["monthlyLimit"], "50.00");
+    assert!(revisions[2].4.is_none());
+    assert!(
+        !revisions[2].5,
+        "successor must preserve inline-Task policy"
+    );
+    assert_eq!(revisions[2].6, "system:migration");
+
+    for (template_id, expected_count, expected_latest) in [
+        ("template-equal", 1, 2),
+        ("template-without-threshold", 1, 5),
+        ("template-latest-without-threshold", 2, 7),
+    ] {
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT count(*)::bigint, max(revision) \
+                 FROM envelope_template_revisions \
+                 WHERE template_id = $1",
+            )
+            .bind(template_id)
+            .fetch_one(store.pool())
+            .await?,
+            (expected_count, expected_latest),
+            "only a strictly different threshold on the latest revision may append a successor"
+        );
+    }
+
+    let pending = sqlx::query_as::<_, (i64, String, i64, i64)>(
+        "SELECT requests.template_revision, events.status, events.template_revision, \
+                count(*) OVER ()::bigint \
+         FROM envelope_requests requests \
+         JOIN envelope_request_events events ON events.request_id = requests.id \
+         WHERE requests.id = '00000000-0000-0000-0000-000000000200'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(pending, (3, "pending".to_owned(), 3, 1));
+    let pending_request_id = Uuid::from_u128(0x200);
+    let pending_projection = store
+        .pending_envelope_requests()
+        .await?
+        .into_iter()
+        .find(|request| request.request_id == pending_request_id)
+        .ok_or("migrated pending request was absent from the approval queue")?;
+    assert_eq!(pending_projection.template_revision, Some(3));
+    assert_eq!(
+        pending_projection
+            .requested_envelope
+            .spec
+            .budget
+            .monthly_limit,
+        "150.00",
+        "the migrated pending request must remain between the old threshold and old limits"
+    );
+    assert_eq!(
+        pending_projection
+            .template_envelope
+            .as_ref()
+            .map(|envelope| envelope.revision),
+        Some(4),
+        "the queue must pair immutable request pins with the current template limits"
+    );
+    let admin_projection = store
+        .admin_envelope_requests()
+        .await?
+        .into_iter()
+        .find(|record| record.request.id == pending_projection.request_id)
+        .ok_or("migrated pending request was absent from the admin read model")?;
+    assert_eq!(
+        admin_projection
+            .request
+            .template_envelope
+            .as_ref()
+            .map(|envelope| envelope.revision),
+        Some(3),
+        "the immutable request projection must retain the pinned template"
+    );
+    assert_eq!(
+        admin_projection
+            .template_envelope
+            .as_ref()
+            .map(|envelope| envelope.revision),
+        Some(4),
+        "the admin review projection must expose the current template"
+    );
+
+    let provisioned = sqlx::query_as::<_, (i64, String, String, i64, i64)>(
+        "SELECT requests.template_revision, events.status, events.envelope_instance_id, \
+                events.template_revision, count(*) OVER ()::bigint \
+         FROM envelope_requests requests \
+         JOIN envelope_request_events events ON events.request_id = requests.id \
+         WHERE requests.id = '00000000-0000-0000-0000-000000000201'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(
+        provisioned,
+        (
+            3,
+            "provisioned".to_owned(),
+            "env_template_boundary".to_owned(),
+            3,
+            1
+        ),
+        "already provisioned envelope history must remain unchanged"
+    );
+    let provisioned_projection = store
+        .admin_envelope_requests()
+        .await?
+        .into_iter()
+        .find(|record| record.request.id == Uuid::from_u128(0x201))
+        .ok_or("migrated provisioned request was absent from the admin read model")?;
+    assert_eq!(
+        provisioned_projection
+            .template_envelope
+            .as_ref()
+            .map(|envelope| envelope.revision),
+        Some(3),
+        "terminal request evidence must retain the pinned template revision"
+    );
+    assert_eq!(
+        provisioned_projection
+            .request
+            .requested_envelope
+            .spec
+            .budget
+            .monthly_limit,
+        "150.00",
+        "the already-provisioned envelope must remain above the migrated 50 USD limits"
+    );
+
+    let historical = store
+        .envelope_template_revision("template-stricter", 3)
+        .await?
+        .ok_or("historical template revision was lost")?;
+    assert!(historical.auto_provision_threshold.is_some());
+    let current = store
+        .latest_envelope_template("template-stricter")
+        .await?
+        .ok_or("migrated template revision was not current")?;
+    assert_eq!(current.ceiling.revision, 4);
+    assert_eq!(current.ceiling.spec.budget.monthly_limit, "50.00");
+    assert!(current.auto_provision_threshold.is_none());
+
+    assert!(
+        sqlx::query(
+            "UPDATE envelope_template_revisions SET display_name = 'tampered' \
+             WHERE template_id = 'template-stricter' AND revision = 4",
+        )
+        .execute(store.pool())
+        .await
+        .is_err(),
+        "the migrated successor must remain append-only"
+    );
+    let rollback_spec = serde_json::to_value(&current.ceiling.spec)?;
+    let rollback_equal_threshold = serde_json::json!({
+        "revision": 1,
+        "spec": rollback_spec.clone()
+    });
+    sqlx::query(
+        "INSERT INTO envelope_template_revisions \
+         (template_id, revision, display_name, member_roles, spec, \
+          auto_provision_threshold, authored_by) \
+         VALUES ('template-rollback-compatible', 1, 'Rollback compatible', \
+                 ARRAY['engineer'], $1, $2, 'alice')",
+    )
+    .bind(&rollback_spec)
+    .bind(&rollback_equal_threshold)
+    .execute(store.pool())
+    .await?;
+
+    let mut wrong_revision_threshold = rollback_equal_threshold.clone();
+    wrong_revision_threshold["revision"] = serde_json::json!(2);
+    assert!(
+        sqlx::query(
+            "INSERT INTO envelope_template_revisions \
+             (template_id, revision, display_name, member_roles, spec, \
+              auto_provision_threshold, authored_by) \
+             VALUES ('template-wrong-threshold-revision', 1, 'Wrong threshold revision', \
+                     ARRAY['engineer'], $1, $2, 'alice')",
+        )
+        .bind(&rollback_spec)
+        .bind(&wrong_revision_threshold)
+        .execute(store.pool())
+        .await
+        .is_err(),
+        "rollback thresholds must match both the row revision and its limits"
+    );
+
+    let mut extra_field_threshold = rollback_equal_threshold.clone();
+    extra_field_threshold["unexpected"] = serde_json::json!(true);
+    assert!(
+        sqlx::query(
+            "INSERT INTO envelope_template_revisions \
+             (template_id, revision, display_name, member_roles, spec, \
+              auto_provision_threshold, authored_by) \
+             VALUES ('template-extra-threshold-field', 1, 'Extra threshold field', \
+                     ARRAY['engineer'], $1, $2, 'alice')",
+        )
+        .bind(&rollback_spec)
+        .bind(&extra_field_threshold)
+        .execute(store.pool())
+        .await
+        .is_err(),
+        "rollback thresholds must be the exact historical Envelope shape"
+    );
+
+    let mut forbidden_threshold = rollback_equal_threshold;
+    forbidden_threshold["spec"]["budget"]["monthlyLimit"] = serde_json::json!("25.00");
+    assert!(
+        sqlx::query(
+            "INSERT INTO envelope_template_revisions \
+             (template_id, revision, display_name, member_roles, spec, \
+              auto_provision_threshold, authored_by) \
+             VALUES ('template-forbidden-threshold', 1, 'Forbidden threshold', \
+                     ARRAY['engineer'], $1, $2, 'alice')",
+        )
+        .bind(&rollback_spec)
+        .bind(&forbidden_threshold)
+        .execute(store.pool())
+        .await
+        .is_err(),
+        "only null or exactly equal rollback thresholds may pass the database boundary"
+    );
+
+    let request_id = pending_request_id;
+    let approved_envelope: steward_admission::Envelope = serde_json::from_value(
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT requested_envelope FROM envelope_requests WHERE id = $1",
+        )
+        .bind(request_id)
+        .fetch_one(store.pool())
+        .await?,
+    )?;
+    let stale_result = store
+        .append_envelope_request_status_at_template_revision(
+            request_id,
+            3,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Approved,
+                approval_id: Some(Uuid::from_u128(700)),
+                envelope_instance_id: None,
+                envelope_digest: None,
+                reason: None,
+                rationale: None,
+                evidence_url: None,
+                expires_at: None,
+                approved_envelope: Some(&approved_envelope),
+                actor: "alice",
+            },
+        )
+        .await;
+    assert_eq!(stale_result, Err(StoreError::EnvelopeRequestTemplateStale));
+    let approved = store
+        .append_envelope_request_status_at_template_revision(
+            request_id,
+            4,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Approved,
+                approval_id: Some(Uuid::from_u128(700)),
+                envelope_instance_id: None,
+                envelope_digest: None,
+                reason: None,
+                rationale: None,
+                evidence_url: None,
+                expires_at: None,
+                approved_envelope: Some(&approved_envelope),
+                actor: "alice",
+            },
+        )
+        .await?;
+    assert_eq!(approved.template_revision, Some(3));
+    assert_eq!(approved.status_template_revision, Some(4));
+
+    let filing_request_id = Uuid::from_u128(0x202);
+    assert_eq!(
+        store
+            .claim_envelope_request_decision_filing_at_template_revision(
+                filing_request_id,
+                3,
+                "alice",
+            )
+            .await,
+        Err(StoreError::EnvelopeRequestTemplateStale)
+    );
+    let filing_token = store
+        .claim_envelope_request_decision_filing_at_template_revision(filing_request_id, 4, "alice")
+        .await?;
+    store
+        .release_envelope_request_decision_filing(filing_request_id, filing_token)
+        .await?;
+
+    migration_set(None).run(store.pool()).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)::bigint FROM envelope_template_revisions \
+             WHERE template_id = 'template-stricter'",
+        )
+        .fetch_one(store.pool())
+        .await?,
+        3,
+        "re-running the migrator must not append another successor"
+    );
     Ok(())
 }
 
