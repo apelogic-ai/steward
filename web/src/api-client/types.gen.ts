@@ -707,6 +707,7 @@ export type BrowserTaskEvidence = {
     promptSource?: PromptSourceKind;
     requestedDiagnostics?: null | DiagnosticsRequest;
     requestedRequirements?: null | DirectRequirements;
+    requestedRevision?: string | null;
     requestedWorkspace?: Array<WorkspaceEntry>;
     revision: string;
     source: string;
@@ -1168,9 +1169,17 @@ export type ExactGitCommit = string;
 export type ExecutionBindingAdvertisement = {
     agentRef: string;
     displayName?: string | null;
+    models: ExecutionModelCompatibility;
 };
 
 export type ExecutionLogMode = 'off' | 'full';
+
+/**
+ * Deployment-declared model providers that an immutable agent binding can execute.
+ */
+export type ExecutionModelCompatibility = {
+    providers: Array<string>;
+};
 
 export type FederatedTaskIdentityErrorResponse = {
     error: string;
@@ -1815,6 +1824,10 @@ export type UpdateBrowserPreferences = {
 };
 
 export type UserCapabilitiesResponse = {
+    /**
+     * Deployment-owned coding agents and their configured model compatibility.
+     */
+    agents: Array<ExecutionBindingAdvertisement>;
     apiVersion: string;
     workspace: WorkspaceDeploymentCapabilities;
 };

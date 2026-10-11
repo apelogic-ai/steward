@@ -604,13 +604,21 @@ fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
 }
 
 #[cfg(feature = "runtime")]
-fn managed_inference_failure_category(stderr: &[u8]) -> Option<&'static str> {
+fn managed_inference_failure_category(
+    stderr: &[u8],
+    model_providers: &[String],
+) -> Option<&'static str> {
     String::from_utf8_lossy(stderr).lines().find_map(|line| {
         let line = line.to_ascii_lowercase();
-        let is_inference_error = line.contains("inference")
-            || line.contains("litellm")
-            || line.contains("openai")
-            || line.contains("anthropic");
+        let provider_named = model_providers.iter().any(|provider| {
+            let provider = provider.to_ascii_lowercase();
+            line.split(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+            })
+            .any(|token| token == provider)
+        });
+        let is_inference_error =
+            line.contains("inference") || line.contains("litellm") || provider_named;
         if is_inference_error
             && (line.contains("invalid api key")
                 || line.contains("invalid_api_key")
@@ -636,10 +644,14 @@ fn managed_inference_failure_category(stderr: &[u8]) -> Option<&'static str> {
 }
 
 #[cfg(feature = "runtime")]
-fn task_failure_category(stderr: &[u8], managed_inference: bool) -> &'static str {
+fn task_failure_category(
+    stderr: &[u8],
+    managed_inference: bool,
+    model_providers: &[String],
+) -> &'static str {
     let existing = task_agent_failure_category(stderr);
     if managed_inference && matches!(existing, "agent" | "authentication") {
-        managed_inference_failure_category(stderr).unwrap_or(existing)
+        managed_inference_failure_category(stderr, model_providers).unwrap_or(existing)
     } else {
         existing
     }
@@ -651,10 +663,31 @@ fn request_uses_managed_inference(request: &SandboxTaskRequest) -> bool {
 }
 
 #[cfg(feature = "runtime")]
+fn request_model_providers(request: &SandboxTaskRequest) -> Vec<String> {
+    if let Some(providers) = request
+        .execution_binding
+        .as_ref()
+        .and_then(|binding| binding.models.as_ref())
+        .map(|models| &models.providers)
+    {
+        return providers.clone();
+    }
+    let mut providers = request
+        .models
+        .iter()
+        .map(|model| model.provider.clone())
+        .collect::<Vec<_>>();
+    providers.sort();
+    providers.dedup();
+    providers
+}
+
+#[cfg(feature = "runtime")]
 fn attach_task_agent_failure_category(
     observation: SandboxTaskObservation,
     stderr: &[u8],
     managed_inference: bool,
+    model_providers: &[String],
 ) -> SandboxTaskObservation {
     match observation {
         SandboxTaskObservation::Failed {
@@ -662,7 +695,7 @@ fn attach_task_agent_failure_category(
             ..
         } => SandboxTaskObservation::Failed {
             adapter_observation_id,
-            reason: task_failure_category(stderr, managed_inference).to_owned(),
+            reason: task_failure_category(stderr, managed_inference, model_providers).to_owned(),
         },
         SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
@@ -670,7 +703,7 @@ fn attach_task_agent_failure_category(
             ..
         } => SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
-            reason: task_failure_category(stderr, managed_inference).to_owned(),
+            reason: task_failure_category(stderr, managed_inference, model_providers).to_owned(),
             transcript,
         },
         observation => observation,
@@ -2621,6 +2654,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         }
         let execution_error = match executed {
             Ok(executed) => {
+                let model_providers = request_model_providers(request);
                 return self
                     .observe_task(attempt_id, request)
                     .await
@@ -2629,6 +2663,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                             observation,
                             &executed.stderr,
                             request_uses_managed_inference(request),
+                            &model_providers,
                         )
                     });
             }
@@ -2756,6 +2791,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 })
             }
             "failed" => {
+                let model_providers = request_model_providers(request);
                 let reason = if payload == b"transcript_too_large" {
                     format!(
                         "The execution log exceeded the {} MiB limit per stream.",
@@ -2771,6 +2807,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                             task_failure_category(
                                 &transcript.stderr,
                                 request_uses_managed_inference(request),
+                                &model_providers,
                             )
                             .to_owned()
                         },
@@ -3305,13 +3342,13 @@ mod tests {
     #[cfg(feature = "runtime")]
     use steward_ports::{
         PortError, SandboxExecutionClass, SandboxRequest, SandboxTaskObservation,
-        SandboxTaskOutput, SandboxTaskTranscript, TaskAttemptId,
+        SandboxTaskOutput, SandboxTaskRequest, SandboxTaskTranscript, TaskAttemptId,
     };
     #[cfg(feature = "runtime")]
     use steward_types::direct_package::{
-        ContentDigest, ExactGitCommit, ExecutionLogMode, RepositoryUrl, ResolvedWorkspaceEntry,
-        ResolvedWorkspaceSubmodule, ResourceQuantity, StableProviderId, WorkspaceAccess,
-        WorkspaceEvidence, WorkspaceGitHistory, WorkspaceName, WorkspacePath,
+        ContentDigest, DiagnosticsRequest, ExactGitCommit, ExecutionLogMode, RepositoryUrl,
+        ResolvedWorkspaceEntry, ResolvedWorkspaceSubmodule, ResourceQuantity, StableProviderId,
+        WorkspaceAccess, WorkspaceEvidence, WorkspaceGitHistory, WorkspaceName, WorkspacePath,
         WorkspaceSubmoduleStatus, canonical_json_bytes,
     };
     #[cfg(feature = "runtime")]
@@ -3332,10 +3369,11 @@ mod tests {
         WorkloadExchangeTokenProvider, attach_task_agent_failure_category,
         collect_task_process_stream, delete_owned_sandbox, deletion_names, load_source_credential,
         output_archive_command, project_request, provider_reconciliation,
-        provider_reconciliation_plan, provider_reconciliation_targets, sandbox_spec,
-        sanitized_provider_control_transcript, staging_append_command, staging_archive_chunks,
-        staging_extract_command, staging_prepare_command, task_agent_failure_category,
-        task_attempt_cancel_command, task_attempt_detached_launch_command, task_attempt_directory,
+        provider_reconciliation_plan, provider_reconciliation_targets, request_model_providers,
+        sandbox_spec, sanitized_provider_control_transcript, staging_append_command,
+        staging_archive_chunks, staging_extract_command, staging_prepare_command,
+        task_agent_failure_category, task_attempt_cancel_command,
+        task_attempt_detached_launch_command, task_attempt_directory,
         task_attempt_execution_command, task_attempt_observation_command,
         task_attempt_transcript_stream_command, task_failure_category, task_process_launch_mode,
         task_process_log_record, task_transcript_requested, validate_raw_sandbox_binding,
@@ -4759,6 +4797,7 @@ mod tests {
                 arguments: vec!["--version".to_owned()],
                 expected_stdout: "example-agent 1.0.0".to_owned(),
             },
+            models: None,
             provider_profiles: ExecutionProviderProfiles {
                 tools: Some(ExecutionProviderProfile {
                     id: "example-tools-profile-v7".to_owned(),
@@ -4929,6 +4968,7 @@ mod tests {
                 arguments: vec!["--version".to_owned()],
                 expected_stdout: "example-agent 1.0.0".to_owned(),
             },
+            models: None,
             provider_profiles: ExecutionProviderProfiles {
                 tools: Some(ExecutionProviderProfile {
                     id: "example-tools-profile-v7".to_owned(),
@@ -5002,6 +5042,7 @@ mod tests {
                 arguments: vec!["--version".to_owned()],
                 expected_stdout: "example-agent 1.0.0".to_owned(),
             },
+            models: None,
             provider_profiles: ExecutionProviderProfiles::default(),
         };
         let command = output_archive_command(
@@ -5440,6 +5481,7 @@ mod tests {
     #[cfg(feature = "runtime")]
     #[test]
     fn task_agent_stderr_is_reduced_to_safe_categories() {
+        let model_providers = vec!["example-provider".to_owned()];
         assert_eq!(
             task_agent_failure_category(
                 b"steward-connections-bridge: bridge operation did not receive a valid MCP-GW response"
@@ -5528,40 +5570,111 @@ mod tests {
         );
         assert_eq!(task_agent_failure_category(b"opaque failure"), "agent");
         assert_eq!(
-            task_failure_category(b"openai error: incorrect api key provided", false),
+            task_failure_category(
+                b"example-provider error: incorrect api key provided",
+                false,
+                &model_providers,
+            ),
             "agent",
             "stock mode must preserve its existing failure category"
         );
         assert_eq!(
-            task_failure_category(b"openai error: incorrect api key provided", true),
+            task_failure_category(
+                b"example-provider error: incorrect api key provided",
+                true,
+                &model_providers,
+            ),
             "inference_key_rejected"
         );
         assert_eq!(
-            task_failure_category(b"openai error code: insufficient_quota", true),
+            task_failure_category(
+                b"example-provider error code: insufficient_quota",
+                true,
+                &model_providers,
+            ),
             "inference_budget_exhausted"
         );
         assert_eq!(
-            task_failure_category(b"tool provider returned unauthorized status 401", true),
+            task_failure_category(
+                b"tool provider returned unauthorized status 401",
+                true,
+                &model_providers,
+            ),
             "authentication",
             "managed mode must not relabel unrelated tool authentication failures"
         );
         assert_eq!(
-            task_failure_category(b"jira: invalid api key", true),
+            task_failure_category(b"jira: invalid api key", true, &model_providers),
             "authentication",
             "managed mode must not relabel a tool provider's rejected key"
         );
         assert_eq!(
-            task_failure_category(b"openai request completed\njira: invalid api key\n", true),
+            task_failure_category(
+                b"example-provider request completed\njira: invalid api key\n",
+                true,
+                &model_providers,
+            ),
             "authentication",
             "an unrelated inference line must not relabel a later tool failure"
         );
         assert_eq!(
             task_failure_category(
-                b"steward-connections-bridge: MCP-GW returned HTTP 401: openai invalid api key",
-                true
+                b"steward-connections-bridge: MCP-GW returned HTTP 401: example-provider invalid api key",
+                true,
+                &model_providers,
             ),
             "bridge-gateway-http",
             "specific connection failures must win over inference-shaped text"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn historical_binding_uses_the_admitted_model_provider_for_failure_classification() {
+        let request = SandboxTaskRequest {
+            runtime: RuntimeId("runtime-uid-a".to_owned()),
+            refs: RuntimeRefs::default(),
+            execution_class: SandboxExecutionClass::Agent,
+            agent_type: AgentType {
+                name: "example-agent@1.0.0".to_owned(),
+            },
+            models: vec![ModelRef {
+                provider: "example-provider".to_owned(),
+                model: "model-x".to_owned(),
+            }],
+            command: Vec::new(),
+            diagnostics: DiagnosticsRequest::default(),
+            workspace: None,
+            execution_binding: Some(DisposableExecutionBinding {
+                schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+                binding_id: format!("sha256:{}", "a".repeat(64)),
+                binding_digest: format!("sha256:{}", "a".repeat(64)),
+                agent_ref: "example-agent@1.0.0".to_owned(),
+                display_name: Some("Example Agent".to_owned()),
+                adapter: "codex-v1".to_owned(),
+                image: format!(
+                    "registry.example.test/agents/example@sha256:{}",
+                    "b".repeat(64)
+                ),
+                executable: "/opt/example/bin/agent".to_owned(),
+                version_probe: ExecutionVersionProbe {
+                    arguments: vec!["--version".to_owned()],
+                    expected_stdout: "example-agent 1.0.0".to_owned(),
+                },
+                models: None,
+                provider_profiles: ExecutionProviderProfiles::default(),
+            }),
+        };
+
+        let model_providers = request_model_providers(&request);
+        assert_eq!(model_providers, ["example-provider"]);
+        assert_eq!(
+            task_failure_category(
+                b"example-provider error: incorrect api key provided",
+                true,
+                &model_providers,
+            ),
+            "inference_key_rejected"
         );
     }
 
@@ -5581,6 +5694,7 @@ mod tests {
                 },
                 b"steward-connections-bridge: bridge MCP-GW rejected runtime authorization",
                 false,
+                &[],
             ),
             SandboxTaskObservation::FailedWithTranscript {
                 adapter_observation_id: "attempt-a".to_owned(),
@@ -5601,6 +5715,7 @@ mod tests {
                 },
                 b"opaque stderr",
                 false,
+                &[],
             ),
             SandboxTaskObservation::SucceededWithTranscript {
                 adapter_observation_id: "attempt-b".to_owned(),

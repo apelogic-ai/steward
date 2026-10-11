@@ -9,6 +9,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Execution binding catalogs now declare supported model providers. Signed-in capabilities expose
+  that compatibility, and Task planning rejects an incompatible agent/model selection before
+  reservation without hard-coded provider families.
 - Signed-in users can read the deployment's enabled workspace types and
   numeric workspace limits from `/app/api/v1/capabilities`. The response does
   not expose administrator configuration or other users' data.
@@ -52,6 +55,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Upgrade and rollback
 
+- Existing active execution-binding catalogs must move from
+  `steward.execution-bindings/v1` to `steward.execution-bindings/v2` in the same
+  rollout as these binaries. Add `models.providers` to every binding before changing
+  `apiVersion`; the new parser and Helm schema reject v1 catalogs. The field changes the binding
+  digest. Deployment-preflight inputs must also add `execution.binding.modelProviders`, covering
+  every provider in `capabilityCatalog.models`. Pause Task submission until
+  every apiserver and controller is on the new version so an older controller cannot claim a Task
+  with a v2 binding snapshot. Persisted v1 bindings on already-admitted Tasks remain readable by
+  the new version. Once the new version has created any Task, downgrade is not supported because
+  previous binaries cannot read its v2 binding and additive evidence fields. Before that point,
+  restore the previous binaries and exact v1 catalog together while submission remains paused. See the
+  [execution-binding upgrade procedure](docs/installation/upgrade-execution-bindings.md).
 - Migration 0070 is append-only and records every generated template revision
   with actor `system:migration`; retain it on rollback. List the affected
   template IDs and successor revisions with

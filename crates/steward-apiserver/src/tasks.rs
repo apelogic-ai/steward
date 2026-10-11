@@ -57,9 +57,9 @@ use steward_types::task_output_archive::{
     task_output_archive_with_execution_transcript,
 };
 use steward_types::{
-    AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, Email,
-    InferenceMode, ModelRef, Principal, RuntimeOwnership, TaskExecutionBinding, TaskPhase,
-    ToolGrant,
+    AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId,
+    DisposableExecutionBinding, Email, InferenceMode, ModelRef, Principal, RuntimeOwnership,
+    TaskExecutionBinding, TaskPhase, ToolGrant,
 };
 use uuid::Uuid;
 
@@ -804,6 +804,7 @@ fn resolve_versioned_task_plan(
                 workflow.agent
             ))
         })?;
+    require_binding_model_compatibility(&execution_binding, model)?;
     if execution_binding.provider_profiles.inference.is_none() {
         return Err(ApiError::TaskRuntimeContractUnavailable(format!(
             "logical agent {} has no inference provider profile",
@@ -2600,6 +2601,7 @@ where
             revision: request.package.revision.clone().ok_or_else(|| {
                 ApiError::Admission("registry package revision is required".to_owned())
             })?,
+            requested_revision: request.package.revision.clone(),
             path: request.package.path.clone(),
             closure: None,
             closure_digest,
@@ -2661,27 +2663,22 @@ where
             )
             .await
             .map_err(ApiError::Store)?;
-        let persisted_workspace = existing
-            .as_ref()
-            .and_then(|record| record.browser_task_evidence.as_ref())
-            .and_then(|evidence| evidence.workspace.as_ref());
+        if let Some(record) = existing {
+            validate_browser_task_retry_request(&identity, request, &record)?;
+            let evidence = record
+                .browser_task_evidence
+                .clone()
+                .ok_or(ApiError::Store(StoreError::TaskIdempotencyConflict))?;
+            return Ok((record, evidence));
+        }
         let resolved = resolve_browser_package_pre_admission(
             &self.ledger,
             &self.config,
             &identity,
             request,
-            persisted_workspace,
+            None,
         )
         .await?;
-        if let Some(record) = existing {
-            let envelope_digest = resolved
-                .envelope
-                .envelope_digest
-                .as_deref()
-                .ok_or(ApiError::MissingEnvelope)?;
-            validate_browser_task_retry(&identity, &resolved.evidence, envelope_digest, &record)?;
-            return Ok((record, resolved.evidence));
-        }
         let approved = resolved
             .envelope
             .approved_envelope
@@ -2790,10 +2787,6 @@ where
             ));
         }
         request.validate().map_err(ApiError::Admission)?;
-        if self.config.direct_git_resolver.is_none() {
-            self.config.report_direct_package_source_disabled();
-            return Err(ApiError::DirectPackageSourceDisabled);
-        }
         let existing = self
             .ledger
             .task_by_idempotency(
@@ -2803,21 +2796,21 @@ where
             )
             .await
             .map_err(ApiError::Store)?;
-        let task_uid = existing
-            .as_ref()
-            .map_or_else(Uuid::new_v4, |record| record.task_uid);
-        let persisted_workspace = existing
-            .as_ref()
-            .and_then(|record| record.direct_task_evidence.as_ref())
-            .and_then(|evidence| evidence.workspace.as_ref());
-        let pre_admission = resolve_direct_task_pre_admission(
-            &self.ledger,
-            &self.config,
-            &identity,
-            request,
-            persisted_workspace,
-        )
-        .await?;
+        if let Some(record) = existing {
+            validate_direct_task_retry_request(&identity, request, &record)?;
+            return Ok((
+                StatusCode::OK,
+                status_response(&self.ledger, record, Vec::new()).await?,
+            ));
+        }
+        if self.config.direct_git_resolver.is_none() {
+            self.config.report_direct_package_source_disabled();
+            return Err(ApiError::DirectPackageSourceDisabled);
+        }
+        let task_uid = Uuid::new_v4();
+        let pre_admission =
+            resolve_direct_task_pre_admission(&self.ledger, &self.config, &identity, request, None)
+                .await?;
         let evidence = direct_task_evidence(
             task_uid,
             identity
@@ -2834,13 +2827,6 @@ where
             execution_binding,
             ..
         } = pre_admission;
-        if let Some(record) = existing {
-            validate_direct_task_retry(&identity, &evidence, &record)?;
-            return Ok((
-                StatusCode::OK,
-                status_response(&self.ledger, record, Vec::new()).await?,
-            ));
-        }
         if !self.config.orchestration_mode.is_active() {
             return Err(ApiError::TaskRuntimeContractUnavailable(
                 "Task submission is disabled during the staged orchestration rollout".to_owned(),
@@ -3144,6 +3130,7 @@ where
                         BrowserTaskRerunError::EnvelopeUnavailable
                     }
                     ApiError::Admission(_)
+                    | ApiError::TaskRequestRejected(_)
                     | ApiError::BrowserTaskSourceUnauthorized
                     | ApiError::TaskSourceUnauthorized(_)
                     | ApiError::TaskWorkflowNotFound
@@ -4634,6 +4621,7 @@ where
     let evidence = BrowserTaskEvidence {
         source: request.package.source.clone(),
         revision,
+        requested_revision: request.package.revision.clone(),
         path: request.package.path.clone(),
         closure: Some(closure),
         closure_digest,
@@ -5520,38 +5508,9 @@ fn validate_direct_task_retry(
     Ok(())
 }
 
-fn direct_task_evidence_matches(
-    stored: &DirectTaskBindingEvidence,
-    resolved: &DirectTaskBindingEvidence,
-) -> bool {
-    let mut comparable = resolved.clone();
-    if stored.requested_requirements.is_none() {
-        comparable.requested_requirements = None;
-    }
-    if stored.requested_diagnostics.is_none() {
-        comparable.requested_diagnostics = None;
-    }
-    if stored.requested_workspace.is_empty() {
-        comparable.requested_workspace.clear();
-    }
-    if stored
-        .effective_requirements
-        .authority
-        .runtime_minutes_limit
-        .is_none()
-    {
-        comparable
-            .effective_requirements
-            .authority
-            .runtime_minutes_limit = None;
-    }
-    stored == &comparable
-}
-
-fn validate_browser_task_retry(
+fn validate_direct_task_retry_request(
     identity: &TaskIdentity,
-    evidence: &BrowserTaskEvidence,
-    envelope_digest: &str,
+    request: &DirectTaskSubmission,
     record: &TaskRecord,
 ) -> Result<(), ApiError> {
     let acting_user = identity.acting_user.as_ref().map(|email| email.0.as_str());
@@ -5559,6 +5518,124 @@ fn validate_browser_task_retry(
         .acting_user
         .as_ref()
         .map(|_| identity.canonical_user_id.as_str());
+    let Some(stored) = record.direct_task_evidence.as_ref() else {
+        return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+    };
+    let source_matches = identity
+        .source_provenance
+        .as_ref()
+        .is_some_and(|source| source == &stored.source_provenance);
+    let invocation_matches = match (&request.invocation_path, &request.package_path) {
+        (Some(path), None) => {
+            stored.invocation_kind == InvocationKind::Manifest && &stored.invocation.path == path
+        }
+        (None, Some(path)) => {
+            stored.invocation_kind == InvocationKind::Implicit && &stored.package.path == path
+        }
+        _ => false,
+    };
+    let diagnostics_match = if request.invocation_path.is_some() {
+        request.diagnostics.is_off()
+    } else {
+        request.diagnostics == stored.requested_diagnostics.unwrap_or(stored.diagnostics)
+    };
+    let requested_envelope = request.envelope_digest.as_ref().map(EnvelopeDigest::as_str);
+    if record.identity_binding_state != "bound"
+        || record.submitter_service != identity.service
+        || record.acting_user.as_deref() != acting_user
+        || record.acting_user_id.as_deref() != acting_user_id
+        || record.owner != identity.owner.0
+        || record.owner_user_id.as_deref() != Some(identity.canonical_user_id.as_str())
+        || record.runtime_ownership != RuntimeOwnership::Provisioned
+        || record.workflow_name.is_some()
+        || record.workflow_version.is_some()
+        || record.workflow_digest.is_some()
+        || !source_matches
+        || !invocation_matches
+        || !diagnostics_match
+        || requested_envelope.is_some_and(|digest| stored.envelope.digest.as_str() != digest)
+    {
+        return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+    }
+    Ok(())
+}
+
+fn direct_task_evidence_matches(
+    stored: &DirectTaskBindingEvidence,
+    resolved: &DirectTaskBindingEvidence,
+) -> bool {
+    let mut comparable = resolved.clone();
+    align_with_historical_default(
+        &stored.requested_requirements,
+        &mut comparable.requested_requirements,
+    );
+    align_with_historical_default(
+        &stored.requested_diagnostics,
+        &mut comparable.requested_diagnostics,
+    );
+    align_with_historical_default(
+        &stored.requested_workspace,
+        &mut comparable.requested_workspace,
+    );
+    align_with_historical_default(
+        &stored
+            .effective_requirements
+            .authority
+            .runtime_minutes_limit,
+        &mut comparable
+            .effective_requirements
+            .authority
+            .runtime_minutes_limit,
+    );
+    if let (Some(stored_workspace), Some(comparable_workspace)) =
+        (stored.workspace.as_ref(), comparable.workspace.as_mut())
+    {
+        align_with_historical_default(
+            &stored_workspace.max_history_depth,
+            &mut comparable_workspace.max_history_depth,
+        );
+    }
+    stored == &comparable
+}
+
+/// Evidence grows only by serde-defaulted fields. A field absent from a historical stored row is
+/// not part of that row's immutable idempotency identity; a present stored value remains exact.
+fn align_with_historical_default<T>(stored: &T, comparable: &mut T)
+where
+    T: Default + PartialEq,
+{
+    if stored == &T::default() {
+        *comparable = T::default();
+    }
+}
+
+fn validate_browser_task_retry_request(
+    identity: &TaskIdentity,
+    request: &BrowserTaskSubmission,
+    record: &TaskRecord,
+) -> Result<(), ApiError> {
+    let acting_user = identity.acting_user.as_ref().map(|email| email.0.as_str());
+    let acting_user_id = identity
+        .acting_user
+        .as_ref()
+        .map(|_| identity.canonical_user_id.as_str());
+    let Some(stored) = record.browser_task_evidence.as_ref() else {
+        return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
+    };
+    let requested_diagnostics = stored.requested_diagnostics.unwrap_or(stored.diagnostics);
+    let revision_matches = stored.requested_revision.as_deref().map_or_else(
+        || {
+            request.package.revision.as_deref().map_or_else(
+                || request.package.source == "inline",
+                |revision| revision == stored.revision,
+            )
+        },
+        |requested| request.package.revision.as_deref() == Some(requested),
+    );
+    let requested_envelope = request
+        .envelope_digest
+        .as_ref()
+        .and_then(|digest| digest.as_str().strip_prefix("steward:"));
     if record.identity_binding_state != "bound"
         || record.submitter_service != identity.service
         || record.acting_user.as_deref() != acting_user
@@ -5567,11 +5644,13 @@ fn validate_browser_task_retry(
         || record.owner_user_id.as_deref() != Some(identity.canonical_user_id.as_str())
         || record.runtime_ownership != RuntimeOwnership::Provisioned
         || record.task_origin != TaskOrigin::Browser
-        || record.user_envelope_digest.as_deref() != Some(envelope_digest)
-        || !record
-            .browser_task_evidence
-            .as_ref()
-            .is_some_and(|stored| browser_task_evidence_matches(stored, evidence))
+        || request.package.source != stored.source
+        || !revision_matches
+        || request.package.path != stored.path
+        || request.package.files != stored.inline_files
+        || request.diagnostics != requested_diagnostics
+        || requested_envelope
+            .is_some_and(|digest| record.user_envelope_digest.as_deref() != Some(digest))
     {
         return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
     }
@@ -5583,17 +5662,33 @@ fn browser_task_evidence_matches(
     resolved: &BrowserTaskEvidence,
 ) -> bool {
     let mut comparable = resolved.clone();
-    if stored.requested_diagnostics.is_none() {
-        comparable.requested_diagnostics = None;
-    }
-    if stored.requested_requirements.is_none() {
-        comparable.requested_requirements = None;
-    }
-    if stored.effective_requirements.is_none() {
-        comparable.effective_requirements = None;
-    }
-    if stored.requested_workspace.is_empty() {
-        comparable.requested_workspace.clear();
+    align_with_historical_default(
+        &stored.requested_revision,
+        &mut comparable.requested_revision,
+    );
+    align_with_historical_default(
+        &stored.requested_diagnostics,
+        &mut comparable.requested_diagnostics,
+    );
+    align_with_historical_default(
+        &stored.requested_requirements,
+        &mut comparable.requested_requirements,
+    );
+    align_with_historical_default(
+        &stored.effective_requirements,
+        &mut comparable.effective_requirements,
+    );
+    align_with_historical_default(
+        &stored.requested_workspace,
+        &mut comparable.requested_workspace,
+    );
+    if let (Some(stored_workspace), Some(comparable_workspace)) =
+        (stored.workspace.as_ref(), comparable.workspace.as_mut())
+    {
+        align_with_historical_default(
+            &stored_workspace.max_history_depth,
+            &mut comparable_workspace.max_history_depth,
+        );
     }
     stored == &comparable
 }
@@ -5816,6 +5911,7 @@ fn resolve_direct_execution_plan(
                 "logical agent {agent_ref} has no deployment execution binding"
             ))
         })?;
+    require_binding_model_compatibility(&binding, model)?;
     if binding.provider_profiles.inference.is_none() {
         return Err(ApiError::TaskRuntimeContractUnavailable(format!(
             "logical agent {agent_ref} has no inference provider profile"
@@ -5858,6 +5954,29 @@ fn resolve_direct_execution_plan(
         })?
         .command;
     Ok((command, TaskExecutionBinding::Disposable(binding)))
+}
+
+fn require_binding_model_compatibility(
+    binding: &DisposableExecutionBinding,
+    model: &steward_types::ModelRef,
+) -> Result<(), ApiError> {
+    let compatibility = binding.models.as_ref().ok_or_else(|| {
+        ApiError::TaskRuntimeContractUnavailable(
+            "This coding agent has no model providers configured. Ask an administrator to update the agent catalog."
+                .to_owned(),
+        )
+    })?;
+    if compatibility
+        .providers
+        .iter()
+        .any(|provider| provider == &model.provider)
+    {
+        return Ok(());
+    }
+    Err(ApiError::TaskRequestRejected(format!(
+        "This coding agent does not support the selected model. Choose a model from {} or another agent.",
+        compatibility.providers.join(", ")
+    )))
 }
 
 fn git_reference(reference: &str) -> Result<String, ApiError> {
@@ -6668,14 +6787,14 @@ mod workflow_request_tests {
         TaskSubmissionRequest, WorkspaceAdmissionPolicy, WorkspaceGitPackLimits,
         WorkspaceResolutionBudget, append_workspace_git_pack, browser_input_retry_matches,
         browser_inputs_archive, browser_inputs_from_archive, browser_rerun_submission,
-        browser_workspace_trigger_commit, default_workspace_name, direct_authority_spec,
-        direct_effective_requirements, direct_requirements_for_task, format_workspace_bytes,
-        prepare_task_input_archive, resolve_scratch_workspace_entry, resolve_versioned_task_plan,
-        source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
-        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
-        workspace_admission_policy, workspace_git_materialized_budget,
-        workspace_submodule_is_selected, workspace_submodule_repository_url,
-        workspace_tree_inventory,
+        browser_task_evidence_matches, browser_workspace_trigger_commit, default_workspace_name,
+        direct_authority_spec, direct_effective_requirements, direct_requirements_for_task,
+        direct_task_evidence_matches, format_workspace_bytes, prepare_task_input_archive,
+        resolve_scratch_workspace_entry, resolve_versioned_task_plan, source_port_error,
+        source_port_error_with_reporter, stable_task_runtime_name, task_orchestration_reservation,
+        validate_workspace_policy, versioned_workflow_reference, workspace_admission_policy,
+        workspace_git_materialized_budget, workspace_submodule_is_selected,
+        workspace_submodule_repository_url, workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -6689,8 +6808,9 @@ mod workflow_request_tests {
     };
     use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
     use steward_types::direct_package::{
-        DirectTaskDefinition, ExactGitCommit, RepositoryUrl, StableProviderId, WorkspaceAuthority,
-        WorkspaceEntry, WorkspaceEntryType, WorkspaceEvidence, WorkspacePath,
+        BrowserTaskEvidence, DirectTaskBindingEvidence, DirectTaskDefinition, ExactGitCommit,
+        RepositoryUrl, StableProviderId, WorkspaceAuthority, WorkspaceEntry, WorkspaceEntryType,
+        WorkspaceEvidence, WorkspacePath,
     };
     use steward_types::{
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
@@ -7734,6 +7854,104 @@ mod workflow_request_tests {
     }
 
     #[test]
+    fn evidence_retries_tolerate_each_field_absent_from_v0_3_15_rows() -> Result<(), String> {
+        fn remove_path(value: &mut serde_json::Value, path: &[&str]) -> Result<(), String> {
+            let (field, parents) = path
+                .split_last()
+                .ok_or_else(|| "evidence field path is empty".to_owned())?;
+            let mut parent = value;
+            for segment in parents {
+                parent = parent
+                    .get_mut(*segment)
+                    .ok_or_else(|| format!("evidence fixture omitted {segment}"))?;
+            }
+            parent
+                .as_object_mut()
+                .ok_or_else(|| format!("evidence parent for {field} is not an object"))?
+                .remove(*field)
+                .ok_or_else(|| format!("evidence fixture omitted {field}"))?;
+            Ok(())
+        }
+
+        let mut direct_value: serde_json::Value = serde_json::from_str(include_str!(
+            "../testdata/direct-task-evidence-v0.3.15.json"
+        ))
+        .map_err(|error| error.to_string())?;
+        direct_value["requestedRequirements"] = direct_value["effectiveRequirements"].clone();
+        direct_value["requestedDiagnostics"] = direct_value["diagnostics"].clone();
+        direct_value["requestedWorkspace"] = serde_json::json!([{
+            "scratch": { "name": "scratch", "size": "2Gi" }
+        }]);
+        direct_value["effectiveRequirements"]["authority"]["runtimeMinutesLimit"] =
+            serde_json::json!("30");
+        direct_value["workspace"] = serde_json::json!({
+            "entries": [{
+                "type": "scratch",
+                "name": "scratch",
+                "size": "2Gi",
+                "contentDigest": format!("steward:sha256:{}", "a".repeat(64))
+            }],
+            "maxMaterializedBytes": 2147483648_u64,
+            "maxHistoryDepth": 20,
+            "workspaceDigest": format!("steward:sha256:{}", "b".repeat(64))
+        });
+        let current_direct: DirectTaskBindingEvidence =
+            serde_json::from_value(direct_value.clone()).map_err(|error| error.to_string())?;
+        for path in [
+            &["requestedRequirements"][..],
+            &["requestedDiagnostics"][..],
+            &["requestedWorkspace"][..],
+            &["effectiveRequirements", "authority", "runtimeMinutesLimit"][..],
+            &["workspace", "maxHistoryDepth"][..],
+        ] {
+            let mut stored = direct_value.clone();
+            remove_path(&mut stored, path)?;
+            let stored: DirectTaskBindingEvidence =
+                serde_json::from_value(stored).map_err(|error| error.to_string())?;
+            assert!(
+                direct_task_evidence_matches(&stored, &current_direct),
+                "direct retry rejected a v0.3.15 row without {}",
+                path.join(".")
+            );
+        }
+
+        let browser_value = serde_json::json!({
+            "source": "steward:registry/repository-review",
+            "revision": "steward:version:1",
+            "requestedRevision": "steward:version:1",
+            "path": "task-definition.json",
+            "closureDigest": format!("steward:sha256:{}", "c".repeat(64)),
+            "diagnostics": { "executionLog": "full" },
+            "requestedDiagnostics": { "executionLog": "full" },
+            "requestedRequirements": direct_value["effectiveRequirements"].clone(),
+            "effectiveRequirements": direct_value["effectiveRequirements"].clone(),
+            "requestedWorkspace": direct_value["requestedWorkspace"].clone(),
+            "workspace": direct_value["workspace"].clone()
+        });
+        let current_browser: BrowserTaskEvidence =
+            serde_json::from_value(browser_value.clone()).map_err(|error| error.to_string())?;
+        for path in [
+            &["requestedRevision"][..],
+            &["requestedRequirements"][..],
+            &["requestedDiagnostics"][..],
+            &["requestedWorkspace"][..],
+            &["effectiveRequirements"][..],
+            &["workspace", "maxHistoryDepth"][..],
+        ] {
+            let mut stored = browser_value.clone();
+            remove_path(&mut stored, path)?;
+            let stored: BrowserTaskEvidence =
+                serde_json::from_value(stored).map_err(|error| error.to_string())?;
+            assert!(
+                browser_task_evidence_matches(&stored, &current_browser),
+                "browser retry rejected a v0.3.15 row without {}",
+                path.join(".")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn repository_browser_workspace_trigger_is_the_package_commit() -> Result<(), String> {
         let repository = GitRepositoryIdentity {
             repository: RepositoryUrl::parse(
@@ -7835,7 +8053,7 @@ mod workflow_request_tests {
                 .map_or("", |(_, version)| version)
         );
         serde_json::to_string(&serde_json::json!({
-            "apiVersion": "steward.execution-bindings/v1",
+            "apiVersion": "steward.execution-bindings/v2",
             "bindings": [{
                 "agentRef": agent_ref,
                 "displayName": format!("Agent {agent_ref}"),
@@ -7845,6 +8063,9 @@ mod workflow_request_tests {
                 "versionProbe": {
                     "arguments": ["--version"],
                     "expectedStdout": expected_version
+                },
+                "models": {
+                    "providers": ["example", "openai"]
                 },
                 "providerProfiles": {
                     "tools": {
@@ -8223,6 +8444,57 @@ mod workflow_request_tests {
                 .iter()
                 .all(|argument| !argument.contains("example-org")),
             "repository mechanics do not belong to the Workflow execution command"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configured_unknown_model_provider_flows_into_the_run_plan() -> Result<(), String> {
+        let user_id = "usr_0123456789abcdef0123456789abcdef";
+        let mut envelope = provisioned_envelope(user_id)?;
+        let model = ModelRef {
+            provider: "example".to_owned(),
+            model: "model-x".to_owned(),
+        };
+        envelope.requested_envelope.spec.llms = vec![model.clone()];
+        envelope
+            .approved_envelope
+            .as_mut()
+            .ok_or_else(|| "fixture must contain an approved Envelope".to_owned())?
+            .spec
+            .llms = vec![model];
+
+        let plan = resolve_versioned_task_plan(
+            &identity(user_id)?,
+            workflow(),
+            vec![envelope.clone()],
+            &task_config(Some("https://mcp-gw.example.test/mcp"))?,
+        )
+        .map_err(|error| format!("configured model unknown to Steward was rejected: {error:?}"))?;
+        assert_eq!(
+            plan.command.get(4).map(String::as_str),
+            Some("example/model-x")
+        );
+
+        let mut incompatible_catalog =
+            serde_json::from_str::<serde_json::Value>(&execution_catalog(&workflow().agent, 'a')?)
+                .map_err(|error| error.to_string())?;
+        incompatible_catalog["bindings"][0]["models"]["providers"] =
+            serde_json::json!(["other-provider"]);
+        let incompatible_config =
+            TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
+                .with_execution_adapter(Arc::new(ExampleExecutionAdapter))?
+                .with_execution_bindings_json(Some(&incompatible_catalog.to_string()))?
+                .with_execution_bindings_active(true)?;
+        let rejected = resolve_versioned_task_plan(
+            &identity(user_id)?,
+            workflow(),
+            vec![envelope],
+            &incompatible_config,
+        );
+        assert!(
+            matches!(rejected, Err(ApiError::TaskRequestRejected(reason)) if reason == "This coding agent does not support the selected model. Choose a model from other-provider or another agent."),
+            "an unlisted model provider must fail before Task reservation"
         );
         Ok(())
     }

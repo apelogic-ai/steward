@@ -25,7 +25,7 @@ user Task.
 |---|---|
 | `STEWARD_TASK_ORCHESTRATION_MODE` | Required in both binaries. `staged` rejects new public and internal Task submissions; `active` enables orchestration. Roll every replica with `staged` before a separate activation change. |
 | `STEWARD_KUBERNETES_TOKEN_REVIEW_AUDIENCE` | Required and non-empty. |
-| `STEWARD_TASK_EXECUTION_BINDINGS_FILE` | Preferred read-only `steward.execution-bindings/v1` catalog. Missing or empty means no coding agents are available. |
+| `STEWARD_TASK_EXECUTION_BINDINGS_FILE` | Preferred read-only `steward.execution-bindings/v2` catalog. Missing or empty means no coding agents are available. |
 | `STEWARD_TASK_EXECUTION_BINDINGS_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
 | `STEWARD_CAPABILITY_CATALOG_FILE` | Read-only `steward.capability-catalog/v2` document used by browser administration. Required when browser administration is enabled. |
 | `STEWARD_CAPABILITY_CATALOG_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |

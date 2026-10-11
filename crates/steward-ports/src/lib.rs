@@ -247,6 +247,8 @@ pub struct SandboxTaskRequest {
     pub execution_class: SandboxExecutionClass,
     /// The controller reads this only from the persisted runtime spec; callers cannot choose it.
     pub agent_type: AgentType,
+    /// The exact models admitted into the immutable runtime spec for this Task.
+    pub models: Vec<ModelRef>,
     pub command: Vec<String>,
     /// Immutable caller-visible diagnostics selected by the admitted direct package.
     /// Legacy tasks and provider-control operations always carry the default disabled value.

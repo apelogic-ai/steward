@@ -668,6 +668,35 @@ impl TaskExecutionBinding {
     }
 }
 
+/// Deployment-declared model providers that an immutable agent binding can execute.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionModelCompatibility {
+    pub providers: Vec<String>,
+}
+
+impl ExecutionModelCompatibility {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.providers.is_empty()
+            || self.providers.len() > 64
+            || self
+                .providers
+                .iter()
+                .any(|provider| !valid_bounded_binding_scalar(provider))
+            || self.providers.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err("execution model providers must be unique bounded identifiers".to_owned());
+        }
+        Ok(())
+    }
+
+    pub fn supports(&self, model: &ModelRef) -> bool {
+        self.providers
+            .binary_search_by(|provider| provider.as_str().cmp(&model.provider))
+            .is_ok()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DisposableExecutionBinding {
@@ -681,6 +710,9 @@ pub struct DisposableExecutionBinding {
     pub image: String,
     pub executable: String,
     pub version_probe: ExecutionVersionProbe,
+    /// Absent only on historical persisted bindings created before compatibility was content-bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<ExecutionModelCompatibility>,
     pub provider_profiles: ExecutionProviderProfiles,
 }
 
@@ -699,6 +731,10 @@ impl DisposableExecutionBinding {
             || !valid_digest_pinned_image(&self.image)
             || !valid_absolute_executable(&self.executable)
             || self.version_probe.validate().is_err()
+            || self
+                .models
+                .as_ref()
+                .is_some_and(|models| models.validate().is_err())
             || self.provider_profiles.validate().is_err()
         {
             return Err("disposable execution binding is incomplete or mutable".to_owned());
@@ -715,6 +751,8 @@ impl DisposableExecutionBinding {
             image: &'a str,
             executable: &'a str,
             version_probe: &'a ExecutionVersionProbe,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            models: &'a Option<ExecutionModelCompatibility>,
             provider_profiles: &'a ExecutionProviderProfiles,
         }
 
@@ -724,9 +762,18 @@ impl DisposableExecutionBinding {
             image: &self.image,
             executable: &self.executable,
             version_probe: &self.version_probe,
+            models: &self.models,
             provider_profiles: &self.provider_profiles,
         })
         .map_err(|error| format!("execution binding cannot be canonicalized: {error}"))
+    }
+
+    /// Historical persisted bindings have no compatibility field. They may only be reached by
+    /// retrying an already-admitted Task whose exact model is immutable in evidence.
+    pub fn supports_model(&self, model: &ModelRef) -> bool {
+        self.models
+            .as_ref()
+            .is_none_or(|compatibility| compatibility.supports(model))
     }
 }
 
@@ -1183,9 +1230,10 @@ mod tests {
 
     use super::{
         CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION, CANONICAL_PRINCIPAL_SCHEMA_VERSION,
-        CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
-        OrganizationIdentityPolicy, Principal, ResidentExecutionBinding, ResidentExecutionContext,
-        RuntimeId, TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding, agent_runtime_crd,
+        CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, DisposableExecutionBinding,
+        Email, ModelRef, OrganizationId, OrganizationIdentityPolicy, Principal,
+        ResidentExecutionBinding, ResidentExecutionContext, RuntimeId,
+        TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding, agent_runtime_crd,
         valid_digest_pinned_image,
     };
 
@@ -1207,6 +1255,36 @@ mod tests {
             deployment_binding_digest: digest('d'),
             freshness_generation: 7,
         })
+    }
+
+    #[test]
+    fn historical_disposable_binding_without_model_compatibility_remains_readable()
+    -> Result<(), String> {
+        let binding = serde_json::from_value::<DisposableExecutionBinding>(json!({
+            "schemaVersion": TASK_EXECUTION_BINDING_SCHEMA_VERSION,
+            "bindingId": digest('a'),
+            "bindingDigest": digest('a'),
+            "agentRef": "example-agent@1.0.0",
+            "adapter": "example-v1",
+            "image": format!(
+                "registry.example.test/agents/example@sha256:{}",
+                "b".repeat(64)
+            ),
+            "executable": "/opt/example/bin/agent",
+            "versionProbe": {
+                "arguments": ["--version"],
+                "expectedStdout": "example-agent 1.0.0"
+            },
+            "providerProfiles": {}
+        }))
+        .map_err(|error| format!("historical binding did not deserialize: {error}"))?;
+        binding.validate()?;
+        assert!(binding.models.is_none());
+        assert!(binding.supports_model(&ModelRef {
+            provider: "historical-provider".to_owned(),
+            model: "historical-model".to_owned(),
+        }));
+        Ok(())
     }
 
     #[test]

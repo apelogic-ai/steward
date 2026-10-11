@@ -60,6 +60,8 @@ pub struct UserEnvelopeSubject {
 pub struct UserCapabilitiesResponse {
     pub api_version: String,
     pub workspace: WorkspaceDeploymentCapabilities,
+    /// Deployment-owned coding agents and their configured model compatibility.
+    pub agents: Vec<ExecutionBindingAdvertisement>,
 }
 
 /// The session binding is opaque to the request domain. It is only used by a broker to bind
@@ -1164,6 +1166,7 @@ where
     Json(UserCapabilitiesResponse {
         api_version: USER_CAPABILITIES_API_VERSION.to_owned(),
         workspace: state.workspace_capabilities,
+        agents: state.agents,
     })
     .into_response()
 }
@@ -1781,7 +1784,8 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use steward_types::direct_package::{ResourceQuantity, WorkspaceAuthority, WorkspaceEntryType};
     use steward_types::{
-        Budget, Duration, KubernetesQuantity, ModelRef, RunnerPlatform, ToolGrant,
+        Budget, Duration, ExecutionModelCompatibility, KubernetesQuantity, ModelRef,
+        RunnerPlatform, ToolGrant,
     };
     use tower::ServiceExt;
 
@@ -2096,6 +2100,9 @@ mod tests {
             vec![ExecutionBindingAdvertisement {
                 agent_ref: "codex@0.140.0".to_owned(),
                 display_name: Some("Codex 0.140.0".to_owned()),
+                models: ExecutionModelCompatibility {
+                    providers: vec!["example".to_owned()],
+                },
             }],
         )
         .layer(axum::Extension(session()?))
@@ -2139,7 +2146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_in_users_can_read_deployment_workspace_capabilities() -> Result<(), String> {
+    async fn signed_in_users_can_read_deployment_capabilities() -> Result<(), String> {
         let workspace = crate::tasks::TaskApiConfig::default()
             .with_workspace_policy_json(Some(
                 &serde_json::json!({
@@ -2156,16 +2163,26 @@ mod tests {
                 .to_string(),
             ))?
             .workspace_deployment_capabilities();
-        let response = inner_router_with_capabilities(TestBroker::default(), Vec::new(), workspace)
-            .layer(axum::Extension(session()?))
-            .oneshot(
-                Request::builder()
-                    .uri("/app/api/v1/capabilities")
-                    .body(Body::empty())
-                    .map_err(|error| format!("build user capabilities request: {error}"))?,
-            )
-            .await
-            .map_err(|error| format!("request user capabilities: {error}"))?;
+        let response = inner_router_with_capabilities(
+            TestBroker::default(),
+            vec![ExecutionBindingAdvertisement {
+                agent_ref: "example-agent@1.0.0".to_owned(),
+                display_name: Some("Example Agent".to_owned()),
+                models: ExecutionModelCompatibility {
+                    providers: vec!["example".to_owned()],
+                },
+            }],
+            workspace,
+        )
+        .layer(axum::Extension(session()?))
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/capabilities")
+                .body(Body::empty())
+                .map_err(|error| format!("build user capabilities request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("request user capabilities: {error}"))?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 16 * 1024)
             .await
@@ -2182,6 +2199,11 @@ mod tests {
             3 * 1024 * 1024 * 1024_u64
         );
         assert_eq!(body["workspace"]["maxHistoryDepth"], 42);
+        assert_eq!(body["agents"][0]["agentRef"], "example-agent@1.0.0");
+        assert_eq!(
+            body["agents"][0]["models"]["providers"],
+            serde_json::json!(["example"])
+        );
         Ok(())
     }
 

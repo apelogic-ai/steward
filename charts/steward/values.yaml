@@ -219,7 +219,7 @@ config:
     executionBindingsMode: staged
     # Deployment-owned catalog. An empty list advertises no coding agents and creates no fallback.
     executionBindings:
-      apiVersion: steward.execution-bindings/v1
+      apiVersion: steward.execution-bindings/v2
       bindings: []
     # Exact OpenAI-compatible Responses API endpoint rendered by the Codex adapter.
     inferenceEndpoint: ""

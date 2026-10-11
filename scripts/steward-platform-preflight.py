@@ -640,6 +640,23 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
     binding = require_object(execution, "binding", "execution")
     for key in ("agentRef", "displayName", "adapter", "executable", "expectedVersion", "runtimeName"):
         require_string(binding, key, "execution.binding")
+    model_providers = binding.get("modelProviders")
+    if (
+        not isinstance(model_providers, list)
+        or not model_providers
+        or len(model_providers) > 64
+        or any(
+            not isinstance(provider, str)
+            or not provider
+            or provider != provider.strip()
+            or len(provider) > 255
+            for provider in model_providers
+        )
+        or len(set(model_providers)) != len(model_providers)
+    ):
+        raise ValidationError(
+            "execution.binding.modelProviders must contain unique non-empty provider identifiers"
+        )
     runtime_image = binding_images.get(binding["runtimeName"])
     if not isinstance(runtime_image, str) or not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", runtime_image):
         raise ValidationError("execution.binding.runtimeName must select one immutable deploymentLock.executionBindingImages entry")
@@ -683,11 +700,24 @@ def validate_input(data: dict[str, Any]) -> list[dict[str, str]]:
         if selected not in profile_ids:
             raise ValidationError(f"execution.binding.{key} must select one providerProfiles name")
 
+    capability_catalog = require_object(data, "capabilityCatalog", "input")
     validate_capability_catalog(
-        require_object(data, "capabilityCatalog", "input"),
+        capability_catalog,
         requires_inference="inferenceProfile" in binding,
         requires_tools="toolsProfile" in binding,
     )
+    uncovered_model_providers = sorted(
+        {
+            model["provider"]
+            for model in capability_catalog["models"]
+            if model["provider"] not in model_providers
+        }
+    )
+    if uncovered_model_providers:
+        raise ValidationError(
+            "execution.binding.modelProviders must cover every capabilityCatalog.models provider; "
+            f"missing: {', '.join(uncovered_model_providers)}"
+        )
     validate_steward_run_release(
         require_object(data, "stewardRunRelease", "input")
     )
@@ -806,7 +836,7 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
                 "mcpGatewayEndpoint": endpoints["mcpGateway"],
                 "executionBindingsMode": "active",
                 "executionBindings": {
-                    "apiVersion": "steward.execution-bindings/v1",
+                    "apiVersion": "steward.execution-bindings/v2",
                     "bindings": [
                         {
                             "agentRef": binding["agentRef"],
@@ -815,6 +845,7 @@ def chart_values(data: dict[str, Any], profile_digests: dict[str, str]) -> dict[
                             "image": lock["executionBindingImages"][binding["runtimeName"]],
                             "executable": binding["executable"],
                             "versionProbe": {"arguments": ["--version"], "expectedStdout": binding["expectedVersion"]},
+                            "models": {"providers": sorted(binding["modelProviders"])},
                             "providerProfiles": {
                                 key.removesuffix("Profile"): {
                                     "id": binding[key],

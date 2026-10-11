@@ -23,9 +23,9 @@ impl ClaudeCodeTaskExecutionAdapter {
         request: TaskExecutionPlanRequest<'_>,
         config_dir: &str,
     ) -> Result<TaskExecutionPlan, PortError> {
-        if request.model.provider != "anthropic" {
+        if !request.binding.supports_model(request.model) {
             return Err(PortError::Rejected {
-                reason: "Claude Code execution requires an approved Anthropic model".to_owned(),
+                reason: "This coding agent does not support the selected model.".to_owned(),
             });
         }
         if !request.tools.is_empty() && request.tool_transport_endpoint.is_none() {
@@ -174,8 +174,8 @@ mod tests {
 
     use steward_ports::{TaskExecutionAdapter, TaskExecutionPlanRequest};
     use steward_types::{
-        DisposableExecutionBinding, ExecutionProviderProfile, ExecutionProviderProfiles,
-        ExecutionVersionProbe, ModelRef, ToolGrant,
+        DisposableExecutionBinding, ExecutionModelCompatibility, ExecutionProviderProfile,
+        ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, ToolGrant,
     };
 
     use super::{CLAUDE_CODE_V1_ADAPTER, ClaudeCodeTaskExecutionAdapter};
@@ -228,6 +228,9 @@ mod tests {
                 arguments: vec!["--version".to_owned()],
                 expected_stdout: "2.1.222 (Claude Code)".to_owned(),
             },
+            models: Some(ExecutionModelCompatibility {
+                providers: vec!["anthropic".to_owned(), "example-provider".to_owned()],
+            }),
             provider_profiles: ExecutionProviderProfiles {
                 tools: Some(ExecutionProviderProfile {
                     id: "example-tools-profile-v7".to_owned(),
@@ -500,8 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_or_malformed_governed_endpoints_and_non_anthropic_models()
-    -> Result<(), String> {
+    fn rejects_missing_or_malformed_governed_endpoints_and_unlisted_models() -> Result<(), String> {
         for endpoint in [
             " https://inference.example.test",
             "ftp://inference.example.test",
@@ -542,7 +544,7 @@ mod tests {
                 .render(TaskExecutionPlanRequest {
                     workflow_prompt: "Inspect input.",
                     model: &ModelRef {
-                        provider: "example-provider".to_owned(),
+                        provider: "other-provider".to_owned(),
                         model: "claude-sonnet-example".to_owned(),
                     },
                     tools: &[],
@@ -551,6 +553,18 @@ mod tests {
                 })
                 .is_err()
         );
+        adapter
+            .render(TaskExecutionPlanRequest {
+                workflow_prompt: "Inspect input.",
+                model: &ModelRef {
+                    provider: "example-provider".to_owned(),
+                    model: "model-x".to_owned(),
+                },
+                tools: &[],
+                tool_transport_endpoint: None,
+                binding: &binding,
+            })
+            .map_err(|error| format!("configured provider must be accepted: {error:?}"))?;
         Ok(())
     }
 }

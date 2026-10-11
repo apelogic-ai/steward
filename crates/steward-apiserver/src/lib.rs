@@ -977,6 +977,7 @@ pub enum ApiError {
         value: String,
     },
     Admission(String),
+    TaskRequestRejected(String),
     DecisionChannel(String),
     Conflict(String),
     NoActiveGrants,
@@ -2824,6 +2825,13 @@ impl IntoResponse for ApiError {
                 )
                     .into_response();
             }
+            Self::TaskRequestRejected(reason) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({ "error": reason })),
+                )
+                    .into_response();
+            }
             Self::TaskPersistenceFailed => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2886,9 +2894,9 @@ impl IntoResponse for ApiError {
             | Self::InferenceKeyMissing
             | Self::InferenceKeyUnusable => StatusCode::UNPROCESSABLE_ENTITY,
             Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
-            Self::InvalidBudgetIncrease { .. } | Self::Admission(_) => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            Self::InvalidBudgetIncrease { .. }
+            | Self::Admission(_)
+            | Self::TaskRequestRejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::NoActiveGrants => StatusCode::NOT_FOUND,
             Self::Store(StoreError::ApprovalNotFound) => StatusCode::NOT_FOUND,
@@ -3903,6 +3911,7 @@ mod tests {
         object.remove("requestedRequirements");
         object.remove("requestedDiagnostics");
         object.remove("requestedWorkspace");
+        object.remove("requestedRevision");
         if browser {
             object.remove("effectiveRequirements");
         } else if let Some(authority) = object
@@ -4029,7 +4038,7 @@ mod tests {
 
     fn execution_binding_catalog() -> String {
         serde_json::json!({
-            "apiVersion": "steward.execution-bindings/v1",
+            "apiVersion": "steward.execution-bindings/v2",
             "bindings": [{
                 "agentRef": TEST_VERSIONED_AGENT,
                 "adapter": "example-v1",
@@ -4038,6 +4047,9 @@ mod tests {
                 "versionProbe": {
                     "arguments": ["--version"],
                     "expectedStdout": "example-agent 1.0.0"
+                },
+                "models": {
+                    "providers": ["openai"]
                 },
                 "providerProfiles": {
                     "tools": {
@@ -12522,6 +12534,96 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn browser_repository_retry_matches_the_original_mutable_git_reference()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        let git = browser_git_fixture()?;
+        let reads = git.reads.clone();
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let app = browser_task_router(
+            ledger.clone(),
+            task_api_config()?
+                .with_git_hosting_plane(git)
+                .with_source_repository_bindings_json(Some(&direct_source_bindings_json(
+                    "654321",
+                )))?,
+            auth,
+        );
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/runs")
+                .header(header::COOKIE, &session_cookie)
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", &csrf)
+                .header("idempotency-key", "browser-repository-retry")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "package": {
+                            "source": "https://github.com/example-org/agentic-ops.git",
+                            "revision": "git:ref:main",
+                            "path": "task-definition.json"
+                        },
+                        "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64)),
+                        "inputs": { "message": "hello" }
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build browser repository retry: {error}"))
+        };
+
+        let first = app
+            .clone()
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("submit initial browser repository Task: {error}"))?;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let reads_after_first = reads
+            .lock()
+            .map_err(|_| "fake Git read ledger was poisoned")?
+            .len();
+        {
+            let tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            let evidence = tasks
+                .first()
+                .and_then(|task| task.browser_task_evidence.as_ref())
+                .ok_or_else(|| "repository Task omitted browser evidence".to_owned())?;
+            assert_eq!(evidence.requested_revision.as_deref(), Some("git:ref:main"));
+            assert_eq!(evidence.revision, format!("git:sha1:{}", "c".repeat(40)));
+        }
+
+        let retry = app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("retry browser repository Task: {error}"))?;
+        assert_eq!(retry.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            reads
+                .lock()
+                .map_err(|_| "fake Git read ledger was poisoned")?
+                .len(),
+            reads_after_first,
+            "an idempotent browser retry must not re-resolve or reread mutable Git source"
+        );
+        assert_eq!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
     fn same_repository_direct_git_fixture() -> Result<FakeDirectGit, String> {
         let repository = RepositoryUrl::parse("https://github.com/example-org/caller.git")?;
         let identity = GitRepositoryIdentity {
@@ -12717,51 +12819,73 @@ mod tests {
         let origin = "http://127.0.0.1:33001";
         let (auth, session_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::User).await?;
-        let response = browser_task_router(ledger.clone(), task_api_config()?, auth)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/app/api/v1/runs")
-                    .header(header::COOKIE, session_cookie)
-                    .header(header::ORIGIN, origin)
-                    .header("sec-fetch-site", "same-origin")
-                    .header("x-steward-csrf", csrf)
-                    .header("idempotency-key", "browser-registry-1")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "package": {
-                                "source": "steward:registry/repository-review",
-                                "revision": "steward:version:1",
-                                "path": "task-definition.json"
-                            },
-                            "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64)),
-                            "inputs": {}
-                        })
-                        .to_string(),
-                    ))
-                    .map_err(|error| format!("build browser registry request: {error}"))?,
-            )
+        let app = browser_task_router(ledger.clone(), task_api_config()?, auth);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/runs")
+                .header(header::COOKIE, &session_cookie)
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", &csrf)
+                .header("idempotency-key", "browser-registry-1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "package": {
+                            "source": "steward:registry/repository-review",
+                            "revision": "steward:version:1",
+                            "path": "task-definition.json"
+                        },
+                        "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64)),
+                        "inputs": {}
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build browser registry request: {error}"))
+        };
+        let response = app
+            .clone()
+            .oneshot(request()?)
             .await
             .map_err(|error| format!("submit browser registry request: {error}"))?;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let tasks = ledger
-            .tasks
-            .lock()
-            .map_err(|_| "fake Task ledger lock was poisoned")?;
-        let task = tasks
-            .first()
-            .ok_or_else(|| "registry alias did not reserve a Task".to_owned())?;
-        assert_eq!(task.workflow, "repository-review@1");
-        assert_eq!(task.task_origin, TaskOrigin::Browser);
-        assert_eq!(task.workflow_version, Some(1));
+        {
+            let mut tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            let task = tasks
+                .first_mut()
+                .ok_or_else(|| "registry alias did not reserve a Task".to_owned())?;
+            assert_eq!(task.workflow, "repository-review@1");
+            assert_eq!(task.task_origin, TaskOrigin::Browser);
+            assert_eq!(task.workflow_version, Some(1));
+            let evidence = task
+                .browser_task_evidence
+                .as_mut()
+                .ok_or_else(|| "registry alias omitted browser evidence".to_owned())?;
+            assert_eq!(evidence.revision, "steward:version:1");
+            evidence.requested_revision = None;
+        }
+
+        let retry = app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("retry browser registry request: {error}"))?;
         assert_eq!(
-            task.browser_task_evidence
-                .as_ref()
-                .map(|evidence| evidence.revision.as_str()),
-            Some("steward:version:1")
+            retry.status(),
+            StatusCode::ACCEPTED,
+            "a v0.3.15 registry evidence row must retain its idempotent retry"
         );
-        assert!(task.execute_requested);
+        assert_eq!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?
+                .len(),
+            1
+        );
         Ok(())
     }
 
@@ -13385,6 +13509,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_package_rejects_an_agent_model_mismatch_as_permanent_user_input()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        enable_inline_for_versioned_task_fixture(&ledger, true)?;
+        let mut incompatible_catalog: serde_json::Value =
+            serde_json::from_str(&execution_binding_catalog())
+                .map_err(|error| format!("parse execution binding fixture: {error}"))?;
+        incompatible_catalog["bindings"][0]["models"]["providers"] =
+            serde_json::json!(["anthropic"]);
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let response = browser_task_router(
+            ledger.clone(),
+            task_api_config()?
+                .with_execution_bindings_json(Some(&incompatible_catalog.to_string()))?,
+            auth,
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/runs")
+                .header(header::COOKIE, session_cookie)
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", csrf)
+                .header("idempotency-key", "browser-incompatible-model")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(inline_browser_task_body().to_string()))
+                .map_err(|error| format!("build browser model-mismatch request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("submit browser model-mismatch request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read browser model-mismatch response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("decode browser model-mismatch response: {error}"))?,
+            serde_json::json!({
+                "error": "This coding agent does not support the selected model. Choose a model from anthropic or another agent."
+            })
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?
+                .is_empty(),
+            "an incompatible browser agent/model selection must fail before Task reservation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn browser_idempotency_recovers_incomplete_submission_and_rejects_changed_content()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
@@ -13407,7 +13587,7 @@ mod tests {
         let origin = "http://127.0.0.1:33001";
         let (auth, session_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::User).await?;
-        let app = browser_task_router(ledger.clone(), task_api_config()?, auth);
+        let app = browser_task_router(ledger.clone(), task_api_config()?, auth.clone());
         let request = |body: &serde_json::Value| {
             Request::builder()
                 .method("POST")
@@ -13444,8 +13624,35 @@ mod tests {
                 .ok_or_else(|| "initial browser Task omitted its evidence".to_owned())?;
             *evidence = browser_evidence_v0_3_15(evidence)?;
         }
+        let authority_before_retry = {
+            let tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            let task = tasks
+                .first()
+                .ok_or_else(|| "initial browser Task was not reserved".to_owned())?;
+            (
+                task.user_envelope_instance_id.clone(),
+                task.user_envelope_revision,
+                task.user_envelope_digest.clone(),
+                task.user_envelope_snapshot.clone(),
+            )
+        };
 
-        let recovered = app
+        let mut incompatible_catalog: serde_json::Value =
+            serde_json::from_str(&execution_binding_catalog())
+                .map_err(|error| format!("parse execution binding fixture: {error}"))?;
+        incompatible_catalog["bindings"][0]["models"]["providers"] =
+            serde_json::json!(["anthropic"]);
+        let retry_app = browser_task_router(
+            ledger.clone(),
+            task_api_config()?
+                .with_execution_bindings_json(Some(&incompatible_catalog.to_string()))?,
+            auth,
+        );
+
+        let recovered = retry_app
             .clone()
             .oneshot(request(&inline_browser_task_body())?)
             .await
@@ -13459,12 +13666,22 @@ mod tests {
             assert_eq!(tasks.len(), 1);
             assert!(tasks[0].input_archive.is_some());
             assert!(tasks[0].execute_requested);
+            assert_eq!(
+                (
+                    tasks[0].user_envelope_instance_id.clone(),
+                    tasks[0].user_envelope_revision,
+                    tasks[0].user_envelope_digest.clone(),
+                    tasks[0].user_envelope_snapshot.clone(),
+                ),
+                authority_before_retry,
+                "an idempotent retry must not replace the Task's immutable Envelope evidence"
+            );
         }
 
         let mut changed_envelope = inline_browser_task_body();
         changed_envelope["envelopeDigest"] =
             serde_json::Value::String(format!("steward:sha256:{}", "d".repeat(64)));
-        let envelope_conflict = app
+        let envelope_conflict = retry_app
             .clone()
             .oneshot(request(&changed_envelope)?)
             .await
@@ -13490,7 +13707,7 @@ mod tests {
         definition["promptText"] = serde_json::Value::String("Write something else.".to_owned());
         changed["package"]["files"]["task-definition.json"] =
             serde_json::Value::String(definition.to_string());
-        let conflict = app
+        let conflict = retry_app
             .oneshot(request(&changed)?)
             .await
             .map_err(|error| format!("submit changed browser Task: {error}"))?;
@@ -15392,6 +15609,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_package_rejects_an_agent_model_mismatch_as_permanent_user_input()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["runtime"]["model"] = serde_json::json!({
+            "provider": "openai",
+            "model": "gpt-5.4"
+        });
+        let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
+        let mut catalog: serde_json::Value = serde_json::from_str(&execution_binding_catalog())
+            .map_err(|error| format!("parse execution binding fixture: {error}"))?;
+        catalog["bindings"][0]["models"]["providers"] = serde_json::json!(["anthropic"]);
+        let config = task_api_config()?
+            .with_execution_bindings_json(Some(&catalog.to_string()))?
+            .with_git_hosting_plane(git);
+        let response = task_router(ledger.clone(), FakeTaskIdentityResolver, config)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-incompatible-model")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build incompatible direct request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit incompatible direct request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read incompatible direct response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("decode incompatible direct response: {error}"))?,
+            serde_json::json!({
+                "error": "This coding agent does not support the selected model. Choose a model from anthropic or another agent."
+            })
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .is_empty(),
+            "an incompatible direct package must fail before Task reservation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn direct_package_requires_an_unambiguous_model_selection() -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
         authorize_direct_source(&ledger)?;
@@ -15506,7 +15782,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_package_retry_cannot_change_the_resolved_envelope_evidence()
+    async fn direct_package_unpinned_retry_returns_the_original_envelope_evidence()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
         authorize_direct_source(&ledger)?;
@@ -15555,11 +15831,7 @@ mod tests {
             .oneshot(request()?)
             .await
             .map_err(|error| format!("retry direct package after Envelope rotation: {error}"))?;
-        assert_eq!(
-            retry.status(),
-            StatusCode::CONFLICT,
-            "an idempotent retry must not silently bind to newly resolved authority"
-        );
+        assert_eq!(retry.status(), StatusCode::OK);
         assert_eq!(
             ledger
                 .tasks
@@ -15586,7 +15858,7 @@ mod tests {
         let mut definition = direct_definition_no_skills()?;
         definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
         let git = direct_git_fixture(unpinned_direct_manifest()?, definition, None)?;
-        let app = direct_test_app(ledger.clone(), git)?;
+        let app = direct_test_app(ledger.clone(), git.clone())?;
         let request = || {
             Request::builder()
                 .method("POST")
@@ -15622,14 +15894,26 @@ mod tests {
             *evidence = direct_evidence_v0_3_15(evidence)?;
         }
 
-        let retry = app
+        let mut incompatible_catalog: serde_json::Value =
+            serde_json::from_str(&execution_binding_catalog())
+                .map_err(|error| format!("parse execution binding fixture: {error}"))?;
+        incompatible_catalog["bindings"][0]["models"]["providers"] =
+            serde_json::json!(["anthropic"]);
+        let retry_app = task_router(
+            ledger.clone(),
+            FakeTaskIdentityResolver,
+            task_api_config()?
+                .with_execution_bindings_json(Some(&incompatible_catalog.to_string()))?
+                .with_git_hosting_plane(git),
+        );
+        let retry = retry_app
             .oneshot(request()?)
             .await
             .map_err(|error| format!("retry direct package with historical evidence: {error}"))?;
         assert_eq!(
             retry.status(),
             StatusCode::OK,
-            "a retry must accept evidence persisted before requested/effective fields existed"
+            "an idempotent retry must return the historical Task without consulting the current binding catalog"
         );
         Ok(())
     }
@@ -16139,6 +16423,49 @@ mod tests {
         assert_eq!(
             task.agent_command.get(2).map(String::as_str),
             Some("openai/gpt-5.4")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn versioned_task_rejects_an_agent_model_mismatch_as_permanent_user_input()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let mut catalog: serde_json::Value = serde_json::from_str(&execution_binding_catalog())
+            .map_err(|error| format!("parse execution binding fixture: {error}"))?;
+        catalog["bindings"][0]["models"]["providers"] = serde_json::json!(["anthropic"]);
+        let config = task_api_config()?.with_execution_bindings_json(Some(&catalog.to_string()))?;
+        let response = task_router(ledger.clone(), FakeTaskIdentityResolver, config)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "versioned-incompatible-model")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"workflow":"repository-review@1"}"#))
+                    .map_err(|error| format!("build incompatible versioned request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit incompatible versioned request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read incompatible versioned response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("decode incompatible versioned response: {error}"))?,
+            serde_json::json!({
+                "error": "This coding agent does not support the selected model. Choose a model from anthropic or another agent."
+            })
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .is_empty(),
+            "an incompatible versioned Task must fail before Task reservation"
         );
         Ok(())
     }

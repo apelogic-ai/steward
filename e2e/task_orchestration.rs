@@ -844,6 +844,7 @@ fn disposable_execution_binding() -> Result<TaskExecutionBinding, io::Error> {
             arguments: vec!["--version".to_owned()],
             expected_stdout: "example-agent 1".to_owned(),
         },
+        models: None,
         provider_profiles: ExecutionProviderProfiles::default(),
     };
     let digest = format!(
@@ -879,6 +880,7 @@ fn browser_direct_package_evidence(
     let evidence = BrowserTaskEvidence {
         source: source.to_owned(),
         revision: repository_revision.unwrap_or_else(|| closure_digest.as_str().to_owned()),
+        requested_revision: None,
         path,
         closure: Some(closure),
         closure_digest,
@@ -4652,6 +4654,121 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .is_none(),
         "a later attempt owned by another canonical user must remain invisible"
     );
+
+    let inactive_task_uid = Uuid::new_v4();
+    let inactive_operation_id = Uuid::new_v4();
+    let inactive_runtime_name = format!("task-{}", inactive_operation_id.simple());
+    let inactive_candidate_digest = digest(serde_json::to_value(&spec))?;
+    let inactive_inert_digest = manifest_digest_with_binding(
+        inactive_task_uid,
+        inactive_operation_id,
+        &inactive_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let inactive_active_digest = manifest_digest_with_binding(
+        inactive_task_uid,
+        inactive_operation_id,
+        &inactive_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    let inactive_browser_evidence: BrowserTaskEvidence = serde_json::from_value(json!({
+        "source": "steward:registry/fault-injection",
+        "revision": "steward:version:1",
+        "path": "task-definition.json",
+        "closureDigest": format!("steward:sha256:{}", "d".repeat(64))
+    }))?;
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: inactive_task_uid,
+            operation_id: inactive_operation_id,
+            idempotency_key: &format!("inactive-browser-retry-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "fault-injection@1",
+            workflow_name: Some("fault-injection"),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &inactive_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &agent_command,
+            execution_binding: Some(&execution_binding),
+            source_provenance: None,
+            direct_task_evidence: None,
+            task_origin: TaskOrigin::Browser,
+            browser_task_evidence: Some(&inactive_browser_evidence),
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &inactive_candidate_digest,
+            admission_decision: &admission_decision,
+            inert_manifest_digest: &inactive_inert_digest,
+            active_manifest_digest: &inactive_active_digest,
+        })
+        .await?;
+    store
+        .put_task_inputs(
+            inactive_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"retry input uploaded before authority revocation",
+        )
+        .await?;
+    store
+        .append_envelope_request_status(
+            envelope_request.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Provisioned,
+                to: EnvelopeRequestStatus::Stale,
+                approval_id: None,
+                envelope_instance_id: None,
+                envelope_digest: None,
+                reason: Some("revoked before retry requested execution"),
+                rationale: None,
+                evidence_url: None,
+                expires_at: None,
+                approved_envelope: None,
+                actor: "admin@example.com",
+            },
+        )
+        .await?;
+    store
+        .request_task_execution(inactive_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    let create_calls_before_inactive_retry = kubernetes.create_calls.load(Ordering::SeqCst);
+    reconcile_current(&client, &task_runtime, &store, inactive_task_uid).await?;
+    let inactive_operation = operation(&store, inactive_task_uid).await?;
+    assert_eq!(
+        inactive_operation.state,
+        TaskOrchestrationState::CleanupPending
+    );
+    assert_eq!(
+        inactive_operation.last_error_code.as_deref(),
+        Some("user_envelope_inactive")
+    );
+    let inactive_task = store
+        .task(inactive_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(inactive_task.phase, TaskPhase::Failed);
+    assert!(inactive_task.finalize_requested);
+    assert_eq!(
+        kubernetes.create_calls.load(Ordering::SeqCst),
+        create_calls_before_inactive_retry,
+        "the controller must revalidate browser retry authority before creating a runtime"
+    );
+
     assert_eq!(reservation.record.task_uid, task_uid);
     Ok(())
 }
