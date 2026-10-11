@@ -676,12 +676,16 @@ Steward release namespace also creates `steward-workflows`.
   per-create driver/runtime overrides, so the gateway's configured image and
   runtime policy remain authoritative.
 - `config.controller.openshellTaskLogMode` defaults to `off`. Set it to `full`
-  to mirror task-process stdout and stderr into controller logs while the task
-  runs; each record includes `runtime_uid`, `workspace`, `sandbox`, `stream`,
-  and the escaped output `message`, including prompts and responses emitted by
-  the task process. **Warning:** `full` logging copies task-controlled output
-  without redaction and may expose prompts, responses, credentials, or other
-  sensitive information to anyone who can read or retain controller logs.
+  to mirror synchronous task-process stdout and stderr into controller logs;
+  each record includes `runtime_uid`, `workspace`, `sandbox`, `stream`, and the
+  escaped output `message`, including prompts and responses emitted by the task
+  process. Beginning with Steward 0.3.16, Agent Tasks with
+  `diagnostics.executionLog: full` run detached, so their process output is
+  available through the authenticated Run execution-log routes and is not
+  copied into controller logs.
+  **Warning:** `full` logging copies task-controlled output without redaction
+  and may expose prompts, responses, credentials, or other sensitive information
+  to anyone authorized to read or retain controller-log or Run-log output.
 - In governed mode, `config.mint.issuer`, `spiffeTrustDomain`, and
   `openshellNamespace` must be supplied for the target environment; none has
   a usable default. The issuer must also be configured in MCP-GW.

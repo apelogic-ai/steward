@@ -9,6 +9,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- OpenShell Agent Tasks with `diagnostics.executionLog: full` now run in a
+  restart-safe, attempt-scoped process group. Steward persists bounded stdout
+  and stderr snapshots while the Task runs, refreshes Run detail before the
+  terminal state, and retains final output for successful and failed attempts.
+  The bounded JSON execution-log response adds the required `partial` field:
+  `complete` now means the Task is terminal, while `partial` identifies the
+  last live snapshot when no final transcript was saved, such as after some
+  cancellations or unknown outcomes. Unchanged snapshots do not rewrite the
+  stored log.
+- Compatible Agent images that use full execution logging must expose Linux
+  procfs at `/proc` and provide the documented shell utilities, including
+  `setsid`, `awk`, `head`, and `tail`. The detached process output is available
+  through authenticated Run-log routes; `openshellTaskLogMode=full` mirrors
+  only synchronous task processes into controller logs.
 - TaskDefinition v2 Git workspaces may identify an already-admitted repository
   by its case-insensitive `owner/repository` name or by an HTTPS link on the
   configured source host. Steward resolves only operator-bound stable IDs,

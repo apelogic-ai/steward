@@ -933,7 +933,10 @@ fn valid_kubernetes_runtime_class_name(value: &str) -> bool {
 pub enum OpenShellTaskLogMode {
     /// Retain task output for result handling without emitting it to controller logs.
     Off,
-    /// Emit escaped stdout and stderr events live while retaining the result buffers.
+    /// Emit escaped stdout and stderr events for synchronous task processes.
+    ///
+    /// Agent executions with full diagnostics run detached and publish their output through the
+    /// authenticated execution-log API instead of the controller log stream.
     Full,
 }
 

@@ -230,11 +230,14 @@ authorization material. Provider-control executions remain structurally excluded
 Missing diagnostics or `executionLog: off` captures no caller-visible transcript.
 The diagnostic selection is snapshotted with the Task.
 
-This P0 contract deliberately covers successful execution only. Durable logs for
-failed, cancelled, or pre-execution-rejected Tasks require a separate bounded
-observability design: retention, authorization, size limits, redaction boundaries,
-failure-safe persistence, and a Task-log API. Lifecycle summaries must not be
-presented as a substitute for those logs.
+Beginning with Steward 0.3.16, for a started OpenShell Agent attempt with full
+diagnostics, Steward retains bounded live stdout and stderr snapshots while the
+process runs and exposes them to the Task owner and administrators through the Run
+execution-log routes. Successful and failed attempts persist their final streams; a
+cancelled or outcome-unknown Task without a saved final transcript returns the last
+live snapshot marked `partial`. A pre-execution rejection has no process attempt and
+therefore no execution log. Lifecycle summaries are not presented as a substitute
+for process output.
 
 ## P0 demonstration
 
