@@ -3457,15 +3457,30 @@ where
         }
         resolved.push(resolved_entry);
     }
-    let workspace_digest = workspace_entry_digest(&serde_json::json!({
+    let max_history_depth = resolved
+        .iter()
+        .any(|entry| {
+            matches!(
+                entry,
+                ResolvedWorkspaceEntry::Git {
+                    history: WorkspaceGitHistory::Full,
+                    ..
+                }
+            )
+        })
+        .then_some(policy.max_history_depth);
+    let mut digest_value = serde_json::json!({
         "entries": &resolved,
         "maxMaterializedBytes": git_materialized_budget,
-        "maxHistoryDepth": policy.max_history_depth,
-    }))?;
+    });
+    if let Some(max_history_depth) = max_history_depth {
+        digest_value["maxHistoryDepth"] = serde_json::json!(max_history_depth);
+    }
+    let workspace_digest = workspace_entry_digest(&digest_value)?;
     let evidence = WorkspaceEvidence {
         entries: resolved,
         max_materialized_bytes: git_materialized_budget,
-        max_history_depth: Some(policy.max_history_depth),
+        max_history_depth,
         workspace_digest,
     };
     evidence.validate().map_err(ApiError::Admission)?;
@@ -3487,10 +3502,17 @@ fn resolve_scratch_workspace_entry(
         "size": entry.scratch.size,
         "limits": entry.scratch.limits,
     }))?;
+    let requested_bytes = parse_workspace_size_bytes(entry.scratch.size.as_str())
+        .ok_or_else(|| ApiError::Admission("workspace_limit_invalid".to_owned()))?;
+    let size = if requested_bytes == enforced_bytes {
+        entry.scratch.size.clone()
+    } else {
+        ResourceQuantity::parse(format_workspace_bytes(enforced_bytes))
+            .map_err(ApiError::Admission)?
+    };
     Ok(ResolvedWorkspaceEntry::Scratch {
         name,
-        size: ResourceQuantity::parse(format_workspace_bytes(enforced_bytes))
-            .map_err(ApiError::Admission)?,
+        size,
         content_digest,
     })
 }
