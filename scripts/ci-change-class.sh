@@ -26,6 +26,17 @@ set -euo pipefail
 # A larger change set is not worth reasoning about path by path.
 MAX_CHANGED_FILES=300
 
+# The branch every reduced run must be aimed at. This is deliberately not
+# configurable: the script reads only the four CI_* event values below, so no
+# workflow-level or job-level variable can redirect it.
+TARGET_REF=refs/remotes/origin/main
+
+# Agent instructions and READMEs are documentation at the repository root and
+# below these roots only. No image or bundle includes one of them wholesale;
+# the classifier tests derive the packaged directories and fail if that
+# changes. A new root is `full` until it is added here.
+DOCS_NAME_ROOTS='adapters bins conformance crates docs e2e xtask .claude .codex'
+
 # What each class runs. `run` lanes must end `success`; `skip` lanes must end
 # `skipped`. Any other combination fails the aggregate, so this table and the
 # job conditions in .github/workflows/ci.yml cannot drift apart silently.
@@ -66,6 +77,7 @@ is_plain_path() {
 path_class() {
   local path="$1"
   local name="${path##*/}"
+  local docs_root
 
   # The browser presentation and its journeys. Everything below these
   # directories is `web`, including Markdown: files under web/ can be bundled
@@ -95,21 +107,20 @@ path_class() {
   esac
 
   # Agent instructions and READMEs, at the repository root and below the
-  # source roots listed here. No image or bundle includes one of these roots
-  # wholesale; the classifier tests derive the packaged directories and fail
-  # if that changes. A new root is `full` until it is added.
+  # roots in DOCS_NAME_ROOTS.
   case "${name}" in
     AGENTS.md|CLAUDE.md|README|README.md|README.txt|README.rst)
-      case "${path}" in
-        */*)
-          case "${path}" in
-            adapters/*|bins/*|conformance/*|crates/*|docs/*|e2e/*|xtask/*) echo docs ;;
-            .claude/*|.codex/*) echo docs ;;
-            *) echo full ;;
-          esac
-          ;;
-        *) echo docs ;;
-      esac
+      if [[ "${path}" != */* ]]; then
+        echo docs
+        return
+      fi
+      for docs_root in ${DOCS_NAME_ROOTS}; do
+        if [[ "${path}" == "${docs_root}"/* ]]; then
+          echo docs
+          return
+        fi
+      done
+      echo full
       return
       ;;
   esac
@@ -165,9 +176,9 @@ entry_class() {
 # `::` that starts a runner workflow command, is replaced by a fixed phrase.
 printable_path() {
   if is_plain_path "$1"; then
-    echo "$1"
+    printf '%s\n' "$1"
   else
-    echo "a path with unusual characters"
+    printf '%s\n' "a path with unusual characters"
   fi
 }
 
@@ -258,7 +269,6 @@ detect_unchecked() {
   local base_ref="${CI_BASE_REF:-}"
   local base="${CI_BASE_SHA:-}"
   local head="${CI_HEAD_SHA:-}"
-  local target_ref="${CI_TARGET_REF:-refs/remotes/origin/main}"
   local parents first_parent diff queue_base
 
   # Pushes, schedules, manual runs, and anything not aimed at main always run
@@ -327,7 +337,7 @@ detect_unchecked() {
     # group that has not merged yet. Classify everything between main and
     # this group, so an entry queued behind a non-web change is `full`
     # whatever the queue's merge strategy.
-    if ! queue_base="$(git merge-base "${target_ref}" "${head}" 2>/dev/null)" ||
+    if ! queue_base="$(git merge-base "${TARGET_REF}" "${head}" 2>/dev/null)" ||
       ! is_commit_id "${queue_base}"; then
       full_because "cannot find where the merge group left main"
       return

@@ -3505,6 +3505,138 @@ mod tests {
 
     #[test]
     fn ci_lanes_are_gated_by_the_tested_change_class() -> Result<(), String> {
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        check_ci_change_class_contract(&ci)
+    }
+
+    // Each edit below neutralises the classifier, a lane, or the verdict
+    // while leaving the workflow valid. The contract must reject every one.
+    #[test]
+    fn ci_change_class_contract_rejects_neutralising_workflow_edits() -> Result<(), String> {
+        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
+        let classify_run = "          class=\"$(bash scripts/ci-change-class.sh detect)\"\n";
+        let classify_shell = "        id: classify\n        shell: bash\n";
+        let verdict_shell =
+            "      - name: Require every lane the change class runs\n        shell: bash\n";
+        let edits = [
+            (
+                "class overwritten after detect",
+                classify_run,
+                "          class=\"$(bash scripts/ci-change-class.sh detect)\"\n          class=docs\n"
+                    .to_owned(),
+            ),
+            (
+                "detect result discarded",
+                classify_run,
+                "          class=\"$(bash scripts/ci-change-class.sh detect || true)\"\n".to_owned(),
+            ),
+            (
+                "shell that ignores the verdict script",
+                verdict_shell,
+                "      - name: Require every lane the change class runs\n        shell: \"true {0}\"\n"
+                    .to_owned(),
+            ),
+            (
+                "verdict without an explicit shell",
+                verdict_shell,
+                "      - name: Require every lane the change class runs\n".to_owned(),
+            ),
+            (
+                "shell that writes the class itself",
+                classify_shell,
+                "        id: classify\n        shell: \"bash -c 'echo class=docs >> $GITHUB_OUTPUT' {0}\"\n"
+                    .to_owned(),
+            ),
+            (
+                "workflow-level override variable",
+                "env:\n  CARGO_TERM_COLOR: always\n",
+                "env:\n  CARGO_TERM_COLOR: always\n  CI_TARGET_REF: HEAD\n".to_owned(),
+            ),
+            (
+                "workflow-level git redirection",
+                "env:\n  CARGO_TERM_COLOR: always\n",
+                "env:\n  CARGO_TERM_COLOR: always\n  GIT_DIR: /tmp/elsewhere\n".to_owned(),
+            ),
+            (
+                "workflow-level default shell",
+                "env:\n  CARGO_TERM_COLOR: always\n",
+                "defaults:\n  run:\n    shell: \"true {0}\"\n\nenv:\n  CARGO_TERM_COLOR: always\n"
+                    .to_owned(),
+            ),
+            (
+                "job-level environment on the classifier",
+                "    name: changes\n",
+                "    name: changes\n    env:\n      BASH_ENV: scripts/override.sh\n".to_owned(),
+            ),
+            (
+                "job-level environment on the aggregate",
+                "    name: pinned\n",
+                "    name: pinned\n    env:\n      BASH_ENV: scripts/override.sh\n".to_owned(),
+            ),
+            (
+                "job-level default shell on a lane",
+                "    name: e2e / browser user journeys\n",
+                "    name: e2e / browser user journeys\n    defaults:\n      run:\n        shell: \"true {0}\"\n"
+                    .to_owned(),
+            ),
+            (
+                "extra environment on the classify step",
+                "          CI_HEAD_SHA: ${{ github.sha }}\n",
+                "          CI_HEAD_SHA: ${{ github.sha }}\n          BASH_ENV: scripts/override.sh\n"
+                    .to_owned(),
+            ),
+            (
+                "continue-on-error on a lane",
+                "    name: e2e / browser user journeys\n",
+                "    name: e2e / browser user journeys\n    continue-on-error: true\n".to_owned(),
+            ),
+            (
+                "continue-on-error on a lane step",
+                "      - name: Install release-candidate artifacts in a clean cluster\n",
+                "      - name: Install release-candidate artifacts in a clean cluster\n        continue-on-error: true\n"
+                    .to_owned(),
+            ),
+            (
+                "lane result taken from another lane",
+                "POSTGRES_TLS: ${{ needs.postgres-tls.result }}",
+                "POSTGRES_TLS: ${{ needs.conformance-pinned.result }}".to_owned(),
+            ),
+            (
+                "condition that always holds",
+                "    if: needs.changes.outputs.class == 'full' || needs.changes.outputs.class == 'web'\n",
+                "    if: needs.changes.outputs.class == 'full' || needs.changes.outputs.class == 'web' || always()\n"
+                    .to_owned(),
+            ),
+            (
+                "reduced lane command made non-fatal",
+                "        run: bash scripts/test-ci-change-class.sh\n",
+                "        run: bash scripts/test-ci-change-class.sh || true\n".to_owned(),
+            ),
+            (
+                "reduced lane exits before its last command",
+                "          bash scripts/test-validate-release-version.sh\n",
+                "          exit 0\n          bash scripts/test-validate-release-version.sh\n".to_owned(),
+            ),
+        ];
+
+        for (name, original, replacement) in edits {
+            if ci.matches(original).count() != 1 {
+                return Err(format!(
+                    "the workflow edit '{name}' no longer applies to exactly one place"
+                ));
+            }
+            let edited = ci.replacen(original, &replacement, 1);
+            let outcome = std::panic::catch_unwind(|| check_ci_change_class_contract(&edited));
+            if matches!(outcome, Ok(Ok(()))) {
+                return Err(format!("the contract accepted a workflow with: {name}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_ci_change_class_contract(ci: &str) -> Result<(), String> {
         use serde_json::Value;
 
         fn text<'a>(value: &'a Value, key: &str, context: &str) -> Result<&'a str, String> {
@@ -3558,15 +3690,13 @@ mod tests {
             Ok(())
         }
 
-        let ci = fs::read_to_string(root().join(".github/workflows/ci.yml"))
-            .map_err(|error| format!("Steward CI workflow is required: {error}"))?;
         let script = fs::read_to_string(root().join("scripts/ci-change-class.sh"))
             .map_err(|error| format!("CI change classifier is required: {error}"))?;
         let xtask_source = include_str!("main.rs");
 
         // The workflow is parsed, so a comment or a string that merely
         // mentions a condition cannot satisfy this test.
-        let workflow: Value = serde_saphyr::from_str(&ci)
+        let workflow: Value = serde_saphyr::from_str(ci)
             .map_err(|error| format!("CI workflow is not valid YAML: {error}"))?;
         let jobs = workflow
             .get("jobs")
@@ -3576,6 +3706,26 @@ mod tests {
             jobs.get(name)
                 .ok_or_else(|| format!("CI job {name} is required"))
         };
+
+        // Nothing outside a step may change how the classifier or the
+        // verdict runs: no default shell, and no environment the scripts or
+        // git would read.
+        assert!(
+            workflow.get("defaults").is_none(),
+            "the CI workflow must not set `defaults`"
+        );
+        assert_eq!(
+            workflow.get("env"),
+            Some(&serde_json::json!({ "CARGO_TERM_COLOR": "always" })),
+            "the CI workflow environment must stay exactly CARGO_TERM_COLOR"
+        );
+        for (name, definition) in jobs {
+            assert!(
+                definition.get("defaults").is_none(),
+                "CI job {name} must not set `defaults`"
+            );
+        }
+        let checkout = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd";
 
         // The lane table in the classifier script is the single definition of
         // what each class runs.
@@ -3642,7 +3792,15 @@ mod tests {
         // The classifier runs unconditionally and passes event data to the
         // script only through the environment.
         let changes = job("changes")?;
-        for forbidden in ["if", "needs", "continue-on-error"] {
+        for forbidden in [
+            "if",
+            "needs",
+            "continue-on-error",
+            "env",
+            "container",
+            "services",
+            "strategy",
+        ] {
             assert!(
                 changes.get(forbidden).is_none(),
                 "the change classifier must not set `{forbidden}`"
@@ -3656,13 +3814,30 @@ mod tests {
         );
         let change_steps = steps(changes, "the change classifier")?;
         assert_eq!(change_steps.len(), 2, "the change classifier has two steps");
+        // The full history makes the base commit reachable.
         assert_eq!(
-            change_steps[0].pointer("/with/fetch-depth"),
-            Some(&Value::from(0)),
-            "the change classifier needs the full history to reach the base commit"
+            change_steps[0],
+            serde_json::json!({
+                "name": "Check out repository",
+                "uses": checkout,
+                "with": { "fetch-depth": 0, "persist-credentials": false },
+            }),
+            "the change classifier must check out the full history with the pinned action"
         );
         let classify = &change_steps[1];
+        assert_eq!(
+            classify
+                .as_object()
+                .map(|step| step.keys().map(String::as_str).collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from(["name", "id", "shell", "env", "run"])),
+            "the classify step must set exactly its name, id, shell, environment, and script"
+        );
         assert_eq!(text(classify, "id", "the classify step")?, "classify");
+        assert_eq!(
+            text(classify, "shell", "the classify step")?,
+            "bash",
+            "the classify step must run under bash"
+        );
         let expected_environment = [
             ("CI_EVENT_NAME", "${{ github.event_name }}"),
             (
@@ -3683,14 +3858,13 @@ mod tests {
             Some(&Value::Object(expected_environment)),
             "the classify step must pass exactly the event name, base, and head"
         );
-        let classify_run = text(classify, "run", "the classify step")?;
-        assert!(
-            classify_run.contains("class=\"$(bash scripts/ci-change-class.sh detect)\"\n"),
-            "the classify step must take the class from the classifier script"
-        );
-        assert!(
-            !classify_run.contains("${{"),
-            "the classify step must not interpolate expressions into its script"
+        assert_eq!(
+            text(classify, "run", "the classify step")?,
+            "set -euo pipefail\n\
+             class=\"$(bash scripts/ci-change-class.sh detect)\"\n\
+             echo \"class=${class}\" >> \"${GITHUB_OUTPUT}\"\n\
+             echo \"Change class: \\`${class}\\`\" >> \"${GITHUB_STEP_SUMMARY}\"\n",
+            "the classify step must take the class from the classifier script and nothing else"
         );
 
         // Each lane waits for the classifier and carries exactly the
@@ -3747,26 +3921,35 @@ mod tests {
 
         // The reduced lane runs every gate that reads documentation or
         // browser-presentation sources, including the classifier tests.
-        let reduced_commands = steps(job("quality-reduced")?, "quality-reduced")?
-            .iter()
-            .filter_map(|step| step.get("run").and_then(Value::as_str))
-            .flat_map(str::lines)
-            .map(str::trim)
-            .collect::<BTreeSet<_>>();
-        for required in [
-            "cargo xtask workflow-lint",
-            "cargo xtask check-neutrality",
-            "cargo xtask check-secrets",
-            "cargo test -p xtask",
-            "bash scripts/test-validate-release-version.sh",
-            "bash scripts/validate-release-version.sh",
-            "bash scripts/test-ci-change-class.sh",
-        ] {
+        let reduced = job("quality-reduced")?;
+        assert!(
+            reduced.get("env").is_none() && reduced.get("container").is_none(),
+            "the reduced quality lane must not set a job environment or container"
+        );
+        let mut reduced_commands = Vec::new();
+        for step in steps(reduced, "quality-reduced")? {
             assert!(
-                reduced_commands.contains(required),
-                "the reduced quality lane must run `{required}`"
+                step.get("shell").is_none() && step.get("env").is_none(),
+                "the reduced quality lane steps must use the default shell and environment"
             );
+            if let Some(command) = step.get("run").and_then(Value::as_str) {
+                reduced_commands.push(command);
+            }
         }
+        assert_eq!(
+            reduced_commands,
+            [
+                "rustup toolchain install 1.95.0 --profile minimal",
+                "cargo xtask workflow-lint",
+                "cargo xtask check-neutrality",
+                "cargo xtask check-secrets",
+                "cargo test -p xtask",
+                "bash scripts/test-validate-release-version.sh\n\
+                 bash scripts/validate-release-version.sh\n",
+                "bash scripts/test-ci-change-class.sh",
+            ],
+            "the reduced quality lane must run exactly these commands"
+        );
 
         // The aggregate always reports, waits for exactly the classifier and
         // the lanes, and hands each lane's own result to the verdict.
@@ -3777,6 +3960,12 @@ mod tests {
             "the pinned aggregate must report for every run"
         );
         require_blocking(pinned, "pinned")?;
+        for forbidden in ["env", "container", "services", "strategy"] {
+            assert!(
+                pinned.get(forbidden).is_none(),
+                "the pinned aggregate must not set `{forbidden}`"
+            );
+        }
         let mut expected_needs = lane_names.clone();
         expected_needs.insert("changes".to_owned());
         assert_eq!(
@@ -3809,13 +3998,30 @@ mod tests {
             expected_run.push_str(&format!(" \\\n  \"{lane}=${{{name}}}\""));
         }
         expected_run.push('\n');
-        let verdict_steps = steps(pinned, "pinned")?
-            .iter()
-            .filter(|step| step.get("run").is_some())
-            .collect::<Vec<_>>();
-        let [verdict] = verdict_steps.as_slice() else {
-            return Err("the pinned aggregate must have exactly one script step".to_owned());
+        let [pinned_checkout, verdict] = steps(pinned, "pinned")?.as_slice() else {
+            return Err("the pinned aggregate must be a checkout and one script step".to_owned());
         };
+        assert_eq!(
+            *pinned_checkout,
+            serde_json::json!({
+                "name": "Check out repository",
+                "uses": checkout,
+                "with": { "persist-credentials": false },
+            }),
+            "the pinned aggregate must check out with the pinned action"
+        );
+        assert_eq!(
+            verdict
+                .as_object()
+                .map(|step| step.keys().map(String::as_str).collect::<BTreeSet<_>>()),
+            Some(BTreeSet::from(["name", "shell", "env", "run"])),
+            "the verdict step must set exactly its name, shell, environment, and script"
+        );
+        assert_eq!(
+            text(verdict, "shell", "the pinned verdict step")?,
+            "bash",
+            "the verdict step must run under bash"
+        );
         assert_eq!(
             verdict.get("env"),
             Some(&Value::Object(expected_environment)),

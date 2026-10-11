@@ -384,10 +384,30 @@ expect_detect docs "merge group, docs only" merge_group refs/heads/main "${base}
 expect_detect full "merge group, web and Rust commits" merge_group refs/heads/main "${base}" "${mixed_group_head}"
 expect_detect full "merge group, docs queued behind Rust" merge_group refs/heads/main "${rust_head}" "${queued_docs_head}"
 expect_detect web "merge group, docs queued behind web" merge_group refs/heads/main "${web_head}" "${queued_behind_web_head}"
-observed="$(cd "${repository}" && env -u GIT_DIR -u GIT_WORK_TREE CI_TARGET_REF=refs/remotes/origin/absent \
-  CI_EVENT_NAME=merge_group CI_BASE_REF=refs/heads/main CI_BASE_SHA="${base}" CI_HEAD_SHA="${docs_head}" \
-  bash "${script}" detect 2>/dev/null)" || fail "detect without a main ref exited non-zero"
-[[ "${observed}" == full ]] || fail "merge group without a main ref: expected full, got ${observed}"
+# Nothing the classifier decides with can be redirected through the
+# environment, with or without the runner's own marker variable.
+for marker in true ""; do
+  for override in CI_TARGET_REF TARGET_REF; do
+    observed="$(cd "${repository}" && env -u GIT_DIR -u GIT_WORK_TREE GITHUB_ACTIONS="${marker}" \
+      "${override}=${queued_docs_head}" MAX_CHANGED_FILES=0 DOCS_NAME_ROOTS=migrations LANES= \
+      CI_EVENT_NAME=merge_group CI_BASE_REF=refs/heads/main CI_BASE_SHA="${rust_head}" \
+      CI_HEAD_SHA="${queued_docs_head}" bash "${script}" detect 2>/dev/null)" ||
+      fail "detect with ${override} set exited non-zero"
+    [[ "${observed}" == full ]] ||
+      fail "${override} must not redirect the merge-group comparison: got ${observed}"
+  done
+done
+observed="$(printf ':100644 100644 %s %s M\0migrations/README.md\0' "${zero}" "${blob}" |
+  DOCS_NAME_ROOTS=migrations bash "${script}" classify 2>/dev/null)"
+[[ "${observed}" == full ]] || fail "the documentation roots must not be configurable from the environment"
+if LANES='' bash "${script}" verdict docs success >/dev/null 2>&1; then
+  fail "the lane table must not be configurable from the environment"
+fi
+
+fixture_git update-ref -d refs/remotes/origin/main
+expect_detect full "merge group without a main ref" merge_group refs/heads/main "${base}" "${docs_head}"
+fixture_git update-ref refs/remotes/origin/main "${base}"
+expect_detect docs "merge group after the main ref returns" merge_group refs/heads/main "${base}" "${docs_head}"
 expect_detect full "merge group, missing base" merge_group refs/heads/main "" "${web_head}"
 expect_detect full "merge group for another branch" merge_group refs/heads/release/0.3 "${base}" "${web_head}"
 expect_detect full "merge group, short base ref" merge_group main "${base}" "${web_head}"
@@ -531,9 +551,16 @@ repo_git() {
   env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE git -C "${root}" "$@"
 }
 
-if repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  tracked="${scratch}/tracked"
-  repo_git ls-files >"${tracked}"
+# The guard is never skipped. Without a readable work tree (a source tarball,
+# or a checkout git refuses to open) it has nothing to inspect, and that is a
+# failure, not a pass.
+tracked="${scratch}/tracked"
+if ! repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+  ! repo_git ls-files >"${tracked}" || [[ ! -s "${tracked}" ]]; then
+  echo "ci change class: the consumer guard needs a git work tree at ${root}" >&2
+  exit 1
+fi
+{
 
   is_tracked() {
     grep -Fxq -- "$1" "${tracked}"
@@ -572,15 +599,28 @@ if repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     if is_tracked "${directory}/Cargo.toml"; then echo "${directory}"; fi
   }
 
+  # Prints the tracked files that are `candidate` or live below it.
+  tracked_below() {
+    [[ -n "$1" ]] || return 0
+    grep -E -- "^$(printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g')(/|$)" "${tracked}" || true
+  }
+
+  # Prints the docs-class files that are `candidate` or live below it.
+  docs_members() {
+    local member
+    while IFS= read -r member; do
+      if [[ "$(entry_class 100644 100644 "${member}")" == docs ]]; then
+        printf '%s\n' "${member}"
+      fi
+    done < <(tracked_below "$1")
+  }
+
   # Fails when `candidate` names a docs-class file, or a directory holding one.
   reject_docs_consumer() {
     local consumer="$1" candidate="$2" member
-    [[ -n "${candidate}" ]] || return 0
     while IFS= read -r member; do
-      if [[ "$(entry_class 100644 100644 "${member}")" == docs ]]; then
-        fail "${consumer} consumes ${member}, which is still classified docs"
-      fi
-    done < <(grep -E -- "^$(printf '%s' "${candidate}" | sed 's/[][\.*^$+?(){}|/]/\\&/g')(/|$)" "${tracked}" || true)
+      fail "${consumer} consumes ${member}, which is still classified docs"
+    done < <(docs_members "${candidate}")
   }
 
   # 1. Rust sources: every string literal that could name a document,
@@ -634,59 +674,378 @@ if repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   done
 
   # 2. Packaged directories, derived from the build definitions: everything
-  #    the final stage of an image copies, from the build context or from an
+  #    a shipped image stage copies, from the build context or from an
   #    earlier stage that holds the repository, and every chart directory
   #    passed to `helm package`. No docs-class file may live in one, so a new
-  #    packaged directory fails here until its files are classified. Earlier
-  #    image stages only feed the compiler, which check 1 covers.
-  packaged="${scratch}/packaged"
-  : >"${packaged}"
-  packaged_candidate() {
-    local consumer="$1" candidate="$2"
-    [[ -n "${candidate}" ]] || return 0
-    if grep -Eq -- "^$(printf '%s' "${candidate}" | sed 's/[][\.*^$+?(){}|/]/\\&/g')(/|$)" "${tracked}"; then
-      echo "${candidate}" >>"${packaged}"
-      reject_docs_consumer "${consumer}" "${candidate}"
+  #    packaged directory fails here until its files are classified. Stages
+  #    that only feed a later stage are covered by check 1.
+  #
+  #    The derivation fails closed. A form it cannot resolve to concrete
+  #    paths is a finding: a JSON-form or heredoc COPY, a glob, a variable
+  #    that could name a tracked file, a bind mount, a copy of a stage's
+  #    whole working directory, or a build stage that puts the context
+  #    somewhere other than its working directory.
+  #
+  #    dockerfile_findings prints one line per result:
+  #      packaged<TAB>path   a tracked path a shipped stage includes
+  #      finding<TAB>text    something that must fail the guard
+  logical_instructions() {
+    awk '
+      { sub(/\r$/, "") }
+      /^[[:space:]]*#/ { next }
+      {
+        line = pending $0
+        if (line ~ /\\[[:space:]]*$/) { sub(/\\[[:space:]]*$/, " ", line); pending = line; next }
+        pending = ""
+        sub(/^[[:space:]]+/, "", line)
+        if (line != "") print line
+      }
+      END { if (pending != "") print pending }
+    ' "$1"
+  }
+
+  # Reports one repository-relative source that a shipped stage includes.
+  packaged_source() {
+    local path="$1" what="$2" candidate prefix member
+    case "${path}" in
+      *'*'*|*'?'*|*'['*)
+        printf 'finding\t%s\n' "a glob in ${what}"
+        return
+        ;;
+    esac
+    if [[ "${path}" == *'$'* ]]; then
+      # A variable is tolerated only below a directory that holds no tracked
+      # file, such as a build output directory.
+      prefix="${path%%\$*}"
+      if [[ "${prefix}" != */* ]]; then
+        printf 'finding\t%s\n' "a variable in ${what} that could name a tracked file"
+        return
+      fi
+      candidate="$(normalize "${prefix%/*}")"
+      if [[ -z "${candidate}" || -n "$(tracked_below "${candidate}" | head -n 1)" ]]; then
+        printf 'finding\t%s\n' "a variable in ${what} that could name a tracked file"
+      fi
+      return
+    fi
+    candidate="$(normalize "${path}")"
+    if [[ -z "${candidate}" ]]; then
+      printf 'finding\t%s\n' "the whole repository in ${what}"
+      return
+    fi
+    if [[ -n "$(tracked_below "${candidate}" | head -n 1)" ]]; then
+      printf 'packaged\t%s\n' "${candidate}"
+      while IFS= read -r member; do
+        printf 'finding\t%s\n' "${member}, which is still classified docs, in ${what}"
+      done < <(docs_members "${candidate}")
     fi
   }
-  while IFS= read -r dockerfile; do
-    while IFS= read -r instruction; do
-      read -r -a tokens <<<"${instruction}"
-      token_count="${#tokens[@]}"
-      from_stage=0
-      for ((index = 1; index < token_count - 1; index++)); do
-        token="${tokens[index]}"
+
+  dockerfile_findings() {
+    local file="$1"
+    local logical line keyword rest stage stage_count workdir shipped
+    local token index count from source destination name entry
+    local names=" " referenced=" " workdirs=" " candidate relative whole w
+    local -a tokens
+
+    logical="$(logical_instructions "${file}")"
+    stage_count="$(grep -ciE '^FROM[[:space:]]' <<<"${logical}" || true)"
+    if ((stage_count == 0)); then
+      printf 'finding\t%s\n' "no FROM instruction"
+      return
+    fi
+
+    # First pass: stage names, the stages another stage builds on, copies
+    # from, or mounts, and every working directory.
+    stage=-1
+    while IFS= read -r line; do
+      keyword="" rest=""
+      read -r keyword rest <<<"${line}" || true
+      keyword="$(tr '[:lower:]' '[:upper:]' <<<"${keyword}")"
+      case "${keyword}" in
+        FROM)
+          stage=$((stage + 1))
+          tokens=()
+          read -r -a tokens <<<"${rest}" || true
+          count="${#tokens[@]}"
+          if ((count >= 1)); then referenced="${referenced}${tokens[0]} "; fi
+          if ((count >= 3)); then names="${names}${tokens[count - 1]}=${stage} "; fi
+          ;;
+        WORKDIR)
+          w="$(normalize "${rest}")"
+          if [[ "${rest}" != /* || -z "${w}" || "${rest}" == *'$'* ]]; then
+            printf 'finding\t%s\n' "a working directory this guard cannot resolve"
+          else
+            workdirs="${workdirs}${w} "
+          fi
+          ;;
+        COPY|ADD|RUN)
+          set -f
+          for token in ${rest}; do
+            case "${token}" in
+              --from=*) referenced="${referenced}${token#--from=} " ;;
+              --mount=*from=*)
+                name="${token##*from=}"
+                referenced="${referenced}${name%%,*} "
+                ;;
+            esac
+          done
+          set +f
+          ;;
+      esac
+    done <<<"${logical}"
+
+    stage=-1
+    workdir=""
+    shipped=0
+    while IFS= read -r line; do
+      keyword="" rest=""
+      read -r keyword rest <<<"${line}" || true
+      keyword="$(tr '[:lower:]' '[:upper:]' <<<"${keyword}")"
+      case "${keyword}" in
+        FROM)
+          stage=$((stage + 1))
+          workdir=""
+          # A stage is shipped when it is the last one or nothing builds on it.
+          shipped=1
+          if ((stage != stage_count - 1)); then
+            if [[ "${referenced}" == *" ${stage} "* ]]; then shipped=0; fi
+            for entry in ${names}; do
+              if [[ "${entry##*=}" == "${stage}" && "${referenced}" == *" ${entry%%=*} "* ]]; then
+                shipped=0
+              fi
+            done
+          fi
+          continue
+          ;;
+        WORKDIR)
+          workdir="$(normalize "${rest}")"
+          continue
+          ;;
+        RUN)
+          if ((shipped == 1)) && [[ "${rest}" == *--mount=*type=bind* || "${rest}" == *--mount=*source=* || "${rest}" == *--mount=*src=* ]]; then
+            printf 'finding\t%s\n' "a bind mount in a shipped stage"
+          fi
+          continue
+          ;;
+        COPY|ADD) ;;
+        *) continue ;;
+      esac
+
+      if [[ "${rest}" == *'<<'* ]]; then
+        printf 'finding\t%s\n' "a heredoc ${keyword}, which this guard does not parse"
+        continue
+      fi
+      rest="${rest//\"/}"
+      rest="${rest//\'/}"
+      from=""
+      tokens=()
+      set -f
+      for token in ${rest}; do
         case "${token}" in
-          --from=*) from_stage=1; continue ;;
-          --*) continue ;;
+          --from=*) from="${token#--from=}" ;;
+          --*) ;;
+          *) tokens+=("${token}") ;;
         esac
-        if ((from_stage == 0)); then
-          case "${token}" in
-            .|./|'*'|./'*')
-              fail "${dockerfile} copies the whole build context into its final image"
-              continue
+      done
+      set +f
+      count="${#tokens[@]}"
+      if ((count == 0)); then
+        printf 'finding\t%s\n' "an empty ${keyword}"
+        continue
+      fi
+      if [[ "${tokens[0]}" == '['* ]]; then
+        printf 'finding\t%s\n' "a JSON-form ${keyword}, which this guard does not parse"
+        continue
+      fi
+      if ((count < 2)); then
+        printf 'finding\t%s\n' "a ${keyword} without a destination"
+        continue
+      fi
+      destination="${tokens[count - 1]}"
+
+      for ((index = 0; index < count - 1; index++)); do
+        source="${tokens[index]}"
+        if [[ -z "${from}" ]]; then
+          if ((shipped == 1)); then
+            packaged_source "${source}" "a ${keyword} from the build context"
+          elif [[ -z "${workdir}" ]]; then
+            # A stage that feeds a later one may hold the repository, but
+            # only inside its working directory, where copies out of it can
+            # be mapped back to repository paths.
+            printf 'finding\t%s\n' "a build stage that copies the context before setting a working directory"
+          elif [[ "${destination}" == *..* || "${destination}" == *'$'* ]]; then
+            printf 'finding\t%s\n' "a build stage destination this guard cannot resolve"
+          elif [[ "${destination}" == /* ]]; then
+            relative="$(normalize "${destination}")"
+            if [[ "${relative}" != "${workdir}" && "${relative}" != "${workdir}"/* ]]; then
+              printf 'finding\t%s\n' "a build stage that copies the context outside its working directory"
+            fi
+          fi
+          continue
+        fi
+
+        ((shipped == 1)) || continue
+        name=external
+        if [[ "${from}" =~ ^[0-9]+$ || "${names}" == *" ${from}="* ]]; then name=local; fi
+        if [[ "${name}" == external ]]; then
+          # Copied out of a published image, not out of this repository.
+          continue
+        fi
+        if [[ "${source}" != /* ]]; then
+          printf 'finding\t%s\n' "a relative path copied out of a build stage"
+          continue
+        fi
+        if [[ "${source}" == *..* ]]; then
+          printf 'finding\t%s\n' "a path with a parent segment copied out of a build stage"
+          continue
+        fi
+        candidate="$(normalize "${source}")"
+        relative=""
+        whole=0
+        for w in ${workdirs}; do
+          if [[ -z "${candidate}" || "${candidate}" == "${w}" || "${w}" == "${candidate}"/* ]]; then
+            whole=1
+          elif [[ "${candidate}" == "${w}"/* ]]; then
+            relative="${candidate#"${w}"/}"
+          fi
+        done
+        if ((whole == 1)); then
+          printf 'finding\t%s\n' "the whole working directory of a build stage in a shipped stage"
+        elif [[ -n "${relative}" ]]; then
+          packaged_source "${relative}" "a ${keyword} out of a build stage"
+        else
+          case "${source}" in
+            *'*'*|*'?'*|*'['*|*'$'*)
+              printf 'finding\t%s\n' "an unresolvable path copied out of a build stage"
               ;;
           esac
-          packaged_candidate "${dockerfile}" "$(normalize "${token}")"
-        else
-          # A path inside an earlier stage: try each suffix as a repository
-          # path, so /workspace/web/public is recognised as web/public.
-          suffix="${token#/}"
-          while [[ -n "${suffix}" ]]; do
-            packaged_candidate "${dockerfile}" "$(normalize "${suffix}")"
-            if [[ "${suffix}" == */* ]]; then suffix="${suffix#*/}"; else suffix=""; fi
-          done
         fi
       done
-    done < <(awk '
-      /^FROM[[:space:]]/ { count = 0; next }
-      toupper($1) == "COPY" || toupper($1) == "ADD" { lines[count++] = $0 }
-      END { for (i = 0; i < count; i++) print lines[i] }
-    ' "${root}/${dockerfile}")
-    if grep -Eq '^(COPY|ADD)[[:space:]].*\\$' "${root}/${dockerfile}"; then
-      fail "${dockerfile} continues a COPY across lines, which this guard does not parse"
-    fi
+    done <<<"${logical}"
+  }
+
+  packaged="${scratch}/packaged"
+  : >"${packaged}"
+  while IFS= read -r dockerfile; do
+    while IFS=$'\t' read -r kind detail; do
+      case "${kind}" in
+        packaged) echo "${detail}" >>"${packaged}" ;;
+        finding) fail "${dockerfile}: ${detail}" ;;
+        '') ;;
+        *) fail "${dockerfile}: unexpected guard output" ;;
+      esac
+    done < <(dockerfile_findings "${root}/${dockerfile}")
   done < <(grep -E '(^|/)[^/]*Dockerfile[^/]*$' "${tracked}" || true)
+
+  # Fixtures: one image definition per form the derivation must reject, and
+  # some it must accept. Each rejected fixture adds a single instruction to
+  # the shipped stage of an otherwise acceptable definition.
+  # shellcheck disable=SC2016 # the variable belongs to the image definition
+  fixture_header='FROM example.test/rust:1 AS build
+WORKDIR /workspace
+COPY . .
+RUN cargo build --release
+FROM example.test/runtime:1
+COPY --from=build /workspace/target/release/steward /usr/local/bin/steward
+COPY --from=build "/workspace/target/release/${BINARY}" /usr/local/bin/other
+COPY --from=example.test/tools:1 /usr/local/bin/tool /usr/local/bin/tool
+COPY LICENSE /usr/share/licenses/steward/LICENSE
+'
+  expect_dockerfile() {
+    local expected="$1" name="$2" body="$3" file="${scratch}/fixture.Dockerfile" findings
+    printf '%s' "${body}" >"${file}"
+    findings="$(dockerfile_findings "${file}" | grep -c '^finding' || true)"
+    if [[ "${expected}" == accept && "${findings}" != 0 ]]; then
+      fail "image fixture '${name}' must be accepted: $(dockerfile_findings "${file}" | tr '\n\t' '; ')"
+    elif [[ "${expected}" == reject && "${findings}" == 0 ]]; then
+      fail "image fixture '${name}' must be rejected"
+    fi
+  }
+  expect_dockerfile accept "baseline" "${fixture_header}"
+  expect_dockerfile accept "packaged web directory" "${fixture_header}COPY --from=build /workspace/web/public ./web/public
+"
+  expect_dockerfile accept "build-stage glob and bind mount" 'FROM example.test/rust:1 AS build
+WORKDIR /src
+COPY Cargo.* ./
+COPY crates ./crates
+RUN --mount=type=bind,source=docs,target=/src/docs cargo build
+FROM example.test/runtime:1
+COPY --from=build /src/target/release/steward /usr/local/bin/steward
+'
+  expect_dockerfile reject "whole working directory of a build stage" "${fixture_header}COPY --from=build /workspace /opt/src
+"
+  expect_dockerfile reject "trailing slash on the working directory" "${fixture_header}COPY --from=build /workspace/ /opt/src
+"
+  expect_dockerfile reject "parent of the working directory" "${fixture_header}COPY --from=build / /opt/rootfs
+"
+  expect_dockerfile reject "dot source out of a build stage" "${fixture_header}COPY --from=build . /opt/src
+"
+  expect_dockerfile reject "relative source out of a build stage" "${fixture_header}COPY --from=build docs /opt/docs
+"
+  expect_dockerfile reject "parent segment out of a build stage" "${fixture_header}COPY --from=build /workspace/target/../docs /opt/docs
+"
+  expect_dockerfile reject "stage referenced by index" "${fixture_header}COPY --from=0 /workspace /opt/src
+"
+  expect_dockerfile reject "JSON-form COPY" "${fixture_header}COPY [\"crates\", \"/opt/crates/\"]
+"
+  expect_dockerfile reject "JSON-form ADD" "${fixture_header}ADD [\"docs\", \"/opt/docs/\"]
+"
+  expect_dockerfile reject "JSON-form COPY out of a build stage" "${fixture_header}COPY --from=build [\"/workspace/docs\", \"/opt/docs/\"]
+"
+  expect_dockerfile reject "glob source" "${fixture_header}COPY docs/*.md /opt/docs/
+"
+  expect_dockerfile reject "README glob" "${fixture_header}COPY README* /opt/
+"
+  expect_dockerfile reject "glob out of a build stage" "${fixture_header}COPY --from=build /workspace/docs/*.md /opt/docs/
+"
+  expect_dockerfile reject "bind mount" "${fixture_header}RUN --mount=type=bind,source=docs,target=/mnt/docs cp -r /mnt/docs /opt/docs
+"
+  expect_dockerfile reject "bind mount without a type" "${fixture_header}RUN --mount=source=docs,target=/mnt/docs cp -r /mnt/docs /opt/docs
+"
+  expect_dockerfile reject "whole context" "${fixture_header}COPY . /opt/src
+"
+  expect_dockerfile reject "docs directory from the context" "${fixture_header}COPY docs /opt/docs
+"
+  expect_dockerfile reject "docs directory out of a build stage" "${fixture_header}COPY --from=build /workspace/docs /opt/docs
+"
+  expect_dockerfile reject "docs-class file from the context" "${fixture_header}COPY CHANGELOG.md /opt/CHANGELOG.md
+"
+  expect_dockerfile reject "source root holding agent instructions" "${fixture_header}COPY --from=build /workspace/crates/steward-mint /opt/mint
+"
+  expect_dockerfile reject "variable inside a tracked directory" "${fixture_header}COPY \"docs/\${NAME}\" /opt/doc
+"
+  expect_dockerfile reject "variable as the whole source" "${fixture_header}COPY \"\${SOURCE}\" /opt/src
+"
+  expect_dockerfile reject "variable inside a tracked directory of a build stage" "${fixture_header}COPY --from=build \"/workspace/docs/\${NAME}\" /opt/doc
+"
+  expect_dockerfile reject "lowercase instruction" "${fixture_header}copy docs /opt/docs
+"
+  expect_dockerfile reject "continued instruction" "${fixture_header}COPY \\
+  docs \\
+  /opt/docs
+"
+  expect_dockerfile reject "heredoc" "${fixture_header}COPY <<EOF /opt/notes
+text
+EOF
+"
+  expect_dockerfile reject "shipped stage that is not last" 'FROM example.test/runtime:1 AS tools
+COPY docs /opt/docs
+FROM example.test/runtime:1
+COPY LICENSE /LICENSE
+'
+  expect_dockerfile reject "context copied outside the working directory" 'FROM example.test/rust:1 AS build
+WORKDIR /workspace
+COPY docs /stash
+FROM example.test/runtime:1
+COPY --from=build /stash /opt/docs
+'
+  expect_dockerfile reject "context copied before a working directory" 'FROM example.test/rust:1 AS build
+COPY . .
+FROM example.test/runtime:1
+COPY --from=build /target/release/steward /usr/local/bin/steward
+'
+  expect_dockerfile reject "no stage" 'COPY docs /opt/docs
+'
 
   while IFS= read -r match; do
     consumer="${match%%:*}"
@@ -702,7 +1061,8 @@ if repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
       fail "${consumer} packages a chart directory this guard cannot resolve: ${token}"
       continue
     fi
-    packaged_candidate "${consumer}" "${candidate}"
+    echo "${candidate}" >>"${packaged}"
+    reject_docs_consumer "${consumer}" "${candidate}"
   done < <(repo_git grep -E 'helm package' -- '*.sh' '.github' ':!scripts/test-ci-change-class.sh' || true)
 
   # The derivation must see the directories known to be packaged today.
@@ -760,10 +1120,11 @@ if repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     case "${path}" in
       docs/contracts/*) continue ;;
       */*)
-        case "${path}" in
-          adapters/*|bins/*|conformance/*|crates/*|docs/*|e2e/*|xtask/*) ;;
-          *) continue ;;
-        esac
+        below_root=0
+        for docs_root in ${DOCS_NAME_ROOTS}; do
+          if [[ "${path}" == "${docs_root}"/* ]]; then below_root=1; fi
+        done
+        ((below_root == 1)) || continue
         ;;
     esac
     case "${path##*/}" in
@@ -777,7 +1138,7 @@ if repo_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   while IFS= read -r path; do
     [[ "$(entry_class 100644 100644 "${path}")" == docs ]] || fail "${path} must be classified docs"
   done < <(grep -E '^\.claude/.*\.md$' "${tracked}" || true)
-fi
+}
 
 if ((failures != 0)); then
   echo "ci change class: ${failures} failure(s)" >&2
