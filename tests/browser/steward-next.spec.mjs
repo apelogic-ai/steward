@@ -401,7 +401,7 @@ const presentationRoutes = [
   { path: "/admin/runs", heading: "All runs", activeNavigation: "Runs" },
   { path: `/admin/runs/${taskUid}`, heading: "repository-review@1", activeNavigation: "Runs" },
   { path: "/admin/approvals", heading: "Requests", activeNavigation: "Approvals" },
-  { path: `/admin/approvals/${unifiedEnvelopeRequest.id}`, heading: /Developer · above ceiling/i, activeNavigation: "Approvals" },
+  { path: `/admin/approvals/${unifiedEnvelopeRequest.id}`, heading: /Developer · above limits/i, activeNavigation: "Approvals" },
   { path: "/admin/settings", heading: "Settings", activeNavigation: "Settings" },
 ];
 
@@ -582,7 +582,6 @@ async function startWeb() {
             displayName: submitted.displayName,
             memberRoles: submitted.memberRoles,
             envelope: submitted.envelope,
-            autoProvisionThreshold: submitted.autoProvisionThreshold ?? null,
           }));
           return;
         }
@@ -2082,11 +2081,11 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
   const administrator = await guardedPage(browser, { colorScheme: "light", session: administratorSession });
   try {
     await administrator.page.goto(`${origin}/admin/approvals`);
-    await expect(administrator.page.getByText(/Requests above a template ceiling/)).toBeVisible();
+    await expect(administrator.page.getByText(/Requests above template limits/)).toBeVisible();
     await expect(administrator.page.getByRole("table", { name: "Requests" })).toBeVisible();
     await administrator.page.getByRole("link", { name: /Developer/ }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/approvals/${unifiedEnvelopeRequest.id}`);
-    await expect(administrator.page.getByRole("heading", { name: /Developer · above ceiling/i })).toBeVisible();
+    await expect(administrator.page.getByRole("heading", { name: /Developer · above limits/i })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -2503,16 +2502,16 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
   }
 });
 
-test("a value above the template ceiling is submitted for administrator approval", async ({ browser }) => {
+test("a value above the template limits is submitted for administrator approval", async ({ browser }) => {
   const developer = await guardedPage(browser);
   try {
     await developer.page.goto(`${origin}/envelopes/new`);
     await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("template:developer");
     await developer.page.getByLabel("Time to live").fill("5h");
 
-    const summary = developer.page.getByText("Needs admin approval: 1 value above the template ceiling", { exact: true });
+    const summary = developer.page.getByText("Needs admin approval: 1 value above the template's limits", { exact: true });
     await expect(summary).toBeVisible();
-    await expect(developer.page.getByText("Time to live: 5h (ceiling 4h)", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Time to live: 5h (limit 4h)", { exact: true })).toBeVisible();
     await expect(developer.page.getByRole("button", { name: "Submit for approval" })).toBeVisible();
 
     await developer.page.getByLabel("Time to live").fill("4h");
@@ -2524,7 +2523,7 @@ test("a value above the template ceiling is submitted for administrator approval
     await developer.page.getByRole("button", { name: "Submit for approval" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
     await expect(developer.page.getByText("Pending administrator approval", { exact: true })).toBeVisible();
-    await expect(developer.page.getByText("Time to live: 5h (ceiling 4h)", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Time to live: 5h (limit 4h)", { exact: true })).toBeVisible();
     await expect(developer.page.getByText("Justification: Needed for a bounded release review.", { exact: true })).toBeVisible();
 
     const mutation = developer.mutations.find((entry) => entry.path === "/app/api/v1/envelope-requests");
@@ -2536,7 +2535,7 @@ test("a value above the template ceiling is submitted for administrator approval
   }
 });
 
-test("the per-run limit reports ceiling exceptions and cannot exceed the monthly limit", async ({ browser }) => {
+test("the per-run limit reports template-limit exceptions and cannot exceed the monthly limit", async ({ browser }) => {
   const developer = await guardedPage(browser);
   try {
     await developer.page.goto(`${origin}/envelopes/new?template=developer`);
@@ -2545,8 +2544,8 @@ test("the per-run limit reports ceiling exceptions and cannot exceed the monthly
     await singleRunLimit.fill("6.00");
 
     await expect(singleRunLimit).toHaveClass(/border-warn/);
-    await expect(developer.page.getByText("Above ceiling 5.00 USD", { exact: true })).toBeVisible();
-    await expect(developer.page.getByText("Limit per run: 6.00 USD (ceiling 5.00 USD)", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Above limit 5.00 USD", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Limit per run: 6.00 USD (limit 5.00 USD)", { exact: true })).toBeVisible();
     await expect(developer.page.getByRole("button", { name: "Submit for approval" })).toBeEnabled();
 
     await developer.page.getByLabel("Monthly limit (USD)").fill("5.00");
@@ -3006,7 +3005,7 @@ test("onboarding lets the user choose which first envelope template to request",
     await step.getByRole("button", { name: /Get your first envelope/ }).click();
     await step.getByRole("button", { name: /Developer/ }).click();
     await expect(step.getByRole("link", { name: "Request Developer envelope" })).toBeVisible();
-    await expect(step).toContainText("Requests within a template's ceiling are approved and provisioned right away.");
+    await expect(step).toContainText("Requests within a template's limits are approved and provisioned right away. Anything above goes to the approval queue.");
   } finally {
     await closeGuardedPage(developer);
   }
@@ -3752,10 +3751,12 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(administrator.page.getByText("Current revision 4")).toBeVisible();
     await expect(administrator.page.getByRole("combobox", { name: "Limit type" })).toHaveCount(0);
     await expect(administrator.page.getByRole("textbox", { name: "Limit per run (USD)" })).toHaveValue("2.50");
-    await expect(administrator.page.getByRole("textbox", { name: "Monthly (USD)" })).toHaveValue("25.00");
-    await administrator.page.getByRole("textbox", { name: "Monthly (USD)" }).fill("30.00");
+    await expect(administrator.page.getByText("Requests within these limits are approved automatically. Anything above goes to the approval queue.", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByRole("heading", { name: "Auto-approval" })).toHaveCount(0);
+    await expect(administrator.page.getByRole("textbox", { name: "Monthly limit (USD)" })).toHaveValue("25.00");
+    await administrator.page.getByRole("textbox", { name: "Monthly limit (USD)" }).fill("30.00");
     await administrator.page.getByRole("textbox", { name: "Limit per run (USD)" }).fill("3.00");
-    await expect(administrator.page.getByRole("textbox", { name: "TTL" })).toHaveValue("4h");
+    await expect(administrator.page.getByRole("textbox", { name: "Time-to-live limit" })).toHaveValue("4h");
     const model = administrator.page.getByRole("combobox", { name: "Models" });
     await expect(model).toBeVisible();
     await expect(administrator.page.getByText("provider-a/model-a", { exact: true })).toBeVisible();
@@ -3781,7 +3782,7 @@ test("administrator templates and approvals use typed browser authority", async 
       singleRunLimit: "3.00",
     });
     expect(templateMutation.body.envelope.spec.llms).toEqual(capabilityCatalog.models);
-    expect(templateMutation.body.autoProvisionThreshold).toBeNull();
+    expect(templateMutation.body).not.toHaveProperty("autoProvisionThreshold");
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("reviewer");
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
     await expect.poll(() => administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/reviewer")).toBe(true);
@@ -3803,12 +3804,12 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(administrator.page).toHaveURL(`${origin}/admin/approvals/${pendingEnvelopeRequest.requestId}`);
     const envelopeRequestCard = administrator.page.locator("main");
     await expect(envelopeRequestCard.getByText("alice@example.com")).toBeVisible();
-    await expect(envelopeRequestCard.getByRole("heading", { name: "Requested vs template ceiling" })).toBeVisible();
+    await expect(envelopeRequestCard.getByRole("heading", { name: "Requested vs template limits" })).toBeVisible();
     await expect(envelopeRequestCard.getByText("Requester justification", { exact: true })).toBeVisible();
     await expect(envelopeRequestCard.getByText("Needed for a bounded release review.", { exact: true })).toBeVisible();
     await expect(envelopeRequestCard.getByText("40.00 USD", { exact: true }).first()).toBeVisible();
     await expect(envelopeRequestCard.getByText("25.00 USD", { exact: true }).first()).toBeVisible();
-    await expect(envelopeRequestCard.getByText("Monthly limit: 40.00 USD (ceiling 25.00 USD)", { exact: true })).toBeVisible();
+    await expect(envelopeRequestCard.getByText("Monthly limit: 40.00 USD (limit 25.00 USD)", { exact: true })).toBeVisible();
     await expect(envelopeRequestCard.getByRole("button", { name: "Reject" })).toBeDisabled();
     await envelopeRequestCard.getByRole("button", { name: "File reference" }).click();
     await envelopeRequestCard.getByLabel("Rationale", { exact: true }).fill("Approved for the requested bounded envelope.");
@@ -3869,8 +3870,8 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await administrator.page.getByRole("button", { name: "Remove reviewer" }).click();
     await templateId.fill("not valid");
     await administrator.page.getByRole("textbox", { name: "Limit per run (USD)" }).fill("not-a-decimal");
-    await administrator.page.getByRole("textbox", { name: "Monthly (USD)" }).fill("");
-    await administrator.page.getByRole("textbox", { name: "TTL" }).fill("");
+    await administrator.page.getByRole("textbox", { name: "Monthly limit (USD)" }).fill("");
+    await administrator.page.getByRole("textbox", { name: "Time-to-live limit" }).fill("");
     await administrator.page.getByRole("button", { name: "Remove provider-a/model-a" }).click();
     await administrator.page.getByRole("button", { name: "Create template" }).click();
 
@@ -3889,34 +3890,11 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
     await roles.fill("operator");
     await roles.press("Enter");
     await administrator.page.getByRole("textbox", { name: "Limit per run (USD)" }).fill("1.00");
-    await administrator.page.getByRole("textbox", { name: "Monthly (USD)" }).fill("10.00");
-    await administrator.page.getByRole("textbox", { name: "TTL" }).fill("15m");
+    await administrator.page.getByRole("textbox", { name: "Monthly limit (USD)" }).fill("10.00");
+    await administrator.page.getByRole("textbox", { name: "Time-to-live limit" }).fill("15m");
     const models = administrator.page.getByRole("combobox", { name: "Models" });
     await models.fill("provider-a/model-a");
     await models.press("Enter");
-    const autoApprove = administrator.page.getByRole("checkbox", { name: "Auto-approve every request within the ceiling" });
-    await autoApprove.uncheck();
-    await administrator.page.getByRole("textbox", { name: "Auto-approve up to (complete envelope JSON)" }).fill("not-json");
-    await administrator.page.getByRole("button", { name: "Create template" }).click();
-    await expect(administrator.page.getByText("Enter a complete valid envelope as JSON.")).toBeVisible();
-    expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
-
-    await administrator.page.getByRole("textbox", { name: "Auto-approve up to (complete envelope JSON)" }).fill(JSON.stringify({
-      revision: 2,
-      spec: {
-        budget: { currency: "USD", monthlyLimit: "11.00", singleRunLimit: "1.00" },
-        llms: [{ provider: "provider-a", model: "model-a" }],
-        tools: [],
-        runtimeMinutesLimit: "60",
-        ttl: "15m",
-        runner: { platforms: ["linux"] },
-      },
-    }));
-    await administrator.page.getByRole("button", { name: "Create template" }).click();
-    await expect(administrator.page.getByText("Enter a valid envelope within this template ceiling.")).toBeVisible();
-    expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
-
-    await autoApprove.check();
     await administrator.page.getByRole("button", { name: "Create template" }).click();
 
     await expect(administrator.page.getByText("The server rejected the template, so no authority was changed. Error code: template_invalid.")).toBeVisible();
@@ -3945,7 +3923,7 @@ test("new template reports display-name and member-role limits before submission
   }
 });
 
-test("administrator preserves a narrower auto-provision threshold when revising a template", async ({ browser }) => {
+test("administrator reads but does not carry forward a historical auto-provision threshold", async ({ browser }) => {
   const threshold = {
     ...adminEnvelope,
     spec: {
@@ -3963,15 +3941,15 @@ test("administrator preserves a narrower auto-provision threshold when revising 
   });
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
-    const autoApproveToCeiling = administrator.page.getByRole("checkbox", { name: "Auto-approve every request within the ceiling" });
-    await expect(autoApproveToCeiling).not.toBeChecked();
-    await expect(administrator.page.getByRole("textbox", { name: "Auto-approve up to (complete envelope JSON)" })).toHaveValue(JSON.stringify(threshold, null, 2));
+    await expect(administrator.page.getByText("Requests within these limits are approved automatically. Anything above goes to the approval queue.", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByRole("checkbox", { name: /Auto-approve/ })).toHaveCount(0);
+    await expect(administrator.page.getByRole("textbox", { name: /Auto-approve/ })).toHaveCount(0);
 
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/analyst")).toBeTruthy();
     const mutation = administrator.mutations.find((item) => item.path === "/admin/api/v1/envelope-templates/analyst");
     expectMutationProof(mutation);
-    expect(mutation.body.autoProvisionThreshold).toEqual({ ...threshold, revision: adminEnvelope.revision + 1 });
+    expect(mutation.body).not.toHaveProperty("autoProvisionThreshold");
   } finally {
     await closeGuardedPage(administrator);
   }
@@ -4329,7 +4307,7 @@ test("the deployed admin template contract is accepted during the rolling Next c
   try {
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     await expect(administrator.page.getByText("Current revision 4")).toBeVisible();
-    await expect(administrator.page.getByRole("textbox", { name: "Monthly (USD)" })).toHaveValue("25.00");
+    await expect(administrator.page.getByRole("textbox", { name: "Monthly limit (USD)" })).toHaveValue("25.00");
     await expect(administrator.page.getByText("provider-a/model-a", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(administrator);

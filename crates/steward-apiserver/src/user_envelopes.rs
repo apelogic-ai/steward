@@ -79,8 +79,8 @@ pub struct AvailableEnvelopeTemplate {
     #[schema(value_type = BrowserEnvelope)]
     pub ceiling: Envelope,
     #[schema(value_type = Option<BrowserEnvelope>)]
-    /// Requests within this boundary provision automatically. When absent, the ceiling is the
-    /// automatic-provisioning boundary.
+    /// Historical compatibility metadata. New template revisions do not carry this field and
+    /// request admission is governed only by `ceiling`.
     pub auto_provision_threshold: Option<Envelope>,
     pub allow_inline_browser_tasks: bool,
 }
@@ -355,7 +355,7 @@ pub(crate) struct PublishedWorkflowsResponse {
 }
 
 /// Submission passed only after the HTTP boundary has derived its canonical owner, required an
-/// exact template revision and decided whether it is within the automatic-provisioning boundary.
+/// exact template revision and decided whether it is within the template's limits.
 pub struct ValidatedEnvelopeRequest<'a> {
     pub template: Option<&'a AvailableEnvelopeTemplate>,
     pub requested_envelope: &'a Envelope,
@@ -380,8 +380,8 @@ pub enum EnvelopeReviewBoundaryError {
 /// Production request broker backed by the authoritative envelope and request ledgers.
 ///
 /// A template becomes visible only through a local-RBAC member-role assignment. Its current
-/// envelope is the hard ceiling and the automatic-provisioning boundary. Requests outside that
-/// exact revision remain pending for an explicit administrator decision.
+/// limits are the automatic-provisioning boundary. Requests outside those limits remain pending
+/// for an explicit administrator decision, subject to the deployment safety ceiling.
 #[derive(Clone)]
 pub struct PgEnvelopeRequestBroker {
     store: PgStore,
@@ -958,7 +958,7 @@ where
         Ok(None) => Err(Box::new(envelope_request_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             "platform_safety_ceiling_unconfigured",
-            "This deployment does not accept requests outside a template ceiling.",
+            "This deployment does not accept requests above a template's limits.",
             vec![EnvelopeRequestField::RequestedEnvelope],
         ))),
         Err(EnvelopeReviewBoundaryError::InvalidEnvelope) => {
@@ -1422,17 +1422,7 @@ where
             );
         }
         match envelope_is_within(&requested_envelope, &template.ceiling) {
-            Ok(AdmissionDecision::Admit) => {
-                let auto_provision_boundary = template
-                    .auto_provision_threshold
-                    .as_ref()
-                    .unwrap_or(&template.ceiling);
-                match envelope_is_within(&requested_envelope, auto_provision_boundary) {
-                    Ok(AdmissionDecision::Admit) => true,
-                    Ok(AdmissionDecision::Reject { .. }) => false,
-                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                }
-            }
+            Ok(AdmissionDecision::Admit) => true,
             Ok(AdmissionDecision::Reject { deltas }) => {
                 ceiling_exceedances = deltas;
                 if replayed_request.is_none()
@@ -2873,7 +2863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_above_auto_threshold_but_within_ceiling_requires_review() -> Result<(), String>
+    async fn historical_auto_threshold_does_not_add_a_second_review_boundary() -> Result<(), String>
     {
         let mut requested = template().ceiling;
         requested.spec.budget.monthly_limit = "75.00".to_owned();
@@ -2890,7 +2880,7 @@ mod tests {
                             "templateId": "engineer",
                             "templateRevision": 3,
                             "requestedEnvelope": requested,
-                            "idempotencyKey": "request-above-threshold",
+                            "idempotencyKey": "request-within-limits",
                         })
                         .to_string(),
                     ))
@@ -2904,8 +2894,11 @@ mod tests {
             .map_err(|error| format!("read response: {error}"))?;
         let value: serde_json::Value =
             serde_json::from_slice(&body).map_err(|error| format!("parse response: {error}"))?;
-        assert_eq!(value["request"]["status"], "pending");
-        assert!(value["request"]["approvedEnvelope"].is_null());
+        assert_eq!(value["request"]["status"], "provisioned");
+        assert_eq!(
+            value["request"]["approvedEnvelope"],
+            value["request"]["requestedEnvelope"]
+        );
         Ok(())
     }
 
@@ -3025,7 +3018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_minutes_above_the_template_ceiling_remain_pending() -> Result<(), String> {
+    async fn runtime_minutes_above_the_template_limits_remain_pending() -> Result<(), String> {
         let broker = TestBroker::default();
         let mut requested = template().ceiling;
         requested.spec.runtime_minutes_limit = Some("180".to_owned());

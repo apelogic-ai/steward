@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { AdminRequestView, BrowserEnvelopeRequestView } from "@/api-client";
 
-import { EnvelopeRequestCard, UnifiedRequestCard } from "./admin-approvals-view";
+import { EnvelopeRequestCard, UnifiedRequestCard, requestReason, triggerLabel } from "./admin-approvals-view";
 
 const source = readFileSync(new URL("./admin-approvals-view.tsx", import.meta.url), "utf8");
 
@@ -76,7 +76,54 @@ describe("envelope request approval controls", () => {
     expect(html).not.toContain('name="expiresAt" placeholder="2026-08-25T17:00:00Z" required=""');
   });
 
-  test("shows the requester justification beside recorded ceiling deltas", () => {
+  test("describes a completed within-limits request from its status", () => {
+    const completed: AdminRequestView = {
+      ...unifiedRequest,
+      history: [{ actor: "system:auto", at: "2026-08-30T12:00:01Z", state: "auto_approved" }],
+      state: "auto_approved",
+      stateActor: "system:auto",
+      stateAt: "2026-08-30T12:00:01Z",
+    };
+
+    expect(requestReason(completed)).toBe("auto-approved");
+    expect(triggerLabel(completed)).toEqual(["Auto-approved", "Provisioned automatically"]);
+    const html = renderToStaticMarkup(<UnifiedRequestCard request={completed} />);
+    expect(html).toContain("This request was provisioned automatically.");
+    expect(html).not.toContain("awaiting administrator approval");
+  });
+
+  test("does not label decided within-limits requests as awaiting review", () => {
+    const cases = [
+      ["approved", "approved", "Approved", "Approved by an administrator"],
+      ["rejected", "rejected", "Rejected", "Request was rejected"],
+      ["expired", "expired", "Expired", "Request expired"],
+    ] as const;
+
+    for (const [state, reason, label, detail] of cases) {
+      const decided: AdminRequestView = { ...unifiedRequest, state };
+      expect(requestReason(decided)).toBe(reason);
+      expect(triggerLabel(decided)).toEqual([label, detail]);
+    }
+  });
+
+  test("includes field names and units in above-limit trigger details", () => {
+    const aboveLimits: AdminRequestView = {
+      ...unifiedRequest,
+      deltas: [
+        { ceiling: "50.00", currency: "EUR", dimension: "budget", requested: "150.00" },
+        { ceiling: "60", dimension: "runtimeMinutes", requested: "90" },
+        { ceiling: "2h", dimension: "ttl", requested: "3h" },
+      ],
+      kind: "ceiling_exceeded",
+    };
+
+    expect(triggerLabel(aboveLimits)).toEqual([
+      "Above limits",
+      "Monthly limit 150.00 EUR > 50.00 EUR · Runtime minutes 90 minutes > 60 minutes · TTL 3h > 2h",
+    ]);
+  });
+
+  test("shows the requester justification beside recorded limit deltas", () => {
     const html = renderToStaticMarkup(<UnifiedRequestCard request={{
       ...unifiedRequest,
       deltas: [{ ceiling: "200.00", currency: "USD", dimension: "budget", requested: "300.00" }],
@@ -86,9 +133,9 @@ describe("envelope request approval controls", () => {
 
     expect(html).toContain("Requester justification");
     expect(html).toContain("Needed for a release review");
-    expect(html).toContain("Requested vs template ceiling");
-    expect(html).toContain("Needs admin approval: 1 value above the template ceiling");
-    expect(html).toContain("Monthly limit: <strong>300.00 USD</strong> (ceiling 200.00 USD)");
+    expect(html).toContain("Requested vs template limits");
+    expect(html).toContain("Needs admin approval: 1 value above the template&#x27;s limits");
+    expect(html).toContain("Monthly limit: <strong>300.00 USD</strong> (limit 200.00 USD)");
     expect(html).toContain("300.00 USD");
     expect(html).toContain("200.00 USD");
   });

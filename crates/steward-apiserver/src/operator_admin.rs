@@ -230,6 +230,9 @@ pub struct OperatorTemplateApplyRequest {
     pub display_name: String,
     pub member_roles: Vec<String>,
     pub ceiling: BrowserEnvelope,
+    /// Serde-only compatibility sentinel so retired clients receive an actionable response.
+    #[schema(ignore)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_provision_threshold: Option<BrowserEnvelope>,
     #[serde(default = "default_true")]
     pub allow_inline_browser_tasks: bool,
@@ -549,13 +552,15 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
     Path((template_id, revision)): Path<(String, i64)>,
     Json(mut request): Json<OperatorTemplateApplyRequest>,
 ) -> Response {
+    if request.auto_provision_threshold.is_some() {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE,
+        );
+    }
     if !crate::browser_admin::valid_template_identifier(&template_id)
         || revision <= 0
         || request.ceiling.revision != revision
-        || request
-            .auto_provision_threshold
-            .as_ref()
-            .is_some_and(|threshold| threshold.revision != revision)
     {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -579,13 +584,11 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
         );
     }
     let ceiling: Envelope = request.ceiling.clone().into();
-    let threshold = request.auto_provision_threshold.clone().map(Into::into);
     match ledger.template_revision(&template_id, revision).await {
         Ok(Some(existing)) => {
             if existing.display_name != request.display_name
                 || existing.member_roles != request.member_roles
                 || existing.ceiling != ceiling
-                || existing.auto_provision_threshold != threshold
                 || existing.allow_inline_browser_tasks != request.allow_inline_browser_tasks
             {
                 return error(
@@ -601,7 +604,7 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
                 display_name: &request.display_name,
                 member_roles: &request.member_roles,
                 ceiling: &ceiling,
-                auto_provision_threshold: threshold.as_ref(),
+                auto_provision_threshold: None,
                 allow_inline_browser_tasks: request.allow_inline_browser_tasks,
                 authored_by: &admin.actor,
             })
@@ -614,7 +617,7 @@ pub(crate) async fn apply_template<L: OperatorLedger>(
                     display_name: request.display_name,
                     member_roles: request.member_roles,
                     ceiling: request.ceiling,
-                    auto_provision_threshold: request.auto_provision_threshold,
+                    auto_provision_threshold: None,
                     allow_inline_browser_tasks: request.allow_inline_browser_tasks,
                 }),
             )
@@ -774,6 +777,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeOperatorLedger {
         mutations: Arc<Mutex<Vec<(String, String, BrowserRbacAssignmentAction)>>>,
+        templates: Arc<Mutex<Vec<EnvelopeTemplateRevisionRecord>>>,
     }
 
     impl OperatorLedger for FakeOperatorLedger {
@@ -832,17 +836,41 @@ mod tests {
 
         fn template_revision<'a>(
             &'a self,
-            _template_id: &'a str,
-            _revision: i64,
+            template_id: &'a str,
+            revision: i64,
         ) -> BoxFuture<'a, Result<Option<EnvelopeTemplateRevisionRecord>, StoreError>> {
-            Box::pin(async { Ok(None) })
+            Box::pin(async move {
+                self.templates
+                    .lock()
+                    .map_err(|_| StoreError::Database("fake template lock poisoned".to_owned()))
+                    .map(|templates| {
+                        templates
+                            .iter()
+                            .find(|template| {
+                                template.template_id == template_id
+                                    && template.ceiling.revision == revision
+                            })
+                            .cloned()
+                    })
+            })
         }
 
         fn latest_template<'a>(
             &'a self,
-            _template_id: &'a str,
+            template_id: &'a str,
         ) -> BoxFuture<'a, Result<Option<EnvelopeTemplateRevisionRecord>, StoreError>> {
-            Box::pin(async { Ok(None) })
+            Box::pin(async move {
+                self.templates
+                    .lock()
+                    .map_err(|_| StoreError::Database("fake template lock poisoned".to_owned()))
+                    .map(|templates| {
+                        templates
+                            .iter()
+                            .filter(|template| template.template_id == template_id)
+                            .max_by_key(|template| template.ceiling.revision)
+                            .cloned()
+                    })
+            })
         }
 
         fn insert_template<'a>(
@@ -934,6 +962,182 @@ mod tests {
         .await
         .map_err(|error| format!("execute invalid template request: {error}"))?;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn template_writes_reject_the_retired_auto_provision_threshold() -> Result<(), String> {
+        let envelope = serde_json::json!({
+            "revision": 1,
+            "spec": {
+                "llms": [{"provider": "provider-a", "model": "model-a"}],
+                "tools": [],
+                "budget": {"monthlyLimit": "50.00", "currency": "USD"},
+                "ttl": "24h",
+                "runner": {}
+            }
+        });
+        let response = router(
+            FakeOperatorLedger::default(),
+            FakeAuthenticator { is_admin: true },
+        )
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/admin/operator/v1/templates/default/revisions/1")
+                .header(header::AUTHORIZATION, "Bearer operator-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "displayName": "Default",
+                        "memberRoles": ["engineer"],
+                        "ceiling": envelope,
+                        "autoProvisionThreshold": envelope,
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build retired threshold request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute retired threshold request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read retired threshold response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse retired threshold response: {error}"))?;
+        assert_eq!(
+            body["error"],
+            steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn threshold_free_replay_accepts_an_unchanged_historical_revision() -> Result<(), String>
+    {
+        let ceiling: BrowserEnvelope = serde_json::from_value(serde_json::json!({
+            "revision": 1,
+            "spec": {
+                "llms": [{"provider": "provider-a", "model": "model-a"}],
+                "tools": [],
+                "budget": {"monthlyLimit": "100.00", "currency": "USD"},
+                "ttl": "24h",
+                "runner": {}
+            }
+        }))
+        .map_err(|error| format!("deserialize historical ceiling: {error}"))?;
+        let mut threshold: Envelope = ceiling.clone().into();
+        threshold.spec.budget.monthly_limit = "50.00".to_owned();
+        let ledger = FakeOperatorLedger::default();
+        ledger
+            .templates
+            .lock()
+            .map_err(|_| "fake template lock poisoned")?
+            .push(EnvelopeTemplateRevisionRecord {
+                template_id: "default".to_owned(),
+                display_name: "Default".to_owned(),
+                member_roles: vec!["engineer".to_owned()],
+                ceiling: ceiling.clone().into(),
+                auto_provision_threshold: Some(threshold.clone()),
+                allow_inline_browser_tasks: true,
+            });
+
+        let response = router(ledger, FakeAuthenticator { is_admin: true })
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/operator/v1/templates/default/revisions/1")
+                    .header(header::AUTHORIZATION, "Bearer operator-token")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "displayName": "Default",
+                            "memberRoles": ["engineer"],
+                            "ceiling": ceiling,
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build historical replay request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute historical replay request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read historical replay response: {error}"))?;
+        let response: OperatorTemplateResponse = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse historical replay response: {error}"))?;
+        assert_eq!(
+            response.auto_provision_threshold,
+            Some(BrowserEnvelope::from(threshold)),
+            "the idempotent response must preserve the historical read field"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn historical_template_reads_preserve_the_retired_threshold() -> Result<(), String> {
+        let ceiling: Envelope = BrowserEnvelope {
+            revision: 1,
+            spec: crate::user_envelopes::BrowserEnvelopeSpec {
+                llms: vec![steward_types::ModelRef {
+                    provider: "provider-a".to_owned(),
+                    model: "model-a".to_owned(),
+                }],
+                tools: Vec::new(),
+                budget: steward_types::Budget {
+                    monthly_limit: "100.00".to_owned(),
+                    single_run_limit: None,
+                    currency: "USD".to_owned(),
+                },
+                runtime_minutes_limit: None,
+                workspace: None,
+                ttl: steward_types::Duration("24h".to_owned()),
+                runner: steward_types::RunnerRequirements::default(),
+            },
+        }
+        .into();
+        let mut threshold = ceiling.clone();
+        threshold.spec.budget.monthly_limit = "50.00".to_owned();
+        let response = template_view(EnvelopeTemplateRevisionRecord {
+            template_id: "default".to_owned(),
+            display_name: "Default".to_owned(),
+            member_roles: vec!["engineer".to_owned()],
+            ceiling,
+            auto_provision_threshold: Some(threshold.clone()),
+            allow_inline_browser_tasks: true,
+        });
+        assert_eq!(
+            response.auto_provision_threshold,
+            Some(BrowserEnvelope::from(threshold))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn template_write_serialization_omits_the_retired_threshold() -> Result<(), String> {
+        let request: OperatorTemplateApplyRequest = serde_json::from_value(serde_json::json!({
+            "displayName": "Default",
+            "memberRoles": ["engineer"],
+            "ceiling": {
+                "revision": 1,
+                "spec": {
+                    "llms": [{"provider": "provider-a", "model": "model-a"}],
+                    "tools": [],
+                    "budget": {"monthlyLimit": "50.00", "currency": "USD"},
+                    "ttl": "24h",
+                    "runner": {}
+                }
+            }
+        }))
+        .map_err(|error| format!("deserialize template write: {error}"))?;
+        let serialized = serde_json::to_value(request)
+            .map_err(|error| format!("serialize template write: {error}"))?;
+        assert!(
+            serialized.get("autoProvisionThreshold").is_none(),
+            "new template writes must omit the retired field rather than sending null"
+        );
         Ok(())
     }
 }

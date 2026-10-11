@@ -521,6 +521,8 @@ pub(crate) struct AuthorEnvelopeTemplateBody {
     display_name: String,
     member_roles: Vec<String>,
     envelope: BrowserEnvelope,
+    /// Serde-only compatibility sentinel so retired clients receive an actionable response.
+    #[schema(ignore)]
     auto_provision_threshold: Option<BrowserEnvelope>,
     #[serde(default = "default_true")]
     allow_inline_browser_tasks: bool,
@@ -694,8 +696,8 @@ pub(crate) struct RejectEnvelopeRequestBody {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ApproveEnvelopeRequestBody {
-    /// Required for ceiling-exceeded requests and whenever decision metadata is supplied.
-    /// Legacy clients may omit it only for an unfiled within-ceiling request.
+    /// Required for requests above the template limits and whenever decision metadata is supplied.
+    /// Legacy clients may omit it only for an unfiled request within the template limits.
     rationale: Option<String>,
     evidence_url: Option<String>,
     expires_at: Option<String>,
@@ -1127,23 +1129,23 @@ where
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return ApiError::Store(error).into_response(),
     };
+    let mut governing_template_revision = None;
+    let mut current_ceiling_exceedances = Vec::new();
     if request.status == EnvelopeRequestStatus::Pending {
-        if let (Some(template_id), Some(template_revision)) =
+        if let (Some(template_id), Some(_pinned_template_revision)) =
             (request.template_id.as_deref(), request.template_revision)
         {
-            match state.ledger.latest_envelope_template(template_id).await {
-                Ok(Some(template)) if template.ceiling.revision == template_revision => {}
-                Ok(_) => return StatusCode::CONFLICT.into_response(),
+            let current = match state.ledger.latest_envelope_template(template_id).await {
+                Ok(Some(template)) => template,
+                Ok(None) => return StatusCode::CONFLICT.into_response(),
                 Err(error) => return ApiError::Store(error).into_response(),
-            }
-            let Some(template_envelope) = request.template_envelope.as_ref() else {
-                return StatusCode::CONFLICT.into_response();
             };
-            match envelope_is_within(&request.requested_envelope, template_envelope) {
-                Ok(AdmissionDecision::Admit) if request.ceiling_exceedances.is_empty() => {}
-                Ok(AdmissionDecision::Reject { deltas })
-                    if deltas == request.ceiling_exceedances => {}
-                Ok(_) => return StatusCode::CONFLICT.into_response(),
+            governing_template_revision = Some(current.ceiling.revision);
+            match envelope_is_within(&request.requested_envelope, &current.ceiling) {
+                Ok(AdmissionDecision::Admit) => {}
+                Ok(AdmissionDecision::Reject { deltas }) => {
+                    current_ceiling_exceedances = deltas;
+                }
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
         } else if request.template_id.is_some() || request.template_revision.is_some() {
@@ -1151,7 +1153,7 @@ where
         }
 
         let requires_review =
-            request.template_id.is_none() || !request.ceiling_exceedances.is_empty();
+            request.template_id.is_none() || !current_ceiling_exceedances.is_empty();
         if requires_review {
             if rationale.is_none() {
                 return envelope_request_error_response(
@@ -1199,7 +1201,7 @@ where
                     return envelope_request_error_response(
                         StatusCode::UNPROCESSABLE_ENTITY,
                         "platform_safety_ceiling_unconfigured",
-                        "This deployment does not accept requests outside a template ceiling.",
+                        "This deployment does not accept requests above a template's limits.",
                         vec![EnvelopeRequestField::RequestedEnvelope],
                     );
                 }
@@ -1281,26 +1283,34 @@ where
     let approval_id = request.approval_id.unwrap_or_else(Uuid::new_v4);
     let actor = authority.principal().canonical_user_id.as_str();
     let decision_key = request.decision_key.clone();
-    match state
-        .ledger
-        .append_envelope_request_status(
-            request.id,
-            EnvelopeRequestStatusUpdate {
-                from: EnvelopeRequestStatus::Pending,
-                to: EnvelopeRequestStatus::Provisioned,
-                approval_id: Some(approval_id),
-                envelope_instance_id: Some(&instance_id),
-                envelope_digest: Some(&digest),
-                reason: None,
-                rationale,
-                evidence_url,
-                expires_at: body.expires_at.as_deref(),
-                approved_envelope: Some(&request.requested_envelope),
-                actor,
-            },
-        )
-        .await
-    {
+    let update = EnvelopeRequestStatusUpdate {
+        from: EnvelopeRequestStatus::Pending,
+        to: EnvelopeRequestStatus::Provisioned,
+        approval_id: Some(approval_id),
+        envelope_instance_id: Some(&instance_id),
+        envelope_digest: Some(&digest),
+        reason: None,
+        rationale,
+        evidence_url,
+        expires_at: body.expires_at.as_deref(),
+        approved_envelope: Some(&request.requested_envelope),
+        actor,
+    };
+    let transition = match governing_template_revision {
+        Some(revision) => {
+            state
+                .ledger
+                .append_envelope_request_status_at_template_revision(request.id, revision, update)
+                .await
+        }
+        None => {
+            state
+                .ledger
+                .append_envelope_request_status(request.id, update)
+                .await
+        }
+    };
+    match transition {
         Ok(request) => {
             if let Err(error) = record_envelope_request_resolution(
                 &state.decisions,
@@ -1466,7 +1476,7 @@ where
         (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Envelope request was not found"),
         (status = 409, description = "Envelope request is no longer governed by the current template revision"),
-        (status = 422, description = "Envelope request does not exceed its template ceiling"),
+        (status = 422, description = "Envelope request does not exceed its template limits"),
         (status = 503, description = "Envelope request or decision channel is unavailable")
     ),
     security(("browserSession" = []))
@@ -1505,21 +1515,22 @@ where
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return ApiError::Store(error).into_response(),
     };
+    let mut governing_template_revision = None;
     let counterexample = match (request.template_id.as_deref(), request.template_revision) {
-        (Some(template_id), Some(template_revision)) => {
+        (Some(template_id), Some(_pinned_template_revision)) => {
             let template = match state.ledger.latest_envelope_template(template_id).await {
-                Ok(Some(template)) if template.ceiling.revision == template_revision => template,
-                Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+                Ok(Some(template)) => template,
                 Ok(None) => return StatusCode::NOT_FOUND.into_response(),
                 Err(error) => return ApiError::Store(error).into_response(),
             };
+            governing_template_revision = Some(template.ceiling.revision);
             match steward_admission::envelope_is_within(
                 &request.requested_envelope,
                 &template.ceiling,
             ) {
                 Ok(AdmissionDecision::Reject { deltas }) => AdmissionDecision::Reject { deltas }
                     .counterexample()
-                    .unwrap_or_else(|| "Envelope request exceeds its template ceiling".to_owned()),
+                    .unwrap_or_else(|| "Envelope request exceeds its template limits".to_owned()),
                 Ok(AdmissionDecision::Admit) => {
                     return StatusCode::UNPROCESSABLE_ENTITY.into_response();
                 }
@@ -1532,11 +1543,23 @@ where
         _ => return StatusCode::CONFLICT.into_response(),
     };
     let actor = authority.principal().canonical_user_id.as_str();
-    let token = match state
-        .ledger
-        .claim_envelope_request_decision_filing(request_id, actor)
-        .await
-    {
+    let claim = match governing_template_revision {
+        Some(revision) => {
+            state
+                .ledger
+                .claim_envelope_request_decision_filing_at_template_revision(
+                    request_id, revision, actor,
+                )
+                .await
+        }
+        None => {
+            state
+                .ledger
+                .claim_envelope_request_decision_filing(request_id, actor)
+                .await
+        }
+    };
+    let token = match claim {
         Ok(token) => token,
         Err(StoreError::DecisionReferenceMismatch) => {
             return match state
@@ -1994,14 +2017,21 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
+    if body.auto_provision_threshold.is_some() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE,
+            })),
+        )
+            .into_response();
+    }
     let envelope: Envelope = body.envelope.into();
-    let auto_provision_threshold = body.auto_provision_threshold.map(Into::into);
     if !valid_template_authoring(
         &template_id,
         &body.display_name,
         &body.member_roles,
         &envelope,
-        auto_provision_threshold.as_ref(),
     ) {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
@@ -2035,7 +2065,7 @@ where
             display_name: &body.display_name,
             member_roles: &body.member_roles,
             ceiling: &envelope,
-            auto_provision_threshold: auto_provision_threshold.as_ref(),
+            auto_provision_threshold: None,
             allow_inline_browser_tasks: body.allow_inline_browser_tasks,
             authored_by: authority.principal().canonical_user_id.as_str(),
         })
@@ -2052,7 +2082,7 @@ where
                     member_role,
                     member_roles: body.member_roles,
                     envelope: envelope.into(),
-                    auto_provision_threshold: auto_provision_threshold.map(Into::into),
+                    auto_provision_threshold: None,
                     allow_inline_browser_tasks: body.allow_inline_browser_tasks,
                 }),
             )
@@ -2130,7 +2160,6 @@ fn valid_template_authoring(
     display_name: &str,
     member_roles: &[String],
     envelope: &Envelope,
-    auto_provision_threshold: Option<&Envelope>,
 ) -> bool {
     valid_template_identifier(template_id)
         && !display_name.is_empty()
@@ -2145,14 +2174,6 @@ fn valid_template_authoring(
         && envelope.revision > 0
         && !envelope.spec.llms.is_empty()
         && validate_envelope(envelope).is_ok()
-        && auto_provision_threshold.is_none_or(|threshold| {
-            threshold.revision == envelope.revision
-                && validate_envelope(threshold).is_ok()
-                && matches!(
-                    steward_admission::envelope_is_within(threshold, envelope),
-                    Ok(AdmissionDecision::Admit)
-                )
-        })
 }
 
 #[utoipa::path(
@@ -2225,8 +2246,21 @@ fn decision(
 fn envelope_admin_request(record: AdminEnvelopeRequestRecord) -> AdminRequestView {
     let automatic = record.request.status == EnvelopeRequestStatus::Provisioned
         && record.request.status_actor == "system:auto";
-    let deltas = if record.request.ceiling_exceedances.is_empty() {
+    let pending = record.request.status == EnvelopeRequestStatus::Pending;
+    let deltas = if pending {
         record
+            .template_envelope
+            .as_ref()
+            .map(|template| {
+                match envelope_is_within(&record.request.requested_envelope, template) {
+                    Ok(AdmissionDecision::Reject { deltas }) => deltas,
+                    Ok(AdmissionDecision::Admit) | Err(_) => Vec::new(),
+                }
+            })
+            .unwrap_or_default()
+    } else if record.request.ceiling_exceedances.is_empty() {
+        record
+            .request
             .template_envelope
             .as_ref()
             .map(|template| {
@@ -2263,7 +2297,15 @@ fn envelope_admin_request(record: AdminEnvelopeRequestRecord) -> AdminRequestVie
         template: AdminRequestTemplate {
             id: record.request.template_id,
             display_name: record.template_display_name,
-            revision: record.request.template_revision,
+            revision: if pending {
+                record
+                    .template_envelope
+                    .as_ref()
+                    .map(|template| template.revision)
+                    .or(record.request.template_revision)
+            } else {
+                record.request.template_revision
+            },
         },
         created_at: record.request.created_at.clone(),
         state_at: record.request.status_at.clone(),
@@ -2956,14 +2998,15 @@ mod request_projection_tests {
     use super::{AdminRequestKind, approval_admin_request, envelope_admin_request};
 
     #[test]
-    fn envelope_review_projection_preserves_the_recorded_request_context() -> Result<(), String> {
-        let template = Envelope {
+    fn pending_envelope_projection_uses_current_limits_without_rewriting_the_pin()
+    -> Result<(), String> {
+        let pinned_template = Envelope {
             revision: 3,
             spec: EnvelopeSpec {
                 llms: Vec::new(),
                 tools: Vec::new(),
                 budget: Budget {
-                    monthly_limit: "100.00".to_owned(),
+                    monthly_limit: "200.00".to_owned(),
                     single_run_limit: Some("10.00".to_owned()),
                     currency: "USD".to_owned(),
                 },
@@ -2973,11 +3016,14 @@ mod request_projection_tests {
                 runner: RunnerRequirements::default(),
             },
         };
-        let mut requested = template.clone();
-        requested.spec.budget.monthly_limit = "125.00".to_owned();
+        let mut requested = pinned_template.clone();
+        requested.spec.budget.monthly_limit = "150.00".to_owned();
+        let mut current_template = pinned_template.clone();
+        current_template.revision = 4;
+        current_template.spec.budget.monthly_limit = "50.00".to_owned();
         let delta = AdmissionDelta::Budget {
-            requested: "125.00".to_owned(),
-            ceiling: "100.00".to_owned(),
+            requested: "150.00".to_owned(),
+            ceiling: "50.00".to_owned(),
             currency: "USD".to_owned(),
         };
         let projected = envelope_admin_request(AdminEnvelopeRequestRecord {
@@ -2987,9 +3033,9 @@ mod request_projection_tests {
                 template_id: Some("engineer".to_owned()),
                 template_revision: Some(3),
                 requested_envelope: requested,
-                template_envelope: Some(template.clone()),
+                template_envelope: Some(pinned_template),
                 justification: Some("Need a larger monthly limit".to_owned()),
-                ceiling_exceedances: vec![delta.clone()],
+                ceiling_exceedances: Vec::new(),
                 approved_envelope: None,
                 status: EnvelopeRequestStatus::Pending,
                 approval_id: None,
@@ -3007,11 +3053,13 @@ mod request_projection_tests {
             },
             owner_display_email: "alice@example.com".to_owned(),
             template_display_name: Some("Engineer".to_owned()),
-            template_envelope: Some(template),
+            template_envelope: Some(current_template.clone()),
         });
 
         assert_eq!(projected.kind, AdminRequestKind::CeilingExceeded);
         assert_eq!(projected.deltas, vec![delta]);
+        assert_eq!(projected.template.revision, Some(4));
+        assert_eq!(projected.template_envelope, Some(current_template.into()));
         assert_eq!(
             projected.justification.as_deref(),
             Some("Need a larger monthly limit")

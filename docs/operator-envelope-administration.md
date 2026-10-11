@@ -1,6 +1,6 @@
 # User Envelope and RBAC administration
 
-Status: current release contract for Steward v0.3.3.
+Status: current development contract after Steward v0.3.15.
 
 This guide covers the catalog-backed User Envelope model and the supported
 day-two operator commands introduced after Steward 0.2.6. Canonical user IDs,
@@ -9,7 +9,7 @@ not email addresses, are authorization and mutation keys. Email is display-only.
 ## Authority model
 
 `envelope_template_revisions` is the sole authority for template identity,
-immutable revisions, eligible member roles, and ceilings. Legacy
+immutable revisions, eligible member roles, and limits. Legacy
 `envelopes(scope_kind = 'member_role')` rows remain read-only
 for one compatibility window; new template and provisioning operations neither
 read nor write them.
@@ -23,13 +23,18 @@ Template-backed requests are handled as follows:
 
 | Requested authority | Result |
 |---|---|
-| At or below the template ceiling | Provision automatically |
-| Above the template ceiling but within the deployment safety ceiling and capability catalog | Remain pending for an administrator |
+| Within the template limits | Provision automatically |
+| Above the template limits but within the deployment safety ceiling and capability catalog | Remain pending for an administrator |
 | Outside the deployment safety ceiling or capability catalog | Reject with `422` and identify the affected field |
 
-The deprecated `autoProvisionThreshold` field remains accepted as compatibility
-metadata but does not affect request admission. A template-free request omits
-both `templateId` and `templateRevision`, carries
+Each template has one boundary: its published limits. To review any request
+above 50 USD, for example, set the template's monthly limit to 50 USD. The
+retired `autoProvisionThreshold` field remains readable on historical template
+revisions, but new revisions never carry it. Template writes that set it are
+rejected with `422` and an actionable message directing the operator to set the
+template limits instead.
+
+A template-free request omits both `templateId` and `templateRevision`, carries
 the complete requested Envelope, and always remains pending until an explicit
 administrator decision. Operators must configure
 `config.apiserver.customEnvelopeSafetyCeiling`; otherwise custom requests fail
@@ -84,7 +89,7 @@ revision:
 ```
 
 The target must exist, be active, hold an eligible member role, and request
-authority within the exact template ceiling. The immutable request records the
+authority within the exact template limits. The immutable request records the
 target as owner and the authenticated administrator as actor. Exact retries are
 idempotent.
 
@@ -166,7 +171,7 @@ The optional Helm value `config.apiserver.defaultLlmTemplate.enabled` seeds the
 same catalog record at startup. It is disabled by default. When enabled, operators
 must supply at least one eligible member role and one exact model from the deployed
 capability catalog, a bounded budget, TTL, and revision. Tools remain empty and the
-automatic threshold is fixed to the ceiling. The conventional ID `default` is
+published limits are the automatic-provisioning boundary. The conventional ID `default` is
 configurable and has no special application semantics. Reapplying identical
 content succeeds; drift at the same revision is a startup conflict.
 
@@ -177,6 +182,38 @@ makes the event's template-revision snapshot nullable for custom requests. The
 existing foreign key continues to protect template-backed requests. Existing
 requests, events, RBAC audit history, and provisioned Envelope evidence are not
 rewritten.
+
+Migration 0070 retires the separate automatic-provision threshold without
+silently widening authority. For every template whose latest revision had a
+threshold stricter than its limits, it appends a successor revision whose limits
+equal the old threshold and records `system:migration` as the author. Templates
+without a threshold, and templates whose threshold already equalled their
+limits, are unchanged. Historical revisions retain their readable threshold.
+
+Pending requests remain pinned to their original immutable request evidence and
+stay pending. Administrators review and approve them against the current template
+revision's limits. Already provisioned Envelopes are unchanged, including any
+whose authority is above the new current limits.
+
+After the migration, record the exact affected templates and successor revisions:
+
+```sql
+SELECT template_id, revision
+FROM envelope_template_revisions
+WHERE authored_by = 'system:migration'
+ORDER BY template_id, revision;
+```
+
+Keep migration 0070 applied during rollback. Older binaries can read the
+narrowed successor revisions. The database accepts an older writer's threshold
+only when it is exactly equal to that revision's limits, so it remains the same
+single boundary; every distinct threshold is rejected. If a one-boundary binary
+created a default-template revision, set
+`config.apiserver.defaultLlmTemplate.enabled=false` before rolling back to
+v0.3.15. The previous apiserver will not start with default-template seeding
+enabled against that threshold-free revision. Do not delete the
+migration-authored revisions or rewrite pending and provisioned history to
+manufacture rollback compatibility.
 
 Roll back only to a binary that understands every row written after upgrade.
 In particular, a pre-0051 binary cannot read a template-free request. Before such
