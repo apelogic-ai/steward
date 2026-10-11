@@ -75,6 +75,8 @@ const TAR_BLOCK_BYTES: usize = 512;
 #[cfg(feature = "runtime")]
 const STAGING_EXEC_STDIN_CHUNK_BYTES: usize = 512 * 1024;
 #[cfg(feature = "runtime")]
+const EXECUTION_TRANSCRIPT_TRUNCATION_MARKER: &str = "[... execution output truncated ...]\n";
+#[cfg(feature = "runtime")]
 const KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH: usize = 253;
 #[cfg(feature = "runtime")]
 const KUBERNETES_DNS_LABEL_MAX_LENGTH: usize = 63;
@@ -1014,14 +1016,7 @@ struct TaskProcessResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TaskProcessLaunchMode {
     Synchronous,
-    Detached,
-}
-
-#[cfg(feature = "runtime")]
-#[derive(Debug, Eq, PartialEq)]
-enum TaskProcessLaunchOutcome {
-    Detached,
-    Completed(Result<TaskProcessResult, PortError>),
+    SandboxDetached,
 }
 
 #[cfg(feature = "runtime")]
@@ -1030,25 +1025,9 @@ fn task_process_launch_mode(
     execution_log: ExecutionLogMode,
 ) -> TaskProcessLaunchMode {
     if execution_class == SandboxExecutionClass::Agent && execution_log == ExecutionLogMode::Full {
-        TaskProcessLaunchMode::Detached
+        TaskProcessLaunchMode::SandboxDetached
     } else {
         TaskProcessLaunchMode::Synchronous
-    }
-}
-
-#[cfg(feature = "runtime")]
-async fn launch_task_process<F>(mode: TaskProcessLaunchMode, process: F) -> TaskProcessLaunchOutcome
-where
-    F: Future<Output = Result<TaskProcessResult, PortError>> + Send + 'static,
-{
-    match mode {
-        TaskProcessLaunchMode::Synchronous => TaskProcessLaunchOutcome::Completed(process.await),
-        TaskProcessLaunchMode::Detached => {
-            drop(tokio::spawn(async move {
-                let _ = process.await;
-            }));
-            TaskProcessLaunchOutcome::Detached
-        }
     }
 }
 
@@ -2593,40 +2572,50 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             output_archive_command,
             task_transcript_requested(request.execution_class, request.diagnostics.execution_log),
         );
-        let process_runtime = self.clone();
-        let process_runtime_uid = request.runtime.0.clone();
-        let process_workspace = workspace.to_owned();
-        let process_sandbox = sandbox.to_owned();
-        let process_command = vec!["/bin/sh".to_owned(), "-c".to_owned(), wrapped_command];
-        let execution_class = request.execution_class;
-        let process = async move {
-            process_runtime
-                .exec_task_process(
-                    &sandbox_id,
-                    &process_command,
-                    environment,
-                    execution_class,
-                    TaskProcessLogContext {
-                        runtime_uid: &process_runtime_uid,
-                        workspace: &process_workspace,
-                        sandbox: &process_sandbox,
-                    },
-                )
-                .await
-        };
-        let executed = match launch_task_process(
-            task_process_launch_mode(request.execution_class, request.diagnostics.execution_log),
-            process,
-        )
-        .await
-        {
-            TaskProcessLaunchOutcome::Detached => {
-                return Ok(SandboxTaskObservation::Accepted {
-                    adapter_observation_id: attempt_id.0.clone(),
-                });
+        let launch_mode =
+            task_process_launch_mode(request.execution_class, request.diagnostics.execution_log);
+        let process_command = match launch_mode {
+            TaskProcessLaunchMode::Synchronous => wrapped_command,
+            TaskProcessLaunchMode::SandboxDetached => {
+                task_attempt_detached_launch_command(&attempt_directory, &wrapped_command)
             }
-            TaskProcessLaunchOutcome::Completed(executed) => executed,
         };
+        let executed = self
+            .exec_task_process(
+                &sandbox_id,
+                &["/bin/sh".to_owned(), "-c".to_owned(), process_command],
+                environment,
+                request.execution_class,
+                TaskProcessLogContext {
+                    runtime_uid: &request.runtime.0,
+                    workspace,
+                    sandbox,
+                },
+            )
+            .await;
+        if launch_mode == TaskProcessLaunchMode::SandboxDetached {
+            return match executed {
+                Ok(executed) if executed.exit_code == 0 => {
+                    self.observe_task(attempt_id, request).await
+                }
+                Ok(_) => {
+                    eprintln!(
+                        "openshell_task_launch_failed runtime_uid=\"{}\" category=launcher_rejected",
+                        escaped_task_log_value(request.runtime.0.as_bytes())
+                    );
+                    Err(PortError::Failed {
+                        reason: "OpenShell task launch was not accepted".to_owned(),
+                    })
+                }
+                Err(error) => {
+                    eprintln!(
+                        "openshell_task_launch_failed runtime_uid=\"{}\" category=transport",
+                        escaped_task_log_value(request.runtime.0.as_bytes())
+                    );
+                    Err(error)
+                }
+            };
+        }
         let execution_error = match executed {
             Ok(executed) => {
                 return self
@@ -2764,16 +2753,23 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 })
             }
             "failed" => {
-                let reason = transcript.as_ref().map_or_else(
-                    || "task agent failed; inspect the bounded controller diagnostic".to_owned(),
-                    |transcript| {
-                        task_failure_category(
-                            &transcript.stderr,
-                            request_uses_managed_inference(request),
-                        )
-                        .to_owned()
-                    },
-                );
+                let reason = if payload == b"transcript_too_large" {
+                    "Task execution transcript exceeded its bounded archive contract".to_owned()
+                } else {
+                    transcript.as_ref().map_or_else(
+                        || {
+                            "task agent failed; inspect the bounded controller diagnostic"
+                                .to_owned()
+                        },
+                        |transcript| {
+                            task_failure_category(
+                                &transcript.stderr,
+                                request_uses_managed_inference(request),
+                            )
+                            .to_owned()
+                        },
+                    )
+                };
                 Ok(if let Some(transcript) = transcript {
                     SandboxTaskObservation::FailedWithTranscript {
                         adapter_observation_id: correlation,
@@ -2812,10 +2808,59 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             SandboxTaskObservation::Accepted { .. }
             | SandboxTaskObservation::Running { .. }
             | SandboxTaskObservation::RunningWithTranscript { .. } => {
-                Ok(SandboxTaskObservation::OutcomeUnknown {
-                    reason: "OpenShell does not expose a proven attempt-scoped cancellation acknowledgement"
-                        .to_owned(),
-                })
+                let workspace = request
+                    .refs
+                    .workspace
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| PortError::Rejected {
+                        reason: "task runtime has no sandbox workspace reference".to_owned(),
+                    })?;
+                let sandbox = request
+                    .refs
+                    .sandbox
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| PortError::Rejected {
+                        reason: "task runtime has no sandbox name reference".to_owned(),
+                    })?;
+                let attempt_directory = task_attempt_directory(attempt_id)?;
+                let cancelled = self
+                    .authenticated_client()
+                    .await?
+                    .workspace(workspace)
+                    .exec(
+                        sandbox,
+                        &[
+                            "/bin/sh".to_owned(),
+                            "-c".to_owned(),
+                            task_attempt_cancel_command(&attempt_directory),
+                        ],
+                        ExecOptions {
+                            timeout: Some(StdDuration::from_secs(30)),
+                            ..ExecOptions::default()
+                        },
+                    )
+                    .await
+                    .map_err(port_failure)?;
+                if cancelled.exit_code == 44 {
+                    return Ok(SandboxTaskObservation::Absent);
+                }
+                if !matches!(cancelled.exit_code, 0 | 17) {
+                    return Err(PortError::Failed {
+                        reason: "Task attempt process group could not be stopped".to_owned(),
+                    });
+                }
+                match self.observe_task(attempt_id, request).await? {
+                    SandboxTaskObservation::Accepted { .. }
+                    | SandboxTaskObservation::Running { .. }
+                    | SandboxTaskObservation::RunningWithTranscript { .. } => {
+                        Err(PortError::Failed {
+                            reason: "Task attempt process group is still running".to_owned(),
+                        })
+                    }
+                    terminal => Ok(terminal),
+                }
             }
         }
     }
@@ -2863,10 +2908,64 @@ fn task_attempt_claim_command(directory: &str) -> String {
 #[cfg(feature = "runtime")]
 fn task_attempt_transcript_stream_command(directory: &str, relative_path: &str) -> String {
     let path = shell_quote(&format!("{directory}/{relative_path}"));
+    let marker = shell_quote(EXECUTION_TRANSCRIPT_TRUNCATION_MARKER);
+    let retained_bytes = MAX_EXECUTION_STREAM_BYTES
+        .saturating_sub(EXECUTION_TRANSCRIPT_TRUNCATION_MARKER.len() as u64);
     format!(
         "set -eu; test -f {path}; size=$(wc -c < {path}); \
          case \"$size\" in ''|*[!0-9]*) exit 65 ;; esac; \
-         test \"$size\" -le {MAX_EXECUTION_STREAM_BYTES}; cat {path}"
+         if [ \"$size\" -gt {MAX_EXECUTION_STREAM_BYTES} ]; then \
+           printf '%s' {marker}; tail -c {retained_bytes} {path} | head -c {retained_bytes}; \
+         else head -c {MAX_EXECUTION_STREAM_BYTES} {path}; fi"
+    )
+}
+
+#[cfg(feature = "runtime")]
+fn task_attempt_detached_launch_command(directory: &str, execution_command: &str) -> String {
+    let directory = shell_quote(directory);
+    let execution_command = shell_quote(execution_command);
+    format!(
+        "set -eu; command -v setsid >/dev/null 2>&1; \
+         setsid /bin/sh -c {execution_command} </dev/null >/dev/null 2>&1 & \
+         for attempt in 1 2 3 4 5 6 7 8 9 10; do \
+           state=$(cat {directory}/state 2>/dev/null || true); \
+           if [ -n \"$state\" ] && [ \"$state\" != claimed ]; then exit 0; fi; \
+           sleep 1; \
+         done; \
+         exit 70"
+    )
+}
+
+#[cfg(feature = "runtime")]
+fn task_attempt_cancel_command(directory: &str) -> String {
+    let directory = shell_quote(directory);
+    format!(
+        "set -eu; test -d {directory} || exit 44; \
+         state=$(cat {directory}/state); [ \"$state\" = running ] || exit 17; \
+         pid=$(cat {directory}/pid 2>/dev/null || true); \
+         pid_start=$(cat {directory}/pid-start 2>/dev/null || true); \
+         case \"$pid:$pid_start\" in *[!0-9:]*|:|*:) exit 70 ;; esac; \
+         current_start=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); \
+         if [ \"$current_start\" = \"$pid_start\" ]; then kill -TERM -\"$pid\"; fi; \
+         for attempt in 1 2 3 4 5 6 7 8 9 10; do \
+           state=$(cat {directory}/state); [ \"$state\" = running ] || exit 17; \
+           current_start=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); \
+           if [ \"$current_start\" != \"$pid_start\" ]; then \
+             printf outcome_unknown > {directory}/state.tmp; \
+             mv {directory}/state.tmp {directory}/state; exit 0; \
+           fi; \
+           sleep 1; \
+         done; \
+         kill -KILL -\"$pid\"; \
+         for attempt in 1 2 3 4 5; do \
+           current_start=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); \
+           if [ \"$current_start\" != \"$pid_start\" ]; then \
+             printf outcome_unknown > {directory}/state.tmp; \
+             mv {directory}/state.tmp {directory}/state; exit 0; \
+           fi; \
+           sleep 1; \
+         done; \
+         exit 70"
     )
 }
 
@@ -2880,26 +2979,32 @@ fn task_attempt_execution_command(
     let diagnostics_directory = format!("{directory}/.steward/diagnostics");
     let stdout_path = format!("{directory}/{EXECUTION_STDOUT_ARCHIVE_PATH}");
     let stderr_path = format!("{directory}/{EXECUTION_STDERR_ARCHIVE_PATH}");
+    let failure_reason_path = format!("{directory}/failure-reason");
     let directory = shell_quote(directory);
     let diagnostics_directory = shell_quote(&diagnostics_directory);
     let stdout_path = shell_quote(&stdout_path);
     let stderr_path = shell_quote(&stderr_path);
+    let failure_reason_path = shell_quote(&failure_reason_path);
     let command = command
         .iter()
         .map(|argument| shell_quote(argument))
         .collect::<Vec<_>>()
         .join(" ");
+    let diagnostics_setup = if capture_transcript {
+        format!("mkdir -p {diagnostics_directory}; : > {stdout_path}; : > {stderr_path};")
+    } else {
+        String::new()
+    };
     let execution = if capture_transcript {
         format!(
-            "mkdir -p {diagnostics_directory}; \
-             ({command}) > {stdout_path} 2> {stderr_path}; status=$?; \
+            "({command}) > {stdout_path} 2> {stderr_path}; status=$?; \
              if ! stdout_size=$(wc -c < {stdout_path}) \
                 || ! stderr_size=$(wc -c < {stderr_path}); then status=70; \
              else transcript_size=$((stdout_size + stderr_size)); \
                if [ \"$stdout_size\" -gt {MAX_EXECUTION_STREAM_BYTES} ] \
                   || [ \"$stderr_size\" -gt {MAX_EXECUTION_STREAM_BYTES} ] \
                   || [ \"$transcript_size\" -gt {MAX_EXECUTION_TRANSCRIPT_BYTES} ]; then \
-                 printf '%s\\n' 'Task execution transcript exceeded its bounded archive contract' >&2; \
+                 printf '%s' transcript_too_large > {failure_reason_path}; \
                  status=74; \
                else cat {stdout_path}; cat {stderr_path} >&2; fi; \
              fi"
@@ -2919,6 +3024,10 @@ fn task_attempt_execution_command(
            mv {directory}/heartbeat.tmp {directory}/heartbeat; sleep 5; done) & \
          heartbeat_pid=$!; \
          trap 'kill \"$heartbeat_pid\" 2>/dev/null || true; wait \"$heartbeat_pid\" 2>/dev/null || true' EXIT; \
+         mark_interrupted() {{ printf outcome_unknown > {directory}/state.tmp; \
+           mv {directory}/state.tmp {directory}/state; exit 143; }}; \
+         trap mark_interrupted HUP INT TERM; \
+         {diagnostics_setup} \
          printf running > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; \
          {execution}; \
          if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
@@ -2947,7 +3056,9 @@ fn task_attempt_observation_command(directory: &str) -> String {
              mv {directory}/state.tmp {directory}/state; fi; \
          fi; \
          printf '%s\\n' \"$state\"; \
-         if [ \"$state\" = succeeded ]; then cat {directory}/output.tar; fi"
+         if [ \"$state\" = succeeded ]; then cat {directory}/output.tar; \
+         elif [ \"$state\" = failed ] && [ -f {directory}/failure-reason ]; then \
+           cat {directory}/failure-reason; fi"
     )
 }
 
@@ -3211,14 +3322,15 @@ mod tests {
         CONNECTIONS_BRIDGE_AGENT_TYPE, INFERENCE_PROVIDER, OpenShellConnectionConfig,
         OpenShellTaskLogMode, ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES,
         SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream, TaskProcessLaunchMode,
-        TaskProcessLaunchOutcome, TaskProcessLogContext, TaskProcessLogSink, TaskProcessResult,
-        TaskProcessStream, WorkloadExchangeTokenProvider, attach_task_agent_failure_category,
-        collect_task_process_stream, delete_owned_sandbox, deletion_names, launch_task_process,
-        load_source_credential, output_archive_command, project_request, provider_reconciliation,
+        TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
+        WorkloadExchangeTokenProvider, attach_task_agent_failure_category,
+        collect_task_process_stream, delete_owned_sandbox, deletion_names, load_source_credential,
+        output_archive_command, project_request, provider_reconciliation,
         provider_reconciliation_plan, provider_reconciliation_targets, sandbox_spec,
         sanitized_provider_control_transcript, staging_append_command, staging_archive_chunks,
         staging_extract_command, staging_prepare_command, task_agent_failure_category,
-        task_attempt_directory, task_attempt_execution_command, task_attempt_observation_command,
+        task_attempt_cancel_command, task_attempt_detached_launch_command, task_attempt_directory,
+        task_attempt_execution_command, task_attempt_observation_command,
         task_attempt_transcript_stream_command, task_failure_category, task_process_launch_mode,
         task_process_log_record, task_transcript_requested, validate_raw_sandbox_binding,
         validate_workload_exchange_endpoint, workspace_materialization_command,
@@ -3764,11 +3876,11 @@ mod tests {
     }
 
     #[cfg(feature = "runtime")]
-    #[tokio::test]
-    async fn full_diagnostics_agent_launch_returns_before_process_completion() {
+    #[test]
+    fn full_diagnostics_agent_launch_is_sandbox_detached_and_cancellable() {
         assert_eq!(
             task_process_launch_mode(SandboxExecutionClass::Agent, ExecutionLogMode::Full),
-            TaskProcessLaunchMode::Detached
+            TaskProcessLaunchMode::SandboxDetached
         );
         assert_eq!(
             task_process_launch_mode(SandboxExecutionClass::Agent, ExecutionLogMode::Off),
@@ -3782,23 +3894,29 @@ mod tests {
             TaskProcessLaunchMode::Synchronous
         );
 
-        let (_release, blocked) = tokio::sync::oneshot::channel::<()>();
-        let launched = tokio::time::timeout(
-            Duration::from_millis(25),
-            launch_task_process(TaskProcessLaunchMode::Detached, async move {
-                let _ = blocked.await;
-                Ok(TaskProcessResult {
-                    exit_code: 0,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                })
-            }),
-        )
-        .await;
-        assert!(
-            matches!(launched, Ok(TaskProcessLaunchOutcome::Detached)),
-            "full-diagnostics execution must detach so the controller can observe its transcript while it runs"
+        let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
+        let execution = task_attempt_execution_command(
+            directory,
+            &["/bin/sleep".to_owned(), "30".to_owned()],
+            "true",
+            true,
         );
+        let launcher = task_attempt_detached_launch_command(directory, &execution);
+        let cancellation = task_attempt_cancel_command(directory);
+        assert!(launcher.contains("setsid /bin/sh"));
+        assert!(launcher.contains("[ \"$state\" != claimed ]"));
+        assert!(execution.contains("trap mark_interrupted HUP INT TERM"));
+        assert!(cancellation.contains("kill -TERM -\"$pid\""));
+        assert!(cancellation.contains("kill -KILL -\"$pid\""));
+        for command in [execution, launcher, cancellation] {
+            assert!(
+                Command::new("/bin/sh")
+                    .args(["-n", "-c", &command])
+                    .status()
+                    .is_ok_and(|status| status.success()),
+                "the detached task lifecycle command must be valid POSIX shell"
+            );
+        }
     }
 
     #[cfg(feature = "runtime")]

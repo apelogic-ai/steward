@@ -13,6 +13,7 @@ use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::core::admission::{AdmissionRequest, AdmissionResponse, Operation};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
@@ -678,25 +679,84 @@ async fn run_task_controller<R: SandboxTaskRuntime>(
     sandbox_runtime: R,
     authority: PgStore,
 ) {
+    let sandbox_runtime = Arc::new(sandbox_runtime);
+    let mut scheduler = TaskReconcileScheduler::default();
+    let mut poll = tokio::time::interval(TASK_CONTROLLER_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        match authority.task_orchestration_work_items().await {
-            Ok(work) => {
-                for item in work {
-                    if let Err(error) = reconcile_task_orchestration_work_item(
-                        &client,
-                        &sandbox_runtime,
-                        &authority,
-                        &item,
-                    )
-                    .await
-                    {
-                        eprintln!("task reconcile error: {error}");
+        tokio::select! {
+            _ = poll.tick() => {
+                match authority.task_orchestration_work_items().await {
+                    Ok(work) => {
+                        for item in work {
+                            if scheduler.len() >= MAX_CONCURRENT_TASK_RECONCILES {
+                                break;
+                            }
+                            let task_uid = item.task.task_uid.to_string();
+                            let task_client = client.clone();
+                            let task_runtime = Arc::clone(&sandbox_runtime);
+                            let task_authority = authority.clone();
+                            scheduler.schedule(task_uid, async move {
+                                reconcile_task_orchestration_work_item(
+                                    &task_client,
+                                    task_runtime.as_ref(),
+                                    &task_authority,
+                                    &item,
+                                )
+                                .await
+                            });
+                        }
                     }
+                    Err(error) => eprintln!("task queue read failed: {error}"),
                 }
             }
-            Err(error) => eprintln!("task queue read failed: {error}"),
+            completed = scheduler.next(), if !scheduler.is_empty() => {
+                if let Some((_, result)) = completed
+                    && let Err(error) = result
+                {
+                    eprintln!("task reconcile error: {error}");
+                }
+            }
         }
-        tokio::time::sleep(TASK_CONTROLLER_POLL_INTERVAL).await;
+    }
+}
+
+type TaskReconcileFuture =
+    Pin<Box<dyn Future<Output = (String, Result<(), TaskControllerError>)> + Send + 'static>>;
+
+#[derive(Default)]
+struct TaskReconcileScheduler {
+    active: BTreeSet<String>,
+    pending: FuturesUnordered<TaskReconcileFuture>,
+}
+
+impl TaskReconcileScheduler {
+    fn len(&self) -> usize {
+        self.active.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.active.is_empty()
+    }
+
+    fn schedule<F>(&mut self, task_uid: String, reconcile: F) -> bool
+    where
+        F: Future<Output = Result<(), TaskControllerError>> + Send + 'static,
+    {
+        if !self.active.insert(task_uid.clone()) {
+            return false;
+        }
+        self.pending.push(Box::pin(async move {
+            let result = reconcile.await;
+            (task_uid, result)
+        }));
+        true
+    }
+
+    async fn next(&mut self) -> Option<(String, Result<(), TaskControllerError>)> {
+        let result = self.pending.next().await?;
+        self.active.remove(&result.0);
+        Some(result)
     }
 }
 
@@ -719,7 +779,8 @@ const TASK_OPERATION_ANNOTATION: &str = "agents.apelogic.ai/orchestration-id";
 const TASK_MANIFEST_DIGEST_ANNOTATION: &str = "agents.apelogic.ai/manifest-digest";
 const TASK_RUNTIME_MODE_ANNOTATION: &str = "agents.apelogic.ai/runtime-mode";
 const TASK_ORCHESTRATOR_ACTOR: &str = "task-orchestrator";
-const TASK_CONTROLLER_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
+const TASK_CONTROLLER_POLL_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const MAX_CONCURRENT_TASK_RECONCILES: usize = 32;
 
 #[derive(Debug)]
 pub enum ApprovalDispatcherError {
@@ -5525,9 +5586,9 @@ mod tests {
     use super::{
         Action, AuthorityAction, InferenceAction, MEMBER_ROLE_ANNOTATION, ManagedInferencePlane,
         ReconcileDecision, ReconcileIntent, RuntimeCreateErrorClass, SERVICE_PRINCIPAL_ANNOTATION,
-        TASK_CONTROLLER_POLL_INTERVAL, TaskRuntimeAction, TaskRuntimeBinding,
-        TaskRuntimeBindingStore, authority_action, authority_application_action,
-        classify_runtime_create_status, cleanup_runtime, connection_operation_authority_action,
+        TaskReconcileScheduler, TaskRuntimeAction, TaskRuntimeBinding, TaskRuntimeBindingStore,
+        authority_action, authority_application_action, classify_runtime_create_status,
+        cleanup_runtime, connection_operation_authority_action,
         connection_operation_failure_log_line, create_task_runtime_inner,
         ensure_managed_mode_has_no_stock_credential, exhausted_spend_to_preserve,
         failed_runtime_status, inference_action, provider_control_bindings_match, reconcile_once,
@@ -5539,9 +5600,28 @@ mod tests {
         task_runtime_observation_is_failed, ttl_action,
     };
 
-    #[test]
-    fn task_controller_poll_interval_keeps_live_logs_current() {
-        assert!(TASK_CONTROLLER_POLL_INTERVAL <= StdDuration::from_secs(15));
+    #[tokio::test]
+    async fn blocked_task_start_does_not_hide_another_tasks_ready_observation() -> Result<(), String>
+    {
+        let mut scheduler = TaskReconcileScheduler::default();
+        let (_release, blocked) = tokio::sync::oneshot::channel::<()>();
+        assert!(scheduler.schedule("blocked-task".to_owned(), async move {
+            let _ = blocked.await;
+            Ok(())
+        }));
+        assert!(scheduler.schedule("ready-task".to_owned(), async { Ok(()) }));
+        assert!(
+            !scheduler.schedule("blocked-task".to_owned(), async { Ok(()) }),
+            "one controller instance must not schedule the same Task twice"
+        );
+
+        let completed = tokio::time::timeout(StdDuration::from_millis(25), scheduler.next())
+            .await
+            .map_err(|_| "a ready Task reconcile waited for a blocked start".to_owned())?
+            .ok_or_else(|| "the scheduler discarded the ready Task".to_owned())?;
+        assert_eq!(completed.0, "ready-task");
+        assert!(completed.1.is_ok());
+        Ok(())
     }
 
     #[test]

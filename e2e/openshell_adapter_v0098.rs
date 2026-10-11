@@ -14,9 +14,9 @@ use steward_ports::{
     SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
 use steward_types::direct_package::{
-    ContentDigest, DiagnosticsRequest, ExactGitCommit, ExecutionLogMode, RepositoryUrl,
-    ResolvedWorkspaceEntry, StableProviderId, WorkspaceAccess, WorkspaceEvidence,
-    WorkspaceGitHistory, WorkspaceName, canonical_json_bytes,
+    ContentDigest, DiagnosticsRequest, ExactGitCommit, ExecutionLogMode,
+    MAX_EXECUTION_STREAM_BYTES, RepositoryUrl, ResolvedWorkspaceEntry, StableProviderId,
+    WorkspaceAccess, WorkspaceEvidence, WorkspaceGitHistory, WorkspaceName, canonical_json_bytes,
 };
 use steward_types::task_input_archive::frame_task_input_archive;
 use steward_types::task_output_archive::{
@@ -381,7 +381,7 @@ async fn verify_attempt_failure_semantics(
     sandbox: &SandboxRequest,
     input_archive: &[u8],
 ) -> Result<(), String> {
-    let mut task = SandboxTaskRequest {
+    let task = SandboxTaskRequest {
         runtime: sandbox.runtime.clone(),
         refs: sandbox.refs.clone(),
         execution_class: SandboxExecutionClass::Agent,
@@ -391,82 +391,139 @@ async fn verify_attempt_failure_semantics(
             "-c".to_owned(),
             "mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; sleep 60".to_owned(),
         ],
-        diagnostics: Default::default(),
+        diagnostics: DiagnosticsRequest {
+            execution_log: ExecutionLogMode::Full,
+        },
         workspace: None,
         execution_binding: None,
     };
     let attempt = TaskAttemptId("00000000-0000-4000-8000-000000000002".to_owned());
-    // Exercise the pinned transport and a real running command, not a fabricated
-    // marker. A cancellation without acknowledgement must not claim retirement.
-    let observe_cancellation = async {
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            match runtime.observe_task(&attempt, &task).await {
-                Ok(SandboxTaskObservation::Running { .. }) => break,
-                Ok(SandboxTaskObservation::Absent | SandboxTaskObservation::Accepted { .. }) => {}
-                other => {
-                    return Err(format!(
-                        "expected a live attempt before cancellation: {other:?}"
-                    ));
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err("attempt never became observable as running".to_owned());
-            }
-            sleep(Duration::from_secs(1)).await;
-        }
-        let cancelled = runtime
-            .cancel_task(&attempt, &task)
-            .await
-            .map_err(|error| format!("cancel observation failed: {error:?}"))?;
-        if !matches!(cancelled, SandboxTaskObservation::OutcomeUnknown { .. }) {
-            return Err(format!(
-                "unacknowledged cancellation claimed retirement: {cancelled:?}"
-            ));
-        }
-        Ok::<(), String>(())
-    };
-    let (started, cancelled) = tokio::join!(
-        runtime.start_task(&attempt, &task, input_archive),
-        observe_cancellation,
-    );
-    cancelled?;
-    if !matches!(started, Ok(SandboxTaskObservation::Succeeded { .. })) {
+    let started = runtime
+        .start_task(&attempt, &task, input_archive)
+        .await
+        .map_err(|error| format!("detached cancellation task failed to start: {error:?}"))?;
+    if !matches!(
+        started,
+        SandboxTaskObservation::Accepted { .. }
+            | SandboxTaskObservation::Running { .. }
+            | SandboxTaskObservation::RunningWithTranscript { .. }
+    ) {
         return Err(format!(
-            "uncertain cancellation lost eventual terminal evidence: {started:?}"
+            "detached cancellation task was not live after launch: {started:?}"
         ));
     }
+    let cancelled = runtime
+        .cancel_task(&attempt, &task)
+        .await
+        .map_err(|error| format!("attempt-scoped cancellation failed: {error:?}"))?;
+    if !matches!(cancelled, SandboxTaskObservation::OutcomeUnknown { .. }) {
+        return Err(format!(
+            "attempt-scoped cancellation did not terminalize the process group: {cancelled:?}"
+        ));
+    }
+    sleep(Duration::from_secs(2)).await;
+    if !matches!(
+        runtime.observe_task(&attempt, &task).await,
+        Ok(SandboxTaskObservation::OutcomeUnknown { .. })
+    ) {
+        return Err("cancelled process group became live again".to_owned());
+    }
 
-    let orphan = TaskAttemptId("00000000-0000-4000-8000-000000000003".to_owned());
-    // Kill only this attempt's wrapper inside the run-owned sandbox. Its child
-    // may survive: expiration is evidence of uncertainty, never process absence.
-    task.command[2] = format!(
-        "exec </dev/null >/dev/null 2>&1; kill -KILL \"$(cat /sandbox/.steward-attempts/{}/pid)\"; sleep 40",
-        orphan.0
-    );
-    let _start_observation = runtime.start_task(&orphan, &task, input_archive).await;
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let oversized_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000003".to_owned());
+    let oversized_task = SandboxTaskRequest {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "yes x | head -c {}; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"",
+                MAX_EXECUTION_STREAM_BYTES + 1
+            ),
+        ],
+        ..task.clone()
+    };
+    let mut oversized = runtime
+        .start_task(&oversized_attempt, &oversized_task, input_archive)
+        .await
+        .map_err(|error| format!("oversized transcript task failed to start: {error:?}"))?;
+    let oversized_deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        match runtime.observe_task(&orphan, &task).await {
-            Ok(SandboxTaskObservation::OutcomeUnknown { .. }) => break,
-            Ok(SandboxTaskObservation::Running { .. }) => {}
+        match oversized {
+            SandboxTaskObservation::Accepted { .. }
+            | SandboxTaskObservation::Running { .. }
+            | SandboxTaskObservation::RunningWithTranscript { .. } => {}
+            SandboxTaskObservation::FailedWithTranscript {
+                reason, transcript, ..
+            } => {
+                if reason != "Task execution transcript exceeded its bounded archive contract" {
+                    return Err(format!(
+                        "oversized transcript had unsafe reason: {reason:?}"
+                    ));
+                }
+                if transcript.stdout.len()
+                    != usize::try_from(MAX_EXECUTION_STREAM_BYTES)
+                        .map_err(|_| "execution stream bound does not fit usize".to_owned())?
+                    || !transcript
+                        .stdout
+                        .starts_with(b"[... execution output truncated ...]\n")
+                    || !transcript.stderr.is_empty()
+                {
+                    return Err(
+                        "oversized transcript was not returned as a bounded tail".to_owned()
+                    );
+                }
+                break;
+            }
             other => {
                 return Err(format!(
-                    "orphaned wrapper produced false terminal evidence: {other:?}"
+                    "oversized transcript did not terminalize as a bounded failure: {other:?}"
                 ));
             }
         }
-        if Instant::now() >= deadline {
-            return Err("orphaned running marker remained live indefinitely".to_owned());
+        if Instant::now() >= oversized_deadline {
+            return Err("oversized transcript did not terminalize within 120 seconds".to_owned());
         }
         sleep(Duration::from_secs(1)).await;
+        oversized = runtime
+            .observe_task(&oversized_attempt, &oversized_task)
+            .await
+            .map_err(|error| format!("oversized transcript observation failed: {error:?}"))?;
     }
-    let retry = runtime
-        .start_task(&orphan, &task, input_archive)
+
+    let launch_failure_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000004".to_owned());
+    let launch_failure_task = SandboxTaskRequest {
+        command: Vec::new(),
+        ..task.clone()
+    };
+    if runtime
+        .start_task(&launch_failure_attempt, &launch_failure_task, input_archive)
         .await
-        .map_err(|error| format!("orphan observation retry failed: {error:?}"))?;
-    if !matches!(retry, SandboxTaskObservation::OutcomeUnknown { .. }) {
-        return Err(format!("an orphaned attempt was restarted: {retry:?}"));
+        .is_ok()
+    {
+        return Err("a detached wrapper syntax failure was reported as accepted".to_owned());
+    }
+
+    let synchronous_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000005".to_owned());
+    let synchronous_task = SandboxTaskRequest {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; printf sync > \"$STEWARD_OUTPUT_DIR/out/result.txt\""
+                .to_owned(),
+        ],
+        diagnostics: DiagnosticsRequest {
+            execution_log: ExecutionLogMode::Off,
+        },
+        ..task
+    };
+    if !matches!(
+        runtime
+            .start_task(&synchronous_attempt, &synchronous_task, input_archive)
+            .await,
+        Ok(SandboxTaskObservation::Succeeded { .. })
+    ) {
+        return Err(
+            "executionLog=off did not retain synchronous terminal start behavior".to_owned(),
+        );
     }
     Ok(())
 }
@@ -512,7 +569,7 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
         "an invalid Kubernetes RuntimeClass contract must fail closed"
     );
 
-    let runtime = OpenShellRuntime::connect(config)
+    let runtime = OpenShellRuntime::connect(config.clone())
         .await
         .map_err(|error| format!("authenticated OpenShell connection failed: {error:?}"))?;
     let mut request = SandboxRequest {
@@ -544,41 +601,75 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
     let (caller_archive, expected_payload) = make_input_archive(&run_dir)?;
     let (input_archive, workspace) = make_workspace_archive(&run_dir, &caller_archive)?;
     let attempt_id = TaskAttemptId("00000000-0000-4000-8000-000000000001".to_owned());
-    let task_result = runtime
-        .start_task(
-            &attempt_id,
-            &SandboxTaskRequest {
-                runtime: request.runtime.clone(),
-                refs,
-                execution_class: SandboxExecutionClass::Agent,
-                agent_type: request.agent_type.clone(),
-                command: vec![
-                    "/bin/sh".to_owned(),
-                    "-c".to_owned(),
-                    "set -eu; repository=/sandbox/workspace/source; test \"$(git -C \"$repository\" log --format=%s -2)\" = 'second revision\nfirst revision'; git -C \"$repository\" blame --porcelain tracked.txt | grep -Fq 'summary first revision'; test -z \"$(git -C \"$repository\" remote)\"; ! git -C \"$repository\" push >/dev/null 2>&1; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"; printf task-stdout; printf task-stderr >&2".to_owned(),
-                ],
-                diagnostics: DiagnosticsRequest {
-                    execution_log: ExecutionLogMode::Full,
-                },
-                workspace: Some(workspace),
-                execution_binding: None,
-            },
-            &input_archive,
-        )
-        .await
-        .map_err(|error| format!("adapter task round trip failed: {error:?}"))
-        .and_then(|observation| match observation {
-            SandboxTaskObservation::SucceededWithTranscript {
-                output,
-                transcript,
-                ..
-            } if transcript.stdout == b"task-stdout" && transcript.stderr == b"task-stderr" => {
-                output_payload(&run_dir, &output.archive)
+    let task = SandboxTaskRequest {
+        runtime: request.runtime.clone(),
+        refs,
+        execution_class: SandboxExecutionClass::Agent,
+        agent_type: request.agent_type.clone(),
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "set -eu; repository=/sandbox/workspace/source; test \"$(git -C \"$repository\" log --format=%s -2)\" = 'second revision\nfirst revision'; git -C \"$repository\" blame --porcelain tracked.txt | grep -Fq 'summary first revision'; test -z \"$(git -C \"$repository\" remote)\"; ! git -C \"$repository\" push >/dev/null 2>&1; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; printf task-; printf task- >&2; sleep 5; printf stdout; printf stderr >&2; sleep 5; cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"".to_owned(),
+        ],
+        diagnostics: DiagnosticsRequest {
+            execution_log: ExecutionLogMode::Full,
+        },
+        workspace: Some(workspace),
+        execution_binding: None,
+    };
+    let task_result = async {
+        let mut observation = runtime
+            .start_task(&attempt_id, &task, &input_archive)
+            .await
+            .map_err(|error| format!("adapter task round trip failed: {error:?}"))?;
+        let observing_runtime = OpenShellRuntime::connect(config.clone())
+            .await
+            .map_err(|error| format!("adapter reconnect during task failed: {error:?}"))?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut last_live_transcript: Option<(Vec<u8>, Vec<u8>)> = None;
+        let mut live_transcript_grew = false;
+        loop {
+            match observation {
+                SandboxTaskObservation::Accepted { .. } | SandboxTaskObservation::Running { .. } => {}
+                SandboxTaskObservation::RunningWithTranscript { transcript, .. } => {
+                    if let Some((previous_stdout, previous_stderr)) = &last_live_transcript {
+                        if transcript.stdout.starts_with(previous_stdout)
+                            && transcript.stderr.starts_with(previous_stderr)
+                            && (transcript.stdout.len() > previous_stdout.len()
+                                || transcript.stderr.len() > previous_stderr.len())
+                        {
+                            live_transcript_grew = true;
+                        }
+                    }
+                    last_live_transcript = Some((transcript.stdout, transcript.stderr));
+                }
+                SandboxTaskObservation::SucceededWithTranscript {
+                    output,
+                    transcript,
+                    ..
+                } if transcript.stdout == b"task-stdout"
+                    && transcript.stderr == b"task-stderr"
+                    && live_transcript_grew =>
+                {
+                    break output_payload(&run_dir, &output.archive);
+                }
+                other => {
+                    break Err(format!(
+                        "adapter task round trip did not grow a live transcript before retaining its terminal transcript: {other:?}"
+                    ));
+                }
             }
-            other => Err(format!(
-                "adapter task round trip did not retain its terminal transcript: {other:?}"
-            )),
-        });
+            if Instant::now() >= deadline {
+                break Err("adapter task round trip did not finish within 120 seconds".to_owned());
+            }
+            sleep(Duration::from_secs(1)).await;
+            observation = observing_runtime
+                .observe_task(&attempt_id, &task)
+                .await
+                .map_err(|error| format!("adapter task observation failed: {error:?}"))?;
+        }
+    }
+    .await;
 
     let failure_semantics = if task_result.is_ok() {
         verify_attempt_failure_semantics(&runtime, &request, &caller_archive).await

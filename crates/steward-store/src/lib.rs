@@ -4743,10 +4743,12 @@ impl PgStore {
         let mut statement = QueryBuilder::<Postgres>::new("SELECT ");
         statement.push(match stream {
             AgentRunLogStream::Stdout => {
-                "COALESCE(attempts.execution_stdout, attempts.live_execution_stdout) AS content"
+                "COALESCE(attempts.execution_stdout, attempts.live_execution_stdout) AS content, \
+                 attempts.execution_stdout IS NOT NULL AS terminal_content"
             }
             AgentRunLogStream::Stderr => {
-                "COALESCE(attempts.execution_stderr, attempts.live_execution_stderr) AS content"
+                "COALESCE(attempts.execution_stderr, attempts.live_execution_stderr) AS content, \
+                 attempts.execution_stderr IS NOT NULL AS terminal_content"
             }
         });
         statement.push(
@@ -4787,7 +4789,9 @@ impl PgStore {
                             steward_types::TaskPhase::Succeeded
                                 | steward_types::TaskPhase::Failed
                                 | steward_types::TaskPhase::Cancelled
-                        ),
+                        ) && row
+                            .try_get::<bool, _>("terminal_content")
+                            .map_err(database_error)?,
                     })
                 })
                 .transpose()
@@ -9219,7 +9223,7 @@ impl PgStore {
                 execution_stdout,
                 execution_stderr,
             } => {
-                sqlx::query(
+                let updated = sqlx::query(
                     "UPDATE task_execution_attempts \
                      SET state = 'running', generation = generation + 1, \
                          adapter_observation_id = $3, \
@@ -9228,7 +9232,11 @@ impl PgStore {
                          started_at = COALESCE(started_at, now()), \
                          retry_at = NULL, last_error_code = NULL, updated_at = now() \
                      WHERE attempt_id = $1 AND generation = $2 \
-                       AND state IN ('start_pending', 'running')",
+                       AND state IN ('start_pending', 'running') \
+                       AND (state <> 'running' \
+                         OR adapter_observation_id IS DISTINCT FROM $3 \
+                         OR ($4 IS NOT NULL AND live_execution_stdout IS DISTINCT FROM $4) \
+                         OR ($5 IS NOT NULL AND live_execution_stderr IS DISTINCT FROM $5))",
                 )
                 .bind(attempt_id)
                 .bind(expected_generation)
@@ -9237,7 +9245,12 @@ impl PgStore {
                 .bind(execution_stderr)
                 .execute(&mut *transaction)
                 .await
-                .map_err(database_error)?;
+                .map_err(database_error)?
+                .rows_affected();
+                if updated == 0 {
+                    transaction.commit().await.map_err(database_error)?;
+                    return Ok(TaskExecutionTransition::AlreadyApplied(current));
+                }
                 sqlx::query(
                     "UPDATE task_submissions SET phase = 'running', updated_at = now() \
                      WHERE task_uid = $1 AND phase = 'queued' AND NOT finalize_requested \

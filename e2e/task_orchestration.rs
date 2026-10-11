@@ -1393,8 +1393,12 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
                         stderr: b"successful".to_vec(),
                     },
                 },
-                2 => SandboxTaskObservation::Running {
+                2 => SandboxTaskObservation::RunningWithTranscript {
                     adapter_observation_id: attempt_id.0.clone(),
+                    transcript: SandboxTaskTranscript {
+                        stdout: b"successful".to_vec(),
+                        stderr: b"successful".to_vec(),
+                    },
                 },
                 3 => SandboxTaskObservation::RunningWithTranscript {
                     adapter_observation_id: attempt_id.0.clone(),
@@ -3800,21 +3804,35 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         .ok_or_else(|| io::Error::other("first live execution transcript is absent"))?;
     assert_eq!(first_live_log.content, b"successful");
     assert!(!first_live_log.complete);
+    let first_live_generation = store
+        .task_execution_attempt(successful_task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("live execution attempt is absent"))?
+        .generation;
 
     reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
-    let preserved_live_log = store
+    let repeated_live_log = store
         .agent_run_execution_log(
             successful_task_uid,
             Some(identity.user_id.as_str()),
             AgentRunLogStream::Stdout,
         )
         .await?
-        .ok_or_else(|| io::Error::other("preserved live execution transcript is absent"))?;
+        .ok_or_else(|| io::Error::other("repeated live execution transcript is absent"))?;
     assert_eq!(
-        preserved_live_log.content, first_live_log.content,
-        "an observation without a transcript must not erase the last live snapshot"
+        repeated_live_log.content, first_live_log.content,
+        "an identical live transcript must retain the same snapshot"
     );
-    assert!(!preserved_live_log.complete);
+    assert!(!repeated_live_log.complete);
+    assert_eq!(
+        store
+            .task_execution_attempt(successful_task_uid)
+            .await?
+            .ok_or_else(|| io::Error::other("repeated live execution attempt is absent"))?
+            .generation,
+        first_live_generation,
+        "an unchanged transcript must not rewrite the attempt or advance its generation"
+    );
 
     reconcile_current(&client, &task_runtime, &store, successful_task_uid).await?;
     let grown_live_log = store
