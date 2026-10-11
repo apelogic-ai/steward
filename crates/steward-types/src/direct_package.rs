@@ -629,12 +629,16 @@ pub struct BrowserTaskEvidence {
     #[serde(default)]
     pub diagnostics: DiagnosticsRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
     pub requested_diagnostics: Option<DiagnosticsRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
     pub requested_requirements: Option<DirectRequirements>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
     pub effective_requirements: Option<DirectRequirements>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(ignore)]
     pub requested_workspace: Vec<WorkspaceEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceEvidence>,
@@ -1466,6 +1470,7 @@ pub struct AuthorityRequirements {
     pub tools: Vec<ToolRequirement>,
     pub budget: BudgetRequirement,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
     pub runtime_minutes_limit: Option<Decimal>,
     pub ttl: Duration,
     pub runner: RunnerRequirement,
@@ -1778,12 +1783,15 @@ pub struct DirectTaskBindingEvidence {
     pub closure_digest: ContentDigest,
     pub envelope: EnvelopeEvidence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
     pub requested_requirements: Option<DirectRequirements>,
     pub effective_requirements: DirectRequirements,
     pub diagnostics: DiagnosticsRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(ignore)]
     pub requested_diagnostics: Option<DiagnosticsRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(ignore)]
     pub requested_workspace: Vec<WorkspaceEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceEvidence>,
