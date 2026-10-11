@@ -15,7 +15,7 @@ describe("envelope run history", () => {
   test("uses the approved request copy and explicit units", () => {
     expect(source).toContain("Pick an existing template and adjust it, or create your own envelope request.");
     expect(source).toContain("Limit per run");
-    expect(source).toContain("Limit {template.ceiling.spec.runtimeMinutesLimit} minutes");
+    expect(source).toContain("`${template.ceiling.spec.runtimeMinutesLimit} minutes`");
     expect(source).toContain("Workflow rendering is unavailable. Try again.");
     expect(source).not.toContain("authoritative workflow service");
   });
@@ -44,6 +44,7 @@ describe("envelope request review summary", () => {
     expect(templateRequestReviewSummary({
       budget: "150.00",
       models: new Set(["provider-a\u0000model-a"]),
+      singleRunLimit: "11.00",
       runtimeMinutes: "90",
       template,
       tools: new Set(),
@@ -51,6 +52,7 @@ describe("envelope request review summary", () => {
     })).toEqual({
       exceedances: [
         { ceiling: "50.00 USD", label: "Monthly limit", requested: "150.00 USD" },
+        { ceiling: "5.00 USD", label: "Limit per run", requested: "11.00 USD" },
         { ceiling: "30 minutes", label: "Runtime minutes", requested: "90 minutes" },
         { ceiling: "30m", label: "Time to live", requested: "2h" },
       ],
@@ -62,6 +64,7 @@ describe("envelope request review summary", () => {
     expect(templateRequestReviewSummary({
       budget: "150.00",
       models: new Set(["provider-a\u0000model-a"]),
+      singleRunLimit: "5.00",
       runtimeMinutes: "30",
       template,
       tools: new Set(),
@@ -76,6 +79,19 @@ describe("envelope request review summary", () => {
     expect(templateRequestReviewSummary({
       budget: "40.00",
       models: new Set(["provider-a\u0000model-a"]),
+      singleRunLimit: "2.50",
+      runtimeMinutes: "20",
+      template,
+      tools: new Set(),
+      ttl: "20m",
+    })).toEqual({ exceedances: [], requiresApproval: false });
+  });
+
+  test("uses the requested per-run limit for automatic approval", () => {
+    expect(templateRequestReviewSummary({
+      budget: "25.00",
+      models: new Set(["provider-a\u0000model-a"]),
+      singleRunLimit: "4.00",
       runtimeMinutes: "20",
       template,
       tools: new Set(),

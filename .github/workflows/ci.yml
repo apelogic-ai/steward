@@ -2,6 +2,11 @@ name: ci
 
 on:
   pull_request:
+  # Merge queue groups run the same gates as pull requests. The group is
+  # checked out at github.sha on a gh-readonly-queue/main/... branch.
+  merge_group:
+    types:
+      - checks_requested
   push:
     branches:
       - main
@@ -49,7 +54,12 @@ jobs:
 
       - name: Run the release validation entrypoint
         env:
-          STEWARD_MIGRATION_BASE: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.sha }}
+          # Pull requests compare against the PR base, merge queue groups
+          # against the group's parent commit, and pushes against the previous
+          # tip. Without the merge-group term the base would fall through to
+          # github.sha and the append-only migration check would compare the
+          # group against itself.
+          STEWARD_MIGRATION_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.sha }}
         run: cargo xtask ci
 
       - name: Build governed Connections test artifacts
