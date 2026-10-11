@@ -122,6 +122,7 @@ fn ci() -> TaskResult {
     quality_after_tool_checks()?;
     run("bash", &["scripts/test-core-install-chart.sh"])?;
     run("bash", &["scripts/test-ci-change-class.sh"])?;
+    run("bash", &["scripts/test-validate-release-artifacts.sh"])?;
     conformance(&["--pinned".to_owned()])
 }
 
@@ -3619,6 +3620,67 @@ mod tests {
                 "          bash scripts/test-validate-release-version.sh\n",
                 "          exit 0\n          bash scripts/test-validate-release-version.sh\n".to_owned(),
             ),
+            // The release lane's image scope. The first seven narrow or
+            // drop a check for a class that needs it; the rest loosen a
+            // step the contract pins.
+            (
+                "web image scope forced for the full class",
+                "        run: scripts/validate-release-artifacts.sh --build-images\n",
+                "        run: scripts/validate-release-artifacts.sh --build-images --scope web\n"
+                    .to_owned(),
+            ),
+            (
+                "full image scope skipped for the full class",
+                "      - name: Render the chart and build all component images\n        if: needs.changes.outputs.class != 'web'\n",
+                "      - name: Render the chart and build all component images\n        if: needs.changes.outputs.class == 'web'\n"
+                    .to_owned(),
+            ),
+            (
+                "web image built for no class the lane runs",
+                "      - name: Render the chart and build the web image\n        if: needs.changes.outputs.class == 'web'\n",
+                "      - name: Render the chart and build the web image\n        if: needs.changes.outputs.class == 'docs'\n"
+                    .to_owned(),
+            ),
+            (
+                "web image scan skipped for the web class",
+                "      - name: Enforce critical web image policy\n",
+                "      - name: Enforce critical web image policy\n        if: needs.changes.outputs.class != 'web'\n"
+                    .to_owned(),
+            ),
+            (
+                "Rust image scan skipped for every class",
+                "      - name: Enforce critical mint image policy\n        if: needs.changes.outputs.class != 'web'\n",
+                "      - name: Enforce critical mint image policy\n        if: false\n".to_owned(),
+            ),
+            (
+                "clean-cluster install skipped for the full class",
+                "      - name: Install release-candidate artifacts in a clean cluster\n        if: needs.changes.outputs.class != 'web'\n",
+                "      - name: Install release-candidate artifacts in a clean cluster\n        if: needs.changes.outputs.class == 'docs'\n"
+                    .to_owned(),
+            ),
+            (
+                "condition on a release step that runs for both scopes",
+                "      - name: Enforce critical chart policy\n",
+                "      - name: Enforce critical chart policy\n        if: needs.changes.outputs.class != 'web'\n"
+                    .to_owned(),
+            ),
+            (
+                "web image scope made non-fatal",
+                "        run: scripts/validate-release-artifacts.sh --build-images --scope web\n",
+                "        run: scripts/validate-release-artifacts.sh --build-images --scope web || true\n"
+                    .to_owned(),
+            ),
+            (
+                "continue-on-error on the web image scope",
+                "      - name: Render the chart and build the web image\n",
+                "      - name: Render the chart and build the web image\n        continue-on-error: true\n"
+                    .to_owned(),
+            ),
+            (
+                "web image scan pointed at another image",
+                "          image-ref: steward-web:release-validation\n",
+                "          image-ref: steward-web:latest\n".to_owned(),
+            ),
         ];
 
         for (name, original, replacement) in edits {
@@ -3675,15 +3737,30 @@ mod tests {
         }
 
         // A lane that feeds the aggregate must report its real outcome and
-        // run every step: no `continue-on-error`, and no conditional step.
-        fn require_blocking(job: &Value, context: &str) -> Result<(), String> {
+        // run every step: no `continue-on-error`, and no conditional step
+        // other than the scope conditions the caller models.
+        fn require_blocking(
+            job: &Value,
+            context: &str,
+            scope_conditions: &[&str],
+        ) -> Result<(), String> {
             if job.get("continue-on-error").is_some() {
                 return Err(format!("{context} must not set continue-on-error"));
             }
             for (index, step) in steps(job, context)?.iter().enumerate() {
-                for forbidden in ["continue-on-error", "if"] {
-                    if step.get(forbidden).is_some() {
-                        return Err(format!("{context} step {index} must not set `{forbidden}`"));
+                if step.get("continue-on-error").is_some() {
+                    return Err(format!(
+                        "{context} step {index} must not set `continue-on-error`"
+                    ));
+                }
+                match step.get("if") {
+                    None => {}
+                    Some(Value::String(condition))
+                        if scope_conditions.contains(&condition.as_str()) => {}
+                    Some(_) => {
+                        return Err(format!(
+                            "{context} step {index} must not set `if` to anything but a modelled scope condition"
+                        ));
                     }
                 }
             }
@@ -3806,7 +3883,7 @@ mod tests {
                 "the change classifier must not set `{forbidden}`"
             );
         }
-        require_blocking(changes, "the change classifier")?;
+        require_blocking(changes, "the change classifier", &[])?;
         assert_eq!(
             changes.pointer("/outputs/class").and_then(Value::as_str),
             Some("${{ steps.classify.outputs.class }}"),
@@ -3877,6 +3954,11 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" || ")
         };
+        // The two step conditions the release lane may carry. The full
+        // scope is "every class except web", so a class this contract does
+        // not know still gets every check.
+        let full_scope = "needs.changes.outputs.class != 'web'";
+        let web_scope = "needs.changes.outputs.class == 'web'";
         for (lane, running) in &lanes {
             let lane_job = job(lane)?;
             let context = format!("CI job {lane}");
@@ -3884,7 +3966,13 @@ mod tests {
                 needs(lane_job, &context)?.contains("changes"),
                 "{lane} must wait for the change classifier"
             );
-            require_blocking(lane_job, &context)?;
+            // Only the release lane has steps that depend on the class.
+            let scope_conditions: &[&str] = if *lane == "release-candidate" {
+                &[full_scope, web_scope]
+            } else {
+                &[]
+            };
+            require_blocking(lane_job, &context, scope_conditions)?;
             let condition = squeeze(text(lane_job, "if", &context)?);
             let expected = if *lane == "release-candidate" {
                 // `full` still waits for a green quality gate. `web` skips
@@ -3912,6 +4000,153 @@ mod tests {
             BTreeSet::from(["changes".to_owned(), "quality".to_owned()]),
             "the release-candidate lane must wait for the quality gate"
         );
+
+        // The release lane narrows its image scope for the `web` class and
+        // for nothing else. The scopes are the table in the release
+        // validation script; every step, command, and condition is pinned
+        // here, so a scan or an install cannot be dropped or made
+        // conditional without changing this test.
+        let release_validation =
+            fs::read_to_string(root().join("scripts/validate-release-artifacts.sh"))
+                .map_err(|error| format!("release artifact validation is required: {error}"))?;
+        let image_table = release_validation
+            .split_once("\nIMAGE_STEPS='\n")
+            .and_then(|(_before, after)| after.split_once("\n'\n"))
+            .map(|(table, _after)| table)
+            .ok_or_else(|| "the release image step table could not be isolated".to_owned())?;
+        let mut web_scope_steps = Vec::new();
+        // Each image the lane builds, and whether the web scope builds it.
+        let mut images = Vec::new();
+        for row in image_table.lines() {
+            let columns = row.split_whitespace().collect::<Vec<_>>();
+            let [step, in_full, in_web] = columns.as_slice() else {
+                return Err(format!("malformed image step table row: {row}"));
+            };
+            assert_eq!(
+                *in_full, "run",
+                "the full scope must run every image step, including {step}"
+            );
+            let in_web = match *in_web {
+                "run" => true,
+                "skip" => false,
+                _ => return Err(format!("malformed image step table row: {row}")),
+            };
+            if in_web {
+                web_scope_steps.push(*step);
+            }
+            if let Some(image) = step.strip_prefix("image:") {
+                images.push((image, in_web));
+            }
+        }
+        assert_eq!(
+            web_scope_steps,
+            ["image:web", "smoke:web"],
+            "the web scope must build and smoke-test the web image, and only that image"
+        );
+        let release = job("release-candidate")?;
+        for forbidden in ["env", "container", "services", "strategy"] {
+            assert!(
+                release.get(forbidden).is_none(),
+                "the release-candidate lane must not set `{forbidden}`"
+            );
+        }
+        let trivy = "aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8";
+        let mut expected_release_steps = vec![
+            serde_json::json!({
+                "name": "Check out repository",
+                "uses": checkout,
+                "with": { "persist-credentials": false },
+            }),
+            serde_json::json!({
+                "name": "Install Helm",
+                "uses": "./.github/actions/setup-tools",
+                "with": { "kubernetes-tools": "true", "workflow-tools": "true" },
+            }),
+            serde_json::json!({
+                "name": "Lint privileged workflows and release scripts",
+                "run": "cargo xtask workflow-lint",
+            }),
+            serde_json::json!({
+                "name": "Lint exact core and complete source-chart profiles",
+                "run": "bash scripts/customer-core-install-e2e.sh --lint-source-chart charts/steward",
+            }),
+            serde_json::json!({
+                "name": "Render the chart and build all component images",
+                "if": full_scope,
+                "run": "scripts/validate-release-artifacts.sh --build-images",
+            }),
+            serde_json::json!({
+                "name": "Render the chart and build the web image",
+                "if": web_scope,
+                "run": "scripts/validate-release-artifacts.sh --build-images --scope web",
+            }),
+            serde_json::json!({
+                "name": "Prepare chart vulnerability scan",
+                "run": "set -euo pipefail\n\
+                        version=\"$(awk '$1 == \"version:\" { print $2; exit }' charts/steward/Chart.yaml)\"\n\
+                        mkdir -p target/release-candidate/chart\n\
+                        helm package charts/steward --destination target/release-candidate \\\n  \
+                        --version \"$version\" --app-version \"$version\"\n\
+                        tar -xzf \"target/release-candidate/steward-$version.tgz\" \\\n  \
+                        -C target/release-candidate/chart\n",
+            }),
+            // Runs no Steward image and reads no repository file a `web`
+            // change set can touch.
+            serde_json::json!({
+                "name": "Verify Gateway API backend TLS with Envoy Gateway",
+                "if": full_scope,
+                "run": "scripts/steward-gateway-backend-tls-e2e.sh",
+            }),
+        ];
+        // Every image a scope builds is scanned in that scope, under the
+        // same policy, and no scan refers to an image the scope did not
+        // build.
+        for (image, in_web) in &images {
+            let label = match *image {
+                "bridge" => "connections bridge",
+                other => other,
+            };
+            let mut scan = serde_json::json!({
+                "name": format!("Enforce critical {label} image policy"),
+                "uses": trivy,
+                "with": {
+                    "image-ref": format!("steward-{image}:release-validation"),
+                    "format": "table",
+                    "exit-code": "1",
+                    "severity": "CRITICAL",
+                },
+            });
+            if !in_web {
+                scan["if"] = Value::from(full_scope);
+            }
+            expected_release_steps.push(scan);
+        }
+        expected_release_steps.extend([
+            serde_json::json!({
+                "name": "Enforce critical chart policy",
+                "uses": trivy,
+                "with": {
+                    "scan-type": "fs",
+                    "scan-ref": "target/release-candidate/chart",
+                    "format": "table",
+                    "exit-code": "1",
+                    "severity": "CRITICAL",
+                },
+            }),
+            // Needs every Rust image, and installs the core profile, which
+            // does not deploy the web image.
+            serde_json::json!({
+                "name": "Install release-candidate artifacts in a clean cluster",
+                "if": full_scope,
+                "run": "bash scripts/release-candidate-acceptance.sh",
+            }),
+        ]);
+        assert_eq!(
+            steps(release, "release-candidate")?,
+            &expected_release_steps,
+            "the release-candidate lane must run exactly these steps under exactly these scopes"
+        );
+
         let nightly = job("latest-nightly")?;
         assert_eq!(
             squeeze(text(nightly, "if", "latest-nightly")?),
@@ -3959,7 +4194,7 @@ mod tests {
             "always()",
             "the pinned aggregate must report for every run"
         );
-        require_blocking(pinned, "pinned")?;
+        require_blocking(pinned, "pinned", &[])?;
         for forbidden in ["env", "container", "services", "strategy"] {
             assert!(
                 pinned.get(forbidden).is_none(),
@@ -4036,6 +4271,11 @@ mod tests {
         assert!(
             xtask_source.contains("run(\"bash\", &[\"scripts/test-ci-change-class.sh\"])?;"),
             "cargo xtask ci must run the change classifier tests"
+        );
+        assert!(
+            xtask_source
+                .contains("run(\"bash\", &[\"scripts/test-validate-release-artifacts.sh\"])?;"),
+            "cargo xtask ci must run the release validation scope tests"
         );
 
         Ok(())

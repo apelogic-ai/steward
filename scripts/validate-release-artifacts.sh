@@ -1,5 +1,111 @@
 #!/usr/bin/env bash
+# Validates the release chart and, on request, the component images.
+#
+#   validate-release-artifacts.sh
+#       the release-helper tests and every chart check; builds nothing
+#   validate-release-artifacts.sh --build-images [--scope full|web]
+#       the same checks, then builds and smoke-tests the images in the scope
+#   validate-release-artifacts.sh [--build-images [--scope full|web]] --plan
+#       prints what that invocation covers, one step per line, and exits
+#       without running anything
+#
+# Scopes
+#
+# `full` is the default and builds and smoke-tests every component image.
+#
+# `web` is for a change set that touches only the browser presentation
+# (`web/` and `tests/browser/`, plus documentation). It builds and
+# smoke-tests the web image exactly as `full` does, and leaves out the images
+# compiled from the Rust workspace, which such a change cannot alter. It
+# leaves out nothing else: the release-helper tests and every chart check
+# run in both scopes.
+#
+# The table below is the single definition of both scopes: the plan and the
+# run iterate the same rows. Every `web` step is also a `full` step;
+# scripts/test-validate-release-artifacts.sh holds that invariant and checks
+# that every row has an implementation, and the workflow contract test in
+# xtask requires CI to scan exactly the images each scope builds.
 set -euo pipefail
+
+# What `--build-images` does in each scope, in execution order. `image:` rows
+# build `steward-<name>:release-validation`; `smoke:` rows run a built image.
+#
+# step             full  web
+IMAGE_STEPS='
+image:apiserver    run   skip
+image:controller   run   skip
+image:mint         run   skip
+image:bridge       run   skip
+image:web          run   run
+smoke:web          run   run
+smoke:bridge       run   skip
+smoke:mint         run   skip
+'
+
+usage() {
+  echo "usage: $0 [--build-images [--scope full|web]] [--plan]" >&2
+  exit 2
+}
+
+# Prints the image steps the scope runs, one per line, in execution order.
+image_steps() {
+  local scope="$1" step in_full in_web expected
+  while read -r step in_full in_web; do
+    [[ -n "${step}" ]] || continue
+    case "${scope}" in
+      full) expected="${in_full}" ;;
+      web) expected="${in_web}" ;;
+      *) echo "unknown image scope: ${scope}" >&2; exit 1 ;;
+    esac
+    case "${expected}" in
+      run) echo "${step}" ;;
+      skip) ;;
+      *) echo "image step table is malformed for ${step}" >&2; exit 1 ;;
+    esac
+  done <<<"${IMAGE_STEPS}"
+}
+
+build_images=0
+image_scope=full
+scope_given=0
+plan_only=0
+while (($# > 0)); do
+  case "$1" in
+    --build-images) build_images=1 ;;
+    --scope)
+      (($# >= 2 && scope_given == 0)) || usage
+      image_scope="$2"
+      scope_given=1
+      shift
+      ;;
+    --plan) plan_only=1 ;;
+    *) usage ;;
+  esac
+  shift
+done
+if ((scope_given == 1 && build_images == 0)); then
+  # A scope selects images, so it means nothing without a build.
+  usage
+fi
+case "${image_scope}" in
+  full|web) ;;
+  *) usage ;;
+esac
+planned_image_steps=""
+if ((build_images == 1)); then
+  planned_image_steps="$(image_steps "${image_scope}")"
+fi
+
+if ((plan_only == 1)); then
+  # The checks every invocation runs, whatever the scope.
+  echo checks:release-helper-tests
+  echo checks:chart
+  if [[ -n "${planned_image_steps}" ]]; then
+    echo "${planned_image_steps}"
+  fi
+  echo checks:release-workflow
+  exit 0
+fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bash "${root}/scripts/customer-core-install-e2e.sh" \
@@ -1363,22 +1469,31 @@ if grep -q '^kind: Ingress$' "${rendered}"; then
   exit 1
 fi
 
-if [[ "${1:-}" == "--build-images" ]]; then
-  for component in apiserver controller mint; do
-    docker build \
-      --file "${root}/build/package.Dockerfile" \
-      --build-arg "BINARY=steward-${component}-bin" \
-      --tag "steward-${component}:release-validation" \
-      "${root}"
-  done
+# The image steps. Each function is one row of IMAGE_STEPS, and both scopes
+# run the same function for a row they share.
+build_packaged_image() {
+  docker build \
+    --file "${root}/build/package.Dockerfile" \
+    --build-arg "BINARY=steward-$1-bin" \
+    --tag "steward-$1:release-validation" \
+    "${root}"
+}
+
+build_bridge_image() {
   docker build \
     --file "${root}/build/connections-bridge.Dockerfile" \
     --tag "steward-bridge:release-validation" \
     "${root}"
+}
+
+build_web_image() {
   docker build \
     --file "${root}/build/web.Dockerfile" \
     --tag "steward-web:release-validation" \
     "${root}"
+}
+
+smoke_web_image() {
   web_container_id="$(
     docker run --rm --detach \
       --read-only \
@@ -1418,6 +1533,9 @@ if [[ "${1:-}" == "--build-images" ]]; then
   fi
   docker stop --time 5 "${web_container_id}" >/dev/null
   web_container_id=""
+}
+
+smoke_bridge_image() {
   docker run --rm --entrypoint /bin/sh steward-bridge:release-validation -ceu '
     command -v tar >/dev/null
     command -v ip >/dev/null
@@ -1428,6 +1546,9 @@ if [[ "${1:-}" == "--build-images" ]]; then
     : >/sandbox/release-validation
     rm /sandbox/release-validation
   '
+}
+
+smoke_mint_image() {
   cat > "${mint_synthetic_kubeconfig}" <<'EOF'
 apiVersion: v1
 kind: Config
@@ -1462,10 +1583,24 @@ EOF
     exit 1
   fi
   grep -Fq 'OpenShell identity discovery failed' "${mint_startup_output}"
-elif [[ -n "${1:-}" ]]; then
-  echo "usage: $0 [--build-images]" >&2
-  exit 2
-fi
+}
+
+for image_step in ${planned_image_steps}; do
+  case "${image_step}" in
+    image:apiserver|image:controller|image:mint)
+      build_packaged_image "${image_step#image:}"
+      ;;
+    image:bridge) build_bridge_image ;;
+    image:web) build_web_image ;;
+    smoke:web) smoke_web_image ;;
+    smoke:bridge) smoke_bridge_image ;;
+    smoke:mint) smoke_mint_image ;;
+    *)
+      echo "image step has no implementation: ${image_step}" >&2
+      exit 1
+      ;;
+  esac
+done
 
 release_workflow="${root}/.github/workflows/release.yml"
 if [[ "$(grep -Fc 'for component in apiserver controller mint bridge web; do' "${release_workflow}")" -ne 2 ]]; then
