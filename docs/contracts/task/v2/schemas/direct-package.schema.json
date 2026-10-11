@@ -325,6 +325,7 @@
         "llms": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/modelRequirement" } },
         "tools": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/toolRequirement" } },
         "budget": { "$ref": "#/$defs/budgetRequirement" },
+        "runtimeMinutesLimit": { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$" },
         "ttl": { "type": "string", "pattern": "^[1-9][0-9]*(?:s|m|h)$" },
         "runner": { "$ref": "#/$defs/runnerRequirement" }
       },
@@ -727,8 +728,15 @@
         "closure": { "$ref": "#/$defs/packageClosure" },
         "closureDigest": { "$ref": "#/$defs/stewardDigest" },
         "envelope": { "$ref": "#/$defs/envelopeEvidence" },
+        "requestedRequirements": { "$ref": "#/$defs/directRequirements" },
         "effectiveRequirements": { "$ref": "#/$defs/directRequirements" },
+        "requestedDiagnostics": { "$ref": "#/$defs/diagnostics" },
         "diagnostics": { "$ref": "#/$defs/diagnostics" },
+        "requestedWorkspace": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/workspaceEntry" }
+        },
         "workspace": { "$ref": "#/$defs/workspaceEvidence" },
         "promptSource": { "enum": ["path", "inline"], "default": "path" }
       },

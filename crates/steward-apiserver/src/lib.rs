@@ -14569,7 +14569,7 @@ mod tests {
             app,
             "direct-workspace-tree-over-cap",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "workspace_limit_exceeded",
+            "workspace materialized file count 2 exceeds the effective ceiling 1",
         )
         .await
     }
@@ -14606,7 +14606,7 @@ mod tests {
             app,
             "direct-workspace-envelope-type",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "workspace_entry_type_not_allowed",
+            "workspace type git is not allowed; effective choices: none",
         )
         .await
     }
@@ -14651,7 +14651,7 @@ mod tests {
             app,
             "direct-workspace-envelope-cap",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "workspace_limit_exceeded",
+            "history depth 5 exceeds the effective ceiling 4",
         )
         .await
     }
@@ -14821,7 +14821,7 @@ mod tests {
             app,
             "direct-over-authority",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "exceed the resolved Envelope",
+            "envelope exceeded: budget.monthlyLimit requested 50.00 USD, ceiling 25.00 USD",
         )
         .await
     }
