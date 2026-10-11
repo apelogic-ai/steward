@@ -47,11 +47,11 @@ After, preserving the omitted immutable execution and provider-profile fields ex
 5. Wait until every old apiserver and controller pod is gone, then resume submission and
    publication. This prevents an old controller from claiming a newly admitted v2-bound Task.
 
-The `models.providers` field changes each binding's content-bound digest. Once any Task has been
-created with a v2 binding snapshot, downgrade to a binary that understands only v1 bindings is not
-supported. Before the first such Task exists, restore the previous binaries and exact v1 catalog
-together while submission remains paused. Do not run a mixed controller fleet while v2-bound Tasks
-are claimable.
+The `models.providers` field changes each binding's content-bound digest. Once the new version has
+created any Task, downgrade is not supported: the previous binary cannot read either the v2 binding
+or the additive evidence fields. Before the first such Task exists, restore the previous binaries
+and exact v1 catalog together while submission remains paused. Do not run a mixed controller fleet
+while v2-bound Tasks are claimable.
 
 ## Installations without an explicit catalog
 

@@ -63,9 +63,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   every provider in `capabilityCatalog.models`. Pause Task submission until
   every apiserver and controller is on the new version so an older controller cannot claim a Task
   with a v2 binding snapshot. Persisted v1 bindings on already-admitted Tasks remain readable by
-  the new version. Once any Task has been created with a v2 binding snapshot, downgrade is not
-  supported because previous binaries cannot read it. Before that point, restore the previous
-  binaries and exact v1 catalog together while submission remains paused. See the
+  the new version. Once the new version has created any Task, downgrade is not supported because
+  previous binaries cannot read its v2 binding and additive evidence fields. Before that point,
+  restore the previous binaries and exact v1 catalog together while submission remains paused. See the
   [execution-binding upgrade procedure](docs/installation/upgrade-execution-bindings.md).
 - Migration 0070 is append-only and records every generated template revision
   with actor `system:migration`; retain it on rollback. List the affected

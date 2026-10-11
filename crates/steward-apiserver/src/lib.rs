@@ -12819,51 +12819,73 @@ mod tests {
         let origin = "http://127.0.0.1:33001";
         let (auth, session_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::User).await?;
-        let response = browser_task_router(ledger.clone(), task_api_config()?, auth)
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/app/api/v1/runs")
-                    .header(header::COOKIE, session_cookie)
-                    .header(header::ORIGIN, origin)
-                    .header("sec-fetch-site", "same-origin")
-                    .header("x-steward-csrf", csrf)
-                    .header("idempotency-key", "browser-registry-1")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "package": {
-                                "source": "steward:registry/repository-review",
-                                "revision": "steward:version:1",
-                                "path": "task-definition.json"
-                            },
-                            "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64)),
-                            "inputs": {}
-                        })
-                        .to_string(),
-                    ))
-                    .map_err(|error| format!("build browser registry request: {error}"))?,
-            )
+        let app = browser_task_router(ledger.clone(), task_api_config()?, auth);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/runs")
+                .header(header::COOKIE, &session_cookie)
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", &csrf)
+                .header("idempotency-key", "browser-registry-1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "package": {
+                            "source": "steward:registry/repository-review",
+                            "revision": "steward:version:1",
+                            "path": "task-definition.json"
+                        },
+                        "envelopeDigest": format!("steward:sha256:{}", "b".repeat(64)),
+                        "inputs": {}
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build browser registry request: {error}"))
+        };
+        let response = app
+            .clone()
+            .oneshot(request()?)
             .await
             .map_err(|error| format!("submit browser registry request: {error}"))?;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let tasks = ledger
-            .tasks
-            .lock()
-            .map_err(|_| "fake Task ledger lock was poisoned")?;
-        let task = tasks
-            .first()
-            .ok_or_else(|| "registry alias did not reserve a Task".to_owned())?;
-        assert_eq!(task.workflow, "repository-review@1");
-        assert_eq!(task.task_origin, TaskOrigin::Browser);
-        assert_eq!(task.workflow_version, Some(1));
+        {
+            let mut tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            let task = tasks
+                .first_mut()
+                .ok_or_else(|| "registry alias did not reserve a Task".to_owned())?;
+            assert_eq!(task.workflow, "repository-review@1");
+            assert_eq!(task.task_origin, TaskOrigin::Browser);
+            assert_eq!(task.workflow_version, Some(1));
+            let evidence = task
+                .browser_task_evidence
+                .as_mut()
+                .ok_or_else(|| "registry alias omitted browser evidence".to_owned())?;
+            assert_eq!(evidence.revision, "steward:version:1");
+            evidence.requested_revision = None;
+        }
+
+        let retry = app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("retry browser registry request: {error}"))?;
         assert_eq!(
-            task.browser_task_evidence
-                .as_ref()
-                .map(|evidence| evidence.revision.as_str()),
-            Some("steward:version:1")
+            retry.status(),
+            StatusCode::ACCEPTED,
+            "a v0.3.15 registry evidence row must retain its idempotent retry"
         );
-        assert!(task.execute_requested);
+        assert_eq!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?
+                .len(),
+            1
+        );
         Ok(())
     }
 
@@ -13487,6 +13509,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_package_rejects_an_agent_model_mismatch_as_permanent_user_input()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        enable_inline_for_versioned_task_fixture(&ledger, true)?;
+        let mut incompatible_catalog: serde_json::Value =
+            serde_json::from_str(&execution_binding_catalog())
+                .map_err(|error| format!("parse execution binding fixture: {error}"))?;
+        incompatible_catalog["bindings"][0]["models"]["providers"] =
+            serde_json::json!(["anthropic"]);
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let response = browser_task_router(
+            ledger.clone(),
+            task_api_config()?
+                .with_execution_bindings_json(Some(&incompatible_catalog.to_string()))?,
+            auth,
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/runs")
+                .header(header::COOKIE, session_cookie)
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", csrf)
+                .header("idempotency-key", "browser-incompatible-model")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(inline_browser_task_body().to_string()))
+                .map_err(|error| format!("build browser model-mismatch request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("submit browser model-mismatch request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read browser model-mismatch response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("decode browser model-mismatch response: {error}"))?,
+            serde_json::json!({
+                "error": "This coding agent does not support the selected model. Choose a model from anthropic or another agent."
+            })
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?
+                .is_empty(),
+            "an incompatible browser agent/model selection must fail before Task reservation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn browser_idempotency_recovers_incomplete_submission_and_rejects_changed_content()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
@@ -13546,6 +13624,21 @@ mod tests {
                 .ok_or_else(|| "initial browser Task omitted its evidence".to_owned())?;
             *evidence = browser_evidence_v0_3_15(evidence)?;
         }
+        let authority_before_retry = {
+            let tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            let task = tasks
+                .first()
+                .ok_or_else(|| "initial browser Task was not reserved".to_owned())?;
+            (
+                task.user_envelope_instance_id.clone(),
+                task.user_envelope_revision,
+                task.user_envelope_digest.clone(),
+                task.user_envelope_snapshot.clone(),
+            )
+        };
 
         let mut incompatible_catalog: serde_json::Value =
             serde_json::from_str(&execution_binding_catalog())
@@ -13573,6 +13666,16 @@ mod tests {
             assert_eq!(tasks.len(), 1);
             assert!(tasks[0].input_archive.is_some());
             assert!(tasks[0].execute_requested);
+            assert_eq!(
+                (
+                    tasks[0].user_envelope_instance_id.clone(),
+                    tasks[0].user_envelope_revision,
+                    tasks[0].user_envelope_digest.clone(),
+                    tasks[0].user_envelope_snapshot.clone(),
+                ),
+                authority_before_retry,
+                "an idempotent retry must not replace the Task's immutable Envelope evidence"
+            );
         }
 
         let mut changed_envelope = inline_browser_task_body();

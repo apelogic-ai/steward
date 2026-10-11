@@ -60,9 +60,12 @@ The Task record captures:
 - exact package pin, closure, and closure digest; and
 - the existing runtime plan and execution binding.
 
-An idempotency retry recomputes and compares that evidence. It can finish input upload
-or execution-request persistence after an interrupted submission, but changed package
-bytes, a moved Git ref, changed inputs, or changed authority returns a conflict.
+An idempotency retry compares the request with the stored evidence before consulting the
+current catalog or reading Git. It can finish input upload or execution-request persistence after
+an interrupted submission, but changed package identity, inputs, or authority returns a conflict.
+Current repository evidence stores both the requested ref and its resolved commit. Historical
+rows that predate that field store only the resolved commit, so their retry must use that exact
+`git:sha1:` revision; a mutable ref cannot be proven equal and returns a conflict.
 
 ## Outputs
 

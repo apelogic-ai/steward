@@ -5565,27 +5565,48 @@ fn direct_task_evidence_matches(
     resolved: &DirectTaskBindingEvidence,
 ) -> bool {
     let mut comparable = resolved.clone();
-    if stored.requested_requirements.is_none() {
-        comparable.requested_requirements = None;
-    }
-    if stored.requested_diagnostics.is_none() {
-        comparable.requested_diagnostics = None;
-    }
-    if stored.requested_workspace.is_empty() {
-        comparable.requested_workspace.clear();
-    }
-    if stored
-        .effective_requirements
-        .authority
-        .runtime_minutes_limit
-        .is_none()
-    {
-        comparable
+    align_with_historical_default(
+        &stored.requested_requirements,
+        &mut comparable.requested_requirements,
+    );
+    align_with_historical_default(
+        &stored.requested_diagnostics,
+        &mut comparable.requested_diagnostics,
+    );
+    align_with_historical_default(
+        &stored.requested_workspace,
+        &mut comparable.requested_workspace,
+    );
+    align_with_historical_default(
+        &stored
             .effective_requirements
             .authority
-            .runtime_minutes_limit = None;
+            .runtime_minutes_limit,
+        &mut comparable
+            .effective_requirements
+            .authority
+            .runtime_minutes_limit,
+    );
+    if let (Some(stored_workspace), Some(comparable_workspace)) =
+        (stored.workspace.as_ref(), comparable.workspace.as_mut())
+    {
+        align_with_historical_default(
+            &stored_workspace.max_history_depth,
+            &mut comparable_workspace.max_history_depth,
+        );
     }
     stored == &comparable
+}
+
+/// Evidence grows only by serde-defaulted fields. A field absent from a historical stored row is
+/// not part of that row's immutable idempotency identity; a present stored value remains exact.
+fn align_with_historical_default<T>(stored: &T, comparable: &mut T)
+where
+    T: Default + PartialEq,
+{
+    if stored == &T::default() {
+        *comparable = T::default();
+    }
 }
 
 fn validate_browser_task_retry_request(
@@ -5641,17 +5662,33 @@ fn browser_task_evidence_matches(
     resolved: &BrowserTaskEvidence,
 ) -> bool {
     let mut comparable = resolved.clone();
-    if stored.requested_diagnostics.is_none() {
-        comparable.requested_diagnostics = None;
-    }
-    if stored.requested_requirements.is_none() {
-        comparable.requested_requirements = None;
-    }
-    if stored.effective_requirements.is_none() {
-        comparable.effective_requirements = None;
-    }
-    if stored.requested_workspace.is_empty() {
-        comparable.requested_workspace.clear();
+    align_with_historical_default(
+        &stored.requested_revision,
+        &mut comparable.requested_revision,
+    );
+    align_with_historical_default(
+        &stored.requested_diagnostics,
+        &mut comparable.requested_diagnostics,
+    );
+    align_with_historical_default(
+        &stored.requested_requirements,
+        &mut comparable.requested_requirements,
+    );
+    align_with_historical_default(
+        &stored.effective_requirements,
+        &mut comparable.effective_requirements,
+    );
+    align_with_historical_default(
+        &stored.requested_workspace,
+        &mut comparable.requested_workspace,
+    );
+    if let (Some(stored_workspace), Some(comparable_workspace)) =
+        (stored.workspace.as_ref(), comparable.workspace.as_mut())
+    {
+        align_with_historical_default(
+            &stored_workspace.max_history_depth,
+            &mut comparable_workspace.max_history_depth,
+        );
     }
     stored == &comparable
 }
@@ -6750,14 +6787,14 @@ mod workflow_request_tests {
         TaskSubmissionRequest, WorkspaceAdmissionPolicy, WorkspaceGitPackLimits,
         WorkspaceResolutionBudget, append_workspace_git_pack, browser_input_retry_matches,
         browser_inputs_archive, browser_inputs_from_archive, browser_rerun_submission,
-        browser_workspace_trigger_commit, default_workspace_name, direct_authority_spec,
-        direct_effective_requirements, direct_requirements_for_task, format_workspace_bytes,
-        prepare_task_input_archive, resolve_scratch_workspace_entry, resolve_versioned_task_plan,
-        source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
-        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
-        workspace_admission_policy, workspace_git_materialized_budget,
-        workspace_submodule_is_selected, workspace_submodule_repository_url,
-        workspace_tree_inventory,
+        browser_task_evidence_matches, browser_workspace_trigger_commit, default_workspace_name,
+        direct_authority_spec, direct_effective_requirements, direct_requirements_for_task,
+        direct_task_evidence_matches, format_workspace_bytes, prepare_task_input_archive,
+        resolve_scratch_workspace_entry, resolve_versioned_task_plan, source_port_error,
+        source_port_error_with_reporter, stable_task_runtime_name, task_orchestration_reservation,
+        validate_workspace_policy, versioned_workflow_reference, workspace_admission_policy,
+        workspace_git_materialized_budget, workspace_submodule_is_selected,
+        workspace_submodule_repository_url, workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -6771,8 +6808,9 @@ mod workflow_request_tests {
     };
     use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
     use steward_types::direct_package::{
-        DirectTaskDefinition, ExactGitCommit, RepositoryUrl, StableProviderId, WorkspaceAuthority,
-        WorkspaceEntry, WorkspaceEntryType, WorkspaceEvidence, WorkspacePath,
+        BrowserTaskEvidence, DirectTaskBindingEvidence, DirectTaskDefinition, ExactGitCommit,
+        RepositoryUrl, StableProviderId, WorkspaceAuthority, WorkspaceEntry, WorkspaceEntryType,
+        WorkspaceEvidence, WorkspacePath,
     };
     use steward_types::{
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
@@ -7812,6 +7850,104 @@ mod workflow_request_tests {
         assert!(browser_input_retry_matches(&first, b"caller"));
         assert!(browser_input_retry_matches(&second, b"caller"));
         assert!(!browser_input_retry_matches(&first, b"changed-caller"));
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_retries_tolerate_each_field_absent_from_v0_3_15_rows() -> Result<(), String> {
+        fn remove_path(value: &mut serde_json::Value, path: &[&str]) -> Result<(), String> {
+            let (field, parents) = path
+                .split_last()
+                .ok_or_else(|| "evidence field path is empty".to_owned())?;
+            let mut parent = value;
+            for segment in parents {
+                parent = parent
+                    .get_mut(*segment)
+                    .ok_or_else(|| format!("evidence fixture omitted {segment}"))?;
+            }
+            parent
+                .as_object_mut()
+                .ok_or_else(|| format!("evidence parent for {field} is not an object"))?
+                .remove(*field)
+                .ok_or_else(|| format!("evidence fixture omitted {field}"))?;
+            Ok(())
+        }
+
+        let mut direct_value: serde_json::Value = serde_json::from_str(include_str!(
+            "../testdata/direct-task-evidence-v0.3.15.json"
+        ))
+        .map_err(|error| error.to_string())?;
+        direct_value["requestedRequirements"] = direct_value["effectiveRequirements"].clone();
+        direct_value["requestedDiagnostics"] = direct_value["diagnostics"].clone();
+        direct_value["requestedWorkspace"] = serde_json::json!([{
+            "scratch": { "name": "scratch", "size": "2Gi" }
+        }]);
+        direct_value["effectiveRequirements"]["authority"]["runtimeMinutesLimit"] =
+            serde_json::json!("30");
+        direct_value["workspace"] = serde_json::json!({
+            "entries": [{
+                "type": "scratch",
+                "name": "scratch",
+                "size": "2Gi",
+                "contentDigest": format!("steward:sha256:{}", "a".repeat(64))
+            }],
+            "maxMaterializedBytes": 2147483648_u64,
+            "maxHistoryDepth": 20,
+            "workspaceDigest": format!("steward:sha256:{}", "b".repeat(64))
+        });
+        let current_direct: DirectTaskBindingEvidence =
+            serde_json::from_value(direct_value.clone()).map_err(|error| error.to_string())?;
+        for path in [
+            &["requestedRequirements"][..],
+            &["requestedDiagnostics"][..],
+            &["requestedWorkspace"][..],
+            &["effectiveRequirements", "authority", "runtimeMinutesLimit"][..],
+            &["workspace", "maxHistoryDepth"][..],
+        ] {
+            let mut stored = direct_value.clone();
+            remove_path(&mut stored, path)?;
+            let stored: DirectTaskBindingEvidence =
+                serde_json::from_value(stored).map_err(|error| error.to_string())?;
+            assert!(
+                direct_task_evidence_matches(&stored, &current_direct),
+                "direct retry rejected a v0.3.15 row without {}",
+                path.join(".")
+            );
+        }
+
+        let browser_value = serde_json::json!({
+            "source": "steward:registry/repository-review",
+            "revision": "steward:version:1",
+            "requestedRevision": "steward:version:1",
+            "path": "task-definition.json",
+            "closureDigest": format!("steward:sha256:{}", "c".repeat(64)),
+            "diagnostics": { "executionLog": "full" },
+            "requestedDiagnostics": { "executionLog": "full" },
+            "requestedRequirements": direct_value["effectiveRequirements"].clone(),
+            "effectiveRequirements": direct_value["effectiveRequirements"].clone(),
+            "requestedWorkspace": direct_value["requestedWorkspace"].clone(),
+            "workspace": direct_value["workspace"].clone()
+        });
+        let current_browser: BrowserTaskEvidence =
+            serde_json::from_value(browser_value.clone()).map_err(|error| error.to_string())?;
+        for path in [
+            &["requestedRevision"][..],
+            &["requestedRequirements"][..],
+            &["requestedDiagnostics"][..],
+            &["requestedWorkspace"][..],
+            &["effectiveRequirements"][..],
+            &["workspace", "maxHistoryDepth"][..],
+        ] {
+            let mut stored = browser_value.clone();
+            remove_path(&mut stored, path)?;
+            let stored: BrowserTaskEvidence =
+                serde_json::from_value(stored).map_err(|error| error.to_string())?;
+            assert!(
+                browser_task_evidence_matches(&stored, &current_browser),
+                "browser retry rejected a v0.3.15 row without {}",
+                path.join(".")
+            );
+        }
         Ok(())
     }
 
