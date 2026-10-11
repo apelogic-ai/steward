@@ -388,6 +388,7 @@ async fn verify_attempt_failure_semantics(
         refs: sandbox.refs.clone(),
         execution_class: SandboxExecutionClass::Agent,
         agent_type: sandbox.agent_type.clone(),
+        models: sandbox.models.clone(),
         command: vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
@@ -662,6 +663,7 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
         refs,
         execution_class: SandboxExecutionClass::Agent,
         agent_type: request.agent_type.clone(),
+        models: request.models.clone(),
         command: vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),

@@ -663,12 +663,23 @@ fn request_uses_managed_inference(request: &SandboxTaskRequest) -> bool {
 }
 
 #[cfg(feature = "runtime")]
-fn request_model_providers(request: &SandboxTaskRequest) -> &[String] {
-    request
+fn request_model_providers(request: &SandboxTaskRequest) -> Vec<String> {
+    if let Some(providers) = request
         .execution_binding
         .as_ref()
         .and_then(|binding| binding.models.as_ref())
-        .map_or(&[], |models| models.providers.as_slice())
+        .map(|models| &models.providers)
+    {
+        return providers.clone();
+    }
+    let mut providers = request
+        .models
+        .iter()
+        .map(|model| model.provider.clone())
+        .collect::<Vec<_>>();
+    providers.sort();
+    providers.dedup();
+    providers
 }
 
 #[cfg(feature = "runtime")]
@@ -2643,6 +2654,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         }
         let execution_error = match executed {
             Ok(executed) => {
+                let model_providers = request_model_providers(request);
                 return self
                     .observe_task(attempt_id, request)
                     .await
@@ -2651,7 +2663,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                             observation,
                             &executed.stderr,
                             request_uses_managed_inference(request),
-                            request_model_providers(request),
+                            &model_providers,
                         )
                     });
             }
@@ -2779,6 +2791,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 })
             }
             "failed" => {
+                let model_providers = request_model_providers(request);
                 let reason = if payload == b"transcript_too_large" {
                     format!(
                         "The execution log exceeded the {} MiB limit per stream.",
@@ -2794,7 +2807,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                             task_failure_category(
                                 &transcript.stderr,
                                 request_uses_managed_inference(request),
-                                request_model_providers(request),
+                                &model_providers,
                             )
                             .to_owned()
                         },
@@ -3329,13 +3342,13 @@ mod tests {
     #[cfg(feature = "runtime")]
     use steward_ports::{
         PortError, SandboxExecutionClass, SandboxRequest, SandboxTaskObservation,
-        SandboxTaskOutput, SandboxTaskTranscript, TaskAttemptId,
+        SandboxTaskOutput, SandboxTaskRequest, SandboxTaskTranscript, TaskAttemptId,
     };
     #[cfg(feature = "runtime")]
     use steward_types::direct_package::{
-        ContentDigest, ExactGitCommit, ExecutionLogMode, RepositoryUrl, ResolvedWorkspaceEntry,
-        ResolvedWorkspaceSubmodule, ResourceQuantity, StableProviderId, WorkspaceAccess,
-        WorkspaceEvidence, WorkspaceGitHistory, WorkspaceName, WorkspacePath,
+        ContentDigest, DiagnosticsRequest, ExactGitCommit, ExecutionLogMode, RepositoryUrl,
+        ResolvedWorkspaceEntry, ResolvedWorkspaceSubmodule, ResourceQuantity, StableProviderId,
+        WorkspaceAccess, WorkspaceEvidence, WorkspaceGitHistory, WorkspaceName, WorkspacePath,
         WorkspaceSubmoduleStatus, canonical_json_bytes,
     };
     #[cfg(feature = "runtime")]
@@ -3356,10 +3369,11 @@ mod tests {
         WorkloadExchangeTokenProvider, attach_task_agent_failure_category,
         collect_task_process_stream, delete_owned_sandbox, deletion_names, load_source_credential,
         output_archive_command, project_request, provider_reconciliation,
-        provider_reconciliation_plan, provider_reconciliation_targets, sandbox_spec,
-        sanitized_provider_control_transcript, staging_append_command, staging_archive_chunks,
-        staging_extract_command, staging_prepare_command, task_agent_failure_category,
-        task_attempt_cancel_command, task_attempt_detached_launch_command, task_attempt_directory,
+        provider_reconciliation_plan, provider_reconciliation_targets, request_model_providers,
+        sandbox_spec, sanitized_provider_control_transcript, staging_append_command,
+        staging_archive_chunks, staging_extract_command, staging_prepare_command,
+        task_agent_failure_category, task_attempt_cancel_command,
+        task_attempt_detached_launch_command, task_attempt_directory,
         task_attempt_execution_command, task_attempt_observation_command,
         task_attempt_transcript_stream_command, task_failure_category, task_process_launch_mode,
         task_process_log_record, task_transcript_requested, validate_raw_sandbox_binding,
@@ -5611,6 +5625,56 @@ mod tests {
             ),
             "bridge-gateway-http",
             "specific connection failures must win over inference-shaped text"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn historical_binding_uses_the_admitted_model_provider_for_failure_classification() {
+        let request = SandboxTaskRequest {
+            runtime: RuntimeId("runtime-uid-a".to_owned()),
+            refs: RuntimeRefs::default(),
+            execution_class: SandboxExecutionClass::Agent,
+            agent_type: AgentType {
+                name: "example-agent@1.0.0".to_owned(),
+            },
+            models: vec![ModelRef {
+                provider: "example-provider".to_owned(),
+                model: "model-x".to_owned(),
+            }],
+            command: Vec::new(),
+            diagnostics: DiagnosticsRequest::default(),
+            workspace: None,
+            execution_binding: Some(DisposableExecutionBinding {
+                schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+                binding_id: format!("sha256:{}", "a".repeat(64)),
+                binding_digest: format!("sha256:{}", "a".repeat(64)),
+                agent_ref: "example-agent@1.0.0".to_owned(),
+                display_name: Some("Example Agent".to_owned()),
+                adapter: "codex-v1".to_owned(),
+                image: format!(
+                    "registry.example.test/agents/example@sha256:{}",
+                    "b".repeat(64)
+                ),
+                executable: "/opt/example/bin/agent".to_owned(),
+                version_probe: ExecutionVersionProbe {
+                    arguments: vec!["--version".to_owned()],
+                    expected_stdout: "example-agent 1.0.0".to_owned(),
+                },
+                models: None,
+                provider_profiles: ExecutionProviderProfiles::default(),
+            }),
+        };
+
+        let model_providers = request_model_providers(&request);
+        assert_eq!(model_providers, ["example-provider"]);
+        assert_eq!(
+            task_failure_category(
+                b"example-provider error: incorrect api key provided",
+                true,
+                &model_providers,
+            ),
+            "inference_key_rejected"
         );
     }
 

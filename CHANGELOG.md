@@ -55,6 +55,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Upgrade and rollback
 
+- Existing active execution-binding catalogs must move from
+  `steward.execution-bindings/v1` to `steward.execution-bindings/v2` in the same
+  rollout as these binaries. Add `models.providers` to every binding before changing
+  `apiVersion`; the new parser and Helm schema reject v1 catalogs. Pause Task submission until
+  every apiserver and controller is on the new version so an older controller cannot claim a Task
+  with a v2 binding snapshot. Persisted v1 bindings on already-admitted Tasks remain readable by
+  the new version. To roll back, pause submission, drain and finalize every Task admitted with a
+  v2 binding, then restore the previous binaries and exact v1 catalog together. Previous binaries
+  cannot read v2 binding snapshots, while new binaries cannot start with a v1 catalog. See the
+  [execution-binding upgrade procedure](docs/installation/upgrade-execution-bindings.md).
 - Migration 0070 is append-only and records every generated template revision
   with actor `system:migration`; retain it on rollback. List the affected
   template IDs and successor revisions with

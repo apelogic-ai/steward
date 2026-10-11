@@ -2501,6 +2501,7 @@ fn sandbox_task_request(
         refs,
         execution_class,
         agent_type: task.runtime_spec.agent_type.clone(),
+        models: task.runtime_spec.llms.clone(),
         command: task.agent_command.clone(),
         diagnostics,
         workspace: sandbox_task_workspace(
