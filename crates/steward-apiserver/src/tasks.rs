@@ -27,8 +27,9 @@ use steward_admission::{
 };
 use steward_ports::{
     GitFile, GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
-    GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree, GitTreeRequest,
-    MAX_TASK_INPUT_ARCHIVE_BYTES, TaskExecutionAdapter, TaskExecutionPlanRequest,
+    GitRepositoryDescriptionFailure, GitRepositoryIdentity, GitRepositoryReference,
+    GitRevisionRequest, GitTree, GitTreeRequest, MAX_TASK_INPUT_ARCHIVE_BYTES,
+    TaskExecutionAdapter, TaskExecutionPlanRequest,
 };
 use steward_store::{
     EnvelopeRequestRecord, FederatedSubjectObservation, FederatedSubjectRecord,
@@ -187,6 +188,11 @@ pub(crate) type DescribedRepositories<'a> = std::pin::Pin<
 trait DirectGitResolver: Send + Sync {
     fn repository_web_origin(&self) -> Option<String>;
 
+    fn classify_repository_description_failure(
+        &self,
+        error: &steward_ports::PortError,
+    ) -> GitRepositoryDescriptionFailure;
+
     fn describe_repositories<'a>(
         &'a self,
         repositories: &'a [GitRepositoryReference],
@@ -338,6 +344,13 @@ where
 {
     fn repository_web_origin(&self) -> Option<String> {
         GitHostingPlane::repository_web_origin(self)
+    }
+
+    fn classify_repository_description_failure(
+        &self,
+        error: &steward_ports::PortError,
+    ) -> GitRepositoryDescriptionFailure {
+        GitHostingPlane::classify_repository_description_failure(self, error)
     }
 
     fn describe_repositories<'a>(
@@ -5519,6 +5532,7 @@ fn git_reference(reference: &str) -> Result<String, ApiError> {
 
 struct NamedWorkspaceRepositoryCatalog {
     repositories: Vec<(GitRepositoryIdentity, GitRepositoryDescription)>,
+    had_transient_failure: bool,
 }
 
 fn validate_named_workspace_repository_origin(
@@ -5569,34 +5583,36 @@ async fn load_named_workspace_repository_catalog(
     budget.consume_repository_descriptions(references.len())?;
     let mut descriptions = git.describe_repositories(&references);
     let mut repositories = Vec::with_capacity(references.len());
+    let mut had_transient_failure = false;
     while let Some((index, result)) = descriptions.next().await {
         let Some(reference) = references.get(index) else {
             config.report_source_port_failure(
                 "describe_repositories",
                 "failed",
-                "source_metadata_invalid",
+                "source_unavailable",
             );
-            return Err(ApiError::TaskRuntimeContractUnavailable(
-                "Steward could not verify the workspace repository. Retry the request; if it persists, contact a Steward administrator."
-                    .to_owned(),
-            ));
+            had_transient_failure = true;
+            continue;
         };
         let description = match result {
             Ok(description) => description,
-            Err(steward_ports::PortError::Rejected { .. }) => {
-                config.report_source_port_failure(
-                    "describe_repositories",
-                    "rejected",
-                    "source_rejected",
-                );
-                continue;
-            }
             Err(error) => {
-                return Err(source_port_error_with_reporter(
-                    config,
-                    "describe_repositories",
-                    error,
-                ));
+                let (category, diagnostic, transient) =
+                    match git.classify_repository_description_failure(&error) {
+                        GitRepositoryDescriptionFailure::Throttled => ("failed", "throttled", true),
+                        GitRepositoryDescriptionFailure::SourceUnavailable => {
+                            ("failed", "source_unavailable", true)
+                        }
+                        GitRepositoryDescriptionFailure::NotInstalled => {
+                            ("rejected", "not_installed", false)
+                        }
+                        GitRepositoryDescriptionFailure::MetadataInvalid => {
+                            ("rejected", "metadata_invalid", false)
+                        }
+                    };
+                config.report_source_port_failure("describe_repositories", category, diagnostic);
+                had_transient_failure |= transient;
+                continue;
             }
         };
         if description.repository_owner_id != reference.repository_owner_id
@@ -5604,26 +5620,22 @@ async fn load_named_workspace_repository_catalog(
         {
             config.report_source_port_failure(
                 "describe_repositories",
-                "failed",
-                "source_metadata_invalid",
+                "rejected",
+                "metadata_invalid",
             );
-            return Err(ApiError::TaskRuntimeContractUnavailable(
-                "Steward could not verify the workspace repository. Retry the request; if it persists, contact a Steward administrator."
-                    .to_owned(),
-            ));
+            continue;
         }
-        let repository =
-            RepositoryUrl::parse(format!("{}.git", description.web_url)).map_err(|_| {
+        let repository = match RepositoryUrl::parse(format!("{}.git", description.web_url)) {
+            Ok(repository) => repository,
+            Err(_) => {
                 config.report_source_port_failure(
                     "describe_repositories",
-                    "failed",
-                    "source_metadata_invalid",
+                    "rejected",
+                    "metadata_invalid",
                 );
-                ApiError::TaskRuntimeContractUnavailable(
-                    "Steward could not verify the workspace repository. Retry the request; if it persists, contact a Steward administrator."
-                        .to_owned(),
-                )
-            })?;
+                continue;
+            }
+        };
         repositories.push((
             GitRepositoryIdentity {
                 repository,
@@ -5633,7 +5645,10 @@ async fn load_named_workspace_repository_catalog(
             description,
         ));
     }
-    Ok(NamedWorkspaceRepositoryCatalog { repositories })
+    Ok(NamedWorkspaceRepositoryCatalog {
+        repositories,
+        had_transient_failure,
+    })
 }
 
 fn resolve_named_workspace_repository(
@@ -5650,11 +5665,13 @@ fn resolve_named_workspace_repository(
                 .is_none_or(|url| url.eq_ignore_ascii_case(&description.web_url))
     });
     let Some(matched) = matches.next() else {
-        config.report_source_port_failure(
-            "resolve_named_repository",
-            "rejected",
-            "source_not_bound",
-        );
+        if catalog.had_transient_failure {
+            return Err(ApiError::TaskRuntimeContractUnavailable(
+                "Steward could not verify the workspace repository. Retry the request; if it persists, contact a Steward administrator."
+                    .to_owned(),
+            ));
+        }
+        config.report_source_port_failure("resolve_named_repository", "rejected", "not_bound");
         return Err(ApiError::Admission(
             "The requested workspace repository is unavailable. Ask a Steward administrator to verify that it is allowed and accessible."
                 .to_owned(),
@@ -6266,9 +6283,9 @@ mod workflow_request_tests {
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{Envelope, EnvelopeSpec};
     use steward_ports::{
-        GitFile, GitFileRequest, GitPack, GitPackRequest, GitRepositoryIdentity,
-        GitRepositoryReference, GitRevisionRequest, GitTree, GitTreeEntry, GitTreePath,
-        GitTreeRequest, PortError, TaskExecutionAdapter, TaskExecutionPlan,
+        GitFile, GitFileRequest, GitPack, GitPackRequest, GitRepositoryDescriptionFailure,
+        GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree, GitTreeEntry,
+        GitTreePath, GitTreeRequest, PortError, TaskExecutionAdapter, TaskExecutionPlan,
         TaskExecutionPlanRequest,
     };
     use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
@@ -6333,6 +6350,13 @@ mod workflow_request_tests {
     impl DirectGitResolver for OversizedPackResolver {
         fn repository_web_origin(&self) -> Option<String> {
             None
+        }
+
+        fn classify_repository_description_failure(
+            &self,
+            _error: &PortError,
+        ) -> GitRepositoryDescriptionFailure {
+            GitRepositoryDescriptionFailure::SourceUnavailable
         }
 
         fn describe_repositories<'a>(

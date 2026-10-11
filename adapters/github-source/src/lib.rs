@@ -9,8 +9,9 @@ use reqwest::{Client, Response, StatusCode, redirect::Policy};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use steward_ports::{
     GitFile, GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
-    GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree,
-    GitTreeEntry as PortGitTreeEntry, GitTreePath, GitTreeRequest, PortError,
+    GitRepositoryDescriptionFailure, GitRepositoryIdentity, GitRepositoryReference,
+    GitRevisionRequest, GitTree, GitTreeEntry as PortGitTreeEntry, GitTreePath, GitTreeRequest,
+    PortError,
 };
 use steward_types::direct_package::{
     ExactGitCommit, MAX_PACKAGE_FILE_BYTES, RepositoryUrl, StableProviderId,
@@ -21,6 +22,9 @@ pub const IMPLEMENTED_PORTS: [&str; 1] = ["GitHostingPlane"];
 const API_ORIGIN: &str = "https://api.github.com";
 const CLONE_ORIGIN: &str = "https://github.com";
 const METADATA_RESPONSE_BYTES: u64 = 1024 * 1024;
+const ERROR_RESPONSE_BYTES: u64 = 64 * 1024;
+const THROTTLED_REASON_SUFFIX: &str = " [throttled]";
+const ACCESS_REJECTED_REASON: &str = "GitHub App repository access was rejected";
 const TREE_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_GIT_PACK_BYTES: u64 = 256 * 1024 * 1024;
 const GIT_UPLOAD_PACK_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
@@ -698,6 +702,32 @@ impl GitHostingPlane for GitHubSourceAdapter {
         Some(self.clone_origin.clone())
     }
 
+    fn classify_repository_description_failure(
+        &self,
+        error: &PortError,
+    ) -> GitRepositoryDescriptionFailure {
+        match error {
+            PortError::Failed { reason } if reason.ends_with(THROTTLED_REASON_SUFFIX) => {
+                GitRepositoryDescriptionFailure::Throttled
+            }
+            PortError::Failed { .. }
+            | PortError::Unsupported { .. }
+            | PortError::SandboxFailed
+            | PortError::CredentialGrantFailed => {
+                GitRepositoryDescriptionFailure::SourceUnavailable
+            }
+            PortError::Rejected { reason }
+                if reason == "GitHub App is not installed for the repository owner"
+                    || reason == "GitHub App is not installed on the requested repository"
+                    || reason == ACCESS_REJECTED_REASON =>
+            {
+                GitRepositoryDescriptionFailure::NotInstalled
+            }
+            PortError::Rejected { .. } => GitRepositoryDescriptionFailure::MetadataInvalid,
+            _ => GitRepositoryDescriptionFailure::SourceUnavailable,
+        }
+    }
+
     fn describe_repositories<'a>(
         &'a self,
         repositories: &'a [GitRepositoryReference],
@@ -1262,11 +1292,26 @@ async fn decode_response<T: DeserializeOwned>(
         return Err(rejected("GitHub API redirects are forbidden"));
     }
     if !status.is_success() {
-        if matches!(
-            status,
-            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
-        ) {
-            return Err(failed(operation));
+        let throttled_by_header = response.headers().contains_key("retry-after")
+            || response
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.trim() == "0");
+        if status == StatusCode::TOO_MANY_REQUESTS
+            || (status == StatusCode::FORBIDDEN && throttled_by_header)
+        {
+            return Err(throttled(operation));
+        }
+        if status == StatusCode::FORBIDDEN {
+            let bytes = read_bounded(response, ERROR_RESPONSE_BYTES, operation).await?;
+            if String::from_utf8_lossy(&bytes)
+                .to_ascii_lowercase()
+                .contains("secondary rate limit")
+            {
+                return Err(throttled(operation));
+            }
+            return Err(rejected(ACCESS_REJECTED_REASON));
         }
         if status == StatusCode::NOT_FOUND && matches!(authentication, Authentication::App) {
             return Err(rejected(
@@ -1280,6 +1325,12 @@ async fn decode_response<T: DeserializeOwned>(
     }
     let bytes = read_bounded(response, max_bytes, operation).await?;
     serde_json::from_slice(&bytes).map_err(|_| rejected("GitHub returned malformed JSON"))
+}
+
+fn throttled(operation: &'static str) -> PortError {
+    PortError::Failed {
+        reason: format!("{operation}{THROTTLED_REASON_SUFFIX}"),
+    }
 }
 
 async fn read_bounded(
@@ -1384,14 +1435,17 @@ mod tests {
     use futures::StreamExt as _;
     use serde_json::json;
     use steward_ports::{
-        GitFileRequest, GitHostingPlane, GitRepositoryIdentity, GitRepositoryReference,
-        GitRevisionRequest, GitTreeRequest, PortError,
+        GitFileRequest, GitHostingPlane, GitRepositoryDescriptionFailure, GitRepositoryIdentity,
+        GitRepositoryReference, GitRevisionRequest, GitTreeRequest, PortError,
     };
     use steward_types::direct_package::{
         ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
     };
 
-    use super::{GitHubSourceAdapter, decode_upload_pack_result, encode_upload_pack_request};
+    use super::{
+        ACCESS_REJECTED_REASON, GitHubSourceAdapter, decode_upload_pack_result,
+        encode_upload_pack_request,
+    };
 
     const CLONE_ORIGIN: &str = "https://github.example.test";
     const REPOSITORY: &str = "https://github.example.test/example-org/source-a.git";
@@ -1460,6 +1514,11 @@ mod tests {
                 headers: Vec::new(),
                 body: body.to_owned(),
             }
+        }
+
+        fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+            self.headers.push((name, value));
+            self
         }
 
         fn redirect() -> Self {
@@ -2064,21 +2123,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_throttling_is_retryable() -> Result<(), String> {
-        for status in [403, 429] {
-            let mock = MockGitHub::start(vec![ResponseSpec::status(
-                status,
-                r#"{"message":"rate limited"}"#,
-            )])?;
+    async fn provider_throttling_is_retryable_but_permanent_forbidden_is_not() -> Result<(), String>
+    {
+        for response in [
+            ResponseSpec::status(429, r#"{"message":"rate limited"}"#),
+            ResponseSpec::status(403, r#"{"message":"try later"}"#)
+                .with_header("retry-after", "60"),
+            ResponseSpec::status(403, r#"{"message":"try later"}"#)
+                .with_header("x-ratelimit-remaining", "0"),
+            ResponseSpec::status(
+                403,
+                r#"{"message":"You have exceeded a secondary rate limit."}"#,
+            ),
+        ] {
+            let mock = MockGitHub::start(vec![response])?;
             let result = adapter(&mock)?
                 .resolve_repository(&repository_url(REPOSITORY)?)
                 .await;
             assert!(
-                matches!(result, Err(PortError::Failed { ref reason }) if reason == "resolve GitHub App installation"),
-                "status {status} must be retryable, got {result:?}"
+                matches!(result, Err(PortError::Failed { ref reason }) if reason == "resolve GitHub App installation [throttled]"),
+                "rate-limited response must be retryable, got {result:?}"
             );
             mock.finish()?;
         }
+
+        let mock = MockGitHub::start(vec![ResponseSpec::status(
+            403,
+            r#"{"message":"installation suspended"}"#,
+        )])?;
+        let adapter = adapter(&mock)?;
+        let result = adapter
+            .resolve_repository(&repository_url(REPOSITORY)?)
+            .await;
+        assert!(
+            matches!(result, Err(PortError::Rejected { ref reason }) if reason == ACCESS_REJECTED_REASON),
+            "ordinary forbidden response must remain permanent, got {result:?}"
+        );
+        let error = result.err().ok_or_else(|| "403 must fail".to_owned())?;
+        assert_eq!(
+            adapter.classify_repository_description_failure(&error),
+            GitRepositoryDescriptionFailure::NotInstalled
+        );
+        mock.finish()?;
         Ok(())
     }
 

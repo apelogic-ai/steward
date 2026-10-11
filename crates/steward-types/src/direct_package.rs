@@ -1790,6 +1790,11 @@ impl DirectTaskBindingEvidence {
                 "invocation repository differs from its signed source provenance".to_owned(),
             );
         }
+        if repository_url_origin(&self.invocation.repository)
+            != repository_url_origin(&self.package.repository)
+        {
+            return Err("invocation repository differs from its package source host".to_owned());
+        }
         if self.invocation_kind == InvocationKind::Implicit
             && (self.invocation.repository != self.package.repository
                 || self.invocation.repository_id != self.package.repository_id
@@ -1821,6 +1826,13 @@ impl DirectTaskBindingEvidence {
         }
         Ok(())
     }
+}
+
+fn repository_url_origin(repository: &RepositoryUrl) -> Option<&str> {
+    repository
+        .as_str()
+        .strip_prefix("https://")
+        .and_then(|value| value.split_once('/').map(|(origin, _)| origin))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]

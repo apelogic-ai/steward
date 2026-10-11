@@ -649,6 +649,18 @@ pub struct GitRepositoryDescription {
     pub web_url: String,
 }
 
+/// Provider-neutral reason why one stable repository could not be described.
+///
+/// Core uses this only for bounded diagnostics and retry behavior. Provider-specific
+/// response parsing remains inside the hosting adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitRepositoryDescriptionFailure {
+    Throttled,
+    SourceUnavailable,
+    NotInstalled,
+    MetadataInvalid,
+}
+
 pub trait GitHostingPlane: Send + Sync + 'static {
     /// Canonical HTTPS origin used for human-facing repository links.
     ///
@@ -656,6 +668,21 @@ pub trait GitHostingPlane: Send + Sync + 'static {
     /// reject links for a different hosting plane before resolving any repository.
     fn repository_web_origin(&self) -> Option<String> {
         None
+    }
+
+    fn classify_repository_description_failure(
+        &self,
+        error: &PortError,
+    ) -> GitRepositoryDescriptionFailure {
+        match error {
+            PortError::Rejected { .. } => GitRepositoryDescriptionFailure::MetadataInvalid,
+            PortError::Unsupported { .. }
+            | PortError::Failed { .. }
+            | PortError::SandboxFailed
+            | PortError::CredentialGrantFailed => {
+                GitRepositoryDescriptionFailure::SourceUnavailable
+            }
+        }
     }
 
     /// Resolves display metadata for each stable repository reference.

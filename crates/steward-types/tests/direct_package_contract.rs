@@ -960,6 +960,10 @@ fn binding_evidence_rejects_tampered_source_and_package_relationships() -> Resul
             "/invocation/repository",
             serde_json::json!("https://github.com/example-org/other.git"),
         ),
+        (
+            "/invocation/repository",
+            serde_json::json!("https://attacker.example.test/example-org/caller.git"),
+        ),
         ("/envelope/revision", serde_json::json!(0)),
     ];
 
@@ -985,6 +989,8 @@ fn binding_evidence_accepts_the_server_selected_source_host() -> Result<(), Stri
         .map_err(|error| format!("evidence must serialize: {error}"))?;
     value["invocation"]["repository"] =
         serde_json::json!("https://source.example.test/example-org/caller.git");
+    value["package"]["repository"] =
+        serde_json::json!("https://source.example.test/example-org/agentic-ops.git");
     let evidence: DirectTaskBindingEvidence = serde_json::from_value(value)
         .map_err(|error| format!("alternate-host evidence must parse: {error}"))?;
     evidence.validate()

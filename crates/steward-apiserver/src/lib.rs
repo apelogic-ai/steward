@@ -3839,9 +3839,9 @@ mod tests {
     use steward_ports::{
         DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, GitFile,
         GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
-        GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree, GitTreeEntry,
-        GitTreeRequest, PortError, TaskExecutionAdapter, TaskExecutionPlan,
-        TaskExecutionPlanRequest,
+        GitRepositoryDescriptionFailure, GitRepositoryIdentity, GitRepositoryReference,
+        GitRevisionRequest, GitTree, GitTreeEntry, GitTreeRequest, PortError, TaskExecutionAdapter,
+        TaskExecutionPlan, TaskExecutionPlanRequest,
     };
     use steward_store::{
         AdminApprovalRecord, AdminEnvelopeProvisionRequest, AdminEnvelopeRequestRecord,
@@ -4094,6 +4094,7 @@ mod tests {
     struct FakeDirectGit {
         source_origin: String,
         describe_calls: Arc<AtomicUsize>,
+        description_failures: Arc<BTreeMap<String, PortError>>,
         repositories: Arc<BTreeMap<String, GitRepositoryIdentity>>,
         files: Arc<BTreeMap<(String, String, String), Vec<u8>>>,
         trees: Arc<BTreeMap<(String, String), Vec<GitTreeEntry>>>,
@@ -4107,6 +4108,28 @@ mod tests {
             Some(self.source_origin.clone())
         }
 
+        fn classify_repository_description_failure(
+            &self,
+            error: &PortError,
+        ) -> GitRepositoryDescriptionFailure {
+            match error {
+                PortError::Failed { reason } if reason == "throttled" => {
+                    GitRepositoryDescriptionFailure::Throttled
+                }
+                PortError::Failed { .. }
+                | PortError::Unsupported { .. }
+                | PortError::SandboxFailed
+                | PortError::CredentialGrantFailed => {
+                    GitRepositoryDescriptionFailure::SourceUnavailable
+                }
+                PortError::Rejected { reason } if reason == "not installed" => {
+                    GitRepositoryDescriptionFailure::NotInstalled
+                }
+                PortError::Rejected { .. } => GitRepositoryDescriptionFailure::MetadataInvalid,
+                _ => GitRepositoryDescriptionFailure::SourceUnavailable,
+            }
+        }
+
         fn describe_repositories<'a>(
             &'a self,
             repositories: &'a [GitRepositoryReference],
@@ -4114,6 +4137,12 @@ mod tests {
         {
             self.describe_calls.fetch_add(1, Ordering::SeqCst);
             futures::stream::iter(repositories.iter().enumerate().map(|(index, reference)| {
+                if let Some(error) = self
+                    .description_failures
+                    .get(reference.repository_id.as_str())
+                {
+                    return (index, Err(error.clone()));
+                }
                 let resolved = self
                     .repositories
                     .values()
@@ -4298,6 +4327,7 @@ mod tests {
         Ok(FakeDirectGit {
             source_origin: source_origin.to_owned(),
             describe_calls: Arc::new(AtomicUsize::new(0)),
+            description_failures: Arc::new(BTreeMap::new()),
             repositories: Arc::new(BTreeMap::from([
                 (caller.as_str().to_owned(), caller_identity),
                 (source.as_str().to_owned(), source_identity),
@@ -12191,6 +12221,7 @@ mod tests {
         Ok(FakeDirectGit {
             source_origin: "https://github.com".to_owned(),
             describe_calls: Arc::new(AtomicUsize::new(0)),
+            description_failures: Arc::new(BTreeMap::new()),
             repositories: Arc::new(BTreeMap::from([(
                 source.as_str().to_owned(),
                 source_identity,
@@ -12380,6 +12411,7 @@ mod tests {
         Ok(FakeDirectGit {
             source_origin: "https://github.com".to_owned(),
             describe_calls: Arc::new(AtomicUsize::new(0)),
+            description_failures: Arc::new(BTreeMap::new()),
             repositories: Arc::new(BTreeMap::from([(repository.as_str().to_owned(), identity)])),
             files: Arc::new(files),
             trees: Arc::new(BTreeMap::new()),
@@ -13499,14 +13531,147 @@ mod tests {
     }
 
     fn direct_source_bindings_json(source_repository_id: &str) -> String {
+        direct_source_bindings_json_for(&[source_repository_id])
+    }
+
+    fn direct_source_bindings_json_for(source_repository_ids: &[&str]) -> String {
         serde_json::json!({
             "contractVersion": "steward.source-repository-bindings/v1",
-            "bindings": [{
+            "bindings": source_repository_ids.iter().map(|source_repository_id| serde_json::json!({
                 "caller": {"ownerId": "7890", "repositoryId": "123456"},
                 "source": {"ownerId": "7890", "repositoryId": source_repository_id}
-            }]
+            })).collect::<Vec<_>>()
         })
         .to_string()
+    }
+
+    async fn exercise_named_workspace_description_case(
+        idempotency_key: &str,
+        requested_repository: &str,
+        failure: Option<PortError>,
+        expected_status: StatusCode,
+        expected_diagnostics: &[&str],
+    ) -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "repository": requested_repository,
+                "ref": "main"
+            }
+        }]);
+        let mut git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let has_failure = failure.is_some();
+        if let Some(failure) = failure {
+            Arc::make_mut(&mut git.description_failures).insert("555001".to_owned(), failure);
+        }
+        let failure_lines = Arc::new(Mutex::new(Vec::new()));
+        let captured_failure_lines = failure_lines.clone();
+        let app = task_router(
+            ledger,
+            FakeTaskIdentityResolver,
+            task_api_config()?
+                .with_failure_reporter(Arc::new(move |line| {
+                    if let Ok(mut lines) = captured_failure_lines.lock() {
+                        lines.push(line.to_owned());
+                    }
+                }))
+                .with_git_hosting_plane(git)
+                .with_source_repository_bindings_json(Some(&direct_source_bindings_json_for(
+                    if has_failure {
+                        &["555001", "654321"]
+                    } else {
+                        &["654321"]
+                    },
+                )))?,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", idempotency_key)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build named workspace failure request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit named workspace failure request: {error}"))?;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("read named workspace failure response: {error}"))?;
+        assert_eq!(status, expected_status);
+        if expected_status == StatusCode::SERVICE_UNAVAILABLE {
+            assert!(
+                String::from_utf8_lossy(&body).contains(
+                    "Steward could not verify the workspace repository. Retry the request"
+                ),
+                "retryable response must tell the caller to retry"
+            );
+        }
+        assert_eq!(
+            *failure_lines
+                .lock()
+                .map_err(|_| "source failure reporter lock was poisoned")?,
+            expected_diagnostics
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_workspace_catalog_drains_mixed_failures_and_preserves_retry_semantics()
+    -> Result<(), String> {
+        exercise_named_workspace_description_case(
+            "throttled-with-match",
+            "example-org/agentic-ops",
+            Some(PortError::Failed {
+                reason: "throttled".to_owned(),
+            }),
+            StatusCode::ACCEPTED,
+            &["task source operation failed operation=describe_repositories category=failed diagnostic=throttled"],
+        )
+        .await?;
+        exercise_named_workspace_description_case(
+            "throttled-without-match",
+            "example-org/missing",
+            Some(PortError::Failed {
+                reason: "throttled".to_owned(),
+            }),
+            StatusCode::SERVICE_UNAVAILABLE,
+            &["task source operation failed operation=describe_repositories category=failed diagnostic=throttled"],
+        )
+        .await?;
+        exercise_named_workspace_description_case(
+            "permanent-with-match",
+            "example-org/agentic-ops",
+            Some(PortError::Rejected {
+                reason: "not installed".to_owned(),
+            }),
+            StatusCode::ACCEPTED,
+            &["task source operation failed operation=describe_repositories category=rejected diagnostic=not_installed"],
+        )
+        .await?;
+        exercise_named_workspace_description_case(
+            "permanent-without-match",
+            "example-org/missing",
+            None,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &["task source operation failed operation=resolve_named_repository category=rejected diagnostic=not_bound"],
+        )
+        .await
     }
 
     #[tokio::test]
