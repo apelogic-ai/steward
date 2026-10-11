@@ -1,3 +1,4 @@
+// CI validation: comment-only change to exercise the web change class.
 import type { ProviderConnectionStatus } from "@/api-client";
 
 export type ConnectionHealth = "healthy" | "expiring_soon" | "expired" | "reauth_required" | "other";
