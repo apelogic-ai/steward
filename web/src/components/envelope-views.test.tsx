@@ -25,6 +25,19 @@ describe("envelope run history", () => {
     expect(source).toContain('request.reason ? <p className="rounded-card');
     expect(source).toContain('event.reason ? <p className="mt-1 text-sm');
   });
+
+  test("explains empty model searches and blocks requests without a model", () => {
+    expect(source).toContain("No models in this template match");
+    expect(source).toContain("Select at least one model.");
+    expect(source).toContain('aria-invalid={models.size === 0 || undefined}');
+    expect(source).toContain('disabled={submission === "submitting" || Boolean(singleRunError) || models.size === 0}');
+  });
+
+  test("shows workspace access on envelope details", () => {
+    expect(source).toContain("WorkspaceAuthorityDetails");
+    expect(source).toContain('workspace={envelope.spec.workspace}');
+    expect(source).toContain('title={request.approvedEnvelope ? "Approved access" : "Requested access"}');
+  });
 });
 
 const template: AvailableEnvelopeTemplate = {

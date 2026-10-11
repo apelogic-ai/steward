@@ -26,6 +26,7 @@ import { DataTable, FilterChips, GrantChipList, Meter, SectionCard, grantKindFor
 import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
 import { EnvelopeExceedanceSummary, envelopeDeltaSummary } from "@/components/envelope-exceedance-summary";
 import { DurationInput, MoneyInput, durationUnit, formatDuration, formatMoney } from "@/components/presentation-values";
+import { WorkspaceAuthorityDetails } from "@/components/workspace-authority-details";
 import { DefinitionList, PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -49,7 +50,7 @@ function actionMessage(status: Exclude<UnifiedRequestActionState, "idle" | "fili
   }[status];
 }
 
-function envelopeAuthorityItems(spec: BrowserEnvelopeSpec): [string, string][] {
+function envelopeAuthorityItems(spec: BrowserEnvelopeSpec): Array<[string, ReactNode]> {
   const runner = spec.runner;
   return [
     ["Models", spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") || "None"],
@@ -64,6 +65,7 @@ function envelopeAuthorityItems(spec: BrowserEnvelopeSpec): [string, string][] {
     ["Runner memory", runner?.memory ?? "Not set"],
     ["Runner compute", runner?.compute ?? "Not set"],
     ["Runner storage", runner?.storage ?? "Not set"],
+    ["Workspace", <WorkspaceAuthorityDetails key="workspace" workspace={spec.workspace} />],
   ];
 }
 
@@ -223,6 +225,7 @@ function deltaSide(delta: AdminRequestView["deltas"][number], side: "ceiling" | 
     return <span className="font-mono text-sm">{value === null || value === undefined ? "Not set" : formatDuration(value, "minutes", "m")}</span>;
   }
   if (delta.dimension === "ttl") return <span className="font-mono text-sm">{formatDuration(delta[side], "wire", durationUnit(delta.requested))}</span>;
+  if (delta.dimension === "workspace") return <WorkspaceAuthorityDetails workspace={delta[side]} />;
   const value = delta[side];
   return <span className="font-mono text-sm">{deltaValue(value)}</span>;
 }
@@ -238,9 +241,10 @@ function numericDelta(delta: AdminRequestView["deltas"][number]): string | null 
 
 function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>) {
   if (request.kind === "custom" && request.requestedEnvelope) return <SectionCard title="Requested access"><DefinitionList items={envelopeAuthorityItems(request.requestedEnvelope.spec)} /><p className="mt-4 rounded-control bg-notice p-4 text-sm">This custom request has no governing template and always requires administrator approval.</p></SectionCard>;
-  if (request.deltas.length === 0) return <p className="rounded-control border border-line bg-notice p-4 text-sm">{requestStateCopy[request.state].message}</p>;
+  const workspaceComparison = request.requestedEnvelope ? <SectionCard title="Workspace access"><div className="grid gap-5 lg:grid-cols-2"><section aria-label="Requested workspace" className="space-y-3"><h3 className="text-sm font-semibold">Requested</h3><WorkspaceAuthorityDetails workspace={request.requestedEnvelope.spec.workspace} /></section><section aria-label="Template workspace limit" className="space-y-3"><h3 className="text-sm font-semibold">Template limit</h3><WorkspaceAuthorityDetails workspace={request.templateEnvelope?.spec.workspace} /></section></div></SectionCard> : null;
+  if (request.deltas.length === 0) return <div className="space-y-5">{workspaceComparison}<p className="rounded-control border border-line bg-notice p-4 text-sm">{requestStateCopy[request.state].message}</p></div>;
   return (
-    <SectionCard title="Requested vs template limits">
+    <div className="space-y-5">{workspaceComparison}<SectionCard title="Requested vs template limits">
       <div className="overflow-x-auto">
         <div className="min-w-[520px]">
           <div className="grid grid-cols-[minmax(90px,130px)_1fr_1fr] gap-4 border-b border-line-soft pb-2 text-xs font-medium text-muted-ink"><span>Field</span><span>Requested</span><span>{request.template.id ? `${request.template.id} rev ${request.template.revision ?? "—"}` : "Limit"}</span></div>
@@ -250,7 +254,7 @@ function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>)
           })}
         </div>
       </div>
-    </SectionCard>
+    </SectionCard></div>
   );
 }
 

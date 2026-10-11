@@ -196,6 +196,13 @@ const envelope = {
     tools: [{ provider: "github", resource: "repository", action: "get_file_contents" }],
     ttl: "4h",
     runner: { platforms: [] },
+    workspace: {
+      allowedTypes: ["git", "scratch"],
+      maxTotalSize: "2Gi",
+      maxFiles: 1000,
+      maxHistoryDepth: 100,
+      maxSubmoduleDepth: 2,
+    },
   },
 };
 
@@ -2451,11 +2458,42 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     await expect(developer.page.getByRole("spinbutton", { name: /^Limit per run/ })).toHaveValue("5.00");
     await expect(developer.page.getByRole("spinbutton", { name: /^Time-to-live limit/ })).toHaveValue("4");
     await expect(developer.page.getByRole("combobox", { name: "Time-to-live unit" })).toHaveValue("h");
+    const models = developer.page.getByRole("combobox", { name: "Models" });
+    const modelsCard = models.locator("xpath=ancestor::section[1]");
+    const modelPicker = modelsCard;
+    await modelPicker.getByRole("button", { name: "Remove provider-a/model-a" }).click();
+    await models.fill("provider-a/model-a");
+    await expect(modelsCard).toHaveCSS("overflow", "visible");
+    const pickerBounds = await Promise.all([modelsCard.boundingBox(), developer.page.getByRole("listbox").boundingBox()]);
+    expect(pickerBounds[0]).not.toBeNull();
+    expect(pickerBounds[1]).not.toBeNull();
+    expect(pickerBounds[1].y + pickerBounds[1].height).toBeGreaterThan(pickerBounds[0].y + pickerBounds[0].height);
+    await models.fill("claude");
+    const noModelResults = developer.page.getByRole("status");
+    await expect(noModelResults).toHaveText("No models in this template match “claude”");
+    const noModelResultsId = await noModelResults.getAttribute("id");
+    expect(noModelResultsId).toBeTruthy();
+    await expect(models).toHaveAttribute("aria-describedby", noModelResultsId);
+    await models.fill("");
+    await modelPicker.getByRole("button", { name: "Remove openai/gpt-5.4" }).click();
+    await expect(models).toHaveAttribute("aria-invalid", "true");
+    await expect(modelPicker.getByText("Select at least one model.", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("button", { name: "Submit request" })).toBeDisabled();
+    await models.fill("provider-a/model-a");
+    await models.press("Enter");
+    await expect(modelPicker.getByText("Select at least one model.", { exact: true })).toHaveCount(0);
     await developer.page.getByRole("spinbutton", { name: /^Limit per run/ }).fill("4.00");
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
     const provisioned = developer.page.locator("#page-title").getByText("provisioned", { exact: true });
     await expect(provisioned).toHaveAttribute("data-tone", "ok");
+    const workspaceAccess = developer.page.getByRole("group", { name: "Workspace access" });
+    await expect(workspaceAccess.getByText("git", { exact: true })).toBeVisible();
+    await expect(workspaceAccess.getByText("scratch", { exact: true })).toBeVisible();
+    await expect(workspaceAccess.getByText("2Gi", { exact: true })).toBeVisible();
+    await expect(workspaceAccess.getByText("1000 files", { exact: true })).toBeVisible();
+    await expect(workspaceAccess.getByText("100 commits", { exact: true })).toBeVisible();
+    await expect(workspaceAccess.getByText("2 levels", { exact: true })).toBeVisible();
     const envelopeMutation = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/envelope-requests");
     expectMutationProof(envelopeMutation);
     expect(envelopeMutation.body.requestedEnvelope.spec.budget.singleRunLimit).toBe("4.00");
@@ -2534,6 +2572,9 @@ test("a value above the template limits is submitted for administrator approval"
     await developer.page.getByRole("button", { name: "Submit for approval" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
     await expect(developer.page.getByText("Pending administrator approval", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("heading", { name: "Requested access" })).toBeVisible();
+    await expect(developer.page.getByRole("heading", { name: "Approved access" })).toHaveCount(0);
+    await expect(developer.page.getByRole("group", { name: "Workspace access" }).getByText("scratch", { exact: true })).toBeVisible();
     await expect(developer.page.getByText("Time-to-live limit: 5 h (limit 4 h)", { exact: true })).toBeVisible();
     await expect(developer.page.getByText("Justification: Needed for a bounded release review.", { exact: true })).toBeVisible();
 
@@ -3861,6 +3902,11 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(envelopeRequestCard.getByText("40.00 USD", { exact: true }).first()).toBeVisible();
     await expect(envelopeRequestCard.getByText("25.00 USD", { exact: true }).first()).toBeVisible();
     await expect(envelopeRequestCard.getByText("Monthly limit: 40.00 USD (limit 25.00 USD)", { exact: true })).toBeVisible();
+    const requestedWorkspace = envelopeRequestCard.getByRole("region", { name: "Requested workspace" });
+    await expect(requestedWorkspace.getByText("git", { exact: true })).toBeVisible();
+    await expect(requestedWorkspace.getByText("scratch", { exact: true })).toBeVisible();
+    await expect(requestedWorkspace.getByText("2Gi", { exact: true })).toBeVisible();
+    await expect(requestedWorkspace.getByText("1000 files", { exact: true })).toBeVisible();
     await expect(envelopeRequestCard.getByRole("button", { name: "Reject" })).toBeDisabled();
     await envelopeRequestCard.getByRole("button", { name: "File reference" }).click();
     await envelopeRequestCard.getByLabel("Rationale", { exact: true }).fill("Approved for the requested bounded envelope.");
