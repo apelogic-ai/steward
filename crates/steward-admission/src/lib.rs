@@ -288,7 +288,7 @@ impl AdmissionDecision {
             .map(AdmissionDelta::counterexample)
             .collect::<Vec<_>>()
             .join("; ");
-        Some(format!("envelope exceeded: {details}"))
+        Some(details)
     }
 }
 
@@ -351,25 +351,39 @@ impl AdmissionDelta {
                 ceiling,
                 currency,
             } => format!(
-                "budget.monthlyLimit requested {requested} {currency}, ceiling {ceiling} {currency}"
+                "Monthly budget: requested {}, limit {}",
+                format_money(requested, currency),
+                format_money(ceiling, currency)
             ),
             Self::SingleRunBudget {
                 requested,
                 ceiling,
                 currency,
             } => format!(
-                "budget.singleRunLimit requested {} {currency}, ceiling {ceiling} {currency}",
-                requested.as_deref().unwrap_or("unbounded")
+                "Per-run budget: requested {}, limit {}",
+                requested.as_deref().map_or_else(
+                    || "no limit".to_owned(),
+                    |value| format_money(value, currency)
+                ),
+                format_money(ceiling, currency)
             ),
-            Self::RuntimeMinutes { requested, ceiling } => format!(
-                "runtimeMinutesLimit requested {} min, ceiling {ceiling} min",
-                requested.as_deref().unwrap_or("unbounded")
+            Self::RuntimeMinutes {
+                requested: Some(requested),
+                ceiling,
+            } => {
+                format!("Runtime allowance: requested {requested} minutes, limit {ceiling} minutes")
+            }
+            Self::RuntimeMinutes {
+                requested: None,
+                ceiling,
+            } => format!(
+                "Runtime allowance: requested without a limit, but this Envelope allows at most {ceiling} minutes"
             ),
             Self::Ttl { requested, ceiling } => {
-                format!("ttl requested {requested}, ceiling {ceiling}")
+                format!("Maximum run duration: requested {requested}, limit {ceiling}")
             }
             Self::Models { requested, ceiling } => format!(
-                "llms requested [{}], ceiling [{}]",
+                "Models: requested {}, allowed {}",
                 requested
                     .iter()
                     .map(|model| format!("{}/{}", model.provider, model.model))
@@ -382,7 +396,7 @@ impl AdmissionDelta {
                     .join(", ")
             ),
             Self::Tools { requested, ceiling } => format!(
-                "tools requested [{}], ceiling [{}]",
+                "Tools: requested {}, allowed {}",
                 requested
                     .iter()
                     .map(|tool| format!("{}:{}:{}", tool.provider, tool.resource, tool.action))
@@ -395,33 +409,82 @@ impl AdmissionDelta {
                     .join(", ")
             ),
             Self::RunnerPlatforms { requested, ceiling } => format!(
-                "runner.platforms requested {:?}, ceiling {:?}",
-                requested, ceiling
+                "Runner platforms: requested {}, allowed {}",
+                format_runner_platforms(requested),
+                format_runner_platforms(ceiling)
             ),
-            Self::RunnerMemory { requested, ceiling } => format!(
-                "runner.memory requested {}, ceiling {}",
-                requested.0,
-                ceiling.as_ref().map_or("none", |value| value.0.as_str())
-            ),
-            Self::RunnerCompute { requested, ceiling } => format!(
-                "runner.compute requested {}, ceiling {}",
-                requested.0,
-                ceiling.as_ref().map_or("none", |value| value.0.as_str())
-            ),
-            Self::RunnerStorage { requested, ceiling } => format!(
-                "runner.storage requested {}, ceiling {}",
-                requested.0,
-                ceiling.as_ref().map_or("none", |value| value.0.as_str())
-            ),
-            Self::Workspace { requested, ceiling } => format!(
-                "workspace requested {}, ceiling {}",
+            Self::RunnerMemory { requested, ceiling } => {
+                runner_resource_message("memory", requested, ceiling.as_ref())
+            }
+            Self::RunnerCompute { requested, ceiling } => {
+                runner_resource_message("compute", requested, ceiling.as_ref())
+            }
+            Self::RunnerStorage { requested, ceiling } => {
+                runner_resource_message("storage", requested, ceiling.as_ref())
+            }
+            Self::Workspace {
+                requested,
+                ceiling: Some(ceiling),
+            } => format!(
+                "Workspace access: requested {}; allowed {}",
                 workspace_authority_summary(requested),
-                ceiling
-                    .as_ref()
-                    .map_or_else(|| "none".to_owned(), workspace_authority_summary)
+                workspace_authority_summary(ceiling)
+            ),
+            Self::Workspace {
+                requested,
+                ceiling: None,
+            } => format!(
+                "Workspace access: requested {}, but this Envelope does not allow workspace access",
+                workspace_authority_summary(requested)
             ),
         }
     }
+}
+
+fn format_money(amount: &str, currency: &str) -> String {
+    if currency == "USD" {
+        format!("${amount}")
+    } else {
+        format!("{amount} {currency}")
+    }
+}
+
+fn format_runner_platforms(platforms: &[RunnerPlatform]) -> String {
+    platforms
+        .iter()
+        .map(|platform| match platform {
+            RunnerPlatform::Linux => "linux",
+            RunnerPlatform::Mac => "macOS",
+            RunnerPlatform::Windows => "windows",
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn runner_resource_message(
+    resource: &str,
+    requested: &KubernetesQuantity,
+    ceiling: Option<&KubernetesQuantity>,
+) -> String {
+    let requested = format_binary_quantity(requested.0.as_str());
+    match ceiling {
+        Some(ceiling) => format!(
+            "Runner {resource}: requested {requested}, limit {}",
+            format_binary_quantity(ceiling.0.as_str())
+        ),
+        None => format!(
+            "Runner {resource}: requested {requested}, but this Envelope does not allow a {resource} request"
+        ),
+    }
+}
+
+fn format_binary_quantity(value: &str) -> String {
+    for (suffix, label) in [("Ti", "TiB"), ("Gi", "GiB"), ("Mi", "MiB"), ("Ki", "KiB")] {
+        if let Some(number) = value.strip_suffix(suffix) {
+            return format!("{number} {label}");
+        }
+    }
+    value.to_owned()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -681,23 +744,31 @@ fn workspace_authority_summary(authority: &WorkspaceAuthority) -> String {
             WorkspaceEntryType::Git => "git",
             WorkspaceEntryType::Scratch => "scratch",
         })
-        .collect::<Vec<_>>()
-        .join(",");
+        .collect::<Vec<_>>();
+    let types = match types.as_slice() {
+        [] => "no workspace types".to_owned(),
+        [only] => (*only).to_owned(),
+        [first, second] => format!("{first} and {second}"),
+        _ => types.join(", "),
+    };
     format!(
-        "types=[{types}], total={}, files={}, history={}, submodules={}",
-        authority
-            .max_total_size
-            .as_ref()
-            .map_or("deployment limit", |value| value.as_str()),
-        authority
-            .max_files
-            .map_or_else(|| "deployment limit".to_owned(), |value| value.to_string()),
-        authority
-            .max_history_depth
-            .map_or_else(|| "deployment limit".to_owned(), |value| value.to_string()),
-        authority
-            .max_submodule_depth
-            .map_or_else(|| "deployment limit".to_owned(), |value| value.to_string())
+        "{types}; total size {}; {} files; {} history generations; {} submodule levels",
+        authority.max_total_size.as_ref().map_or_else(
+            || "up to the deployment limit".to_owned(),
+            |value| { format_binary_quantity(value.as_str()) }
+        ),
+        authority.max_files.map_or_else(
+            || "up to the deployment limit".to_owned(),
+            |value| format!("up to {value}")
+        ),
+        authority.max_history_depth.map_or_else(
+            || "up to the deployment limit".to_owned(),
+            |value| format!("up to {value}")
+        ),
+        authority.max_submodule_depth.map_or_else(
+            || "up to the deployment limit".to_owned(),
+            |value| format!("up to {value}")
+        )
     )
 }
 
@@ -1673,7 +1744,7 @@ mod tests {
                 .map_err(|error| format!("evaluate request: {error:?}"))?
                 .counterexample()
                 .as_deref(),
-            Some("envelope exceeded: budget.singleRunLimit requested 3.00 USD, ceiling 2.00 USD")
+            Some("Per-run budget: requested $3.00, limit $2.00")
         );
         Ok(())
     }
@@ -1688,9 +1759,7 @@ mod tests {
                 .map_err(|error| format!("evaluate request: {error:?}"))?
                 .counterexample()
                 .as_deref(),
-            Some(
-                "envelope exceeded: budget.singleRunLimit requested unbounded USD, ceiling 2.00 USD"
-            )
+            Some("Per-run budget: requested no limit, limit $2.00")
         );
         Ok(())
     }
@@ -1707,7 +1776,7 @@ mod tests {
                 .map_err(|error| format!("evaluate envelope request: {error:?}"))?
                 .counterexample()
                 .as_deref(),
-            Some("envelope exceeded: runtimeMinutesLimit requested 180 min, ceiling 120 min")
+            Some("Runtime allowance: requested 180 minutes, limit 120 minutes")
         );
         Ok(())
     }
@@ -1723,7 +1792,9 @@ mod tests {
                 .map_err(|error| format!("evaluate envelope request: {error:?}"))?
                 .counterexample()
                 .as_deref(),
-            Some("envelope exceeded: runtimeMinutesLimit requested unbounded min, ceiling 120 min")
+            Some(
+                "Runtime allowance: requested without a limit, but this Envelope allows at most 120 minutes"
+            )
         );
         Ok(())
     }
@@ -1907,7 +1978,7 @@ mod tests {
     }
 
     #[test]
-    fn counterexample_message_is_stable_for_both_front_doors() {
+    fn rejection_message_uses_plain_labels_and_units_for_both_front_doors() {
         let decision = AdmissionDecision::Reject {
             deltas: vec![
                 AdmissionDelta::Budget {
@@ -1925,10 +1996,57 @@ mod tests {
         assert_eq!(
             decision.counterexample(),
             Some(
-                "envelope exceeded: budget.monthlyLimit requested 220.00 USD, ceiling 200.00 USD; ttl requested 25h, ceiling 24h"
+                "Monthly budget: requested $220.00, limit $200.00; Maximum run duration: requested 25h, limit 24h"
                     .to_owned()
             )
         );
+    }
+
+    #[test]
+    fn rejection_message_does_not_expose_debug_platform_formatting() {
+        let decision = AdmissionDecision::Reject {
+            deltas: vec![AdmissionDelta::RunnerPlatforms {
+                requested: vec![RunnerPlatform::Windows],
+                ceiling: vec![RunnerPlatform::Linux],
+            }],
+        };
+
+        assert_eq!(
+            decision.counterexample(),
+            Some("Runner platforms: requested windows, allowed linux".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejection_messages_explain_absent_runner_and_workspace_authority() -> Result<(), String> {
+        let requested_workspace = WorkspaceAuthority {
+            allowed_types: vec![WorkspaceEntryType::Git, WorkspaceEntryType::Scratch],
+            max_total_size: Some(ResourceQuantity::parse("2Gi")?),
+            max_files: Some(100),
+            max_history_depth: Some(20),
+            max_submodule_depth: Some(2),
+        };
+        let decision = AdmissionDecision::Reject {
+            deltas: vec![
+                AdmissionDelta::RunnerMemory {
+                    requested: KubernetesQuantity("8Gi".to_owned()),
+                    ceiling: None,
+                },
+                AdmissionDelta::Workspace {
+                    requested: requested_workspace,
+                    ceiling: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            decision.counterexample(),
+            Some(
+                "Runner memory: requested 8 GiB, but this Envelope does not allow a memory request; Workspace access: requested git and scratch; total size 2 GiB; up to 100 files; up to 20 history generations; up to 2 submodule levels, but this Envelope does not allow workspace access"
+                    .to_owned()
+            )
+        );
+        Ok(())
     }
 
     #[test]

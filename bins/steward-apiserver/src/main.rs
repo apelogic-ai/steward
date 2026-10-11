@@ -898,6 +898,7 @@ async fn browser_application_router(
                 application_config.task_identity_discovery_enabled,
             ),
             workflow_agents.clone(),
+            task_api_config.workspace_deployment_capabilities(),
             auth.clone(),
         ))
         .merge(steward_apiserver::preferences::protected_router(

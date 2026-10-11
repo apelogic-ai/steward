@@ -3228,7 +3228,7 @@ where
         && git_materialized_budget == 0
     {
         return Err(ApiError::Admission(format!(
-            "Git workspace size requires available capacity, but scratch requests consume the effective ceiling {}",
+            "Git workspaces need available capacity, but scratch requests use all {} this Envelope allows.",
             format_workspace_bytes(policy.max_total_bytes)
         )));
     }
@@ -3413,13 +3413,14 @@ where
                     .unwrap_or(policy.max_files);
                 if resolution.inventory.bytes > entry_size_limit {
                     return Err(ApiError::Admission(format!(
-                        "workspace materialized size {} bytes exceeds the effective ceiling {} bytes",
-                        resolution.inventory.bytes, entry_size_limit
+                        "Workspace materialized size {} is more than the {} this Envelope allows.",
+                        format_workspace_bytes(resolution.inventory.bytes),
+                        format_workspace_bytes(entry_size_limit)
                     )));
                 }
                 if resolution.inventory.files > entry_file_limit {
                     return Err(ApiError::Admission(format!(
-                        "workspace materialized file count {} exceeds the effective ceiling {}",
+                        "Workspace file count {} is more than the {} this Envelope allows.",
                         resolution.inventory.files, entry_file_limit
                     )));
                 }
@@ -3440,13 +3441,14 @@ where
                     .min(config.workspace_policy.scratch_volume_bytes);
                 if materialized_bytes > byte_ceiling {
                     return Err(ApiError::Admission(format!(
-                        "total workspace materialized size {} bytes exceeds the effective ceiling {} bytes",
-                        materialized_bytes, byte_ceiling
+                        "Total workspace size {} is more than the {} this Envelope allows.",
+                        format_workspace_bytes(materialized_bytes),
+                        format_workspace_bytes(byte_ceiling)
                     )));
                 }
                 if materialized_files > policy.max_files {
                     return Err(ApiError::Admission(format!(
-                        "total workspace materialized file count {} exceeds the effective ceiling {}",
+                        "Total workspace file count {} is more than the {} this Envelope allows.",
                         materialized_files, policy.max_files
                     )));
                 }
@@ -3540,7 +3542,7 @@ fn resolve_scratch_workspace_entry(
     let size = if requested_bytes == enforced_bytes {
         entry.scratch.size.clone()
     } else {
-        ResourceQuantity::parse(format_workspace_bytes(enforced_bytes))
+        ResourceQuantity::parse(format_workspace_quantity(enforced_bytes))
             .map_err(ApiError::Admission)?
     };
     Ok(ResolvedWorkspaceEntry::Scratch {
@@ -3622,7 +3624,7 @@ fn validate_workspace_policy(
             match entry.git.history {
                 WorkspaceGitHistory::Depth(depth) if depth > policy.max_history_depth => {
                     return Err(ApiError::Admission(format!(
-                        "history depth {depth} exceeds the effective ceiling {}",
+                        "Git history depth {depth} is more than the {} generations this Envelope allows.",
                         policy.max_history_depth
                     )));
                 }
@@ -3632,7 +3634,8 @@ fn validate_workspace_policy(
                 && policy.max_submodule_depth == 0
             {
                 return Err(ApiError::Admission(
-                    "submodule depth 1 exceeds the effective ceiling 0".to_owned(),
+                    "Git submodule depth 1 is more than the 0 levels this Envelope allows."
+                        .to_owned(),
                 ));
             }
             (WorkspaceEntryType::Git, entry.git.limits.as_ref())
@@ -3655,8 +3658,8 @@ fn validate_workspace_policy(
             let ceiling = deployment.scratch_volume_bytes;
             if size > ceiling {
                 return Err(ApiError::Admission(format!(
-                    "scratch size {} exceeds the effective ceiling {}",
-                    entry.scratch.size.as_str(),
+                    "Scratch size {} is more than the {} this deployment allows.",
+                    format_workspace_bytes(size),
                     format_workspace_bytes(ceiling)
                 )));
             }
@@ -3674,8 +3677,8 @@ fn validate_workspace_policy(
                 })?;
                 if size > limit {
                     return Err(ApiError::Admission(format!(
-                        "scratch size {} exceeds its requested materialization limit {}",
-                        entry.scratch.size.as_str(),
+                        "Scratch size {} is more than its requested materialization limit of {}.",
+                        format_workspace_bytes(size),
                         format_workspace_bytes(limit)
                     )));
                 }
@@ -3709,7 +3712,7 @@ fn validate_workspace_policy(
         && files > policy.max_files
     {
         return Err(ApiError::Admission(format!(
-            "workspace file limit {files} exceeds the effective ceiling {}",
+            "Workspace file limit {files} is more than the {} this Envelope allows.",
             policy.max_files
         )));
     }
@@ -3719,7 +3722,7 @@ fn validate_workspace_policy(
         })?;
         if size > policy.max_total_bytes {
             return Err(ApiError::Admission(format!(
-                "workspace size limit {} exceeds the effective ceiling {}",
+                "Workspace size limit {} is more than the {} this Envelope allows.",
                 format_workspace_bytes(size),
                 format_workspace_bytes(policy.max_total_bytes)
             )));
@@ -3736,6 +3739,24 @@ const fn workspace_entry_type_label(entry_type: WorkspaceEntryType) -> &'static 
 }
 
 fn format_workspace_bytes(bytes: u64) -> String {
+    for (suffix, divisor) in [
+        ("TiB", 1024_u64.pow(4)),
+        ("GiB", 1024_u64.pow(3)),
+        ("MiB", 1024_u64.pow(2)),
+        ("KiB", 1024_u64),
+    ] {
+        if bytes >= divisor {
+            if bytes.is_multiple_of(divisor) {
+                return format!("{} {suffix}", bytes / divisor);
+            }
+            let tenths = (u128::from(bytes) * 10 + u128::from(divisor / 2)) / u128::from(divisor);
+            return format!("{}.{:01} {suffix}", tenths / 10, tenths % 10);
+        }
+    }
+    format!("{bytes} bytes")
+}
+
+fn format_workspace_quantity(bytes: u64) -> String {
     [
         ("Ti", 1024_u64.pow(4)),
         ("Gi", 1024_u64.pow(3)),
@@ -3765,7 +3786,7 @@ fn workspace_entry_size_limit(
                         Ok(size)
                     } else {
                         Err(ApiError::Admission(format!(
-                            "workspace size limit {} exceeds the effective ceiling {}",
+                            "Workspace size limit {} is more than the {} this deployment allows.",
                             format_workspace_bytes(size),
                             format_workspace_bytes(deployment_limit)
                         )))
@@ -3785,7 +3806,7 @@ fn workspace_git_materialized_budget(
         .map(|remaining| remaining.min(MAX_WORKSPACE_MATERIALIZED_BYTES))
         .ok_or_else(|| {
             ApiError::Admission(format!(
-                "total scratch size {} exceeds the effective ceiling {}",
+                "Total scratch size {} is more than the {} this Envelope allows.",
                 format_workspace_bytes(scratch_reserved_bytes),
                 format_workspace_bytes(max_total_bytes)
             ))
@@ -3842,7 +3863,7 @@ impl WorkspaceResolutionBudget {
                 })?;
         if self.repository_descriptions > MAX_SOURCE_REPOSITORY_BINDINGS {
             return Err(ApiError::Admission(format!(
-                "workspace repository count {} exceeds the effective ceiling {}",
+                "Workspace repository count {} is more than the {} this deployment allows.",
                 self.repository_descriptions, MAX_SOURCE_REPOSITORY_BINDINGS
             )));
         }
@@ -3855,7 +3876,7 @@ impl WorkspaceResolutionBudget {
         })?;
         if self.tree_reads > policy.max_tree_reads {
             return Err(ApiError::Admission(format!(
-                "workspace tree read count {} exceeds the effective ceiling {}",
+                "Workspace tree read count {} is more than the {} this deployment allows.",
                 self.tree_reads, policy.max_tree_reads
             )));
         }
@@ -3876,16 +3897,16 @@ impl WorkspaceResolutionBudget {
         })?;
         if *entry_count > entry_limit || self.submodules > policy.max_total_submodules {
             let (requested, ceiling, label) = if *entry_count > entry_limit {
-                (*entry_count, entry_limit, "workspace submodule count")
+                (*entry_count, entry_limit, "Workspace submodule count")
             } else {
                 (
                     self.submodules,
                     policy.max_total_submodules,
-                    "total workspace submodule count",
+                    "Total workspace submodule count",
                 )
             };
             return Err(ApiError::Admission(format!(
-                "{label} {requested} exceeds the effective ceiling {ceiling}"
+                "{label} {requested} is more than the {ceiling} this deployment allows."
             )));
         }
         Ok(())
@@ -4060,7 +4081,7 @@ where
                 .max_total_submodules
                 .saturating_sub(budget.submodules);
             return Err(ApiError::Admission(format!(
-                "workspace submodule count {} exceeds the effective ceiling {}",
+                "Workspace submodule count {} is more than the {} this deployment allows.",
                 modules.len(),
                 entry_remaining.min(total_remaining)
             )));
@@ -4134,7 +4155,7 @@ where
             if request.recursive {
                 if parent.depth >= request.max_depth {
                     return Err(ApiError::Admission(format!(
-                        "submodule depth {} exceeds the effective ceiling {}",
+                        "Git submodule depth {} is more than the {} levels this Envelope allows.",
                         parent.depth + 1,
                         request.max_depth
                     )));
@@ -4927,8 +4948,8 @@ async fn append_workspace_git_pack(
     }
     let pack = git.read_pack(&request).await.map_err(|error| match error {
         steward_ports::PortError::LimitExceeded { .. } => ApiError::Admission(format!(
-            "workspace materialized size exceeds the effective ceiling {} bytes",
-            request.max_bytes
+            "Workspace materialized size is more than the {} this Envelope allows.",
+            format_workspace_bytes(request.max_bytes)
         )),
         error => source_port_error(error),
     })?;
@@ -4939,9 +4960,9 @@ async fn append_workspace_git_pack(
     }
     if pack.bytes.len() as u64 > request.max_bytes {
         return Err(ApiError::Admission(format!(
-            "workspace materialized size {} bytes exceeds the effective ceiling {} bytes",
-            pack.bytes.len(),
-            request.max_bytes
+            "Workspace materialized size {} is more than the {} this Envelope allows.",
+            format_workspace_bytes(pack.bytes.len() as u64),
+            format_workspace_bytes(request.max_bytes)
         )));
     }
     if let Some(limit) = limits.full_history_depth
@@ -6018,6 +6039,7 @@ fn source_port_error_with_reporter(
         steward_ports::PortError::Rejected { reason } if reason == "Git reference is invalid" => {
             ("rejected", "git_reference_invalid")
         }
+        steward_ports::PortError::LimitExceeded { .. } => ("rejected", "source_limit_exceeded"),
         steward_ports::PortError::Rejected { .. } => ("rejected", "source_rejected"),
         steward_ports::PortError::Unsupported { .. } => ("unsupported", "source_unsupported"),
         steward_ports::PortError::Failed { .. } => ("failed", "source_failed"),
@@ -6029,6 +6051,9 @@ fn source_port_error_with_reporter(
 
 fn source_port_error(error: steward_ports::PortError) -> ApiError {
     match error {
+        steward_ports::PortError::LimitExceeded { .. } => {
+            ApiError::Admission("Source content is larger than this Task allows.".to_owned())
+        }
         steward_ports::PortError::Rejected { .. } => {
             ApiError::Admission("exact source object could not be resolved".to_owned())
         }
@@ -6644,12 +6669,13 @@ mod workflow_request_tests {
         WorkspaceResolutionBudget, append_workspace_git_pack, browser_input_retry_matches,
         browser_inputs_archive, browser_inputs_from_archive, browser_rerun_submission,
         browser_workspace_trigger_commit, default_workspace_name, direct_authority_spec,
-        direct_effective_requirements, direct_requirements_for_task, prepare_task_input_archive,
-        resolve_scratch_workspace_entry, resolve_versioned_task_plan,
-        source_port_error_with_reporter, stable_task_runtime_name, task_orchestration_reservation,
-        validate_workspace_policy, versioned_workflow_reference, workspace_admission_policy,
-        workspace_git_materialized_budget, workspace_submodule_is_selected,
-        workspace_submodule_repository_url, workspace_tree_inventory,
+        direct_effective_requirements, direct_requirements_for_task, format_workspace_bytes,
+        prepare_task_input_archive, resolve_scratch_workspace_entry, resolve_versioned_task_plan,
+        source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
+        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
+        workspace_admission_policy, workspace_git_materialized_budget,
+        workspace_submodule_is_selected, workspace_submodule_repository_url,
+        workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -6670,6 +6696,24 @@ mod workflow_request_tests {
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn workspace_byte_messages_use_readable_rounded_units() {
+        assert_eq!(format_workspace_bytes(2 * 1024 * 1024 * 1024), "2 GiB");
+        assert_eq!(format_workspace_bytes(1_400_000_000), "1.3 GiB");
+        assert_eq!(format_workspace_bytes(900), "900 bytes");
+    }
+
+    #[test]
+    fn source_size_limit_is_a_user_actionable_admission_error() {
+        assert!(matches!(
+            source_port_error(PortError::LimitExceeded {
+                resource: "GitHub response bytes",
+            }),
+            ApiError::Admission(ref reason)
+                if reason == "Source content is larger than this Task allows."
+        ));
+    }
 
     struct ExampleExecutionAdapter;
 
@@ -6790,6 +6834,75 @@ mod workflow_request_tests {
         }
     }
 
+    struct CompleteHistoryPackResolver;
+
+    impl DirectGitResolver for CompleteHistoryPackResolver {
+        fn repository_web_origin(&self) -> Option<String> {
+            None
+        }
+
+        fn classify_repository_description_failure(
+            &self,
+            _error: &PortError,
+        ) -> GitRepositoryDescriptionFailure {
+            GitRepositoryDescriptionFailure::SourceUnavailable
+        }
+
+        fn describe_repositories<'a>(
+            &'a self,
+            _repositories: &'a [GitRepositoryReference],
+        ) -> super::DescribedRepositories<'a> {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn resolve_repository<'a>(
+            &'a self,
+            _repository: &'a RepositoryUrl,
+        ) -> futures::future::BoxFuture<'a, Result<GitRepositoryIdentity, PortError>> {
+            Box::pin(async { Err(PortError::Unsupported { operation: "test" }) })
+        }
+
+        fn read_file<'a>(
+            &'a self,
+            _request: &'a GitFileRequest,
+        ) -> futures::future::BoxFuture<'a, Result<GitFile, PortError>> {
+            Box::pin(async { Err(PortError::Unsupported { operation: "test" }) })
+        }
+
+        fn resolve_revision<'a>(
+            &'a self,
+            _request: &'a GitRevisionRequest,
+        ) -> futures::future::BoxFuture<'a, Result<ExactGitCommit, PortError>> {
+            Box::pin(async { Err(PortError::Unsupported { operation: "test" }) })
+        }
+
+        fn read_pack<'a>(
+            &'a self,
+            request: &'a GitPackRequest,
+        ) -> futures::future::BoxFuture<'a, Result<GitPack, PortError>> {
+            Box::pin(async move {
+                assert_eq!(
+                    request.depth,
+                    Some(20),
+                    "full-history admission must probe exactly the configured generation limit"
+                );
+                Ok(GitPack {
+                    repository: request.repository.clone(),
+                    commit: request.commit.clone(),
+                    shallow: Vec::new(),
+                    bytes: b"PACKcomplete-history".to_vec(),
+                })
+            })
+        }
+
+        fn read_tree<'a>(
+            &'a self,
+            _request: &'a GitTreeRequest,
+        ) -> futures::future::BoxFuture<'a, Result<GitTree, PortError>> {
+            Box::pin(async { Err(PortError::Unsupported { operation: "test" }) })
+        }
+    }
+
     #[test]
     fn workspace_policy_rejects_disabled_types_and_over_cap_history() -> Result<(), String> {
         let config = TaskApiConfig::default().with_workspace_policy_json(Some(
@@ -6829,7 +6942,7 @@ mod workflow_request_tests {
         assert!(matches!(
             validate_workspace_policy(&config.workspace_policy, &policy, &git),
             Err(ApiError::Admission(ref reason))
-                if reason == "history depth 21 exceeds the effective ceiling 20"
+                if reason == "Git history depth 21 is more than the 20 generations this Envelope allows."
         ));
         Ok(())
     }
@@ -7013,7 +7126,7 @@ mod workflow_request_tests {
                 .as_ref()
                 .map(|value| value.as_str()),
             Some("60"),
-            "runtime enforcement still uses the Envelope ceiling and evidence must not claim otherwise"
+            "effective evidence records the Envelope's cumulative runtime allowance"
         );
 
         let definition: DirectTaskDefinition = serde_json::from_value(definition_json(Some("61")))
@@ -7027,7 +7140,7 @@ mod workflow_request_tests {
                 .map_err(|error| format!("evaluate runtime limit: {error:?}"))?
                 .counterexample()
                 .as_deref(),
-            Some("envelope exceeded: runtimeMinutesLimit requested 61 min, ceiling 60 min")
+            Some("Runtime allowance: requested 61 minutes, limit 60 minutes")
         );
         Ok(())
     }
@@ -7089,7 +7202,7 @@ mod workflow_request_tests {
         assert!(matches!(
             validate_workspace_policy(&config.workspace_policy, &policy, &scratch),
             Err(ApiError::Admission(ref reason))
-                if reason == "scratch size 4Gi exceeds the effective ceiling 2Gi"
+                if reason == "Scratch size 4 GiB is more than the 2 GiB this deployment allows."
         ));
 
         let narrower_authority: WorkspaceAuthority = serde_json::from_value(serde_json::json!({
@@ -7110,7 +7223,7 @@ mod workflow_request_tests {
         assert!(matches!(
             validate_workspace_policy(&config.workspace_policy, &narrower_policy, &one_gib),
             Err(ApiError::Admission(ref reason))
-                if reason == "This deployment provides scratch space in a fixed 2Gi volume, which is more than the 1Gi this Envelope allows."
+                if reason == "This deployment provides scratch space in a fixed 2 GiB volume, which is more than the 1 GiB this Envelope allows."
         ));
 
         let smaller_volume = TaskApiConfig::default().with_workspace_policy_json(Some(
@@ -7204,15 +7317,15 @@ mod workflow_request_tests {
         for (entry, expected) in [
             (
                 serde_json::json!({"git": {"limits": {"size": "3Gi"}}}),
-                "workspace size limit 3Gi exceeds the effective ceiling 2Gi",
+                "Workspace size limit 3 GiB is more than the 2 GiB this Envelope allows.",
             ),
             (
                 serde_json::json!({"git": {"limits": {"files": 101}}}),
-                "workspace file limit 101 exceeds the effective ceiling 100",
+                "Workspace file limit 101 is more than the 100 this Envelope allows.",
             ),
             (
                 serde_json::json!({"git": {"history": {"depth": 21}}}),
-                "history depth 21 exceeds the effective ceiling 20",
+                "Git history depth 21 is more than the 20 generations this Envelope allows.",
             ),
         ] {
             let entry: WorkspaceEntry =
@@ -7337,7 +7450,7 @@ mod workflow_request_tests {
         assert!(matches!(
             budget.consume_tree_read(&policy),
             Err(ApiError::Admission(ref reason))
-                if reason == "workspace tree read count 2 exceeds the effective ceiling 1"
+                if reason == "Workspace tree read count 2 is more than the 1 this deployment allows."
         ));
         let mut entry_count = 0;
         assert!(
@@ -7348,7 +7461,7 @@ mod workflow_request_tests {
         assert!(matches!(
             budget.consume_submodule(&mut entry_count, &policy, 1),
             Err(ApiError::Admission(ref reason))
-                if reason == "workspace submodule count 2 exceeds the effective ceiling 1"
+                if reason == "Workspace submodule count 2 is more than the 1 this deployment allows."
         ));
     }
 
@@ -7407,7 +7520,7 @@ mod workflow_request_tests {
         assert!(matches!(
             result,
             Err(ApiError::Admission(ref reason))
-                if reason == "workspace materialized size exceeds the effective ceiling 8 bytes"
+                if reason == "Workspace materialized size is more than the 8 bytes this Envelope allows."
         ));
         Ok(())
     }
@@ -7441,7 +7554,7 @@ mod workflow_request_tests {
         assert!(matches!(
             result,
             Err(ApiError::Admission(ref reason))
-                if reason == "workspace materialized size exceeds the effective ceiling 8 bytes"
+                if reason == "Workspace materialized size is more than the 8 bytes this Envelope allows."
         ));
         Ok(())
     }
@@ -7497,6 +7610,57 @@ mod workflow_request_tests {
             Err(ApiError::Admission(ref reason))
                 if reason == "The repository history has more than 20 generations, which is the limit this Envelope allows. Request a depth of 20 or less."
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_history_with_exactly_the_allowed_generations_is_accepted() -> Result<(), String> {
+        use sha2::{Digest, Sha256};
+        use steward_types::direct_package::{
+            ContentDigest, ResolvedWorkspaceEntry, WorkspaceAccess, WorkspaceGitHistory,
+            WorkspaceName, canonical_json_bytes,
+        };
+
+        let repository =
+            RepositoryUrl::parse("https://github.example.test/example-org/source.git")?;
+        let commit = ExactGitCommit::parse(format!("git:sha1:{}", "a".repeat(40)))?;
+        let entries = vec![ResolvedWorkspaceEntry::Git {
+            name: WorkspaceName::parse("source")?,
+            access: WorkspaceAccess::Copy,
+            repository,
+            repository_id: StableProviderId::parse("123")?,
+            repository_owner_id: StableProviderId::parse("456")?,
+            commit,
+            history: WorkspaceGitHistory::Full,
+            paths: Vec::new(),
+            submodules: Vec::new(),
+            max_materialized_bytes: 64,
+            content_digest: ContentDigest::parse(format!("steward:sha256:{}", "b".repeat(64)))?,
+        }];
+        let max_materialized_bytes = 64_u64;
+        let max_history_depth = 20_u32;
+        let digest = Sha256::digest(
+            canonical_json_bytes(&serde_json::json!({
+                "entries": &entries,
+                "maxMaterializedBytes": max_materialized_bytes,
+                "maxHistoryDepth": max_history_depth,
+            }))
+            .map_err(|error| error.to_string())?,
+        );
+        let evidence = WorkspaceEvidence {
+            entries,
+            max_materialized_bytes,
+            max_history_depth: Some(max_history_depth),
+            workspace_digest: ContentDigest::parse(format!("steward:sha256:{digest:x}"))?,
+        };
+        let config = TaskApiConfig {
+            direct_git_resolver: Some(Arc::new(CompleteHistoryPackResolver)),
+            ..TaskApiConfig::default()
+        };
+
+        prepare_task_input_archive(&config, b"caller", Some(&evidence))
+            .await
+            .map_err(|error| format!("accept repository at full-history limit: {error:?}"))?;
         Ok(())
     }
 

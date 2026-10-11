@@ -33,6 +33,9 @@ use crate::browser_auth::{
     BrowserAuthService, BrowserMutationProof, BrowserSessionBinding, BrowserSessionContext,
     protect_browser_routes,
 };
+#[cfg(test)]
+use crate::tasks::TaskApiConfig;
+use crate::tasks::WorkspaceDeploymentCapabilities;
 use crate::{
     AgentRunAvailability, AgentRunDataStatus, BoxFuture, DirectPackageGithubActionsWorkflowContext,
     ExecutionBindingAdvertisement, GithubActionsEnvelopeSelection, StewardRunRelease,
@@ -42,6 +45,7 @@ use crate::{
 };
 
 pub const ENVELOPE_REQUESTS_API_VERSION: &str = "steward.envelope-requests/v1";
+pub const USER_CAPABILITIES_API_VERSION: &str = "steward.user-capabilities/v1";
 pub const MAX_CUSTOM_ENVELOPE_SAFETY_CEILING_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +53,13 @@ pub struct UserEnvelopeSubject {
     pub canonical_user_id: CanonicalUserId,
     pub display_email: Email,
     pub member_roles: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UserCapabilitiesResponse {
+    pub api_version: String,
+    pub workspace: WorkspaceDeploymentCapabilities,
 }
 
 /// The session binding is opaque to the request domain. It is only used by a broker to bind
@@ -1065,6 +1076,7 @@ where
 pub(crate) struct UserEnvelopeState<P> {
     broker: P,
     agents: Vec<ExecutionBindingAdvertisement>,
+    workspace_capabilities: WorkspaceDeploymentCapabilities,
 }
 
 #[cfg(test)]
@@ -1076,12 +1088,30 @@ where
     inner_router_with_agents(broker, Vec::new())
 }
 
+#[cfg(test)]
 fn inner_router_with_agents<P, B>(broker: P, agents: Vec<ExecutionBindingAdvertisement>) -> Router
 where
     P: EnvelopeRequestBroker<B>,
     B: Clone + Eq + Hash + Send + Sync + 'static,
 {
+    inner_router_with_capabilities(
+        broker,
+        agents,
+        TaskApiConfig::default().workspace_deployment_capabilities(),
+    )
+}
+
+fn inner_router_with_capabilities<P, B>(
+    broker: P,
+    agents: Vec<ExecutionBindingAdvertisement>,
+    workspace_capabilities: WorkspaceDeploymentCapabilities,
+) -> Router
+where
+    P: EnvelopeRequestBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
     Router::new()
+        .route("/app/api/v1/capabilities", get(user_capabilities::<P, B>))
         .route(
             "/app/api/v1/envelope-templates",
             get(list_templates::<P, B>),
@@ -1103,7 +1133,39 @@ where
             post(render_repository_bundle_for_envelope::<P, B>),
         )
         .route("/app/api/v1/workflows", get(list_workflows::<P, B>))
-        .with_state(UserEnvelopeState { broker, agents })
+        .with_state(UserEnvelopeState {
+            broker,
+            agents,
+            workspace_capabilities,
+        })
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "getUserCapabilities",
+    path = "/app/api/v1/capabilities",
+    responses(
+        (status = 200, body = UserCapabilitiesResponse),
+        (status = 401, description = "Browser session is absent or invalid")
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn user_capabilities<P, B>(
+    session: Option<Extension<UserEnvelopeSession<B>>>,
+    State(state): State<UserEnvelopeState<P>>,
+) -> Response
+where
+    P: EnvelopeRequestBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    if session.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(UserCapabilitiesResponse {
+        api_version: USER_CAPABILITIES_API_VERSION.to_owned(),
+        workspace: state.workspace_capabilities,
+    })
+    .into_response()
 }
 
 #[utoipa::path(
@@ -1144,12 +1206,13 @@ where
 pub fn protected_router<P>(
     broker: P,
     agents: Vec<ExecutionBindingAdvertisement>,
+    workspace_capabilities: WorkspaceDeploymentCapabilities,
     browser_auth: BrowserAuthService,
 ) -> Router
 where
     P: EnvelopeRequestBroker<BrowserSessionBinding>,
 {
-    let routes = inner_router_with_agents(broker, agents)
+    let routes = inner_router_with_capabilities(broker, agents, workspace_capabilities)
         .route_layer(middleware::from_fn(adapt_browser_context));
     protect_browser_routes(routes, browser_auth)
 }
@@ -1727,7 +1790,7 @@ mod tests {
         EnvelopeRequestField, EnvelopeRequestStatus, EnvelopeReviewBoundaryError,
         PublishedWorkflowOption, UserEnvelopeMutationProof, UserEnvelopeRequest,
         UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest, envelope_usage_view,
-        inner_router, inner_router_with_agents,
+        inner_router, inner_router_with_agents, inner_router_with_capabilities,
     };
     use crate::connections::{
         ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionStartOperation,
@@ -2052,6 +2115,73 @@ mod tests {
             .map_err(|error| format!("parse workflow catalog response: {error}"))?;
         assert_eq!(response["agents"][0]["agentRef"], "codex@0.140.0");
         assert_eq!(response["agents"][0]["displayName"], "Codex 0.140.0");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deployment_workspace_capabilities_require_a_signed_in_user() -> Result<(), String> {
+        let response = inner_router_with_capabilities(
+            TestBroker::default(),
+            Vec::new(),
+            crate::tasks::TaskApiConfig::default().workspace_deployment_capabilities(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/capabilities")
+                .body(Body::empty())
+                .map_err(|error| format!("build unauthenticated capabilities request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("request unauthenticated capabilities: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signed_in_users_can_read_deployment_workspace_capabilities() -> Result<(), String> {
+        let workspace = crate::tasks::TaskApiConfig::default()
+            .with_workspace_policy_json(Some(
+                &serde_json::json!({
+                    "enabledTypes": ["git"],
+                    "maxTotalSize": "3Gi",
+                    "scratchVolumeSize": "2Gi",
+                    "maxFiles": 321,
+                    "maxHistoryDepth": 42,
+                    "maxSubmoduleDepth": 3,
+                    "maxSubmodulesPerEntry": 7,
+                    "maxTotalSubmodules": 9,
+                    "maxTreeReads": 11
+                })
+                .to_string(),
+            ))?
+            .workspace_deployment_capabilities();
+        let response = inner_router_with_capabilities(TestBroker::default(), Vec::new(), workspace)
+            .layer(axum::Extension(session()?))
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/capabilities")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build user capabilities request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request user capabilities: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read user capabilities response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse user capabilities response: {error}"))?;
+        assert_eq!(body["apiVersion"], "steward.user-capabilities/v1");
+        assert_eq!(
+            body["workspace"]["enabledTypes"],
+            serde_json::json!(["git"])
+        );
+        assert_eq!(
+            body["workspace"]["maxTotalBytes"],
+            3 * 1024 * 1024 * 1024_u64
+        );
+        assert_eq!(body["workspace"]["maxHistoryDepth"], 42);
         Ok(())
     }
 
