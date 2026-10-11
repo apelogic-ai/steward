@@ -10,12 +10,14 @@ inverts the usual instinct about a failing test.
    adding a skip, not by narrowing the input. If a test that passed now fails,
    upstream behaviour changed, and that is the most valuable signal this
    repository produces.
-   Root §4 applies here with one adaptation: a red test in this directory is
-   *resolved* by a filed finding and a recorded decision, not by becoming green.
+   Root "Red tests" applies here with one adaptation: a red test in this
+   directory is *resolved* by a filed finding and a recorded decision, not by
+   becoming green.
    Resolved and red is fine. Red and silent is not.
 2. **On red:** file it against its G-number, update the register's status column
    if the guarantee genuinely changed, and escalate. Then decide — hold the pin,
-   carry a patch (with an upstream attempt, per root §10), or amend what we sell.
+   carry a patch (with an upstream attempt, per root "Upstream dependencies and
+   conformance"), or amend what we sell.
 3. **Every test maps to exactly one register entry — structurally.** One module
    per guarantee, `tests/g<N>_<slug>.rs`, matching `module` in `register.toml`.
    A test can only live in one file, so the mapping cannot rot. A module with no
@@ -49,7 +51,8 @@ inverts the usual instinct about a failing test.
    can never raise one. Raising a claim is a deliberate edit with an author and
    a diff. See `docs/guarantee-register-generation.md`.
 
-10. **These rules are not editable by an agent either.** Root §13 applies to
-    this file, and specifically to the temptation it describes: if an assertion
-    here will not pass, the assertion is the message. Do not edit rule 1.
+10. **These rules are not editable by an agent either.** Root "Authority and
+    rule changes" applies to this file, and specifically to the temptation it
+    describes: if an assertion here will not pass, the assertion is the
+    message. Do not edit rule 1.
 <!-- END:conformance-agent-rules -->

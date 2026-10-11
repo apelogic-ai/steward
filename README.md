@@ -68,9 +68,9 @@ records the limits of this tested matrix.
 ```
 AGENTS.md                     the working agreement — read before changing anything
 CLAUDE.md                     → @AGENTS.md
-.gitignore                    matches §11.1, §5, §1.4
+.gitignore                    matches "Secrets and confidential information", "Test environments", "Worktrees"
 Cargo.toml                    Rust workspace
-deny.toml                     the §8 layering rule, mechanically
+deny.toml                     the vendor layering rule, mechanically
 
 bins/
   steward-apiserver/          API composition root
