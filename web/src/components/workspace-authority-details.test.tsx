@@ -25,3 +25,12 @@ test("workspace types and limits come from the API value", () => {
 test("an absent workspace is explicit", () => {
   expect(renderToStaticMarkup(<WorkspaceAuthorityDetails workspace={null} />)).toContain("No workspace access");
 });
+
+test("omitted legacy limits defer to the deployment", () => {
+  const workspace: WorkspaceAuthority = { allowedTypes: ["git"] };
+
+  const html = renderToStaticMarkup(<WorkspaceAuthorityDetails workspace={workspace} />);
+
+  expect(html.match(/Deployment limit/g)).toHaveLength(4);
+  expect(html).not.toContain("undefined");
+});

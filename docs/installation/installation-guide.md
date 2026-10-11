@@ -203,8 +203,9 @@ web or apiserver image rebuild is needed.
 Set the chart's top-level `workspace` values to choose the enabled `git` and `scratch`
 entry types and the deployment ceilings for total bytes, files, Git history depth, and
 submodule recursion, submodule fan-out, and tree reads. `scratchVolumeSize` is the
-filesystem-enforced scratch capacity supplied by OpenShell; a Task may request no more
-than that capacity.
+filesystem-enforced scratch capacity supplied by OpenShell and must match the sandbox
+platform's default workspace storage size; a Task may request no more than that
+capacity.
 Git workspaces use only repositories admitted by stable ID in `githubSource.bindings`.
 Steward fetches exact objects through the source GitHub App, strips credentials and
 remotes before the agent starts, and records the pinned commit in Task evidence.

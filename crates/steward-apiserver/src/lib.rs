@@ -491,6 +491,8 @@ pub struct GrantRevocationRequest {
         browser_admin::BrowserFederatedSubjectAuditResponse,
         browser_admin::AssociateFederatedSubjectBody,
         browser_admin::DisableFederatedSubjectBody,
+        browser_admin::BrowserCapabilityCatalogResponse,
+        tasks::WorkspaceDeploymentCapabilities,
         browser_members::BrowserMemberView,
         browser_members::BrowserMemberIdentityView,
         browser_members::BrowserMemberDetailView,
@@ -5045,6 +5047,31 @@ mod tests {
                 "{schema} must preserve historical threshold reads"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn admin_capabilities_openapi_publishes_deployment_workspace_limits() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        assert_eq!(
+            document.pointer(
+                "/paths/~1admin~1api~1v1~1capabilities/get/responses/200/content/application~1json/schema/$ref"
+            ),
+            Some(&serde_json::json!(
+                "#/components/schemas/BrowserCapabilityCatalogResponse"
+            )),
+            "the capabilities route must publish its workspace-aware response"
+        );
+        assert_eq!(
+            document.pointer(
+                "/components/schemas/BrowserCapabilityCatalogResponse/allOf/1/properties/workspace/oneOf/1/$ref"
+            ),
+            Some(&serde_json::json!(
+                "#/components/schemas/WorkspaceDeploymentCapabilities"
+            )),
+            "generated clients must receive the deployment workspace limits"
+        );
         Ok(())
     }
 

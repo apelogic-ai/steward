@@ -229,12 +229,13 @@ pub struct CapabilityCatalog {
     pub catalogs: Vec<CapabilityProviderCatalog>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct BrowserCapabilityCatalogResponse {
+pub(crate) struct BrowserCapabilityCatalogResponse {
     #[serde(flatten)]
     catalog: CapabilityCatalog,
-    workspace: WorkspaceDeploymentCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<WorkspaceDeploymentCapabilities>,
 }
 
 impl CapabilityCatalog {
@@ -1010,7 +1011,7 @@ where
     operation_id = "getAdminCapabilities",
     path = "/admin/api/v1/capabilities",
     responses(
-        (status = 200, body = CapabilityCatalog),
+        (status = 200, body = BrowserCapabilityCatalogResponse),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Administrator role is required")
     ),
@@ -1025,14 +1026,11 @@ where
     L: AdmissionLedger,
     D: DecisionChannel + Clone,
 {
-    match state.workspace_capabilities {
-        Some(workspace) => Json(BrowserCapabilityCatalogResponse {
-            catalog: state.capabilities,
-            workspace,
-        })
-        .into_response(),
-        None => Json(state.capabilities).into_response(),
-    }
+    Json(BrowserCapabilityCatalogResponse {
+        catalog: state.capabilities,
+        workspace: state.workspace_capabilities,
+    })
+    .into_response()
 }
 
 #[utoipa::path(
