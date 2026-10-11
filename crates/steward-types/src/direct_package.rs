@@ -78,6 +78,73 @@ validated_string!(ResourceQuantity, valid_resource_quantity);
 validated_string!(WorkspaceName, valid_workspace_name);
 validated_string!(WorkspacePath, valid_workspace_path);
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, utoipa::ToSchema)]
+#[serde(transparent)]
+pub struct WorkspaceGitRepositoryName(String);
+
+impl WorkspaceGitRepositoryName {
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        let normalized = value
+            .strip_prefix("https://github.com/")
+            .map(|path| path.strip_suffix(".git").unwrap_or(path))
+            .unwrap_or(&value);
+        if valid_workspace_git_repository_name(normalized) {
+            Ok(Self(normalized.to_owned()))
+        } else {
+            Err("WorkspaceGitRepositoryName is invalid".to_owned())
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceGitRepositoryName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, utoipa::ToSchema)]
+#[serde(transparent)]
+pub struct WorkspaceGitNamedRef(String);
+
+impl WorkspaceGitNamedRef {
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        let normalized = if value.starts_with("git:ref:") {
+            value
+        } else if value.starts_with("git:") {
+            return Err("WorkspaceGitNamedRef is invalid".to_owned());
+        } else {
+            format!("git:ref:{value}")
+        };
+        if valid_git_ref(&normalized) {
+            Ok(Self(normalized))
+        } else {
+            Err("WorkspaceGitNamedRef is invalid".to_owned())
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkspaceGitNamedRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 fn valid_repository_url(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("https://") else {
         return false;
@@ -235,6 +302,27 @@ fn valid_bounded_ref(value: &str) -> bool {
         && value.len() <= 2048
         && value.trim() == value
         && !value.chars().any(char::is_control)
+}
+
+fn valid_workspace_git_repository_name(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 512
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let mut components = value.split('/');
+    let valid_component = |component: &str| {
+        !component.is_empty()
+            && !matches!(component, "." | "..")
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    };
+    components.next().is_some_and(valid_component)
+        && components.next().is_some_and(valid_component)
+        && components.next().is_none()
 }
 
 fn valid_decimal(value: &str) -> bool {
@@ -995,6 +1083,7 @@ pub enum WorkspaceAccess {
 pub enum WorkspaceGitRepository {
     #[default]
     SelfRepository,
+    Named(WorkspaceGitRepositoryName),
     Explicit(WorkspaceGitRepositoryIdentity),
 }
 
@@ -1005,6 +1094,7 @@ impl Serialize for WorkspaceGitRepository {
     {
         match self {
             Self::SelfRepository => serializer.serialize_str("self"),
+            Self::Named(name) => serializer.serialize_str(name.as_str()),
             Self::Explicit(identity) => identity.serialize(serializer),
         }
     }
@@ -1018,6 +1108,11 @@ impl<'de> Deserialize<'de> for WorkspaceGitRepository {
         let value = serde_json::Value::deserialize(deserializer)?;
         if value == serde_json::Value::String("self".to_owned()) {
             return Ok(Self::SelfRepository);
+        }
+        if let Some(value) = value.as_str() {
+            return WorkspaceGitRepositoryName::parse(value)
+                .map(Self::Named)
+                .map_err(serde::de::Error::custom);
         }
         serde_json::from_value(value)
             .map(Self::Explicit)
@@ -1037,6 +1132,7 @@ pub enum WorkspaceGitRef {
     #[default]
     Trigger,
     Exact(ExactGitCommit),
+    Named(WorkspaceGitNamedRef),
 }
 
 impl Serialize for WorkspaceGitRef {
@@ -1047,6 +1143,7 @@ impl Serialize for WorkspaceGitRef {
         match self {
             Self::Trigger => serializer.serialize_str("trigger"),
             Self::Exact(commit) => serializer.serialize_str(commit.as_str()),
+            Self::Named(reference) => serializer.serialize_str(reference.as_str()),
         }
     }
 }
@@ -1059,9 +1156,13 @@ impl<'de> Deserialize<'de> for WorkspaceGitRef {
         let value = String::deserialize(deserializer)?;
         if value == "trigger" {
             Ok(Self::Trigger)
-        } else {
+        } else if value.starts_with("git:sha1:") {
             ExactGitCommit::parse(value)
                 .map(Self::Exact)
+                .map_err(serde::de::Error::custom)
+        } else {
+            WorkspaceGitNamedRef::parse(value)
+                .map(Self::Named)
                 .map_err(serde::de::Error::custom)
         }
     }

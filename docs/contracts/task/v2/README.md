@@ -104,14 +104,27 @@ credentials. Each item is exactly one of `{"git": {...}}` or
 `{"scratch": {...}}` and is materialized beneath `/sandbox/workspace/<name>` before
 the agent starts. Omitting `workspace` preserves the prior runtime behavior.
 
-A Git entry identifies `"self"` or an explicit stable owner/repository ID pair. Its
-`ref` is `"trigger"` or an exact `git:sha1:<40-hex>` commit, and `history` is
-`"none"`, `{"depth": N}`, or `"full"` when deployment and Envelope policy permit
-it. Optional `paths` select a sparse working tree. Submodules are disabled by default;
-`mode: admitted` permits only source-App-installed repositories admitted by stable ID,
-always at the parent gitlink commit. Required submodules fail admission if they cannot
-be materialized. `read-only` is the default; `copy` is writable but has no remote or
-credential, so changes leave only through declared outputs.
+A Git entry normally identifies a repository by its familiar `owner/repository` name:
+
+```json
+{"git":{"repository":"example-org/repository","ref":"main"}}
+```
+
+A full `https://github.com/example-org/repository` link is accepted and normalized to
+the same name. `"self"` and the older `{"ownerId":"…","repositoryId":"…"}` form
+remain accepted without changing their canonical bytes. A named repository is resolved
+through the source GitHub App at admission, checked against admitted stable IDs, and
+then pinned to one exact commit in evidence.
+
+`ref` accepts an ordinary branch or tag name, its explicit `git:ref:<name>` form,
+`"trigger"`, or an exact `git:sha1:<40-hex>` commit. Named refs are resolved before
+runtime reservation. `history` is `"none"`, `{"depth": N}`, or `"full"` when
+deployment and Envelope policy permit it. Optional `paths` select a sparse working
+tree. Submodules are disabled by default; `mode: admitted` permits only source-App-
+installed repositories admitted by stable ID, always at the parent gitlink commit.
+Required submodules fail admission if they cannot be materialized. `read-only` is the
+default; `copy` is writable but has no remote or credential, so changes leave only
+through declared outputs.
 
 A scratch entry is an empty writable directory with a requested size. Deployment,
 Envelope, and per-entry limits are intersected before any runtime is created. Steward

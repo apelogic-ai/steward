@@ -7,8 +7,9 @@ use steward_types::direct_package::{
     AgentRef, ContentDigest, Decimal, DirectTaskBindingEvidence, DirectTaskDefinition,
     DirectTaskStatusResponse, DirectTaskSubmission, Duration, ExactGitCommit, ExecutionLogMode,
     InstructionSkill, InvocationManifest, PackageClosure, RelativePath, RepositoryUrl,
-    SOURCE_PROVENANCE_JWT_CLAIM, Slug, SourceProvenance, StableProviderId, Uuid, WorkspaceName,
-    WorkspacePath, canonical_json_bytes,
+    SOURCE_PROVENANCE_JWT_CLAIM, Slug, SourceProvenance, StableProviderId, Uuid,
+    WorkspaceGitNamedRef, WorkspaceGitRepositoryName, WorkspaceName, WorkspacePath,
+    canonical_json_bytes,
 };
 
 const CONTRACT_ROOT: &str = "../../docs/contracts/task/v2";
@@ -282,6 +283,17 @@ fn matches_schema_pattern(pattern: &str, value: &str) -> Result<bool, String> {
         "^[a-z0-9-]{1,40}$" => WorkspaceName::parse(value).is_ok(),
         "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*/?$" => {
             WorkspacePath::parse(value).is_ok()
+        }
+        "^(?:(?!\\.{1,2}/)(?![A-Za-z0-9._-]+/\\.{1,2}$)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+|https://github\\.com/(?!\\.{1,2}/)(?![A-Za-z0-9._-]+/(?:\\.{1,2}|\\.git|\\.{1,2}\\.git)$)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\\.git)?)$" => {
+            WorkspaceGitRepositoryName::parse(value).is_ok()
+        }
+        "^(?!trigger$)(?!git:)(?!-)(?!.*(?:\\.\\.|\\x40\\{|\\\\|[\\u0000-\\u0020\\u007F]))(?!.*\\/$).+$" => {
+            value != "trigger"
+                && !value.starts_with("git:")
+                && WorkspaceGitNamedRef::parse(value).is_ok()
+        }
+        "^git:ref:(?!-)(?!.*(?:\\.\\.|\\x40\\{|\\\\|[\\u0000-\\u0020\\u007F]))(?!.*\\/$).+$" => {
+            value.starts_with("git:ref:") && WorkspaceGitNamedRef::parse(value).is_ok()
         }
         "^\\S(?:.*\\S)?$" => {
             !value.is_empty()
@@ -592,7 +604,77 @@ fn task_definition_accepts_typed_workspace_entries() -> Result<(), String> {
     validate_schema_instance(&schema, definition_schema, &definition, "$task")?;
     let definition: DirectTaskDefinition = serde_json::from_value(definition)
         .map_err(|error| format!("workspace TaskDefinition must parse: {error}"))?;
-    definition.validate()
+    definition.validate()?;
+    let serialized = serde_json::to_value(definition)
+        .map_err(|error| format!("workspace TaskDefinition must serialize: {error}"))?;
+    assert_eq!(
+        serialized.pointer("/workspace/1/git/repository"),
+        Some(&serde_json::json!({
+            "ownerId": "1000001",
+            "repositoryId": "2000001"
+        })),
+        "the existing stable-ID wire form must remain byte-shape compatible"
+    );
+    Ok(())
+}
+
+#[test]
+fn task_definition_accepts_named_workspace_repositories_and_refs() -> Result<(), String> {
+    let schema = parse_value("schemas/direct-package.schema.json")?;
+    let definition_schema = schema
+        .pointer("/$defs/taskDefinition")
+        .ok_or_else(|| "TaskDefinition schema must exist".to_owned())?;
+
+    for (repository, git_ref, normalized_repository, normalized_ref) in [
+        (
+            "example-org/repository",
+            "main",
+            "example-org/repository",
+            "git:ref:main",
+        ),
+        (
+            "https://github.com/example-org/repository",
+            "git:ref:release-v1",
+            "example-org/repository",
+            "git:ref:release-v1",
+        ),
+        (
+            "example-org/repository",
+            "v1.2.3",
+            "example-org/repository",
+            "git:ref:v1.2.3",
+        ),
+    ] {
+        let definition = serde_json::json!({
+            "schemaVersion": "steward.task-definition/v2",
+            "name": "repository-review",
+            "version": 1,
+            "runtime": { "agentRef": "example-agent@1.2.3" },
+            "promptText": "Review the repository and write out/report.md.",
+            "workspace": [{
+                "git": {
+                    "repository": repository,
+                    "ref": git_ref
+                }
+            }],
+            "outputs": [{ "path": "out", "kind": "directory", "required": true }]
+        });
+        validate_schema_instance(&schema, definition_schema, &definition, "$task")?;
+        let definition: DirectTaskDefinition = serde_json::from_value(definition)
+            .map_err(|error| format!("named workspace TaskDefinition must parse: {error}"))?;
+        definition.validate()?;
+        let serialized = serde_json::to_value(definition)
+            .map_err(|error| format!("named workspace TaskDefinition must serialize: {error}"))?;
+        assert_eq!(
+            serialized.pointer("/workspace/0/git/repository"),
+            Some(&serde_json::json!(normalized_repository))
+        );
+        assert_eq!(
+            serialized.pointer("/workspace/0/git/ref"),
+            Some(&serde_json::json!(normalized_ref))
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -617,6 +699,16 @@ fn task_definition_rejects_malformed_workspace_entries() -> Result<(), String> {
         serde_json::json!([{ "artifact": {} }]),
         serde_json::json!([{ "git": {}, "scratch": { "size": "1Gi" } }]),
         serde_json::json!([{ "git": { "history": { "depth": 0 } } }]),
+        serde_json::json!([{ "git": { "repository": "example-org" } }]),
+        serde_json::json!([{ "git": { "repository": "example-org/repository/extra" } }]),
+        serde_json::json!([{ "git": { "repository": "https://github.com/example-org/repository/extra" } }]),
+        serde_json::json!([{ "git": { "repository": "../repository" } }]),
+        serde_json::json!([{ "git": { "repository": "example-org/.." } }]),
+        serde_json::json!([{ "git": { "repository": "https://github.com/example-org/.git" } }]),
+        serde_json::json!([{ "git": { "ref": "git:branch:main" } }]),
+        serde_json::json!([{ "git": { "ref": "refs/heads/../secret" } }]),
+        serde_json::json!([{ "git": { "ref": "-main" } }]),
+        serde_json::json!([{ "git": { "ref": "release/" } }]),
         serde_json::json!([{ "scratch": {} }]),
     ] {
         let definition = definition_with(workspace);

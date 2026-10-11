@@ -46,8 +46,8 @@ use steward_types::direct_package::{
     ResolvedWorkspaceEntry, ResolvedWorkspaceSubmodule, SourceProvenance, StableProviderId,
     TASK_BINDING_EVIDENCE_SCHEMA, TaskOrigin, TriggerRepository, WorkspaceAuthority,
     WorkspaceEntry, WorkspaceEntryType, WorkspaceEvidence, WorkspaceGitHistory,
-    WorkspaceGitRepository, WorkspaceName, WorkspacePath, WorkspaceSubmoduleMode,
-    WorkspaceSubmoduleStatus, canonical_json_bytes,
+    WorkspaceGitRepository, WorkspaceGitRepositoryName, WorkspaceName, WorkspacePath,
+    WorkspaceSubmoduleMode, WorkspaceSubmoduleStatus, canonical_json_bytes,
 };
 use steward_types::task_input_archive::{frame_task_input_archive, split_task_input_archive};
 use steward_types::task_output_archive::{
@@ -193,6 +193,11 @@ trait DirectGitResolver: Send + Sync {
     fn resolve_repository<'a>(
         &'a self,
         repository: &'a steward_types::direct_package::RepositoryUrl,
+    ) -> BoxFuture<'a, Result<GitRepositoryIdentity, steward_ports::PortError>>;
+
+    fn resolve_repository_name<'a>(
+        &'a self,
+        repository: &'a WorkspaceGitRepositoryName,
     ) -> BoxFuture<'a, Result<GitRepositoryIdentity, steward_ports::PortError>>;
 
     fn read_file<'a>(
@@ -346,6 +351,13 @@ where
         repository: &'a steward_types::direct_package::RepositoryUrl,
     ) -> BoxFuture<'a, Result<GitRepositoryIdentity, steward_ports::PortError>> {
         Box::pin(GitHostingPlane::resolve_repository(self, repository))
+    }
+
+    fn resolve_repository_name<'a>(
+        &'a self,
+        repository: &'a WorkspaceGitRepositoryName,
+    ) -> BoxFuture<'a, Result<GitRepositoryIdentity, steward_ports::PortError>> {
+        Box::pin(GitHostingPlane::resolve_repository_name(self, repository))
     }
 
     fn read_file<'a>(
@@ -3117,12 +3129,28 @@ where
                         "workspace_git_source_resolver_unavailable".to_owned(),
                     )
                 })?;
-                let (repository, is_self) = match &entry.git.repository {
+                let (repository, is_self, requested_name) = match &entry.git.repository {
                     WorkspaceGitRepository::SelfRepository => (
                         context.self_repository.cloned().ok_or_else(|| {
                             ApiError::Admission("workspace_git_self_unavailable".to_owned())
                         })?,
                         true,
+                        None,
+                    ),
+                    WorkspaceGitRepository::Named(name) => (
+                        git.resolve_repository_name(name).await.map_err(|error| {
+                            let _ = source_port_error_with_reporter(
+                                config,
+                                "resolve_repository_name",
+                                error,
+                            );
+                            ApiError::Admission(format!(
+                                "workspace_git_repository_unresolved: {}",
+                                name.as_str()
+                            ))
+                        })?,
+                        false,
+                        Some(name.as_str()),
                     ),
                     WorkspaceGitRepository::Explicit(reference) => {
                         let reference = GitRepositoryReference {
@@ -3134,6 +3162,7 @@ where
                                 .await?
                                 .0,
                             false,
+                            None,
                         )
                     }
                 };
@@ -3147,9 +3176,11 @@ where
                     )
                     .await?
                 {
-                    return Err(ApiError::Admission(
-                        "workspace_git_repository_not_admitted".to_owned(),
-                    ));
+                    let reason = requested_name.map_or_else(
+                        || "workspace_git_repository_not_admitted".to_owned(),
+                        |name| format!("workspace_git_repository_not_admitted: {name}"),
+                    );
+                    return Err(ApiError::Admission(reason));
                 }
                 let (_, description) = describe_workspace_repository(
                     git.as_ref(),
@@ -3165,6 +3196,15 @@ where
                 };
                 let commit = match &entry.git.git_ref {
                     steward_types::direct_package::WorkspaceGitRef::Exact(commit) => commit.clone(),
+                    steward_types::direct_package::WorkspaceGitRef::Named(reference) => git
+                        .resolve_revision(&GitRevisionRequest {
+                            repository: repository.clone(),
+                            reference: reference.as_str().to_owned(),
+                        })
+                        .await
+                        .map_err(|error| {
+                            source_port_error_with_reporter(config, "resolve_revision", error)
+                        })?,
                     steward_types::direct_package::WorkspaceGitRef::Trigger
                         if is_self && context.trigger_commit.is_some() =>
                     {
@@ -6035,6 +6075,13 @@ mod workflow_request_tests {
         fn resolve_repository<'a>(
             &'a self,
             _repository: &'a RepositoryUrl,
+        ) -> futures::future::BoxFuture<'a, Result<GitRepositoryIdentity, PortError>> {
+            Box::pin(async { Err(PortError::Unsupported { operation: "test" }) })
+        }
+
+        fn resolve_repository_name<'a>(
+            &'a self,
+            _repository: &'a steward_types::direct_package::WorkspaceGitRepositoryName,
         ) -> futures::future::BoxFuture<'a, Result<GitRepositoryIdentity, PortError>> {
             Box::pin(async { Err(PortError::Unsupported { operation: "test" }) })
         }

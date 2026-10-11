@@ -6,7 +6,7 @@ use futures::Stream;
 
 use steward_types::direct_package::{
     DiagnosticsRequest, ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
-    WorkspaceEvidence,
+    WorkspaceEvidence, WorkspaceGitRepositoryName,
 };
 
 /// One safe, provider-neutral path from a Git tree.
@@ -674,6 +674,21 @@ pub trait GitHostingPlane: Send + Sync + 'static {
         &self,
         repository: &RepositoryUrl,
     ) -> impl Future<Output = Result<GitRepositoryIdentity, PortError>> + Send;
+
+    /// Resolves one human-facing `owner/repository` name to its current stable identity.
+    ///
+    /// Implementations own provider-specific origins and authentication. Callers must authorize
+    /// the returned stable identifiers before reading repository content.
+    fn resolve_repository_name(
+        &self,
+        _repository: &WorkspaceGitRepositoryName,
+    ) -> impl Future<Output = Result<GitRepositoryIdentity, PortError>> + Send {
+        async {
+            Err(PortError::Unsupported {
+                operation: "resolve_repository_name",
+            })
+        }
+    }
 
     fn read_file(
         &self,

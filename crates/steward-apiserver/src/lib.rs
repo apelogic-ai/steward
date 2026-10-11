@@ -4160,6 +4160,16 @@ mod tests {
                 })
         }
 
+        async fn resolve_repository_name(
+            &self,
+            repository: &steward_types::direct_package::WorkspaceGitRepositoryName,
+        ) -> Result<GitRepositoryIdentity, PortError> {
+            let repository =
+                RepositoryUrl::parse(format!("https://github.com/{}.git", repository.as_str()))
+                    .map_err(|reason| PortError::Failed { reason })?;
+            self.resolve_repository(&repository).await
+        }
+
         async fn read_file(&self, request: &GitFileRequest) -> Result<GitFile, PortError> {
             let key = (
                 request.repository.repository.as_str().to_owned(),
@@ -13683,6 +13693,197 @@ mod tests {
             _ => return Err("explicit workspace evidence was not a Git entry".to_owned()),
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_resolves_admitted_repository_and_ref_by_name() -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "repository": "example-org/agentic-ops",
+                "ref": "main",
+                "history": {"depth": 5},
+                "access": "copy"
+            }
+        }]);
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-named-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "contractVersion": "steward.task/v2",
+                            "invocationPath": ".steward/tasks/release-summary.json",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build direct workspace request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit direct workspace request: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let task_uid = {
+            let tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            let task = tasks
+                .first()
+                .ok_or_else(|| "named workspace Task was not persisted".to_owned())?;
+            let entry = task
+                .direct_task_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.workspace.as_ref())
+                .and_then(|workspace| workspace.entries.first())
+                .ok_or_else(|| "named workspace evidence was not persisted".to_owned())?;
+            match entry {
+                steward_types::direct_package::ResolvedWorkspaceEntry::Git {
+                    repository,
+                    repository_owner_id,
+                    repository_id,
+                    commit,
+                    ..
+                } => {
+                    assert_eq!(
+                        repository.as_str(),
+                        "https://github.com/example-org/agentic-ops.git"
+                    );
+                    assert_eq!(repository_owner_id.as_str(), "7890");
+                    assert_eq!(repository_id.as_str(), "654321");
+                    assert_eq!(commit.as_str(), format!("git:sha1:{}", "c".repeat(40)));
+                }
+                _ => return Err("named workspace evidence was not a Git entry".to_owned()),
+            }
+            task.task_uid
+        };
+
+        let upload = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/tasks/{task_uid}/inputs"))
+                    .header("authorization", "Bearer github-assertion")
+                    .header("content-type", "application/x-tar")
+                    .body(Body::from("caller-authored-tar"))
+                    .map_err(|error| format!("build named workspace input upload: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("upload named workspace inputs: {error}"))?;
+        assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+        let stored = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake Task ledger lock was poisoned")?[0]
+            .input_archive
+            .clone()
+            .ok_or_else(|| "named workspace input frame was not stored".to_owned())?;
+        let material = steward_types::task_input_archive::split_task_input_archive(&stored)
+            .map_err(|error| format!("split named workspace input frame: {error:?}"))?
+            .workspace_archive
+            .ok_or_else(|| "named workspace material was not framed separately".to_owned())?;
+        let header = material
+            .get(..512)
+            .ok_or_else(|| "named workspace manifest header was truncated".to_owned())?;
+        assert_eq!(&header[..14], b"manifest.json\0");
+        let manifest_size = std::str::from_utf8(&header[124..136])
+            .map_err(|error| format!("parse named workspace manifest size: {error}"))?
+            .trim_matches(['\0', ' ']);
+        let manifest_size = usize::from_str_radix(manifest_size, 8)
+            .map_err(|error| format!("decode named workspace manifest size: {error}"))?;
+        let manifest: steward_types::direct_package::WorkspaceEvidence = serde_json::from_slice(
+            material
+                .get(512..512 + manifest_size)
+                .ok_or_else(|| "named workspace manifest was truncated".to_owned())?,
+        )
+        .map_err(|error| format!("parse named workspace manifest: {error}"))?;
+        let manifest_entry = manifest
+            .entries
+            .first()
+            .ok_or_else(|| "named workspace manifest omitted its entry".to_owned())?;
+        match manifest_entry {
+            steward_types::direct_package::ResolvedWorkspaceEntry::Git {
+                repository_owner_id,
+                repository_id,
+                commit,
+                ..
+            } => {
+                assert_eq!(repository_owner_id.as_str(), "7890");
+                assert_eq!(repository_id.as_str(), "654321");
+                assert_eq!(commit.as_str(), format!("git:sha1:{}", "c".repeat(40)));
+            }
+            _ => return Err("named workspace manifest entry was not Git".to_owned()),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_rejects_unadmitted_repository_name_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "repository": "example-org/foreign",
+                "ref": "main"
+            }
+        }]);
+        let mut git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let foreign = RepositoryUrl::parse("https://github.com/example-org/foreign.git")?;
+        Arc::make_mut(&mut git.repositories).insert(
+            foreign.as_str().to_owned(),
+            GitRepositoryIdentity {
+                repository: foreign,
+                repository_id: StableProviderId::parse("9991")?,
+                repository_owner_id: StableProviderId::parse("9990")?,
+            },
+        );
+        let app = direct_test_app(ledger.clone(), git)?;
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-workspace-unadmitted-name",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_git_repository_not_admitted: example-org/foreign",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn direct_workspace_reports_unresolved_repository_name_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        authorize_direct_source(&ledger)?;
+        let mut definition = direct_definition_no_skills()?;
+        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "repository": "example-org/missing",
+                "ref": "main"
+            }
+        }]);
+        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+        let app = direct_test_app(ledger.clone(), git)?;
+        assert_direct_rejection_before_reservation(
+            &ledger,
+            app,
+            "direct-workspace-unresolved-name",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_git_repository_unresolved: example-org/missing",
+        )
+        .await
     }
 
     #[tokio::test]
