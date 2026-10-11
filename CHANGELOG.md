@@ -9,6 +9,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- TaskDefinition v2 Git workspaces may identify an already-admitted repository
+  by its case-insensitive `owner/repository` name or by an HTTPS link on the
+  configured source host. Steward resolves only operator-bound stable IDs,
+  records the provider's canonical identity and exact commit, and reuses that
+  snapshot on idempotent retries.
 - Envelope Templates now have one boundary: requests within the published
   limits provision automatically, while requests above those limits enter the
   administrator approval queue when they remain within the deployment safety

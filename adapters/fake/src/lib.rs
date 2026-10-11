@@ -10,7 +10,7 @@ use steward_ports::{
     SessionEvent, SessionRelay, StreamGranularity, SvidAssertion, SvidValidationError,
     ToolCapabilities, ToolPlane, ValidatedWorkload, WorkloadIdentity,
 };
-use steward_types::direct_package::{RepositoryUrl, StableProviderId, WorkspaceGitRepositoryName};
+use steward_types::direct_package::{RepositoryUrl, StableProviderId};
 use steward_types::{RuntimeId, SpendSummary};
 
 pub const IMPLEMENTED_PORTS: [&str; 8] = [
@@ -174,16 +174,6 @@ impl GitHostingPlane for FakeAdapter {
             repository_owner_id: StableProviderId::parse("1000")
                 .map_err(|reason| PortError::Failed { reason })?,
         })
-    }
-
-    async fn resolve_repository_name(
-        &self,
-        repository: &WorkspaceGitRepositoryName,
-    ) -> Result<GitRepositoryIdentity, PortError> {
-        let repository =
-            RepositoryUrl::parse(format!("https://github.com/{}.git", repository.as_str()))
-                .map_err(|reason| PortError::Failed { reason })?;
-        self.resolve_repository(&repository).await
     }
 
     async fn read_file(&self, request: &GitFileRequest) -> Result<GitFile, PortError> {

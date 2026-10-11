@@ -110,15 +110,20 @@ A Git entry normally identifies a repository by its familiar `owner/repository` 
 {"git":{"repository":"example-org/repository","ref":"main"}}
 ```
 
-A full `https://github.com/example-org/repository` link is accepted and normalized to
-the same name. `"self"` and the older `{"ownerId":"…","repositoryId":"…"}` form
-remain accepted without changing their canonical bytes. A named repository is resolved
-through the source GitHub App at admission, checked against admitted stable IDs, and
-then pinned to one exact commit in evidence.
+A full HTTPS link on the configured source host is also accepted; links on any other
+host fail admission. `"self"` and the older `{"ownerId":"…","repositoryId":"…"}`
+form remain accepted without changing their canonical bytes. Steward compares the
+human-facing name case-insensitively only against repositories already admitted by
+stable ID, records the provider's canonical name, and pins one exact commit in evidence.
+It never probes an unbound repository name.
 
 `ref` accepts an ordinary branch or tag name, its explicit `git:ref:<name>` form,
-`"trigger"`, or an exact `git:sha1:<40-hex>` commit. Named refs are resolved before
-runtime reservation. `history` is `"none"`, `{"depth": N}`, or `"full"` when
+`"trigger"`, or an exact `git:sha1:<40-hex>` commit. `HEAD` and SHA-shaped bare
+values are rejected; use the typed exact-commit form instead. Avoid giving a branch
+and tag the same name because the provider commit resolver owns that ambiguous lookup.
+Named refs are resolved before runtime reservation. An idempotent retry reuses the
+commit already recorded for the Task even if the name later moves. `history` is
+`"none"`, `{"depth": N}`, or `"full"` when
 deployment and Envelope policy permit it. Optional `paths` select a sparse working
 tree. Submodules are disabled by default; `mode: admitted` permits only source-App-
 installed repositories admitted by stable ID, always at the parent gitlink commit.

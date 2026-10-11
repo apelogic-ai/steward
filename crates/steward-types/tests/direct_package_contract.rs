@@ -284,15 +284,15 @@ fn matches_schema_pattern(pattern: &str, value: &str) -> Result<bool, String> {
         "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*/?$" => {
             WorkspacePath::parse(value).is_ok()
         }
-        "^(?:(?!\\.{1,2}/)(?![A-Za-z0-9._-]+/\\.{1,2}$)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+|https://github\\.com/(?!\\.{1,2}/)(?![A-Za-z0-9._-]+/(?:\\.{1,2}|\\.git|\\.{1,2}\\.git)$)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\\.git)?)$" => {
+        "^(?:(?!\\.{1,2}/)(?![A-Za-z0-9._-]+/\\.{1,2}(?:\\.git)?$)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\\.git)?|https://(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\\.)+[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/(?!\\.{1,2}/)(?![A-Za-z0-9._-]+/(?:\\.{1,2}|\\.git|\\.{1,2}\\.git)$)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(?:\\.git)?)$" => {
             WorkspaceGitRepositoryName::parse(value).is_ok()
         }
-        "^(?!trigger$)(?!git:)(?!-)(?!.*(?:\\.\\.|\\x40\\{|\\\\|[\\u0000-\\u0020\\u007F]))(?!.*\\/$).+$" => {
+        "^(?!trigger$)(?!HEAD$)(?![0-9A-Fa-f]{7,40}$)(?!git:)(?!-)(?!.*(?:\\.\\.|\\x40\\{|\\\\|[\\u0000-\\u0020\\u007F]))(?!.*\\/$).+$" => {
             value != "trigger"
                 && !value.starts_with("git:")
                 && WorkspaceGitNamedRef::parse(value).is_ok()
         }
-        "^git:ref:(?!-)(?!.*(?:\\.\\.|\\x40\\{|\\\\|[\\u0000-\\u0020\\u007F]))(?!.*\\/$).+$" => {
+        "^git:ref:(?!HEAD$)(?![0-9A-Fa-f]{7,40}$)(?!-)(?!.*(?:\\.\\.|\\x40\\{|\\\\|[\\u0000-\\u0020\\u007F]))(?!.*\\/$).+$" => {
             value.starts_with("git:ref:") && WorkspaceGitNamedRef::parse(value).is_ok()
         }
         "^\\S(?:.*\\S)?$" => {
@@ -635,8 +635,20 @@ fn task_definition_accepts_named_workspace_repositories_and_refs() -> Result<(),
         (
             "https://github.com/example-org/repository",
             "git:ref:release-v1",
-            "example-org/repository",
+            "https://github.com/example-org/repository",
             "git:ref:release-v1",
+        ),
+        (
+            "https://source.example.test/Example-Org/Repository.git",
+            "main",
+            "https://source.example.test/Example-Org/Repository",
+            "git:ref:main",
+        ),
+        (
+            "Example-Org/Repository.git",
+            "main",
+            "Example-Org/Repository",
+            "git:ref:main",
         ),
         (
             "example-org/repository",
@@ -706,6 +718,9 @@ fn task_definition_rejects_malformed_workspace_entries() -> Result<(), String> {
         serde_json::json!([{ "git": { "repository": "example-org/.." } }]),
         serde_json::json!([{ "git": { "repository": "https://github.com/example-org/.git" } }]),
         serde_json::json!([{ "git": { "ref": "git:branch:main" } }]),
+        serde_json::json!([{ "git": { "ref": "HEAD" } }]),
+        serde_json::json!([{ "git": { "ref": "abcdef0" } }]),
+        serde_json::json!([{ "git": { "ref": "0123456789abcdef0123456789abcdef01234567" } }]),
         serde_json::json!([{ "git": { "ref": "refs/heads/../secret" } }]),
         serde_json::json!([{ "git": { "ref": "-main" } }]),
         serde_json::json!([{ "git": { "ref": "release/" } }]),

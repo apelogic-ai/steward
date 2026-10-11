@@ -14,7 +14,6 @@ use steward_ports::{
 };
 use steward_types::direct_package::{
     ExactGitCommit, MAX_PACKAGE_FILE_BYTES, RepositoryUrl, StableProviderId,
-    WorkspaceGitRepositoryName,
 };
 
 pub const IMPLEMENTED_PORTS: [&str; 1] = ["GitHostingPlane"];
@@ -739,14 +738,6 @@ impl GitHostingPlane for GitHubSourceAdapter {
         Ok(self.authenticate_repository(&coordinates).await?.identity)
     }
 
-    async fn resolve_repository_name(
-        &self,
-        repository: &WorkspaceGitRepositoryName,
-    ) -> Result<GitRepositoryIdentity, PortError> {
-        let coordinates = RepositoryCoordinates::from_name(repository, &self.clone_origin)?;
-        Ok(self.authenticate_repository(&coordinates).await?.identity)
-    }
-
     async fn read_file(&self, request: &GitFileRequest) -> Result<GitFile, PortError> {
         if request.max_bytes == 0 || request.max_bytes > MAX_PACKAGE_FILE_BYTES {
             return Err(rejected("Git file byte bound is invalid"));
@@ -998,29 +989,6 @@ impl RepositoryCoordinates {
             owner: owner.to_owned(),
             name: name.to_owned(),
             repository: repository.clone(),
-        })
-    }
-
-    fn from_name(
-        repository: &WorkspaceGitRepositoryName,
-        clone_origin: &str,
-    ) -> Result<Self, PortError> {
-        let (owner, name) = repository
-            .as_str()
-            .split_once('/')
-            .filter(|(owner, name)| {
-                valid_repository_component(owner) && valid_repository_component(name)
-            })
-            .ok_or_else(|| rejected("GitHub repository name is invalid"))?;
-        let repository = RepositoryUrl::parse(format!(
-            "{}/{owner}/{name}.git",
-            clone_origin.trim_end_matches('/')
-        ))
-        .map_err(|_| rejected("GitHub repository name is invalid"))?;
-        Ok(Self {
-            owner: owner.to_owned(),
-            name: name.to_owned(),
-            repository,
         })
     }
 
@@ -1410,7 +1378,7 @@ mod tests {
         GitRevisionRequest, GitTreeRequest, PortError,
     };
     use steward_types::direct_package::{
-        ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId, WorkspaceGitRepositoryName,
+        ExactGitCommit, RelativePath, RepositoryUrl, StableProviderId,
     };
 
     use super::{GitHubSourceAdapter, decode_upload_pack_result, encode_upload_pack_request};
@@ -1709,23 +1677,6 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with("GET /repos/example-org/source-a/installation "));
         assert!(requests[0].contains("authorization: Bearer fixture-app-assertion"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn resolves_human_facing_repository_name_to_stable_identity() -> Result<(), String> {
-        let mock = MockGitHub::start(authentication_responses())?;
-        let resolved = port(
-            adapter(&mock)?
-                .resolve_repository_name(&WorkspaceGitRepositoryName::parse(
-                    "example-org/source-a",
-                )?)
-                .await,
-        )?;
-        assert_eq!(resolved, identity(REPOSITORY, 1001, 1000)?);
-        let requests = mock.finish()?;
-        assert!(requests[0].starts_with("GET /repos/example-org/source-a/installation "));
-        assert!(requests[1].contains(r#""repositories":["source-a"]"#));
         Ok(())
     }
 

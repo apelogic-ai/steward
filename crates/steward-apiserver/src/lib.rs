@@ -4097,6 +4097,7 @@ mod tests {
         trees: Arc<BTreeMap<(String, String), Vec<GitTreeEntry>>>,
         wrong_object_path: Option<String>,
         reads: Arc<Mutex<Vec<(String, String, String)>>>,
+        resolved_revision: Arc<Mutex<ExactGitCommit>>,
     }
 
     impl GitHostingPlane for FakeDirectGit {
@@ -4117,7 +4118,8 @@ mod tests {
                         let coordinates = identity
                             .repository
                             .as_str()
-                            .strip_prefix("https://github.com/")
+                            .strip_prefix("https://")
+                            .and_then(|value| value.split_once('/').map(|(_, path)| path))
                             .and_then(|value| value.strip_suffix(".git"))
                             .and_then(|value| value.split_once('/'))
                             .ok_or_else(|| PortError::Failed {
@@ -4158,16 +4160,6 @@ mod tests {
                 .ok_or_else(|| PortError::Rejected {
                     reason: "repository is not present in the deterministic fake".to_owned(),
                 })
-        }
-
-        async fn resolve_repository_name(
-            &self,
-            repository: &steward_types::direct_package::WorkspaceGitRepositoryName,
-        ) -> Result<GitRepositoryIdentity, PortError> {
-            let repository =
-                RepositoryUrl::parse(format!("https://github.com/{}.git", repository.as_str()))
-                    .map_err(|reason| PortError::Failed { reason })?;
-            self.resolve_repository(&repository).await
         }
 
         async fn read_file(&self, request: &GitFileRequest) -> Result<GitFile, PortError> {
@@ -4253,8 +4245,12 @@ mod tests {
                     reason: "Git reference is invalid".to_owned(),
                 });
             }
-            ExactGitCommit::parse(format!("git:sha1:{}", "c".repeat(40)))
-                .map_err(|reason| PortError::Failed { reason })
+            self.resolved_revision
+                .lock()
+                .map_err(|_| PortError::Failed {
+                    reason: "fake Git revision lock was poisoned".to_owned(),
+                })
+                .map(|commit| commit.clone())
         }
     }
 
@@ -4312,6 +4308,10 @@ mod tests {
             trees: Arc::new(BTreeMap::new()),
             wrong_object_path: wrong_object_path.map(str::to_owned),
             reads: Arc::new(Mutex::new(Vec::new())),
+            resolved_revision: Arc::new(Mutex::new(ExactGitCommit::parse(format!(
+                "git:sha1:{}",
+                "c".repeat(40)
+            ))?)),
         })
     }
 
@@ -12174,6 +12174,10 @@ mod tests {
             trees: Arc::new(BTreeMap::new()),
             wrong_object_path: None,
             reads: Arc::new(Mutex::new(Vec::new())),
+            resolved_revision: Arc::new(Mutex::new(ExactGitCommit::parse(format!(
+                "git:sha1:{}",
+                "c".repeat(40)
+            ))?)),
         })
     }
 
@@ -12354,6 +12358,10 @@ mod tests {
             trees: Arc::new(BTreeMap::new()),
             wrong_object_path: None,
             reads: Arc::new(Mutex::new(Vec::new())),
+            resolved_revision: Arc::new(Mutex::new(ExactGitCommit::parse(format!(
+                "git:sha1:{}",
+                "c".repeat(40)
+            ))?)),
         })
     }
 
@@ -13703,14 +13711,28 @@ mod tests {
         definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
         definition["workspace"] = serde_json::json!([{
             "git": {
-                "repository": "example-org/agentic-ops",
+                "repository": "https://github.com/Example-Org/Agentic-Ops.git",
                 "ref": "main",
                 "history": {"depth": 5},
                 "access": "copy"
             }
         }]);
         let git = direct_git_fixture(direct_manifest()?, definition, None)?;
-        let app = direct_test_app(ledger.clone(), git)?;
+        let resolved_revision = git.resolved_revision.clone();
+        let app = task_router(
+            ledger.clone(),
+            FakeTaskIdentityResolver,
+            task_api_config()?
+                .with_git_hosting_plane(git)
+                .with_source_repository_bindings_json(Some(&direct_source_bindings_json(
+                    "654321",
+                )))?,
+        );
+        let request_body = serde_json::json!({
+            "contractVersion": "steward.task/v2",
+            "invocationPath": ".steward/tasks/release-summary.json",
+        })
+        .to_string();
         let response = app
             .clone()
             .oneshot(
@@ -13720,19 +13742,36 @@ mod tests {
                     .header("authorization", "Bearer github-assertion")
                     .header("idempotency-key", "direct-named-workspace")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "contractVersion": "steward.task/v2",
-                            "invocationPath": ".steward/tasks/release-summary.json",
-                        })
-                        .to_string(),
-                    ))
+                    .body(Body::from(request_body.clone()))
                     .map_err(|error| format!("build direct workspace request: {error}"))?,
             )
             .await
             .map_err(|error| format!("submit direct workspace request: {error}"))?;
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+        *resolved_revision
+            .lock()
+            .map_err(|_| "fake Git revision lock was poisoned")? =
+            ExactGitCommit::parse(format!("git:sha1:{}", "d".repeat(40)))?;
+        let retry = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "direct-named-workspace")
+                    .header("content-type", "application/json")
+                    .body(Body::from(request_body))
+                    .map_err(|error| format!("build direct workspace retry: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("retry direct workspace request: {error}"))?;
+        assert_eq!(
+            retry.status(),
+            StatusCode::OK,
+            "a retry must reuse the admitted workspace commit after the named ref moves"
+        );
         let task_uid = {
             let tasks = ledger
                 .tasks
@@ -13850,13 +13889,21 @@ mod tests {
                 repository_owner_id: StableProviderId::parse("9990")?,
             },
         );
-        let app = direct_test_app(ledger.clone(), git)?;
+        let app = task_router(
+            ledger.clone(),
+            FakeTaskIdentityResolver,
+            task_api_config()?
+                .with_git_hosting_plane(git)
+                .with_source_repository_bindings_json(Some(&direct_source_bindings_json(
+                    "654321",
+                )))?,
+        );
         assert_direct_rejection_before_reservation(
             &ledger,
             app,
             "direct-workspace-unadmitted-name",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "workspace_git_repository_not_admitted: example-org/foreign",
+            "The requested workspace repository is unavailable. Ask a Steward administrator to verify that it is allowed and accessible.",
         )
         .await
     }
@@ -13864,26 +13911,43 @@ mod tests {
     #[tokio::test]
     async fn direct_workspace_reports_unresolved_repository_name_before_reservation()
     -> Result<(), String> {
-        let ledger = versioned_task_ledger()?;
-        authorize_direct_source(&ledger)?;
-        let mut definition = direct_definition_no_skills()?;
-        definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
-        definition["workspace"] = serde_json::json!([{
-            "git": {
-                "repository": "example-org/missing",
-                "ref": "main"
-            }
-        }]);
-        let git = direct_git_fixture(direct_manifest()?, definition, None)?;
-        let app = direct_test_app(ledger.clone(), git)?;
-        assert_direct_rejection_before_reservation(
-            &ledger,
-            app,
-            "direct-workspace-unresolved-name",
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "workspace_git_repository_unresolved: example-org/missing",
-        )
-        .await
+        for (idempotency_key, repository) in [
+            ("direct-workspace-unresolved-name", "example-org/missing"),
+            (
+                "direct-workspace-wrong-source-host",
+                "https://source.example.test/example-org/agentic-ops",
+            ),
+        ] {
+            let ledger = versioned_task_ledger()?;
+            authorize_direct_source(&ledger)?;
+            let mut definition = direct_definition_no_skills()?;
+            definition["runtime"]["agentRef"] = serde_json::json!(TEST_VERSIONED_AGENT);
+            definition["workspace"] = serde_json::json!([{
+                "git": {
+                    "repository": repository,
+                    "ref": "main"
+                }
+            }]);
+            let git = direct_git_fixture(direct_manifest()?, definition, None)?;
+            let app = task_router(
+                ledger.clone(),
+                FakeTaskIdentityResolver,
+                task_api_config()?
+                    .with_git_hosting_plane(git)
+                    .with_source_repository_bindings_json(Some(&direct_source_bindings_json(
+                        "654321",
+                    )))?,
+            );
+            assert_direct_rejection_before_reservation(
+                &ledger,
+                app,
+                idempotency_key,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "The requested workspace repository is unavailable. Ask a Steward administrator to verify that it is allowed and accessible.",
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]

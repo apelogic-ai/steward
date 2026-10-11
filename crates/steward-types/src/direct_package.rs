@@ -85,19 +85,37 @@ pub struct WorkspaceGitRepositoryName(String);
 impl WorkspaceGitRepositoryName {
     pub fn parse(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
-        let normalized = value
-            .strip_prefix("https://github.com/")
-            .map(|path| path.strip_suffix(".git").unwrap_or(path))
-            .unwrap_or(&value);
-        if valid_workspace_git_repository_name(normalized) {
-            Ok(Self(normalized.to_owned()))
+        let normalized = if let Some(rest) = value.strip_prefix("https://") {
+            let (host, path) = rest
+                .split_once('/')
+                .ok_or_else(|| "WorkspaceGitRepositoryName is invalid".to_owned())?;
+            let host = host.to_ascii_lowercase();
+            let path = path.strip_suffix(".git").unwrap_or(path);
+            if !valid_repository_host(&host) || !valid_workspace_git_repository_name(path) {
+                return Err("WorkspaceGitRepositoryName is invalid".to_owned());
+            }
+            format!("https://{host}/{path}")
         } else {
-            Err("WorkspaceGitRepositoryName is invalid".to_owned())
-        }
+            value.strip_suffix(".git").unwrap_or(&value).to_owned()
+        };
+        valid_workspace_git_repository_selector(&normalized)
+            .then_some(Self(normalized))
+            .ok_or_else(|| "WorkspaceGitRepositoryName is invalid".to_owned())
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn full_name(&self) -> &str {
+        self.0
+            .strip_prefix("https://")
+            .and_then(|rest| rest.split_once('/').map(|(_, path)| path))
+            .unwrap_or(&self.0)
+    }
+
+    pub fn web_url(&self) -> Option<&str> {
+        self.0.starts_with("https://").then_some(self.0.as_str())
     }
 }
 
@@ -325,6 +343,17 @@ fn valid_workspace_git_repository_name(value: &str) -> bool {
         && components.next().is_none()
 }
 
+fn valid_workspace_git_repository_selector(value: &str) -> bool {
+    value.strip_prefix("https://").map_or_else(
+        || valid_workspace_git_repository_name(value),
+        |rest| {
+            rest.split_once('/').is_some_and(|(host, path)| {
+                valid_repository_host(host) && valid_workspace_git_repository_name(path)
+            })
+        },
+    )
+}
+
 fn valid_decimal(value: &str) -> bool {
     let mut parts = value.split('.');
     let Some(whole) = parts.next() else {
@@ -530,6 +559,9 @@ fn valid_git_ref(value: &str) -> bool {
     !reference.is_empty()
         && reference.len() <= 512
         && reference.trim() == reference
+        && reference != "HEAD"
+        && !((7..=40).contains(&reference.len())
+            && reference.bytes().all(|byte| byte.is_ascii_hexdigit()))
         && !reference.starts_with('-')
         && !reference.ends_with('/')
         && !["..", "@{", "\\", " "]
