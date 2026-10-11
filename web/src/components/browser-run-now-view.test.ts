@@ -157,14 +157,25 @@ describe("Run now failures", () => {
     })).toBe("The run request was rejected. Choose an inline task or ask an administrator to enable GitHub source packages.");
   });
 
-  test("names the selected workspace repository in its actionable rejection", () => {
-    const message = (runNowFailureMessage as unknown as (error: unknown, repository: string) => string)({
+  test("shows a repository rejection reason and names the selected repository", () => {
+    const message = runNowFailureMessage({
       error: "task.workspace_rejected",
-      failureReason: "The requested workspace repository is unavailable.",
+      failureReason: "The requested workspace repository was not approved.",
     }, "example-org/repository");
 
+    expect(message).toContain("The requested workspace repository was not approved.");
     expect(message).toContain("example-org/repository");
     expect(message).not.toContain("task.workspace_rejected");
+  });
+
+  test("shows a non-repository workspace rejection without blaming the selected repository", () => {
+    const message = runNowFailureMessage({
+      error: "task.workspace_rejected",
+      failureReason: "Workspace history depth 25 exceeds the effective ceiling 10.",
+    }, "example-org/repository");
+
+    expect(message).toBe("The run request was rejected. Workspace history depth 25 exceeds the effective ceiling 10.");
+    expect(message).not.toContain("example-org/repository");
   });
 });
 

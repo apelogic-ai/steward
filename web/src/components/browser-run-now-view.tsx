@@ -136,9 +136,20 @@ export function effectiveModelSelection(
 function failureHint(code: string | null, reason: string): string | null {
   if (code === "task.direct_package_source_disabled") return "Choose an inline task or ask an administrator to enable GitHub source packages.";
   if (reason.includes("selected model is not allowed")) return "Choose an agent compatible with this Envelope, or request an Envelope that allows its model.";
-  if (reason.includes("requirements exceed the selected Envelope")) return "Choose a package within this Envelope's approved models, tools, budget, and runner limits.";
-  if (reason.includes("repository") && reason.includes("allowed")) return "Use a repository in the operator's allowed source list.";
   return null;
+}
+
+function repositoryWorkspaceFailure(reason: string): boolean {
+  const normalized = reason.toLocaleLowerCase("en-US").replaceAll(/[_-]+/g, " ");
+  const unavailable = ["not found", "not approved", "not admitted", "not allowed", "unavailable", "unresolved"]
+    .some((phrase) => normalized.includes(phrase));
+  return (normalized.includes("repository") && unavailable)
+    || ((normalized.includes("branch") || normalized.includes("tag")) && normalized.includes("not found"));
+}
+
+function sentence(value: string): string {
+  const trimmed = value.trim();
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
 }
 
 export function runNowFailureMessage(error: unknown, workspaceRepository?: string): string {
@@ -147,16 +158,14 @@ export function runNowFailureMessage(error: unknown, workspaceRepository?: strin
   const code = typeof value.error === "string" && value.error.trim() ? value.error : null;
   const reason = typeof value.failureReason === "string" && value.failureReason.trim()
     ? value.failureReason
-    : typeof value.message === "string" && value.message.trim()
-      ? value.message
-      : null;
+    : null;
   if (reason) {
-    const workspaceRejected = code?.includes("workspace") || reason.toLocaleLowerCase("en-US").includes("workspace repository");
-    if (workspaceRepository && workspaceRejected) {
-      return `The run request was rejected. ${workspaceRepository} could not be used as the workspace repository. Choose an approved repository and branch or tag, or ask an administrator to check its access.`;
-    }
     const hint = failureHint(code, reason);
-    return hint ? `The run request was rejected. ${hint}` : genericRunNowFailure;
+    if (hint) return `The run request was rejected. ${hint}`;
+    const repository = workspaceRepository && repositoryWorkspaceFailure(reason)
+      ? ` Repository: ${workspaceRepository}.`
+      : "";
+    return `The run request was rejected. ${sentence(reason)}${repository}`;
   }
   return genericRunNowFailure;
 }
@@ -188,6 +197,7 @@ export function inlineFiles(
       ? {
           workspace: [{
             git: {
+              // TODO(#397): remove these casts when the generated schema includes named repository and ref selectors.
               repository: ("ref" in checkout
                 ? workspaceRepositoryName(checkout.repository)
                 : {

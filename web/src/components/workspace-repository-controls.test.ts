@@ -1,13 +1,16 @@
 import { expect, test } from "bun:test";
+import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import type { GithubRepositoryView } from "@/api-client";
 
 import {
   canonicalWorkspaceRef,
+  editWorkspaceReference,
   matchingWorkspaceRepository,
   readableWorkspaceRef,
   updateWorkspaceRepository,
+  validWorkspaceBranchOrTag,
   WorkspaceRepositoryControls,
 } from "./workspace-repository-controls";
 
@@ -58,10 +61,28 @@ test("existing stable-ID, self, trigger, and exact-commit forms remain distingui
 test("repository names and links select the admitted repository without changing its canonical label", () => {
   expect(matchingWorkspaceRepository("EXAMPLE-ORG/REPOSITORY.git", [repository])).toEqual(repository);
   expect(matchingWorkspaceRepository("https://github.com/example-org/repository.git", [repository])).toEqual(repository);
+  expect(matchingWorkspaceRepository("https://gitlab.com/example-org/repository.git", [repository])).toBeNull();
+});
+
+test("clearing and retyping a ref keeps the empty draft without rewriting the workspace", () => {
+  const initial = JSON.stringify([{ git: { repository: "example-org/repository", ref: "git:ref:main" } }]);
+  const cleared = editWorkspaceReference(initial, repository, "");
+
+  expect(cleared).toEqual({ draft: "", workspace: null });
+  const retyped = editWorkspaceReference(initial, repository, "release-v1");
+  expect(retyped.draft).toBe("release-v1");
+  expect(JSON.parse(retyped.workspace ?? "null")[0].git.ref).toBe("git:ref:release-v1");
+});
+
+test("the branch or tag field rejects trigger and exact-commit selectors", () => {
+  expect(validWorkspaceBranchOrTag("main")).toBeTrue();
+  expect(validWorkspaceBranchOrTag("git:ref:main")).toBeTrue();
+  expect(validWorkspaceBranchOrTag("trigger")).toBeFalse();
+  expect(validWorkspaceBranchOrTag(`git:sha1:${"a".repeat(40)}`)).toBeFalse();
 });
 
 test("the Task editor control offers admitted repositories and preserves a legacy selector", () => {
-  const html = renderToStaticMarkup(WorkspaceRepositoryControls({
+  const html = renderToStaticMarkup(createElement(WorkspaceRepositoryControls, {
     onChange: () => undefined,
     repositories: [repository],
     value: JSON.stringify([{

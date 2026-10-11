@@ -1,5 +1,7 @@
 "use client";
 
+import { useState } from "react";
+
 import type { GithubRepositoryView } from "@/api-client";
 
 const fieldClass = "min-h-11 w-full rounded-control border bg-panel px-3 font-normal";
@@ -30,14 +32,20 @@ function firstGitEntry(entries: unknown[]): { index: number; entry: WorkspaceObj
   return null;
 }
 
-function normalizedRepositoryName(value: string): string {
+function repositorySelector(value: string): { host: string | null; path: string } {
   const trimmed = value.trim().replace(/\.git$/i, "");
   try {
     const url = new URL(trimmed);
     const path = url.pathname.replace(/^\/+|\/+$/g, "");
-    return path.toLocaleLowerCase("en-US");
+    return {
+      host: url.host.toLocaleLowerCase("en-US"),
+      path: path.toLocaleLowerCase("en-US"),
+    };
   } catch {
-    return trimmed.replace(/^\/+|\/+$/g, "").toLocaleLowerCase("en-US");
+    return {
+      host: null,
+      path: trimmed.replace(/^\/+|\/+$/g, "").toLocaleLowerCase("en-US"),
+    };
   }
 }
 
@@ -48,6 +56,14 @@ export function workspaceRepositoryName(repository: Pick<GithubRepositoryView, "
 export function canonicalWorkspaceRef(value: string): string {
   const trimmed = value.trim();
   return trimmed.startsWith("git:ref:") ? trimmed : `git:ref:${trimmed}`;
+}
+
+export function validWorkspaceBranchOrTag(value: string): boolean {
+  const trimmed = value.trim();
+  return Boolean(trimmed)
+    && trimmed !== "trigger"
+    && trimmed !== "git:ref:"
+    && !trimmed.startsWith("git:sha1:");
 }
 
 export function readableWorkspaceRef(value: unknown): string | null {
@@ -62,11 +78,13 @@ export function matchingWorkspaceRepository(
   repositories: readonly GithubRepositoryView[],
 ): GithubRepositoryView | null {
   if (typeof value !== "string") return null;
-  const normalized = normalizedRepositoryName(value);
-  return repositories.find((repository) => (
-    normalizedRepositoryName(workspaceRepositoryName(repository)) === normalized
-      || normalizedRepositoryName(repository.url) === normalized
-  )) ?? null;
+  const requested = repositorySelector(value);
+  return repositories.find((repository) => {
+    const name = repositorySelector(workspaceRepositoryName(repository));
+    if (requested.host === null) return requested.path === name.path;
+    const link = repositorySelector(repository.url);
+    return requested.host === link.host && requested.path === link.path;
+  }) ?? null;
 }
 
 export function updateWorkspaceRepository(
@@ -75,7 +93,7 @@ export function updateWorkspaceRepository(
   reference: string,
 ): string | null {
   const entries = workspaceEntries(value);
-  if (!entries || !reference.trim()) return null;
+  if (!entries || !validWorkspaceBranchOrTag(reference)) return null;
   const selection = firstGitEntry(entries);
   const git = {
     ...(selection?.git ?? {}),
@@ -86,6 +104,17 @@ export function updateWorkspaceRepository(
   if (selection) next[selection.index] = { ...selection.entry, git };
   else next.push({ git });
   return JSON.stringify(next, null, 2);
+}
+
+export function editWorkspaceReference(
+  value: string,
+  repository: Pick<GithubRepositoryView, "name" | "owner">,
+  draft: string,
+): { draft: string; workspace: string | null } {
+  return {
+    draft,
+    workspace: updateWorkspaceRepository(value, repository, draft),
+  };
 }
 
 export function WorkspaceRepositoryControls({
@@ -101,20 +130,30 @@ export function WorkspaceRepositoryControls({
   const selection = entries ? firstGitEntry(entries) : null;
   const matched = matchingWorkspaceRepository(selection?.git.repository, repositories);
   const currentReference = readableWorkspaceRef(selection?.git.ref);
-  const reference = currentReference ?? matched?.defaultBranch ?? "";
+  const derivedReference = currentReference ?? matched?.defaultBranch ?? "";
+  const [referenceEdit, setReferenceEdit] = useState(() => ({
+    source: value,
+    draft: derivedReference,
+  }));
+  const reference = referenceEdit.source === value ? referenceEdit.draft : derivedReference;
   const preservesLegacySelector = Boolean(selection && (!matched || !currentReference));
 
   function selectRepository(repositoryId: string) {
     const repository = repositories.find((candidate) => candidate.repositoryId === repositoryId);
     if (!repository) return;
-    const next = updateWorkspaceRepository(value, repository, currentReference ?? repository.defaultBranch);
-    if (next) onChange(next);
+    const draft = currentReference ?? repository.defaultBranch;
+    const next = updateWorkspaceRepository(value, repository, draft);
+    if (next) {
+      setReferenceEdit({ source: next, draft });
+      onChange(next);
+    }
   }
 
   function selectReference(nextReference: string) {
     if (!matched) return;
-    const next = updateWorkspaceRepository(value, matched, nextReference);
-    if (next) onChange(next);
+    const edit = editWorkspaceReference(value, matched, nextReference);
+    setReferenceEdit({ source: edit.workspace ?? value, draft: edit.draft });
+    if (edit.workspace) onChange(edit.workspace);
   }
 
   return <div className="grid gap-4 md:grid-cols-2">
@@ -128,6 +167,7 @@ export function WorkspaceRepositoryControls({
       <input className={`${fieldClass} font-mono`} disabled={!matched} onChange={(event) => selectReference(event.target.value)} placeholder={matched?.defaultBranch ?? "Choose a repository first"} value={reference} />
     </label>
     {!entries ? <p className="text-sm text-err md:col-span-2" role="alert">Workspace must be a valid JSON array before using the repository picker.</p> : null}
+    {matched && !validWorkspaceBranchOrTag(reference) ? <p className="text-sm text-err md:col-span-2" role="alert">Enter a branch or tag name.</p> : null}
     {preservesLegacySelector ? <p className="text-xs text-muted-ink md:col-span-2">The existing repository and revision selection remains unchanged until you choose a repository and branch or tag.</p> : null}
   </div>;
 }
