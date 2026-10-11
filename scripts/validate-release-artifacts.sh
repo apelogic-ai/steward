@@ -250,6 +250,7 @@ task_execution_binding_values=(
   --set-string 'config.apiserver.executionBindings.bindings[0].executable=/opt/example/bin/agent'
   --set-string 'config.apiserver.executionBindings.bindings[0].versionProbe.arguments[0]=--version'
   --set-string 'config.apiserver.executionBindings.bindings[0].versionProbe.expectedStdout=example-agent 1.2.3'
+  --set-string 'config.apiserver.executionBindings.bindings[0].models.providers[0]=example'
   --set-string 'config.apiserver.executionBindings.bindings[0].providerProfiles.tools.id=example-tools-profile-v7'
   --set-string 'config.apiserver.executionBindings.bindings[0].providerProfiles.tools.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
   --set-string 'config.apiserver.executionBindings.bindings[0].providerProfiles.inference.id=example-inference-profile-v7'
@@ -457,7 +458,7 @@ if [[ "${chart_contract_mode}" == customer-v1 ]]; then
 fi
 if [[ "$(grep -c 'name: STEWARD_TASK_EXECUTION_BINDINGS_FILE' "${rendered}")" != "1" ]] ||
   ! grep -Fq 'name: STEWARD_TASK_EXECUTION_BINDINGS_MODE, value: "staged"' "${rendered}" ||
-  ! grep -Fq '\"apiVersion\":\"steward.execution-bindings/v1\"' "${rendered}" ||
+  ! grep -Fq '\"apiVersion\":\"steward.execution-bindings/v2\"' "${rendered}" ||
   ! grep -Fq '\"bindings\":[]' "${rendered}"
 then
   echo "the empty execution binding catalog must be mounted only in the apiserver" >&2

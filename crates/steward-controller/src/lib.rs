@@ -8565,6 +8565,7 @@ mod webhook_tests {
                 arguments: vec!["--version".to_owned()],
                 expected_stdout: "example-agent 1.0.0".to_owned(),
             },
+            models: None,
             provider_profiles: ExecutionProviderProfiles::default(),
         });
         execution_binding.validate()?;

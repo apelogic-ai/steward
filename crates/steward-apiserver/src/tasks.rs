@@ -804,6 +804,12 @@ fn resolve_versioned_task_plan(
                 workflow.agent
             ))
         })?;
+    if !execution_binding.supports_model(model) {
+        return Err(ApiError::TaskRuntimeContractUnavailable(format!(
+            "logical agent {} does not support model {}/{}",
+            workflow.agent, model.provider, model.model
+        )));
+    }
     if execution_binding.provider_profiles.inference.is_none() {
         return Err(ApiError::TaskRuntimeContractUnavailable(format!(
             "logical agent {} has no inference provider profile",
@@ -5816,6 +5822,12 @@ fn resolve_direct_execution_plan(
                 "logical agent {agent_ref} has no deployment execution binding"
             ))
         })?;
+    if !binding.supports_model(model) {
+        return Err(ApiError::TaskRuntimeContractUnavailable(format!(
+            "logical agent {agent_ref} does not support model {}/{}",
+            model.provider, model.model
+        )));
+    }
     if binding.provider_profiles.inference.is_none() {
         return Err(ApiError::TaskRuntimeContractUnavailable(format!(
             "logical agent {agent_ref} has no inference provider profile"
@@ -7835,7 +7847,7 @@ mod workflow_request_tests {
                 .map_or("", |(_, version)| version)
         );
         serde_json::to_string(&serde_json::json!({
-            "apiVersion": "steward.execution-bindings/v1",
+            "apiVersion": "steward.execution-bindings/v2",
             "bindings": [{
                 "agentRef": agent_ref,
                 "displayName": format!("Agent {agent_ref}"),
@@ -7845,6 +7857,9 @@ mod workflow_request_tests {
                 "versionProbe": {
                     "arguments": ["--version"],
                     "expectedStdout": expected_version
+                },
+                "models": {
+                    "providers": ["example", "openai"]
                 },
                 "providerProfiles": {
                     "tools": {
@@ -8223,6 +8238,57 @@ mod workflow_request_tests {
                 .iter()
                 .all(|argument| !argument.contains("example-org")),
             "repository mechanics do not belong to the Workflow execution command"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configured_unknown_model_provider_flows_into_the_run_plan() -> Result<(), String> {
+        let user_id = "usr_0123456789abcdef0123456789abcdef";
+        let mut envelope = provisioned_envelope(user_id)?;
+        let model = ModelRef {
+            provider: "example".to_owned(),
+            model: "model-x".to_owned(),
+        };
+        envelope.requested_envelope.spec.llms = vec![model.clone()];
+        envelope
+            .approved_envelope
+            .as_mut()
+            .ok_or_else(|| "fixture must contain an approved Envelope".to_owned())?
+            .spec
+            .llms = vec![model];
+
+        let plan = resolve_versioned_task_plan(
+            &identity(user_id)?,
+            workflow(),
+            vec![envelope.clone()],
+            &task_config(Some("https://mcp-gw.example.test/mcp"))?,
+        )
+        .map_err(|error| format!("configured model unknown to Steward was rejected: {error:?}"))?;
+        assert_eq!(
+            plan.command.get(4).map(String::as_str),
+            Some("example/model-x")
+        );
+
+        let mut incompatible_catalog =
+            serde_json::from_str::<serde_json::Value>(&execution_catalog(&workflow().agent, 'a')?)
+                .map_err(|error| error.to_string())?;
+        incompatible_catalog["bindings"][0]["models"]["providers"] =
+            serde_json::json!(["other-provider"]);
+        let incompatible_config =
+            TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
+                .with_execution_adapter(Arc::new(ExampleExecutionAdapter))?
+                .with_execution_bindings_json(Some(&incompatible_catalog.to_string()))?
+                .with_execution_bindings_active(true)?;
+        let rejected = resolve_versioned_task_plan(
+            &identity(user_id)?,
+            workflow(),
+            vec![envelope],
+            &incompatible_config,
+        );
+        assert!(
+            matches!(rejected, Err(ApiError::TaskRuntimeContractUnavailable(reason)) if reason.contains("does not support model example/model-x")),
+            "an unlisted model provider must fail before Task reservation"
         );
         Ok(())
     }

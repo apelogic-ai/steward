@@ -104,6 +104,7 @@
       "runtimeName": "codex",
       "executable": "/usr/bin/codex",
       "expectedVersion": "codex-cli 0.140.0",
+      "modelProviders": ["litellm"],
       "toolsProfile": "steward-mcp-gw",
       "inferenceProfile": "steward-litellm"
     }

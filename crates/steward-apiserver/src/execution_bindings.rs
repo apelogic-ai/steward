@@ -5,12 +5,13 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_types::{
-    DisposableExecutionBinding, ExecutionProviderProfiles, ExecutionVersionProbe,
-    TASK_EXECUTION_BINDING_DIGEST_DOMAIN, TASK_EXECUTION_BINDING_SCHEMA_VERSION,
+    DisposableExecutionBinding, ExecutionModelCompatibility, ExecutionProviderProfiles,
+    ExecutionVersionProbe, TASK_EXECUTION_BINDING_DIGEST_DOMAIN,
+    TASK_EXECUTION_BINDING_SCHEMA_VERSION,
 };
 
 const BINDING_SCHEMA: &str = TASK_EXECUTION_BINDING_SCHEMA_VERSION;
-pub const EXECUTION_BINDING_CATALOG_API_VERSION: &str = "steward.execution-bindings/v1";
+pub const EXECUTION_BINDING_CATALOG_API_VERSION: &str = "steward.execution-bindings/v2";
 pub const MAX_EXECUTION_BINDING_CATALOG_BYTES: usize = 1024 * 1024;
 const MAX_EXECUTION_BINDINGS: usize = 128;
 
@@ -24,11 +25,19 @@ struct CatalogEntry {
     image: String,
     executable: String,
     version_probe: ExecutionVersionProbe,
+    models: ExecutionModelCompatibility,
     provider_profiles: ExecutionProviderProfiles,
 }
 
 impl CatalogEntry {
-    fn into_binding(self) -> Result<DisposableExecutionBinding, String> {
+    fn into_binding(mut self) -> Result<DisposableExecutionBinding, String> {
+        let provider_count = self.models.providers.len();
+        self.models.providers.sort();
+        self.models.providers.dedup();
+        if self.models.providers.len() != provider_count {
+            return Err("execution model providers must be unique bounded identifiers".to_owned());
+        }
+        self.models.validate()?;
         let mut binding = DisposableExecutionBinding {
             schema_version: BINDING_SCHEMA.to_owned(),
             binding_id: format!("sha256:{}", "0".repeat(64)),
@@ -39,6 +48,7 @@ impl CatalogEntry {
             image: self.image,
             executable: self.executable,
             version_probe: self.version_probe,
+            models: Some(self.models),
             provider_profiles: self.provider_profiles,
         };
         binding.validate()?;
@@ -65,6 +75,7 @@ pub struct ExecutionBindingAdvertisement {
     pub agent_ref: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    pub models: ExecutionModelCompatibility,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -123,9 +134,15 @@ impl ExecutionBindingCatalog {
     pub fn advertisements(&self) -> Vec<ExecutionBindingAdvertisement> {
         self.by_agent
             .values()
-            .map(|binding| ExecutionBindingAdvertisement {
-                agent_ref: binding.agent_ref.clone(),
-                display_name: binding.display_name.clone(),
+            .filter_map(|binding| {
+                binding
+                    .models
+                    .clone()
+                    .map(|models| ExecutionBindingAdvertisement {
+                        agent_ref: binding.agent_ref.clone(),
+                        display_name: binding.display_name.clone(),
+                        models,
+                    })
             })
             .collect()
     }
@@ -185,6 +202,9 @@ mod tests {
                 "arguments": ["--version"],
                 "expectedStdout": format!("example-agent {agent_ref}")
             },
+            "models": {
+                "providers": ["example"]
+            },
             "providerProfiles": {
                 "tools": {
                     "id": format!("example-tools-{agent_ref}"),
@@ -200,7 +220,7 @@ mod tests {
 
     fn catalog_json(entries: Vec<Value>) -> Result<String, String> {
         serde_json::to_string(&json!({
-            "apiVersion": "steward.execution-bindings/v1",
+            "apiVersion": "steward.execution-bindings/v2",
             "bindings": entries
         }))
         .map_err(|error| error.to_string())
@@ -237,6 +257,18 @@ mod tests {
         assert_eq!(
             one.pointer("/providerProfiles/tools/id"),
             Some(&json!("example-tools-agent@1.0.0"))
+        );
+        let advertised = serde_json::to_value(
+            catalog
+                .advertisements()
+                .into_iter()
+                .next()
+                .ok_or_else(|| "agent was not advertised".to_owned())?,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            advertised.pointer("/models/providers"),
+            Some(&json!(["example"]))
         );
         assert_eq!(catalog.agent_refs(), ["agent@1.0.0", "agent@2.0.0"]);
         Ok(())
@@ -322,6 +354,25 @@ mod tests {
         invalid_probe["versionProbe"]["arguments"] = json!([]);
         cases.push(vec![invalid_probe]);
 
+        let mut missing_models = valid.clone();
+        missing_models
+            .as_object_mut()
+            .ok_or_else(|| "test binding was not an object".to_owned())?
+            .remove("models");
+        cases.push(vec![missing_models]);
+
+        let mut empty_providers = valid.clone();
+        empty_providers["models"]["providers"] = json!([]);
+        cases.push(vec![empty_providers]);
+
+        let mut duplicate_providers = valid.clone();
+        duplicate_providers["models"]["providers"] = json!(["example", "example"]);
+        cases.push(vec![duplicate_providers]);
+
+        let mut malformed_provider = valid.clone();
+        malformed_provider["models"]["providers"] = json!([" example"]);
+        cases.push(vec![malformed_provider]);
+
         let mut unknown_field = valid.clone();
         unknown_field["credential"] = json!("not-allowed");
         cases.push(vec![unknown_field]);
@@ -352,6 +403,7 @@ mod tests {
             "/executable",
             "/versionProbe/arguments/0",
             "/versionProbe/expectedStdout",
+            "/models/providers/0",
             "/providerProfiles/tools/id",
             "/providerProfiles/tools/digest",
             "/providerProfiles/inference/id",

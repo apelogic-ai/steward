@@ -263,6 +263,7 @@ mod tests {
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
     use serde_json::{Value, json};
+    use steward_types::ExecutionModelCompatibility;
 
     use super::{BUILT_IN_STARTER_PROMPT, StarterTaskSetting, get_starter_task};
     use crate::ExecutionBindingAdvertisement;
@@ -271,6 +272,9 @@ mod tests {
         vec![ExecutionBindingAdvertisement {
             agent_ref: "codex@0.140.0".to_owned(),
             display_name: Some("Codex 0.140.0".to_owned()),
+            models: ExecutionModelCompatibility {
+                providers: vec!["example".to_owned()],
+            },
         }]
     }
 

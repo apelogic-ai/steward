@@ -4029,7 +4029,7 @@ mod tests {
 
     fn execution_binding_catalog() -> String {
         serde_json::json!({
-            "apiVersion": "steward.execution-bindings/v1",
+            "apiVersion": "steward.execution-bindings/v2",
             "bindings": [{
                 "agentRef": TEST_VERSIONED_AGENT,
                 "adapter": "example-v1",
@@ -4038,6 +4038,9 @@ mod tests {
                 "versionProbe": {
                     "arguments": ["--version"],
                     "expectedStdout": "example-agent 1.0.0"
+                },
+                "models": {
+                    "providers": ["openai"]
                 },
                 "providerProfiles": {
                     "tools": {

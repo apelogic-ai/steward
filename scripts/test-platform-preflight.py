@@ -478,6 +478,14 @@ class PlatformPreflightTests(unittest.TestCase):
             self.assertTrue(rendered_values["execution"]["enabled"])
             self.assertTrue(rendered_values["connectionsBridge"]["enabled"])
             self.assertEqual(rendered_values["config"]["apiserver"]["executionBindingsMode"], "active")
+            self.assertEqual(
+                rendered_values["config"]["apiserver"]["executionBindings"]["apiVersion"],
+                "steward.execution-bindings/v2",
+            )
+            self.assertEqual(
+                rendered_values["config"]["apiserver"]["executionBindings"]["bindings"][0]["models"],
+                {"providers": ["litellm"]},
+            )
             profiles = rendered_values["config"]["apiserver"]["executionBindings"]["bindings"][0]["providerProfiles"]
             self.assertEqual(profiles["tools"]["digest"], "sha256:" + "8" * 64)
             self.assertEqual(profiles["inference"]["digest"], "sha256:" + "7" * 64)
@@ -681,6 +689,18 @@ class PlatformPreflightTests(unittest.TestCase):
         result = self.run_validate(self.input)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must be non-empty when the binding uses tools", result.stderr)
+
+    def test_rejects_missing_or_duplicate_binding_model_providers(self) -> None:
+        del self.input["execution"]["binding"]["modelProviders"]
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("execution.binding.modelProviders", result.stderr)
+
+        self.input = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+        self.input["execution"]["binding"]["modelProviders"] = ["litellm", "litellm"]
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("execution.binding.modelProviders", result.stderr)
 
     def test_allows_catalog_category_omitted_by_binding(self) -> None:
         del self.input["execution"]["binding"]["toolsProfile"]

@@ -603,6 +603,7 @@ mod tests {
     use axum::Router;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
+    use steward_types::ExecutionModelCompatibility;
     use tower::ServiceExt;
 
     use super::{
@@ -625,6 +626,9 @@ mod tests {
         ExecutionBindingAdvertisement {
             agent_ref: agent_ref.to_owned(),
             display_name: Some(display_name.to_owned()),
+            models: ExecutionModelCompatibility {
+                providers: vec!["example".to_owned()],
+            },
         }
     }
 
@@ -1145,8 +1149,16 @@ mod tests {
         assert_eq!(
             listed.pointer("/agents"),
             Some(&serde_json::json!([
-                {"agentRef": TEST_AGENT, "displayName": "Example Agent 1"},
-                {"agentRef": TEST_AGENT_TWO, "displayName": "Example Agent 2"}
+                {
+                    "agentRef": TEST_AGENT,
+                    "displayName": "Example Agent 1",
+                    "models": {"providers": ["example"]}
+                },
+                {
+                    "agentRef": TEST_AGENT_TWO,
+                    "displayName": "Example Agent 2",
+                    "models": {"providers": ["example"]}
+                }
             ])),
             "the authoring UI must receive deployment presentation metadata with exact logical references"
         );

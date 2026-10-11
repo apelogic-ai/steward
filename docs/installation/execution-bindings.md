@@ -7,7 +7,7 @@ Execution bindings are public deployment metadata that connect an opaque Workflo
 one immutable runtime contract. They contain no credentials. Steward owns parsing, binding
 resolution, durable Task snapshots, adapter behavior, and fail-closed execution. The deployment
 owns every agent reference, label, version, image digest, executable, version probe, provider
-profile ID and profile digest, and installs those OpenShell profiles. Workflow administrators may
+profile ID and profile digest, supported model providers, and installs those OpenShell profiles. Workflow administrators may
 select only an advertised `agentRef`; browser and Task requests cannot provide any execution field.
 
 A clean installation has an empty catalog. It starts normally, advertises zero coding agents,
@@ -22,7 +22,7 @@ The top-level object and every nested object reject unknown fields.
 
 | Field | Required | Contract |
 |---|---:|---|
-| `apiVersion` | yes | Exact value `steward.execution-bindings/v1`. |
+| `apiVersion` | yes | Exact value `steward.execution-bindings/v2`. |
 | `bindings` | yes | Zero to 128 entries; duplicate `agentRef` or derived identities fail startup. |
 | `agentRef` | yes | Opaque exact deployment value, 3–255 bytes, one `@`, lowercase bounded name, version beginning with a digit; `latest` is invalid. |
 | `displayName` | no | Presentation only, 1–200 characters, trimmed, no control characters. The Workflow UI shows it beside the exact reference; it is excluded from execution identity and is never an ownership key. |
@@ -31,6 +31,7 @@ The top-level object and every nested object reject unknown fields.
 | `executable` | yes | Absolute normalized path, 2–1024 bytes; no empty, `.` or `..` components. |
 | `versionProbe.arguments` | yes | One to eight process arguments, each 1–128 characters with no control characters. No shell parsing occurs. |
 | `versionProbe.expectedStdout` | yes | Exact trimmed stdout, 1–255 characters with no control characters. Any difference fails execution before the agent runs. |
+| `models.providers` | yes | One to 64 unique provider identifiers supported by this exact agent image and adapter deployment. Steward intersects this list with the selected Envelope; model names remain deployment configuration. |
 | `providerProfiles.tools` | conditional | Required for Tasks with approved tools. |
 | `providerProfiles.inference` | conditional | Required for Tasks with approved models. |
 | `providerProfiles.*.id` | conditional | Exact OpenShell provider-profile ID, 1–255 characters, no whitespace or control characters. |
@@ -85,9 +86,9 @@ also supply `/bin/sh`, `id`, `mkdir`, `ln`, `tee`, and `cat`, declare a non-root
 remain non-root when OpenShell starts the Task. Claude Code refuses `bypassPermissions` as root, so
 the adapter checks the effective UID and fails closed before its version probe or inference call.
 Image conformance must exercise that non-root entrypoint; a root-only image is not compatible with
-`claude-code-v1`. The adapter passes the admitted provider-qualified Anthropic model group to
-match the runtime-scoped LiteLLM key; it does not select or remap a model. The deployment
-configures the Anthropic-compatible API base URL independently from
+`claude-code-v1`. The adapter passes the admitted provider-qualified model group to match the
+runtime-scoped inference key; it does not select or remap a model. The binding decides which
+providers are compatible. The deployment configures the Anthropic-compatible API base URL independently from
 Codex's OpenAI-compatible Responses endpoint.
 
 Before launch, the adapter removes inherited Claude cloud-provider selectors and alternate
@@ -97,9 +98,19 @@ directory prevents a host or image-level login and API-key helper from becoming 
 path.
 
 Adding another compatible version is configuration-only: publish a distinct digest-pinned image,
-choose a new exact `agentRef`, set its executable and probe, install its profiles, validate the
-catalog, and roll out the ConfigMap. A new Steward release is needed only for a new adapter or
-binding schema.
+choose a new exact `agentRef`, set its executable and probe, declare its supported providers,
+install its profiles, validate the catalog, and roll out the ConfigMap. A new Steward release is
+needed only for a new adapter or binding schema.
+
+## Adding a model
+
+Add the exact `<provider>/<model>` name and pricing to the inference proxy, add the same model to
+the Steward capability catalog, and make it available through the relevant Envelope Template.
+No Steward release is required. The model is selectable for an agent when its provider appears in
+that execution binding's `models.providers`. Adding another model under an already-listed provider
+requires no binding change; adding a provider requires a reviewed binding update and a new derived
+binding digest. A Task is rejected before reservation when the selected agent does not advertise
+the selected model provider.
 
 ## OpenShell provider profiles
 
@@ -145,7 +156,7 @@ config:
   apiserver:
     executionBindingsMode: active
     executionBindings:
-      apiVersion: steward.execution-bindings/v1
+      apiVersion: steward.execution-bindings/v2
       bindings:
         - agentRef: example-agent@1.2.3
           displayName: Example Agent 1.2.3
@@ -155,6 +166,8 @@ config:
           versionProbe:
             arguments: [--version]
             expectedStdout: example-agent 1.2.3
+          models:
+            providers: [example]
           providerProfiles:
             tools:
               id: example-tools-profile-v7
@@ -193,7 +206,7 @@ new publication and new Task submission for that reference but does not delete o
 Workflow revisions. Restore the same binding to make such revisions executable again.
 
 Before reservation, Steward persists the schema version, derived identity/digest, reference,
-adapter, image, executable, version probe, and required profile references. Controller reconciliation
+adapter, image, executable, version probe, model-provider compatibility, and required profile references. Controller reconciliation
 uses that snapshot only. An idempotency-key retry returns the existing reservation before consulting
 the current catalog. Catalog edits therefore affect only new Tasks; queued Tasks retain their old
 image and profiles. Runtime image, version-probe, profile selection, and binding-label mismatch fail
@@ -211,6 +224,8 @@ use a new versioned reference.
 - `execution binding catalog is invalid`: fix JSON shape, unknown fields, or a field limit.
 - `logical agent ... has no deployment execution binding`: add/restore the exact reference; no Task
   was reserved.
+- `logical agent ... does not support model ...`: add a compatible agent/provider binding or select
+  an Envelope model supported by that binding; no Task was reserved.
 - `no coding agents are configured for Workflow publication`: configure at least one binding.
 - `has no tool provider profile` / `has no inference provider profile`: add the category required
   by the approved Envelope.

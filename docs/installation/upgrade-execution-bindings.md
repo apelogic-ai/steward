@@ -1,7 +1,7 @@
 # Upgrade note: explicit execution bindings
 
 Installations that previously relied on an implicit coding-agent image or default logical agent
-must configure `steward.execution-bindings/v1` before publishing or submitting new versioned
+must configure `steward.execution-bindings/v2` before publishing or submitting new versioned
 Workflows. Steward no longer synthesizes a coding agent.
 
 This is an enforced two-stage rollout. Do not combine the stages: an old controller cannot safely
@@ -12,7 +12,8 @@ Before rollout:
 
 1. Inventory the exact logical references stored in executable Workflow revisions.
 2. For each reference that must remain executable, configure its immutable image digest, absolute
-   executable, exact version probe, and tool/inference provider-profile IDs and digests.
+   executable, exact version probe, supported model providers, and tool/inference provider-profile
+   IDs and digests.
 3. Install those immutable OpenShell profiles under the configured IDs.
 4. Run the digest-pinned offline container validator from
    [the installation contract](execution-bindings.md#catalog-schema) and retain the printed derived
@@ -32,3 +33,6 @@ contain a binding continue from that snapshot. Rows without a binding remain rea
 receive a manufactured binding. New submissions for a Workflow whose reference is absent fail
 before reservation. Roll back first to `staged`, drain and finalize all bound Tasks, and only then
 restore old binaries. Never run old controllers while bound Tasks are claimable.
+
+The v2 catalog adds required `models.providers` compatibility. Persisted v1 Task bindings remain
+readable for their already-admitted immutable model, but new Task admission requires a v2 catalog.

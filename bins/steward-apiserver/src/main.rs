@@ -2320,7 +2320,7 @@ autoProvisionThreshold:
     #[test]
     fn empty_claude_endpoint_is_absent_until_a_claude_binding_is_activated() -> Result<(), String> {
         let codex_catalog = r#"{
-          "apiVersion": "steward.execution-bindings/v1",
+          "apiVersion": "steward.execution-bindings/v2",
           "bindings": [{
             "agentRef": "codex@1.2.3",
             "displayName": "Codex",
@@ -2328,6 +2328,7 @@ autoProvisionThreshold:
             "image": "registry.example.test/agents/codex@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "executable": "/usr/bin/codex",
             "versionProbe": {"arguments": ["--version"], "expectedStdout": "codex 1.2.3"},
+            "models": {"providers": ["openai"]},
             "providerProfiles": {}
           }]
         }"#;

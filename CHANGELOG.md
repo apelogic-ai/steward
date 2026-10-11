@@ -9,6 +9,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Execution binding catalogs now declare supported model providers. Signed-in capabilities expose
+  that compatibility, and Task planning rejects an incompatible agent/model selection before
+  reservation without hard-coded provider families.
 - Signed-in users can read the deployment's enabled workspace types and
   numeric workspace limits from `/app/api/v1/capabilities`. The response does
   not expose administrator configuration or other users' data.

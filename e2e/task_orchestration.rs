@@ -844,6 +844,7 @@ fn disposable_execution_binding() -> Result<TaskExecutionBinding, io::Error> {
             arguments: vec!["--version".to_owned()],
             expected_stdout: "example-agent 1".to_owned(),
         },
+        models: None,
         provider_profiles: ExecutionProviderProfiles::default(),
     };
     let digest = format!(

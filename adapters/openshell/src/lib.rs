@@ -604,13 +604,21 @@ fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
 }
 
 #[cfg(feature = "runtime")]
-fn managed_inference_failure_category(stderr: &[u8]) -> Option<&'static str> {
+fn managed_inference_failure_category(
+    stderr: &[u8],
+    model_providers: &[String],
+) -> Option<&'static str> {
     String::from_utf8_lossy(stderr).lines().find_map(|line| {
         let line = line.to_ascii_lowercase();
-        let is_inference_error = line.contains("inference")
-            || line.contains("litellm")
-            || line.contains("openai")
-            || line.contains("anthropic");
+        let provider_named = model_providers.iter().any(|provider| {
+            let provider = provider.to_ascii_lowercase();
+            line.split(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+            })
+            .any(|token| token == provider)
+        });
+        let is_inference_error =
+            line.contains("inference") || line.contains("litellm") || provider_named;
         if is_inference_error
             && (line.contains("invalid api key")
                 || line.contains("invalid_api_key")
@@ -636,10 +644,14 @@ fn managed_inference_failure_category(stderr: &[u8]) -> Option<&'static str> {
 }
 
 #[cfg(feature = "runtime")]
-fn task_failure_category(stderr: &[u8], managed_inference: bool) -> &'static str {
+fn task_failure_category(
+    stderr: &[u8],
+    managed_inference: bool,
+    model_providers: &[String],
+) -> &'static str {
     let existing = task_agent_failure_category(stderr);
     if managed_inference && matches!(existing, "agent" | "authentication") {
-        managed_inference_failure_category(stderr).unwrap_or(existing)
+        managed_inference_failure_category(stderr, model_providers).unwrap_or(existing)
     } else {
         existing
     }
@@ -651,10 +663,20 @@ fn request_uses_managed_inference(request: &SandboxTaskRequest) -> bool {
 }
 
 #[cfg(feature = "runtime")]
+fn request_model_providers(request: &SandboxTaskRequest) -> &[String] {
+    request
+        .execution_binding
+        .as_ref()
+        .and_then(|binding| binding.models.as_ref())
+        .map_or(&[], |models| models.providers.as_slice())
+}
+
+#[cfg(feature = "runtime")]
 fn attach_task_agent_failure_category(
     observation: SandboxTaskObservation,
     stderr: &[u8],
     managed_inference: bool,
+    model_providers: &[String],
 ) -> SandboxTaskObservation {
     match observation {
         SandboxTaskObservation::Failed {
@@ -662,7 +684,7 @@ fn attach_task_agent_failure_category(
             ..
         } => SandboxTaskObservation::Failed {
             adapter_observation_id,
-            reason: task_failure_category(stderr, managed_inference).to_owned(),
+            reason: task_failure_category(stderr, managed_inference, model_providers).to_owned(),
         },
         SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
@@ -670,7 +692,7 @@ fn attach_task_agent_failure_category(
             ..
         } => SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
-            reason: task_failure_category(stderr, managed_inference).to_owned(),
+            reason: task_failure_category(stderr, managed_inference, model_providers).to_owned(),
             transcript,
         },
         observation => observation,
@@ -2629,6 +2651,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                             observation,
                             &executed.stderr,
                             request_uses_managed_inference(request),
+                            request_model_providers(request),
                         )
                     });
             }
@@ -2771,6 +2794,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                             task_failure_category(
                                 &transcript.stderr,
                                 request_uses_managed_inference(request),
+                                request_model_providers(request),
                             )
                             .to_owned()
                         },
@@ -4759,6 +4783,7 @@ mod tests {
                 arguments: vec!["--version".to_owned()],
                 expected_stdout: "example-agent 1.0.0".to_owned(),
             },
+            models: None,
             provider_profiles: ExecutionProviderProfiles {
                 tools: Some(ExecutionProviderProfile {
                     id: "example-tools-profile-v7".to_owned(),
@@ -4929,6 +4954,7 @@ mod tests {
                 arguments: vec!["--version".to_owned()],
                 expected_stdout: "example-agent 1.0.0".to_owned(),
             },
+            models: None,
             provider_profiles: ExecutionProviderProfiles {
                 tools: Some(ExecutionProviderProfile {
                     id: "example-tools-profile-v7".to_owned(),
@@ -5002,6 +5028,7 @@ mod tests {
                 arguments: vec!["--version".to_owned()],
                 expected_stdout: "example-agent 1.0.0".to_owned(),
             },
+            models: None,
             provider_profiles: ExecutionProviderProfiles::default(),
         };
         let command = output_archive_command(
@@ -5440,6 +5467,7 @@ mod tests {
     #[cfg(feature = "runtime")]
     #[test]
     fn task_agent_stderr_is_reduced_to_safe_categories() {
+        let model_providers = vec!["example-provider".to_owned()];
         assert_eq!(
             task_agent_failure_category(
                 b"steward-connections-bridge: bridge operation did not receive a valid MCP-GW response"
@@ -5528,37 +5556,58 @@ mod tests {
         );
         assert_eq!(task_agent_failure_category(b"opaque failure"), "agent");
         assert_eq!(
-            task_failure_category(b"openai error: incorrect api key provided", false),
+            task_failure_category(
+                b"example-provider error: incorrect api key provided",
+                false,
+                &model_providers,
+            ),
             "agent",
             "stock mode must preserve its existing failure category"
         );
         assert_eq!(
-            task_failure_category(b"openai error: incorrect api key provided", true),
+            task_failure_category(
+                b"example-provider error: incorrect api key provided",
+                true,
+                &model_providers,
+            ),
             "inference_key_rejected"
         );
         assert_eq!(
-            task_failure_category(b"openai error code: insufficient_quota", true),
+            task_failure_category(
+                b"example-provider error code: insufficient_quota",
+                true,
+                &model_providers,
+            ),
             "inference_budget_exhausted"
         );
         assert_eq!(
-            task_failure_category(b"tool provider returned unauthorized status 401", true),
+            task_failure_category(
+                b"tool provider returned unauthorized status 401",
+                true,
+                &model_providers,
+            ),
             "authentication",
             "managed mode must not relabel unrelated tool authentication failures"
         );
         assert_eq!(
-            task_failure_category(b"jira: invalid api key", true),
+            task_failure_category(b"jira: invalid api key", true, &model_providers),
             "authentication",
             "managed mode must not relabel a tool provider's rejected key"
         );
         assert_eq!(
-            task_failure_category(b"openai request completed\njira: invalid api key\n", true),
+            task_failure_category(
+                b"example-provider request completed\njira: invalid api key\n",
+                true,
+                &model_providers,
+            ),
             "authentication",
             "an unrelated inference line must not relabel a later tool failure"
         );
         assert_eq!(
             task_failure_category(
-                b"steward-connections-bridge: MCP-GW returned HTTP 401: openai invalid api key",
-                true
+                b"steward-connections-bridge: MCP-GW returned HTTP 401: example-provider invalid api key",
+                true,
+                &model_providers,
             ),
             "bridge-gateway-http",
             "specific connection failures must win over inference-shaped text"
@@ -5581,6 +5630,7 @@ mod tests {
                 },
                 b"steward-connections-bridge: bridge MCP-GW rejected runtime authorization",
                 false,
+                &[],
             ),
             SandboxTaskObservation::FailedWithTranscript {
                 adapter_observation_id: "attempt-a".to_owned(),
@@ -5601,6 +5651,7 @@ mod tests {
                 },
                 b"opaque stderr",
                 false,
+                &[],
             ),
             SandboxTaskObservation::SucceededWithTranscript {
                 adapter_observation_id: "attempt-b".to_owned(),

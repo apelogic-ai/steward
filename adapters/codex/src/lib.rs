@@ -55,6 +55,11 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
         &self,
         request: TaskExecutionPlanRequest<'_>,
     ) -> Result<TaskExecutionPlan, PortError> {
+        if !request.binding.supports_model(request.model) {
+            return Err(PortError::Rejected {
+                reason: "This coding agent does not support the selected model.".to_owned(),
+            });
+        }
         if !request.tools.is_empty() && request.tool_transport_endpoint.is_none() {
             return Err(PortError::Rejected {
                 reason: "tool-bearing Codex execution requires a governed tool endpoint".to_owned(),
@@ -129,8 +134,8 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
 mod tests {
     use steward_ports::{TaskExecutionAdapter, TaskExecutionPlanRequest};
     use steward_types::{
-        DisposableExecutionBinding, ExecutionProviderProfile, ExecutionProviderProfiles,
-        ExecutionVersionProbe, ModelRef, ToolGrant,
+        DisposableExecutionBinding, ExecutionModelCompatibility, ExecutionProviderProfile,
+        ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, ToolGrant,
     };
 
     use super::{CODEX_V1_ADAPTER, CodexTaskExecutionAdapter};
@@ -152,6 +157,9 @@ mod tests {
                 arguments: vec!["--version".to_owned()],
                 expected_stdout: "example-agent 1.0.0".to_owned(),
             },
+            models: Some(ExecutionModelCompatibility {
+                providers: vec!["example-model".to_owned()],
+            }),
             provider_profiles: ExecutionProviderProfiles {
                 tools: Some(ExecutionProviderProfile {
                     id: "example-tools-profile-v7".to_owned(),
@@ -292,6 +300,21 @@ mod tests {
                 })
                 .is_err(),
             "tool-bearing execution must fail closed without a governed endpoint"
+        );
+        assert!(
+            adapter
+                .render(TaskExecutionPlanRequest {
+                    workflow_prompt: "Inspect input.",
+                    model: &ModelRef {
+                        provider: "other-provider".to_owned(),
+                        model: "small".to_owned(),
+                    },
+                    tools: &[],
+                    tool_transport_endpoint: None,
+                    binding: &binding,
+                })
+                .is_err(),
+            "an unlisted provider must fail closed"
         );
         Ok(())
     }

@@ -1,5 +1,5 @@
 {
-  "apiVersion": "steward.execution-bindings/v1",
+  "apiVersion": "steward.execution-bindings/v2",
   "bindings": [{
     "agentRef": "codex@1.2.3",
     "displayName": " Codex",
@@ -7,6 +7,7 @@
     "image": "registry.example.test/agents/example\u0040sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "executable": "/opt/example/bin/agent",
     "versionProbe": {"arguments": ["--version"], "expectedStdout": "codex 1.2.3"},
+    "models": {"providers": ["openai"]},
     "providerProfiles": {}
   }]
 }

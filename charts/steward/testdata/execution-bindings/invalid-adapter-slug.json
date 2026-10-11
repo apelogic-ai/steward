@@ -1,5 +1,5 @@
 {
-  "apiVersion": "steward.execution-bindings/v1",
+  "apiVersion": "steward.execution-bindings/v2",
   "bindings": [{
     "agentRef": "example-agent@1.2.3",
     "adapter": "Malformed-v1",
@@ -9,6 +9,7 @@
       "arguments": ["--version"],
       "expectedStdout": "example-agent 1.2.3"
     },
+    "models": {"providers": ["openai"]},
     "providerProfiles": {
       "tools": {
         "id": "example-tools-profile-v7",
