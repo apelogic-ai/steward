@@ -57,7 +57,8 @@ acknowledgement. This list grants permission; it does not require it.
 - staging explicit paths, committing, and amending an unpushed commit of your
   own;
 - pushing that task branch, including every later push to that same branch
-  after the first (this is an ordinary push, not a force-push);
+  after the first (this is an ordinary push, not a force-push), until its PR
+  head is approved or queued, per "Merge queue";
 - syncing your task branch or worktree onto an updated `origin/main`, by the
   rule in "Force pushes and PR decisions";
 - opening its PR, editing its description, and commenting on it;
@@ -83,11 +84,27 @@ act rather than re-requesting the workflow around it.
 - Never merge, close, reopen, convert, or delete a branch with an open PR.
   Never dismiss a review. Those are human decisions.
 - If a PR appears stale, superseded, or wrong, report it and leave it open.
-- Sync a task branch onto an updated `origin/main` whenever `main` has moved;
-  a stale branch is a review cost. Before the branch's first push, rebase it.
+- Sync a task branch onto an updated `origin/main` whenever `main` has moved,
+  until its PR head is approved or queued (see "Merge queue"); a stale branch
+  is a review cost. Before the branch's first push, rebase it.
   After its first push, merge `origin/main` into it: rebasing a pushed branch
   requires a force-push, so it needs the explicit authorization above and is
   not the default. Never rewrite shared history.
+
+### Merge queue
+
+- PRs merge to `main` through the merge queue. The maintainer-authorized
+  coordinator adds a PR to the queue after it is approved and CI is green on
+  the approved head. Authors never add to, remove from, or bypass the queue.
+- Never push to a branch whose head is approved or queued: the push is rejected
+  or discards the approval. Further changes go in a new PR after the merge.
+- Waiting for CI, review, or the queue is not "blocked". Before reporting
+  blocked, re-check the PR state in the same turn
+  (`gh pr view <n> --json state,mergedAt,headRefOid`) and quote it.
+- If the queue removes a PR, its branch takes pushes again. Read the reason:
+  merge `origin/main` for a conflict; fix and push for a failure the change
+  caused; otherwise say so on the PR with the run link.
+- After a merge, start the next item for your lane from fresh `main`.
 
 ### Commits and staging
 
@@ -102,12 +119,19 @@ act rather than re-requesting the workflow around it.
 
 ### Release batching
 
-- When a maintainer identifies a change as the next release before its PR
-  merges, include every required version, changelog, chart, documentation,
-  release-workflow, and release-contract update in that same PR. Do not defer
-  mechanical release metadata to a second PR.
+- A milestone, epic, or issue label that names a version is planning
+  information, not an instruction to prepare a release. A product PR never
+  changes the version, chart version, release workflow, release-contract
+  scripts, or version-pinned documentation.
+- A product PR does add the user-facing `CHANGELOG.md` entry for its own
+  change, under `## [Unreleased]`.
+- A release is prepared in exactly one release PR, opened from current `main`
+  only when a maintainer or the maintainer-authorized coordinator asks for it
+  by name, after the release's planned changes have merged. It contains every
+  required version, changelog, chart, documentation, release-workflow, and
+  release-contract update together.
 - PR CI is **not** the release gate by itself. Before a release PR is ready, every
-  check the tag-triggered release workflow runs must have passed on the PR head
+  check the tag-triggered release workflow runs must have passed on its head
   with the same entrypoints, runner image and tools: the release `validate` job
   (`cargo xtask ci`), vulnerability scans, released-artifact acceptance (including
   `scripts/customer-core-install-e2e.sh --lint-source-chart`), and migration
@@ -121,15 +145,12 @@ act rather than re-requesting the workflow around it.
   optional values) still lints and renders. Helm drops `null` keys before
   validation, so a `required` key whose default is `null` breaks every install
   that does not set it.
-- A request to cut, tag, or publish a release after the product PR has merged is
-  not authority to create a standalone release-preparation PR. If `main` is not
-  release-ready, stop before creating a branch, commit, push, PR, or tag. Report
-  the exact missing release surfaces, that correcting them requires another
-  full CI run, and the expected wait. Proceed only after the maintainer
-  explicitly approves that additional PR and CI cost.
-- Never tag a commit that the current release contract will reject. Do not call
-  a standalone release-preparation change cheap or simple when repository rules
-  require the full gate.
+- A request to tag or publish a release is not a request for the release PR.
+  If `main` is not release-ready, do not tag. Report the exact missing release
+  surfaces, that correcting them takes the release PR and another full CI run,
+  and the expected wait.
+- Never tag a commit that the current release contract will reject. The release
+  PR uses the full gate; do not call it cheap or simple.
 - Do not push release tags. A release tag is created by a maintainer (or the
   maintainer-authorized coordinator) only after CI, or the release dry-run, has
   passed on the exact merge commit. A pushed tag is immutable: if its release
@@ -149,11 +170,13 @@ they are pushed, and stay retrievable after an edit or deletion.
   else they said is not.
 - Keep the license, third-party notices, and changelog accurate for what the
   release actually ships. A newly bundled or vendored artifact updates
-  `THIRD_PARTY_NOTICES.md` in the PR that introduces it, and a release adds its
-  `CHANGELOG.md` entry in the same PR as its version and chart updates, per
-  "Release batching". A changelog entry is complete when a consumer can read it
-  and know every behavior, contract, and operational change they must act on;
-  an entry naming only the headline feature is not complete.
+  `THIRD_PARTY_NOTICES.md` in the PR that introduces it. A product PR adds its
+  own `CHANGELOG.md` entry under `## [Unreleased]`, and the release PR moves
+  those entries under the released version together with the version and chart
+  updates, per "Release batching". A changelog entry is complete when a
+  consumer can read it and know every behavior, contract, and operational
+  change they must act on; an entry naming only the headline feature is not
+  complete.
 
 ### Worktrees
 
@@ -251,6 +274,11 @@ Also run every affected integration/E2E target required by the ticket and the
 test ladder. Use `cargo xtask` usage and CI as the command source of truth; do
 not duplicate its evolving internal command list here. Pinned upstream gates
 block; latest/nightly upstream lanes are informational.
+
+Any change to a type that appears in the HTTP API schema also requires
+regenerating the web client (`bun run web:generate-api`), committing
+`web/src/api-client` (generated output; any lane may commit it), and running
+`bun run web:check`. Never hide a field from the schema to make the check pass.
 
 Never hand off warnings. Repository Clippy policy treats warnings as errors.
 
