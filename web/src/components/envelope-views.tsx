@@ -92,7 +92,6 @@ function fixedAuthorityExceedsThreshold(template: AvailableEnvelopeTemplate): bo
   if (!threshold) return false;
   const requested = template.ceiling.spec;
   const allowed = threshold.spec;
-  if (optionalDecimalExceeds(requested.budget.singleRunLimit, allowed.budget.singleRunLimit)) return true;
   if ((requested.runner?.platforms ?? []).some((platform) => !(allowed.runner?.platforms ?? []).includes(platform))) return true;
   for (const resource of ["memory", "compute", "storage"] as const) {
     const requestedValue = requested.runner?.[resource];
@@ -114,16 +113,18 @@ function fixedAuthorityExceedsThreshold(template: AvailableEnvelopeTemplate): bo
   return false;
 }
 
-export function templateRequestReviewSummary({ budget, models, runtimeMinutes, template, tools, ttl }: Readonly<{
+export function templateRequestReviewSummary({ budget, models, runtimeMinutes, singleRunLimit, template, tools, ttl }: Readonly<{
   budget: string;
   models: ReadonlySet<string>;
   runtimeMinutes: string;
+  singleRunLimit: string;
   template: AvailableEnvelopeTemplate;
   tools: ReadonlySet<string>;
   ttl: string;
 }>): { exceedances: Array<EnvelopeExceedanceSummaryValue>; requiresApproval: boolean } {
   const exceedances = [
     decimalExceeds(budget, template.ceiling.spec.budget.monthlyLimit) ? { ceiling: `${template.ceiling.spec.budget.monthlyLimit} ${template.ceiling.spec.budget.currency}`, label: "Monthly limit", requested: `${budget} ${template.ceiling.spec.budget.currency}` } : null,
+    template.ceiling.spec.budget.singleRunLimit && singleRunLimit.trim() && decimalExceeds(singleRunLimit.trim(), template.ceiling.spec.budget.singleRunLimit) ? { ceiling: `${template.ceiling.spec.budget.singleRunLimit} ${template.ceiling.spec.budget.currency}`, label: "Limit per run", requested: `${singleRunLimit.trim()} ${template.ceiling.spec.budget.currency}` } : null,
     template.ceiling.spec.runtimeMinutesLimit && runtimeMinutes.trim() && decimalExceeds(runtimeMinutes.trim(), template.ceiling.spec.runtimeMinutesLimit) ? { ceiling: `${template.ceiling.spec.runtimeMinutesLimit} minutes`, label: "Runtime minutes", requested: `${runtimeMinutes.trim()} minutes` } : null,
     durationExceeds(ttl, template.ceiling.spec.ttl) ? { ceiling: template.ceiling.spec.ttl, label: "Time to live", requested: ttl } : null,
     [...models].some((model) => !template.ceiling.spec.llms.some((allowed) => `${allowed.provider}\u0000${allowed.model}` === model)) ? {
@@ -139,6 +140,7 @@ export function templateRequestReviewSummary({ budget, models, runtimeMinutes, t
   ].filter((value): value is EnvelopeExceedanceSummaryValue => value !== null);
   const threshold = template.autoProvisionThreshold ?? template.ceiling;
   const aboveAutomaticThreshold = decimalExceeds(budget, threshold.spec.budget.monthlyLimit)
+    || optionalDecimalExceeds(singleRunLimit.trim() || null, threshold.spec.budget.singleRunLimit)
     || optionalDecimalExceeds(runtimeMinutes.trim() || null, threshold.spec.runtimeMinutesLimit)
     || durationExceeds(ttl, threshold.spec.ttl)
     || [...models].some((model) => !threshold.spec.llms.some((allowed) => `${allowed.provider}\u0000${allowed.model}` === model))
@@ -223,30 +225,30 @@ export function NewEnvelopeView() {
 function EnvelopeRequestForm({ templates }: Readonly<{ templates: Array<AvailableEnvelopeTemplate> }>) {
   const searchParams = useSearchParams();
   const requestedTemplate = searchParams.get("template");
-  const initialTemplateId = templates.some((template) => template.id === requestedTemplate) ? requestedTemplate ?? undefined : undefined;
-  const [requestType, setRequestType] = useState<"template" | "custom">(searchParams.get("type") === "custom" || !templates.length ? "custom" : "template");
+  const initialTemplate = templates.find((template) => template.id === requestedTemplate) ?? templates[0];
+  const [selection, setSelection] = useState(() => searchParams.get("type") === "custom" || !initialTemplate ? "custom" : `template:${initialTemplate.id}`);
   const [submitting, setSubmitting] = useState(false);
+  const template = selection.startsWith("template:") ? templates.find((candidate) => `template:${candidate.id}` === selection) : undefined;
   return (
     <div className="space-y-5">
-      <label className="grid max-w-md gap-2 text-sm font-semibold">Request type
-        <select className="min-h-11 rounded-md border bg-panel px-3 font-normal" disabled={submitting} onChange={(event) => setRequestType(event.target.value === "custom" ? "custom" : "template")} value={requestType}>
-          {templates.length ? <option value="template">Use a template</option> : null}
+      <label className="grid min-w-0 gap-2 text-sm font-semibold">Template
+        <select className="min-h-11 min-w-0 w-full max-w-full rounded-md border bg-panel px-3 font-normal" disabled={submitting} onChange={(event) => setSelection(event.target.value)} value={template ? `template:${template.id}` : "custom"}>
+          {templates.map((candidate) => <option key={candidate.id} value={`template:${candidate.id}`}>{candidate.displayName} · rev {candidate.revision} — {candidate.ceiling.spec.budget.monthlyLimit} {candidate.ceiling.spec.budget.currency}/month · TTL {candidate.ceiling.spec.ttl} · {candidate.ceiling.spec.tools.length} {candidate.ceiling.spec.tools.length === 1 ? "tool" : "tools"}</option>)}
           <option value="custom">Custom envelope</option>
         </select>
       </label>
-      {requestType === "template" && templates.length
-        ? <TemplateEnvelopeRequestForm initialTemplateId={initialTemplateId} onSubmittingChange={setSubmitting} templates={templates} />
+      {template
+        ? <TemplateEnvelopeRequestForm key={template.id} onSubmittingChange={setSubmitting} template={template} />
         : <CustomEnvelopeRequestForm onSubmittingChange={setSubmitting} />}
     </div>
   );
 }
 
-function TemplateEnvelopeRequestForm({ initialTemplateId, onSubmittingChange, templates }: Readonly<{ initialTemplateId?: string; onSubmittingChange: (submitting: boolean) => void; templates: Array<AvailableEnvelopeTemplate> }>) {
+function TemplateEnvelopeRequestForm({ onSubmittingChange, template }: Readonly<{ onSubmittingChange: (submitting: boolean) => void; template: AvailableEnvelopeTemplate }>) {
   const router = useRouter();
   const session = useSession();
-  const [templateId, setTemplateId] = useState(initialTemplateId ?? templates[0]?.id ?? "");
-  const template = templates.find((item) => item.id === templateId) ?? templates[0];
   const [budget, setBudget] = useState(template.ceiling.spec.budget.monthlyLimit);
+  const [singleRunLimit, setSingleRunLimit] = useState(template.ceiling.spec.budget.singleRunLimit ?? "");
   const [runtimeMinutes, setRuntimeMinutes] = useState(template.ceiling.spec.runtimeMinutesLimit ?? "");
   const [ttl, setTtl] = useState(template.ceiling.spec.ttl);
   const [models, setModels] = useState(() => new Set(template.ceiling.spec.llms.map((item) => `${item.provider}\u0000${item.model}`)));
@@ -263,24 +265,18 @@ function TemplateEnvelopeRequestForm({ initialTemplateId, onSubmittingChange, te
     setRejectedFields([]);
   }
 
-  function selectTemplate(id: string) {
-    const next = templates.find((item) => item.id === id);
-    if (!next) return;
-    setTemplateId(id);
-    setBudget(next.ceiling.spec.budget.monthlyLimit);
-    setRuntimeMinutes(next.ceiling.spec.runtimeMinutesLimit ?? "");
-    setTtl(next.ceiling.spec.ttl);
-    setModels(new Set(next.ceiling.spec.llms.map((item) => `${item.provider}\u0000${item.model}`)));
-    setTools(new Set(next.ceiling.spec.tools.map((item) => `${item.provider}\u0000${item.resource}\u0000${item.action}`)));
-    setJustification("");
-    setSubmission("idle");
-    setFailureReason(null);
-    setRejectedFields([]);
-  }
+  const singleRunValue = singleRunLimit.trim();
+  const singleRunError = !singleRunValue && template.ceiling.spec.budget.singleRunLimit
+    ? "Enter a limit per run."
+    : singleRunValue && !decimalParts(singleRunValue)
+      ? "Limit per run must be 0 or more."
+      : singleRunValue && decimalExceeds(singleRunValue, budget)
+        ? "Limit per run cannot exceed the monthly limit."
+        : null;
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (session.status !== "authenticated") return;
+    if (session.status !== "authenticated" || singleRunError) return;
     setSubmission("submitting");
     setFailureReason(null);
     setRejectedFields([]);
@@ -298,7 +294,7 @@ function TemplateEnvelopeRequestForm({ initialTemplateId, onSubmittingChange, te
             budget: {
               currency: template.ceiling.spec.budget.currency,
               monthlyLimit: budget,
-              singleRunLimit: template.ceiling.spec.budget.singleRunLimit,
+              ...(singleRunValue ? { singleRunLimit: singleRunValue } : {}),
             },
             ...(runtimeMinutes.trim() ? { runtimeMinutesLimit: runtimeMinutes.trim() } : {}),
             ttl,
@@ -324,30 +320,36 @@ function TemplateEnvelopeRequestForm({ initialTemplateId, onSubmittingChange, te
 
   const modelOptions = template.ceiling.spec.llms.map((item) => ({ key: `${item.provider}\u0000${item.model}`, kind: "model" as const, label: `${item.provider}/${item.model}` }));
   const toolOptions = template.ceiling.spec.tools.map((item) => ({ key: `${item.provider}\u0000${item.resource}\u0000${item.action}`, kind: grantKindForAction(item.action), label: `${item.provider}:${item.resource}:${item.action}` }));
-  const { exceedances, requiresApproval } = templateRequestReviewSummary({ budget, models, runtimeMinutes, template, tools, ttl });
+  const { exceedances, requiresApproval } = templateRequestReviewSummary({ budget, models, runtimeMinutes, singleRunLimit, template, tools, ttl });
   const exceededFields = new Set(exceedances.map(({ label }) => label));
   if (rejectedFields.includes("budgetMonthlyLimit")) exceededFields.add("Monthly limit");
+  if (rejectedFields.includes("budgetSingleRunLimit")) exceededFields.add("Limit per run");
   if (rejectedFields.includes("runtimeMinutesLimit")) exceededFields.add("Runtime minutes");
   if (rejectedFields.includes("ttl")) exceededFields.add("Time to live");
   const fieldClass = (exceeded: boolean) => `min-h-11 rounded-control border px-3 font-normal ${exceeded ? "border-warn ring-1 ring-warn" : ""}`;
+  const ceilingHint = (exceeded: boolean, value: string) => <span className={`text-xs font-normal ${exceeded ? "text-warn" : "text-muted-ink"}`}>{exceeded ? "Above ceiling" : "Ceiling"} {value}</span>;
   const stepTitle = (number: string, title: string) => <span className="flex items-center gap-3"><span className="font-mono text-xs font-normal text-faint-ink">{number}</span>{title}</span>;
+  const summary = [
+    ["Template", template.displayName],
+    ["Monthly limit", `${budget} ${template.ceiling.spec.budget.currency}`],
+    ["Limit per run", singleRunValue ? `${singleRunValue} ${template.ceiling.spec.budget.currency}` : "Not set"],
+    ["Time to live", ttl],
+    ["Models", String(models.size)],
+    ["Tools", String(tools.size)],
+  ];
   return (
     <form className="flex flex-wrap items-start gap-5" onSubmit={submit}>
       <div className="min-w-0 flex-[1_1_520px] space-y-4">
-        <SectionCard title={stepTitle("01", "Template")}>
-          <label className="sr-only">Template<select disabled={submission === "submitting"} onChange={(event) => selectTemplate(event.target.value)} value={template.id}>{templates.map((item) => <option key={item.id} value={item.id}>{item.displayName} · revision {item.revision}</option>)}</select></label>
-          <div className="grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">{templates.map((item) => <button aria-pressed={item.id === template.id} className={`rounded-tile border p-4 text-left ${item.id === template.id ? "border-brand bg-brand-soft" : "hover:bg-subtle"}`} disabled={submission === "submitting"} key={item.id} onClick={() => selectTemplate(item.id)} type="button"><span className="flex items-center justify-between gap-3"><strong className="text-[15px]">{item.displayName}</strong><span className="font-mono text-xs text-muted-ink">rev {item.revision}</span></span><span className="mt-2 block text-xs text-muted-ink">Up to {item.ceiling.spec.budget.monthlyLimit} {item.ceiling.spec.budget.currency}/mo · {item.ceiling.spec.ttl} · {item.ceiling.spec.tools.length} tools</span></button>)}</div>
-        </SectionCard>
-        <SectionCard title={stepTitle("02", "Budget and lifetime")}><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})<input className={fieldClass(exceededFields.has("Monthly limit"))} disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => { setBudget(event.target.value); clearRejectedSubmission(); }} required value={budget} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.budget.monthlyLimit} {template.ceiling.spec.budget.currency}</span></label><label className="grid gap-2 text-sm font-semibold">Time to live<input className={`${fieldClass(exceededFields.has("Time to live"))} font-mono`} disabled={submission === "submitting"} onChange={(event) => { setTtl(event.target.value); clearRejectedSubmission(); }} required value={ttl} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.ttl}</span></label>{template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month<input className={fieldClass(exceededFields.has("Runtime minutes"))} disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => { setRuntimeMinutes(event.target.value); clearRejectedSubmission(); }} required value={runtimeMinutes} /><span className="text-xs font-normal text-muted-ink">Ceiling {template.ceiling.spec.runtimeMinutesLimit} minutes</span></label> : null}</div></SectionCard>
-        <SectionCard className={exceededFields.has("Models") || rejectedFields.includes("llms") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("03", "Models")}><TagSelect addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" onChange={(next) => { setModels(new Set(next)); clearRejectedSubmission(); }} options={modelOptions} value={[...models]} /></SectionCard>
-        <SectionCard className={exceededFields.has("Tools") || rejectedFields.includes("tools") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("04", "Tools")}><TagSelect addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search GitHub tools…" label="Tools" onChange={(next) => { setTools(new Set(next)); clearRejectedSubmission(); }} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools in the template ceiling are offered.</p></SectionCard>
-        <SectionCard title={stepTitle("05", "Request note")}><label className="grid gap-2 text-sm font-semibold">Justification (optional)<textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); clearRejectedSubmission(); }} placeholder="Explain why these limits or capabilities are needed." value={justification} /></label></SectionCard>
+        <SectionCard title={stepTitle("01", "Budget and lifetime")}><div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Monthly limit ({template.ceiling.spec.budget.currency})<input className={fieldClass(exceededFields.has("Monthly limit"))} disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => { setBudget(event.target.value); clearRejectedSubmission(); }} required value={budget} />{ceilingHint(exceededFields.has("Monthly limit"), `${template.ceiling.spec.budget.monthlyLimit} ${template.ceiling.spec.budget.currency}`)}</label><label className="grid gap-2 text-sm font-semibold">Limit per run ({template.ceiling.spec.budget.currency})<input aria-invalid={Boolean(singleRunError) || exceededFields.has("Limit per run")} className={fieldClass(exceededFields.has("Limit per run") || Boolean(singleRunError))} disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => { setSingleRunLimit(event.target.value); clearRejectedSubmission(); }} required={Boolean(template.ceiling.spec.budget.singleRunLimit)} value={singleRunLimit} />{template.ceiling.spec.budget.singleRunLimit ? ceilingHint(exceededFields.has("Limit per run"), `${template.ceiling.spec.budget.singleRunLimit} ${template.ceiling.spec.budget.currency}`) : <span className="text-xs font-normal text-muted-ink">Optional · cannot exceed the monthly limit</span>}{singleRunError ? <span className="text-xs font-normal text-err" role="alert">{singleRunError}</span> : null}</label><label className="grid gap-2 text-sm font-semibold">Time to live<input className={`${fieldClass(exceededFields.has("Time to live"))} font-mono`} disabled={submission === "submitting"} onChange={(event) => { setTtl(event.target.value); clearRejectedSubmission(); }} required value={ttl} />{ceilingHint(exceededFields.has("Time to live"), template.ceiling.spec.ttl)}</label>{template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime minutes / month<input className={fieldClass(exceededFields.has("Runtime minutes"))} disabled={submission === "submitting"} inputMode="decimal" onChange={(event) => { setRuntimeMinutes(event.target.value); clearRejectedSubmission(); }} required value={runtimeMinutes} />{ceilingHint(exceededFields.has("Runtime minutes"), `${template.ceiling.spec.runtimeMinutesLimit} minutes`)}</label> : null}</div></SectionCard>
+        <SectionCard className={exceededFields.has("Models") || rejectedFields.includes("llms") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("02", "Models")}><TagSelect addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" onChange={(next) => { setModels(new Set(next)); clearRejectedSubmission(); }} options={modelOptions} value={[...models]} /></SectionCard>
+        <SectionCard className={exceededFields.has("Tools") || rejectedFields.includes("tools") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("03", "Tools")}><TagSelect addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search GitHub tools…" label="Tools" onChange={(next) => { setTools(new Set(next)); clearRejectedSubmission(); }} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools in the template ceiling are offered.</p></SectionCard>
+        <SectionCard title={stepTitle("04", "Request note")}><label className="grid gap-2 text-sm font-semibold">Justification (optional)<textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); clearRejectedSubmission(); }} placeholder="Explain why these limits or capabilities are needed." value={justification} /></label></SectionCard>
       </div>
       <SectionCard className="sticky top-7 flex-[1_1_280px] lg:max-w-[380px]" title="Summary">
-        <dl className="space-y-3 text-sm">{[["Template", template.displayName], ["Monthly limit", `${budget} ${template.ceiling.spec.budget.currency}`], ["Limit per run", template.ceiling.spec.budget.singleRunLimit ? `${template.ceiling.spec.budget.singleRunLimit} ${template.ceiling.spec.budget.currency}` : "Not set"], ["TTL", ttl], ["Models", String(models.size)], ["Tools", String(tools.size)]].map(([label, value]) => <div className="flex justify-between gap-4" key={label}><dt className="text-muted-ink">{label}</dt><dd className="text-right font-medium">{value}</dd></div>)}</dl>
+        <dl className="space-y-3 text-sm">{summary.map(([label, value]) => <div className={`flex justify-between gap-4 ${exceededFields.has(label) ? "text-warn" : ""}`} key={label}><dt className={exceededFields.has(label) ? undefined : "text-muted-ink"}>{label}</dt><dd className="text-right font-medium">{value}</dd></div>)}</dl>
         {submission !== "idle" && submission !== "submitting" ? <p className="mt-4 text-sm text-err" role="alert">{failureReason ?? { conflict: "The template revision changed. Reload before retrying.", rejected: "The request is outside the platform safety limits or capability catalog.", forbidden: "You are not allowed to submit this request.", unavailable: "The request service is unavailable.", error: "The request could not be accepted." }[submission]}</p> : null}
         {exceedances.length ? <div className="mt-4"><EnvelopeExceedanceSummary values={exceedances} /></div> : null}
-        <button className="mt-5 min-h-10 w-full rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting"} type="submit">{submission === "submitting" ? "Submitting…" : requiresApproval ? "Submit for approval" : "Submit request"}</button>
+        <button className="mt-5 min-h-10 w-full rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting" || Boolean(singleRunError)} type="submit">{submission === "submitting" ? "Submitting…" : requiresApproval ? "Submit for approval" : "Submit request"}</button>
         <p className="mt-3 text-xs leading-5 text-muted-ink">{requiresApproval ? exceedances.length ? `${exceedances.length} ${exceedances.length === 1 ? "value exceeds" : "values exceed"} the template ceiling and need admin approval.` : "This request is above the automatic approval limit and needs admin approval." : "This request will be provisioned immediately."}</p>
       </SectionCard>
     </form>
