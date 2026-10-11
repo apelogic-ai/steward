@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- The supported Codex reference runtime now includes pinned `rg`, `jq`, `fd`,
+  and `tree` commands for repository inspection and structured-output work.
 - Execution binding catalogs now declare supported model providers. Signed-in capabilities expose
   that compatibility, and Task planning rejects an incompatible agent/model selection before
   reservation without hard-coded provider families.

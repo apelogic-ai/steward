@@ -1643,6 +1643,81 @@ mod tests {
     }
 
     #[test]
+    fn codex_reference_runtime_includes_supported_read_tools() -> Result<(), String> {
+        let container = fs::read_to_string(root().join("build/codex-reference.Dockerfile"))
+            .map_err(|error| format!("Codex reference runtime build is required: {error}"))?;
+        let documentation =
+            fs::read_to_string(root().join("docs/installation/codex-reference-runtime.md"))
+                .map_err(|error| {
+                    format!("Codex reference runtime documentation is required: {error}")
+                })?;
+        let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("CI workflow is required: {error}"))?;
+        let governed_probe = fs::read_to_string(
+            root().join("scripts/codex-reference-runtime-e2e.sh"),
+        )
+        .map_err(|error| format!("Codex reference runtime governed probe is required: {error}"))?;
+
+        for required in [
+            "RIPGREP_VERSION=14.1.0-1",
+            "RIPGREP_SHA256=c5ae63c7bee915b1cfc9f0bd07c55b4ce7f2bcd1133cba4da56719aac26101a4",
+            "JQ_VERSION=1.7.1-3ubuntu0.24.04.2",
+            "JQ_SHA256=f59183392f84fe67b407b494d8ba6185e9b0e4a106ffcb369490bd20a83fd40e",
+            "LIBJQ_VERSION=1.7.1-3ubuntu0.24.04.2",
+            "LIBJQ_SHA256=078fbf38b2e7c3f24cc5dc894d1bb03b617894b887a6e13d5943e13818e724f3",
+            "LIBONIG_VERSION=6.9.9-1build1",
+            "LIBONIG_SHA256=605f42287d2bcb6c84f5a02377c7cd777090c5e857259a4030a571989f19dde2",
+            "FD_FIND_VERSION=9.0.0-1",
+            "FD_FIND_SHA256=2f4f1bf881e3e967f7ef3da0b757638f4b0db5227f21b2ac0aaa89ae76e6672d",
+            "TREE_VERSION=2.1.1-2ubuntu3.24.04.2",
+            "TREE_SHA256=56edc302c11b1d35975ded0a38d52e98e82280b12a7a1c7a1b03e4772061731e",
+            "https://launchpad.net/ubuntu/+archive/primary/+files/ripgrep_${RIPGREP_VERSION}_amd64.deb",
+            "https://launchpad.net/ubuntu/+archive/primary/+files/jq_${JQ_VERSION}_amd64.deb",
+            "https://launchpad.net/ubuntu/+archive/primary/+files/libjq1_${LIBJQ_VERSION}_amd64.deb",
+            "https://launchpad.net/ubuntu/+archive/primary/+files/libonig5_${LIBONIG_VERSION}_amd64.deb",
+            "https://launchpad.net/ubuntu/+archive/primary/+files/fd-find_${FD_FIND_VERSION}_amd64.deb",
+            "https://launchpad.net/ubuntu/+archive/primary/+files/tree_${TREE_VERSION}_amd64.deb",
+            "sha256sum --check --strict",
+            "dpkg --install",
+            "ln -s /usr/bin/fdfind /usr/local/bin/fd",
+            "rg --version",
+            "jq --version",
+            "fd --version",
+            "tree --version",
+        ] {
+            assert!(
+                container.contains(required),
+                "Codex reference runtime must install and verify {required}"
+            );
+        }
+        for required in ["`rg`", "`jq`", "`fd`", "`tree`"] {
+            assert!(
+                documentation.contains(required),
+                "Codex reference runtime documentation must list {required}"
+            );
+        }
+        assert!(
+            workflow.contains("bash scripts/codex-reference-runtime-e2e.sh"),
+            "Codex reference runtime CI must run the governed sandbox probe"
+        );
+        for required in ["rg", "jq", "fd", "tree"] {
+            assert!(
+                governed_probe.contains(&format!("{required} --version")),
+                "governed sandbox probe must execute {required} --version"
+            );
+        }
+        let workspace = governed_probe
+            .lines()
+            .find_map(|line| line.strip_prefix("workspace=\"")?.strip_suffix('"'))
+            .ok_or_else(|| "governed sandbox probe must declare its workspace".to_owned())?;
+        assert!(
+            workspace.len() <= 19,
+            "governed sandbox probe workspace must fit OpenShell's 19-character limit"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn production_execution_binding_code_contains_no_deployment_agent_values() -> Result<(), String>
     {
         let production_sources = [
