@@ -23,6 +23,18 @@ Install the provider-profile bundle from the same Steward release and record the
 IDs and digests in the binding. The release builds the image for `linux/amd64`, verifies its pinned
 CLI version during the build, scans it, and publishes its immutable digest, SBOM, and provenance.
 
+## Included command-line tools
+
+The non-root `sandbox` user can use these pinned tools for repository inspection and structured
+output processing:
+
+| Command | Version | Purpose |
+|---|---:|---|
+| `rg` | 14.1.0 | Fast recursive text search |
+| `jq` | 1.7.1 | JSON inspection and transformation |
+| `fd` | 9.0.0 | File and directory search |
+| `tree` | 2.1.1 | Directory-tree inspection |
+
 ## Mirror the exact manifest
 
 Use the released [daemonless registry mirror](registry-mirroring.md). Add an

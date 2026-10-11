@@ -1643,6 +1643,61 @@ mod tests {
     }
 
     #[test]
+    fn codex_reference_runtime_includes_supported_read_tools() -> Result<(), String> {
+        let container = fs::read_to_string(root().join("build/codex-reference.Dockerfile"))
+            .map_err(|error| format!("Codex reference runtime build is required: {error}"))?;
+        let documentation =
+            fs::read_to_string(root().join("docs/installation/codex-reference-runtime.md"))
+                .map_err(|error| {
+                    format!("Codex reference runtime documentation is required: {error}")
+                })?;
+        let workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("CI workflow is required: {error}"))?;
+        let governed_probe = fs::read_to_string(
+            root().join("scripts/codex-reference-runtime-e2e.sh"),
+        )
+        .map_err(|error| format!("Codex reference runtime governed probe is required: {error}"))?;
+
+        for required in [
+            "RIPGREP_VERSION=14.1.0-1",
+            "JQ_VERSION=1.7.1-3ubuntu0.24.04.2",
+            "FD_FIND_VERSION=9.0.0-1",
+            "TREE_VERSION=2.1.1-2ubuntu3.24.04.2",
+            "ripgrep=${RIPGREP_VERSION}",
+            "jq=${JQ_VERSION}",
+            "fd-find=${FD_FIND_VERSION}",
+            "tree=${TREE_VERSION}",
+            "ln -s /usr/bin/fdfind /usr/local/bin/fd",
+            "rg --version",
+            "jq --version",
+            "fd --version",
+            "tree --version",
+        ] {
+            assert!(
+                container.contains(required),
+                "Codex reference runtime must install and verify {required}"
+            );
+        }
+        for required in ["`rg`", "`jq`", "`fd`", "`tree`"] {
+            assert!(
+                documentation.contains(required),
+                "Codex reference runtime documentation must list {required}"
+            );
+        }
+        assert!(
+            workflow.contains("bash scripts/codex-reference-runtime-e2e.sh"),
+            "Codex reference runtime CI must run the governed sandbox probe"
+        );
+        for required in ["rg", "jq", "fd", "tree"] {
+            assert!(
+                governed_probe.contains(&format!("{required} --version")),
+                "governed sandbox probe must execute {required} --version"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn production_execution_binding_code_contains_no_deployment_agent_values() -> Result<(), String>
     {
         let production_sources = [

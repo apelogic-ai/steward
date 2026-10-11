@@ -344,7 +344,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.class == 'full'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -353,6 +353,19 @@ jobs:
 
       - name: Build Codex reference runtime
         run: docker build --platform linux/amd64 --file build/codex-reference.Dockerfile --tag steward-codex-runtime:release-validation .
+
+      - name: Install governed sandbox tools
+        uses: ./.github/actions/setup-tools
+        with:
+          kubernetes-tools: "true"
+
+      - name: Verify Codex tools in a governed sandbox
+        env:
+          STEWARD_CODEX_REFERENCE_IMAGE: steward-codex-runtime:release-validation
+          STEWARD_OPEN_SHELL_RELEASE: v0.0.98
+          STEWARD_OPENSHELL_SANDBOX_IMAGE: steward-codex-runtime:release-validation
+          STEWARD_RUN_ID: codex-reference-${{ github.run_id }}-${{ github.run_attempt }}
+        run: bash scripts/openshell-testbed.sh bash scripts/codex-reference-runtime-e2e.sh
 
       - name: Enforce critical Codex reference runtime policy
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
