@@ -25,7 +25,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   requests and Envelope details show omitted operational limits from the
   deployment when available, without rendering missing values. Existing
   narrower file, history, and submodule limits remain unchanged when those
-  forms are edited.
+  forms are edited. Administrator approval comparisons always identify omitted
+  limits as deployment limits, and stored size values that need correction can
+  no longer be cleared implicitly by an unrelated edit.
 - OpenShell Agent Tasks with `diagnostics.executionLog: full` now run in a
   restart-safe, attempt-scoped process group. Steward persists bounded stdout
   and stderr snapshots while the Task runs, refreshes Run detail before the

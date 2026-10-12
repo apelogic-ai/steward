@@ -9,6 +9,8 @@ export type WorkspaceAuthorityDraft = {
   allowedTypes: Array<string>;
   preservedLimits?: Pick<WorkspaceAuthority, "maxFiles" | "maxHistoryDepth" | "maxSubmoduleDepth">;
   size: string;
+  sizeEdited?: boolean;
+  sizeNeedsCorrection?: boolean;
   sizeUnit: WorkspaceSizeUnit;
 };
 
@@ -55,7 +57,8 @@ export function workspaceAuthorityDraft(workspace?: null | WorkspaceAuthority, e
   return {
     allowedTypes: workspace?.allowedTypes.filter((type) => !enabled || enabled.has(type)) ?? [],
     ...(Object.keys(preservedLimits).length > 0 ? { preservedLimits } : {}),
-    size: match?.[1] ?? "",
+    size: match?.[1] ?? workspace?.maxTotalSize ?? "",
+    ...(!match && workspace?.maxTotalSize ? { sizeNeedsCorrection: true } : {}),
     sizeUnit: match ? displayUnit[match[2] as WorkspaceWireUnit] : "GiB",
   };
 }
@@ -68,6 +71,7 @@ export function workspaceAuthorityFromDraft(draft: WorkspaceAuthorityDraft, enab
     allowedTypes: allowedTypes as WorkspaceAuthority["allowedTypes"],
     ...draft.preservedLimits,
   };
+  if (draft.sizeNeedsCorrection && !draft.sizeEdited) return null;
   if (!draft.size.trim()) return authority;
   if (!/^[1-9][0-9]*$/.test(draft.size.trim())) return null;
   return {
@@ -115,7 +119,7 @@ export function WorkspaceAuthorityControls({
       </div>
       <label className="grid gap-2 text-sm font-semibold">Total size limit (optional)
         <span className="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
-          <input aria-invalid={Boolean(error) || undefined} className="min-h-11 min-w-0 rounded-md border bg-panel px-3 font-normal" disabled={disabled || draft.allowedTypes.length === 0} inputMode="numeric" min={1} onChange={(event) => onChange({ ...draft, size: event.target.value })} placeholder="Deployment limit" step={1} type="number" value={draft.size} />
+          <input aria-invalid={Boolean(error) || undefined} className="min-h-11 min-w-0 rounded-md border bg-panel px-3 font-normal" disabled={disabled || draft.allowedTypes.length === 0} inputMode="numeric" onChange={(event) => onChange({ ...draft, size: event.target.value, sizeEdited: true })} pattern="[1-9][0-9]*" placeholder="Deployment limit" type="text" value={draft.size} />
           <select aria-label="Total size unit" className="min-h-11 rounded-md border bg-panel px-3 font-normal" disabled={disabled || draft.allowedTypes.length === 0} onChange={(event) => onChange({ ...draft, sizeUnit: event.target.value as WorkspaceSizeUnit })} value={draft.sizeUnit}>
             {workspaceSizeUnits.map((unit) => <option key={unit} value={unit}>{unit}</option>)}
           </select>

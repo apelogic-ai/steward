@@ -49,10 +49,10 @@ test("two-field workspace authority shows known deployment limits without undefi
   expect(html).not.toContain("undefined");
 });
 
-test("omitted limits are left out when deployment values are unknown", () => {
-  const html = renderToStaticMarkup(<WorkspaceAuthorityDetails workspace={{ allowedTypes: ["git"] }} />);
+test("approval comparisons can name omitted limits when deployment values are unknown", () => {
+  const html = renderToStaticMarkup(<WorkspaceAuthorityDetails showDeploymentFallback workspace={{ allowedTypes: ["git"] }} />);
 
   expect(html).toContain("git");
-  expect(html).not.toContain("Deployment limit");
+  expect(html.match(/Deployment limit/g)).toHaveLength(4);
   expect(html).not.toContain("undefined");
 });

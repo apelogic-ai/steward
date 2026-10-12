@@ -1016,6 +1016,10 @@ async function guardedPage(browser, {
   await context.route(`${origin}/app/api/v1/capabilities`, async (route) => {
     if (holdUserCapabilities) await userCapabilitiesReleased;
     await json(route, {
+      agents: [
+        { agentRef: "codex@0.140.0", displayName: "Codex 0.140.0", models: { providers: ["openai"] } },
+        { agentRef: "claude-code@2.1.222", displayName: "Claude Code 2.1.222", models: { providers: ["provider-a"] } },
+      ],
       apiVersion: "steward.user-capabilities/v1",
       workspace: capabilityCatalog.workspace,
     });
@@ -2710,7 +2714,7 @@ test("users can request a custom envelope without selecting a template", async (
     await developer.page.getByLabel("Complete envelope JSON").fill(JSON.stringify(analystEnvelope, null, 2));
     const workspace = developer.page.getByRole("group", { name: "Workspace access" });
     await workspace.getByRole("checkbox", { name: "Git" }).check();
-    await workspace.getByRole("spinbutton", { name: /^Total size limit/ }).fill("2");
+    await workspace.getByRole("textbox", { name: /^Total size limit/ }).fill("2");
     await expect(workspace.getByRole("combobox", { name: "Total size unit" })).toHaveValue("GiB");
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await Promise.all([
@@ -3923,9 +3927,9 @@ test("administrator templates and approvals use typed browser authority", async 
     const workspace = administrator.page.getByRole("group", { name: "Workspace access" });
     await expect(workspace.getByRole("checkbox", { name: "Git" })).toBeChecked();
     await expect(workspace.getByRole("checkbox", { name: "Scratch" })).toBeChecked();
-    await expect(workspace.getByRole("spinbutton", { name: /^Total size limit/ })).toHaveValue("2");
+    await expect(workspace.getByRole("textbox", { name: /^Total size limit/ })).toHaveValue("2");
     await workspace.getByRole("checkbox", { name: "Scratch" }).uncheck();
-    await workspace.getByRole("spinbutton", { name: /^Total size limit/ }).fill("");
+    await workspace.getByRole("textbox", { name: /^Total size limit/ }).fill("");
     await expect(administrator.page.getByRole("heading", { name: "Runner" })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByText("Template revision saved.")).toBeVisible();

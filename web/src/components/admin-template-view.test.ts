@@ -117,6 +117,10 @@ describe("first envelope template", () => {
     })).toEqual({});
     expect(validateTemplateFields({
       ...common,
+      workspace: { allowedTypes: ["git"], maxTotalSize: "1.5Gi" },
+    })).toEqual({});
+    expect(validateTemplateFields({
+      ...common,
       workspace: {
         allowedTypes: ["git", "scratch"],
         maxTotalSize: "2Gi",

@@ -9,10 +9,12 @@ import {
   denyAdminEscalation,
   fileAdminApprovalDecision,
   fileAdminEnvelopeRequest,
+  getAdminCapabilities,
   getAdminRequest,
   topUpAdminEscalation,
   rejectAdminEnvelopeRequest,
   type BrowserApprovalView,
+  type BrowserCapabilityCatalogResponse,
   type BrowserDecisionReferenceResponse,
   type BrowserEnvelopeSpec,
   type BrowserEnvelopeRequestDecisionResponse,
@@ -21,6 +23,7 @@ import {
   type AdminRequestState,
   type AdminRequestResponse,
   type AdminRequestsResponse,
+  type WorkspaceDeploymentCapabilities,
 } from "@/api-client";
 import { DataTable, FilterChips, GrantChipList, Meter, SectionCard, grantKindForAction } from "@/components/hs";
 import { ConfirmationDialog } from "@/components/hs/confirmation-dialog";
@@ -50,7 +53,7 @@ function actionMessage(status: Exclude<UnifiedRequestActionState, "idle" | "fili
   }[status];
 }
 
-function envelopeAuthorityItems(spec: BrowserEnvelopeSpec): Array<[string, ReactNode]> {
+function envelopeAuthorityItems(spec: BrowserEnvelopeSpec, workspaceDeployment?: WorkspaceDeploymentCapabilities): Array<[string, ReactNode]> {
   const runner = spec.runner;
   return [
     ["Models", spec.llms.map((model) => `${model.provider}/${model.model}`).join(", ") || "None"],
@@ -65,7 +68,7 @@ function envelopeAuthorityItems(spec: BrowserEnvelopeSpec): Array<[string, React
     ["Runner memory", runner?.memory ?? "Not set"],
     ["Runner compute", runner?.compute ?? "Not set"],
     ["Runner storage", runner?.storage ?? "Not set"],
-    ["Workspace", <WorkspaceAuthorityDetails key="workspace" workspace={spec.workspace} />],
+    ["Workspace", <WorkspaceAuthorityDetails deployment={workspaceDeployment} key="workspace" showDeploymentFallback workspace={spec.workspace} />],
   ];
 }
 
@@ -184,7 +187,10 @@ function RequestTable({ requests }: Readonly<{ requests: Array<AdminRequestView>
 export function AdminRequestDetailView({ requestId }: Readonly<{ requestId: string }>) {
   const load = useCallback(() => getAdminRequest({ cache: "no-store", credentials: "same-origin", path: { request_id: requestId } }), [requestId]);
   const state = useApiResource<AdminRequestResponse>(load);
-  return <ResourceBoundary state={state}>{({ request }) => <section aria-labelledby="page-title" className="mx-auto max-w-[980px] space-y-5"><PageHeader description={`${request.requester.displayEmail} · requested ${new Date(request.createdAt).toLocaleString()}`} title={<span className="inline-flex flex-wrap items-center gap-3">{request.template.displayName ?? "Custom envelope"} · {requestReason(request)} <StatusBadge value={request.state} /></span>} />{request.kind === "ceiling_exceeded" ? <div className="rounded-[10px] bg-warn-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-warn">Requested above the template limits</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : request.kind === "cumulative_exhausted" ? <div className="rounded-[10px] bg-err-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-err">Escalated: a cumulative limit was reached and the run is parked</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : null}<ul><UnifiedRequestCard request={request} /></ul><Link className="inline-flex text-sm font-semibold" href="/admin/approvals">← Back to requests</Link></section>}</ResourceBoundary>;
+  const loadCapabilities = useCallback(() => getAdminCapabilities({ cache: "no-store", credentials: "same-origin" }), []);
+  const capabilitiesState = useApiResource<BrowserCapabilityCatalogResponse>(loadCapabilities);
+  const workspaceDeployment = capabilitiesState.status === "ready" ? capabilitiesState.value.workspace ?? undefined : undefined;
+  return <ResourceBoundary state={state}>{({ request }) => <section aria-labelledby="page-title" className="mx-auto max-w-[980px] space-y-5"><PageHeader description={`${request.requester.displayEmail} · requested ${new Date(request.createdAt).toLocaleString()}`} title={<span className="inline-flex flex-wrap items-center gap-3">{request.template.displayName ?? "Custom envelope"} · {requestReason(request)} <StatusBadge value={request.state} /></span>} />{request.kind === "ceiling_exceeded" ? <div className="rounded-[10px] bg-warn-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-warn">Requested above the template limits</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : request.kind === "cumulative_exhausted" ? <div className="rounded-[10px] bg-err-soft px-[18px] py-3.5"><strong className="block text-[13px] font-semibold text-err">Escalated: a cumulative limit was reached and the run is parked</strong><p className="mt-1 font-mono text-sm">{triggerLabel(request)[1]}</p></div> : null}<ul><UnifiedRequestCard request={request} workspaceDeployment={workspaceDeployment} /></ul><Link className="inline-flex text-sm font-semibold" href="/admin/approvals">← Back to requests</Link></section>}</ResourceBoundary>;
 }
 
 function deltaValue(value: unknown): string {
@@ -209,7 +215,7 @@ function deltaLabel(dimension: AdminRequestView["deltas"][number]["dimension"]):
   }[dimension];
 }
 
-function deltaSide(delta: AdminRequestView["deltas"][number], side: "ceiling" | "requested"): ReactNode {
+function deltaSide(delta: AdminRequestView["deltas"][number], side: "ceiling" | "requested", workspaceDeployment?: WorkspaceDeploymentCapabilities): ReactNode {
   if (delta.dimension === "models") {
     return <GrantChipList grants={delta[side].map((model) => ({ kind: "model", name: `${model.provider}/${model.model}` }))} />;
   }
@@ -225,7 +231,7 @@ function deltaSide(delta: AdminRequestView["deltas"][number], side: "ceiling" | 
     return <span className="font-mono text-sm">{value === null || value === undefined ? "Not set" : formatDuration(value, "minutes", "m")}</span>;
   }
   if (delta.dimension === "ttl") return <span className="font-mono text-sm">{formatDuration(delta[side], "wire", durationUnit(delta.requested))}</span>;
-  if (delta.dimension === "workspace") return <WorkspaceAuthorityDetails workspace={delta[side]} />;
+  if (delta.dimension === "workspace") return <WorkspaceAuthorityDetails deployment={workspaceDeployment} showDeploymentFallback workspace={delta[side]} />;
   const value = delta[side];
   return <span className="font-mono text-sm">{deltaValue(value)}</span>;
 }
@@ -239,9 +245,9 @@ function numericDelta(delta: AdminRequestView["deltas"][number]): string | null 
   return `+${formatDuration(String(difference), "minutes", "m")}`;
 }
 
-function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>) {
-  if (request.kind === "custom" && request.requestedEnvelope) return <SectionCard title="Requested access"><DefinitionList items={envelopeAuthorityItems(request.requestedEnvelope.spec)} /><p className="mt-4 rounded-control bg-notice p-4 text-sm">This custom request has no governing template and always requires administrator approval.</p></SectionCard>;
-  const workspaceComparison = request.requestedEnvelope ? <SectionCard title="Workspace access"><div className="grid gap-5 lg:grid-cols-2"><section aria-label="Requested workspace" className="space-y-3"><h3 className="text-sm font-semibold">Requested</h3><WorkspaceAuthorityDetails workspace={request.requestedEnvelope.spec.workspace} /></section><section aria-label="Template workspace limit" className="space-y-3"><h3 className="text-sm font-semibold">Template limit</h3><WorkspaceAuthorityDetails workspace={request.templateEnvelope?.spec.workspace} /></section></div></SectionCard> : null;
+function RequestComparison({ request, workspaceDeployment }: Readonly<{ request: AdminRequestView; workspaceDeployment?: WorkspaceDeploymentCapabilities }>) {
+  if (request.kind === "custom" && request.requestedEnvelope) return <SectionCard title="Requested access"><DefinitionList items={envelopeAuthorityItems(request.requestedEnvelope.spec, workspaceDeployment)} /><p className="mt-4 rounded-control bg-notice p-4 text-sm">This custom request has no governing template and always requires administrator approval.</p></SectionCard>;
+  const workspaceComparison = request.requestedEnvelope ? <SectionCard title="Workspace access"><div className="grid gap-5 lg:grid-cols-2"><section aria-label="Requested workspace" className="space-y-3"><h3 className="text-sm font-semibold">Requested</h3><WorkspaceAuthorityDetails deployment={workspaceDeployment} showDeploymentFallback workspace={request.requestedEnvelope.spec.workspace} /></section><section aria-label="Template workspace limit" className="space-y-3"><h3 className="text-sm font-semibold">Template limit</h3><WorkspaceAuthorityDetails deployment={workspaceDeployment} showDeploymentFallback workspace={request.templateEnvelope?.spec.workspace} /></section></div></SectionCard> : null;
   if (request.deltas.length === 0) return <div className="space-y-5">{workspaceComparison}<p className="rounded-control border border-line bg-notice p-4 text-sm">{requestStateCopy[request.state].message}</p></div>;
   return (
     <div className="space-y-5">{workspaceComparison}<SectionCard title="Requested vs template limits">
@@ -250,7 +256,7 @@ function RequestComparison({ request }: Readonly<{ request: AdminRequestView }>)
           <div className="grid grid-cols-[minmax(90px,130px)_1fr_1fr] gap-4 border-b border-line-soft pb-2 text-xs font-medium text-muted-ink"><span>Field</span><span>Requested</span><span>{request.template.id ? `${request.template.id} rev ${request.template.revision ?? "—"}` : "Limit"}</span></div>
           {request.deltas.map((delta, index) => {
             const over = numericDelta(delta);
-            return <div className="grid grid-cols-[minmax(90px,130px)_1fr_1fr] gap-4 border-b border-line-soft py-3 last:border-0" key={`${delta.dimension}-${index}`}><strong className="text-sm">{deltaLabel(delta.dimension)}</strong><div className={over ? "font-semibold text-err" : ""}>{deltaSide(delta, "requested")}{over ? <span className="ms-2 rounded-full bg-err-soft px-2 py-0.5 text-xs font-semibold text-err">{over}</span> : null}</div><div className="opacity-80">{deltaSide(delta, "ceiling")}</div></div>;
+            return <div className="grid grid-cols-[minmax(90px,130px)_1fr_1fr] gap-4 border-b border-line-soft py-3 last:border-0" key={`${delta.dimension}-${index}`}><strong className="text-sm">{deltaLabel(delta.dimension)}</strong><div className={over ? "font-semibold text-err" : ""}>{deltaSide(delta, "requested", workspaceDeployment)}{over ? <span className="ms-2 rounded-full bg-err-soft px-2 py-0.5 text-xs font-semibold text-err">{over}</span> : null}</div><div className="opacity-80">{deltaSide(delta, "ceiling", workspaceDeployment)}</div></div>;
           })}
         </div>
       </div>
@@ -262,7 +268,7 @@ function RequestHistory({ request }: Readonly<{ request: AdminRequestView }>) {
   return <SectionCard title="History"><ol className="space-y-4">{request.history.map((event, index) => <li className="relative ps-5" key={`${event.at}-${index}`}><span aria-hidden="true" className={`absolute start-0 top-1 size-2.5 rounded-full border-2 ${event.state === "rejected" || event.state === "expired" ? "border-err" : event.state === "approved" || event.state === "auto_approved" ? "border-ok" : "border-faint-ink"}`} /><p className="text-sm font-semibold">{event.state.replaceAll("_", " ")}</p><p className="mt-0.5 text-[13px] text-muted-ink">by {event.actor} · {new Date(event.at).toLocaleString()}</p>{event.reason ? <p className="mt-1 text-[13px] text-muted-ink">{event.reason}</p> : null}</li>)}</ol></SectionCard>;
 }
 
-export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequestView }>) {
+export function UnifiedRequestCard({ request, workspaceDeployment }: Readonly<{ request: AdminRequestView; workspaceDeployment?: WorkspaceDeploymentCapabilities }>) {
   const session = useSession();
   const [reference, setReference] = useState<{ decisionKey: string; evidenceUrl: string } | null>(request.decision?.decisionKey && request.decision.evidenceUrl ? {
     decisionKey: request.decision.decisionKey,
@@ -392,7 +398,7 @@ export function UnifiedRequestCard({ request }: Readonly<{ request: AdminRequest
     <li className="space-y-5">
       {request.justification ? <SectionCard title="Requester justification"><p className="whitespace-pre-wrap text-sm">{request.justification}</p></SectionCard> : null}
       {request.kind === "ceiling_exceeded" ? <EnvelopeExceedanceSummary values={request.deltas.map(envelopeDeltaSummary)} /> : null}
-      <RequestComparison request={request} />
+      <RequestComparison request={request} workspaceDeployment={workspaceDeployment} />
       {terminal ? <RequestHistory request={request} /> : <SectionCard title="Decision"><div className="grid gap-5"><div className="grid grid-cols-[24px_minmax(0,1fr)] gap-3"><span className="grid size-6 place-items-center rounded-full bg-line-soft font-mono text-xs font-semibold">1</span><div><h3 className="text-sm font-semibold">File a decision reference</h3><p className="mt-1 text-[13px] text-muted-ink">Creates the governed record that serves as evidence for the exception.</p>{reference ? <div className="mt-3"><DefinitionList items={[["Decision key", reference.decisionKey], ["Evidence URL", reference.evidenceUrl]]} /></div> : <button className="mt-3 min-h-10 rounded-control border px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={status === "filing"} onClick={() => void fileDecision()} type="button">{status === "filing" ? "Filing…" : "File reference"}</button>}</div></div><div className={`grid grid-cols-[24px_minmax(0,1fr)] gap-3 ${reference ? "" : "opacity-55"}`}><span className="grid size-6 place-items-center rounded-full bg-line-soft font-mono text-xs font-semibold">2</span><div><h3 className="text-sm font-semibold">Approve or reject</h3><form className="mt-3 grid gap-4 sm:grid-cols-2" onSubmit={approve}>
         <label className="grid gap-2 text-sm font-semibold sm:col-span-2">Rationale<textarea className="min-h-24 rounded-md border p-3 font-normal" name="rationale" required /></label>
         <label className="grid gap-2 text-sm font-semibold">Expires at{request.source === "envelope_request" ? " (optional)" : " (RFC 3339)"}<input className="min-h-11 rounded-md border px-3 font-normal" name="expiresAt" placeholder="2026-08-25T17:00:00Z" required={request.source !== "envelope_request"} /></label>

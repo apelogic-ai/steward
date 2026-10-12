@@ -62,6 +62,21 @@ describe("workspace authority controls", () => {
     });
   });
 
+  test("keeps an unparseable stored size visible and blocks an implicit removal", () => {
+    const draft = workspaceAuthorityDraft({ allowedTypes: ["git"], maxTotalSize: "01Gi" }, deployment.enabledTypes);
+
+    expect(draft.size).toBe("01Gi");
+    expect(workspaceAuthorityFromDraft(draft, deployment.enabledTypes)).toBeNull();
+    expect(workspaceAuthorityFromDraft({ ...draft, size: "", sizeEdited: true }, deployment.enabledTypes)).toEqual({ allowedTypes: ["git"] });
+    const html = renderToStaticMarkup(<WorkspaceAuthorityControls deployment={deployment} draft={draft} onChange={() => {}} />);
+    expect(html).toContain('type="text"');
+    expect(html).toContain('value="01Gi"');
+  });
+
+  test("rejects mistyped size text instead of treating it as an empty limit", () => {
+    expect(workspaceAuthorityFromDraft({ allowedTypes: ["git"], size: "2e", sizeUnit: "GiB" }, deployment.enabledTypes)).toBeNull();
+  });
+
   test("formats binary quantities with plain units", () => {
     expect(formatBinaryBytes(2 * 1024 ** 3)).toBe("2 GiB");
     expect(formatWorkspaceQuantity("768Mi")).toBe("768 MiB");

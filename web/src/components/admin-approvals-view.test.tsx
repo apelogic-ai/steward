@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import type { AdminRequestView, BrowserEnvelopeRequestView } from "@/api-client";
+import type { AdminRequestView, BrowserEnvelopeRequestView, WorkspaceDeploymentCapabilities } from "@/api-client";
 
 import { EnvelopeRequestCard, UnifiedRequestCard, requestReason, triggerLabel } from "./admin-approvals-view";
 
@@ -55,6 +55,18 @@ const unifiedRequest: AdminRequestView = {
     id: request.templateId,
     revision: request.templateRevision,
   },
+};
+
+const workspaceDeployment: WorkspaceDeploymentCapabilities = {
+  enabledTypes: ["git", "scratch"],
+  maxFiles: 2_000,
+  maxHistoryDepth: 200,
+  maxSubmoduleDepth: 4,
+  maxSubmodulesPerEntry: 8,
+  maxTotalBytes: 4 * 1024 ** 3,
+  maxTotalSubmodules: 16,
+  maxTreeReads: 2_000,
+  scratchVolumeBytes: 8 * 1024 ** 3,
 };
 
 describe("envelope request approval controls", () => {
@@ -138,6 +150,31 @@ describe("envelope request approval controls", () => {
     expect(html).toContain("Monthly limit: <strong>300.00 USD</strong> (limit 200.00 USD)");
     expect(html).toContain("300.00 USD");
     expect(html).toContain("200.00 USD");
+  });
+
+  test("shows the deployment limits behind omitted workspace fields during approval", () => {
+    const comparison: AdminRequestView = {
+      ...unifiedRequest,
+      requestedEnvelope: {
+        ...request.requestedEnvelope,
+        spec: { ...request.requestedEnvelope.spec, workspace: { allowedTypes: ["git"] } },
+      },
+      templateEnvelope: {
+        ...request.templateEnvelope!,
+        spec: {
+          ...request.templateEnvelope!.spec,
+          workspace: { allowedTypes: ["git"], maxFiles: 1_000, maxTotalSize: "2Gi" },
+        },
+      },
+    };
+
+    const html = renderToStaticMarkup(<UnifiedRequestCard request={comparison} workspaceDeployment={workspaceDeployment} />);
+
+    expect(source).toContain("getAdminCapabilities");
+    expect(html).toContain("Deployment limit · 4 GiB");
+    expect(html).toContain("Deployment limit · 2,000 files");
+    expect(html).toContain("2 GiB");
+    expect(html).toContain("1,000 files");
   });
 
   test("shows a human-written history reason without hiding it as a diagnostic", () => {

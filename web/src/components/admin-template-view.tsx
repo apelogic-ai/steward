@@ -104,6 +104,12 @@ function runnerQuantity(value: string, resource: "compute" | "memory" | "storage
   return quantity > 0n && quantity <= 340282366920938463463374607431768211455n ? quantity : null;
 }
 
+function validResourceQuantity(value: string): boolean {
+  return value.length > 0
+    && value.length <= 32
+    && [...value].every((character) => /^[A-Za-z0-9.-]$/.test(character));
+}
+
 function isWorkspaceAuthority(value: unknown): value is WorkspaceAuthority {
   if (!isRecord(value)
     || !Array.isArray(value.allowedTypes)
@@ -111,7 +117,7 @@ function isWorkspaceAuthority(value: unknown): value is WorkspaceAuthority {
     || value.allowedTypes.some((entry) => typeof entry !== "string" || entry.length === 0)
     || new Set(value.allowedTypes).size !== value.allowedTypes.length
     || (value.maxTotalSize !== undefined && value.maxTotalSize !== null
-      && (typeof value.maxTotalSize !== "string" || runnerQuantity(value.maxTotalSize, "storage") === null))
+      && (typeof value.maxTotalSize !== "string" || !validResourceQuantity(value.maxTotalSize)))
     || (value.maxFiles !== undefined && value.maxFiles !== null
       && (typeof value.maxFiles !== "number" || !Number.isSafeInteger(value.maxFiles) || value.maxFiles <= 0))
     || (value.maxHistoryDepth !== undefined && value.maxHistoryDepth !== null

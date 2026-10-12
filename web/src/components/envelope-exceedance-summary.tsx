@@ -17,11 +17,11 @@ function workspace(value: DirectAdmissionDelta & { dimension: "workspace" }, sid
   if (!authority) return "Not set";
   return [
     `types ${listOrNone(authority.allowedTypes)}`,
-    authority.maxTotalSize ? `size ${formatWorkspaceQuantity(authority.maxTotalSize)}` : null,
-    authority.maxFiles === null || authority.maxFiles === undefined ? null : `${authority.maxFiles.toLocaleString("en-US")} files`,
-    authority.maxHistoryDepth === null || authority.maxHistoryDepth === undefined ? null : `${authority.maxHistoryDepth.toLocaleString("en-US")} generations`,
-    authority.maxSubmoduleDepth === null || authority.maxSubmoduleDepth === undefined ? null : `${authority.maxSubmoduleDepth.toLocaleString("en-US")} ${authority.maxSubmoduleDepth === 1 ? "level" : "levels"}`,
-  ].filter((entry): entry is string => entry !== null).join(" · ");
+    `size ${authority.maxTotalSize ? formatWorkspaceQuantity(authority.maxTotalSize) : "deployment limit"}`,
+    `files ${authority.maxFiles === null || authority.maxFiles === undefined ? "deployment limit" : authority.maxFiles.toLocaleString("en-US")}`,
+    `history ${authority.maxHistoryDepth === null || authority.maxHistoryDepth === undefined ? "deployment limit" : authority.maxHistoryDepth.toLocaleString("en-US")}`,
+    `submodules ${authority.maxSubmoduleDepth === null || authority.maxSubmoduleDepth === undefined ? "deployment limit" : authority.maxSubmoduleDepth.toLocaleString("en-US")}`,
+  ].join(" · ");
 }
 
 export function envelopeDeltaSummary(delta: DirectAdmissionDelta): EnvelopeExceedanceSummaryValue {
