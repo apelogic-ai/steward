@@ -28,6 +28,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   forms are edited. Administrator approval comparisons always identify omitted
   limits as deployment limits, and stored size values that need correction can
   no longer be cleared implicitly by an unrelated edit.
+- The published Task API schema and generated web client now include the
+  `owner/repository`, plain branch or tag, and `git:ref:<name>` workspace
+  selectors already accepted by the server.
 - OpenShell Agent Tasks with `diagnostics.executionLog: full` now run in a
   restart-safe, attempt-scoped process group. Steward persists bounded stdout
   and stderr snapshots while the Task runs, refreshes Run detail before the
