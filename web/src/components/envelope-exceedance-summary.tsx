@@ -1,5 +1,6 @@
 import type { DirectAdmissionDelta } from "@/api-client";
 import { durationUnit, formatDuration, formatMoney } from "@/components/presentation-values";
+import { formatWorkspaceQuantity } from "@/components/workspace-authority-controls";
 
 export type EnvelopeExceedanceSummaryValue = {
   ceiling: string;
@@ -11,15 +12,19 @@ function listOrNone(values: Array<string>): string {
   return values.length ? values.join(", ") : "None";
 }
 
+function countWithUnit(value: number, singular: string, plural = `${singular}s`): string {
+  return `${value.toLocaleString("en-US")} ${value === 1 ? singular : plural}`;
+}
+
 function workspace(value: DirectAdmissionDelta & { dimension: "workspace" }, side: "ceiling" | "requested"): string {
   const authority = value[side];
   if (!authority) return "Not set";
   return [
     `types ${listOrNone(authority.allowedTypes)}`,
-    `size ${authority.maxTotalSize}`,
-    `files ${authority.maxFiles}`,
-    `history ${authority.maxHistoryDepth}`,
-    `submodules ${authority.maxSubmoduleDepth}`,
+    `size ${authority.maxTotalSize ? formatWorkspaceQuantity(authority.maxTotalSize) : "deployment limit"}`,
+    `files ${authority.maxFiles === null || authority.maxFiles === undefined ? "deployment limit" : countWithUnit(authority.maxFiles, "file")}`,
+    `history ${authority.maxHistoryDepth === null || authority.maxHistoryDepth === undefined ? "deployment limit" : countWithUnit(authority.maxHistoryDepth, "generation")}`,
+    `submodules ${authority.maxSubmoduleDepth === null || authority.maxSubmoduleDepth === undefined ? "deployment limit" : countWithUnit(authority.maxSubmoduleDepth, "level")}`,
   ].join(" · ");
 }
 

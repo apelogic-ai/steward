@@ -8,6 +8,7 @@ import {
   getAdminCapabilities,
   getAdminEnvelopeTemplate,
   putAdminEnvelopeTemplate,
+  type BrowserCapabilityCatalogResponse,
   type BrowserEnvelope,
   type BrowserEnvelopeTemplateResponse,
   type CapabilityCatalog,
@@ -20,6 +21,7 @@ import { DiagnosticDetails, type DiagnosticItem } from "@/components/diagnostic-
 import { DataTable, FormSection, GrantChipList, SectionCard, TagSelect, grantKindForAction } from "@/components/hs";
 import { DurationInput, MoneyInput, formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
 import { ToolPicker, dedupeToolGrants, toolKey } from "@/components/tool-picker";
+import { WorkspaceAuthorityControls, workspaceAuthorityDraft, workspaceAuthorityFromDraft } from "@/components/workspace-authority-controls";
 import { EmptyState, PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyMutationFailure } from "@/data/mutation-state";
 import { useApiResource } from "@/data/use-api-resource";
@@ -102,34 +104,27 @@ function runnerQuantity(value: string, resource: "compute" | "memory" | "storage
   return quantity > 0n && quantity <= 340282366920938463463374607431768211455n ? quantity : null;
 }
 
+function validResourceQuantity(value: string): boolean {
+  return value.length > 0
+    && value.length <= 32
+    && [...value].every((character) => /^[A-Za-z0-9.-]$/.test(character));
+}
+
 function isWorkspaceAuthority(value: unknown): value is WorkspaceAuthority {
   if (!isRecord(value)
     || !Array.isArray(value.allowedTypes)
     || value.allowedTypes.length === 0
-    || value.allowedTypes.some((entry) => entry !== "git" && entry !== "scratch")
+    || value.allowedTypes.some((entry) => typeof entry !== "string" || entry.length === 0)
     || new Set(value.allowedTypes).size !== value.allowedTypes.length
-    || typeof value.maxTotalSize !== "string"
-    || runnerQuantity(value.maxTotalSize, "storage") === null
-    || typeof value.maxFiles !== "number"
-    || !Number.isSafeInteger(value.maxFiles)
-    || value.maxFiles <= 0
-    || typeof value.maxHistoryDepth !== "number"
-    || !Number.isSafeInteger(value.maxHistoryDepth)
-    || value.maxHistoryDepth <= 0
-    || typeof value.maxSubmoduleDepth !== "number"
-    || !Number.isSafeInteger(value.maxSubmoduleDepth)
-    || value.maxSubmoduleDepth < 0) return false;
+    || (value.maxTotalSize !== undefined && value.maxTotalSize !== null
+      && (typeof value.maxTotalSize !== "string" || !validResourceQuantity(value.maxTotalSize)))
+    || (value.maxFiles !== undefined && value.maxFiles !== null
+      && (typeof value.maxFiles !== "number" || !Number.isSafeInteger(value.maxFiles) || value.maxFiles <= 0))
+    || (value.maxHistoryDepth !== undefined && value.maxHistoryDepth !== null
+      && (typeof value.maxHistoryDepth !== "number" || !Number.isSafeInteger(value.maxHistoryDepth) || value.maxHistoryDepth <= 0))
+    || (value.maxSubmoduleDepth !== undefined && value.maxSubmoduleDepth !== null
+      && (typeof value.maxSubmoduleDepth !== "number" || !Number.isSafeInteger(value.maxSubmoduleDepth) || value.maxSubmoduleDepth < 0))) return false;
   return true;
-}
-
-function workspaceAuthorityFromJson(value: string): WorkspaceAuthority | null | undefined {
-  if (!value.trim()) return undefined;
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return isWorkspaceAuthority(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
 }
 
 function isBrowserEnvelope(value: unknown): value is BrowserEnvelope {
@@ -187,7 +182,7 @@ export function validateTemplateFields({
   singleRunLimit,
   templateId,
   tools,
-  workspaceJson,
+  workspace,
 }: Readonly<{
   allowedModels: ReadonlySet<string>;
   allowedTools: ReadonlySet<string>;
@@ -199,7 +194,7 @@ export function validateTemplateFields({
   singleRunLimit: string;
   templateId: string;
   tools: Array<ToolGrant>;
-  workspaceJson: string;
+  workspace?: null | WorkspaceAuthority;
 }>): TemplateFieldErrors {
   const errors: TemplateFieldErrors = {};
   if (!templateId) errors.templateId = "Enter a template ID.";
@@ -225,7 +220,7 @@ export function validateTemplateFields({
   if (models.length === 0) errors.models = "Select at least one model.";
   else if (models.some((model) => !allowedModels.has(modelKey(model)))) errors.models = "Remove or replace every model that is not available in this installation.";
   if (tools.some((tool) => !allowedTools.has(toolKey(tool)))) errors.tools = "Remove or replace every tool that is not available in this installation.";
-  if (workspaceAuthorityFromJson(workspaceJson) === null) errors.workspace = "Enter complete valid workspace limits or leave this blank.";
+  if (workspace === null || (workspace !== undefined && !isWorkspaceAuthority(workspace))) errors.workspace = "Choose at least one workspace type and enter a positive whole-number size, or leave the size blank.";
   return errors;
 }
 
@@ -295,7 +290,7 @@ function normalizeTemplateList(value: unknown): AdminTemplateListResponse | null
   return { apiVersion: "steward.browser-admin/v1", templates };
 }
 
-function normalizeCapabilityCatalog(value: unknown): CapabilityCatalog | null {
+function normalizeCapabilityCatalog(value: unknown): BrowserCapabilityCatalogResponse | null {
   if (!isRecord(value)
     || value.schemaVersion !== "steward.capability-catalog/v2"
     || !Array.isArray(value.models)
@@ -315,7 +310,7 @@ function normalizeCapabilityCatalog(value: unknown): CapabilityCatalog | null {
     && typeof catalog.catalogId === "string"
     && typeof catalog.version === "string"
     && typeof catalog.available === "boolean");
-  return modelsValid && toolsValid && catalogsValid ? value as CapabilityCatalog : null;
+  return modelsValid && toolsValid && catalogsValid ? value as BrowserCapabilityCatalogResponse : null;
 }
 
 async function getAdminEnvelopeTemplates(): Promise<{ data?: unknown; response?: Response }> {
@@ -453,7 +448,7 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
     cache: "no-store",
     credentials: "same-origin",
   }), []);
-  const capabilitiesState = useApiResource<CapabilityCatalog>(loadCapabilities);
+  const capabilitiesState = useApiResource<BrowserCapabilityCatalogResponse>(loadCapabilities);
   const normalizedTemplate = state.status === "ready"
     ? normalizeEnvelopeTemplateResponse(state.value, memberRole)
     : null;
@@ -506,7 +501,7 @@ function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
     cache: "no-store",
     credentials: "same-origin",
   }), []);
-  const state = useApiResource<CapabilityCatalog>(load);
+  const state = useApiResource<BrowserCapabilityCatalogResponse>(load);
   const acceptedState = state.status === "ready"
     ? normalizeCapabilityCatalog(state.value)
       ? { status: "ready" as const, value: normalizeCapabilityCatalog(state.value)! }
@@ -536,7 +531,7 @@ function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
   );
 }
 
-function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTasks, capabilities, create = false, csrf, memberRole, memberRoles, templateDisplayName, template }: Readonly<{ allowInlineBrowserTasks: boolean; capabilities: CapabilityCatalog; create?: boolean; csrf: string; memberRole: string; memberRoles: Array<string>; templateDisplayName: string; template: BrowserEnvelope }>) {
+function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTasks, capabilities, create = false, csrf, memberRole, memberRoles, templateDisplayName, template }: Readonly<{ allowInlineBrowserTasks: boolean; capabilities: BrowserCapabilityCatalogResponse; create?: boolean; csrf: string; memberRole: string; memberRoles: Array<string>; templateDisplayName: string; template: BrowserEnvelope }>) {
   const router = useRouter();
   const budgetCurrency = templateBudgetCurrency(template);
   const modelCatalog = capabilities.models;
@@ -563,7 +558,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
   const [rolesEdited, setRolesEdited] = useState(!create);
   const [templateIdDraft, setTemplateIdDraft] = useState("");
   const [allowInlineBrowserTasks, setAllowInlineBrowserTasks] = useState(initialAllowInlineBrowserTasks);
-  const [workspaceJson, setWorkspaceJson] = useState(template.spec.workspace ? JSON.stringify(template.spec.workspace, null, 2) : "");
+  const [workspaceDraft, setWorkspaceDraft] = useState(() => workspaceAuthorityDraft(template.spec.workspace, capabilities.workspace?.enabledTypes));
   const parsedRoles = [...new Set(roles.split(",").map((role) => role.trim()).filter(Boolean))].sort();
   const selectedRoles = templateMemberRoles(templateIdDraft, parsedRoles, rolesEdited);
   const missingModels = models.filter((model) => !allowedModels.has(modelKey(model)));
@@ -605,7 +600,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
     const memory = String(fields.get("memory") ?? "").trim();
     const compute = String(fields.get("compute") ?? "").trim();
     const storage = String(fields.get("storage") ?? "").trim();
-    const workspace = workspaceAuthorityFromJson(workspaceJson);
+    const workspace = capabilities.workspace ? workspaceAuthorityFromDraft(workspaceDraft, capabilities.workspace.enabledTypes) : template.spec.workspace;
     const envelope: BrowserEnvelope = {
       revision: create || saveAsNew ? 1 : currentRevision + 1,
       spec: {
@@ -638,7 +633,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       singleRunLimit,
       templateId,
       tools,
-      workspaceJson,
+      workspace,
     });
     setFieldErrors(errors);
     if (Object.keys(errors).length > 0) {
@@ -675,6 +670,14 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
   }
 
   const runner = template.spec.runner;
+  const workspaceControls = capabilities.workspace ? (
+    <WorkspaceAuthorityControls
+      deployment={capabilities.workspace}
+      draft={workspaceDraft}
+      error={fieldErrors.workspace}
+      onChange={(next) => { setWorkspaceDraft(next); clearFieldError("workspace"); }}
+    />
+  ) : <p className="text-sm text-muted-ink">Workspace settings are unavailable until this installation publishes its workspace capabilities.</p>;
   const limitsHelp = <p className="border-b bg-notice px-6 py-4 text-sm">Requests within these limits are approved automatically. Anything above goes to the approval queue.</p>;
   if (create) {
     return (
@@ -718,8 +721,8 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
           <ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} tools={tools} />
           <FieldError message={fieldErrors.tools} />
         </FormSection>
-        <FormSection description="Optional limits for typed Task workspaces. Blank means this template grants no workspace entries." title="Workspace limits">
-          <label className="grid gap-2 text-sm font-semibold">Workspace limits (JSON)<textarea aria-invalid={Boolean(fieldErrors.workspace)} className="min-h-44 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setWorkspaceJson(event.target.value); clearFieldError("workspace"); }} placeholder="Paste workspace limits JSON or leave blank." spellCheck={false} value={workspaceJson} /><FieldError message={fieldErrors.workspace} /></label>
+        <FormSection description="Choose the workspace types this template allows. Operational limits come from the deployment." title="Workspace access">
+          {workspaceControls}
         </FormSection>
         <FormSection description="Repository packages remain available when inline authoring is disabled." title="Browser execution">
           <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={allowInlineBrowserTasks} onChange={(event) => setAllowInlineBrowserTasks(event.target.checked)} type="checkbox" />Allow inline browser-authored packages</label>
@@ -756,7 +759,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
 
       <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Available tools"}. Tool groups appear when this installation provides them.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} previousTools={previousTools} tools={tools} /><FieldError message={fieldErrors.tools} /></fieldset></FormSection>
 
-      <FormSection description="Optional limits for typed Task workspaces. Blank means this template grants no workspace entries." title="Workspace limits"><label className="grid gap-2 text-sm font-semibold">Workspace limits (JSON)<textarea aria-invalid={Boolean(fieldErrors.workspace)} className="min-h-44 rounded-control border bg-canvas p-3 font-mono text-xs font-normal" onChange={(event) => { setWorkspaceJson(event.target.value); clearFieldError("workspace"); }} placeholder="Paste workspace limits JSON or leave blank." spellCheck={false} value={workspaceJson} /><FieldError message={fieldErrors.workspace} /></label></FormSection>
+      <FormSection description="Choose the workspace types this template allows. Operational limits come from the deployment." title="Workspace access">{workspaceControls}</FormSection>
 
       <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
 

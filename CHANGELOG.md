@@ -20,6 +20,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- Envelope template and custom-request forms now offer deployment-configured
+  workspace types as checkboxes with an optional total-size limit. Template
+  requests and Envelope details show omitted operational limits from the
+  deployment when available, without rendering missing values. Existing
+  narrower file, history, and submodule limits remain unchanged when those
+  forms are edited. Administrator approval comparisons always identify omitted
+  limits as deployment limits, and stored size values that need correction can
+  no longer be cleared implicitly by an unrelated edit.
 - The published Task API schema and generated web client now include the
   `owner/repository`, plain branch or tag, and `git:ref:<name>` workspace
   selectors already accepted by the server.

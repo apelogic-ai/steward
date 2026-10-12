@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
-import type { AvailableEnvelopeTemplate } from "@/api-client";
-import { templateRequestReviewSummary } from "./envelope-views";
+import type { AvailableEnvelopeTemplate, BrowserEnvelope } from "@/api-client";
+import { parseCustomEnvelope, templateRequestReviewSummary, withWorkspaceAuthority } from "./envelope-views";
+import { workspaceAuthorityDraft, workspaceAuthorityFromDraft } from "./workspace-authority-controls";
 
 const source = readFileSync(new URL("./envelope-views.tsx", import.meta.url), "utf8");
 
@@ -37,6 +38,56 @@ describe("envelope run history", () => {
     expect(source).toContain("WorkspaceAuthorityDetails");
     expect(source).toContain('workspace={envelope.spec.workspace}');
     expect(source).toContain('title={request.approvedEnvelope ? "Approved access" : "Requested access"}');
+  });
+
+  test("loads deployment workspace capabilities for template and custom requests", () => {
+    expect(source).toContain("getUserCapabilities");
+    expect(source).toContain("WorkspaceAuthorityControls");
+    expect(source).toContain("capabilitiesState.value.workspace");
+  });
+
+  test("custom requests preserve legacy narrowing limits while updating the structured selection", () => {
+    const sourceEnvelope: BrowserEnvelope = {
+      revision: 1,
+      spec: {
+        budget: { currency: "USD", monthlyLimit: "20.00" },
+        llms: [{ provider: "provider-a", model: "model-a" }],
+        tools: [],
+        ttl: "30m",
+        workspace: {
+          allowedTypes: ["git", "scratch"],
+          maxFiles: 1_000,
+          maxHistoryDepth: 50,
+          maxSubmoduleDepth: 2,
+          maxTotalSize: "4Gi",
+        },
+      },
+    };
+    const draft = workspaceAuthorityDraft(sourceEnvelope.spec.workspace, ["git", "scratch"]);
+    const workspace = workspaceAuthorityFromDraft({ ...draft, allowedTypes: ["git"], size: "2" }, ["git", "scratch"]);
+    expect(workspace).not.toBeNull();
+    const envelope = withWorkspaceAuthority(sourceEnvelope, workspace ?? undefined);
+
+    expect(envelope.spec.workspace).toEqual({
+      allowedTypes: ["git"],
+      maxFiles: 1_000,
+      maxHistoryDepth: 50,
+      maxSubmoduleDepth: 2,
+      maxTotalSize: "2Gi",
+    });
+  });
+
+  test("custom requests reject malformed workspace authority before editing it", () => {
+    expect(parseCustomEnvelope(JSON.stringify({
+      revision: 1,
+      spec: {
+        budget: { currency: "USD", monthlyLimit: "20.00" },
+        llms: [{ provider: "provider-a", model: "model-a" }],
+        tools: [],
+        ttl: "30m",
+        workspace: { maxTotalSize: "2Gi" },
+      },
+    }))).toBeNull();
   });
 });
 

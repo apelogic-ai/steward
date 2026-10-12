@@ -64,7 +64,7 @@ describe("first envelope template", () => {
       singleRunLimit: "not-a-decimal",
       templateId: "not valid",
       tools: [{ provider: "github", resource: "repository", action: "write" }],
-      workspaceJson: "",
+      workspace: undefined,
     });
 
     expect(errors).toEqual({
@@ -90,7 +90,7 @@ describe("first envelope template", () => {
       singleRunLimit: "0.",
       templateId: "engineering.v1",
       tools: [],
-      workspaceJson: "",
+      workspace: undefined,
     })).toEqual({});
   });
 
@@ -109,19 +109,31 @@ describe("first envelope template", () => {
     };
     expect(validateTemplateFields({
       ...common,
-      workspaceJson: JSON.stringify({
+      workspace: { allowedTypes: ["git"] },
+    })).toEqual({});
+    expect(validateTemplateFields({
+      ...common,
+      workspace: { allowedTypes: ["git"], maxTotalSize: "2Gi" },
+    })).toEqual({});
+    expect(validateTemplateFields({
+      ...common,
+      workspace: { allowedTypes: ["git"], maxTotalSize: "1.5Gi" },
+    })).toEqual({});
+    expect(validateTemplateFields({
+      ...common,
+      workspace: {
         allowedTypes: ["git", "scratch"],
         maxTotalSize: "2Gi",
         maxFiles: 100_000,
         maxHistoryDepth: 1_000,
         maxSubmoduleDepth: 4,
-      }),
+      },
     })).toEqual({});
     expect(validateTemplateFields({
       ...common,
-      workspaceJson: JSON.stringify({ allowedTypes: ["git"], maxTotalSize: "2GB" }),
+      workspace: { allowedTypes: [], maxTotalSize: "2Gi" },
     })).toEqual({
-      workspace: "Enter complete valid workspace limits or leave this blank.",
+      workspace: "Choose at least one workspace type and enter a positive whole-number size, or leave the size blank.",
     });
   });
 
@@ -144,7 +156,7 @@ describe("first envelope template", () => {
       singleRunLimit: "1.00",
       templateId: "engineer",
       tools: [],
-      workspaceJson: "",
+      workspace: undefined,
     })).toEqual({
       ttl: "Enter a time-to-live limit.",
       runtimeMinutes: "Enter a non-negative decimal.",
@@ -167,7 +179,7 @@ describe("first envelope template", () => {
       singleRunLimit: "1.00",
       templateId: "engineer",
       tools: [],
-      workspaceJson: "",
+      workspace: undefined,
     })).toEqual({
       displayName: "Use at most 128 characters.",
       memberRoles: "Use at most 64 eligible member roles.",

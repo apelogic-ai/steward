@@ -234,6 +234,17 @@ const capabilityCatalog = {
   ],
   tools: envelope.spec.tools.map((tool) => ({ ...tool, accessClass: "read" })),
   catalogs: [{ provider: "github", catalogId: "github-tools", version: "1.6.0", available: true }],
+  workspace: {
+    enabledTypes: ["git", "scratch"],
+    maxFiles: 1000,
+    maxHistoryDepth: 100,
+    maxSubmoduleDepth: 2,
+    maxSubmodulesPerEntry: 8,
+    maxTotalBytes: 4 * 1024 ** 3,
+    maxTotalSubmodules: 16,
+    maxTreeReads: 2000,
+    scratchVolumeBytes: 8 * 1024 ** 3,
+  },
 };
 
 const githubReadTools = [
@@ -862,6 +873,7 @@ async function guardedPage(browser, {
   githubRepositoriesStatus = 200,
   githubRepositoryResponses = null,
   holdGithubRepositories = false,
+  holdUserCapabilities = false,
   inlineRun = false,
   publishedWorkflows = true,
   taskLibraryMutable = false,
@@ -895,6 +907,8 @@ async function guardedPage(browser, {
   let githubRepositoryRequestCount = 0;
   let releaseGithubRepositories;
   const githubRepositoriesReleased = new Promise((resolve) => { releaseGithubRepositories = resolve; });
+  let releaseUserCapabilities;
+  const userCapabilitiesReleased = new Promise((resolve) => { releaseUserCapabilities = resolve; });
   let onboardingRunCreated = false;
   let laterFailedOnboardingRun = false;
   let githubAutomationCompleted = false;
@@ -999,6 +1013,17 @@ async function guardedPage(browser, {
     apiVersion: "steward.onboarding-starter-task/v1",
     starterTask,
   }));
+  await context.route(`${origin}/app/api/v1/capabilities`, async (route) => {
+    if (holdUserCapabilities) await userCapabilitiesReleased;
+    await json(route, {
+      agents: [
+        { agentRef: "codex@0.140.0", displayName: "Codex 0.140.0", models: { providers: ["openai"] } },
+        { agentRef: "claude-code@2.1.222", displayName: "Claude Code 2.1.222", models: { providers: ["provider-a"] } },
+      ],
+      apiVersion: "steward.user-capabilities/v1",
+      workspace: capabilityCatalog.workspace,
+    });
+  });
   if (connectionStartFailure) {
     await context.route(`${origin}/app/api/v1/connections/github/operations/*`, (route) => json(route, {
       apiVersion: "steward.connections/v1",
@@ -1727,6 +1752,7 @@ async function guardedPage(browser, {
       models: capabilityCatalogModels,
       tools: capabilityCatalogTools,
       catalogs: capabilityCatalog.catalogs,
+      workspace: capabilityCatalog.workspace,
     })
     : route.fulfill({ status: capabilityCatalogStatus, body: "" }));
   await context.route(`${origin}/admin/api/v1/workflows`, async (route) => {
@@ -1889,6 +1915,7 @@ async function guardedPage(browser, {
     runEventRequests,
     setupStatusRequests,
     releaseGithubRepositories,
+    releaseUserCapabilities,
     useAdminSetupStatus: (status) => { currentAdminSetupStatus = status; },
     useLaterFailedOnboardingRun: () => { laterFailedOnboardingRun = true; },
   };
@@ -2490,9 +2517,9 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
     const workspaceAccess = developer.page.getByRole("group", { name: "Workspace access" });
     await expect(workspaceAccess.getByText("git", { exact: true })).toBeVisible();
     await expect(workspaceAccess.getByText("scratch", { exact: true })).toBeVisible();
-    await expect(workspaceAccess.getByText("2Gi", { exact: true })).toBeVisible();
-    await expect(workspaceAccess.getByText("1000 files", { exact: true })).toBeVisible();
-    await expect(workspaceAccess.getByText("100 commits", { exact: true })).toBeVisible();
+    await expect(workspaceAccess.getByText("2 GiB", { exact: true })).toBeVisible();
+    await expect(workspaceAccess.getByText("1,000 files", { exact: true })).toBeVisible();
+    await expect(workspaceAccess.getByText("100 generations", { exact: true })).toBeVisible();
     await expect(workspaceAccess.getByText("2 levels", { exact: true })).toBeVisible();
     const envelopeMutation = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/envelope-requests");
     expectMutationProof(envelopeMutation);
@@ -2685,6 +2712,10 @@ test("users can request a custom envelope without selecting a template", async (
     await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("custom");
     await expect(developer.page.getByLabel("Request type")).toHaveCount(0);
     await developer.page.getByLabel("Complete envelope JSON").fill(JSON.stringify(analystEnvelope, null, 2));
+    const workspace = developer.page.getByRole("group", { name: "Workspace access" });
+    await workspace.getByRole("checkbox", { name: "Git" }).check();
+    await workspace.getByRole("textbox", { name: /^Total size limit/ }).fill("2");
+    await expect(workspace.getByRole("combobox", { name: "Total size unit" })).toHaveValue("GiB");
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await Promise.all([
       expect(developer.page.getByRole("combobox", { name: "Template", exact: true })).toBeDisabled(),
@@ -2702,8 +2733,42 @@ test("users can request a custom envelope without selecting a template", async (
     expect(mutations[0].body.idempotencyKey).toBe(mutation.body.idempotencyKey);
     expect(mutation.body).not.toHaveProperty("templateId");
     expect(mutation.body).not.toHaveProperty("templateRevision");
-    expect(mutation.body.requestedEnvelope).toEqual(analystEnvelope);
+    expect(mutation.body.requestedEnvelope).toEqual({
+      ...analystEnvelope,
+      spec: {
+        ...analystEnvelope.spec,
+        workspace: { allowedTypes: ["git"], maxTotalSize: "2Gi" },
+      },
+    });
   } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("custom envelope retries keep the exact payload while capabilities load", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    expectedHttpStatuses: [503],
+    holdUserCapabilities: true,
+    mutationFailures: { "/app/api/v1/envelope-requests": [{ delayMs: 1_000, status: 503 }] },
+  });
+  try {
+    await developer.page.goto(`${origin}/envelopes/new`);
+    await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("custom");
+    await developer.page.getByLabel("Complete envelope JSON").fill(JSON.stringify(envelope, null, 2));
+    await expect(developer.page.getByText("Workspace controls are unavailable.", { exact: false })).toBeVisible();
+    await developer.page.getByRole("button", { name: "Submit request" }).click();
+    await expect(developer.page.getByRole("alert").filter({ hasText: "HyperShell couldn't submit the request" })).toBeVisible();
+
+    developer.releaseUserCapabilities();
+    await expect(developer.page.getByRole("group", { name: "Workspace access" }).getByRole("checkbox", { name: "Git" })).toBeChecked();
+    await developer.page.getByRole("button", { name: "Submit request" }).click();
+    await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
+
+    const mutations = developer.mutations.filter((entry) => entry.path === "/app/api/v1/envelope-requests");
+    expect(mutations).toHaveLength(2);
+    expect(mutations[1].body).toEqual(mutations[0].body);
+  } finally {
+    developer.releaseUserCapabilities();
     await closeGuardedPage(developer);
   }
 });
@@ -3859,6 +3924,12 @@ test("administrator templates and approvals use typed browser authority", async 
     const tools = administrator.page.getByRole("group", { name: "Tools" });
     await expect(tools.getByRole("searchbox", { name: "Search tools" })).toBeVisible();
     await expect(tools.getByText("github:repository:get_file_contents", { exact: true })).toBeVisible();
+    const workspace = administrator.page.getByRole("group", { name: "Workspace access" });
+    await expect(workspace.getByRole("checkbox", { name: "Git" })).toBeChecked();
+    await expect(workspace.getByRole("checkbox", { name: "Scratch" })).toBeChecked();
+    await expect(workspace.getByRole("textbox", { name: /^Total size limit/ })).toHaveValue("2");
+    await workspace.getByRole("checkbox", { name: "Scratch" }).uncheck();
+    await workspace.getByRole("textbox", { name: /^Total size limit/ }).fill("");
     await expect(administrator.page.getByRole("heading", { name: "Runner" })).toBeVisible();
     await administrator.page.getByRole("button", { name: "Save new version" }).click();
     await expect(administrator.page.getByText("Template revision saved.")).toBeVisible();
@@ -3874,6 +3945,12 @@ test("administrator templates and approvals use typed browser authority", async 
       singleRunLimit: "3.00",
     });
     expect(templateMutation.body.envelope.spec.llms).toEqual(capabilityCatalog.models);
+    expect(templateMutation.body.envelope.spec.workspace).toEqual({
+      allowedTypes: ["git"],
+      maxFiles: 1000,
+      maxHistoryDepth: 100,
+      maxSubmoduleDepth: 2,
+    });
     expect(templateMutation.body).not.toHaveProperty("autoProvisionThreshold");
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("reviewer");
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
@@ -3905,8 +3982,8 @@ test("administrator templates and approvals use typed browser authority", async 
     const requestedWorkspace = envelopeRequestCard.getByRole("region", { name: "Requested workspace" });
     await expect(requestedWorkspace.getByText("git", { exact: true })).toBeVisible();
     await expect(requestedWorkspace.getByText("scratch", { exact: true })).toBeVisible();
-    await expect(requestedWorkspace.getByText("2Gi", { exact: true })).toBeVisible();
-    await expect(requestedWorkspace.getByText("1000 files", { exact: true })).toBeVisible();
+    await expect(requestedWorkspace.getByText("2 GiB", { exact: true })).toBeVisible();
+    await expect(requestedWorkspace.getByText("1,000 files", { exact: true })).toBeVisible();
     await expect(envelopeRequestCard.getByRole("button", { name: "Reject" })).toBeDisabled();
     await envelopeRequestCard.getByRole("button", { name: "File reference" }).click();
     await envelopeRequestCard.getByLabel("Rationale", { exact: true }).fill("Approved for the requested bounded envelope.");
