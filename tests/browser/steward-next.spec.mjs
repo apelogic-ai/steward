@@ -603,6 +603,11 @@ async function startWeb() {
         if (requestUrl.pathname.startsWith("/admin/api/v1/envelope-templates/")) {
           const templateId = decodeURIComponent(requestUrl.pathname.split("/").at(-1) ?? "");
           const submitted = JSON.parse(rawBody);
+          if (!/^[A-Z]{3}$/.test(submitted.envelope.spec.budget.currency)) {
+            response.writeHead(422, { "content-type": "application/json", "cache-control": "no-store" });
+            response.end(JSON.stringify({}));
+            return;
+          }
           response.writeHead(201, { "content-type": "application/json", "cache-control": "no-store" });
           response.end(JSON.stringify({
             apiVersion: "steward.browser-admin/v1",
@@ -4231,6 +4236,27 @@ test("administrator templates and approvals use typed browser authority", async 
 
     await administrator.page.goto(`${origin}/admin/settings`);
     await expect(administrator.page.getByRole("heading", { name: /Alice Example/ })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("administrator creates the first template with a valid budget currency", async ({ browser }) => {
+  const administrator = await guardedPage(browser, { session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/new`);
+    await expect(administrator.page.getByText("Set spend limits in USD and how long an envelope stays valid.", { exact: true })).toBeVisible();
+    await administrator.page.getByRole("textbox", { name: "Template ID" }).fill("engineer");
+    await administrator.page.getByRole("textbox", { name: "Display name" }).fill("Engineering");
+    await administrator.page.getByRole("spinbutton", { name: /^Limit per run/ }).fill("1.00");
+    await administrator.page.getByRole("spinbutton", { name: /^Monthly limit/ }).fill("10.00");
+    await administrator.page.getByRole("spinbutton", { name: /^Time-to-live limit/ }).fill("15");
+    await administrator.page.getByRole("button", { name: "Create template" }).click();
+
+    await expect(administrator.page).toHaveURL(`${origin}/admin/envelopes/templates/engineer`);
+    const mutation = administrator.mutations.find((entry) => entry.path === "/admin/api/v1/envelope-templates/engineer");
+    expectMutationProof(mutation);
+    expect(mutation.body.envelope.spec.budget.currency).toBe("USD");
   } finally {
     await closeGuardedPage(administrator);
   }

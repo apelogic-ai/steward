@@ -24,7 +24,7 @@ describe("first envelope template", () => {
     expect(initialEnvelopeTemplate).toEqual({
       revision: 1,
       spec: {
-        budget: { currency: "", monthlyLimit: "", singleRunLimit: "" },
+        budget: { currency: "USD", monthlyLimit: "", singleRunLimit: "" },
         llms: [],
         tools: [],
         ttl: "",
@@ -92,6 +92,27 @@ describe("first envelope template", () => {
       tools: [],
       workspace: undefined,
     })).toEqual({});
+  });
+
+  test("requires a server-compatible budget currency before submission", () => {
+    const envelope = authoredEnvelope();
+    envelope.spec.budget.currency = "usd";
+
+    expect(validateTemplateFields({
+      allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
+      allowedTools: new Set(),
+      displayName: "Engineering",
+      envelope,
+      memberRoles: ["engineer"],
+      models: envelope.spec.llms,
+      monthlyLimit: "10.00",
+      singleRunLimit: "1.00",
+      templateId: "engineer",
+      tools: [],
+      workspace: undefined,
+    })).toEqual({
+      currency: "Use a three-letter uppercase currency code.",
+    });
   });
 
   test("validates the optional workspace authority before submission", () => {

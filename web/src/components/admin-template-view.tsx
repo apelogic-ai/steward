@@ -29,7 +29,7 @@ import { useSession } from "@/session/session-context";
 
 type TemplateMutationState = "idle" | "saving" | "saved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
 
-type TemplateField = "templateId" | "displayName" | "memberRoles" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "memory" | "compute" | "storage" | "models" | "tools" | "workspace";
+type TemplateField = "templateId" | "displayName" | "memberRoles" | "currency" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "memory" | "compute" | "storage" | "models" | "tools" | "workspace";
 
 export type TemplateFieldErrors = Partial<Record<TemplateField, string>>;
 
@@ -55,7 +55,7 @@ export const initialEnvelopeTemplate: BrowserEnvelope = {
   revision: 1,
   spec: {
     budget: {
-      currency: "",
+      currency: "USD",
       monthlyLimit: "",
       singleRunLimit: "",
     },
@@ -204,6 +204,7 @@ export function validateTemplateFields({
   if (memberRoles.length === 0) errors.memberRoles = "Add at least one eligible member role.";
   else if (memberRoles.length > 64) errors.memberRoles = "Use at most 64 eligible member roles.";
   else if (memberRoles.some((role) => !validTemplateIdentifier(role))) errors.memberRoles = "Use a valid identifier for every eligible member role.";
+  if (!/^[A-Z]{3}$/.test(envelope.spec.budget.currency)) errors.currency = "Use a three-letter uppercase currency code.";
   if (!singleRunLimit.trim()) errors.singleRunLimit = "Enter a limit per run.";
   else if (!validDecimal(singleRunLimit.trim())) errors.singleRunLimit = decimalMessage;
   if (!monthlyLimit.trim()) errors.monthlyLimit = "Enter a monthly limit.";
@@ -691,6 +692,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
           </div>
         </FormSection>
         <FormSection description={`Set spend limits in ${budgetCurrency} and how long an envelope stays valid.`} title="Budget and lifetime">
+          <FieldError message={fieldErrors.currency} />
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <label className="grid gap-2 text-sm font-semibold">Limit per run<MoneyInput aria-invalid={Boolean(fieldErrors.singleRunLimit)} currency={budgetCurrency} onChange={(value) => { setSingleRunLimit(value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label>
             <label className="grid gap-2 text-sm font-semibold">Monthly limit<MoneyInput aria-invalid={Boolean(fieldErrors.monthlyLimit)} currency={budgetCurrency} onChange={(value) => { setMonthlyLimit(value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label>
@@ -752,6 +754,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       </FormSection>
 
       <FormSection description={`Inference spend limits in ${budgetCurrency} and how long an envelope stays valid.`} title="Budget and lifetime">
+        <FieldError message={fieldErrors.currency} />
         <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Limit per run<MoneyInput aria-invalid={Boolean(fieldErrors.singleRunLimit)} currency={budgetCurrency} onChange={(value) => { setSingleRunLimit(value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label><label className="grid gap-2 text-sm font-semibold">Monthly limit<MoneyInput aria-invalid={Boolean(fieldErrors.monthlyLimit)} currency={budgetCurrency} onChange={(value) => { setMonthlyLimit(value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label><label className="grid gap-2 text-sm font-semibold">Time-to-live limit<DurationInput aria-invalid={Boolean(fieldErrors.ttl)} onChange={(value) => { setTtl(value); clearFieldError("ttl"); }} required unitAriaLabel="Time-to-live unit" value={ttl} /><FieldError message={fieldErrors.ttl} /></label><label className="grid gap-2 text-sm font-semibold">Runtime limit per month<DurationInput aria-invalid={Boolean(fieldErrors.runtimeMinutes)} mode="minutes" onChange={(value) => { setRuntimeMinutesLimit(value); clearFieldError("runtimeMinutes"); }} value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label></div>
       </FormSection>
 
