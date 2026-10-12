@@ -1945,20 +1945,26 @@ export type WorkspaceGitHistorySchema = WorkspaceGitHistoryModeSchema | {
     depth: number;
 };
 
+export type WorkspaceGitNamedRef = string;
+
 /**
- * OpenAPI projection of the custom `"trigger" | "git:sha1:..."` wire shape.
+ * OpenAPI projection of the custom `"trigger" | "git:sha1:..." | "branch-or-tag" |
+ * "git:ref:branch-or-tag"` wire shape.
  */
-export type WorkspaceGitRefSchema = WorkspaceTriggerRefSchema | ExactGitCommit;
+export type WorkspaceGitRefSchema = WorkspaceTriggerRefSchema | ExactGitCommit | WorkspaceGitNamedRef;
 
 export type WorkspaceGitRepositoryIdentity = {
     ownerId: StableProviderId;
     repositoryId: StableProviderId;
 };
 
+export type WorkspaceGitRepositoryName = string;
+
 /**
- * OpenAPI projection of the custom `"self" | { ownerId, repositoryId }` wire shape.
+ * OpenAPI projection of the custom `"self" | "owner/repository" | { ownerId, repositoryId }`
+ * wire shape.
  */
-export type WorkspaceGitRepositorySchema = WorkspaceSelfRepositorySchema | WorkspaceGitRepositoryIdentity;
+export type WorkspaceGitRepositorySchema = WorkspaceSelfRepositorySchema | WorkspaceGitRepositoryName | WorkspaceGitRepositoryIdentity;
 
 export type WorkspaceGitSubmodules = {
     mode?: WorkspaceSubmoduleMode;
