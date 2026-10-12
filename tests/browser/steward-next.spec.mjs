@@ -474,6 +474,7 @@ async function startWeb() {
 
   let mutationFailures = {};
   let mutationSink;
+  let decisionChannelEnabled = true;
   let rerunFixtures = [];
   let rerunFixtureIndex = 0;
   let connectionStartPolls = 0;
@@ -658,6 +659,11 @@ async function startWeb() {
           return;
         }
         if (requestUrl.pathname.endsWith("/file")) {
+          if (!decisionChannelEnabled) {
+            response.writeHead(503, { "content-type": "application/json", "cache-control": "no-store" });
+            response.end(JSON.stringify({ error: "decision channel is unavailable" }));
+            return;
+          }
           response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
           response.end(JSON.stringify({ apiVersion: "steward.browser-admin/v1", approvalId, decisionKey: "PROJ-123", evidenceUrl: "https://example.com/decisions/PROJ-123" }));
           return;
@@ -762,6 +768,7 @@ async function startWeb() {
     output: () => output,
     useMutationFailures: (failures) => { mutationFailures = failures; },
     useMutationSink: (sink) => { mutationSink = sink; },
+    useDecisionChannel: (enabled) => { decisionChannelEnabled = enabled; },
     useConnectionStartFixture: ({ alwaysPending, deadlineMs, hangPoll }) => {
       connectionStartAlwaysPending = alwaysPending;
       connectionStartDeadlineMs = deadlineMs;
@@ -858,6 +865,7 @@ async function guardedPage(browser, {
   mockSignIn = true,
   colorScheme = "dark",
   connectionPhase = "connected",
+  decisionChannelEnabled = true,
   connectionStartFailure = null,
   connectionStartHangPoll = false,
   connectionStartPendingDeadlineMs = null,
@@ -920,6 +928,7 @@ async function guardedPage(browser, {
   let currentAdminSetupStatus = adminSetupStatus;
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
+  web.useDecisionChannel(decisionChannelEnabled);
   web.useConnectionStartFixture({
     alwaysPending: connectionStartPendingDeadlineMs !== null,
     deadlineMs: connectionStartPendingDeadlineMs ?? 30_000,
@@ -4158,7 +4167,7 @@ test("administrator templates and approvals use typed browser authority", async 
     await expect(requestedWorkspace.getByText("scratch", { exact: true })).toBeVisible();
     await expect(requestedWorkspace.getByText("2 GiB", { exact: true })).toBeVisible();
     await expect(requestedWorkspace.getByText("1,000 files", { exact: true })).toBeVisible();
-    await expect(envelopeRequestCard.getByRole("button", { name: "Reject" })).toBeDisabled();
+    await expect(envelopeRequestCard.getByRole("button", { name: "Reject" })).toBeEnabled();
     await envelopeRequestCard.getByRole("button", { name: "File reference" }).click();
     await envelopeRequestCard.getByLabel("Rationale", { exact: true }).fill("Approved for the requested bounded envelope.");
     await envelopeRequestCard.getByRole("button", { name: "Approve exception" }).click();
@@ -4615,24 +4624,56 @@ test("administrator template authoring has no fallback when the capability catal
   }
 });
 
-test("administrator can reject a pending envelope request with an optional reason", async ({ browser }) => {
-  const administrator = await guardedPage(browser, { session: administratorSession });
+test("administrator decides envelope requests with the decision channel disabled", async ({ browser }) => {
+  const approvingAdministrator = await guardedPage(browser, {
+    decisionChannelEnabled: false,
+    session: administratorSession,
+  });
   try {
-    await administrator.page.goto(`${origin}/admin/approvals`);
-    await administrator.page.getByRole("link").filter({ hasText: pendingEnvelopeRequest.requestId }).click();
-    const envelopeRequestCard = administrator.page.locator("main");
-    await envelopeRequestCard.getByRole("button", { name: "File reference" }).click();
-    await envelopeRequestCard.getByLabel("Rejection reason (optional)").fill("Authority is not appropriate for this user.");
-    await envelopeRequestCard.getByRole("button", { name: "Reject" }).click();
-    const confirmation = administrator.page.getByRole("alertdialog", { name: "Reject this request?" });
+    await approvingAdministrator.page.goto(`${origin}/admin/approvals/${pendingEnvelopeRequest.requestId}`);
+    const request = approvingAdministrator.page.locator("main");
+    await expect(request.getByRole("button", { name: "Approve exception" })).toBeEnabled();
+    await expect(request.getByRole("button", { name: "Reject" })).toBeEnabled();
+    await request.getByLabel("Rationale", { exact: true }).fill("Approved without an external decision reference.");
+    const approvalResponsePromise = approvingAdministrator.page.waitForResponse((response) => response.url().endsWith(`/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`));
+    await request.getByRole("button", { name: "Approve exception" }).click();
+    const approvalResponse = await approvalResponsePromise;
+    expect((await approvalResponse.json()).request.status).toBe("provisioned");
+    await expect(request.getByText("The approval was applied.")).toBeVisible();
+    const approval = approvingAdministrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/approve`);
+    expectMutationProof(approval);
+    expect(approval.body).toEqual({
+      evidenceUrl: null,
+      expiresAt: null,
+      rationale: "Approved without an external decision reference.",
+    });
+    expect(approvingAdministrator.mutations.some((mutation) => mutation.path.endsWith("/file"))).toBe(false);
+  } finally {
+    await closeGuardedPage(approvingAdministrator);
+  }
+
+  const rejectingAdministrator = await guardedPage(browser, {
+    decisionChannelEnabled: false,
+    session: administratorSession,
+  });
+  try {
+    await rejectingAdministrator.page.goto(`${origin}/admin/approvals/${pendingEnvelopeRequest.requestId}`);
+    const request = rejectingAdministrator.page.locator("main");
+    await request.getByLabel("Rejection reason (optional)").fill("Authority is not appropriate for this user.");
+    await request.getByRole("button", { name: "Reject" }).click();
+    const confirmation = rejectingAdministrator.page.getByRole("alertdialog", { name: "Reject this request?" });
     await expect(confirmation).toBeVisible();
+    const rejectionResponsePromise = rejectingAdministrator.page.waitForResponse((response) => response.url().endsWith(`/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/reject`));
     await confirmation.getByRole("button", { name: "Reject request" }).click();
-    await expect(envelopeRequestCard.getByText("The envelope request was rejected.")).toBeVisible();
-    const rejection = administrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/reject`);
+    const rejectionResponse = await rejectionResponsePromise;
+    expect((await rejectionResponse.json()).request.status).toBe("rejected");
+    await expect(request.getByText("The envelope request was rejected.")).toBeVisible();
+    const rejection = rejectingAdministrator.mutations.find((mutation) => mutation.path === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/reject`);
     expectMutationProof(rejection);
     expect(rejection.body).toEqual({ reason: "Authority is not appropriate for this user." });
+    expect(rejectingAdministrator.mutations.some((mutation) => mutation.path.endsWith("/file"))).toBe(false);
   } finally {
-    await closeGuardedPage(administrator);
+    await closeGuardedPage(rejectingAdministrator);
   }
 });
 
