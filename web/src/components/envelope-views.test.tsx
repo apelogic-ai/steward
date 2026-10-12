@@ -30,8 +30,8 @@ describe("envelope run history", () => {
   test("explains empty model searches and blocks requests without a model", () => {
     expect(source).toContain("No models in this template match");
     expect(source).toContain("Select at least one model.");
-    expect(source).toContain('aria-invalid={models.size === 0 || undefined}');
-    expect(source).toContain('disabled={submission === "submitting" || Boolean(singleRunError) || models.size === 0}');
+    expect(source).toContain('aria-invalid={models.size === 0 || rejectedFields.includes("llms") || undefined}');
+    expect(source).toContain('(requiresApproval && !justification.trim())');
   });
 
   test("shows workspace access on envelope details", () => {

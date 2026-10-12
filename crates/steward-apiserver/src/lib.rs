@@ -3888,6 +3888,12 @@ mod tests {
         BrowserAuthService, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
     };
     use super::tasks::task_identity_from_token_review;
+    use super::user_envelopes::{
+        AvailableEnvelopeTemplate, EnvelopeRequestBroker, EnvelopeRequestBrokerError,
+        UserEnvelopeMutationProof, UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject,
+        ValidatedEnvelopeRequest, envelope_content_digest, envelope_instance_id,
+        inner_router as user_envelope_router, user_envelope_request,
+    };
     use super::{
         AGENT_RUNS_API_VERSION, AdmissionContext, AdmissionLedger, AgentRunLedger, ApiDoc,
         ApiError, AuthenticatedCaller, AuthenticationError, BoxFuture, BudgetIncrease,
@@ -6439,6 +6445,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn above_template_user_request_can_be_approved_into_active_authority()
+    -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let review_ledger = ledger();
+        let owner = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+            .map_err(|error| error.to_string())?;
+        let session = UserEnvelopeSession {
+            subject: UserEnvelopeSubject {
+                canonical_user_id: owner.clone(),
+                display_email: Email("alice@example.com".to_owned()),
+                member_roles: vec!["engineer".to_owned()],
+            },
+            binding: (),
+        };
+        let mut requested = review_ledger
+            .envelope_templates
+            .lock()
+            .map_err(|_| "lock envelope templates")?
+            .first()
+            .ok_or_else(|| "missing envelope template".to_owned())?
+            .ceiling
+            .clone();
+        requested.spec.budget.monthly_limit = "250.00".to_owned();
+
+        let user_app = user_envelope_router(review_ledger.clone());
+        let response = user_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(session)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "templateId": "engineer",
+                            "templateRevision": 3,
+                            "requestedEnvelope": requested,
+                            "idempotencyKey": "whole-path-template-exception",
+                            "justification": "Needed for a governed task",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build envelope request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit envelope request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read envelope request: {error}"))?;
+        let created: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse envelope request: {error}"))?;
+        assert_eq!(created["request"]["status"], "pending");
+        let request_id = created["request"]["id"]
+            .as_str()
+            .ok_or_else(|| "created request id is missing".to_owned())?;
+
+        let (admin_auth, admin_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let admin_app = browser_admin::protected_router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            review_ledger.clone(),
+            FakeDecisionChannel::default(),
+            browser_capability_catalog(),
+            admin_auth,
+        );
+        let approval = admin_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/api/v1/envelope-requests/{request_id}/approve"
+                    ))
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"rationale":"approved the requested template exception"}"#,
+                    ))
+                    .map_err(|error| format!("build envelope approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("approve envelope request: {error}"))?;
+        assert_eq!(approval.status(), StatusCode::OK);
+
+        let active = review_ledger
+            .active_provisioned_user_envelopes(&owner)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id.to_string(), request_id);
+        assert_eq!(active[0].approved_envelope, Some(requested));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn template_exception_approval_rechecks_the_current_capability_catalog()
     -> Result<(), String> {
         let origin = "http://127.0.0.1:33002";
@@ -7929,6 +8036,134 @@ mod tests {
         envelope_instance_grants: Arc<Mutex<Vec<(Uuid, EnvelopeInstanceGrantRecord)>>>,
         managed_inference_credential_present: Arc<Mutex<bool>>,
         managed_inference_credential_error: Arc<Mutex<Option<StoreError>>>,
+    }
+
+    impl EnvelopeRequestBroker<()> for FakeLedger {
+        fn templates<'a>(
+            &'a self,
+            session: &'a UserEnvelopeSession<()>,
+        ) -> BoxFuture<'a, Result<Vec<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>>
+        {
+            Box::pin(async move {
+                self.envelope_templates
+                    .lock()
+                    .map_err(|_| EnvelopeRequestBrokerError::Unavailable)
+                    .map(|templates| {
+                        templates
+                            .iter()
+                            .filter(|template| {
+                                template
+                                    .member_roles
+                                    .iter()
+                                    .any(|role| session.subject.member_roles.contains(role))
+                            })
+                            .map(|template| AvailableEnvelopeTemplate {
+                                id: template.template_id.clone(),
+                                display_name: template.display_name.clone(),
+                                revision: template.ceiling.revision,
+                                ceiling: template.ceiling.clone(),
+                                auto_provision_threshold: template.auto_provision_threshold.clone(),
+                                allow_inline_browser_tasks: template.allow_inline_browser_tasks,
+                            })
+                            .collect()
+                    })
+            })
+        }
+
+        fn list<'a>(
+            &'a self,
+            session: &'a UserEnvelopeSession<()>,
+        ) -> BoxFuture<'a, Result<Vec<UserEnvelopeRequest>, EnvelopeRequestBrokerError>> {
+            Box::pin(async move {
+                self.user_envelopes
+                    .lock()
+                    .map_err(|_| EnvelopeRequestBrokerError::Unavailable)
+                    .map(|records| {
+                        records
+                            .iter()
+                            .filter(|record| {
+                                record.owner_user_id == session.subject.canonical_user_id
+                            })
+                            .cloned()
+                            .map(user_envelope_request)
+                            .collect()
+                    })
+            })
+        }
+
+        fn get<'a>(
+            &'a self,
+            session: &'a UserEnvelopeSession<()>,
+            request_id: Uuid,
+        ) -> BoxFuture<'a, Result<Option<UserEnvelopeRequest>, EnvelopeRequestBrokerError>>
+        {
+            Box::pin(async move {
+                self.user_envelopes
+                    .lock()
+                    .map_err(|_| EnvelopeRequestBrokerError::Unavailable)
+                    .map(|records| {
+                        records
+                            .iter()
+                            .find(|record| {
+                                record.id == request_id
+                                    && record.owner_user_id == session.subject.canonical_user_id
+                            })
+                            .cloned()
+                            .map(user_envelope_request)
+                    })
+            })
+        }
+
+        fn create<'a>(
+            &'a self,
+            session: &'a UserEnvelopeSession<()>,
+            request: ValidatedEnvelopeRequest<'a>,
+        ) -> BoxFuture<'a, Result<UserEnvelopeRequest, EnvelopeRequestBrokerError>> {
+            Box::pin(async move {
+                let mut records = self
+                    .user_envelopes
+                    .lock()
+                    .map_err(|_| EnvelopeRequestBrokerError::Unavailable)?;
+                let id = Uuid::from_u128(400 + records.len() as u128);
+                let approved_envelope = request
+                    .auto_provision
+                    .then(|| request.requested_envelope.clone());
+                let record = EnvelopeRequestRecord {
+                    id,
+                    owner_user_id: session.subject.canonical_user_id.clone(),
+                    template_id: request.template.map(|template| template.id.clone()),
+                    template_revision: request.template.map(|template| template.revision),
+                    template_envelope: request.template.map(|template| template.ceiling.clone()),
+                    requested_envelope: request.requested_envelope.clone(),
+                    approved_envelope,
+                    status: if request.auto_provision {
+                        EnvelopeRequestStatus::Provisioned
+                    } else {
+                        EnvelopeRequestStatus::Pending
+                    },
+                    approval_id: None,
+                    envelope_instance_id: request.auto_provision.then(|| envelope_instance_id(id)),
+                    envelope_digest: request
+                        .auto_provision
+                        .then(|| envelope_content_digest(request.requested_envelope))
+                        .transpose()
+                        .map_err(|_| EnvelopeRequestBrokerError::Unavailable)?,
+                    reason: None,
+                    rationale: None,
+                    justification: request.justification.map(str::to_owned),
+                    ceiling_exceedances: request.ceiling_exceedances.to_vec(),
+                    evidence_url: None,
+                    decision_key: None,
+                    expires_at: None,
+                    status_actor: session.subject.canonical_user_id.as_str().to_owned(),
+                    status_template_revision: request.template.map(|template| template.revision),
+                    created_at: "2026-10-12T12:00:00.000000Z".to_owned(),
+                    status_at: "2026-10-12T12:00:00.000000Z".to_owned(),
+                };
+                records.push(record.clone());
+                Ok(user_envelope_request(record))
+            })
+        }
     }
 
     #[derive(Clone)]

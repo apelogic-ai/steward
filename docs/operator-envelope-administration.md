@@ -25,7 +25,7 @@ Template-backed requests are handled as follows:
 |---|---|
 | Within the template limits | Provision automatically |
 | Above the template limits with available capabilities | Remain pending for an administrator |
-| A model, tool, or workspace type unavailable in the deployment | Reject with `422` and identify the affected field |
+| An above-template model, tool, or workspace type unavailable in the deployment | Reject with `422` and identify the affected field |
 
 Each template has one boundary: its published limits. To review any request
 above 50 USD, for example, set the template's monthly limit to 50 USD. The
@@ -34,7 +34,7 @@ revisions, but new revisions never carry it. Template writes that set it are
 rejected with `422` and an actionable message directing the operator to set the
 template limits instead.
 
-A template-free request omits both `templateId` and `templateRevision`, carries
+A reviewed request must include the requester's justification. A template-free request omits both `templateId` and `templateRevision`, carries
 the complete requested Envelope, and always remains pending until an explicit
 administrator decision. Steward validates that its models, tools, and workspace
 types are available in the deployment at request creation and again at approval.

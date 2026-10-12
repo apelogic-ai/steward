@@ -2605,7 +2605,7 @@ test("a value above the template limits is submitted for administrator approval"
     await expect(developer.page.getByRole("button", { name: "Submit request" })).toBeVisible();
     await timeToLive.fill("5");
 
-    await developer.page.getByLabel("Justification (optional)").fill("Needed for a bounded release review.");
+    await developer.page.getByLabel("Justification (required for approval)").fill("Needed for a bounded release review.");
     await developer.page.getByRole("button", { name: "Submit for approval" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
     await expect(developer.page.getByText("Pending administrator approval", { exact: true })).toBeVisible();
@@ -2660,6 +2660,8 @@ test("the per-run limit reports template-limit exceptions and cannot exceed the 
     await expect(singleRunLimit.locator("..")).toHaveClass(/border-warn/);
     await expect(developer.page.getByText("Above limit 5.00 USD", { exact: true })).toBeVisible();
     await expect(developer.page.getByText("Limit per run: 6.00 USD (limit 5.00 USD)", { exact: true })).toBeVisible();
+    await expect(developer.page.getByRole("button", { name: "Submit for approval" })).toBeDisabled();
+    await developer.page.getByLabel("Justification (required for approval)").fill("Needed for a larger governed run.");
     await expect(developer.page.getByRole("button", { name: "Submit for approval" })).toBeEnabled();
 
     await developer.page.getByRole("spinbutton", { name: /^Monthly limit/ }).fill("5.00");
@@ -2693,18 +2695,19 @@ test("a capability rejection identifies the field and clears after correction", 
     await monthlyLimit.fill("26.00");
     const models = developer.page.getByRole("combobox", { name: "Models" });
     const modelsCard = models.locator("xpath=ancestor::section[1]");
+    await developer.page.getByLabel("Justification (required for approval)").fill("Needed for a governed task.");
     await developer.page.getByRole("button", { name: "Submit for approval" }).click();
 
-    const failureAlert = developer.page.getByRole("alert").filter({ hasText: "Some values are outside the platform limits" });
-    await expect(failureAlert).toHaveText("Some values are outside the platform limits or available capabilities. Check the highlighted fields and try again.");
-    await expect(developer.page.getByText(failureReason, { exact: true })).toBeHidden();
+    const failureAlert = developer.page.getByRole("alert").filter({ hasText: failureReason });
+    await expect(failureAlert).toHaveText(failureReason);
+    await expect(models).toHaveAttribute("aria-invalid", "true");
     await developer.page.getByText("Details", { exact: true }).click();
     await expect(developer.page.getByText("capability_not_available", { exact: true })).toBeVisible();
-    await expect(developer.page.getByText(failureReason, { exact: true })).toBeVisible();
     await expect(modelsCard).toHaveClass(/border-warn/);
 
     await modelsCard.getByRole("button", { name: "Remove openai/gpt-5.4" }).click();
     await expect(failureAlert).toHaveCount(0);
+    await expect(models).not.toHaveAttribute("aria-invalid", "true");
     await expect(modelsCard).not.toHaveClass(/border-warn/);
     await monthlyLimit.fill("25.00");
     await expect(developer.page.getByRole("button", { name: "Submit request" })).toBeVisible();
@@ -2723,6 +2726,7 @@ test("users can request a custom envelope without selecting a template", async (
     await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("custom");
     await expect(developer.page.getByLabel("Request type")).toHaveCount(0);
     await developer.page.getByLabel("Complete envelope JSON").fill(JSON.stringify(analystEnvelope, null, 2));
+    await developer.page.getByLabel("Justification (required)").fill("Needed for a governed task.");
     const workspace = developer.page.getByRole("group", { name: "Workspace access" });
     await workspace.getByRole("checkbox", { name: "Git" }).check();
     await workspace.getByRole("textbox", { name: /^Total size limit/ }).fill("2");
@@ -2766,6 +2770,7 @@ test("custom envelope retries keep the exact payload while capabilities load", a
     await developer.page.goto(`${origin}/envelopes/new`);
     await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("custom");
     await developer.page.getByLabel("Complete envelope JSON").fill(JSON.stringify(envelope, null, 2));
+    await developer.page.getByLabel("Justification (required)").fill("Needed for a governed task.");
     await expect(developer.page.getByText("Workspace controls are unavailable.", { exact: false })).toBeVisible();
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page.getByRole("alert").filter({ hasText: "HyperShell couldn't submit the request" })).toBeVisible();

@@ -550,9 +550,10 @@ Steward release namespace also creates `steward-workflows`.
   for this release so existing values continue to install, and the apiserver logs one startup
   warning when it is set. Remove the key before the next release, when the schema will reject it.
   Requests within a template provision automatically. Above-template and template-free requests
-  remain pending until an administrator approves or declines them. Steward validates requested
-  model, tool, and workspace-type availability both when a request is created and when it is
-  approved; deployment workspace limits remain enforced at Task admission.
+  remain pending until an administrator approves or declines them, and require a requester
+  justification. Steward validates model, tool, and workspace-type availability for these reviewed
+  requests both when a request is created and when it is approved; deployment workspace limits
+  remain enforced at Task admission.
 - `config.apiserver.stewardRunRelease` is the exact verified steward-run handoff selected by the
   installation BOM: manifest schema, semantic version, reusable-workflow repository and commit,
   and action commit. The deprecated `governedJobContainerImage` coordinate remains accepted for

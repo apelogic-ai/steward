@@ -11,9 +11,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - User Envelope requests within a template still provision automatically. Requests above a
   template and complete template-free requests now remain pending for an administrator without a
-  second platform safety ceiling. Model, tool, and workspace-type availability is checked at both
-  request creation and approval, and remaining rejections return a plain sentence plus affected
-  fields.
+  second platform safety ceiling. For requests that need review, model, tool, and workspace-type
+  availability is checked at both request creation and approval, and rejections return a plain
+  sentence plus affected fields. Within-template auto-provisioning remains governed by the
+  published template rather than the descriptive capability catalog.
 
 ### Removed
 

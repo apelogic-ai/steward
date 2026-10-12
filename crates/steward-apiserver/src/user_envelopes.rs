@@ -665,7 +665,7 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
     }
 }
 
-fn user_envelope_request(record: EnvelopeRequestRecord) -> UserEnvelopeRequest {
+pub(crate) fn user_envelope_request(record: EnvelopeRequestRecord) -> UserEnvelopeRequest {
     UserEnvelopeRequest {
         id: record.id,
         template_id: record.template_id,
@@ -1026,7 +1026,7 @@ pub(crate) struct UserEnvelopeState<P> {
 }
 
 #[cfg(test)]
-fn inner_router<P, B>(broker: P) -> Router
+pub(crate) fn inner_router<P, B>(broker: P) -> Router
 where
     P: EnvelopeRequestBroker<B>,
     B: Clone + Eq + Hash + Send + Sync + 'static,
@@ -1315,7 +1315,7 @@ where
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 409, description = "Template revision conflicts"),
-        (status = 422, body = EnvelopeRequestErrorResponse, description = "Requested envelope is invalid or outside the deployment review boundary"),
+        (status = 422, body = EnvelopeRequestErrorResponse, description = "Requested envelope, justification, or reviewed capabilities are invalid"),
         (status = 503, description = "Envelope requests are unavailable")
     ),
     security(("browserSession" = []))
@@ -1389,15 +1389,6 @@ where
         Ok(None) => None,
         Err(error) => return broker_error_response(error),
     };
-    if replayed_request.is_none()
-        && let Err(response) = validate_capabilities(
-            &state.broker,
-            &state.workspace_capabilities,
-            &requested_envelope,
-        )
-    {
-        return *response;
-    }
     let template = match (body.template_id.as_deref(), body.template_revision) {
         (None, None) => None,
         (Some(template_id), Some(template_revision)) => {
@@ -1455,6 +1446,23 @@ where
             }),
         )
             .into_response();
+    }
+    if !auto_provision && justification.is_none() {
+        return envelope_request_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "justification_required",
+            "Justification is required for requests that need administrator approval.",
+            vec![EnvelopeRequestField::Justification],
+        );
+    }
+    if !auto_provision
+        && let Err(response) = validate_capabilities(
+            &state.broker,
+            &state.workspace_capabilities,
+            &requested_envelope,
+        )
+    {
+        return *response;
     }
     match state
         .broker
@@ -2322,6 +2330,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn within_template_request_on_an_empty_capability_catalog_provisions()
+    -> Result<(), String> {
+        let broker = TestBroker {
+            capability_violation_fields: vec![
+                EnvelopeRequestField::Llms,
+                EnvelopeRequestField::Tools,
+            ],
+            ..TestBroker::default()
+        };
+        let mut workspace_capabilities =
+            crate::tasks::TaskApiConfig::default().workspace_deployment_capabilities();
+        workspace_capabilities.enabled_types.clear();
+        let response = inner_router_with_capabilities(broker, Vec::new(), workspace_capabilities)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "templateId": "engineer",
+                            "templateRevision": 3,
+                            "requestedEnvelope": template().auto_provision_threshold,
+                            "idempotencyKey": "within-template-stale-catalog",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build within-template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit within-template request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read within-template response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse within-template response: {error}"))?;
+        assert_eq!(value["request"]["status"], "provisioned");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn within_template_request_with_a_stale_catalog_capability_provisions()
+    -> Result<(), String> {
+        let response = inner_router(TestBroker {
+            capability_violation_fields: vec![EnvelopeRequestField::Llms],
+            ..TestBroker::default()
+        })
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/envelope-requests")
+                .header("content-type", "application/json")
+                .extension(session()?)
+                .extension(UserEnvelopeMutationProof)
+                .body(Body::from(
+                    serde_json::json!({
+                        "templateId": "engineer",
+                        "templateRevision": 3,
+                        "requestedEnvelope": template().auto_provision_threshold,
+                        "idempotencyKey": "within-template-stale-model",
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build stale-catalog request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("submit stale-catalog request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read stale-catalog response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse stale-catalog response: {error}"))?;
+        assert_eq!(value["request"]["status"], "provisioned");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn custom_envelope_request_is_template_free_and_always_pending() -> Result<(), String> {
         let app = inner_router(TestBroker::default());
         let requested = template().auto_provision_threshold;
@@ -2338,6 +2427,7 @@ mod tests {
                         serde_json::json!({
                             "requestedEnvelope": requested,
                             "idempotencyKey": "custom-request-1",
+                            "justification": "Needed for a governed task",
                         })
                         .to_string(),
                     ))
@@ -2393,6 +2483,7 @@ mod tests {
                         serde_json::json!({
                             "requestedEnvelope": template().ceiling,
                             "idempotencyKey": "custom-unavailable-capability",
+                            "justification": "Needed for a governed task",
                         })
                         .to_string(),
                     ))
@@ -2425,6 +2516,53 @@ mod tests {
             "a capability-catalog rejection must not persist a request"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requests_that_need_review_require_a_justification() -> Result<(), String> {
+        let mut above_template = template().ceiling;
+        above_template.spec.budget.monthly_limit = "101.00".to_owned();
+        for (body, idempotency_key) in [
+            (
+                serde_json::json!({
+                    "requestedEnvelope": template().ceiling,
+                    "idempotencyKey": "custom-without-justification",
+                }),
+                "custom-without-justification",
+            ),
+            (
+                serde_json::json!({
+                    "templateId": "engineer",
+                    "templateRevision": 3,
+                    "requestedEnvelope": above_template,
+                    "idempotencyKey": "exception-without-justification",
+                }),
+                "exception-without-justification",
+            ),
+        ] {
+            let response = inner_router(TestBroker::default())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/app/api/v1/envelope-requests")
+                        .header("content-type", "application/json")
+                        .extension(session()?)
+                        .extension(UserEnvelopeMutationProof)
+                        .body(Body::from(body.to_string()))
+                        .map_err(|error| format!("build {idempotency_key} request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("submit {idempotency_key} request: {error}"))?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .map_err(|error| format!("read {idempotency_key} response: {error}"))?;
+            let value: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|error| format!("parse {idempotency_key} response: {error}"))?;
+            assert_eq!(value["error"], "justification_required");
+            assert_eq!(value["fields"], serde_json::json!(["justification"]));
+        }
         Ok(())
     }
 
@@ -2993,6 +3131,7 @@ mod tests {
                     "templateRevision": 3,
                     "requestedEnvelope": excessive,
                     "idempotencyKey": "request-over-ceiling",
+                    "justification": "Needed for a governed task",
                 })
                 .to_string(),
             ))
@@ -3186,6 +3325,7 @@ mod tests {
                             "templateRevision": 3,
                             "requestedEnvelope": requested,
                             "idempotencyKey": "runtime-minutes-review",
+                            "justification": "Needed for a governed task",
                         })
                         .to_string(),
                     ))

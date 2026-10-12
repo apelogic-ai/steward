@@ -4284,7 +4284,7 @@ export type CreateRequestErrors = {
      */
     409: unknown;
     /**
-     * Requested envelope is invalid or outside the deployment review boundary
+     * Requested envelope, justification, or reviewed capabilities are invalid
      */
     422: EnvelopeRequestErrorResponse;
     /**

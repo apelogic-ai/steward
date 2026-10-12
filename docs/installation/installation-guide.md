@@ -151,9 +151,10 @@ exact User Envelope through Steward's ordinary request and approval lifecycle.
 
 That lifecycle has no separate platform safety ceiling. Requests within a template's published
 limits provision automatically. Requests above a template and complete template-free requests
-remain pending until an administrator approves or declines them. Steward checks that requested
-models, tools, and workspace types are available when the request is created and checks them again
-at approval; Task admission continues to enforce the deployment's workspace limits. The deprecated
+remain pending until an administrator approves or declines them, and require a requester
+justification. For these reviewed requests, Steward checks that requested models, tools, and
+workspace types are available when the request is created and checks them again at approval; Task
+admission continues to enforce the deployment's workspace limits. The deprecated
 `config.apiserver.customEnvelopeSafetyCeiling` key is accepted but ignored for one compatibility
 release and emits one apiserver startup warning when set. Remove it before the next release.
 

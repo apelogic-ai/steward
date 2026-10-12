@@ -129,6 +129,12 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         }
         None => {}
     }
+    if let Some(warning) = custom_envelope_safety_ceiling_startup_warning(
+        env::var_os("STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON").is_some()
+            || env::var_os("STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE").is_some(),
+    ) {
+        eprintln!("{warning}");
+    }
     let client = kube::Client::try_default().await?;
     let task_orchestration_mode = task_orchestration_mode()?;
     let inference_mode = inference_mode()?;
@@ -777,18 +783,6 @@ async fn browser_application_router(
         &workflow_agents,
     )
     .map_err(|error| io::Error::other(format!("starter task configuration failed: {error}")))?;
-    let custom_envelope_safety_ceiling_configured = configured_bounded_json(
-        "STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON",
-        "STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE",
-        user_envelopes::MAX_CUSTOM_ENVELOPE_SAFETY_CEILING_BYTES,
-        "custom Envelope safety ceiling",
-    )?
-    .is_some();
-    if let Some(warning) =
-        custom_envelope_safety_ceiling_startup_warning(custom_envelope_safety_ceiling_configured)
-    {
-        eprintln!("{warning}");
-    }
     let steward_run_release = configured_bounded_json(
         "STEWARD_RUN_RELEASE_JSON",
         "STEWARD_RUN_RELEASE_FILE",
