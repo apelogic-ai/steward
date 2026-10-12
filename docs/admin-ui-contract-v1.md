@@ -2,8 +2,7 @@
 
 Status: active browser and API boundary.
 
-Applies to Steward 0.3.15 and the explicitly marked unreleased 0.3.16 changes.
-Sections that describe unreleased behavior say so explicitly.
+Applies to Steward 0.3.16.
 
 ## Presentation ownership
 
@@ -109,7 +108,7 @@ Template responses retain `memberRole`, set to the first eligible role, as a
 compatibility alias. Catalog-aware clients use the authoritative `memberRoles`
 array.
 
-#### Unreleased 0.3.16: one template boundary
+#### Steward 0.3.16: one template boundary
 
 A template has one set of limits. Requests within the current limits provision
 automatically; requests above them enter the approval queue and remain bounded
@@ -123,7 +122,7 @@ template revision as immutable evidence, while queue presentation, external
 decision filing, and approval use the current revision under a revision fence.
 Already provisioned Envelopes are not rewritten.
 
-#### Unreleased: capability tool picker
+#### Capability tool picker
 
 The template editor presents the deployment capability catalog as a searchable
 tool picker. Optional `toolsets` on a catalog tool are authoritative,
@@ -157,8 +156,6 @@ models are omitted rather than rendered as guessed disabled options. Admission
 remains the authority for exact deltas and Envelope revisions.
 
 ### Connections and onboarding
-
-The administrator setup guide described below is unreleased.
 
 The administrator workspace exposes `/admin/get-started`. Its source of truth
 is the administrator-only, read-only `GET /admin/api/v1/setup-status` route.

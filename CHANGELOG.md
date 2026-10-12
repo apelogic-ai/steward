@@ -7,6 +7,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.16] - 2026-10-12
+
+This release requires a coordinated upgrade of the agent catalog; follow
+[Upgrade and rollback](#upgrade-and-rollback) before resuming Task submission.
+It makes coding-agent and model compatibility deployment-configured, adds live
+execution-log persistence, accepts stable workspace repository and ref names,
+and simplifies Envelope request limits and administration. Additive migrations
+0069 and 0070 preserve request review context and retire the separate
+automatic-provision threshold without rewriting provisioned Envelopes.
+
 ### Added
 
 - The supported Codex reference runtime now includes pinned `rg`, `jq`, `fd`,
@@ -25,14 +35,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- Task admission now accepts requested values at or below every effective
+  Envelope limit, including scratch sizes smaller than the deployment volume
+  and `history: full` within the allowed Git-history depth. A scratch request
+  is rejected when the deployment's fixed scratch volume is larger than the
+  Envelope permits. Requested and effective values remain in immutable Task
+  evidence.
 - Envelope template and custom-request forms now offer deployment-configured
-  workspace types as checkboxes with an optional total-size limit. Template
-  requests and Envelope details show omitted operational limits from the
-  deployment when available, without rendering missing values. Existing
-  narrower file, history, and submodule limits remain unchanged when those
-  forms are edited. Administrator approval comparisons always identify omitted
-  limits as deployment limits, and stored size values that need correction can
-  no longer be cleared implicitly by an unrelated edit.
+  workspace types as checkboxes with an optional total-size limit; the other
+  workspace limits default to the deployment's settings. Template requests and
+  Envelope details show those effective deployment limits without rendering
+  missing values. Existing narrower file, history, and submodule limits remain
+  unchanged when those forms are edited. Administrator approval comparisons
+  always identify omitted limits as deployment limits, and stored size values
+  that need correction can no longer be cleared implicitly by an unrelated
+  edit.
 - The published Task API schema and generated web client now include the
   `owner/repository`, plain branch or tag, and `git:ref:<name>` workspace
   selectors already accepted by the server.
@@ -54,15 +71,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   by its case-insensitive `owner/repository` name or by an HTTPS link on the
   configured source host. Steward resolves only operator-bound stable IDs,
   records the provider's canonical identity and exact commit, and reuses that
-  snapshot on idempotent retries.
+  snapshot on idempotent retries. Browser Run now and the Task editor author
+  these repository names and plain branch or tag refs directly.
+- `ref: "trigger"` now resolves correctly for an admitted repository other
+  than the Task's own source repository, resolving the selected repository's
+  default branch rather than reusing the Task source ref.
 - Envelope Templates now have one boundary: requests within the published
   limits provision automatically, while requests above those limits enter the
   administrator approval queue when they remain within the deployment safety
-  ceiling and capability catalog. To preserve existing review policy, migration
-  0070 appends a narrower successor revision for each current template whose
-  retired `autoProvisionThreshold` was stricter than its limits. Templates
-  without a threshold are unchanged, pending requests remain pending, and
-  already provisioned Envelopes are unaffected.
+  ceiling and capability catalog. Above-template requests require a
+  justification and preserve the exact exceeded values for requester and
+  administrator review. To preserve existing review policy, migration 0070
+  appends a narrower successor revision for each current template whose retired
+  `autoProvisionThreshold` was stricter than its limits. Templates without a
+  threshold are unchanged, pending requests remain pending, and already
+  provisioned Envelopes are unaffected.
 - Historical template revisions continue to expose `autoProvisionThreshold` on
   reads. New template revisions omit it, and browser or operator writes that set
   it are rejected with an actionable error. To retain the old behavior of
@@ -70,21 +93,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Admission failures now name limits and units in user-readable language,
   including readable binary workspace sizes, without exposing internal field
   paths or debug formatting.
+- Envelope screens now let users edit the per-run budget limit, summarize every
+  requested value above a template, show effective workspace access, and use
+  consistent plain-language labels and units across request, detail, and
+  administrator views.
 
 ### Upgrade and rollback
 
-- Existing active execution-binding catalogs must move from
-  `steward.execution-bindings/v1` to `steward.execution-bindings/v2` in the same
-  rollout as these binaries. Add `models.providers` to every binding before changing
-  `apiVersion`; the new parser and Helm schema reject v1 catalogs. The field changes the binding
-  digest. Deployment-preflight inputs must also add `execution.binding.modelProviders`, covering
-  every provider in `capabilityCatalog.models`. Pause Task submission until
-  every apiserver and controller is on the new version so an older controller cannot claim a Task
-  with a v2 binding snapshot. Persisted v1 bindings on already-admitted Tasks remain readable by
-  the new version. Once the new version has created any Task, downgrade is not supported because
-  previous binaries cannot read its v2 binding and additive evidence fields. Before that point,
-  restore the previous binaries and exact v1 catalog together while submission remains paused. See the
-  [execution-binding upgrade procedure](docs/installation/upgrade-execution-bindings.md).
+- **Required coordinated agent-catalog upgrade:** move every active catalog from
+  `steward.execution-bindings/v1` to `steward.execution-bindings/v2`, with
+  `models.providers` declared for every agent. Upgrade the catalog, chart,
+  apiserver, and controller in one coordinated step with Task submission and
+  Workflow publication paused. Deployment-preflight input must add
+  `execution.binding.modelProviders`, covering every provider in
+  `capabilityCatalog.models`. Resume only after every old apiserver and
+  controller pod is gone. The field changes the binding digest; persisted v1
+  bindings on already-admitted Tasks remain readable. Once v0.3.16 creates any
+  Task, do not downgrade: previous binaries cannot read its v2 binding and
+  additive evidence fields. Before the first new Task, restore the previous
+  binaries and exact v1 catalog together while submission remains paused. See
+  the [execution-binding upgrade procedure](docs/installation/upgrade-execution-bindings.md).
 - Migration 0070 is append-only and records every generated template revision
   with actor `system:migration`; retain it on rollback. List the affected
   template IDs and successor revisions with
@@ -1166,7 +1194,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.15...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.16...HEAD
+[0.3.16]: https://github.com/apelogic-ai/steward/compare/v0.3.15...v0.3.16
 [0.3.15]: https://github.com/apelogic-ai/steward/compare/v0.3.14...v0.3.15
 [0.3.14]: https://github.com/apelogic-ai/steward/compare/v0.3.13...v0.3.14
 [0.3.13]: https://github.com/apelogic-ai/steward/compare/v0.3.12...v0.3.13

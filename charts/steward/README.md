@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.15` and application `0.3.15`.
+Current release contract: chart `0.3.16` and application `0.3.16`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -528,7 +528,7 @@ Steward release namespace also creates `steward-workflows`.
             resource: actions_get
             action: read
             accessClass: read
-            # Unreleased presentation metadata.
+            # Optional presentation metadata.
             toolsets: [actions]
         catalogs:
           - provider: github
@@ -540,7 +540,7 @@ Steward release namespace also creates `steward-workflows`.
   Tool access classes and provider catalog availability are display metadata. Authority,
   budget, TTL, template, and user fields are intentionally not part of this catalog.
 
-  **Unreleased:** optional `toolsets` are also presentation metadata. A tool may belong to at
+  Optional `toolsets` are also presentation metadata. A tool may belong to at
   most 16 toolsets. The template editor groups tools only when these authoritative names are
   supplied; it does not infer groups from tool names or provider conventions. Existing v2
   entries without `toolsets` remain valid and appear in a deterministic fallback group.

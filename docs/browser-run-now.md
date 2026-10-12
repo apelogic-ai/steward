@@ -1,6 +1,6 @@
 # Browser Run now
 
-Status: current Steward v0.3.15 contract plus Unreleased model-selection behavior.
+Status: current Steward v0.3.16 contract.
 
 Steward users can start a governed Task from the browser without first creating a
 GitHub Actions workflow. The browser route is:
