@@ -77,12 +77,18 @@ describe("envelope request approval controls", () => {
     expect(source).not.toContain("request authority is unavailable");
   });
 
-  test("unified queue preserves rejection and optional approval evidence", () => {
+  test("unified queue decisions do not require a filed reference", () => {
     const html = renderToStaticMarkup(<UnifiedRequestCard request={unifiedRequest} />);
+    const approveButton = html.match(/<button[^>]*>Approve exception<\/button>/)?.[0];
+    const rejectButton = html.match(/<button[^>]*>Reject<\/button>/)?.[0];
 
     expect(html).toContain("File a decision reference");
     expect(html).toContain("Approve or reject");
-    expect(html).toContain(">Reject</button>");
+    expect(approveButton).toBeDefined();
+    expect(approveButton).not.toMatch(/\sdisabled(?:=|\s|>)/);
+    expect(rejectButton).toBeDefined();
+    expect(rejectButton).not.toMatch(/\sdisabled(?:=|\s|>)/);
+    expect(html).toContain('name="rationale"');
     expect(html).toContain('name="reason"');
     expect(html).toContain("Expires at (optional)");
     expect(html).not.toContain('name="expiresAt" placeholder="2026-08-25T17:00:00Z" required=""');
