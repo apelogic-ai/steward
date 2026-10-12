@@ -3623,6 +3623,10 @@ test("a successful inline run publishes and dispatches the exact governed GitHub
     await expect(developer.page.getByText("No matching generated workflow is present yet.")).toBeVisible();
 
     await developer.page.getByRole("button", { name: "Publish as pull request" }).click();
+    await expect.poll(
+      () => developer.mutations.filter((entry) => entry.path.endsWith("/github/publish")).length,
+      { message: "the GitHub publication should reach the same-origin boundary" },
+    ).toBe(1);
     const publication = developer.mutations.find((entry) => entry.path.endsWith("/github/publish"));
     expectMutationProof(publication);
     expect(publication.body.owner).toBe("example-org");
@@ -3633,6 +3637,10 @@ test("a successful inline run publishes and dispatches the exact governed GitHub
 
     await expect(developer.page.getByText("The exact generated workflow is present on the default branch.")).toBeVisible({ timeout: 10_000 });
     await developer.page.getByRole("button", { name: "Run on GitHub" }).click();
+    await expect.poll(
+      () => developer.mutations.filter((entry) => entry.path.endsWith("/github/dispatch")).length,
+      { message: "the governed GitHub dispatch should reach the same-origin boundary" },
+    ).toBe(1);
     const dispatch = developer.mutations.find((entry) => entry.path.endsWith("/github/dispatch"));
     expectMutationProof(dispatch);
     expect(dispatch.body).toMatchObject({ owner: "example-org", repository: "agentic-ops", inputs: {} });
