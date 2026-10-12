@@ -149,6 +149,14 @@ into Helm values. The deployment capability catalog advertises model and tool ch
 grants no authority. Before external Task submission, provision the authenticated user's
 exact User Envelope through Steward's ordinary request and approval lifecycle.
 
+That lifecycle has no separate platform safety ceiling. Requests within a template's published
+limits provision automatically. Requests above a template and complete template-free requests
+remain pending until an administrator approves or declines them. Steward checks that requested
+models, tools, and workspace types are available when the request is created and checks them again
+at approval; Task admission continues to enforce the deployment's workspace limits. The deprecated
+`config.apiserver.customEnvelopeSafetyCeiling` key is accepted but ignored for one compatibility
+release and emits one apiserver startup warning when set. Remove it before the next release.
+
 ### Deployment-owned starter task
 
 The optional `config.apiserver.starterTask` value controls the task displayed by

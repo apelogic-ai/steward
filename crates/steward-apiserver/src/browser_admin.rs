@@ -30,7 +30,7 @@ use crate::user_envelopes::{
     BrowserEnvelope, BrowserEnvelopeSpec, EnvelopeRequestErrorResponse, EnvelopeRequestField,
     capability_catalog_violation_fields, envelope_content_digest, envelope_instance_id,
     envelope_request_error_response, envelope_request_field_list,
-    envelope_request_fields_for_deltas,
+    workspace_capability_violation_fields,
 };
 use crate::{
     AdminContext, AdmissionLedger, ApiError, ApprovalRequest, DecisionChannel, RuntimeRepository,
@@ -217,7 +217,6 @@ pub(crate) struct BrowserAdminState<R, L, D> {
     decisions: D,
     capabilities: CapabilityCatalog,
     workspace_capabilities: Option<WorkspaceDeploymentCapabilities>,
-    custom_envelope_safety_ceiling: Option<Envelope>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize, utoipa::ToSchema)]
@@ -929,7 +928,6 @@ fn inner_router<R, L, D>(
     decisions: D,
     capabilities: CapabilityCatalog,
     workspace_capabilities: Option<WorkspaceDeploymentCapabilities>,
-    custom_envelope_safety_ceiling: Option<Envelope>,
 ) -> Router
 where
     R: RuntimeRepository,
@@ -1002,7 +1000,6 @@ where
             decisions,
             capabilities,
             workspace_capabilities,
-            custom_envelope_safety_ceiling,
         })
 }
 
@@ -1110,7 +1107,7 @@ where
         (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Envelope request was not found"),
         (status = 409, description = "Envelope request or template revision is stale or already decided differently"),
-        (status = 422, body = EnvelopeRequestErrorResponse, description = "Approval rationale, requested capabilities, or platform safety boundary is invalid"),
+        (status = 422, body = EnvelopeRequestErrorResponse, description = "Approval rationale or requested capabilities are invalid"),
         (status = 503, description = "Envelope request authority is unavailable")
     ),
     security(("browserSession" = []))
@@ -1171,58 +1168,32 @@ where
 
         let requires_review =
             request.template_id.is_none() || !current_ceiling_exceedances.is_empty();
-        if requires_review {
-            if rationale.is_none() {
-                return envelope_request_error_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "rationale_required",
-                    "Rationale is required to approve this request.",
-                    vec![EnvelopeRequestField::Rationale],
-                );
-            }
-            let capability_fields = capability_catalog_violation_fields(
-                &state.capabilities,
+        let mut capability_fields =
+            capability_catalog_violation_fields(&state.capabilities, &request.requested_envelope);
+        if let Some(workspace_capabilities) = state.workspace_capabilities.as_ref() {
+            capability_fields.extend(workspace_capability_violation_fields(
+                workspace_capabilities,
                 &request.requested_envelope,
+            ));
+        }
+        if !capability_fields.is_empty() {
+            return envelope_request_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "capability_not_available",
+                format!(
+                    "This deployment does not provide the requested {}.",
+                    envelope_request_field_list(&capability_fields)
+                ),
+                capability_fields,
             );
-            if !capability_fields.is_empty() {
-                return envelope_request_error_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "capability_not_available",
-                    format!(
-                        "The requested {} are not available in this deployment.",
-                        envelope_request_field_list(&capability_fields)
-                    ),
-                    capability_fields,
-                );
-            }
-            match state.custom_envelope_safety_ceiling.as_ref() {
-                Some(ceiling) => match envelope_is_within(&request.requested_envelope, ceiling) {
-                    Ok(AdmissionDecision::Admit) => {}
-                    Ok(AdmissionDecision::Reject { deltas }) => {
-                        return envelope_request_error_response(
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "platform_safety_ceiling_exceeded",
-                            {
-                                let fields = envelope_request_fields_for_deltas(&deltas);
-                                format!(
-                                    "The requested {} exceed the platform safety ceiling.",
-                                    envelope_request_field_list(&fields)
-                                )
-                            },
-                            envelope_request_fields_for_deltas(&deltas),
-                        );
-                    }
-                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                },
-                None => {
-                    return envelope_request_error_response(
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        "platform_safety_ceiling_unconfigured",
-                        "This deployment does not accept requests above a template's limits.",
-                        vec![EnvelopeRequestField::RequestedEnvelope],
-                    );
-                }
-            }
+        }
+        if requires_review && rationale.is_none() {
+            return envelope_request_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "rationale_required",
+                "Rationale is required to approve this request.",
+                vec![EnvelopeRequestField::Rationale],
+            );
         }
     }
     if body
@@ -1665,34 +1636,7 @@ where
     D: DecisionChannel + Clone,
 {
     protect_browser_admin_routes(
-        inner_router(runtimes, ledger, decisions, capabilities, None, None),
-        browser_auth,
-    )
-}
-
-/// Mount administrator routes with the deployment-owned custom Envelope safety ceiling.
-pub fn protected_router_with_custom_envelope_safety<R, L, D>(
-    runtimes: R,
-    ledger: L,
-    decisions: D,
-    capabilities: CapabilityCatalog,
-    custom_envelope_safety_ceiling: Option<Envelope>,
-    browser_auth: BrowserAuthService,
-) -> Router
-where
-    R: RuntimeRepository,
-    L: AdmissionLedger,
-    D: DecisionChannel + Clone,
-{
-    protect_browser_admin_routes(
-        inner_router(
-            runtimes,
-            ledger,
-            decisions,
-            capabilities,
-            None,
-            custom_envelope_safety_ceiling,
-        ),
+        inner_router(runtimes, ledger, decisions, capabilities, None),
         browser_auth,
     )
 }
@@ -1704,7 +1648,6 @@ pub fn protected_router_with_workspace_capabilities<R, L, D>(
     decisions: D,
     capabilities: CapabilityCatalog,
     workspace_capabilities: WorkspaceDeploymentCapabilities,
-    custom_envelope_safety_ceiling: Option<Envelope>,
     browser_auth: BrowserAuthService,
 ) -> Router
 where
@@ -1719,7 +1662,6 @@ where
             decisions,
             capabilities,
             Some(workspace_capabilities),
-            custom_envelope_safety_ceiling,
         ),
         browser_auth,
     )

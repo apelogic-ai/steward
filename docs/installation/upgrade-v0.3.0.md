@@ -25,10 +25,10 @@ that handoff.
    and an exact HTTPS operator origin. Day-two CLI commands use
    `STEWARD_OPERATOR_API_URL` and `STEWARD_OPERATOR_TOKEN_FILE`; they no longer
    accept a caller-selected audit actor or require PostgreSQL credentials.
-7. To enable template-free requests, configure the complete
-   `config.apiserver.customEnvelopeSafetyCeiling`. It must name only capabilities
-   in the v2 catalog and explicitly bound budget, runtime minutes, TTL, and runner
-   platforms/resources. The default `null` setting rejects custom requests.
+7. Current releases accept template-free requests without a deployment safety ceiling. They stay
+   pending until an administrator approves or declines them. The deprecated
+   `config.apiserver.customEnvelopeSafetyCeiling` key is accepted but ignored for one compatibility
+   release and emits one startup warning when set; remove it before the next release.
 8. Browser administration now requires
    `config.apiserver.stewardRunRelease`, populated from the verified installation
    BOM with `manifestSchemaVersion`, `version`, `workflowRepository`,
@@ -62,14 +62,13 @@ After every apiserver and controller runs 0.3.0:
 2. Exercise the supported RBAC CLI against a reserved test identity, including
    idempotent grant/revoke and JSON `effective-access` output.
 3. Publish or apply an exact template revision and verify a within-ceiling
-   request auto-provisions while an above-template request within deployment
-   safety remains pending and can be approved.
+   request auto-provisions while an above-template request remains pending and can be approved.
 4. Provision two different templates with different content for one user.
    Submit one digest-qualified Task for each and verify an unqualified Task
    returns conflict while both remain active.
-5. Submit and explicitly decide one template-free custom request, then tighten
-   the safety ceiling and verify an already-pending request outside the new
-   boundary can no longer be approved.
+5. Submit and explicitly decide one template-free custom request. Verify unavailable model, tool,
+   and workspace types are rejected at creation and approval while available authority can be
+   approved.
 6. Only then activate optional federated Task identity or active orchestration
    modes according to their dedicated guides.
 

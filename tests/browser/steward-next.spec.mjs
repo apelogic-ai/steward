@@ -2670,8 +2670,8 @@ test("the per-run limit reports template-limit exceptions and cannot exceed the 
   }
 });
 
-test("a field-specific envelope rejection identifies the field and clears after correction", async ({ browser }) => {
-  const failureReason = "Monthly limit exceeds the deployment safety ceiling.";
+test("a capability rejection identifies the field and clears after correction", async ({ browser }) => {
+  const failureReason = "This deployment does not provide the requested models.";
   const developer = await guardedPage(browser, {
     expectedHttpStatuses: [422],
     mutationFailures: {
@@ -2679,9 +2679,9 @@ test("a field-specific envelope rejection identifies the field and clears after 
         status: 422,
         body: {
           apiVersion: "steward.envelope-requests/v1",
-          error: "platform_safety_ceiling_exceeded",
+          error: "capability_not_available",
           failureReason,
-          fields: ["budgetMonthlyLimit"],
+          fields: ["llms"],
         },
       },
     },
@@ -2690,22 +2690,23 @@ test("a field-specific envelope rejection identifies the field and clears after 
     await developer.page.goto(`${origin}/envelopes/new`);
     await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("template:developer");
     const monthlyLimit = developer.page.getByRole("spinbutton", { name: /^Monthly limit/ });
-    await monthlyLimit.fill("999.00");
+    await monthlyLimit.fill("26.00");
+    const models = developer.page.getByRole("combobox", { name: "Models" });
+    const modelsCard = models.locator("xpath=ancestor::section[1]");
     await developer.page.getByRole("button", { name: "Submit for approval" }).click();
 
     const failureAlert = developer.page.getByRole("alert").filter({ hasText: "Some values are outside the platform limits" });
     await expect(failureAlert).toHaveText("Some values are outside the platform limits or available capabilities. Check the highlighted fields and try again.");
     await expect(developer.page.getByText(failureReason, { exact: true })).toBeHidden();
     await developer.page.getByText("Details", { exact: true }).click();
-    await expect(developer.page.getByText("platform_safety_ceiling_exceeded", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("capability_not_available", { exact: true })).toBeVisible();
     await expect(developer.page.getByText(failureReason, { exact: true })).toBeVisible();
-    await expect(monthlyLimit.locator("..")).toHaveClass(/border-warn/);
-    await expect(monthlyLimit).toHaveAttribute("aria-invalid", "true");
+    await expect(modelsCard).toHaveClass(/border-warn/);
 
-    await monthlyLimit.fill("25.00");
+    await modelsCard.getByRole("button", { name: "Remove openai/gpt-5.4" }).click();
     await expect(failureAlert).toHaveCount(0);
-    await expect(monthlyLimit.locator("..")).not.toHaveClass(/border-warn/);
-    await expect(monthlyLimit).not.toHaveAttribute("aria-invalid", "true");
+    await expect(modelsCard).not.toHaveClass(/border-warn/);
+    await monthlyLimit.fill("25.00");
     await expect(developer.page.getByRole("button", { name: "Submit request" })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
