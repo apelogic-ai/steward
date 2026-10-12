@@ -95,6 +95,7 @@ function InferenceConnectionCard({ state, refresh }: Readonly<{
     setAction("working");
     try {
       const result = await removeInferenceCredential({
+        body: {} as never,
         cache: "no-store",
         credentials: "same-origin",
         headers: { "X-Steward-CSRF": session.value.csrf },

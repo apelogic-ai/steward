@@ -522,6 +522,7 @@ async function startWeb() {
         || requestUrl.pathname === "/admin/api/v1/connections/github/disconnect"
         || requestUrl.pathname.endsWith("/github/publish")
         || requestUrl.pathname.endsWith("/github/dispatch")
+        || requestUrl.pathname.endsWith("/cancel")
         || requestUrl.pathname.endsWith("/rerun")
         || requestUrl.pathname === "/admin/auth/logout"
       ));
@@ -550,6 +551,14 @@ async function startWeb() {
           rerunFixtureIndex += 1;
           response.writeHead(fixture?.status ?? 503, { "content-type": "application/json", "cache-control": "no-store" });
           response.end(JSON.stringify(fixture?.body ?? {}));
+          return;
+        }
+        if (requestUrl.pathname.endsWith("/cancel")) {
+          response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+          response.end(JSON.stringify({
+            apiVersion: "steward.browser-runs/v1",
+            run: { ...run, phase: "cancelled", finalizationRequested: true, finalized: true },
+          }));
           return;
         }
         if (requestUrl.pathname.endsWith("/github/publish")) {
@@ -1405,7 +1414,7 @@ async function guardedPage(browser, {
     return json(route, { apiVersion: "steward.browser-runs/v1", runs: emptyCollections ? [] : [fixtureRun], nextCursor: null, facets: { phase: emptyCollections ? { ...runFacets, succeeded: 0 } : runFacets } });
   });
   await context.route(`${origin}/app/api/v1/runs/**`, (route) => {
-    if (route.request().url().endsWith("/rerun")) return route.continue();
+    if (route.request().url().endsWith("/rerun") || route.request().url().endsWith("/cancel")) return route.continue();
     if (route.request().url().endsWith("/events")) {
       if (!mockRunEvents) return route.continue();
       runEventRequests.push(route.request());
@@ -1861,7 +1870,7 @@ async function guardedPage(browser, {
       mutations.push({
         path: "/app/api/v1/connections/inference",
         headers: route.request().headers(),
-        body: null,
+        body: route.request().postDataJSON(),
       });
       inferenceCredential = null;
       await route.fulfill({ status: 204, body: "" });
@@ -3781,6 +3790,23 @@ test("browser-origin re-run uses the browser admission boundary", async ({ brows
   }
 });
 
+test("a running run can be cancelled with an empty JSON mutation body", async ({ browser }) => {
+  const developer = await guardedPage(browser, { runPhase: "running" });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await developer.page.getByLabel("More run actions").click();
+    await developer.page.getByRole("button", { name: "Cancel run", exact: true }).click();
+    await developer.page.getByRole("button", { name: "Cancel run", exact: true }).last().click();
+    await expect(developer.page.getByRole("button", { name: "Cancellation requested" })).toBeDisabled();
+
+    const cancellation = developer.mutations.find((mutation) => mutation.path.endsWith("/cancel"));
+    expectMutationProof(cancellation);
+    expect(cancellation.body).toEqual({});
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("run detail uses one held event stream through queued, running, and succeeded", async ({ browser }) => {
   const developer = await guardedPage(browser, {
     inlineRun: true,
@@ -4754,8 +4780,10 @@ test("managed inference keys can be added, replaced, and removed without redispl
     await developer.page.getByRole("button", { name: "Remove API key…" }).click();
     await developer.page.getByRole("button", { name: "Remove API key", exact: true }).click();
     await expect(developer.page.getByRole("button", { name: "Add API key" })).toBeVisible();
-    expect(developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/connections/inference"))
-      .toHaveLength(3);
+    const inferenceMutations = developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/connections/inference");
+    expect(inferenceMutations).toHaveLength(3);
+    expectInterceptedMutationProof(inferenceMutations[2]);
+    expect(inferenceMutations[2].body).toEqual({});
   } finally {
     await closeGuardedPage(developer);
   }
