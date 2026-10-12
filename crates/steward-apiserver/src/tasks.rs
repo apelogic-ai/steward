@@ -113,6 +113,7 @@ struct SourceRepositoryIdentity {
 
 type SourceRepositoryBindingKey = (String, String, String, String);
 type TaskSubmissionFailureReporter = Arc<dyn Fn(&str) + Send + Sync>;
+const WORKSPACE_SOURCE_DOWNLOAD_FAILED_REASON: &str = "Steward could not download the workspace source. Retry the request; if it persists, contact a Steward administrator.";
 
 fn versioned_workflow_reference(
     workflow: &str,
@@ -1707,6 +1708,14 @@ pub trait TaskSubmissionLedger: Clone + Send + Sync + 'static {
         owner_user_id: &'a str,
     ) -> BoxFuture<'a, Result<TaskRecord, StoreError>>;
 
+    fn fail_task_submission<'a>(
+        &'a self,
+        task_uid: Uuid,
+        submitter_service: &'a str,
+        owner_user_id: &'a str,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<TaskRecord, StoreError>>;
+
     fn task_for_submitter<'a>(
         &'a self,
         task_uid: Uuid,
@@ -1833,6 +1842,19 @@ impl TaskSubmissionLedger for PgStore {
     ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
         Box::pin(async move {
             PgStore::request_task_execution(self, task_uid, submitter_service, owner_user_id).await
+        })
+    }
+
+    fn fail_task_submission<'a>(
+        &'a self,
+        task_uid: Uuid,
+        submitter_service: &'a str,
+        owner_user_id: &'a str,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
+        Box::pin(async move {
+            PgStore::fail_task_submission(self, task_uid, submitter_service, owner_user_id, reason)
+                .await
         })
     }
 
@@ -2534,12 +2556,41 @@ where
             }
             Some(_) => {}
             None => {
-                let input_archive = prepare_task_input_archive(
+                if record.phase == TaskPhase::Failed
+                    && record.failure_reason.as_deref()
+                        == Some(WORKSPACE_SOURCE_DOWNLOAD_FAILED_REASON)
+                {
+                    return Err(ApiError::TaskRuntimeContractUnavailable(
+                        WORKSPACE_SOURCE_DOWNLOAD_FAILED_REASON.to_owned(),
+                    ));
+                }
+                let input_archive = match prepare_task_input_archive(
                     &self.config,
                     &caller_input_archive,
                     evidence.workspace.as_ref(),
                 )
-                .await?;
+                .await
+                {
+                    Ok(input_archive) => input_archive,
+                    Err(error) => {
+                        let reason = match &error {
+                            ApiError::Admission(reason)
+                            | ApiError::TaskRequestRejected(reason)
+                            | ApiError::TaskRuntimeContractUnavailable(reason) => reason.as_str(),
+                            _ => "Steward could not prepare the workspace input for this run.",
+                        };
+                        self.ledger
+                            .fail_task_submission(
+                                record.task_uid,
+                                &identity.service,
+                                identity.canonical_user_id.as_str(),
+                                reason,
+                            )
+                            .await
+                            .map_err(|store_error| self.browser_task_store_error(store_error))?;
+                        return Err(error);
+                    }
+                };
                 record = self
                     .ledger
                     .put_task_inputs(
@@ -4821,11 +4872,14 @@ async fn prepare_task_input_archive(
             }
         };
         let mut entry_pack_bytes = append_workspace_git_pack(
+            config,
             git.as_ref(),
-            caller_archive.len(),
-            &mut material,
-            &format!("packs/{index}.pack"),
-            &format!("shallow/{index}"),
+            WorkspaceGitPackTarget {
+                caller_archive_len: caller_archive.len(),
+                material: &mut material,
+                pack_path: format!("packs/{index}.pack"),
+                shallow_path: format!("shallow/{index}"),
+            },
             GitPackRequest {
                 repository: GitRepositoryIdentity {
                     repository: repository.clone(),
@@ -4857,11 +4911,14 @@ async fn prepare_task_input_archive(
                 .checked_sub(total_pack_bytes)
                 .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
             let appended = append_workspace_git_pack(
+                config,
                 git.as_ref(),
-                caller_archive.len(),
-                &mut material,
-                &format!("submodules/{index}/{submodule_index}.pack"),
-                &format!("submodules/{index}/{submodule_index}.shallow"),
+                WorkspaceGitPackTarget {
+                    caller_archive_len: caller_archive.len(),
+                    material: &mut material,
+                    pack_path: format!("submodules/{index}/{submodule_index}.pack"),
+                    shallow_path: format!("submodules/{index}/{submodule_index}.shallow"),
+                },
                 GitPackRequest {
                     repository: GitRepositoryIdentity {
                         repository: submodule.repository.clone().ok_or_else(|| {
@@ -4914,16 +4971,15 @@ async fn prepare_task_input_archive(
 }
 
 async fn append_workspace_git_pack(
+    config: &TaskApiConfig,
     git: &dyn DirectGitResolver,
-    caller_archive_len: usize,
-    material: &mut Vec<u8>,
-    pack_path: &str,
-    shallow_path: &str,
+    target: WorkspaceGitPackTarget<'_>,
     mut request: GitPackRequest,
     limits: WorkspaceGitPackLimits,
 ) -> Result<u64, ApiError> {
-    let reserved = caller_archive_len
-        .checked_add(material.len())
+    let reserved = target
+        .caller_archive_len
+        .checked_add(target.material.len())
         .and_then(|value| value.checked_add(4096))
         .ok_or_else(|| ApiError::Admission("workspace_limit_exceeded".to_owned()))?;
     let remaining = MAX_TASK_INPUT_ARCHIVE_BYTES
@@ -4939,7 +4995,17 @@ async fn append_workspace_git_pack(
             "Workspace materialized size is more than the {} this Envelope allows.",
             format_workspace_bytes(request.max_bytes)
         )),
-        error => source_port_error(error),
+        error => {
+            let mapped = source_port_error_with_reporter(config, "read_pack", error);
+            match mapped {
+                ApiError::TaskRuntimeContractUnavailable(_) => {
+                    ApiError::TaskRuntimeContractUnavailable(
+                        WORKSPACE_SOURCE_DOWNLOAD_FAILED_REASON.to_owned(),
+                    )
+                }
+                mapped => mapped,
+            }
+        }
     })?;
     if pack.repository != request.repository || pack.commit != request.commit {
         return Err(ApiError::Admission(
@@ -4960,7 +5026,7 @@ async fn append_workspace_git_pack(
             "The repository history has more than {limit} generations, which is the limit this Envelope allows. Request a depth of {limit} or less."
         )));
     }
-    append_workspace_tar_file(material, pack_path, &pack.bytes)?;
+    append_workspace_tar_file(target.material, &target.pack_path, &pack.bytes)?;
     if !pack.shallow.is_empty() {
         let shallow = pack
             .shallow
@@ -4973,7 +5039,11 @@ async fn append_workspace_git_pack(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        append_workspace_tar_file(material, shallow_path, format!("{shallow}\n").as_bytes())?;
+        append_workspace_tar_file(
+            target.material,
+            &target.shallow_path,
+            format!("{shallow}\n").as_bytes(),
+        )?;
     }
     Ok(pack.bytes.len() as u64)
 }
@@ -4982,6 +5052,13 @@ async fn append_workspace_git_pack(
 struct WorkspaceGitPackLimits {
     materialized_bytes: u64,
     full_history_depth: Option<u32>,
+}
+
+struct WorkspaceGitPackTarget<'a> {
+    caller_archive_len: usize,
+    material: &'a mut Vec<u8>,
+    pack_path: String,
+    shallow_path: String,
 }
 
 fn append_workspace_tar_file(
@@ -6785,16 +6862,17 @@ mod workflow_request_tests {
     use super::{
         DirectGitResolver, MAX_WORKSPACE_MATERIALIZED_BYTES, TaskApiConfig, TaskCreateRequest,
         TaskSubmissionRequest, WorkspaceAdmissionPolicy, WorkspaceGitPackLimits,
-        WorkspaceResolutionBudget, append_workspace_git_pack, browser_input_retry_matches,
-        browser_inputs_archive, browser_inputs_from_archive, browser_rerun_submission,
-        browser_task_evidence_matches, browser_workspace_trigger_commit, default_workspace_name,
-        direct_authority_spec, direct_effective_requirements, direct_requirements_for_task,
-        direct_task_evidence_matches, format_workspace_bytes, prepare_task_input_archive,
-        resolve_scratch_workspace_entry, resolve_versioned_task_plan, source_port_error,
-        source_port_error_with_reporter, stable_task_runtime_name, task_orchestration_reservation,
-        validate_workspace_policy, versioned_workflow_reference, workspace_admission_policy,
-        workspace_git_materialized_budget, workspace_submodule_is_selected,
-        workspace_submodule_repository_url, workspace_tree_inventory,
+        WorkspaceGitPackTarget, WorkspaceResolutionBudget, append_workspace_git_pack,
+        browser_input_retry_matches, browser_inputs_archive, browser_inputs_from_archive,
+        browser_rerun_submission, browser_task_evidence_matches, browser_workspace_trigger_commit,
+        default_workspace_name, direct_authority_spec, direct_effective_requirements,
+        direct_requirements_for_task, direct_task_evidence_matches, format_workspace_bytes,
+        prepare_task_input_archive, resolve_scratch_workspace_entry, resolve_versioned_task_plan,
+        source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
+        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
+        workspace_admission_policy, workspace_git_materialized_budget,
+        workspace_submodule_is_selected, workspace_submodule_repository_url,
+        workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -7620,11 +7698,14 @@ mod workflow_request_tests {
 
         let mut material = Vec::new();
         let result = append_workspace_git_pack(
+            &TaskApiConfig::default(),
             &OversizedPackResolver,
-            0,
-            &mut material,
-            "packs/0.pack",
-            "shallow/0",
+            WorkspaceGitPackTarget {
+                caller_archive_len: 0,
+                material: &mut material,
+                pack_path: "packs/0.pack".to_owned(),
+                shallow_path: "shallow/0".to_owned(),
+            },
             GitPackRequest {
                 repository,
                 commit,
@@ -7654,11 +7735,14 @@ mod workflow_request_tests {
         };
         let mut material = Vec::new();
         let result = append_workspace_git_pack(
+            &TaskApiConfig::default(),
             &OversizedPackResolver,
-            0,
-            &mut material,
-            "packs/0.pack",
-            "shallow/0",
+            WorkspaceGitPackTarget {
+                caller_archive_len: 0,
+                material: &mut material,
+                pack_path: "packs/0.pack".to_owned(),
+                shallow_path: "shallow/0".to_owned(),
+            },
             GitPackRequest {
                 repository,
                 commit: ExactGitCommit::parse(format!("git:sha1:{}", "a".repeat(40)))?,

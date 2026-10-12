@@ -313,6 +313,8 @@ catalog into an immutable content-addressed ConfigMap and rolls the apiserver
 when it changes. Repository names remain audit metadata and cannot substitute
 for these IDs. The deployment adapter resolves and maintains the approved
 GitHub API CIDRs; the portable chart opens HTTPS egress only to those entries.
+Workspace checkouts also download Git packs from the repository Git host, so include that host's
+resolved CIDRs in `networkPolicy.githubApiCidrs` when NetworkPolicy is enabled.
 
 An in-repository Task package therefore requires all of the following before
 submission: `githubSource.enabled=true`, a read-only Contents GitHub App

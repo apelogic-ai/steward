@@ -518,8 +518,9 @@ as an install prerequisite rather than a later application setting. Enable
 `githubSource`, reference the existing App private-key Secret, install that App
 with read-only Contents on every allowed source repository, add exact
 caller/source stable-ID bindings for cross-repository packages, and configure
-`networkPolicy.githubApiCidrs` when NetworkPolicy is enabled. After rollout,
-prove one exact-commit read before activating the workflow. When
+`networkPolicy.githubApiCidrs` when NetworkPolicy is enabled. Workspace checkouts also require the
+repository Git host's resolved CIDRs in that value so the apiserver can download its Git pack.
+After rollout, prove one exact-commit read before activating the workflow. When
 `taskIdentity.resource` configures protected-resource discovery, also check
 `steward_direct_packages_supported: true` and
 `steward_package_path_supported: true` at
