@@ -50,7 +50,7 @@ describe("envelope ceiling-exceedance summaries", () => {
     expect(html).toContain("Runner memory: <strong>1Gi</strong> (limit Not set)");
     expect(html).toContain("Runner compute: <strong>1</strong> (limit 500m)");
     expect(html).toContain("Runner storage: <strong>10Gi</strong> (limit 5Gi)");
-    expect(html).toContain("Workspace: <strong>types git · size 1 GiB · files 1,000 · history 100 · submodules 1</strong> (limit Not set)");
+    expect(html).toContain("Workspace: <strong>types git · size 1 GiB · files 1,000 files · history 100 generations · submodules 1 level</strong> (limit Not set)");
   });
 
   test("names every deployment limit omitted by a wider workspace request", () => {

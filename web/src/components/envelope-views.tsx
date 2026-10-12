@@ -324,7 +324,7 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template, workspaceCa
   );
 }
 
-function parseCustomEnvelope(value: string): BrowserEnvelope | null {
+export function parseCustomEnvelope(value: string): BrowserEnvelope | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(value);
@@ -339,6 +339,12 @@ function parseCustomEnvelope(value: string): BrowserEnvelope | null {
   if (typeof spec.budget !== "object" || spec.budget === null || Array.isArray(spec.budget)) return null;
   const budget = spec.budget as Record<string, unknown>;
   if (typeof budget.currency !== "string" || typeof budget.monthlyLimit !== "string") return null;
+  if (spec.workspace !== undefined) {
+    if (typeof spec.workspace !== "object" || spec.workspace === null || Array.isArray(spec.workspace)) return null;
+    const workspace = spec.workspace as Record<string, unknown>;
+    if (!Array.isArray(workspace.allowedTypes) || !workspace.allowedTypes.every((type) => typeof type === "string")) return null;
+    if (workspace.maxTotalSize !== undefined && workspace.maxTotalSize !== null && typeof workspace.maxTotalSize !== "string") return null;
+  }
   return parsed as BrowserEnvelope;
 }
 

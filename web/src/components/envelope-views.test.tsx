@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 import type { AvailableEnvelopeTemplate, BrowserEnvelope } from "@/api-client";
-import { templateRequestReviewSummary, withWorkspaceAuthority } from "./envelope-views";
+import { parseCustomEnvelope, templateRequestReviewSummary, withWorkspaceAuthority } from "./envelope-views";
 import { workspaceAuthorityDraft, workspaceAuthorityFromDraft } from "./workspace-authority-controls";
 
 const source = readFileSync(new URL("./envelope-views.tsx", import.meta.url), "utf8");
@@ -75,6 +75,19 @@ describe("envelope run history", () => {
       maxSubmoduleDepth: 2,
       maxTotalSize: "2Gi",
     });
+  });
+
+  test("custom requests reject malformed workspace authority before editing it", () => {
+    expect(parseCustomEnvelope(JSON.stringify({
+      revision: 1,
+      spec: {
+        budget: { currency: "USD", monthlyLimit: "20.00" },
+        llms: [{ provider: "provider-a", model: "model-a" }],
+        tools: [],
+        ttl: "30m",
+        workspace: { maxTotalSize: "2Gi" },
+      },
+    }))).toBeNull();
   });
 });
 
