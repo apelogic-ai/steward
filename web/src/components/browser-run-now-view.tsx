@@ -2,10 +2,11 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useState, type FormEvent } from "react";
+import { useCallback, useId, useState, type FormEvent } from "react";
 
 import {
   getStarterTask,
+  getUserCapabilities,
   listRequests,
   listTemplates,
   myTask,
@@ -15,13 +16,21 @@ import {
   type BrowserTaskView,
   type BrowserTasksResponse,
   type DirectTaskDefinition,
-  type ExecutionBindingAdvertisement,
   type EnvelopeRequestsResponse,
   type EnvelopeTemplatesResponse,
   type GithubRepositoryView,
   type StarterTaskSetting,
+  type UserCapabilitiesResponse,
 } from "@/api-client";
 import { DiagnosticDetails, type DiagnosticItem } from "@/components/diagnostic-details";
+import {
+  compatibleAgents,
+  effectiveAgentSelection,
+  effectiveModelSelection,
+  ModelPicker,
+  preferredTaskModel,
+  type Model,
+} from "@/components/model-selection";
 import { canonicalWorkspaceRef, workspaceRepositoryName } from "@/components/workspace-repository-controls";
 import { PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { RepositoryResource, useGithubRepositories } from "@/data/github-repositories";
@@ -30,6 +39,7 @@ import { useSession } from "@/session/session-context";
 import { listPublishedWorkflows, type PublishedWorkflowListResponse } from "@/workflows/api";
 
 type RunNowData = {
+  capabilities: UserCapabilitiesResponse;
   envelopes: EnvelopeRequestsResponse;
   templates: EnvelopeTemplatesResponse;
   workflows: PublishedWorkflowListResponse;
@@ -43,25 +53,6 @@ type SourceKind = "inline" | "repository" | "registry";
 const fieldClass = "min-h-11 w-full rounded-control border bg-panel px-3 font-normal";
 const genericRunNowFailure = "The run request was rejected. Check the package, inputs, and selected Envelope limits, then try again.";
 
-type CompatibleAgent = {
-  agentRef: string;
-  model: { provider: string; model: string } | null;
-  compatible: boolean;
-  reason: string | null;
-};
-
-type EffectiveAgentSelection = {
-  selected: CompatibleAgent | undefined;
-  warning: string | null;
-};
-
-type Model = { provider: string; model: string };
-
-type EffectiveModelSelection = {
-  selected: Model | null;
-  warning: string | null;
-};
-
 type ExactTaskLocator = Pick<BrowserTaskView, "files" | "path" | "revision" | "source">;
 
 export function packageLocatorForTask(task: ExactTaskLocator): BrowserPackageLocator {
@@ -70,66 +61,6 @@ export function packageLocatorForTask(task: ExactTaskLocator): BrowserPackageLoc
     revision: task.revision,
     path: task.path,
     ...(task.source === "inline" ? { files: task.files } : {}),
-  };
-}
-
-function agentModelProvider(agentRef: string): { provider: string; label: string } | null {
-  if (agentRef.startsWith("codex@")) return { provider: "openai", label: "OpenAI" };
-  if (agentRef.startsWith("claude-code@")) return { provider: "anthropic", label: "Anthropic" };
-  return null;
-}
-
-export function compatibleAgents(agentRefs: string[], models: Array<{ provider: string; model: string }>): CompatibleAgent[] {
-  return agentRefs.map((agentRef) => {
-    const required = agentModelProvider(agentRef);
-    if (!required) {
-      return { agentRef, model: null, compatible: false, reason: "This coding agent is not compatible with any available model." };
-    }
-    const model = models.find((candidate) => candidate.provider === required.provider) ?? null;
-    return model
-      ? { agentRef, model, compatible: true, reason: null }
-      : { agentRef, model: null, compatible: false, reason: `Requires an ${required.label} model, which this Envelope does not allow.` };
-  });
-}
-
-export function effectiveAgentSelection(
-  agentOptions: CompatibleAgent[],
-  requestedAgentRef: string,
-): EffectiveAgentSelection {
-  const requested = agentOptions.find((agent) => agent.agentRef === requestedAgentRef);
-  const selected = requested?.compatible
-    ? requested
-    : agentOptions.find((agent) => agent.compatible);
-  return {
-    selected,
-    warning: selected && selected.agentRef !== requestedAgentRef
-      ? `${requestedAgentRef} is not allowed by this Envelope. Using ${selected.agentRef} instead.`
-      : selected
-        ? null
-        : requested?.reason ?? "No compatible coding agent is available for this Envelope.",
-  };
-}
-
-export function effectiveModelSelection(
-  configuredModel: Model | null,
-  configuredAgentRef: string,
-  selectedAgent: CompatibleAgent | undefined,
-  allowedModels: Model[],
-): EffectiveModelSelection {
-  if (!selectedAgent?.compatible) return { selected: null, warning: null };
-  if (!configuredModel || selectedAgent.agentRef !== configuredAgentRef) {
-    return { selected: selectedAgent.model, warning: null };
-  }
-  const exact = allowedModels.find(
-    (model) => model.provider === configuredModel.provider && model.model === configuredModel.model,
-  );
-  if (exact) return { selected: exact, warning: null };
-  const fallback = selectedAgent.model;
-  return {
-    selected: fallback,
-    warning: fallback
-      ? `${configuredModel.provider}/${configuredModel.model} is not allowed by this Envelope. Using ${fallback.provider}/${fallback.model} instead.`
-      : null,
   };
 }
 
@@ -167,6 +98,7 @@ export function runNowFailureMessage(error: unknown, workspaceRepository?: strin
       : "";
     return `The run request was rejected. ${sentence(reason)}${repository}`;
   }
+  if (code?.includes(" ")) return `The run request was rejected. ${sentence(code)}`;
   return genericRunNowFailure;
 }
 
@@ -197,17 +129,16 @@ export function inlineFiles(
       ? {
           workspace: [{
             git: {
-              // TODO(#397): remove these casts when the generated schema includes named repository and ref selectors.
               repository: ("ref" in checkout
                 ? workspaceRepositoryName(checkout.repository)
                 : {
                     ownerId: checkout.repository.ownerId,
                     repositoryId: checkout.repository.repositoryId,
-                  }) as never,
-              ref: ("ref" in checkout ? canonicalWorkspaceRef(checkout.ref) : "trigger") as never,
+                  }),
+              ref: "ref" in checkout ? canonicalWorkspaceRef(checkout.ref) : "trigger",
               ...(checkout.historyDepth ? { history: { depth: checkout.historyDepth } } : {}),
             },
-          }] as unknown as DirectTaskDefinition["workspace"],
+          }],
         }
       : {}),
     ...(starterTask.taskDefinition.requires
@@ -233,7 +164,8 @@ export function BrowserRunNowView() {
   const taskDigest = search.get("task");
   const session = useSession();
   const load = useCallback(async () => {
-    const [envelopes, templates, workflows, tasks, task, starterTask] = await Promise.all([
+    const [capabilities, envelopes, templates, workflows, tasks, task, starterTask] = await Promise.all([
+      getUserCapabilities({ cache: "no-store", credentials: "same-origin" }),
       listRequests({ cache: "no-store", credentials: "same-origin" }),
       listTemplates({ cache: "no-store", credentials: "same-origin" }),
       listPublishedWorkflows(),
@@ -241,7 +173,9 @@ export function BrowserRunNowView() {
       taskDigest ? myTask({ cache: "no-store", credentials: "same-origin", path: { content_digest: taskDigest } }) : Promise.resolve(null),
       getStarterTask({ cache: "no-store", credentials: "same-origin" }),
     ]);
-    const response = !envelopes.response?.ok
+    const response = !capabilities.response?.ok
+      ? capabilities.response
+      : !envelopes.response?.ok
       ? envelopes.response
       : !templates.response?.ok
         ? templates.response
@@ -255,8 +189,8 @@ export function BrowserRunNowView() {
               ? starterTask.response
               : workflows.response;
     return {
-      data: envelopes.data && templates.data && workflows.data && tasks.data && starterTask.data && (!taskDigest || task?.data)
-        ? { envelopes: envelopes.data, templates: templates.data, workflows: workflows.data, tasks: tasks.data, task: task?.data?.task ?? null, starterTask: starterTask.data.starterTask }
+      data: capabilities.data && envelopes.data && templates.data && workflows.data && tasks.data && starterTask.data && (!taskDigest || task?.data)
+        ? { capabilities: capabilities.data, envelopes: envelopes.data, templates: templates.data, workflows: workflows.data, tasks: tasks.data, task: task?.data?.task ?? null, starterTask: starterTask.data.starterTask }
         : undefined,
       response,
     };
@@ -301,6 +235,8 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
   onCreated: (taskUid: string) => void;
   session: ReturnType<typeof useSession>;
 }>) {
+  const agentWarningId = useId();
+  const modelWarningId = useId();
   const { refresh: refreshRepositories, state: repositoryState } = useGithubRepositories();
   const active = data.envelopes.requests.filter((request) => request.status === "provisioned" && request.envelopeDigest);
   const exactTask = data.task;
@@ -309,6 +245,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
   const [sourceKind, setSourceKind] = useState<SourceKind>(initialKind);
   const [envelopeId, setEnvelopeId] = useState(active[0]?.id ?? "");
   const [agentRef, setAgentRef] = useState(starterTask.taskDefinition.runtime.agentRef);
+  const [model, setModel] = useState<Model | null>(() => preferredTaskModel(starterTask.taskDefinition));
   const [prompt, setPrompt] = useState(starterTask.taskDefinition.promptText ?? "");
   const [repository, setRepository] = useState(starterTask.git?.repository ?? "");
   const [revision, setRevision] = useState(starterTask.git?.revision ?? "");
@@ -332,17 +269,14 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
   const inlineAllowed = selectedTemplate?.allowInlineBrowserTasks !== false;
   const envelope = selectedEnvelope?.approvedEnvelope ?? selectedEnvelope?.requestedEnvelope;
   const agentOptions = compatibleAgents(
-    data.workflows.agents.map((agent: ExecutionBindingAdvertisement) => agent.agentRef),
+    data.capabilities.agents,
     envelope?.spec.llms ?? [],
   );
   const { selected: selectedAgent, warning: agentWarning } = effectiveAgentSelection(agentOptions, agentRef);
   const effectiveAgentRef = selectedAgent?.agentRef ?? "";
-  const configuredModel = starterTask.taskDefinition.runtime.model ?? null;
   const { selected: selectedModel, warning: modelWarning } = effectiveModelSelection(
-    configuredModel,
-    starterTask.taskDefinition.runtime.agentRef,
+    model,
     selectedAgent,
-    envelope?.spec.llms ?? [],
   );
   const workspaceRepositories = repositoryState.status === "ready" ? repositoryState.value.repositories : [];
   const defaultWorkspaceRepository = workspaceRepositories.find((candidate) => candidate.ready);
@@ -440,7 +374,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
       {exactTask ? <div className="grid gap-2 text-sm font-semibold">Task<div className={`${fieldClass} flex items-center font-mono text-xs`}>{exactTask.name}@{exactTask.version} · {exactTask.contentDigest}</div></div> : <label className="grid gap-2 text-sm font-semibold">Package source<select className={fieldClass} onChange={(event) => setSourceKind(event.target.value as SourceKind)} value={sourceKind}><option disabled={!inlineAllowed} value="inline">Inline package{inlineAllowed ? "" : " (disabled by template)"}</option><option value="repository">Git repository</option><option value="registry">Published workflow</option></select></label>}
     </div>
     {exactTask ? <p className="text-sm text-muted-ink">The exact immutable package is locked. Choose an Envelope and optional inputs for this run.</p> : null}
-    {!exactTask && sourceKind === "inline" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Coding agent<select className={`${fieldClass} font-mono`} onChange={(event) => setAgentRef(event.target.value)} value={effectiveAgentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.agentRef}{agent.compatible ? ` · ${agent.model?.provider}/${agent.model?.model}` : ` · ${agent.reason}`}</option>)}</select></label>{agentWarning ?? modelWarning ? <p className="text-sm text-warn" role="status">{agentWarning ?? modelWarning}</p> : null}<label className="grid gap-2 text-sm font-semibold">Prompt<span className="text-xs font-normal text-muted-ink">Write results under <code>$STEWARD_OUTPUT_DIR/out/</code>. Only those files are collected; a run with no <code>out/</code> file fails.</span><textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label><p className="text-xs text-muted-ink">This inline task uses one compatible model and {starterTask.taskDefinition.requires ? "uses its saved access requirements" : "inherits the selected Envelope's approved tools, budget, time-to-live limit, and runner limits"}. Open the Task from the completed Run to reuse or publish the exact package.</p></div> : null}
+    {!exactTask && sourceKind === "inline" ? <div className="grid gap-4"><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Coding agent<select aria-describedby={agentWarning ? agentWarningId : undefined} className={`${fieldClass} font-mono`} onChange={(event) => setAgentRef(event.target.value)} value={effectiveAgentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.displayName ? `${agent.displayName} · ${agent.agentRef}` : agent.agentRef}{agent.compatible ? "" : ` · ${agent.reason}`}</option>)}</select></label><ModelPicker className={fieldClass} describedBy={modelWarning ? modelWarningId : undefined} models={selectedAgent?.models ?? []} onChange={setModel} selected={selectedModel} /></div>{agentWarning ? <p className="text-sm text-warn" id={agentWarningId} role="status">{agentWarning}</p> : null}{modelWarning ? <p className="text-sm text-warn" id={modelWarningId} role="status">{modelWarning}</p> : null}<label className="grid gap-2 text-sm font-semibold">Prompt<span className="text-xs font-normal text-muted-ink">Write results under <code>$STEWARD_OUTPUT_DIR/out/</code>. Only those files are collected; a run with no <code>out/</code> file fails.</span><textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label><p className="text-xs text-muted-ink">This inline task uses the selected compatible model and {starterTask.taskDefinition.requires ? "uses its saved access requirements" : "inherits the selected Envelope's approved tools, budget, time-to-live limit, and runner limits"}. Open the Task from the completed Run to reuse or publish the exact package.</p></div> : null}
     {!exactTask && sourceKind === "inline" ? <div className="space-y-3 rounded-control border p-4"><label className="flex items-center gap-3 text-sm font-semibold"><input checked={checkoutRepository} onChange={(event) => setCheckoutRepository(event.target.checked)} type="checkbox" />Check out this repository</label>{checkoutRepository ? <RepositoryResource onRetry={refreshRepositories} state={repositoryState}>{({ repositories }) => <div className="grid gap-4 md:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Workspace repository<select className={fieldClass} onChange={(event) => { const nextId = event.target.value; const next = repositories.find((candidate) => candidate.repositoryId === nextId); setWorkspaceRepositoryId(nextId); setWorkspaceRef(next?.defaultBranch ?? ""); }} value={workspaceRepositoryId}><option value="">Default repository at trigger revision</option>{repositories.map((candidate) => <option disabled={!candidate.ready} key={candidate.repositoryId} value={candidate.repositoryId}>{workspaceRepositoryName(candidate)}{candidate.ready ? "" : " · not approved"}</option>)}</select></label><label className="grid gap-2 text-sm font-semibold">Branch or tag<input className={`${fieldClass} font-mono`} disabled={!selectedWorkspaceRepository} onChange={(event) => setWorkspaceRef(event.target.value)} placeholder={selectedWorkspaceRepository?.defaultBranch ?? "Choose a named repository first"} value={effectiveWorkspaceRef} /></label><label className="grid gap-2 text-sm font-semibold">History depth (optional)<input className={fieldClass} min={1} onChange={(event) => setHistoryDepth(event.target.value)} placeholder="Files only" step={1} type="number" value={historyDepth} /></label><p className="text-xs text-muted-ink md:col-span-3">Choose a named repository to pin a branch or tag. The default keeps the repository and revision supplied by the trigger.</p></div>}</RepositoryResource> : null}{checkoutRepository && !workspaceRefValid ? <p className="text-sm text-err" role="alert">Enter a branch or tag.</p> : null}{checkoutRepository && !historyDepthValid ? <p className="text-sm text-err" role="alert">History depth must be a positive whole number.</p> : null}{checkoutRepository && repositoryState.status === "ready" && !defaultWorkspaceRepository?.ready ? <p className="text-sm text-warn">No approved repository is available for this workspace.</p> : null}</div> : null}
     {!exactTask && sourceKind === "repository" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Repository<input className={`${fieldClass} font-mono`} onChange={(event) => setRepository(event.target.value)} value={repository} /></label><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Ref or immutable commit<input className={`${fieldClass} font-mono`} onChange={(event) => setRevision(event.target.value)} value={revision} /></label><label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} value={path} /></label></div><p className="text-xs text-muted-ink">The repository must be in the operator&apos;s allowed source list. Steward resolves a ref to an exact commit and validates the package&apos;s declared requirements before execution.</p></div> : null}
     {!exactTask && sourceKind === "registry" ? <label className="grid gap-2 text-sm font-semibold">Published workflow<select className={fieldClass} onChange={(event) => setWorkflowRef(event.target.value)} value={workflowRef}>{data.workflows.workflows.map((workflow) => <option key={`${workflow.name}@${workflow.version}`} value={`${workflow.name}@${workflow.version}`}>{workflow.displayName} · {workflow.name}@{workflow.version}</option>)}</select></label> : null}

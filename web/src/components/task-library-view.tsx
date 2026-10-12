@@ -2,22 +2,33 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useId, useMemo, useState, type FormEvent } from "react";
 
 import {
+  getUserCapabilities,
+  listRequests,
   myTask,
   myTasks,
   saveMyTask,
   type BrowserTaskResponse,
   type BrowserTasksResponse,
   type BrowserTaskView,
+  type EnvelopeRequestsResponse,
+  type UserCapabilitiesResponse,
 } from "@/api-client";
+import {
+  compatibleAgents,
+  effectiveAgentSelection,
+  effectiveModelSelection,
+  ModelPicker,
+  requirementsWithSelectedModel,
+  type Model,
+} from "@/components/model-selection";
 import { WorkspaceRepositoryControls } from "@/components/workspace-repository-controls";
 import { PageHeader, ResourceBoundary } from "@/components/workspace-ui";
 import { RepositoryResource, useGithubRepositories } from "@/data/github-repositories";
 import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
-import { listPublishedWorkflows, type PublishedWorkflowListResponse } from "@/workflows/api";
 
 const fieldClass = "min-h-11 w-full rounded-control border bg-panel px-3 font-normal";
 
@@ -51,19 +62,29 @@ export function TaskLibraryView() {
 }
 
 type EditorData = {
-  agents: PublishedWorkflowListResponse;
+  capabilities: UserCapabilitiesResponse;
+  envelopes: EnvelopeRequestsResponse;
   task: BrowserTaskView | null;
 };
 
 export function TaskEditorView({ contentDigest }: Readonly<{ contentDigest?: string }>) {
   const load = useCallback(async () => {
-    const [agents, task] = await Promise.all([
-      listPublishedWorkflows(),
+    const [capabilities, envelopes, task] = await Promise.all([
+      getUserCapabilities({ cache: "no-store", credentials: "same-origin" }),
+      listRequests({ cache: "no-store", credentials: "same-origin" }),
       contentDigest ? loadTask(contentDigest) : Promise.resolve(null),
     ]);
-    const response = !agents.response?.ok ? agents.response : task && !task.response?.ok ? task.response : agents.response;
+    const response = !capabilities.response?.ok
+      ? capabilities.response
+      : !envelopes.response?.ok
+        ? envelopes.response
+        : task && !task.response?.ok
+          ? task.response
+          : capabilities.response;
     return {
-      data: agents.data && (!contentDigest || task?.data) ? { agents: agents.data, task: task?.data?.task ?? null } : undefined,
+      data: capabilities.data && envelopes.data && (!contentDigest || task?.data)
+        ? { capabilities: capabilities.data, envelopes: envelopes.data, task: task?.data?.task ?? null }
+        : undefined,
       response,
     };
   }, [contentDigest]);
@@ -94,14 +115,20 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
   const existing = data.task;
   const definition = useMemo(() => parseDefinition(existing), [existing]);
   const existingRuntime = definition?.runtime && typeof definition.runtime === "object" ? definition.runtime as Record<string, unknown> : null;
-  const existingModel = existingRuntime?.model && typeof existingRuntime.model === "object" ? existingRuntime.model as Record<string, unknown> : null;
   const nextVersion = existing ? Math.max(existing.version, ...existing.versions.map((version) => version.version)) + 1 : 1;
-  const agentRefs = [...new Set([...(data.agents.agents.map((agent) => agent.agentRef)), typeof existingRuntime?.agentRef === "string" ? existingRuntime.agentRef : ""].filter(Boolean))];
+  const activeEnvelopes = data.envelopes.requests.filter((request) => request.status === "provisioned" && request.envelopeDigest);
+  const initialAgentRef = typeof existingRuntime?.agentRef === "string"
+    ? existingRuntime.agentRef
+    : data.capabilities.agents[0]?.agentRef ?? "";
   const [name, setName] = useState(typeof definition?.name === "string" ? definition.name : "my-task");
   const [path, setPath] = useState(existing?.path ?? "task-definition.json");
-  const [agentRef, setAgentRef] = useState(typeof existingRuntime?.agentRef === "string" ? existingRuntime.agentRef : agentRefs[0] ?? "");
-  const [modelProvider, setModelProvider] = useState(typeof existingModel?.provider === "string" ? existingModel.provider : "");
-  const [modelName, setModelName] = useState(typeof existingModel?.model === "string" ? existingModel.model : "");
+  const [envelopeId, setEnvelopeId] = useState(activeEnvelopes[0]?.id ?? "");
+  const [agentRef, setAgentRef] = useState(initialAgentRef);
+  const [agentChanged, setAgentChanged] = useState(false);
+  const [model, setModel] = useState<Model | null>(() => existing
+    ? existing.runtime.model ?? null
+    : null);
+  const [modelChanged, setModelChanged] = useState(false);
   const [prompt, setPrompt] = useState(typeof definition?.promptText === "string" ? definition.promptText : "Write the requested result under $STEWARD_OUTPUT_DIR/out/.");
   const [skills, setSkills] = useState(jsonText(definition?.skills, []));
   const [workspace, setWorkspace] = useState(jsonText(definition?.workspace, []));
@@ -111,6 +138,37 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
   const [sharedRoles, setSharedRoles] = useState(existing?.sharedRoles ?? []);
   const [status, setStatus] = useState<"idle" | "saving" | "error">("idle");
   const [failure, setFailure] = useState<string | null>(null);
+  const agentWarningId = useId();
+  const modelWarningId = useId();
+  const selectedEnvelope = activeEnvelopes.find((request) => request.id === envelopeId) ?? activeEnvelopes[0];
+  const envelope = selectedEnvelope?.approvedEnvelope ?? selectedEnvelope?.requestedEnvelope;
+  const agentOptions = selectedEnvelope
+    ? compatibleAgents(data.capabilities.agents, envelope?.spec.llms ?? [])
+    : data.capabilities.agents.map((agent) => ({
+        agentRef: agent.agentRef,
+        displayName: agent.displayName ?? null,
+        models: [],
+        compatible: true,
+        reason: null,
+      }));
+  const currentAgent = agentOptions.find((agent) => agent.agentRef === agentRef);
+  const preserveCurrentAgent = Boolean(!agentChanged && agentRef && (!currentAgent || !currentAgent.compatible));
+  const effectiveAgent = effectiveAgentSelection(agentOptions, agentRef);
+  const selectedAgent = preserveCurrentAgent ? undefined : effectiveAgent.selected;
+  const effectiveAgentRef = preserveCurrentAgent ? agentRef : selectedAgent?.agentRef ?? "";
+  const preserveCurrentModel = Boolean(existing && !modelChanged);
+  const effectiveModel = effectiveModelSelection(model, selectedAgent);
+  const selectedModel = preserveCurrentModel ? model : effectiveModel.selected;
+  const agentWarning = preserveCurrentAgent
+    ? selectedEnvelope
+      ? `${currentAgent?.displayName ?? agentRef} is not available with the selected Envelope. You can keep it for this draft or choose another.`
+      : "No active Envelope is selected. You can keep the current coding agent for this draft."
+    : effectiveAgent.warning;
+  const modelWarning = preserveCurrentModel && model && !selectedAgent?.models.some((candidate) => candidate.provider === model.provider && candidate.model === model.model)
+    ? selectedEnvelope
+      ? `${model.provider}/${model.model} is not available with the selected Envelope and coding agent. You can keep it for this draft or choose another.`
+      : "No active Envelope is selected. You can keep the current model for this draft."
+    : effectiveModel.warning;
 
   if (existing && (!existing.editable || existing.source !== "inline" || !existing.taskId)) {
     return <div className="space-y-4"><PageHeader description="Only an owner-scoped draft can create another immutable version." title="Task is read-only" /><Link className="inline-flex rounded-control border px-4 py-2 text-sm font-semibold" href={`/tasks/${encodeURIComponent(existing.contentDigest)}`}>Back to Task</Link></div>;
@@ -118,22 +176,29 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
 
   function previewPackage(): { definition: Record<string, unknown>; files: Record<string, string> } | null {
     try {
+      if (!effectiveAgentRef) return null;
       const parsedSkills = JSON.parse(skills);
       const parsedWorkspace = JSON.parse(workspace);
       const parsedOutputs = JSON.parse(outputs);
       const parsedRequires = requires.trim() ? JSON.parse(requires) : undefined;
       const parsedFiles = JSON.parse(additionalFiles);
       if (!Array.isArray(parsedSkills) || !Array.isArray(parsedWorkspace) || !Array.isArray(parsedOutputs) || !parsedFiles || typeof parsedFiles !== "object" || Array.isArray(parsedFiles)) return null;
+      const selectedRequirements = parsedRequires === undefined
+        ? undefined
+        : selectedModel && (!existing || modelChanged)
+          ? requirementsWithSelectedModel(parsedRequires, selectedModel)
+          : parsedRequires;
+      if (parsedRequires !== undefined && !selectedRequirements) return null;
       const taskDefinition: Record<string, unknown> = {
         schemaVersion: "steward.task-definition/v2",
         name,
         version: nextVersion,
-        runtime: { agentRef, ...(modelProvider.trim() && modelName.trim() ? { model: { provider: modelProvider.trim(), model: modelName.trim() } } : {}) },
+        runtime: { agentRef: effectiveAgentRef, ...(selectedModel ? { model: selectedModel } : {}) },
         promptText: prompt,
         skills: parsedSkills,
         workspace: parsedWorkspace,
         outputs: parsedOutputs,
-        ...(parsedRequires === undefined ? {} : { requires: parsedRequires }),
+        ...(selectedRequirements === undefined ? {} : { requires: selectedRequirements }),
       };
       const files = Object.fromEntries(Object.entries(parsedFiles).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
       if (Object.keys(files).length !== Object.keys(parsedFiles).length) return null;
@@ -174,8 +239,11 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
     <section className="grid gap-4 rounded-card border bg-panel p-6 md:grid-cols-2">
       <label className="grid gap-2 text-sm font-semibold">Name<input className={fieldClass} disabled={Boolean(existing)} onChange={(event) => setName(event.target.value)} required value={name} /></label>
       <label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} required value={path} /></label>
-      <label className="grid gap-2 text-sm font-semibold">Coding agent<select className={`${fieldClass} font-mono`} onChange={(event) => setAgentRef(event.target.value)} required value={agentRef}>{agentRefs.map((ref) => <option key={ref} value={ref}>{ref}</option>)}</select></label>
-      <div className="grid gap-4 sm:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Model provider<input className={fieldClass} onChange={(event) => setModelProvider(event.target.value)} placeholder="Optional" value={modelProvider} /></label><label className="grid gap-2 text-sm font-semibold">Model<input className={fieldClass} onChange={(event) => setModelName(event.target.value)} placeholder="Optional" value={modelName} /></label></div>
+      <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} disabled={activeEnvelopes.length === 0} onChange={(event) => setEnvelopeId(event.target.value)} value={selectedEnvelope?.id ?? ""}>{activeEnvelopes.length === 0 ? <option value="">No active Envelope</option> : null}{activeEnvelopes.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
+      <label className="grid gap-2 text-sm font-semibold">Coding agent<select aria-describedby={agentWarning ? agentWarningId : undefined} className={`${fieldClass} font-mono`} disabled={agentOptions.length === 0 && !preserveCurrentAgent} onChange={(event) => { setAgentRef(event.target.value); setAgentChanged(true); setModel(null); setModelChanged(true); }} required value={effectiveAgentRef}>{agentOptions.length === 0 && !preserveCurrentAgent ? <option value="">No coding agent configured</option> : null}{preserveCurrentAgent ? <option value={agentRef}>Keep current: {agentRef}</option> : null}{agentOptions.filter((agent) => !preserveCurrentAgent || agent.agentRef !== agentRef).map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.displayName ? `${agent.displayName} · ${agent.agentRef}` : agent.agentRef}{agent.compatible ? "" : " · unavailable"}</option>)}</select></label>
+      <ModelPicker allowNoModel={preserveCurrentModel && model === null} className={fieldClass} describedBy={modelWarning ? modelWarningId : undefined} models={selectedAgent?.models ?? []} onChange={(nextModel) => { setModel(nextModel); setModelChanged(true); }} preserveUnavailable={preserveCurrentModel} selected={selectedModel} />
+      {agentWarning ? <p className="text-sm text-warn" id={agentWarningId} role="status">{agentWarning}</p> : null}
+      {modelWarning ? <p className="text-sm text-warn" id={modelWarningId} role="status">{modelWarning}</p> : null}
       <label className="grid gap-2 text-sm font-semibold md:col-span-2">Prompt<textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} required value={prompt} /></label>
       <label className="grid gap-2 text-sm font-semibold">Skills (JSON array)<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setSkills(event.target.value)} spellCheck={false} value={skills} /></label>
       <div className="space-y-3 rounded-control border p-4 md:col-span-2"><div><h2 className="text-sm font-semibold">Repository checkout</h2><p className="mt-1 text-xs text-muted-ink">Choose an approved repository and a branch or tag. Steward pins the selected revision before the run starts.</p></div><RepositoryResource onRetry={refreshRepositories} state={repositoryState}>{({ repositories }) => <WorkspaceRepositoryControls onChange={setWorkspace} repositories={repositories} value={workspace} />}</RepositoryResource></div>
@@ -185,8 +253,8 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
       <label className="grid gap-2 text-sm font-semibold">Additional package files (JSON object)<textarea className="min-h-36 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setAdditionalFiles(event.target.value)} spellCheck={false} value={additionalFiles} /></label>
       {session.status === "authenticated" && session.value.memberRoles.length > 0 ? <fieldset className="md:col-span-2"><legend className="text-sm font-semibold">Share with roles</legend><div className="mt-2 flex flex-wrap gap-4">{session.value.memberRoles.map((role) => <label className="flex items-center gap-2 text-sm" key={role}><input checked={sharedRoles.includes(role)} onChange={(event) => setSharedRoles((current) => event.target.checked ? [...current, role] : current.filter((value) => value !== role))} type="checkbox" />{role}</label>)}</div></fieldset> : null}
     </section>
-    <section className="rounded-card border bg-panel p-5"><h2 className="font-semibold">Review exact Task definition</h2>{preview ? <pre className="mt-3 max-h-[36rem] overflow-auto rounded-control border bg-subtle p-4 text-xs">{JSON.stringify(preview.definition, null, 2)}</pre> : <p className="mt-3 text-sm text-err" role="alert">One or more JSON fields are invalid.</p>}</section>
+    <section className="rounded-card border bg-panel p-5"><h2 className="font-semibold">Review exact Task definition</h2>{preview ? <pre className="mt-3 max-h-[36rem] overflow-auto rounded-control border bg-subtle p-4 text-xs">{JSON.stringify(preview.definition, null, 2)}</pre> : <p className="mt-3 text-sm text-err" role="alert">{selectedEnvelope && (!selectedAgent || !selectedModel) && !preserveCurrentAgent && !preserveCurrentModel ? "Choose a compatible coding agent and model." : "One or more JSON fields are invalid."}</p>}</section>
     {status === "error" ? <p className="text-sm text-err" role="alert">{failure}</p> : null}
-    <div className="flex justify-end"><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!preview || status === "saving" || !agentRef} type="submit">{status === "saving" ? "Saving…" : `Save version ${nextVersion}`}</button></div>
+    <div className="flex justify-end"><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!preview || status === "saving" || !effectiveAgentRef} type="submit">{status === "saving" ? "Saving…" : `Save version ${nextVersion}`}</button></div>
   </form>;
 }

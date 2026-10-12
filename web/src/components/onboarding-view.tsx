@@ -1,16 +1,16 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useState, type FormEvent, type ReactNode } from "react";
 
 import {
   detectWorkflow,
   dispatchTask,
   getStarterTask,
+  getUserCapabilities,
   githubAutomationEvidence,
   githubRunStatus,
   githubTaskBundle,
-  listPublishedWorkflows,
   listTemplates,
   myRunExecutionLog,
   publishTask,
@@ -25,18 +25,23 @@ import {
   type GithubRunStatusResponse,
   type GithubTaskBundleResponse,
   type PublishTaskResponse,
-  type PublishedWorkflowsResponse,
   type StarterTaskSetting,
+  type UserCapabilitiesResponse,
   type WorkflowDetectionResponse,
 } from "@/api-client";
 import {
-  compatibleAgents,
-  effectiveAgentSelection,
-  effectiveModelSelection,
   inlineFiles,
   runNowFailureMessage,
 } from "@/components/browser-run-now-view";
 import { DiagnosticDetails } from "@/components/diagnostic-details";
+import {
+  compatibleAgents,
+  effectiveAgentSelection,
+  effectiveModelSelection,
+  ModelPicker,
+  preferredTaskModel,
+  type Model,
+} from "@/components/model-selection";
 import { parseRunEventData } from "@/components/run-views";
 import { formatDuration, formatMoney } from "@/components/presentation-values";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
@@ -46,9 +51,9 @@ import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
 type OnboardingData = OnboardingEvidence & {
+  capabilities: UserCapabilitiesResponse;
   templates: EnvelopeTemplatesResponse;
   starterTask: StarterTaskSetting;
-  workflows: PublishedWorkflowsResponse;
 };
 
 type InputRow = { id: string; name: string; value: string };
@@ -121,19 +126,19 @@ export function OnboardingView() {
   const [selectedRepositoryId, setSelectedRepositoryId] = useState("");
   const load = useCallback(async () => {
     void refresh;
-    const [evidence, templates, starterTask, workflows] = await Promise.all([
+    const [evidence, capabilities, templates, starterTask] = await Promise.all([
       loadOnboardingEvidence(),
+      getUserCapabilities({ cache: "no-store", credentials: "same-origin" }),
       listTemplates({ cache: "no-store", credentials: "same-origin" }),
       getStarterTask({ cache: "no-store", credentials: "same-origin" }),
-      listPublishedWorkflows({ cache: "no-store", credentials: "same-origin" }),
     ]);
-    const required = [evidence, templates, starterTask, workflows];
-    const data = evidence.data && templates.data && starterTask.data && workflows.data
+    const required = [evidence, capabilities, templates, starterTask];
+    const data = evidence.data && capabilities.data && templates.data && starterTask.data
       ? {
           ...evidence.data,
+          capabilities: capabilities.data,
           templates: templates.data,
           starterTask: starterTask.data.starterTask,
-          workflows: workflows.data,
         }
       : undefined;
     return { data, response: required.find((result) => !result.response?.ok)?.response ?? evidence.response };
@@ -153,6 +158,8 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
   onSelectRepository: (repositoryId: string) => void;
   selectedRepositoryId: string;
 }>) {
+  const agentWarningId = useId();
+  const modelWarningId = useId();
   const session = useSession();
   const { state: repositories } = useGithubRepositories();
   const baseProgress = useMemo(() => deriveOnboardingProgress(data), [data]);
@@ -165,6 +172,7 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
   const [selectedTemplateId, setSelectedTemplateId] = useState(data.templates.templates[0]?.id ?? "");
   const [selectedEnvelopeId, setSelectedEnvelopeId] = useState(provisionedRequest?.id ?? "");
   const [agentRef, setAgentRef] = useState(data.starterTask.taskDefinition.runtime.agentRef);
+  const [model, setModel] = useState<Model | null>(() => preferredTaskModel(data.starterTask.taskDefinition));
   const [prompt, setPrompt] = useState(data.starterTask.taskDefinition.promptText ?? "");
   const [checkoutRepository, setCheckoutRepository] = useState(false);
   const [historyDepth, setHistoryDepth] = useState("");
@@ -194,13 +202,11 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
     [readyRepository, repositoryList, selectedRepositoryId],
   );
   const envelope = selectedEnvelope?.approvedEnvelope ?? selectedEnvelope?.requestedEnvelope;
-  const agentOptions = compatibleAgents(data.workflows.agents.map((agent) => agent.agentRef), envelope?.spec.llms ?? []);
+  const agentOptions = compatibleAgents(data.capabilities.agents, envelope?.spec.llms ?? []);
   const { selected: selectedAgent, warning: agentWarning } = effectiveAgentSelection(agentOptions, agentRef);
   const { selected: selectedModel, warning: modelWarning } = effectiveModelSelection(
-    data.starterTask.taskDefinition.runtime.model ?? null,
-    data.starterTask.taskDefinition.runtime.agentRef,
+    model,
     selectedAgent,
-    envelope?.spec.llms ?? [],
   );
   const parsedHistoryDepth = historyDepth.trim() === "" ? undefined : Number(historyDepth);
   const historyDepthValid = parsedHistoryDepth === undefined || (Number.isSafeInteger(parsedHistoryDepth) && parsedHistoryDepth > 0);
@@ -467,13 +473,15 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
       status: successfulTestRun ? `Test run succeeded in ${runDuration(successfulTestRun.createdAt, successfulTestRun.updatedAt)} · ${successfulTestRun.observedSpend ? formatMoney(successfulTestRun.observedSpend.observedAmount, successfulTestRun.observedSpend.currency) : "spend not reported"}` : testRun ? `${testRun.phase} · ${testRun.taskUid}` : "Check the combination before wiring it into CI",
       body: <form className="space-y-4" onSubmit={(event) => void submitTestRun(event)}>
         <p className="text-sm text-muted-ink">Check the combination before wiring it into CI. This run is governed exactly like one started from GitHub.</p>
-        <div className="grid gap-4 md:grid-cols-3">
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           <div className="grid content-start gap-2 text-sm">{repositoryPicker("No GitHub repositories are visible to this connection.")}</div>
-          <label className="grid gap-2 text-sm font-semibold">Coding agent<select className={fieldClass} onChange={(event) => setAgentRef(event.target.value)} value={agentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.agentRef}{agent.compatible ? "" : " · unavailable"}</option>)}</select></label>
+          <label className="grid gap-2 text-sm font-semibold">Coding agent<select aria-describedby={agentWarning ? agentWarningId : undefined} className={fieldClass} onChange={(event) => setAgentRef(event.target.value)} value={selectedAgent?.agentRef ?? ""}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.displayName ? `${agent.displayName} · ${agent.agentRef}` : agent.agentRef}{agent.compatible ? "" : " · unavailable"}</option>)}</select></label>
+          <ModelPicker className={fieldClass} describedBy={modelWarning ? modelWarningId : undefined} models={selectedAgent?.models ?? []} onChange={setModel} selected={selectedModel} />
           <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} onChange={(event) => setSelectedEnvelopeId(event.target.value)} value={selectedEnvelope?.id ?? ""}>{activeEnvelopes.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
         </div>
         {readinessFailure ? <p className="text-sm text-warn">{readinessFailure}</p> : null}
-        {agentWarning || modelWarning ? <p className="text-sm text-warn">{agentWarning ?? modelWarning}</p> : null}
+        {agentWarning ? <p className="text-sm text-warn" id={agentWarningId} role="status">{agentWarning}</p> : null}
+        {modelWarning ? <p className="text-sm text-warn" id={modelWarningId} role="status">{modelWarning}</p> : null}
         <div className="space-y-3 rounded-control border p-4"><label className="flex items-center gap-3 text-sm font-semibold"><input aria-label="Include checkout in task workspace" checked={checkoutRepository} onChange={(event) => setCheckoutRepository(event.target.checked)} type="checkbox" />Check out this repository</label>{checkoutRepository ? <label className="grid max-w-sm gap-2 text-sm font-semibold">History depth (optional)<input className={fieldClass} min={1} onChange={(event) => setHistoryDepth(event.target.value)} placeholder="Files only" step={1} type="number" value={historyDepth} /></label> : null}{checkoutRepository && !historyDepthValid ? <p className="text-sm text-err" role="alert">History depth must be a positive whole number.</p> : null}<p className="text-xs text-muted-ink">The selected repository is pinned at its default-branch HEAD and materialized read-only.</p></div>
         <label className="grid gap-2 text-sm font-semibold">Prompt<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-sm font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label>
         <div className="space-y-3"><div className="flex items-center justify-between gap-3"><strong className="text-sm">Inputs</strong><button className="rounded-control border px-3 py-1.5 text-sm font-semibold" onClick={() => setInputs((rows) => [...rows, { id: crypto.randomUUID(), name: "", value: "" }])} type="button">+ Add input</button></div>{inputs.map((row) => <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]" key={row.id}><input aria-label="Input name" className={fieldClass} onChange={(event) => setInputs((rows) => rows.map((candidate) => candidate.id === row.id ? { ...candidate, name: event.target.value } : candidate))} placeholder="name" value={row.name} /><input aria-label={`Input value for ${row.name || "new input"}`} className={fieldClass} onChange={(event) => setInputs((rows) => rows.map((candidate) => candidate.id === row.id ? { ...candidate, value: event.target.value } : candidate))} placeholder="value" value={row.value} /><button aria-label={`Remove input ${row.name || "row"}`} className="rounded-control border px-3 text-sm" onClick={() => setInputs((rows) => rows.filter((candidate) => candidate.id !== row.id))} type="button">Remove</button></div>)}<p className="text-xs text-muted-ink">Inputs are passed to the agent as <code>in/inputs.json</code>.</p></div>

@@ -1,6 +1,6 @@
 # Browser Run now
 
-Status: current implementation
+Status: current Steward v0.3.15 contract plus Unreleased model-selection behavior.
 
 Steward users can start a governed Task from the browser without first creating a
 GitHub Actions workflow. The browser route is:
@@ -102,8 +102,15 @@ published Workflow aliases.
 The user **Run now** page offers a prefilled no-tool hello-world package, Git package
 locators, and published Workflows. Inline authoring lists agents directly from the
 deployment-owned execution-binding catalog; it does not require a published Workflow.
-It selects only a coding agent whose model family is allowed by the selected Envelope
-and records that exact model in the package requirements.
+The coding-agent and model pickers intersect the selected Envelope's exact models with
+the providers declared by each execution binding. Run now and Get started use an exact
+compatible model. The Task editor preserves an existing Task's explicit runtime model,
+including an unconfigured model or no model, until the author chooses another; it also
+allows drafts to be saved before an Envelope is active. An explicit model change updates
+the runtime selection and, when the Task declares requirements, its model requirements.
+Provider and model names come only
+from deployment configuration, so adding a model under an already-supported provider
+does not require a browser-code change.
 
 For inline runs, **Check out this repository** adds a typed Git workspace entry for the
 selected admitted repository. The browser submits stable owner/repository IDs and
