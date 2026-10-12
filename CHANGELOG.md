@@ -35,14 +35,21 @@ automatic-provision threshold without rewriting provisioned Envelopes.
 
 ### Changed
 
+- Task admission now accepts requested values at or below every effective
+  Envelope limit, including scratch sizes smaller than the deployment volume
+  and `history: full` within the allowed Git-history depth. A scratch request
+  is rejected when the deployment's fixed scratch volume is larger than the
+  Envelope permits. Requested and effective values remain in immutable Task
+  evidence.
 - Envelope template and custom-request forms now offer deployment-configured
-  workspace types as checkboxes with an optional total-size limit. Template
-  requests and Envelope details show omitted operational limits from the
-  deployment when available, without rendering missing values. Existing
-  narrower file, history, and submodule limits remain unchanged when those
-  forms are edited. Administrator approval comparisons always identify omitted
-  limits as deployment limits, and stored size values that need correction can
-  no longer be cleared implicitly by an unrelated edit.
+  workspace types as checkboxes with an optional total-size limit; the other
+  workspace limits default to the deployment's settings. Template requests and
+  Envelope details show those effective deployment limits without rendering
+  missing values. Existing narrower file, history, and submodule limits remain
+  unchanged when those forms are edited. Administrator approval comparisons
+  always identify omitted limits as deployment limits, and stored size values
+  that need correction can no longer be cleared implicitly by an unrelated
+  edit.
 - The published Task API schema and generated web client now include the
   `owner/repository`, plain branch or tag, and `git:ref:<name>` workspace
   selectors already accepted by the server.
@@ -64,15 +71,21 @@ automatic-provision threshold without rewriting provisioned Envelopes.
   by its case-insensitive `owner/repository` name or by an HTTPS link on the
   configured source host. Steward resolves only operator-bound stable IDs,
   records the provider's canonical identity and exact commit, and reuses that
-  snapshot on idempotent retries.
+  snapshot on idempotent retries. Browser Run now and the Task editor author
+  these repository names and plain branch or tag refs directly.
+- `ref: "trigger"` now resolves correctly for an admitted repository other
+  than the Task's own source repository, resolving the selected repository's
+  default branch rather than reusing the Task source ref.
 - Envelope Templates now have one boundary: requests within the published
   limits provision automatically, while requests above those limits enter the
   administrator approval queue when they remain within the deployment safety
-  ceiling and capability catalog. To preserve existing review policy, migration
-  0070 appends a narrower successor revision for each current template whose
-  retired `autoProvisionThreshold` was stricter than its limits. Templates
-  without a threshold are unchanged, pending requests remain pending, and
-  already provisioned Envelopes are unaffected.
+  ceiling and capability catalog. Above-template requests require a
+  justification and preserve the exact exceeded values for requester and
+  administrator review. To preserve existing review policy, migration 0070
+  appends a narrower successor revision for each current template whose retired
+  `autoProvisionThreshold` was stricter than its limits. Templates without a
+  threshold are unchanged, pending requests remain pending, and already
+  provisioned Envelopes are unaffected.
 - Historical template revisions continue to expose `autoProvisionThreshold` on
   reads. New template revisions omit it, and browser or operator writes that set
   it are rejected with an actionable error. To retain the old behavior of
@@ -80,6 +93,10 @@ automatic-provision threshold without rewriting provisioned Envelopes.
 - Admission failures now name limits and units in user-readable language,
   including readable binary workspace sizes, without exposing internal field
   paths or debug formatting.
+- Envelope screens now let users edit the per-run budget limit, summarize every
+  requested value above a template, show effective workspace access, and use
+  consistent plain-language labels and units across request, detail, and
+  administrator views.
 
 ### Upgrade and rollback
 
