@@ -890,8 +890,10 @@ async function guardedPage(browser, {
   capabilityCatalogModels = capabilityCatalog.models,
   capabilityCatalogTools = capabilityCatalog.tools,
   capabilityCatalogStatus = 200,
+  inlineTaskDefinition = null,
   session = developerSession,
   starterTask = starterTaskFixture,
+  userEnvelopeRequests = null,
   viewport = { width: 1280, height: 800 },
 } = {}) {
   const context = await browser.newContext({ colorScheme, viewport });
@@ -1098,7 +1100,10 @@ async function guardedPage(browser, {
           });
       return;
     }
-    await json(route, { apiVersion: "steward.envelope-requests/v1", requests: emptyCollections ? [] : [envelopeRequest] });
+    await json(route, {
+      apiVersion: "steward.envelope-requests/v1",
+      requests: userEnvelopeRequests ?? (emptyCollections ? [] : [envelopeRequest]),
+    });
   });
   await context.route(`${origin}/app/api/v1/envelope-requests/**`, async (route) => {
     if (route.request().url().endsWith("/github-actions-workflow") || route.request().url().endsWith("/repository-bundle")) {
@@ -1107,14 +1112,19 @@ async function guardedPage(browser, {
     }
     await json(route, { apiVersion: "steward.envelope-requests/v1", request: currentEnvelopeRequest });
   });
+  const loadedInlineTaskDefinition = inlineTaskDefinition
+    ?? JSON.parse(browserTaskFiles[browserTaskDefinitionPath]);
+  const loadedInlineTaskFiles = {
+    [browserTaskDefinitionPath]: JSON.stringify(loadedInlineTaskDefinition, null, 2),
+  };
   const inlineTask = {
       taskId: browserTaskId,
       contentDigest: browserTaskDigest,
-      files: browserTaskFiles,
+      files: loadedInlineTaskFiles,
       name: "browser-task",
       version: 1,
-      runtime: { agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" } },
-      requires: null,
+      runtime: loadedInlineTaskDefinition.runtime,
+      requires: loadedInlineTaskDefinition.requires ?? null,
       source: "inline",
       revision: browserTaskDigest,
       path: browserTaskDefinitionPath,
@@ -3339,6 +3349,141 @@ test("the Task library creates immutable versions and runs inline, Git, and publ
     expect(JSON.parse(saves[1].body.files[browserTaskDefinitionPath]).version).toBe(2);
     const inlineRuns = developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/runs").slice(0, 2);
     expect(inlineRuns.map((submission) => submission.body.package.revision)).toEqual([v1Digest, v2Digest]);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("a Task draft remains saveable without an active Envelope or model", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    taskLibraryMutable: true,
+    userEnvelopeRequests: [],
+  });
+  try {
+    await developer.page.goto(`${origin}/tasks/new`);
+    await expect(developer.page.getByLabel("Envelope")).toHaveValue("");
+    await expect(developer.page.getByLabel("Model", { exact: true })).toBeDisabled();
+    await expect(developer.page.getByRole("button", { name: "Save version 1" })).toBeEnabled();
+    await developer.page.getByRole("button", { name: "Save version 1" }).click();
+
+    const save = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/tasks");
+    const definition = JSON.parse(save.body.files[browserTaskDefinitionPath]);
+    expect(definition.runtime).toEqual({ agentRef: "codex@0.140.0" });
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("a Task draft remains saveable when the active Envelope has no compatible model", async ({ browser }) => {
+  const incompatibleRequest = structuredClone(envelopeRequest);
+  incompatibleRequest.requestedEnvelope.spec.llms = [{ provider: "provider-b", model: "model-b" }];
+  incompatibleRequest.approvedEnvelope.spec.llms = [{ provider: "provider-b", model: "model-b" }];
+  const developer = await guardedPage(browser, {
+    taskLibraryMutable: true,
+    userEnvelopeRequests: [incompatibleRequest],
+  });
+  try {
+    await developer.page.goto(`${origin}/tasks/new`);
+    await expect(developer.page.getByLabel("Envelope")).toHaveValue(envelopeRequest.id);
+    await expect(developer.page.getByLabel("Coding agent")).toHaveValue("codex@0.140.0");
+    await expect(developer.page.getByLabel("Model", { exact: true })).toBeDisabled();
+    await expect(developer.page.getByRole("button", { name: "Save version 1" })).toBeEnabled();
+    await developer.page.getByRole("button", { name: "Save version 1" }).click();
+
+    const save = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/tasks");
+    const definition = JSON.parse(save.body.files[browserTaskDefinitionPath]);
+    expect(definition.runtime).toEqual({ agentRef: "codex@0.140.0" });
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("editing a Task preserves its current runtime model and multi-model requirements", async ({ browser }) => {
+  const existingDefinition = {
+    schemaVersion: "steward.task-definition/v2",
+    name: "browser-task",
+    version: 1,
+    runtime: {
+      agentRef: "custom-agent@1.0.0",
+      model: { provider: "custom-provider", model: "legacy-model" },
+    },
+    promptText: "Create the existing output.",
+    outputs: [{ path: "out", kind: "directory", required: true }],
+    requires: {
+      authority: {
+        budget: { monthlyLimit: "10.00", currency: "USD" },
+        llms: [
+          { provider: "custom-provider", model: "legacy-model" },
+          { provider: "provider-a", model: "model-a" },
+        ],
+        runner: { platforms: [] },
+        tools: [],
+        ttl: "1h",
+      },
+    },
+  };
+  const developer = await guardedPage(browser, {
+    inlineRun: true,
+    inlineTaskDefinition: existingDefinition,
+    taskLibraryMutable: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/tasks/${encodeURIComponent(browserTaskDigest)}/edit`);
+    await expect(developer.page.getByLabel("Coding agent")).toHaveValue("custom-agent@1.0.0");
+    await expect(developer.page.getByLabel("Model", { exact: true })).toHaveValue(
+      JSON.stringify(["custom-provider", "legacy-model"]),
+    );
+    await expect(developer.page.getByRole("option", { name: "Keep current: custom-provider/legacy-model" })).toHaveCount(1);
+    await developer.page.getByLabel("Prompt").fill("Revise the existing output.");
+    await expect(developer.page.getByRole("button", { name: "Save version 2" })).toBeEnabled();
+    await developer.page.getByRole("button", { name: "Save version 2" }).click();
+
+    const save = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/tasks");
+    const definition = JSON.parse(save.body.files[browserTaskDefinitionPath]);
+    expect(definition.runtime).toEqual(existingDefinition.runtime);
+    expect(definition.requires.authority.llms).toEqual(existingDefinition.requires.authority.llms);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("editing a model-free Task does not copy its first requirement into runtime", async ({ browser }) => {
+  const existingDefinition = {
+    schemaVersion: "steward.task-definition/v2",
+    name: "browser-task",
+    version: 1,
+    runtime: { agentRef: "codex@0.140.0" },
+    promptText: "Create the existing output.",
+    outputs: [{ path: "out", kind: "directory", required: true }],
+    requires: {
+      authority: {
+        budget: { monthlyLimit: "10.00", currency: "USD" },
+        llms: [
+          { provider: "openai", model: "gpt-5.4" },
+          { provider: "provider-a", model: "model-a" },
+        ],
+        runner: { platforms: [] },
+        tools: [],
+        ttl: "1h",
+      },
+    },
+  };
+  const developer = await guardedPage(browser, {
+    inlineRun: true,
+    inlineTaskDefinition: existingDefinition,
+    taskLibraryMutable: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/tasks/${encodeURIComponent(browserTaskDigest)}/edit`);
+    await expect(developer.page.getByLabel("Model", { exact: true })).toHaveValue("");
+    await expect(developer.page.getByRole("option", { name: "Keep current: no model" })).toHaveCount(1);
+    await developer.page.getByLabel("Prompt").fill("Revise the existing output.");
+    await developer.page.getByRole("button", { name: "Save version 2" }).click();
+
+    const save = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/tasks");
+    const definition = JSON.parse(save.body.files[browserTaskDefinitionPath]);
+    expect(definition.runtime).toEqual(existingDefinition.runtime);
+    expect(definition.requires.authority.llms).toEqual(existingDefinition.requires.authority.llms);
   } finally {
     await closeGuardedPage(developer);
   }

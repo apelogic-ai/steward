@@ -103,10 +103,12 @@ The user **Run now** page offers a prefilled no-tool hello-world package, Git pa
 locators, and published Workflows. Inline authoring lists agents directly from the
 deployment-owned execution-binding catalog; it does not require a published Workflow.
 The coding-agent and model pickers intersect the selected Envelope's exact models with
-the providers declared by each execution binding. They default to the Task's first
-required model when present, otherwise its configured runtime model. The selected exact
-model is recorded in the runtime selection and, when the Task declares requirements,
-in its model requirements. Provider and model names come only
+the providers declared by each execution binding. Run now and Get started use an exact
+compatible model. The Task editor preserves an existing Task's explicit runtime model,
+including an unconfigured model or no model, until the author chooses another; it also
+allows drafts to be saved before an Envelope is active. An explicit model change updates
+the runtime selection and, when the Task declares requirements, its model requirements.
+Provider and model names come only
 from deployment configuration, so adding a model under an already-supported provider
 does not require a browser-code change.
 

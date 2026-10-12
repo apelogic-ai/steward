@@ -48,14 +48,15 @@ export function compatibleAgents(
   return agents.map((agent) => {
     const providers = new Set(agent.models.providers);
     const models = envelopeModels.filter((model) => providers.has(model.provider));
+    const reason = agent.models.providers.length === 0
+      ? "This coding agent does not declare any supported model providers."
+      : "This Envelope does not allow a model supported by this coding agent.";
     return {
       agentRef: agent.agentRef,
       displayName: agent.displayName ?? null,
       models,
       compatible: models.length > 0,
-      reason: models.length > 0
-        ? null
-        : "This Envelope does not allow a model supported by this coding agent.",
+      reason: models.length > 0 ? null : reason,
     };
   });
 }
@@ -71,7 +72,7 @@ export function effectiveAgentSelection(
   return {
     selected,
     warning: selected && selected.agentRef !== requestedAgentRef
-      ? `${requestedAgentRef} is not compatible with this Envelope. Using ${selected.agentRef} instead.`
+      ? `${requestedAgentRef} is not compatible with this Envelope. Selected ${selected.displayName ?? selected.agentRef}; you can choose another.`
       : selected
         ? null
         : requested?.reason ?? "No compatible coding agent is available for this Envelope.",
@@ -92,7 +93,7 @@ export function effectiveModelSelection(
   return {
     selected: fallback,
     warning: fallback
-      ? `${modelLabel(requestedModel)} is not available for ${selectedAgent.agentRef} in this Envelope. Using ${modelLabel(fallback)} instead.`
+      ? `${modelLabel(requestedModel)} is not available for ${selectedAgent.displayName ?? selectedAgent.agentRef} in this Envelope. Selected ${modelLabel(fallback)}; you can choose another.`
       : null,
   };
 }
@@ -100,7 +101,7 @@ export function effectiveModelSelection(
 export function preferredTaskModel(
   task: Pick<DirectTaskDefinition, "requires" | "runtime">,
 ): Model | null {
-  return task.requires?.authority.llms[0] ?? task.runtime.model ?? null;
+  return task.runtime.model ?? task.requires?.authority.llms[0] ?? null;
 }
 
 export function requirementsWithSelectedModel(requirements: unknown, model: Model): Record<string, unknown> | null {
@@ -117,22 +118,33 @@ export function requirementsWithSelectedModel(requirements: unknown, model: Mode
 }
 
 export function ModelPicker({
+  allowNoModel = false,
   className,
+  describedBy,
   models,
   onChange,
+  preserveUnavailable = false,
   selected,
 }: Readonly<{
+  allowNoModel?: boolean;
   className: string;
+  describedBy?: string;
   models: Model[];
   onChange: (model: Model) => void;
+  preserveUnavailable?: boolean;
   selected: Model | null;
 }>) {
   const id = useId();
+  const selectedIsUnavailable = Boolean(selected && !models.some((model) => modelKey(model) === modelKey(selected)));
+  const options = selected && preserveUnavailable && selectedIsUnavailable
+    ? [selected, ...models]
+    : models;
   return <div className="grid gap-2 text-sm font-semibold">
     <label htmlFor={id}>Model</label>
     <select
+      aria-describedby={describedBy}
       className={`${className} font-mono`}
-      disabled={models.length === 0}
+      disabled={options.length === 0 && !allowNoModel}
       id={id}
       onChange={(event) => {
         const model = models.find((candidate) => modelKey(candidate) === event.target.value);
@@ -140,8 +152,8 @@ export function ModelPicker({
       }}
       value={selected ? modelKey(selected) : ""}
     >
-      {models.length === 0 ? <option value="">No compatible model</option> : null}
-      {models.map((model) => <option key={modelKey(model)} value={modelKey(model)}>{modelOptionLabel(model, models)}</option>)}
+      {allowNoModel ? <option value="">Keep current: no model</option> : options.length === 0 ? <option value="">No compatible model</option> : null}
+      {options.map((model) => <option key={modelKey(model)} value={modelKey(model)}>{preserveUnavailable && selected && selectedIsUnavailable && modelKey(model) === modelKey(selected) ? `Keep current: ${modelLabel(model)}` : modelOptionLabel(model, options)}</option>)}
     </select>
   </div>;
 }

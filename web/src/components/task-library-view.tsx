@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useCallback, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useId, useMemo, useState, type FormEvent } from "react";
 
 import {
   getUserCapabilities,
@@ -21,7 +21,6 @@ import {
   effectiveAgentSelection,
   effectiveModelSelection,
   ModelPicker,
-  preferredTaskModel,
   requirementsWithSelectedModel,
   type Model,
 } from "@/components/model-selection";
@@ -125,9 +124,11 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
   const [path, setPath] = useState(existing?.path ?? "task-definition.json");
   const [envelopeId, setEnvelopeId] = useState(activeEnvelopes[0]?.id ?? "");
   const [agentRef, setAgentRef] = useState(initialAgentRef);
+  const [agentChanged, setAgentChanged] = useState(false);
   const [model, setModel] = useState<Model | null>(() => existing
-    ? preferredTaskModel({ requires: existing.requires, runtime: existing.runtime })
+    ? existing.runtime.model ?? null
     : null);
+  const [modelChanged, setModelChanged] = useState(false);
   const [prompt, setPrompt] = useState(typeof definition?.promptText === "string" ? definition.promptText : "Write the requested result under $STEWARD_OUTPUT_DIR/out/.");
   const [skills, setSkills] = useState(jsonText(definition?.skills, []));
   const [workspace, setWorkspace] = useState(jsonText(definition?.workspace, []));
@@ -137,12 +138,37 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
   const [sharedRoles, setSharedRoles] = useState(existing?.sharedRoles ?? []);
   const [status, setStatus] = useState<"idle" | "saving" | "error">("idle");
   const [failure, setFailure] = useState<string | null>(null);
+  const agentWarningId = useId();
+  const modelWarningId = useId();
   const selectedEnvelope = activeEnvelopes.find((request) => request.id === envelopeId) ?? activeEnvelopes[0];
   const envelope = selectedEnvelope?.approvedEnvelope ?? selectedEnvelope?.requestedEnvelope;
-  const agentOptions = compatibleAgents(data.capabilities.agents, envelope?.spec.llms ?? []);
-  const { selected: selectedAgent, warning: agentWarning } = effectiveAgentSelection(agentOptions, agentRef);
-  const effectiveAgentRef = selectedAgent?.agentRef ?? "";
-  const { selected: selectedModel, warning: modelWarning } = effectiveModelSelection(model, selectedAgent);
+  const agentOptions = selectedEnvelope
+    ? compatibleAgents(data.capabilities.agents, envelope?.spec.llms ?? [])
+    : data.capabilities.agents.map((agent) => ({
+        agentRef: agent.agentRef,
+        displayName: agent.displayName ?? null,
+        models: [],
+        compatible: true,
+        reason: null,
+      }));
+  const currentAgent = agentOptions.find((agent) => agent.agentRef === agentRef);
+  const preserveCurrentAgent = Boolean(!agentChanged && agentRef && (!currentAgent || !currentAgent.compatible));
+  const effectiveAgent = effectiveAgentSelection(agentOptions, agentRef);
+  const selectedAgent = preserveCurrentAgent ? undefined : effectiveAgent.selected;
+  const effectiveAgentRef = preserveCurrentAgent ? agentRef : selectedAgent?.agentRef ?? "";
+  const preserveCurrentModel = Boolean(existing && !modelChanged);
+  const effectiveModel = effectiveModelSelection(model, selectedAgent);
+  const selectedModel = preserveCurrentModel ? model : effectiveModel.selected;
+  const agentWarning = preserveCurrentAgent
+    ? selectedEnvelope
+      ? `${currentAgent?.displayName ?? agentRef} is not available with the selected Envelope. You can keep it for this draft or choose another.`
+      : "No active Envelope is selected. You can keep the current coding agent for this draft."
+    : effectiveAgent.warning;
+  const modelWarning = preserveCurrentModel && model && !selectedAgent?.models.some((candidate) => candidate.provider === model.provider && candidate.model === model.model)
+    ? selectedEnvelope
+      ? `${model.provider}/${model.model} is not available with the selected Envelope and coding agent. You can keep it for this draft or choose another.`
+      : "No active Envelope is selected. You can keep the current model for this draft."
+    : effectiveModel.warning;
 
   if (existing && (!existing.editable || existing.source !== "inline" || !existing.taskId)) {
     return <div className="space-y-4"><PageHeader description="Only an owner-scoped draft can create another immutable version." title="Task is read-only" /><Link className="inline-flex rounded-control border px-4 py-2 text-sm font-semibold" href={`/tasks/${encodeURIComponent(existing.contentDigest)}`}>Back to Task</Link></div>;
@@ -150,7 +176,7 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
 
   function previewPackage(): { definition: Record<string, unknown>; files: Record<string, string> } | null {
     try {
-      if (!effectiveAgentRef || !selectedModel) return null;
+      if (!effectiveAgentRef) return null;
       const parsedSkills = JSON.parse(skills);
       const parsedWorkspace = JSON.parse(workspace);
       const parsedOutputs = JSON.parse(outputs);
@@ -159,13 +185,15 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
       if (!Array.isArray(parsedSkills) || !Array.isArray(parsedWorkspace) || !Array.isArray(parsedOutputs) || !parsedFiles || typeof parsedFiles !== "object" || Array.isArray(parsedFiles)) return null;
       const selectedRequirements = parsedRequires === undefined
         ? undefined
-        : requirementsWithSelectedModel(parsedRequires, selectedModel);
+        : selectedModel && (!existing || modelChanged)
+          ? requirementsWithSelectedModel(parsedRequires, selectedModel)
+          : parsedRequires;
       if (parsedRequires !== undefined && !selectedRequirements) return null;
       const taskDefinition: Record<string, unknown> = {
         schemaVersion: "steward.task-definition/v2",
         name,
         version: nextVersion,
-        runtime: { agentRef: effectiveAgentRef, model: selectedModel },
+        runtime: { agentRef: effectiveAgentRef, ...(selectedModel ? { model: selectedModel } : {}) },
         promptText: prompt,
         skills: parsedSkills,
         workspace: parsedWorkspace,
@@ -212,9 +240,10 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
       <label className="grid gap-2 text-sm font-semibold">Name<input className={fieldClass} disabled={Boolean(existing)} onChange={(event) => setName(event.target.value)} required value={name} /></label>
       <label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} required value={path} /></label>
       <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} disabled={activeEnvelopes.length === 0} onChange={(event) => setEnvelopeId(event.target.value)} value={selectedEnvelope?.id ?? ""}>{activeEnvelopes.length === 0 ? <option value="">No active Envelope</option> : null}{activeEnvelopes.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
-      <label className="grid gap-2 text-sm font-semibold">Coding agent<select className={`${fieldClass} font-mono`} disabled={agentOptions.length === 0} onChange={(event) => setAgentRef(event.target.value)} required value={effectiveAgentRef}>{agentOptions.length === 0 ? <option value="">No coding agent configured</option> : null}{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.displayName ?? agent.agentRef} · {agent.agentRef}{agent.compatible ? "" : " · unavailable"}</option>)}</select></label>
-      <ModelPicker className={fieldClass} models={selectedAgent?.models ?? []} onChange={setModel} selected={selectedModel} />
-      {agentWarning ?? modelWarning ? <p className="text-sm text-warn" role="status">{agentWarning ?? modelWarning}</p> : null}
+      <label className="grid gap-2 text-sm font-semibold">Coding agent<select aria-describedby={agentWarning ? agentWarningId : undefined} className={`${fieldClass} font-mono`} disabled={agentOptions.length === 0 && !preserveCurrentAgent} onChange={(event) => { setAgentRef(event.target.value); setAgentChanged(true); setModel(null); setModelChanged(true); }} required value={effectiveAgentRef}>{agentOptions.length === 0 && !preserveCurrentAgent ? <option value="">No coding agent configured</option> : null}{preserveCurrentAgent ? <option value={agentRef}>Keep current: {agentRef}</option> : null}{agentOptions.filter((agent) => !preserveCurrentAgent || agent.agentRef !== agentRef).map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.displayName ? `${agent.displayName} · ${agent.agentRef}` : agent.agentRef}{agent.compatible ? "" : " · unavailable"}</option>)}</select></label>
+      <ModelPicker allowNoModel={preserveCurrentModel && model === null} className={fieldClass} describedBy={modelWarning ? modelWarningId : undefined} models={selectedAgent?.models ?? []} onChange={(nextModel) => { setModel(nextModel); setModelChanged(true); }} preserveUnavailable={preserveCurrentModel} selected={selectedModel} />
+      {agentWarning ? <p className="text-sm text-warn" id={agentWarningId} role="status">{agentWarning}</p> : null}
+      {modelWarning ? <p className="text-sm text-warn" id={modelWarningId} role="status">{modelWarning}</p> : null}
       <label className="grid gap-2 text-sm font-semibold md:col-span-2">Prompt<textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} required value={prompt} /></label>
       <label className="grid gap-2 text-sm font-semibold">Skills (JSON array)<textarea className="min-h-32 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setSkills(event.target.value)} spellCheck={false} value={skills} /></label>
       <div className="space-y-3 rounded-control border p-4 md:col-span-2"><div><h2 className="text-sm font-semibold">Repository checkout</h2><p className="mt-1 text-xs text-muted-ink">Choose an approved repository and a branch or tag. Steward pins the selected revision before the run starts.</p></div><RepositoryResource onRetry={refreshRepositories} state={repositoryState}>{({ repositories }) => <WorkspaceRepositoryControls onChange={setWorkspace} repositories={repositories} value={workspace} />}</RepositoryResource></div>
@@ -224,8 +253,8 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
       <label className="grid gap-2 text-sm font-semibold">Additional package files (JSON object)<textarea className="min-h-36 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setAdditionalFiles(event.target.value)} spellCheck={false} value={additionalFiles} /></label>
       {session.status === "authenticated" && session.value.memberRoles.length > 0 ? <fieldset className="md:col-span-2"><legend className="text-sm font-semibold">Share with roles</legend><div className="mt-2 flex flex-wrap gap-4">{session.value.memberRoles.map((role) => <label className="flex items-center gap-2 text-sm" key={role}><input checked={sharedRoles.includes(role)} onChange={(event) => setSharedRoles((current) => event.target.checked ? [...current, role] : current.filter((value) => value !== role))} type="checkbox" />{role}</label>)}</div></fieldset> : null}
     </section>
-    <section className="rounded-card border bg-panel p-5"><h2 className="font-semibold">Review exact Task definition</h2>{preview ? <pre className="mt-3 max-h-[36rem] overflow-auto rounded-control border bg-subtle p-4 text-xs">{JSON.stringify(preview.definition, null, 2)}</pre> : <p className="mt-3 text-sm text-err" role="alert">{!selectedEnvelope ? "Choose an active Envelope to select a compatible coding agent and model." : !selectedAgent || !selectedModel ? "Choose a compatible coding agent and model." : "One or more JSON fields are invalid."}</p>}</section>
+    <section className="rounded-card border bg-panel p-5"><h2 className="font-semibold">Review exact Task definition</h2>{preview ? <pre className="mt-3 max-h-[36rem] overflow-auto rounded-control border bg-subtle p-4 text-xs">{JSON.stringify(preview.definition, null, 2)}</pre> : <p className="mt-3 text-sm text-err" role="alert">{selectedEnvelope && (!selectedAgent || !selectedModel) && !preserveCurrentAgent && !preserveCurrentModel ? "Choose a compatible coding agent and model." : "One or more JSON fields are invalid."}</p>}</section>
     {status === "error" ? <p className="text-sm text-err" role="alert">{failure}</p> : null}
-    <div className="flex justify-end"><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!preview || status === "saving" || !effectiveAgentRef || !selectedModel} type="submit">{status === "saving" ? "Saving…" : `Save version ${nextVersion}`}</button></div>
+    <div className="flex justify-end"><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={!preview || status === "saving" || !effectiveAgentRef} type="submit">{status === "saving" ? "Saving…" : `Save version ${nextVersion}`}</button></div>
   </form>;
 }

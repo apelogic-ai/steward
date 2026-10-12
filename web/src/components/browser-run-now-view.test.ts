@@ -154,6 +154,12 @@ describe("Run now failures", () => {
     })).toBe("The run request was rejected. Choose an inline task or ask an administrator to enable GitHub source packages.");
   });
 
+  test("shows a human-readable rejection returned in the error field", () => {
+    expect(runNowFailureMessage({
+      error: "The selected coding agent does not support this model.",
+    })).toBe("The run request was rejected. The selected coding agent does not support this model.");
+  });
+
   test("shows a repository rejection reason and names the selected repository", () => {
     const message = runNowFailureMessage({
       error: "task.workspace_rejected",

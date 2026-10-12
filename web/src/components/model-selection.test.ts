@@ -54,7 +54,7 @@ describe("configuration-driven model selection", () => {
     const options = compatibleAgents(agents, [{ provider: "example", model: "model-x" }]);
     expect(effectiveAgentSelection(options, "limited-agent@1.0.0")).toEqual({
       selected: options[0],
-      warning: "limited-agent@1.0.0 is not compatible with this Envelope. Using example-agent@1.0.0 instead.",
+      warning: "limited-agent@1.0.0 is not compatible with this Envelope. Selected Example agent; you can choose another.",
     });
   });
 
@@ -71,7 +71,7 @@ describe("configuration-driven model selection", () => {
       selectedAgent,
     )).toEqual({
       selected: { provider: "example", model: "model-x" },
-      warning: "provider-a/model-a is not available for example-agent@1.0.0 in this Envelope. Using example/model-x instead.",
+      warning: "provider-a/model-a is not available for Example agent in this Envelope. Selected example/model-x; you can choose another.",
     });
   });
 
@@ -118,7 +118,7 @@ describe("configuration-driven model selection", () => {
     });
   });
 
-  test("defaults to the Task requirements model when one is declared", () => {
+  test("keeps the explicit Task runtime model when requirements allow several models", () => {
     expect(preferredTaskModel({
       runtime: { agentRef: "example-agent@1.0.0", model: { provider: "example", model: "runtime-model" } },
       requires: {
@@ -130,6 +130,6 @@ describe("configuration-driven model selection", () => {
           ttl: "1h",
         },
       },
-    })).toEqual({ provider: "example", model: "required-model" });
+    })).toEqual({ provider: "example", model: "runtime-model" });
   });
 });

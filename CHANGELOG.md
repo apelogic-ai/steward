@@ -16,8 +16,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   reservation without hard-coded provider families.
 - Browser Run now, Get started, and the Task editor now offer an exact model picker derived from
   the selected Envelope and the selected coding agent's configured providers. Existing Tasks
-  default to their first required model when present, and newly configured provider/model names
-  appear without a Steward code change.
+  preserve their explicit runtime model and requirements until the author changes the selection;
+  drafts remain editable without an active Envelope. Newly configured provider/model names appear
+  without a Steward code change.
 - Signed-in users can read the deployment's enabled workspace types and
   numeric workspace limits from `/app/api/v1/capabilities`. The response does
   not expose administrator configuration or other users' data.
