@@ -5,8 +5,7 @@ contract for the Agent Runs dashboard. It deliberately distinguishes
 recorded facts from desired configuration and from data Steward does not
 persist. The browser must never fill an unavailable field from a heuristic.
 
-Applies to Steward 0.3.3, with the execution-log additions beginning in
-Steward 0.3.16 marked below.
+Applies to Steward 0.3.16.
 
 ## Authority and privacy boundary
 

@@ -7,6 +7,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.16] - 2026-10-12
+
+This release requires a coordinated upgrade of the agent catalog; follow
+[Upgrade and rollback](#upgrade-and-rollback) before resuming Task submission.
+It makes coding-agent and model compatibility deployment-configured, adds live
+execution-log persistence, accepts stable workspace repository and ref names,
+and simplifies Envelope request limits and administration. Additive migrations
+0069 and 0070 preserve request review context and retire the separate
+automatic-provision threshold without rewriting provisioned Envelopes.
+
 ### Added
 
 - The supported Codex reference runtime now includes pinned `rg`, `jq`, `fd`,
@@ -73,18 +83,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Upgrade and rollback
 
-- Existing active execution-binding catalogs must move from
-  `steward.execution-bindings/v1` to `steward.execution-bindings/v2` in the same
-  rollout as these binaries. Add `models.providers` to every binding before changing
-  `apiVersion`; the new parser and Helm schema reject v1 catalogs. The field changes the binding
-  digest. Deployment-preflight inputs must also add `execution.binding.modelProviders`, covering
-  every provider in `capabilityCatalog.models`. Pause Task submission until
-  every apiserver and controller is on the new version so an older controller cannot claim a Task
-  with a v2 binding snapshot. Persisted v1 bindings on already-admitted Tasks remain readable by
-  the new version. Once the new version has created any Task, downgrade is not supported because
-  previous binaries cannot read its v2 binding and additive evidence fields. Before that point,
-  restore the previous binaries and exact v1 catalog together while submission remains paused. See the
-  [execution-binding upgrade procedure](docs/installation/upgrade-execution-bindings.md).
+- **Required coordinated agent-catalog upgrade:** move every active catalog from
+  `steward.execution-bindings/v1` to `steward.execution-bindings/v2`, with
+  `models.providers` declared for every agent. Upgrade the catalog, chart,
+  apiserver, and controller in one coordinated step with Task submission and
+  Workflow publication paused. Deployment-preflight input must add
+  `execution.binding.modelProviders`, covering every provider in
+  `capabilityCatalog.models`. Resume only after every old apiserver and
+  controller pod is gone. The field changes the binding digest; persisted v1
+  bindings on already-admitted Tasks remain readable. Once v0.3.16 creates any
+  Task, do not downgrade: previous binaries cannot read its v2 binding and
+  additive evidence fields. Before the first new Task, restore the previous
+  binaries and exact v1 catalog together while submission remains paused. See
+  the [execution-binding upgrade procedure](docs/installation/upgrade-execution-bindings.md).
 - Migration 0070 is append-only and records every generated template revision
   with actor `system:migration`; retain it on rollback. List the affected
   template IDs and successor revisions with
@@ -1166,7 +1177,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.15...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.16...HEAD
+[0.3.16]: https://github.com/apelogic-ai/steward/compare/v0.3.15...v0.3.16
 [0.3.15]: https://github.com/apelogic-ai/steward/compare/v0.3.14...v0.3.15
 [0.3.14]: https://github.com/apelogic-ai/steward/compare/v0.3.13...v0.3.14
 [0.3.13]: https://github.com/apelogic-ai/steward/compare/v0.3.12...v0.3.13
