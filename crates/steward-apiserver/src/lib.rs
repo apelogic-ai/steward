@@ -2825,10 +2825,33 @@ impl IntoResponse for ApiError {
                 )
                     .into_response();
             }
+            Self::Admission(reason) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(TaskErrorResponse {
+                        error: "task.admission_rejected".to_owned(),
+                        failure_reason: Some((*reason).to_owned()),
+                    }),
+                )
+                    .into_response();
+            }
             Self::TaskRequestRejected(reason) => {
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({ "error": reason })),
+                    Json(TaskErrorResponse {
+                        error: "task.request_rejected".to_owned(),
+                        failure_reason: Some((*reason).to_owned()),
+                    }),
+                )
+                    .into_response();
+            }
+            Self::TaskRuntimeContractUnavailable(reason) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(TaskErrorResponse {
+                        error: "task.runtime_contract_unavailable".to_owned(),
+                        failure_reason: Some((*reason).to_owned()),
+                    }),
                 )
                     .into_response();
             }
@@ -13810,7 +13833,8 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body)
                 .map_err(|error| format!("decode browser model-mismatch response: {error}"))?,
             serde_json::json!({
-                "error": "This coding agent does not support the selected model. Choose a model from anthropic or another agent."
+                "error": "task.request_rejected",
+                "failureReason": "This coding agent does not support the selected model. Choose a model from anthropic or another agent."
             })
         );
         assert!(
@@ -15913,7 +15937,8 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body)
                 .map_err(|error| format!("decode incompatible direct response: {error}"))?,
             serde_json::json!({
-                "error": "This coding agent does not support the selected model. Choose a model from anthropic or another agent."
+                "error": "task.request_rejected",
+                "failureReason": "This coding agent does not support the selected model. Choose a model from anthropic or another agent."
             })
         );
         assert!(
@@ -16716,7 +16741,8 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body)
                 .map_err(|error| format!("decode incompatible versioned response: {error}"))?,
             serde_json::json!({
-                "error": "This coding agent does not support the selected model. Choose a model from anthropic or another agent."
+                "error": "task.request_rejected",
+                "failureReason": "This coding agent does not support the selected model. Choose a model from anthropic or another agent."
             })
         );
         assert!(
@@ -16726,6 +16752,51 @@ mod tests {
                 .map_err(|_| "fake task ledger lock was poisoned")?
                 .is_empty(),
             "an incompatible versioned Task must fail before Task reservation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_task_runtime_contract_returns_stable_code_and_plain_reason()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let config = TaskApiConfig::new(Some("https://mcp-gw.example.test/mcp".to_owned()))?
+            .with_task_orchestration_mode(steward_store::TaskOrchestrationMode::Active);
+        let response = task_router(ledger.clone(), FakeTaskIdentityResolver, config)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer github-assertion")
+                    .header("idempotency-key", "unavailable-runtime-contract")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"workflow":"repository-review@1"}"#))
+                    .map_err(|error| {
+                        format!("build unavailable runtime-contract request: {error}")
+                    })?,
+            )
+            .await
+            .map_err(|error| format!("submit unavailable runtime-contract request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read unavailable runtime-contract response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).map_err(|error| format!(
+                "decode unavailable runtime-contract response: {error}"
+            ))?,
+            serde_json::json!({
+                "error": "task.runtime_contract_unavailable",
+                "failureReason": "logical agent example-agent@1.0.0 has no deployment execution binding",
+            })
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake task ledger lock was poisoned")?
+                .is_empty(),
+            "an unavailable runtime contract must fail before Task reservation"
         );
         Ok(())
     }
@@ -17014,10 +17085,11 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(&body)
                 .map_err(|error| format!("decode removed legacy Task response: {error}"))?;
             assert_eq!(
-                body.pointer("/error").and_then(serde_json::Value::as_str),
-                Some(
-                    "Admission(\"governed Tasks require a provisioned User Envelope and a supported direct-package or versioned workflow contract\")"
-                )
+                body,
+                serde_json::json!({
+                    "error": "task.admission_rejected",
+                    "failureReason": "governed Tasks require a provisioned User Envelope and a supported direct-package or versioned workflow contract",
+                })
             );
         }
         assert!(
