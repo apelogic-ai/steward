@@ -129,6 +129,12 @@ async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
         }
         None => {}
     }
+    if let Some(warning) = custom_envelope_safety_ceiling_startup_warning(
+        env::var_os("STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON").is_some()
+            || env::var_os("STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE").is_some(),
+    ) {
+        eprintln!("{warning}");
+    }
     let client = kube::Client::try_default().await?;
     let task_orchestration_mode = task_orchestration_mode()?;
     let inference_mode = inference_mode()?;
@@ -720,38 +726,10 @@ fn install_rustls_crypto_provider() -> Result<(), io::Error> {
     }
 }
 
-fn parse_custom_envelope_safety_ceiling(
-    document: &str,
-    capability_catalog: &browser_admin::CapabilityCatalog,
-) -> Result<steward_admission::Envelope, io::Error> {
-    let ceiling = serde_json::from_str::<user_envelopes::BrowserEnvelope>(document)
-        .map(Into::<steward_admission::Envelope>::into)
-        .map_err(|_| io::Error::other("custom Envelope safety ceiling is invalid JSON"))?;
-    if ceiling.revision <= 0
-        || ceiling.spec.runtime_minutes_limit.is_none()
-        || steward_admission::validate_envelope(&ceiling).is_err()
-    {
-        return Err(io::Error::other(
-            "custom Envelope safety ceiling is structurally invalid or lacks a runtime-minutes limit",
-        ));
-    }
-    if ceiling
-        .spec
-        .llms
-        .iter()
-        .any(|model| !capability_catalog.models.contains(model))
-        || ceiling.spec.tools.iter().any(|tool| {
-            !capability_catalog
-                .tools
-                .iter()
-                .any(|available| available.grants(tool))
-        })
-    {
-        return Err(io::Error::other(
-            "custom Envelope safety ceiling selects an unavailable capability",
-        ));
-    }
-    Ok(ceiling)
+fn custom_envelope_safety_ceiling_startup_warning(configured: bool) -> Option<&'static str> {
+    configured.then_some(
+        "customEnvelopeSafetyCeiling is no longer used; approvals are decided by administrators",
+    )
 }
 
 struct BrowserApplicationConfig {
@@ -805,14 +783,6 @@ async fn browser_application_router(
         &workflow_agents,
     )
     .map_err(|error| io::Error::other(format!("starter task configuration failed: {error}")))?;
-    let custom_envelope_safety_ceiling = configured_bounded_json(
-        "STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON",
-        "STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE",
-        user_envelopes::MAX_CUSTOM_ENVELOPE_SAFETY_CEILING_BYTES,
-        "custom Envelope safety ceiling",
-    )?
-    .map(|document| parse_custom_envelope_safety_ceiling(&document, &capability_catalog))
-    .transpose()?;
     let steward_run_release = configured_bounded_json(
         "STEWARD_RUN_RELEASE_JSON",
         "STEWARD_RUN_RELEASE_FILE",
@@ -892,7 +862,6 @@ async fn browser_application_router(
             user_envelopes::PgEnvelopeRequestBroker::new(
                 store.clone(),
                 capability_catalog.clone(),
-                custom_envelope_safety_ceiling.clone(),
                 steward_run_release,
                 workflow_installation_mode,
                 application_config.task_identity_discovery_enabled,
@@ -915,7 +884,6 @@ async fn browser_application_router(
             decisions,
             capability_catalog,
             task_api_config.workspace_deployment_capabilities(),
-            custom_envelope_safety_ceiling,
             auth.clone(),
         ))
         .merge(browser_admin::protected_federated_subject_router(
@@ -1931,13 +1899,13 @@ mod tests {
         CodexTaskExecutionAdapter, KubernetesTokenReviewAudience, OPERATOR_EXIT_CONFLICT,
         OPERATOR_EXIT_FORBIDDEN, OPERATOR_EXIT_NOT_FOUND, OPERATOR_EXIT_UNAVAILABLE,
         OPERATOR_EXIT_USAGE, OperatorCommandError, TaskApiConfig, TlsListener,
-        bootstrap_rbac_arguments, connection_auto_association_issuer, decode_tls_material,
+        bootstrap_rbac_arguments, connection_auto_association_issuer,
+        custom_envelope_safety_ceiling_startup_warning, decode_tls_material,
         default_template_threshold_is_rollback_compatible, format_effective_access_human,
         github_source_adapter_from_values, install_rustls_crypto_provider,
-        kubernetes_token_review_audience, operator_exit_code, parse_custom_envelope_safety_ceiling,
-        parse_execution_bindings_mode, parse_inference_mode, parse_template_document,
-        stable_bridge_configuration_from_values, templates_command, validate_execution_bindings,
-        with_claude_code_execution_adapter,
+        kubernetes_token_review_audience, operator_exit_code, parse_execution_bindings_mode,
+        parse_inference_mode, parse_template_document, stable_bridge_configuration_from_values,
+        templates_command, validate_execution_bindings, with_claude_code_execution_adapter,
     };
 
     static NEXT_PREFLIGHT_CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -2031,18 +1999,14 @@ mod tests {
     }
 
     #[test]
-    fn custom_envelope_safety_ceiling_requires_bounded_runtime_minutes() {
-        let catalog = steward_apiserver::browser_admin::CapabilityCatalog {
-            schema_version: "steward.capability-catalog/v2".to_owned(),
-            models: vec![steward_types::ModelRef {
-                provider: "provider-a".to_owned(),
-                model: "model-a".to_owned(),
-            }],
-            tools: Vec::new(),
-            catalogs: Vec::new(),
-        };
-        let unbounded = r#"{"revision":1,"spec":{"llms":[{"provider":"provider-a","model":"model-a"}],"tools":[],"budget":{"monthlyLimit":"1.00","currency":"USD"},"ttl":"1h","runner":{}}}"#;
-        assert!(parse_custom_envelope_safety_ceiling(unbounded, &catalog).is_err());
+    fn configured_custom_envelope_safety_ceiling_is_ignored_with_one_warning() {
+        assert_eq!(
+            custom_envelope_safety_ceiling_startup_warning(true),
+            Some(
+                "customEnvelopeSafetyCeiling is no longer used; approvals are decided by administrators"
+            )
+        );
+        assert_eq!(custom_envelope_safety_ceiling_startup_warning(false), None);
     }
 
     #[tokio::test]

@@ -546,11 +546,14 @@ Steward release namespace also creates `steward-workflows`.
   entries without `toolsets` remain valid and appear in a deterministic fallback group.
   Steward does not generate this metadata from an MCP-GW release asset; the deployment owner
   supplies it with the catalog.
-- `config.apiserver.customEnvelopeSafetyCeiling` is the optional deployment-owned maximum for
-  template-free requests. It is a complete Envelope and its capabilities must exist in the
-  catalog. Steward revalidates the current ceiling at both request creation and administrator
-  approval, so tightening it also fences already-pending requests. The default `null` value makes
-  custom requests fail closed.
+- `config.apiserver.customEnvelopeSafetyCeiling` is deprecated and ignored. It remains accepted
+  for this release so existing values continue to install, and the apiserver logs one startup
+  warning when it is set. Remove the key before the next release, when the schema will reject it.
+  Requests within a template provision automatically. Above-template and template-free requests
+  remain pending until an administrator approves or declines them, and require a requester
+  justification. Steward validates model, tool, and workspace-type availability for these reviewed
+  requests both when a request is created and when it is approved; deployment workspace limits
+  remain enforced at Task admission.
 - `config.apiserver.stewardRunRelease` is the exact verified steward-run handoff selected by the
   installation BOM: manifest schema, semantic version, reusable-workflow repository and commit,
   and action commit. The deprecated `governedJobContainerImage` coordinate remains accepted for

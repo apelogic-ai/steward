@@ -217,12 +217,14 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template, workspaceCa
   const [submission, setSubmission] = useState<"idle" | "submitting" | MutationFailureState>("idle");
   const [rejectedFields, setRejectedFields] = useState<Array<EnvelopeRequestField>>([]);
   const [diagnostics, setDiagnostics] = useState<DiagnosticItem[]>([]);
+  const [failureReason, setFailureReason] = useState<string | null>(null);
 
   function clearRejectedSubmission() {
     if (submission === "idle" || submission === "submitting") return;
     setSubmission("idle");
     setRejectedFields([]);
     setDiagnostics([]);
+    setFailureReason(null);
   }
 
   const singleRunValue = singleRunLimit.trim();
@@ -273,6 +275,7 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template, workspaceCa
     const problem = envelopeRequestProblem(result.error);
     setRejectedFields(problem?.fields ?? []);
     setDiagnostics(problem ? [{ label: "Code", value: problem.error }, { label: "Reason", value: problem.failureReason }] : []);
+    setFailureReason(problem?.failureReason ?? null);
     setSubmission(classifyMutationFailure(result.response?.status));
     onSubmittingChange(false);
   }
@@ -307,17 +310,17 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template, workspaceCa
             {template.ceiling.spec.runtimeMinutesLimit ? <label className="grid gap-2 text-sm font-semibold">Runtime limit per month<DurationInput aria-invalid={exceededFields.has("Runtime limit per month") || undefined} className={fieldClass(exceededFields.has("Runtime limit per month"))} disabled={submission === "submitting"} mode="minutes" onChange={(value) => { setRuntimeMinutes(value); clearRejectedSubmission(); }} required value={runtimeMinutes} />{limitHint(exceededFields.has("Runtime limit per month"), formatDuration(template.ceiling.spec.runtimeMinutesLimit, "minutes", "m"))}</label> : null}
           </div>
         </SectionCard>
-        <SectionCard className={models.size === 0 || exceededFields.has("Models") || rejectedFields.includes("llms") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("02", "Models")}><TagSelect aria-invalid={models.size === 0 || undefined} addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" noResultsMessage={(query) => `No models in this template match “${query}”`} onChange={(next) => { setModels(new Set(next)); clearRejectedSubmission(); }} options={modelOptions} value={[...models]} />{models.size === 0 ? <p className="mt-2 text-sm text-err" role="alert">Select at least one model.</p> : null}</SectionCard>
-        <SectionCard className={exceededFields.has("Tools") || rejectedFields.includes("tools") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("03", "Tools")}><TagSelect addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search GitHub tools…" label="Tools" noResultsMessage={(query) => `No tools in this template match “${query}”`} onChange={(next) => { setTools(new Set(next)); clearRejectedSubmission(); }} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools allowed by the template are offered.</p></SectionCard>
-        <SectionCard title={stepTitle("04", "Workspace access")}><WorkspaceAuthorityDetails deployment={workspaceCapabilities} workspace={template.ceiling.spec.workspace} /></SectionCard>
-        <SectionCard title={stepTitle("05", "Request note")}><label className="grid gap-2 text-sm font-semibold">Justification (optional)<textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); clearRejectedSubmission(); }} placeholder="Explain why these limits or capabilities are needed." value={justification} /></label></SectionCard>
+        <SectionCard className={models.size === 0 || exceededFields.has("Models") || rejectedFields.includes("llms") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("02", "Models")}><TagSelect aria-invalid={models.size === 0 || rejectedFields.includes("llms") || undefined} addPlaceholder="Add…" disabled={submission === "submitting"} emptyPlaceholder="Search models…" label="Models" noResultsMessage={(query) => `No models in this template match “${query}”`} onChange={(next) => { setModels(new Set(next)); clearRejectedSubmission(); }} options={modelOptions} value={[...models]} />{models.size === 0 ? <p className="mt-2 text-sm text-err" role="alert">Select at least one model.</p> : null}</SectionCard>
+        <SectionCard className={exceededFields.has("Tools") || rejectedFields.includes("tools") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("03", "Tools")}><TagSelect aria-invalid={rejectedFields.includes("tools") || undefined} addPlaceholder="Add another tool…" disabled={submission === "submitting"} emptyPlaceholder="Search GitHub tools…" label="Tools" noResultsMessage={(query) => `No tools in this template match “${query}”`} onChange={(next) => { setTools(new Set(next)); clearRejectedSubmission(); }} options={toolOptions} value={[...tools]} /><p className="mt-3 text-xs text-muted-ink">Remove anything this envelope doesn’t need. Only tools allowed by the template are offered.</p></SectionCard>
+        <SectionCard className={rejectedFields.includes("workspace") ? "border-warn ring-1 ring-warn" : undefined} title={stepTitle("04", "Workspace access")}><div aria-invalid={rejectedFields.includes("workspace") || undefined}><WorkspaceAuthorityDetails deployment={workspaceCapabilities} workspace={template.ceiling.spec.workspace} /></div></SectionCard>
+        <SectionCard title={stepTitle("05", "Request note")}><label className="grid gap-2 text-sm font-semibold">{requiresApproval ? "Justification (required for approval)" : "Justification (optional)"}<textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); clearRejectedSubmission(); }} placeholder="Explain why these limits or capabilities are needed." required={requiresApproval} value={justification} /></label></SectionCard>
       </div>
       <SectionCard className="sticky top-7 flex-[1_1_280px] lg:max-w-[380px]" title="Summary">
         <dl className="space-y-3 text-sm">{summary.map(([label, value]) => <div className={`flex justify-between gap-4 ${exceededFields.has(label) ? "text-warn" : ""}`} key={label}><dt className={exceededFields.has(label) ? undefined : "text-muted-ink"}>{label}</dt><dd className="text-right font-medium">{value}</dd></div>)}</dl>
-        {submission !== "idle" && submission !== "submitting" ? <p className="mt-4 text-sm text-err" role="alert">{{ conflict: "The template revision changed. Reload before retrying.", rejected: "Some values are outside the platform limits or available capabilities. Check the highlighted fields and try again.", forbidden: "You are not allowed to submit this request.", unavailable: "HyperShell couldn't reach the request service. Try again in a moment.", error: "The request could not be accepted. Try again." }[submission]}</p> : null}
+        {submission !== "idle" && submission !== "submitting" ? <p className="mt-4 text-sm text-err" role="alert">{submission === "rejected" && failureReason ? failureReason : { conflict: "The template revision changed. Reload before retrying.", rejected: "The request was rejected. Check the highlighted fields and try again.", forbidden: "You are not allowed to submit this request.", unavailable: "HyperShell couldn't reach the request service. Try again in a moment.", error: "The request could not be accepted. Try again." }[submission]}</p> : null}
         <DiagnosticDetails className="mt-2" items={diagnostics} />
         {exceedances.length ? <div className="mt-4"><EnvelopeExceedanceSummary values={exceedances} /></div> : null}
-        <button className="mt-5 min-h-10 w-full rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting" || Boolean(singleRunError) || models.size === 0} type="submit">{submission === "submitting" ? "Submitting…" : requiresApproval ? "Submit for approval" : "Submit request"}</button>
+        <button className="mt-5 min-h-10 w-full rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting" || Boolean(singleRunError) || models.size === 0 || (requiresApproval && !justification.trim())} type="submit">{submission === "submitting" ? "Submitting…" : requiresApproval ? "Submit for approval" : "Submit request"}</button>
         <p className="mt-3 text-xs leading-5 text-muted-ink">{requiresApproval ? `${exceedances.length} ${exceedances.length === 1 ? "value exceeds" : "values exceed"} the template limits and need admin approval.` : "This request is within the template limits and will be provisioned immediately."}</p>
       </SectionCard>
     </form>
@@ -362,12 +365,16 @@ function CustomEnvelopeRequestForm({ onSubmittingChange, workspaceCapabilities }
   const [justification, setJustification] = useState("");
   const [submission, setSubmission] = useState<"idle" | "submitting" | "invalid" | "invalid-workspace" | MutationFailureState>("idle");
   const [diagnostics, setDiagnostics] = useState<DiagnosticItem[]>([]);
+  const [rejectedFields, setRejectedFields] = useState<Array<EnvelopeRequestField>>([]);
+  const [failureReason, setFailureReason] = useState<string | null>(null);
   const idempotencyKey = useRef<string | null>(null);
   const attemptEnvelope = useRef<BrowserEnvelope | null>(null);
 
   function resetAttempt() {
     idempotencyKey.current = null;
     attemptEnvelope.current = null;
+    setRejectedFields([]);
+    setFailureReason(null);
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -410,6 +417,8 @@ function CustomEnvelopeRequestForm({ onSubmittingChange, workspaceCapabilities }
     setSubmission(classifyMutationFailure(result.response?.status));
     const problem = envelopeRequestProblem(result.error);
     setDiagnostics(problem ? [{ label: "Code", value: problem.error }, { label: "Reason", value: problem.failureReason }] : []);
+    setRejectedFields(problem?.fields ?? []);
+    setFailureReason(problem?.failureReason ?? null);
     onSubmittingChange(false);
   }
 
@@ -422,7 +431,7 @@ function CustomEnvelopeRequestForm({ onSubmittingChange, workspaceCapabilities }
     : submission !== "idle" && submission !== "submitting"
       ? {
           conflict: "An equivalent envelope request already exists. Reload before retrying.",
-          rejected: "The custom request must fit the platform-wide limits and use available models and tools.",
+          rejected: failureReason ?? "The custom request was rejected. Check the highlighted fields and try again.",
           forbidden: "You are not allowed to submit this request.",
           unavailable: "HyperShell couldn't submit the request. Try again in a moment.",
           error: "The request could not be accepted. Try again.",
@@ -433,7 +442,7 @@ function CustomEnvelopeRequestForm({ onSubmittingChange, workspaceCapabilities }
     <form className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
       <div>
         <h2 className="font-semibold">Custom envelope request</h2>
-        <p className="mt-1 text-sm text-muted-ink">Custom requests have no governing template and always require administrator approval. HyperShell validates the complete envelope against the deployment safety ceiling; model, tool, and limit values are specific to this deployment.</p>
+        <p className="mt-1 text-sm text-muted-ink">Custom requests have no governing template and always require administrator approval. HyperShell checks the requested model, tool, and workspace capabilities before review and again before approval.</p>
       </div>
       <label className="grid gap-2 text-sm font-semibold">Complete envelope JSON
         <textarea
@@ -446,18 +455,18 @@ function CustomEnvelopeRequestForm({ onSubmittingChange, workspaceCapabilities }
           value={envelopeJson}
         />
       </label>
-      <section className="space-y-3 rounded-control border p-4" aria-labelledby="custom-workspace-title">
+      <section className={`space-y-3 rounded-control border p-4 ${rejectedFields.includes("workspace") ? "border-warn ring-1 ring-warn" : ""}`} aria-labelledby="custom-workspace-title">
         <div><h3 className="font-semibold" id="custom-workspace-title">Workspace access</h3><p className="mt-1 text-sm text-muted-ink">These controls update workspace types and total size. Existing file, history, and submodule limits are preserved.</p></div>
         {workspaceCapabilities
           ? <WorkspaceAuthorityControls deployment={workspaceCapabilities} disabled={submission === "submitting"} draft={workspaceDraft} error={workspaceError} onChange={(next) => { setWorkspaceDraft(next); resetAttempt(); setSubmission("idle"); setDiagnostics([]); }} />
           : <p className="text-sm text-muted-ink">Workspace controls are unavailable. Any workspace access in the envelope JSON will be preserved.</p>}
       </section>
-      <label className="grid gap-2 text-sm font-semibold">Justification (optional)
-        <textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); resetAttempt(); setSubmission("idle"); }} placeholder="Explain why this envelope is needed." value={justification} />
+      <label className="grid gap-2 text-sm font-semibold">Justification (required)
+        <textarea className="min-h-24 rounded-control border p-3 font-normal" disabled={submission === "submitting"} maxLength={2000} onChange={(event) => { setJustification(event.target.value); resetAttempt(); setSubmission("idle"); }} placeholder="Explain why this envelope is needed." required value={justification} />
       </label>
       {failure ? <p className="text-sm text-red-800" role="alert">{failure}</p> : null}
       <DiagnosticDetails items={diagnostics} />
-      <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting" || Boolean(workspaceError)} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
+      <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting" || Boolean(workspaceError) || !justification.trim()} type="submit">{submission === "submitting" ? "Submitting…" : "Submit request"}</button>
     </form>
   );
 }

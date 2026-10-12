@@ -29,8 +29,8 @@ user Task.
 | `STEWARD_TASK_EXECUTION_BINDINGS_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
 | `STEWARD_CAPABILITY_CATALOG_FILE` | Read-only `steward.capability-catalog/v2` document used by browser administration. Required when browser administration is enabled. |
 | `STEWARD_CAPABILITY_CATALOG_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
-| `STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE` | Optional read-only complete Envelope that bounds every template-free request at creation and approval. When neither form is configured, custom requests fail closed. |
-| `STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON` | Optional inline equivalent for non-Helm integration environments. Configuring both forms fails startup. |
+| `STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_FILE` | Deprecated compatibility input. It is accepted but ignored, emits a startup warning, and will be removed in the next release. |
+| `STEWARD_CUSTOM_ENVELOPE_SAFETY_CEILING_JSON` | Deprecated inline compatibility input with the same ignored-and-warn behavior. |
 | `STEWARD_RUN_RELEASE_FILE` | Preferred read-only normalized steward-run release handoff for browser Workflow generation. Browser administration requires exactly one file or inline form and steward-run v0.7.0 or later. |
 | `STEWARD_RUN_RELEASE_JSON` | Inline equivalent used by the Helm chart. Configuring both release-handoff forms fails startup. |
 | `STEWARD_RUN_WORKFLOW_INSTALLATION_MODE` | Optional `remote` (default) or `vendored` caller rendering mode. Vendored mode requires steward-run v0.7.6 or later and its verified release asset at `.github/workflows/steward-task-vendored.yml` in the caller repository. |
@@ -70,11 +70,11 @@ config:
           available: true
 ```
 
-Template-free requests have a separate deployment-owned safety boundary. Set
-`config.apiserver.customEnvelopeSafetyCeiling` to a complete Envelope whose models and tools are
-present in the capability catalog. Steward checks the requested budget, runtime minutes, TTL,
-runner platforms/resources, models, and tools both when the user creates the request and when an
-administrator approves it. Leaving the value `null` disables custom requests fail-closed.
+Template-free requests always require administrator approval. Requests above a template's limits
+also require approval and must include a justification. Steward checks the reviewed request's
+model, tool, and workspace capabilities when it is created and checks them again immediately
+before approval. A request inside its template limits provisions without using the descriptive
+capability catalog as an additional authority boundary.
 
 Access classes and provider availability are descriptive UI metadata. It contains no budget,
 TTL, user, template, Envelope, or admission fields. Changing it changes

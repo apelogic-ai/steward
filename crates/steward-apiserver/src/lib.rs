@@ -3888,6 +3888,12 @@ mod tests {
         BrowserAuthService, LocalFakeIdentity, browser_auth_router, local_fake_browser_auth_service,
     };
     use super::tasks::task_identity_from_token_review;
+    use super::user_envelopes::{
+        AvailableEnvelopeTemplate, EnvelopeRequestBroker, EnvelopeRequestBrokerError,
+        UserEnvelopeMutationProof, UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject,
+        ValidatedEnvelopeRequest, envelope_content_digest, envelope_instance_id,
+        inner_router as user_envelope_router, user_envelope_request,
+    };
     use super::{
         AGENT_RUNS_API_VERSION, AdmissionContext, AdmissionLedger, AgentRunLedger, ApiDoc,
         ApiError, AuthenticatedCaller, AuthenticationError, BoxFuture, BudgetIncrease,
@@ -5522,9 +5528,6 @@ mod tests {
             .spec
             .budget
             .monthly_limit = "250.00".to_owned();
-        let admin_safety_ceiling = admin_ledger.pending_envelope_requests[0]
-            .requested_envelope
-            .clone();
         let admin_decisions = FakeDecisionChannel::default();
         let (admin_auth, admin_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
@@ -5577,7 +5580,6 @@ mod tests {
             admin_decisions.clone(),
             browser_capability_catalog(),
             workspace_capabilities,
-            Some(admin_safety_ceiling),
             admin_auth,
         );
         let provisioned = admin_app
@@ -6335,8 +6337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn custom_envelope_approval_rechecks_the_current_platform_safety_ceiling()
-    -> Result<(), String> {
+    async fn custom_envelope_approval_is_decided_by_the_administrator() -> Result<(), String> {
         let origin = "http://127.0.0.1:33002";
         let runtime_repository = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
@@ -6345,18 +6346,13 @@ mod tests {
         custom_ledger.pending_envelope_requests[0].template_id = None;
         custom_ledger.pending_envelope_requests[0].template_revision = None;
         custom_ledger.pending_envelope_requests[0].template_envelope = None;
-        let mut tightened_ceiling = custom_ledger.pending_envelope_requests[0]
-            .requested_envelope
-            .clone();
-        tightened_ceiling.spec.budget.monthly_limit = "50.00".to_owned();
         let (admin_auth, admin_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
-        let app = browser_admin::protected_router_with_custom_envelope_safety(
+        let app = browser_admin::protected_router(
             runtime_repository,
-            custom_ledger,
+            custom_ledger.clone(),
             FakeDecisionChannel::default(),
             browser_capability_catalog(),
-            Some(tightened_ceiling),
             admin_auth,
         );
         let response = app
@@ -6370,19 +6366,26 @@ mod tests {
                     .header("x-steward-csrf", &csrf)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"rationale":"reviewed custom authority against the current platform ceiling"}"#,
+                        r#"{"rationale":"approved the requested custom authority"}"#,
                     ))
                     .map_err(|error| format!("build custom approval request: {error}"))?,
             )
             .await
             .map_err(|error| format!("execute custom approval request: {error}"))?;
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.status(), StatusCode::OK);
+        let owner = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+            .map_err(|error| error.to_string())?;
+        let task_authority = custom_ledger
+            .active_provisioned_user_envelopes(&owner)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(task_authority.len(), 1);
+        assert_eq!(task_authority[0].id, Uuid::from_u128(4));
         Ok(())
     }
 
     #[tokio::test]
-    async fn template_exception_approval_rechecks_the_current_platform_safety_ceiling()
-    -> Result<(), String> {
+    async fn template_exception_approval_is_decided_by_the_administrator() -> Result<(), String> {
         let origin = "http://127.0.0.1:33002";
         let runtime_repository = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
@@ -6393,19 +6396,14 @@ mod tests {
             .spec
             .budget
             .monthly_limit = "250.00".to_owned();
-        let mut tightened_ceiling = review_ledger.pending_envelope_requests[0]
-            .requested_envelope
-            .clone();
-        tightened_ceiling.spec.budget.monthly_limit = "50.00".to_owned();
         let recorded = review_ledger.user_envelopes.clone();
         let (admin_auth, admin_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
-        let app = browser_admin::protected_router_with_custom_envelope_safety(
+        let app = browser_admin::protected_router(
             runtime_repository,
-            review_ledger,
+            review_ledger.clone(),
             FakeDecisionChannel::default(),
             browser_capability_catalog(),
-            Some(tightened_ceiling),
             admin_auth,
         );
         let response = app
@@ -6419,34 +6417,131 @@ mod tests {
                     .header("x-steward-csrf", &csrf)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"rationale":"reviewed template exception against the current platform ceiling"}"#,
+                        r#"{"rationale":"approved the requested template exception"}"#,
                     ))
                     .map_err(|error| format!("build template-exception approval: {error}"))?,
             )
             .await
             .map_err(|error| format!("execute template-exception approval: {error}"))?;
-        assert_eq!(
-            response.status(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "a rationale must not bypass the current platform safety ceiling"
-        );
-        let body = to_bytes(response.into_body(), 16 * 1024)
-            .await
-            .map_err(|error| format!("read safety rejection: {error}"))?;
-        let rejection: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|error| format!("parse safety rejection: {error}"))?;
-        assert_eq!(rejection["error"], "platform_safety_ceiling_exceeded");
-        assert_eq!(
-            rejection["fields"],
-            serde_json::json!(["budgetMonthlyLimit"])
-        );
+        assert_eq!(response.status(), StatusCode::OK);
         assert!(
             recorded
                 .lock()
-                .map_err(|_| "lock rejected envelope requests")?
-                .is_empty(),
-            "rejected approval must not persist a provisioning effect"
+                .map_err(|_| "lock approved envelope requests")?
+                .iter()
+                .any(|request| request.id == Uuid::from_u128(4)
+                    && request.status == EnvelopeRequestStatus::Provisioned),
+            "administrator approval must persist the provisioned envelope"
         );
+        let owner = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+            .map_err(|error| error.to_string())?;
+        let task_authority = review_ledger
+            .active_provisioned_user_envelopes(&owner)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(task_authority.len(), 1);
+        assert_eq!(task_authority[0].id, Uuid::from_u128(4));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn above_template_user_request_can_be_approved_into_active_authority()
+    -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let review_ledger = ledger();
+        let owner = CanonicalUserId::parse("usr_0123456789abcdef0123456789abcdef")
+            .map_err(|error| error.to_string())?;
+        let session = UserEnvelopeSession {
+            subject: UserEnvelopeSubject {
+                canonical_user_id: owner.clone(),
+                display_email: Email("alice@example.com".to_owned()),
+                member_roles: vec!["engineer".to_owned()],
+            },
+            binding: (),
+        };
+        let mut requested = review_ledger
+            .envelope_templates
+            .lock()
+            .map_err(|_| "lock envelope templates")?
+            .first()
+            .ok_or_else(|| "missing envelope template".to_owned())?
+            .ceiling
+            .clone();
+        requested.spec.budget.monthly_limit = "250.00".to_owned();
+
+        let user_app = user_envelope_router(review_ledger.clone());
+        let response = user_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .extension(session)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "templateId": "engineer",
+                            "templateRevision": 3,
+                            "requestedEnvelope": requested,
+                            "idempotencyKey": "whole-path-template-exception",
+                            "justification": "Needed for a governed task",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build envelope request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit envelope request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read envelope request: {error}"))?;
+        let created: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse envelope request: {error}"))?;
+        assert_eq!(created["request"]["status"], "pending");
+        let request_id = created["request"]["id"]
+            .as_str()
+            .ok_or_else(|| "created request id is missing".to_owned())?;
+
+        let (admin_auth, admin_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let admin_app = browser_admin::protected_router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            review_ledger.clone(),
+            FakeDecisionChannel::default(),
+            browser_capability_catalog(),
+            admin_auth,
+        );
+        let approval = admin_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/admin/api/v1/envelope-requests/{request_id}/approve"
+                    ))
+                    .header(header::COOKIE, &admin_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"rationale":"approved the requested template exception"}"#,
+                    ))
+                    .map_err(|error| format!("build envelope approval: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("approve envelope request: {error}"))?;
+        assert_eq!(approval.status(), StatusCode::OK);
+
+        let active = review_ledger
+            .active_provisioned_user_envelopes(&owner)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id.to_string(), request_id);
+        assert_eq!(active[0].approved_envelope, Some(requested));
         Ok(())
     }
 
@@ -6463,18 +6558,36 @@ mod tests {
             .spec
             .budget
             .monthly_limit = "250.00".to_owned();
-        let safety_ceiling = review_ledger.pending_envelope_requests[0]
+        review_ledger.pending_envelope_requests[0]
             .requested_envelope
-            .clone();
+            .spec
+            .tools = vec![ToolGrant {
+            provider: "github".to_owned(),
+            resource: "actions_get".to_owned(),
+            action: "read".to_owned(),
+        }];
+        review_ledger.pending_envelope_requests[0]
+            .requested_envelope
+            .spec
+            .workspace = Some(WorkspaceAuthority {
+            allowed_types: vec![WorkspaceEntryType::Git],
+            max_total_size: Some(ResourceQuantity::parse("1Gi")?),
+            max_files: Some(1_000),
+            max_history_depth: Some(100),
+            max_submodule_depth: Some(1),
+        });
         let recorded = review_ledger.user_envelopes.clone();
         let (admin_auth, admin_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
-        let app = browser_admin::protected_router_with_custom_envelope_safety(
+        let mut workspace_capabilities =
+            TaskApiConfig::default().workspace_deployment_capabilities();
+        workspace_capabilities.enabled_types = vec!["scratch".to_owned()];
+        let app = browser_admin::protected_router_with_workspace_capabilities(
             runtime_repository,
             review_ledger,
             FakeDecisionChannel::default(),
             browser_admin::CapabilityCatalog::default(),
-            Some(safety_ceiling),
+            workspace_capabilities,
             admin_auth,
         );
         let response = app
@@ -6505,7 +6618,14 @@ mod tests {
         let rejection: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("parse capability rejection: {error}"))?;
         assert_eq!(rejection["error"], "capability_not_available");
-        assert_eq!(rejection["fields"], serde_json::json!(["llms"]));
+        assert_eq!(
+            rejection["fields"],
+            serde_json::json!(["llms", "tools", "workspace"])
+        );
+        assert_eq!(
+            rejection["failureReason"],
+            "This deployment does not provide the requested models, tools, workspace."
+        );
         assert!(
             recorded
                 .lock()
@@ -6517,7 +6637,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn template_exception_within_platform_safety_can_be_approved() -> Result<(), String> {
+    async fn template_exception_can_be_approved_by_an_administrator() -> Result<(), String> {
         let origin = "http://127.0.0.1:33002";
         let runtime_repository = FakeRuntimeRepository {
             runtime: Arc::new(Mutex::new(runtime())),
@@ -6528,18 +6648,14 @@ mod tests {
             .spec
             .budget
             .monthly_limit = "250.00".to_owned();
-        let safety_ceiling = review_ledger.pending_envelope_requests[0]
-            .requested_envelope
-            .clone();
         let recorded = review_ledger.user_envelopes.clone();
         let (admin_auth, admin_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
-        let app = browser_admin::protected_router_with_custom_envelope_safety(
+        let app = browser_admin::protected_router(
             runtime_repository,
             review_ledger,
             FakeDecisionChannel::default(),
             browser_capability_catalog(),
-            Some(safety_ceiling),
             admin_auth,
         );
         let response = app
@@ -6597,9 +6713,6 @@ mod tests {
             .spec
             .budget
             .monthly_limit = "250.00".to_owned();
-        let safety_ceiling = review_ledger.pending_envelope_requests[0]
-            .requested_envelope
-            .clone();
         review_ledger
             .decision_references
             .lock()
@@ -6613,12 +6726,11 @@ mod tests {
         let recorded = review_ledger.user_envelopes.clone();
         let (admin_auth, admin_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
-        let app = browser_admin::protected_router_with_custom_envelope_safety(
+        let app = browser_admin::protected_router(
             runtime_repository,
             review_ledger,
             decisions.clone(),
             browser_capability_catalog(),
-            Some(safety_ceiling),
             admin_auth,
         );
         let approval = |expires_at: &'static str| {
@@ -6686,7 +6798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provisioned_custom_envelope_approval_retry_ignores_later_safety_config_drift()
+    async fn provisioned_custom_envelope_approval_retry_ignores_later_capability_config_drift()
     -> Result<(), String> {
         let origin = "http://127.0.0.1:33002";
         let runtime_repository = FakeRuntimeRepository {
@@ -6700,17 +6812,13 @@ mod tests {
             .requested_envelope
             .spec
             .runtime_minutes_limit = Some("60".to_owned());
-        let safety_ceiling = custom_ledger.pending_envelope_requests[0]
-            .requested_envelope
-            .clone();
         let (first_auth, first_cookie, first_csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
-        let first_app = browser_admin::protected_router_with_custom_envelope_safety(
+        let first_app = browser_admin::protected_router(
             runtime_repository.clone(),
             custom_ledger.clone(),
             FakeDecisionChannel::default(),
             browser_capability_catalog(),
-            Some(safety_ceiling),
             first_auth,
         );
         let first = first_app
@@ -6724,7 +6832,7 @@ mod tests {
                     .header("x-steward-csrf", &first_csrf)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"rationale":"approved within the current custom safety ceiling"}"#,
+                        r#"{"rationale":"approved the requested custom authority"}"#,
                     ))
                     .map_err(|error| format!("build first custom approval: {error}"))?,
             )
@@ -6734,12 +6842,11 @@ mod tests {
 
         let (retry_auth, retry_cookie, retry_csrf) =
             signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
-        let retry_app = browser_admin::protected_router_with_custom_envelope_safety(
+        let retry_app = browser_admin::protected_router(
             runtime_repository,
             custom_ledger,
             FakeDecisionChannel::default(),
             browser_admin::CapabilityCatalog::default(),
-            None,
             retry_auth,
         );
         let retry = retry_app
@@ -7929,6 +8036,134 @@ mod tests {
         envelope_instance_grants: Arc<Mutex<Vec<(Uuid, EnvelopeInstanceGrantRecord)>>>,
         managed_inference_credential_present: Arc<Mutex<bool>>,
         managed_inference_credential_error: Arc<Mutex<Option<StoreError>>>,
+    }
+
+    impl EnvelopeRequestBroker<()> for FakeLedger {
+        fn templates<'a>(
+            &'a self,
+            session: &'a UserEnvelopeSession<()>,
+        ) -> BoxFuture<'a, Result<Vec<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>>
+        {
+            Box::pin(async move {
+                self.envelope_templates
+                    .lock()
+                    .map_err(|_| EnvelopeRequestBrokerError::Unavailable)
+                    .map(|templates| {
+                        templates
+                            .iter()
+                            .filter(|template| {
+                                template
+                                    .member_roles
+                                    .iter()
+                                    .any(|role| session.subject.member_roles.contains(role))
+                            })
+                            .map(|template| AvailableEnvelopeTemplate {
+                                id: template.template_id.clone(),
+                                display_name: template.display_name.clone(),
+                                revision: template.ceiling.revision,
+                                ceiling: template.ceiling.clone(),
+                                auto_provision_threshold: template.auto_provision_threshold.clone(),
+                                allow_inline_browser_tasks: template.allow_inline_browser_tasks,
+                            })
+                            .collect()
+                    })
+            })
+        }
+
+        fn list<'a>(
+            &'a self,
+            session: &'a UserEnvelopeSession<()>,
+        ) -> BoxFuture<'a, Result<Vec<UserEnvelopeRequest>, EnvelopeRequestBrokerError>> {
+            Box::pin(async move {
+                self.user_envelopes
+                    .lock()
+                    .map_err(|_| EnvelopeRequestBrokerError::Unavailable)
+                    .map(|records| {
+                        records
+                            .iter()
+                            .filter(|record| {
+                                record.owner_user_id == session.subject.canonical_user_id
+                            })
+                            .cloned()
+                            .map(user_envelope_request)
+                            .collect()
+                    })
+            })
+        }
+
+        fn get<'a>(
+            &'a self,
+            session: &'a UserEnvelopeSession<()>,
+            request_id: Uuid,
+        ) -> BoxFuture<'a, Result<Option<UserEnvelopeRequest>, EnvelopeRequestBrokerError>>
+        {
+            Box::pin(async move {
+                self.user_envelopes
+                    .lock()
+                    .map_err(|_| EnvelopeRequestBrokerError::Unavailable)
+                    .map(|records| {
+                        records
+                            .iter()
+                            .find(|record| {
+                                record.id == request_id
+                                    && record.owner_user_id == session.subject.canonical_user_id
+                            })
+                            .cloned()
+                            .map(user_envelope_request)
+                    })
+            })
+        }
+
+        fn create<'a>(
+            &'a self,
+            session: &'a UserEnvelopeSession<()>,
+            request: ValidatedEnvelopeRequest<'a>,
+        ) -> BoxFuture<'a, Result<UserEnvelopeRequest, EnvelopeRequestBrokerError>> {
+            Box::pin(async move {
+                let mut records = self
+                    .user_envelopes
+                    .lock()
+                    .map_err(|_| EnvelopeRequestBrokerError::Unavailable)?;
+                let id = Uuid::from_u128(400 + records.len() as u128);
+                let approved_envelope = request
+                    .auto_provision
+                    .then(|| request.requested_envelope.clone());
+                let record = EnvelopeRequestRecord {
+                    id,
+                    owner_user_id: session.subject.canonical_user_id.clone(),
+                    template_id: request.template.map(|template| template.id.clone()),
+                    template_revision: request.template.map(|template| template.revision),
+                    template_envelope: request.template.map(|template| template.ceiling.clone()),
+                    requested_envelope: request.requested_envelope.clone(),
+                    approved_envelope,
+                    status: if request.auto_provision {
+                        EnvelopeRequestStatus::Provisioned
+                    } else {
+                        EnvelopeRequestStatus::Pending
+                    },
+                    approval_id: None,
+                    envelope_instance_id: request.auto_provision.then(|| envelope_instance_id(id)),
+                    envelope_digest: request
+                        .auto_provision
+                        .then(|| envelope_content_digest(request.requested_envelope))
+                        .transpose()
+                        .map_err(|_| EnvelopeRequestBrokerError::Unavailable)?,
+                    reason: None,
+                    rationale: None,
+                    justification: request.justification.map(str::to_owned),
+                    ceiling_exceedances: request.ceiling_exceedances.to_vec(),
+                    evidence_url: None,
+                    decision_key: None,
+                    expires_at: None,
+                    status_actor: session.subject.canonical_user_id.as_str().to_owned(),
+                    status_template_revision: request.template.map(|template| template.revision),
+                    created_at: "2026-10-12T12:00:00.000000Z".to_owned(),
+                    status_at: "2026-10-12T12:00:00.000000Z".to_owned(),
+                };
+                records.push(record.clone());
+                Ok(user_envelope_request(record))
+            })
+        }
     }
 
     #[derive(Clone)]

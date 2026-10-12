@@ -24,8 +24,8 @@ Template-backed requests are handled as follows:
 | Requested authority | Result |
 |---|---|
 | Within the template limits | Provision automatically |
-| Above the template limits but within the deployment safety ceiling and capability catalog | Remain pending for an administrator |
-| Outside the deployment safety ceiling or capability catalog | Reject with `422` and identify the affected field |
+| Above the template limits with available capabilities | Remain pending for an administrator |
+| An above-template model, tool, or workspace type unavailable in the deployment | Reject with `422` and identify the affected field |
 
 Each template has one boundary: its published limits. To review any request
 above 50 USD, for example, set the template's monthly limit to 50 USD. The
@@ -34,14 +34,12 @@ revisions, but new revisions never carry it. Template writes that set it are
 rejected with `422` and an actionable message directing the operator to set the
 template limits instead.
 
-A template-free request omits both `templateId` and `templateRevision`, carries
+A reviewed request must include the requester's justification. A template-free request omits both `templateId` and `templateRevision`, carries
 the complete requested Envelope, and always remains pending until an explicit
-administrator decision. Operators must configure
-`config.apiserver.customEnvelopeSafetyCeiling`; otherwise custom requests fail
-closed with `422`. Steward separately validates structure, capability-catalog
-membership, and that budget, runtime minutes, TTL, runner platforms/resources,
-models, and tools are within the current safety ceiling. The same checks run
-again at approval, so a ceiling tightened while a request is pending fences it.
+administrator decision. Steward validates that its models, tools, and workspace
+types are available in the deployment at request creation and again at approval.
+The deprecated `config.apiserver.customEnvelopeSafetyCeiling` setting is accepted
+but ignored for one release and emits one startup warning when set.
 
 ## Multiple active Envelopes and Task selection
 

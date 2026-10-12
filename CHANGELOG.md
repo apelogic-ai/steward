@@ -7,6 +7,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- User Envelope requests within a template still provision automatically. Requests above a
+  template and complete template-free requests now remain pending for an administrator without a
+  second platform safety ceiling. For requests that need review, model, tool, and workspace-type
+  availability is checked at both request creation and approval, and rejections return a plain
+  sentence plus affected fields. Within-template auto-provisioning remains governed by the
+  published template rather than the descriptive capability catalog.
+
+### Removed
+
+- Removed `platform_safety_ceiling_exceeded` and `platform_safety_ceiling_unconfigured` request
+  failures. Administrator approval is the control for authority outside a template.
+
+### Upgrade and rollback
+
+- `config.apiserver.customEnvelopeSafetyCeiling` remains schema-compatible but is ignored in this
+  release. A configured value produces one apiserver startup warning. Remove the key before the
+  next release, when the chart schema will reject it. Existing pending requests are retained and
+  become approvable subject to current deployment capability availability.
+
 ## [0.3.16] - 2026-10-12
 
 This release requires a coordinated upgrade of the agent catalog; follow

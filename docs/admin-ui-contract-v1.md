@@ -88,9 +88,9 @@ one active template may target the same role; an Envelope request pins the
 chosen template ID and revision. A custom request instead omits both template
 fields, carries the complete requested Envelope, and always requires an explicit
 administrator decision. It never invents a template or member role.
-Custom requests and approvals return `422` unless the requested authority is
-within the deployment's current `customEnvelopeSafetyCeiling` and every model
-and tool remains available in the capability catalog.
+Custom requests and approvals return `422` when a requested model, tool, or
+workspace type is not available in the deployment. An administrator explicitly
+decides the complete requested authority without a second platform ceiling.
 
 `POST /admin/api/v1/envelopes/provision` lets an authenticated administrator
 provision an exact template revision for an existing canonical user. Steward
@@ -112,7 +112,7 @@ array.
 
 A template has one set of limits. Requests within the current limits provision
 automatically; requests above them enter the approval queue and remain bounded
-by the deployment safety ceiling and capability catalog. The retired
+by deployment capability availability and explicit administrator approval. The retired
 `autoProvisionThreshold` remains readable only on historical revisions and is
 rejected on new writes.
 

@@ -385,21 +385,15 @@ pub enum EnvelopeRequestBrokerError {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EnvelopeReviewBoundaryError {
-    InvalidEnvelope,
-}
-
 /// Production request broker backed by the authoritative envelope and request ledgers.
 ///
 /// A template becomes visible only through a local-RBAC member-role assignment. Its current
 /// limits are the automatic-provisioning boundary. Requests outside those limits remain pending
-/// for an explicit administrator decision, subject to the deployment safety ceiling.
+/// for an explicit administrator decision.
 #[derive(Clone)]
 pub struct PgEnvelopeRequestBroker {
     store: PgStore,
     capabilities: CapabilityCatalog,
-    custom_envelope_safety_ceiling: Option<Envelope>,
     steward_run_release: StewardRunRelease,
     workflow_installation_mode: StewardRunWorkflowInstallationMode,
     task_identity_discovery_enabled: bool,
@@ -409,7 +403,6 @@ impl PgEnvelopeRequestBroker {
     pub fn new(
         store: PgStore,
         capabilities: CapabilityCatalog,
-        custom_envelope_safety_ceiling: Option<Envelope>,
         steward_run_release: StewardRunRelease,
         workflow_installation_mode: StewardRunWorkflowInstallationMode,
         task_identity_discovery_enabled: bool,
@@ -417,7 +410,6 @@ impl PgEnvelopeRequestBroker {
         Self {
             store,
             capabilities,
-            custom_envelope_safety_ceiling,
             steward_run_release,
             workflow_installation_mode,
             task_identity_discovery_enabled,
@@ -466,19 +458,6 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
         envelope: &Envelope,
     ) -> Vec<EnvelopeRequestField> {
         capability_catalog_violation_fields(&self.capabilities, envelope)
-    }
-
-    fn platform_safety_decision(
-        &self,
-        envelope: &Envelope,
-    ) -> Result<Option<AdmissionDecision>, EnvelopeReviewBoundaryError> {
-        self.custom_envelope_safety_ceiling
-            .as_ref()
-            .map(|ceiling| {
-                envelope_is_within(envelope, ceiling)
-                    .map_err(|_| EnvelopeReviewBoundaryError::InvalidEnvelope)
-            })
-            .transpose()
     }
 
     fn templates<'a>(
@@ -686,7 +665,7 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
     }
 }
 
-fn user_envelope_request(record: EnvelopeRequestRecord) -> UserEnvelopeRequest {
+pub(crate) fn user_envelope_request(record: EnvelopeRequestRecord) -> UserEnvelopeRequest {
     UserEnvelopeRequest {
         id: record.id,
         template_id: record.template_id,
@@ -829,41 +808,6 @@ pub(crate) fn envelope_content_digest(envelope: &Envelope) -> Result<String, ser
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
-pub(crate) fn envelope_request_fields_for_deltas(
-    deltas: &[steward_admission::AdmissionDelta],
-) -> Vec<EnvelopeRequestField> {
-    deltas
-        .iter()
-        .map(|delta| match delta {
-            steward_admission::AdmissionDelta::Budget { .. } => {
-                EnvelopeRequestField::BudgetMonthlyLimit
-            }
-            steward_admission::AdmissionDelta::SingleRunBudget { .. } => {
-                EnvelopeRequestField::BudgetSingleRunLimit
-            }
-            steward_admission::AdmissionDelta::RuntimeMinutes { .. } => {
-                EnvelopeRequestField::RuntimeMinutesLimit
-            }
-            steward_admission::AdmissionDelta::Ttl { .. } => EnvelopeRequestField::Ttl,
-            steward_admission::AdmissionDelta::Models { .. } => EnvelopeRequestField::Llms,
-            steward_admission::AdmissionDelta::Tools { .. } => EnvelopeRequestField::Tools,
-            steward_admission::AdmissionDelta::RunnerPlatforms { .. } => {
-                EnvelopeRequestField::RunnerPlatforms
-            }
-            steward_admission::AdmissionDelta::RunnerMemory { .. } => {
-                EnvelopeRequestField::RunnerMemory
-            }
-            steward_admission::AdmissionDelta::RunnerCompute { .. } => {
-                EnvelopeRequestField::RunnerCompute
-            }
-            steward_admission::AdmissionDelta::RunnerStorage { .. } => {
-                EnvelopeRequestField::RunnerStorage
-            }
-            steward_admission::AdmissionDelta::Workspace { .. } => EnvelopeRequestField::Workspace,
-        })
-        .collect()
-}
-
 pub(crate) fn capability_catalog_violation_fields(
     capabilities: &CapabilityCatalog,
     envelope: &Envelope,
@@ -937,47 +881,54 @@ pub(crate) fn envelope_request_field_list(fields: &[EnvelopeRequestField]) -> St
         .join(", ")
 }
 
-fn validate_review_boundary<P, B>(broker: &P, envelope: &Envelope) -> Result<(), Box<Response>>
+pub(crate) fn workspace_capability_violation_fields(
+    capabilities: &WorkspaceDeploymentCapabilities,
+    envelope: &Envelope,
+) -> Vec<EnvelopeRequestField> {
+    let unavailable = envelope.spec.workspace.as_ref().is_some_and(|workspace| {
+        workspace.allowed_types.iter().any(|entry_type| {
+            let label = match entry_type {
+                steward_types::direct_package::WorkspaceEntryType::Git => "git",
+                steward_types::direct_package::WorkspaceEntryType::Scratch => "scratch",
+            };
+            !capabilities
+                .enabled_types
+                .iter()
+                .any(|enabled| enabled == label)
+        })
+    });
+    unavailable
+        .then_some(EnvelopeRequestField::Workspace)
+        .into_iter()
+        .collect()
+}
+
+fn validate_capabilities<P, B>(
+    broker: &P,
+    workspace_capabilities: &WorkspaceDeploymentCapabilities,
+    envelope: &Envelope,
+) -> Result<(), Box<Response>>
 where
     P: EnvelopeRequestBroker<B>,
     B: Clone + Eq + Hash + Send + Sync + 'static,
 {
-    let capability_fields = broker.envelope_capability_violation_fields(envelope);
+    let mut capability_fields = broker.envelope_capability_violation_fields(envelope);
+    capability_fields.extend(workspace_capability_violation_fields(
+        workspace_capabilities,
+        envelope,
+    ));
     if !capability_fields.is_empty() {
         return Err(Box::new(envelope_request_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             "capability_not_available",
             format!(
-                "The requested {} are not available in this deployment.",
+                "This deployment does not provide the requested {}.",
                 envelope_request_field_list(&capability_fields)
             ),
             capability_fields,
         )));
     }
-    match broker.platform_safety_decision(envelope) {
-        Ok(Some(AdmissionDecision::Admit)) => Ok(()),
-        Ok(Some(AdmissionDecision::Reject { deltas })) => {
-            let fields = envelope_request_fields_for_deltas(&deltas);
-            Err(Box::new(envelope_request_error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "platform_safety_ceiling_exceeded",
-                format!(
-                    "The requested {} exceed the platform safety ceiling.",
-                    envelope_request_field_list(&fields)
-                ),
-                fields,
-            )))
-        }
-        Ok(None) => Err(Box::new(envelope_request_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "platform_safety_ceiling_unconfigured",
-            "This deployment does not accept requests above a template's limits.",
-            vec![EnvelopeRequestField::RequestedEnvelope],
-        ))),
-        Err(EnvelopeReviewBoundaryError::InvalidEnvelope) => {
-            Err(Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))
-        }
-    }
+    Ok(())
 }
 
 /// Server-side request broker. Every method receives the canonical browser subject derived by
@@ -1003,13 +954,6 @@ where
         _envelope: &Envelope,
     ) -> Vec<EnvelopeRequestField> {
         Vec::new()
-    }
-
-    fn platform_safety_decision(
-        &self,
-        _envelope: &Envelope,
-    ) -> Result<Option<AdmissionDecision>, EnvelopeReviewBoundaryError> {
-        Ok(Some(AdmissionDecision::Admit))
     }
 
     fn templates<'a>(
@@ -1082,7 +1026,7 @@ pub(crate) struct UserEnvelopeState<P> {
 }
 
 #[cfg(test)]
-fn inner_router<P, B>(broker: P) -> Router
+pub(crate) fn inner_router<P, B>(broker: P) -> Router
 where
     P: EnvelopeRequestBroker<B>,
     B: Clone + Eq + Hash + Send + Sync + 'static,
@@ -1371,7 +1315,7 @@ where
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 409, description = "Template revision conflicts"),
-        (status = 422, body = EnvelopeRequestErrorResponse, description = "Requested envelope is invalid or outside the deployment review boundary"),
+        (status = 422, body = EnvelopeRequestErrorResponse, description = "Requested envelope, justification, or reviewed capabilities are invalid"),
         (status = 503, description = "Envelope requests are unavailable")
     ),
     security(("browserSession" = []))
@@ -1446,12 +1390,7 @@ where
         Err(error) => return broker_error_response(error),
     };
     let template = match (body.template_id.as_deref(), body.template_revision) {
-        (None, None) => {
-            if let Err(response) = validate_review_boundary(&state.broker, &requested_envelope) {
-                return *response;
-            }
-            None
-        }
+        (None, None) => None,
         (Some(template_id), Some(template_revision)) => {
             match state
                 .broker
@@ -1491,12 +1430,6 @@ where
             Ok(AdmissionDecision::Admit) => true,
             Ok(AdmissionDecision::Reject { deltas }) => {
                 ceiling_exceedances = deltas;
-                if replayed_request.is_none()
-                    && let Err(response) =
-                        validate_review_boundary(&state.broker, &requested_envelope)
-                {
-                    return *response;
-                }
                 false
             }
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1513,6 +1446,23 @@ where
             }),
         )
             .into_response();
+    }
+    if !auto_provision && justification.is_none() {
+        return envelope_request_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "justification_required",
+            "Justification is required for requests that need administrator approval.",
+            vec![EnvelopeRequestField::Justification],
+        );
+    }
+    if !auto_provision
+        && let Err(response) = validate_capabilities(
+            &state.broker,
+            &state.workspace_capabilities,
+            &requested_envelope,
+        )
+    {
+        return *response;
     }
     match state
         .broker
@@ -1791,10 +1741,10 @@ mod tests {
 
     use super::{
         AvailableEnvelopeTemplate, EnvelopeRequestBroker, EnvelopeRequestBrokerError,
-        EnvelopeRequestField, EnvelopeRequestStatus, EnvelopeReviewBoundaryError,
-        PublishedWorkflowOption, UserEnvelopeMutationProof, UserEnvelopeRequest,
-        UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest, envelope_usage_view,
-        inner_router, inner_router_with_agents, inner_router_with_capabilities,
+        EnvelopeRequestField, EnvelopeRequestStatus, PublishedWorkflowOption,
+        UserEnvelopeMutationProof, UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject,
+        ValidatedEnvelopeRequest, envelope_usage_view, inner_router, inner_router_with_agents,
+        inner_router_with_capabilities,
     };
     use crate::connections::{
         ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionStartOperation,
@@ -1805,7 +1755,7 @@ mod tests {
         BoxFuture, ExecutionBindingAdvertisement, StewardRunRelease,
         StewardRunWorkflowInstallationMode,
     };
-    use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec};
+    use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
     use steward_store::{EnvelopeUsageRecord, WorkflowRevisionRecord};
     use steward_types::{CanonicalUserId, Email};
     use uuid::Uuid;
@@ -1814,8 +1764,8 @@ mod tests {
     struct TestBroker {
         create_owners: Arc<Mutex<Vec<CanonicalUserId>>>,
         replayed_request: Arc<Mutex<Option<UserEnvelopeRequest>>>,
-        custom_capabilities_valid: bool,
-        custom_platform_safety_valid: bool,
+        capability_violation_fields: Vec<EnvelopeRequestField>,
+        template_override: Option<AvailableEnvelopeTemplate>,
         steward_run_version: String,
         workflow_installation_mode: StewardRunWorkflowInstallationMode,
         task_identity_discovery_enabled: bool,
@@ -1826,8 +1776,8 @@ mod tests {
             Self {
                 create_owners: Arc::new(Mutex::new(Vec::new())),
                 replayed_request: Arc::new(Mutex::new(None)),
-                custom_capabilities_valid: true,
-                custom_platform_safety_valid: true,
+                capability_violation_fields: Vec::new(),
+                template_override: None,
                 steward_run_version: "0.7.6".to_owned(),
                 workflow_installation_mode: StewardRunWorkflowInstallationMode::Remote,
                 task_identity_discovery_enabled: false,
@@ -1862,27 +1812,7 @@ mod tests {
             &self,
             _envelope: &Envelope,
         ) -> Vec<EnvelopeRequestField> {
-            (!self.custom_capabilities_valid)
-                .then_some(EnvelopeRequestField::Llms)
-                .into_iter()
-                .collect()
-        }
-
-        fn platform_safety_decision(
-            &self,
-            _envelope: &Envelope,
-        ) -> Result<Option<AdmissionDecision>, EnvelopeReviewBoundaryError> {
-            Ok(Some(if self.custom_platform_safety_valid {
-                AdmissionDecision::Admit
-            } else {
-                AdmissionDecision::Reject {
-                    deltas: vec![AdmissionDelta::Budget {
-                        requested: "100.00".to_owned(),
-                        ceiling: "50.00".to_owned(),
-                        currency: "USD".to_owned(),
-                    }],
-                }
-            }))
+            self.capability_violation_fields.clone()
         }
 
         fn templates<'a>(
@@ -1890,7 +1820,8 @@ mod tests {
             _session: &'a UserEnvelopeSession<()>,
         ) -> BoxFuture<'a, Result<Vec<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>>
         {
-            Box::pin(async move { Ok(vec![template()]) })
+            let template = self.template_override.clone().unwrap_or_else(template);
+            Box::pin(async move { Ok(vec![template]) })
         }
 
         fn template<'a>(
@@ -1900,7 +1831,10 @@ mod tests {
             revision: i64,
         ) -> BoxFuture<'a, Result<Option<AvailableEnvelopeTemplate>, EnvelopeRequestBrokerError>>
         {
-            Box::pin(async move { Ok((template_id == "engineer" && revision == 3).then(template)) })
+            let template = self.template_override.clone().unwrap_or_else(template);
+            Box::pin(
+                async move { Ok((template_id == "engineer" && revision == 3).then_some(template)) },
+            )
         }
 
         fn list<'a>(
@@ -2396,6 +2330,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn within_template_request_on_an_empty_capability_catalog_provisions()
+    -> Result<(), String> {
+        let broker = TestBroker {
+            capability_violation_fields: vec![
+                EnvelopeRequestField::Llms,
+                EnvelopeRequestField::Tools,
+            ],
+            ..TestBroker::default()
+        };
+        let mut workspace_capabilities =
+            crate::tasks::TaskApiConfig::default().workspace_deployment_capabilities();
+        workspace_capabilities.enabled_types.clear();
+        let response = inner_router_with_capabilities(broker, Vec::new(), workspace_capabilities)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "templateId": "engineer",
+                            "templateRevision": 3,
+                            "requestedEnvelope": template().auto_provision_threshold,
+                            "idempotencyKey": "within-template-stale-catalog",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build within-template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit within-template request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read within-template response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse within-template response: {error}"))?;
+        assert_eq!(value["request"]["status"], "provisioned");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn within_template_request_with_a_stale_catalog_capability_provisions()
+    -> Result<(), String> {
+        let response = inner_router(TestBroker {
+            capability_violation_fields: vec![EnvelopeRequestField::Llms],
+            ..TestBroker::default()
+        })
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/envelope-requests")
+                .header("content-type", "application/json")
+                .extension(session()?)
+                .extension(UserEnvelopeMutationProof)
+                .body(Body::from(
+                    serde_json::json!({
+                        "templateId": "engineer",
+                        "templateRevision": 3,
+                        "requestedEnvelope": template().auto_provision_threshold,
+                        "idempotencyKey": "within-template-stale-model",
+                    })
+                    .to_string(),
+                ))
+                .map_err(|error| format!("build stale-catalog request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("submit stale-catalog request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read stale-catalog response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse stale-catalog response: {error}"))?;
+        assert_eq!(value["request"]["status"], "provisioned");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn custom_envelope_request_is_template_free_and_always_pending() -> Result<(), String> {
         let app = inner_router(TestBroker::default());
         let requested = template().auto_provision_threshold;
@@ -2412,6 +2427,7 @@ mod tests {
                         serde_json::json!({
                             "requestedEnvelope": requested,
                             "idempotencyKey": "custom-request-1",
+                            "justification": "Needed for a governed task",
                         })
                         .to_string(),
                     ))
@@ -2452,7 +2468,7 @@ mod tests {
         assert_eq!(partial.status(), StatusCode::BAD_REQUEST);
 
         let unavailable_capability_broker = TestBroker {
-            custom_capabilities_valid: false,
+            capability_violation_fields: vec![EnvelopeRequestField::Llms],
             ..TestBroker::default()
         };
         let unavailable_capability = inner_router(unavailable_capability_broker.clone())
@@ -2467,6 +2483,7 @@ mod tests {
                         serde_json::json!({
                             "requestedEnvelope": template().ceiling,
                             "idempotencyKey": "custom-unavailable-capability",
+                            "justification": "Needed for a governed task",
                         })
                         .to_string(),
                     ))
@@ -2499,11 +2516,78 @@ mod tests {
             "a capability-catalog rejection must not persist a request"
         );
 
-        let unsafe_authority_broker = TestBroker {
-            custom_platform_safety_valid: false,
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn requests_that_need_review_require_a_justification() -> Result<(), String> {
+        let mut above_template = template().ceiling;
+        above_template.spec.budget.monthly_limit = "101.00".to_owned();
+        for (body, idempotency_key) in [
+            (
+                serde_json::json!({
+                    "requestedEnvelope": template().ceiling,
+                    "idempotencyKey": "custom-without-justification",
+                }),
+                "custom-without-justification",
+            ),
+            (
+                serde_json::json!({
+                    "templateId": "engineer",
+                    "templateRevision": 3,
+                    "requestedEnvelope": above_template,
+                    "idempotencyKey": "exception-without-justification",
+                }),
+                "exception-without-justification",
+            ),
+        ] {
+            let response = inner_router(TestBroker::default())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/app/api/v1/envelope-requests")
+                        .header("content-type", "application/json")
+                        .extension(session()?)
+                        .extension(UserEnvelopeMutationProof)
+                        .body(Body::from(body.to_string()))
+                        .map_err(|error| format!("build {idempotency_key} request: {error}"))?,
+                )
+                .await
+                .map_err(|error| format!("submit {idempotency_key} request: {error}"))?;
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .map_err(|error| format!("read {idempotency_key} response: {error}"))?;
+            let value: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|error| format!("parse {idempotency_key} response: {error}"))?;
+            assert_eq!(value["error"], "justification_required");
+            assert_eq!(value["fields"], serde_json::json!(["justification"]));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn request_rejects_unavailable_model_tool_and_workspace_with_plain_fields()
+    -> Result<(), String> {
+        let broker = TestBroker {
+            capability_violation_fields: vec![
+                EnvelopeRequestField::Llms,
+                EnvelopeRequestField::Tools,
+            ],
             ..TestBroker::default()
         };
-        let unsafe_authority = inner_router(unsafe_authority_broker.clone())
+        let mut workspace_capabilities =
+            crate::tasks::TaskApiConfig::default().workspace_deployment_capabilities();
+        workspace_capabilities.enabled_types = vec!["scratch".to_owned()];
+        let mut requested = template().ceiling;
+        requested.spec.workspace = Some(WorkspaceAuthority {
+            allowed_types: vec![WorkspaceEntryType::Git],
+            max_total_size: Some(ResourceQuantity::parse("1Gi")?),
+            max_files: Some(1_000),
+            max_history_depth: Some(100),
+            max_submodule_depth: Some(1),
+        });
+        let response = inner_router_with_capabilities(broker, Vec::new(), workspace_capabilities)
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -2513,35 +2597,88 @@ mod tests {
                     .extension(UserEnvelopeMutationProof)
                     .body(Body::from(
                         serde_json::json!({
-                            "requestedEnvelope": template().ceiling,
-                            "idempotencyKey": "custom-over-platform-safety-ceiling",
+                            "requestedEnvelope": requested,
+                            "idempotencyKey": "unavailable-capabilities",
+                            "justification": "Needed for a governed task",
                         })
                         .to_string(),
                     ))
-                    .map_err(|error| format!("build unsafe custom request: {error}"))?,
+                    .map_err(|error| format!("build unavailable-capability request: {error}"))?,
             )
             .await
-            .map_err(|error| format!("submit unsafe custom request: {error}"))?;
-        assert_eq!(unsafe_authority.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let body = to_bytes(unsafe_authority.into_body(), 16 * 1024)
+            .map_err(|error| format!("submit unavailable-capability request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 16 * 1024)
             .await
-            .map_err(|error| format!("read unsafe custom response: {error}"))?;
+            .map_err(|error| format!("read unavailable-capability response: {error}"))?;
         let value: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|error| format!("parse unsafe custom response: {error}"))?;
-        assert_eq!(value["error"], "platform_safety_ceiling_exceeded");
-        assert_eq!(value["fields"], serde_json::json!(["budgetMonthlyLimit"]));
-        assert!(
-            value["failureReason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("monthly limit"))
+            .map_err(|error| format!("parse unavailable-capability response: {error}"))?;
+        assert_eq!(value["error"], "capability_not_available");
+        assert_eq!(
+            value["fields"],
+            serde_json::json!(["llms", "tools", "workspace"])
         );
-        assert!(
-            unsafe_authority_broker
-                .create_owners
-                .lock()
-                .map_err(|_| "lock unsafe-authority create calls")?
-                .is_empty(),
-            "a platform-safety rejection must not persist a request"
+        assert_eq!(
+            value["failureReason"],
+            "This deployment does not provide the requested models, tools, workspace."
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn template_without_runtime_limit_accepts_another_dimension_for_review()
+    -> Result<(), String> {
+        let mut unbounded_runtime_template = template();
+        unbounded_runtime_template
+            .ceiling
+            .spec
+            .runtime_minutes_limit = None;
+        if let Some(threshold) = unbounded_runtime_template.auto_provision_threshold.as_mut() {
+            threshold.spec.runtime_minutes_limit = None;
+        }
+        let mut requested = unbounded_runtime_template.ceiling.clone();
+        requested.spec.budget.monthly_limit = "101.00".to_owned();
+        let app = inner_router(TestBroker {
+            template_override: Some(unbounded_runtime_template),
+            ..TestBroker::default()
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/envelope-requests")
+                    .header("content-type", "application/json")
+                    .extension(session()?)
+                    .extension(UserEnvelopeMutationProof)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "templateId": "engineer",
+                            "templateRevision": 3,
+                            "requestedEnvelope": requested,
+                            "idempotencyKey": "unbounded-runtime-review",
+                            "justification": "Needed for a governed task",
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build unbounded-runtime request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit unbounded-runtime request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read unbounded-runtime response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse unbounded-runtime response: {error}"))?;
+        assert_eq!(value["request"]["status"], "pending");
+        assert_eq!(
+            value["request"]["ceilingExceedances"],
+            serde_json::to_value([AdmissionDelta::Budget {
+                requested: "101.00".to_owned(),
+                ceiling: "100.00".to_owned(),
+                currency: "USD".to_owned(),
+            }])
+            .map_err(|error| format!("serialize expected budget delta: {error}"))?
         );
         Ok(())
     }
@@ -2572,8 +2709,7 @@ mod tests {
             usage: None,
         };
         let broker = TestBroker {
-            custom_capabilities_valid: false,
-            custom_platform_safety_valid: false,
+            capability_violation_fields: vec![EnvelopeRequestField::Llms],
             ..TestBroker::default()
         };
         *broker
@@ -2995,6 +3131,7 @@ mod tests {
                     "templateRevision": 3,
                     "requestedEnvelope": excessive,
                     "idempotencyKey": "request-over-ceiling",
+                    "justification": "Needed for a governed task",
                 })
                 .to_string(),
             ))
@@ -3188,6 +3325,7 @@ mod tests {
                             "templateRevision": 3,
                             "requestedEnvelope": requested,
                             "idempotencyKey": "runtime-minutes-review",
+                            "justification": "Needed for a governed task",
                         })
                         .to_string(),
                     ))

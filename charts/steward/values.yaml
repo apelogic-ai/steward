@@ -186,8 +186,8 @@ config:
       models: []
       tools: []
       catalogs: []
-    # Optional hard ceiling for template-free user requests. When null, custom requests fail
-    # closed; when set, every request and later approval is checked against this current ceiling.
+    # Deprecated compatibility key. It is accepted but ignored in this release; administrator
+    # approval controls above-template and template-free requests. Remove it before the next release.
     customEnvelopeSafetyCeiling: null
     # Exact verified steward-run release coordinates selected by the installation BOM. Required
     # when browser administration is enabled; null keeps the source chart product-neutral.

@@ -73,6 +73,10 @@ After every apiserver and controller runs 0.3.0:
 6. Only then activate optional federated Task identity or active orchestration
    modes according to their dedicated guides.
 
+> Later-release note (2026-10-12): current Steward releases no longer apply the
+> deployment safety ceiling described above. It remains here because these are
+> the historical v0.3.0 rollout and verification instructions.
+
 ## Rollback boundary
 
 Disable optional v3 Task identity and stop new writers before rollback. A
