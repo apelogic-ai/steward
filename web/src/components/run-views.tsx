@@ -576,7 +576,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
   async function cancelRun() {
     if (session.status !== "authenticated") return;
     setCancelState("working");
-    const result = await cancelMyRun({ cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } });
+    const result = await cancelMyRun({ body: {} as never, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { task_uid: taskUid } });
     if (result.response?.status === 409) {
       window.location.reload();
       return;

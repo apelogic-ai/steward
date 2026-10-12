@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- Browser run cancellation and managed inference-key removal now preserve the required JSON
+  mutation proof when their request payload is empty.
 - User Envelope requests within a template still provision automatically. Requests above a
   template and complete template-free requests now remain pending for an administrator without a
   second platform safety ceiling. For requests that need review, model, tool, and workspace-type
