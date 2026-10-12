@@ -1,9 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-  compatibleAgents,
-  effectiveAgentSelection,
-  effectiveModelSelection,
   inlineFiles,
   packageLocatorForTask,
   runNowFailureMessage,
@@ -176,41 +173,5 @@ describe("Run now failures", () => {
 
     expect(message).toBe("The run request was rejected. Workspace history depth 25 exceeds the effective ceiling 10.");
     expect(message).not.toContain("example-org/repository");
-  });
-});
-
-describe("inline agent compatibility", () => {
-  test("only preselects agents whose model family is allowed by the selected envelope", () => {
-    const agents = compatibleAgents(["codex@0.140.0", "claude-code@2.1.222"], [
-      { provider: "openai", model: "gpt-5.4" },
-    ]);
-    expect(agents).toEqual([
-      { agentRef: "codex@0.140.0", model: { provider: "openai", model: "gpt-5.4" }, compatible: true, reason: null },
-      { agentRef: "claude-code@2.1.222", model: null, compatible: false, reason: "Requires an Anthropic model, which this Envelope does not allow." },
-    ]);
-    expect(effectiveAgentSelection(agents, "claude-code@2.1.222")).toEqual({
-      selected: agents[0],
-      warning: "claude-code@2.1.222 is not allowed by this Envelope. Using codex@0.140.0 instead.",
-    });
-  });
-
-  test("uses the configured model when allowed and warns on a compatible model fallback", () => {
-    const selectedAgent = {
-      agentRef: "codex@0.140.0",
-      model: { provider: "openai", model: "gpt-5.4" },
-      compatible: true,
-      reason: null,
-    };
-    const configured = { provider: "openai", model: "gpt-5.5" };
-    expect(effectiveModelSelection(configured, selectedAgent.agentRef, selectedAgent, [
-      selectedAgent.model,
-      configured,
-    ])).toEqual({ selected: configured, warning: null });
-    expect(effectiveModelSelection(configured, selectedAgent.agentRef, selectedAgent, [
-      selectedAgent.model,
-    ])).toEqual({
-      selected: selectedAgent.model,
-      warning: "openai/gpt-5.5 is not allowed by this Envelope. Using openai/gpt-5.4 instead.",
-    });
   });
 });

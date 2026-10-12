@@ -7,10 +7,10 @@ import {
   detectWorkflow,
   dispatchTask,
   getStarterTask,
+  getUserCapabilities,
   githubAutomationEvidence,
   githubRunStatus,
   githubTaskBundle,
-  listPublishedWorkflows,
   listTemplates,
   myRunExecutionLog,
   publishTask,
@@ -25,18 +25,23 @@ import {
   type GithubRunStatusResponse,
   type GithubTaskBundleResponse,
   type PublishTaskResponse,
-  type PublishedWorkflowsResponse,
   type StarterTaskSetting,
+  type UserCapabilitiesResponse,
   type WorkflowDetectionResponse,
 } from "@/api-client";
 import {
-  compatibleAgents,
-  effectiveAgentSelection,
-  effectiveModelSelection,
   inlineFiles,
   runNowFailureMessage,
 } from "@/components/browser-run-now-view";
 import { DiagnosticDetails } from "@/components/diagnostic-details";
+import {
+  compatibleAgents,
+  effectiveAgentSelection,
+  effectiveModelSelection,
+  ModelPicker,
+  preferredTaskModel,
+  type Model,
+} from "@/components/model-selection";
 import { parseRunEventData } from "@/components/run-views";
 import { formatDuration, formatMoney } from "@/components/presentation-values";
 import { PageHeader, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
@@ -46,9 +51,9 @@ import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
 type OnboardingData = OnboardingEvidence & {
+  capabilities: UserCapabilitiesResponse;
   templates: EnvelopeTemplatesResponse;
   starterTask: StarterTaskSetting;
-  workflows: PublishedWorkflowsResponse;
 };
 
 type InputRow = { id: string; name: string; value: string };
@@ -121,19 +126,19 @@ export function OnboardingView() {
   const [selectedRepositoryId, setSelectedRepositoryId] = useState("");
   const load = useCallback(async () => {
     void refresh;
-    const [evidence, templates, starterTask, workflows] = await Promise.all([
+    const [evidence, capabilities, templates, starterTask] = await Promise.all([
       loadOnboardingEvidence(),
+      getUserCapabilities({ cache: "no-store", credentials: "same-origin" }),
       listTemplates({ cache: "no-store", credentials: "same-origin" }),
       getStarterTask({ cache: "no-store", credentials: "same-origin" }),
-      listPublishedWorkflows({ cache: "no-store", credentials: "same-origin" }),
     ]);
-    const required = [evidence, templates, starterTask, workflows];
-    const data = evidence.data && templates.data && starterTask.data && workflows.data
+    const required = [evidence, capabilities, templates, starterTask];
+    const data = evidence.data && capabilities.data && templates.data && starterTask.data
       ? {
           ...evidence.data,
+          capabilities: capabilities.data,
           templates: templates.data,
           starterTask: starterTask.data.starterTask,
-          workflows: workflows.data,
         }
       : undefined;
     return { data, response: required.find((result) => !result.response?.ok)?.response ?? evidence.response };
@@ -165,6 +170,7 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
   const [selectedTemplateId, setSelectedTemplateId] = useState(data.templates.templates[0]?.id ?? "");
   const [selectedEnvelopeId, setSelectedEnvelopeId] = useState(provisionedRequest?.id ?? "");
   const [agentRef, setAgentRef] = useState(data.starterTask.taskDefinition.runtime.agentRef);
+  const [model, setModel] = useState<Model | null>(() => preferredTaskModel(data.starterTask.taskDefinition));
   const [prompt, setPrompt] = useState(data.starterTask.taskDefinition.promptText ?? "");
   const [checkoutRepository, setCheckoutRepository] = useState(false);
   const [historyDepth, setHistoryDepth] = useState("");
@@ -194,13 +200,11 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
     [readyRepository, repositoryList, selectedRepositoryId],
   );
   const envelope = selectedEnvelope?.approvedEnvelope ?? selectedEnvelope?.requestedEnvelope;
-  const agentOptions = compatibleAgents(data.workflows.agents.map((agent) => agent.agentRef), envelope?.spec.llms ?? []);
+  const agentOptions = compatibleAgents(data.capabilities.agents, envelope?.spec.llms ?? []);
   const { selected: selectedAgent, warning: agentWarning } = effectiveAgentSelection(agentOptions, agentRef);
   const { selected: selectedModel, warning: modelWarning } = effectiveModelSelection(
-    data.starterTask.taskDefinition.runtime.model ?? null,
-    data.starterTask.taskDefinition.runtime.agentRef,
+    model,
     selectedAgent,
-    envelope?.spec.llms ?? [],
   );
   const parsedHistoryDepth = historyDepth.trim() === "" ? undefined : Number(historyDepth);
   const historyDepthValid = parsedHistoryDepth === undefined || (Number.isSafeInteger(parsedHistoryDepth) && parsedHistoryDepth > 0);
@@ -467,9 +471,10 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
       status: successfulTestRun ? `Test run succeeded in ${runDuration(successfulTestRun.createdAt, successfulTestRun.updatedAt)} · ${successfulTestRun.observedSpend ? formatMoney(successfulTestRun.observedSpend.observedAmount, successfulTestRun.observedSpend.currency) : "spend not reported"}` : testRun ? `${testRun.phase} · ${testRun.taskUid}` : "Check the combination before wiring it into CI",
       body: <form className="space-y-4" onSubmit={(event) => void submitTestRun(event)}>
         <p className="text-sm text-muted-ink">Check the combination before wiring it into CI. This run is governed exactly like one started from GitHub.</p>
-        <div className="grid gap-4 md:grid-cols-3">
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           <div className="grid content-start gap-2 text-sm">{repositoryPicker("No GitHub repositories are visible to this connection.")}</div>
-          <label className="grid gap-2 text-sm font-semibold">Coding agent<select className={fieldClass} onChange={(event) => setAgentRef(event.target.value)} value={agentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.agentRef}{agent.compatible ? "" : " · unavailable"}</option>)}</select></label>
+          <label className="grid gap-2 text-sm font-semibold">Coding agent<select className={fieldClass} onChange={(event) => setAgentRef(event.target.value)} value={selectedAgent?.agentRef ?? ""}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.displayName ?? agent.agentRef} · {agent.agentRef}{agent.compatible ? "" : " · unavailable"}</option>)}</select></label>
+          <ModelPicker className={fieldClass} models={selectedAgent?.models ?? []} onChange={setModel} selected={selectedModel} />
           <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} onChange={(event) => setSelectedEnvelopeId(event.target.value)} value={selectedEnvelope?.id ?? ""}>{activeEnvelopes.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
         </div>
         {readinessFailure ? <p className="text-sm text-warn">{readinessFailure}</p> : null}
