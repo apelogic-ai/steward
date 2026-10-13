@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- Git workspaces with bounded history now accept the shallow-boundary packets emitted by Git
+  servers, so files-only and explicit-depth checkouts are no longer refused.
 - New Envelope templates now start with and validate a USD budget currency, so administrators can
   create the first template through the browser UI.
 - Browser run cancellation and managed inference-key removal now preserve the required JSON
