@@ -3937,7 +3937,8 @@ test("a running run shows both live logs and advances elapsed time", async ({ br
     },
   }]);
   try {
-    await developer.page.clock.install({ time: new Date("2026-08-24T17:02:05Z") });
+    await developer.page.clock.install({ time: new Date("2026-08-24T17:00:00Z") });
+    await developer.page.clock.pauseAt(new Date("2026-08-24T17:02:05Z"));
     await developer.page.goto(`${origin}/runs/${taskUid}?job=agent_execution`);
     await developer.page.getByText("Execution", { exact: true }).click();
 
@@ -3947,7 +3948,7 @@ test("a running run shows both live logs and advances elapsed time", async ({ br
     await expect(developer.page.getByText("Codex is working", { exact: true })).toBeVisible();
     await expect(developer.page.locator("article > header").getByText(/· 5 s$/)).toBeVisible();
 
-    await developer.page.clock.fastForward(2_000);
+    await developer.page.clock.runFor(2_000);
     await expect(developer.page.locator("article > header").getByText(/· 7 s$/)).toBeVisible();
 
     await developer.page.getByRole("tab", { name: "stdout" }).click();
