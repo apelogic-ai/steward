@@ -43,7 +43,7 @@ use steward_ports::{
     SandboxTaskRequest, SandboxTaskRuntime, SandboxTaskTranscript, TaskAttemptId,
 };
 use steward_store::{
-    AgentRunLogStream, BrowserMemberStateAction, BrowserMemberStateChange,
+    AgentRunLogStream, AgentRunTimelineKind, BrowserMemberStateAction, BrowserMemberStateChange,
     EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
     EnvelopeTemplatePublication, MAX_ACTIVE_BROWSER_TASKS_PER_USER, ManagedInferenceKeyCipher,
     PgStore, StoreError, TaskActivationObservation, TaskCleanupObservation,
@@ -4387,22 +4387,116 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         TaskOrchestrationState::Active
     );
 
+    let cancelled_attempt = match store
+        .claim_task_execution_attempt(
+            cancelled_task_uid,
+            &format!("sha256:{}", "d".repeat(64)),
+            &format!("sha256:{}", "e".repeat(64)),
+            "test-controller",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Created(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "cancelled execution attempt was not created: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    let cancelled_attempt = match store
+        .authorize_task_execution_start(
+            cancelled_attempt.attempt_id,
+            cancelled_attempt.generation,
+            "test-controller",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Applied(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "cancelled execution start was not authorized: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    let cancelled_attempt = match store
+        .record_task_execution_observation(
+            cancelled_attempt.attempt_id,
+            cancelled_attempt.generation,
+            TaskExecutionObservation::Running {
+                adapter_observation_id: "cancelled-running-attempt",
+                execution_stdout: Some(b"partial cancellation output"),
+                execution_stderr: Some(b""),
+            },
+            "test-controller",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Applied(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "cancelled execution was not recorded as running: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    assert_eq!(
+        store
+            .task(cancelled_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .phase,
+        TaskPhase::Running,
+        "the cancellation regression must exercise a running Task"
+    );
+
     let starts_before_cancellation = task_runtime.starts.load(Ordering::SeqCst);
     let cancelled = store
         .request_task_finalization(cancelled_task_uid, &service, identity.user_id.as_str())
         .await?;
     assert!(cancelled.cancel_requested);
-    assert_eq!(cancelled.phase, TaskPhase::Cancelled);
-    reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    assert_eq!(cancelled.phase, TaskPhase::Running);
+    let cancellation_event = store
+        .agent_run_timeline(cancelled_task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("cancelled Task timeline is absent"))?
+        .into_iter()
+        .find(|event| event.kind == AgentRunTimelineKind::FinalizationRequested)
+        .ok_or_else(|| io::Error::other("cancellation request time was not recorded"))?;
+    assert!(!cancellation_event.at.is_empty());
     assert_eq!(
-        operation(&store, cancelled_task_uid).await?.state,
+        cancelled.owner_user_id.as_deref(),
+        Some(identity.user_id.as_str()),
+        "the cancelled Task must retain its canonical owner"
+    );
+    let fenced_attempt = store
+        .task_execution_attempt(cancelled_task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("cancelled execution attempt is absent"))?;
+    assert_eq!(fenced_attempt.attempt_id, cancelled_attempt.attempt_id);
+    assert_eq!(
+        fenced_attempt.state,
+        steward_store::TaskExecutionAttemptState::CancelPending
+    );
+    reconcile_current(&client, &task_runtime, &store, cancelled_task_uid).await?;
+    let cancelled_operation = operation(&store, cancelled_task_uid).await?;
+    assert_eq!(
+        cancelled_operation.state,
         TaskOrchestrationState::CleanupPending,
         "cancellation must establish persisted cleanup authority before deletion"
     );
+    assert_eq!(cancelled_operation.last_error_code, None);
+    let cancelled_after_observation = store
+        .task(cancelled_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(cancelled_after_observation.phase, TaskPhase::Cancelled);
+    assert_eq!(cancelled_after_observation.failure_reason, None);
     assert_eq!(
         task_runtime.starts.load(Ordering::SeqCst),
         starts_before_cancellation,
-        "a cancelled queued Task must not begin execution"
+        "a cancelled running Task must not be started again"
     );
     assert!(
         kubernetes
