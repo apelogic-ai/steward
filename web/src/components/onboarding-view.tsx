@@ -419,7 +419,7 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
       setRunState("idle");
       return;
     }
-    setRunFailure(runNowFailureMessage(result.error));
+    setRunFailure(runNowFailureMessage(result.error, undefined, result.response?.status));
     setRunState("error");
   }
 

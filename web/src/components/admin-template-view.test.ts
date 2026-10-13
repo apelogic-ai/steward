@@ -53,6 +53,28 @@ describe("first envelope template", () => {
     expect(templateMemberRoles(["analyst", "reviewer"])).toEqual(["analyst", "reviewer"]);
   });
 
+  test("requires an explicit runner platform before submission", () => {
+    const envelope = authoredEnvelope();
+    envelope.spec.runner.platforms = [];
+
+    expect(validateTemplateFields({
+      allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
+      allowedTools: new Set(),
+      displayName: "Engineering",
+      envelope,
+      memberRoles: ["engineer"],
+      models: envelope.spec.llms,
+      monthlyLimit: "10.00",
+      requireRunnerPlatform: true,
+      singleRunLimit: "1.00",
+      templateId: "engineer",
+      tools: [],
+      workspace: undefined,
+    })).toEqual({
+      platforms: "Choose at least one runner platform.",
+    });
+  });
+
   test("reports each invalid authored field without reducing it to one rejection", () => {
     const errors = validateTemplateFields({
       allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),

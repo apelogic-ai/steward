@@ -2741,6 +2741,7 @@ test("plain-language pages show names, limits, reasons, and least-authority temp
 
     await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("reviewer");
+    await administrator.page.getByRole("checkbox", { name: "Linux" }).check();
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/envelopes/templates/reviewer?saved=new`);
     await expect(administrator.page.getByText("Template revision saved.", { exact: true })).toBeVisible();
@@ -4526,6 +4527,7 @@ test("administrator templates and approvals use typed browser authority", async 
     });
     expect(templateMutation.body).not.toHaveProperty("autoProvisionThreshold");
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("reviewer");
+    await administrator.page.getByRole("checkbox", { name: "Linux" }).check();
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
     await expect.poll(() => administrator.mutations.some((mutation) => mutation.path === "/admin/api/v1/envelope-templates/reviewer")).toBe(true);
     const copiedTemplate = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/reviewer");
@@ -4602,6 +4604,7 @@ test("administrator creates the first template with a valid budget currency", as
     await administrator.page.getByRole("spinbutton", { name: /^Limit per run/ }).fill("1.00");
     await administrator.page.getByRole("spinbutton", { name: /^Monthly limit/ }).fill("10.00");
     await administrator.page.getByRole("spinbutton", { name: /^Time-to-live limit/ }).fill("15");
+    await administrator.page.getByRole("checkbox", { name: "Linux" }).check();
     await administrator.page.getByRole("button", { name: "Create template" }).click();
 
     await expect(administrator.page).toHaveURL(`${origin}/admin/envelopes/templates/engineer`);
@@ -4654,6 +4657,7 @@ test("new template requires explicit eligibility and identifies invalid fields",
     await expect(administrator.page.getByText("Enter a monthly limit.")).toBeVisible();
     await expect(administrator.page.getByText("Enter a time-to-live limit.")).toBeVisible();
     await expect(administrator.page.getByText("Select at least one model.")).toBeVisible();
+    await expect(administrator.page.getByText("Choose at least one runner platform.")).toBeVisible();
     await expect(administrator.page.getByText(/The server rejected the template/)).toHaveCount(0);
     expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
 
@@ -4667,6 +4671,7 @@ test("new template requires explicit eligibility and identifies invalid fields",
     const models = administrator.page.getByRole("combobox", { name: "Models" });
     await models.fill("provider-a/model-a");
     await models.press("Enter");
+    await administrator.page.getByRole("checkbox", { name: "Linux" }).check();
     await administrator.page.getByRole("button", { name: "Create template" }).click();
 
     await expect(administrator.page.getByText("The template couldn't be saved. Check the fields and try again.")).toBeVisible();
@@ -4763,6 +4768,7 @@ test("administrator can revise and copy a ten-grant template listed in the capab
     expect(revised.body.envelope.spec.tools).toEqual(githubReadTools.map(({ accessClass: _accessClass, ...tool }) => tool));
 
     await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("engineer");
+    await administrator.page.getByRole("checkbox", { name: "Linux" }).check();
     await administrator.page.getByRole("button", { name: "Save as new" }).click();
     await expect.poll(() => administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/engineer")).toBeTruthy();
     const copied = administrator.mutations.find((mutation) => mutation.path === "/admin/api/v1/envelope-templates/engineer");

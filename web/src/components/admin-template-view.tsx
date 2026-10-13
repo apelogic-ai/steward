@@ -28,7 +28,7 @@ import { useSession } from "@/session/session-context";
 
 type TemplateMutationState = "idle" | "saving" | "saved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
 
-type TemplateField = "templateId" | "displayName" | "memberRoles" | "currency" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "memory" | "compute" | "storage" | "models" | "tools" | "workspace";
+type TemplateField = "templateId" | "displayName" | "memberRoles" | "currency" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "platforms" | "memory" | "compute" | "storage" | "models" | "tools" | "workspace";
 
 export type TemplateFieldErrors = Partial<Record<TemplateField, string>>;
 
@@ -177,6 +177,7 @@ export function validateTemplateFields({
   memberRoles,
   models,
   monthlyLimit,
+  requireRunnerPlatform = false,
   singleRunLimit,
   templateId,
   tools,
@@ -189,6 +190,7 @@ export function validateTemplateFields({
   memberRoles: Array<string>;
   models: Array<ModelRef>;
   monthlyLimit: string;
+  requireRunnerPlatform?: boolean;
   singleRunLimit: string;
   templateId: string;
   tools: Array<ToolGrant>;
@@ -210,6 +212,7 @@ export function validateTemplateFields({
   if (!envelope.spec.ttl) errors.ttl = "Enter a time-to-live limit.";
   else if (durationSeconds(envelope.spec.ttl) === null) errors.ttl = "Choose a non-negative number and unit.";
   if (envelope.spec.runtimeMinutesLimit && !validDecimal(envelope.spec.runtimeMinutesLimit)) errors.runtimeMinutes = decimalMessage;
+  if (requireRunnerPlatform && !envelope.spec.runner?.platforms?.length) errors.platforms = "Choose at least one runner platform.";
   for (const resource of ["memory", "compute", "storage"] as const) {
     const value = envelope.spec.runner?.[resource];
     if (value && runnerQuantity(value, resource) === null) errors[resource] = resource === "compute"
@@ -624,6 +627,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       memberRoles: selectedRoles,
       models,
       monthlyLimit,
+      requireRunnerPlatform: create || saveAsNew,
       singleRunLimit,
       templateId,
       tools,
@@ -722,8 +726,8 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         <FormSection description="Repository packages remain available when inline authoring is disabled." title="Browser execution">
           <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={allowInlineBrowserTasks} onChange={(event) => setAllowInlineBrowserTasks(event.target.checked)} type="checkbox" />Allow inline browser-authored packages</label>
         </FormSection>
-        <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner">
-          <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset>
+        <FormSection description="Choose at least one platform. Leave resources blank to use platform defaults." title="Runner">
+          <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" onChange={() => clearFieldError("platforms")} type="checkbox" value={platform} />{platform}</label>)}</div><FieldError message={fieldErrors.platforms} /><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset>
         </FormSection>
         {status !== "idle" && status !== "saving" ? <div className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}><p>{mutationMessage(status)}</p><DiagnosticDetails className="mt-1" items={diagnostics} /></div> : null}
         <footer className="sticky bottom-0 flex flex-wrap items-center justify-between gap-4 border-t bg-subtle px-6 py-4"><p className="text-sm text-muted-ink">{formatCount(models.length, "model")} · {formatCount(tools.length, "tool")} · Limit per run: {singleRunLimit ? formatMoney(singleRunLimit, budgetCurrency) : "—"}</p><div className="flex gap-3"><Link className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold" href="/admin/envelopes/templates">Cancel</Link><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="create">{status === "saving" ? "Saving…" : "Create template"}</button></div></footer>
@@ -757,7 +761,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
 
       <FormSection description="Choose the workspace types this template allows. Operational limits come from the deployment." title="Workspace access">{workspaceControls}</FormSection>
 
-      <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
+      <FormSection description="Choose the platforms this template allows. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" onChange={() => clearFieldError("platforms")} type="checkbox" value={platform} />{platform}</label>)}</div><FieldError message={fieldErrors.platforms} /><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
 
       {status !== "idle" && status !== "saving" ? (
         <div className={status === "saved" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "saved" ? "status" : "alert"}><p>{mutationMessage(status)}</p><DiagnosticDetails className="mt-1" items={diagnostics} /></div>

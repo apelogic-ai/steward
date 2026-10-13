@@ -106,16 +106,18 @@ function alreadyHasNextStep(reason: string): boolean {
 }
 
 export function runNowFailureMessage(error: unknown, workspaceRepository?: string, status?: number): string {
-  if (status === 503) return "The run service is unavailable. Try again in a moment.";
-  if (!error || typeof error !== "object") return genericRunNowFailure;
+  if (!error || typeof error !== "object") return status === 503
+    ? "The run service is unavailable. Try again in a moment."
+    : genericRunNowFailure;
   const value = error as Record<string, unknown>;
   const code = typeof value.error === "string" && value.error.trim() ? value.error : null;
   const reason = typeof value.failureReason === "string" && value.failureReason.trim()
     ? value.failureReason
     : null;
+  const hint = failureHint(code, reason ?? "");
+  if (hint) return `The run request was rejected. ${hint}`;
+  if (status === 503) return "The run service is unavailable. Try again in a moment.";
   if (reason) {
-    const hint = failureHint(code, reason);
-    if (hint) return `The run request was rejected. ${hint}`;
     const repository = workspaceRepository
       && repositoryWorkspaceFailure(reason)
       && !reason.toLocaleLowerCase("en-US").includes(workspaceRepository.toLocaleLowerCase("en-US"))

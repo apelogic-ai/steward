@@ -13,6 +13,10 @@ test("Get started explains why an agent is unavailable", () => {
   expect(source).not.toContain('agent.compatible ? "" : " · unavailable"');
 });
 
+test("Get started classifies test-run failures with the response status", () => {
+  expect(source).toContain("runNowFailureMessage(result.error, undefined, result.response?.status)");
+});
+
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
     codingAgentRuntime: "codex@0.140.0",

@@ -136,10 +136,17 @@ test("exact Tasks preserve inline bytes but use only immutable locators for Git 
 });
 
 describe("Run now failures", () => {
-  test("distinguishes a temporarily unavailable service from a rejected request", () => {
+  test("preserves permanent configuration guidance before a generic 503 retry", () => {
     expect(runNowFailureMessage({
       error: "task.runtime_contract_unavailable",
       failureReason: "logical agent codex has no deployment execution binding",
+    }, undefined, 503)).toBe("The run request was rejected. Ask an administrator to configure this coding agent, or choose another agent.");
+    expect(runNowFailureMessage({
+      error: "task.direct_package_source_disabled",
+      failureReason: "Direct package source resolution is disabled.",
+    }, undefined, 503)).toBe("The run request was rejected. Choose an inline task or ask an administrator to enable GitHub source packages.");
+    expect(runNowFailureMessage({
+      error: "task.runtime_contract_unavailable",
     }, undefined, 503)).toBe("The run service is unavailable. Try again in a moment.");
   });
 
