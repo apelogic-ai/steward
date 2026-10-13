@@ -120,6 +120,8 @@ function areaLocator(page, area) {
     case "Monthly limit":
     case "Runtime limit per month":
       return fieldLocator(page, area).locator("xpath=ancestor::label[1]");
+    case "Access":
+      return page.locator("dt").filter({ hasText: /^Access$/ }).first().locator("xpath=following-sibling::dd[1]");
     case "Tools":
     case "Workspace access":
       return page.getByRole("heading", { name: area, exact: true }).first().locator("xpath=ancestor::section[1]");
@@ -188,14 +190,7 @@ async function ensureExtendedTemplate(page, name) {
   const envelope = structuredClone(standard.ceiling);
   envelope.revision = 1;
   envelope.spec.llms = compatibleModels.slice(0, needed);
-  envelope.spec.tools = [];
-  envelope.spec.runner = { compute: null, memory: null, platforms: ["linux"], storage: null };
-  if (name === "basic") {
-    envelope.spec.budget = { currency: standard.ceiling.spec.budget.currency, monthlyLimit: "20.00", singleRunLimit: "0.75" };
-    envelope.spec.ttl = "15m";
-    delete envelope.spec.runtimeMinutesLimit;
-    delete envelope.spec.workspace;
-  }
+  delete envelope.spec.workspace;
   await mutationJson(page, `/admin/api/v1/envelope-templates/${encodeURIComponent(templateId(name))}`, "PUT", {
     allowInlineBrowserTasks: true,
     displayName: `${runPrefix} ${name.charAt(0).toUpperCase()}${name.slice(1)}`,
@@ -252,11 +247,13 @@ async function recordInitialRuns(journey, page) {
   journey.initialRunIds = new Set((await userRuns(page)).map((run) => run.taskUid));
 }
 
-async function provisionExtendedEnvelope(page, name) {
+async function provisionExtendedEnvelope(journey, page, name) {
   const template = await ensureExtendedTemplate(page, name);
+  const requestedEnvelope = structuredClone(template.ceiling);
+  requestedEnvelope.spec.runtimeMinutesLimit = journey.runRuntimeMinutes;
   const response = await mutationJson(page, "/app/api/v1/envelope-requests", "POST", {
     idempotencyKey: crypto.randomUUID(),
-    requestedEnvelope: template.ceiling,
+    requestedEnvelope,
     templateId: template.id,
     templateRevision: template.revision,
   });
@@ -345,8 +342,27 @@ async function openExecutionStage(page) {
   if (await logStep.count() && !(await logStep.getAttribute("open"))) await logStep.locator("summary").click();
 }
 
-function decimalBelow(value, decrement) {
-  return Math.max(0, Number(value) - decrement).toFixed(2);
+function decimalBelow(value, label) {
+  const match = /^(0|[1-9][0-9]*)(?:\.([0-9]{1,6}))?$/.exec(value);
+  expect(match, `${label} should use the authority decimal syntax`).toBeTruthy();
+  const fractional = match[2] ?? "";
+  const scale = 10n ** BigInt(fractional.length);
+  const units = BigInt(match[1]) * scale + BigInt(fractional || "0");
+  expect(units > 0n, `${label} must be positive so a lower requirement exists`).toBeTruthy();
+  const lower = units / 2n;
+  if (fractional.length === 0) return lower.toString();
+  const whole = lower / scale;
+  const remainder = (lower % scale).toString().padStart(fractional.length, "0").replace(/0+$/, "");
+  return remainder ? `${whole}.${remainder}` : whole.toString();
+}
+
+function durationBelow(value) {
+  const match = /^([1-9][0-9]*)([smh])$/.exec(value);
+  expect(match, "the Envelope time-to-live limit should use seconds, minutes, or hours").toBeTruthy();
+  const multipliers = { s: 1, m: 60, h: 3_600 };
+  const seconds = Number(match[1]) * multipliers[match[2]];
+  expect(seconds, "the Envelope time-to-live limit must allow a lower positive duration").toBeGreaterThan(1);
+  return `${Math.floor(seconds / 2)}s`;
 }
 
 async function fillEnvelopeRequirements(journey, page, boundary) {
@@ -358,10 +374,10 @@ async function fillEnvelopeRequirements(journey, page, boundary) {
     authority: {
       budget: {
         currency: spec.budget.currency,
-        monthlyLimit: atLimit ? spec.budget.monthlyLimit : decimalBelow(spec.budget.monthlyLimit, 1),
+        monthlyLimit: atLimit ? spec.budget.monthlyLimit : decimalBelow(spec.budget.monthlyLimit, "monthly limit"),
         singleRunLimit: spec.budget.singleRunLimit == null
           ? null
-          : atLimit ? spec.budget.singleRunLimit : decimalBelow(spec.budget.singleRunLimit, 0.25),
+          : atLimit ? spec.budget.singleRunLimit : decimalBelow(spec.budget.singleRunLimit, "limit per run"),
       },
       llms: spec.llms,
       runner: {
@@ -371,9 +387,11 @@ async function fillEnvelopeRequirements(journey, page, boundary) {
         storage: atLimit ? spec.runner?.storage ?? null : null,
       },
       tools: atLimit ? spec.tools : [],
-      ttl: atLimit ? spec.ttl : "10m",
+      ttl: atLimit ? spec.ttl : durationBelow(spec.ttl),
       ...(spec.runtimeMinutesLimit == null ? {} : {
-        runtimeMinutesLimit: atLimit ? spec.runtimeMinutesLimit : String(Math.max(0, Number(spec.runtimeMinutesLimit) - 1)),
+        runtimeMinutesLimit: atLimit
+          ? spec.runtimeMinutesLimit
+          : decimalBelow(spec.runtimeMinutesLimit, "runtime-minutes limit"),
       }),
     },
   };
@@ -588,7 +606,8 @@ When("I open {string}", async ({ journey, page }, destination) => {
     await page.getByRole("button", { name, exact: true }).click();
     return;
   }
-  await page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name, exact: true }).click();
+  const linkName = name === "Get started" ? /^Get started(?:\s+\d+\/\d+)?$/ : name;
+  await page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: linkName, exact: name !== "Get started" }).click();
   if (name === "Templates") {
     await waitForTemplateList(page);
     const initialCount = await prefixedTemplateRows(page).count();
@@ -665,7 +684,11 @@ Then("I see {string}", async ({ journey, page }, text) => {
     await expect(term.locator("xpath=following-sibling::dd[1]")).toHaveText(value);
     return;
   }
-  await expect(page.getByText(expected, { exact: false }).first()).toBeVisible();
+  await expect(exact).toBeVisible();
+});
+
+Then("I see the text fragment {string}", async ({ journey, page }, text) => {
+  await expect(page.getByText(resolveText(journey, text), { exact: false }).first()).toBeVisible();
 });
 
 Then("I do not see {string}", async ({ journey, page }, text) => {
@@ -691,6 +714,12 @@ Then("{string} is disabled", async ({ journey, page }, field) => {
     return;
   }
   await expect(fieldLocator(page, field)).toBeDisabled();
+});
+
+Then("the disabled agent {string} says {string}", async ({ journey, page }, agent, text) => {
+  const option = fieldLocator(page, "Coding agent").locator("option").filter({ hasText: resolveText(journey, agent) });
+  await expect(option).toBeDisabled();
+  await expect(option).toContainText(resolveText(journey, text));
 });
 
 When("I tick {string}", async ({ page }, field) => {
@@ -845,7 +874,7 @@ Given("I hold no Envelope", async ({ journey, page }) => {
 
 Given("I hold an Envelope from the template {string}", async ({ journey, page }, name) => {
   let request = await requestForTemplate(page, name, "provisioned");
-  if (!request && journey.extended) request = await provisionExtendedEnvelope(page, name);
+  if (!request && journey.extended) request = await provisionExtendedEnvelope(journey, page, name);
   expect(request, `a provisioned Envelope from ${templateId(name)} should exist`).toBeTruthy();
   journey.currentTemplate = name;
   journey.requests.set(name, request);
@@ -940,6 +969,25 @@ Then("the run output contains {string}", async ({ journey, page }, expected) => 
     throw new Error("[steward-known-failure:#464] The run succeeded without the agent finding the repository checkout.");
   }
   expect(output).toContain(expectedOutput);
+});
+
+Then("the run records coding agent {string} and model {string}", async ({ journey, page }, agent, model) => {
+  expect(journey.run?.taskUid, "a completed run should be recorded before checking its execution choice").toBeTruthy();
+  const expectedAgent = resolveText(journey, agent);
+  const [expectedProvider, expectedModel] = resolveText(journey, model).split("/");
+  expect(expectedProvider && expectedModel, "the expected model should use provider/model form").toBeTruthy();
+  expect(journey.run.codingAgentRuntime, "the run record should keep the chosen coding agent").toBe(expectedAgent);
+  const response = await apiJson(page, `/app/api/v1/runs/${encodeURIComponent(journey.run.taskUid)}/package`);
+  const packagePath = journey.run.package?.path;
+  expect(packagePath, "the completed inline run should identify its package definition").toBeTruthy();
+  const definitionText = response.files?.[packagePath];
+  expect(definitionText, `the completed run package should contain ${packagePath}`).toBeTruthy();
+  const definition = JSON.parse(definitionText);
+  expect(definition.runtime?.agentRef, "the run package should keep the chosen coding agent").toBe(expectedAgent);
+  expect(definition.runtime?.model, "the run package should keep the chosen model").toEqual({
+    provider: expectedProvider,
+    model: expectedModel,
+  });
 });
 
 Then(/^the spend of the run is above ([0-9]+(?:\.[0-9]+)?) ([A-Z]{3})$/, async ({ journey, page }, minimumText, unit) => {

@@ -15,11 +15,12 @@ Feature: J7 - User watches and stops a run
 
   # Steps 1 to 7 and "Done when".
   # 0.3.16: FAIL at step 3 (N-07) and FAIL at step 5 (N-05).
-  @needs-model @known-failing-0.3.16
+  @needs-model @known-failing-407
   Scenario: Watch a run, cancel it and see what was captured and spent
     When I open "Runs"
     And I press "Run now"
-    And I type "Print one line every 10 s for 2 min." into "Prompt"
+    And I choose "standard" in "Envelope"
+    And I type "Print one line every 10 s for 2 min, then write the complete transcript to out/result.txt." into "Prompt"
     And I tick "Capture execution log"
     And I press "Run now"
     Then I see the status "Running"
@@ -54,7 +55,8 @@ Feature: J7 - User watches and stops a run
   Scenario: Variant - a run left to finish has a complete log
     When I open "Runs"
     And I press "Run now"
-    And I type "Print one line every 10 s for 2 min." into "Prompt"
+    And I choose "standard" in "Envelope"
+    And I type "Print one line every 10 s for 2 min, then write the complete transcript to out/result.txt." into "Prompt"
     And I tick "Capture execution log"
     And I press "Run now"
     Then the run ends as "succeeded" within 4 min
@@ -67,6 +69,7 @@ Feature: J7 - User watches and stops a run
   Scenario: A run started without log capture says so
     When I open "Runs"
     And I press "Run now"
+    And I choose "standard" in "Envelope"
     And I untick "Capture execution log"
     And I press "Run now"
     Then the run ends as "succeeded" within 2 min
@@ -76,7 +79,7 @@ Feature: J7 - User watches and stops a run
 
   # F2. The Markdown does not say when a run rightly cannot be cancelled.
   # 0.3.16: the owner of the run sees "You don't have permission to cancel this run." (N-05).
-  @needs-model @known-failing-0.3.16
+  @needs-model @known-failing-407
   Scenario: A run that cannot be cancelled says why and what to do
     Given I am on the page of a run that cannot be cancelled
     When I open "More run actions"
@@ -86,7 +89,7 @@ Feature: J7 - User watches and stops a run
 
   # F3. The run failed before the agent started.
   # 0.3.16: only "Agent execution — Failed" and "The captured stdout log is empty." (N-02, N-04).
-  @known-failing-0.3.16
+  @known-failing-407
   Scenario: A run that fails before the agent starts gives a reason
     Given I have a run that ended as "failed" without a captured execution log
     When I open "Runs"

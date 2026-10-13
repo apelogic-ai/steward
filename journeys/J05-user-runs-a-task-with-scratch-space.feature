@@ -14,7 +14,7 @@ Feature: J5 - User runs a Task with scratch space
 
   # Steps 1 to 5 and "Done when".
   # 0.3.16: FAIL at step 5 (N-04).
-  @needs-model @known-failing-0.3.16
+  @needs-model @known-failing-407
   Scenario: Run a Task that writes to scratch space and reads it back
     When I open "Tasks"
     And I press "New Task"
@@ -40,7 +40,7 @@ Feature: J5 - User runs a Task with scratch space
 
   # F1, F2 and the first case of F3.
   # 0.3.16: the decision is right, but each text is wrapped (N-03).
-  @known-failing-0.3.16
+  @known-failing-407
   Scenario Outline: Scratch space the Envelope cannot give is refused: <case>
     Given I hold an Envelope from the template "<template>"
     When I open "Tasks"
@@ -65,7 +65,7 @@ Feature: J5 - User runs a Task with scratch space
 
   # F3, second case.
   # 0.3.16: the decision is right, but the text is wrapped (N-03).
-  @known-failing-0.3.16
+  @known-failing-407
   Scenario: Scratch space that uses the whole allowance next to a Git entry is refused
     When I open "Tasks"
     And I press "New Task"

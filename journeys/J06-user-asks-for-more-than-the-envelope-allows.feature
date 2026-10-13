@@ -1,6 +1,6 @@
 # Source: user journey J6. Original product findings were recorded against version 0.3.16.
-# Example limits of the "basic" Envelope: 20.00 USD per month, 0.75 USD per run,
-# 15 min per run, 3 tools, Linux. The "timed" Envelope allows 60 min of runtime per month.
+# The "basic" Envelope narrows the run's standard template to one model and no workspace.
+# The "timed" Envelope allows 60 min of runtime per month.
 Feature: J6 - User asks for more than their Envelope allows in a Task
   As a user who writes a Task that states its own needs
   I want to learn before anything starts that the Task asks for too much
@@ -42,7 +42,7 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
   # every refusal must say what to do next.
   # The sentences are the EXPECTED plain wording. 0.3.16 shows
   # 'The run request was rejected. Admission("...")' with "$25" and "20m" (N-03).
-  @known-failing-0.3.16
+  @known-failing-407
   Scenario Outline: A need above the Envelope's limit is refused before anything starts: <requirement>
     When I open "Tasks"
     And I press "New Task"
@@ -71,7 +71,7 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
 
   # F1. 0.3.16: "Steward rejected this package. Check its paths, Task definition,
   # skills, workspace, outputs, and requirements." (J6 F1; no finding number).
-  @known-failing-0.3.16
+  @known-failing-407
   Scenario: Requirements that are not valid are refused with what is wrong
     When I open "Tasks"
     And I press "New Task"

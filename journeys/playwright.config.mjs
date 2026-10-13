@@ -32,7 +32,6 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   timeout: 360_000,
-  navigationTimeout: 30_000,
   expect: { timeout: 10_000 },
   reporter: execution === "known-failing"
     ? [["list"], ["json", { outputFile: resolve("target/journeys/known-failing-report.json") }]]
@@ -43,6 +42,7 @@ export default defineConfig({
     browserName: "chromium",
     headless: true,
     ignoreHTTPSErrors: process.env.STEWARD_JOURNEY_IGNORE_HTTPS_ERRORS === "true",
+    navigationTimeout: 30_000,
     screenshot: "only-on-failure",
     storageState: process.env.STEWARD_JOURNEY_STORAGE_STATE,
     trace: "retain-on-failure",

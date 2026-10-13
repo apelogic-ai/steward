@@ -33,9 +33,9 @@ Feature: J8 - User chooses agent and model
     And I do not see "<provider-a>/<model-a>" in "Model"
     When I choose "basic" in "Envelope"
     Then "<Agent B>" is disabled
-    And I see "This Envelope does not allow a model supported by this coding agent."
-    And I see "is not compatible with this Envelope."
-    And I see "you can choose another."
+    And the disabled agent "<Agent B>" says "This Envelope does not allow a model supported by this coding agent."
+    And I see the text fragment "is not compatible with this Envelope."
+    And I see the text fragment "you can choose another."
     And the field "Coding agent" shows "<Agent A>"
     And "Run now" is enabled
     When I choose "broad" in "Envelope"
@@ -43,7 +43,7 @@ Feature: J8 - User chooses agent and model
     And I choose "<provider-b>/<model-b>" in "Model"
     And I press "Run now"
     Then the run ends as "succeeded" within 2 min
-    And I see "<Agent B>"
+    And the run records coding agent "<Agent B>" and model "<provider-b>/<model-b>"
     When I open "Tasks"
     And I press "New Task"
     And I type "Agent choice" into "Name"
@@ -70,12 +70,11 @@ Feature: J8 - User chooses agent and model
     Then the drop-down "Coding agent" offers "<Agent B>"
     When I choose "basic" in "Envelope"
     Then "<Agent B>" is disabled
-    # The greyed agent reads "… · unavailable" on this screen.
-    And I see "unavailable"
+    And the disabled agent "<Agent B>" says "This Envelope does not allow a model supported by this coding agent."
 
   # F1. 0.3.16: refused and nothing is created, but the text is wrapped and the
   # sentence that says what to do is not shown (N-03).
-  @known-failing-0.3.16
+  @known-failing-407
   Scenario: A saved Task whose model the Envelope does not allow is refused
     Given I have a saved Task named "Agent choice" with the coding agent "<Agent B>" and the model "<provider-b>/<model-b>"
     When I open "Tasks"
