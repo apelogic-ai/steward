@@ -46,9 +46,9 @@ use steward_store::{
     AgentRunLogStream, BrowserMemberStateAction, BrowserMemberStateChange,
     EnvelopeRequestReservationRequest, EnvelopeRequestStatus, EnvelopeRequestStatusUpdate,
     EnvelopeTemplatePublication, MAX_ACTIVE_BROWSER_TASKS_PER_USER, ManagedInferenceKeyCipher,
-    PgStore, StoreError, TaskActivationObservation, TaskExecutionObservation,
-    TaskExecutionTransition, TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest,
-    WorkflowPublication,
+    PgStore, StoreError, TaskActivationObservation, TaskCleanupObservation,
+    TaskExecutionObservation, TaskExecutionTransition, TaskOperationTransition,
+    TaskOrchestrationMode, TaskOrchestrationState, TaskReservationRequest, WorkflowPublication,
 };
 use steward_types::direct_package::{
     BrowserTaskEvidence, ClosureEntry, ClosureEntryKind, ContentDigest, DiagnosticsRequest,
@@ -1149,6 +1149,7 @@ async fn browser_task_rows_persist_and_concurrency_is_bounded_without_breaking_e
         "https://github.com/example-org/agentic-ops.git",
         Some(format!("git:sha1:{}", "e".repeat(40))),
     )?;
+    let mut submission_failure_task_uid = None;
     for (kind, evidence) in [
         ("inline", &inline_evidence),
         ("repository", &repository_evidence),
@@ -1174,6 +1175,9 @@ async fn browser_task_rows_persist_and_concurrency_is_bounded_without_breaking_e
             .task_by_idempotency(&service, identity.user_id.as_str(), &key)
             .await?
             .ok_or("browser package Task was not persisted")?;
+        if kind == "inline" {
+            submission_failure_task_uid = Some(persisted.task_uid);
+        }
         assert_eq!(persisted.task_origin, TaskOrigin::Browser);
         assert!(persisted.direct_task_evidence.is_none());
         assert_eq!(persisted.browser_task_evidence.as_ref(), Some(evidence));
@@ -1239,6 +1243,69 @@ async fn browser_task_rows_persist_and_concurrency_is_bounded_without_breaking_e
     )
     .await;
     assert_eq!(rejected, Err(StoreError::BrowserTaskConcurrencyLimit));
+
+    let submission_failure_task_uid =
+        submission_failure_task_uid.ok_or("submission failure Task was not captured")?;
+    let failure_reason =
+        "Workspace materialized size is more than the 8 bytes this Envelope allows.";
+    let failed = store
+        .fail_task_submission(
+            submission_failure_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            failure_reason,
+        )
+        .await?;
+    assert_eq!(failed.phase, TaskPhase::Failed);
+    assert_eq!(failed.failure_reason.as_deref(), Some(failure_reason));
+    assert!(failed.finalize_requested);
+    assert!(!failed.execute_requested);
+    let cleanup_pending = store
+        .task_runtime_operation(submission_failure_task_uid)
+        .await?
+        .ok_or("failed Task operation was not retained")?;
+    assert_eq!(
+        cleanup_pending.state,
+        TaskOrchestrationState::CleanupPending
+    );
+    assert_eq!(
+        cleanup_pending.last_error_code.as_deref(),
+        Some("task_submission_failed")
+    );
+    let cleanup = store
+        .record_task_cleanup_complete(
+            submission_failure_task_uid,
+            cleanup_pending.generation,
+            TaskCleanupObservation {
+                exact_runtime_absent: false,
+            },
+            "test-controller",
+        )
+        .await?;
+    assert!(matches!(cleanup, TaskOperationTransition::Applied(_)));
+    assert!(
+        store
+            .task(submission_failure_task_uid)
+            .await?
+            .ok_or("failed Task disappeared after cleanup")?
+            .finalized
+    );
+    assert!(
+        reserve_browser_concurrency_fixture(
+            &store,
+            &format!("browser-limit-task-{suffix}-after-cleanup"),
+            &service,
+            &identity,
+            &envelope_instance_id,
+            &envelope_digest,
+            &envelope,
+            &spec,
+            &execution_binding,
+            &evidence,
+        )
+        .await?,
+        "completed cleanup must release the browser concurrency slot"
+    );
     Ok(())
 }
 

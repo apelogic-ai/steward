@@ -12,7 +12,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Run-request refusals and temporary unavailability now return stable error codes separately from
   their plain-language failure reasons.
 - A failed workspace-source download now immediately fails the reserved run with its source cause,
-  prevents runtime provisioning, and records the source-operation failure.
+  prevents runtime provisioning, and records the source-operation failure. Browser submission and
+  the Task-input upload handler return the same bounded 503 explanation.
 - New Envelope templates now start with and validate a USD budget currency, so administrators can
   create the first template through the browser UI.
 - Browser run cancellation and managed inference-key removal now preserve the required JSON
