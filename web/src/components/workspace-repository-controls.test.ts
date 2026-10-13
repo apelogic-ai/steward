@@ -52,8 +52,8 @@ test("updating a named checkout preserves its other authority and sibling entrie
 test("existing stable-ID, self, trigger, and exact-commit forms remain distinguishable", () => {
   expect(matchingWorkspaceRepository({ ownerId: "1000", repositoryId: "1001" }, [repository])).toBeNull();
   expect(matchingWorkspaceRepository("self", [repository])).toBeNull();
-  expect(readableWorkspaceRef("trigger")).toBeNull();
-  expect(readableWorkspaceRef(`git:sha1:${"a".repeat(40)}`)).toBeNull();
+  expect(readableWorkspaceRef("trigger")).toBe("trigger");
+  expect(readableWorkspaceRef(`git:sha1:${"a".repeat(40)}`)).toBe(`git:sha1:${"a".repeat(40)}`);
   expect(readableWorkspaceRef("git:ref:main")).toBe("main");
   expect(canonicalWorkspaceRef("git:ref:main")).toBe("git:ref:main");
 });
@@ -74,10 +74,18 @@ test("clearing and retyping a ref keeps the empty draft without rewriting the wo
   expect(JSON.parse(retyped.workspace ?? "null")[0].git.ref).toBe("git:ref:release-v1");
 });
 
-test("the branch or tag field rejects trigger and exact-commit selectors", () => {
+test("the branch or tag field rejects selectors that are not valid named refs", () => {
   expect(validWorkspaceBranchOrTag("main")).toBeTrue();
   expect(validWorkspaceBranchOrTag("git:ref:main")).toBeTrue();
   expect(validWorkspaceBranchOrTag("trigger")).toBeFalse();
+  expect(validWorkspaceBranchOrTag("HEAD")).toBeFalse();
+  expect(validWorkspaceBranchOrTag("deadbee")).toBeFalse();
+  expect(validWorkspaceBranchOrTag("feature..branch")).toBeFalse();
+  expect(validWorkspaceBranchOrTag("feature\u0085branch")).toBeFalse();
+  expect(validWorkspaceBranchOrTag("a".repeat(512))).toBeTrue();
+  expect(validWorkspaceBranchOrTag("a".repeat(513))).toBeFalse();
+  expect(validWorkspaceBranchOrTag("é".repeat(256))).toBeTrue();
+  expect(validWorkspaceBranchOrTag("é".repeat(257))).toBeFalse();
   expect(validWorkspaceBranchOrTag(`git:sha1:${"a".repeat(40)}`)).toBeFalse();
 });
 
@@ -97,4 +105,21 @@ test("the Task editor control offers admitted repositories and preserves a legac
   expect(html).toContain("Branch or tag");
   expect(html).toContain("example-org/repository");
   expect(html).toContain("repository and revision selection remains unchanged");
+});
+
+test("the Task editor shows the trigger selector instead of the repository default", () => {
+  const html = renderToStaticMarkup(createElement(WorkspaceRepositoryControls, {
+    onChange: () => undefined,
+    repositories: [repository],
+    value: JSON.stringify([{
+      git: {
+        repository: "example-org/repository",
+        ref: "trigger",
+      },
+    }]),
+  }));
+
+  expect(html).toContain('value="trigger"');
+  expect(html).not.toContain('value="main"');
+  expect(html).toContain("Workspace entry example-org/repository accepts trigger");
 });

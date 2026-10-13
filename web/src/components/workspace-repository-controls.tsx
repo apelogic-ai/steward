@@ -60,16 +60,21 @@ export function canonicalWorkspaceRef(value: string): string {
 
 export function validWorkspaceBranchOrTag(value: string): boolean {
   const trimmed = value.trim();
-  return Boolean(trimmed)
-    && trimmed !== "trigger"
-    && trimmed !== "git:ref:"
-    && !trimmed.startsWith("git:sha1:");
+  if (trimmed === "trigger") return false;
+  const explicit = trimmed.startsWith("git:ref:");
+  if (trimmed.startsWith("git:") && !explicit) return false;
+  const reference = explicit ? trimmed.slice("git:ref:".length) : trimmed;
+  if (!reference || new TextEncoder().encode(reference).byteLength > 512 || reference.startsWith("-") || reference.endsWith("/")) return false;
+  if (!explicit && (reference === "HEAD" || (/^[0-9a-f]{7,40}$/i).test(reference))) return false;
+  return !reference.includes("..")
+    && !reference.includes("@{")
+    && !reference.includes("\\")
+    && !(/[\u0000-\u0020\u007f-\u009f]/u).test(reference);
 }
 
 export function readableWorkspaceRef(value: unknown): string | null {
   if (typeof value !== "string") return null;
   if (value.startsWith("git:ref:")) return value.slice("git:ref:".length);
-  if (value === "trigger" || value.startsWith("git:sha1:")) return null;
   return value;
 }
 
@@ -136,12 +141,14 @@ export function WorkspaceRepositoryControls({
     draft: derivedReference,
   }));
   const reference = referenceEdit.source === value ? referenceEdit.draft : derivedReference;
-  const preservesLegacySelector = Boolean(selection && (!matched || !currentReference));
+  const preservesLegacySelector = Boolean(selection && (!matched || !validWorkspaceBranchOrTag(reference)));
 
   function selectRepository(repositoryId: string) {
     const repository = repositories.find((candidate) => candidate.repositoryId === repositoryId);
     if (!repository) return;
-    const draft = currentReference ?? repository.defaultBranch;
+    const draft = currentReference && validWorkspaceBranchOrTag(currentReference)
+      ? currentReference
+      : repository.defaultBranch;
     const next = updateWorkspaceRepository(value, repository, draft);
     if (next) {
       setReferenceEdit({ source: next, draft });
@@ -167,7 +174,7 @@ export function WorkspaceRepositoryControls({
       <input className={`${fieldClass} font-mono`} disabled={!matched} onChange={(event) => selectReference(event.target.value)} placeholder={matched?.defaultBranch ?? "Choose a repository first"} value={reference} />
     </label>
     {!entries ? <p className="text-sm text-err md:col-span-2" role="alert">Workspace must be a valid JSON array before using the repository picker.</p> : null}
-    {matched && !validWorkspaceBranchOrTag(reference) ? <p className="text-sm text-err md:col-span-2" role="alert">Enter a branch or tag name.</p> : null}
+    {matched && !validWorkspaceBranchOrTag(reference) ? <p className="text-sm text-err md:col-span-2" role="alert">Workspace entry {workspaceRepositoryName(matched)} accepts trigger, a full git:sha1 commit, or a branch or tag in JSON. Enter a branch or tag other than HEAD or a commit ID in this field.</p> : null}
     {preservesLegacySelector ? <p className="text-xs text-muted-ink md:col-span-2">The existing repository and revision selection remains unchanged until you choose a repository and branch or tag.</p> : null}
   </div>;
 }
