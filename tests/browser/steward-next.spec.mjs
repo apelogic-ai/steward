@@ -1250,6 +1250,7 @@ async function guardedPage(browser, {
       const task = {
         taskId,
         contentDigest,
+        preferredEnvelopeDigest: body.preferredEnvelopeDigest ?? null,
         files: body.files,
         name: definition.name,
         version: definition.version,
@@ -3444,6 +3445,64 @@ test("a Task draft remains saveable without an active Envelope or model", async 
     const save = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/tasks");
     const definition = JSON.parse(save.body.files[browserTaskDefinitionPath]);
     expect(definition.runtime).toEqual({ agentRef: "codex@0.140.0" });
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("new Tasks use the configured runtime and saved Tasks reuse their Envelope", async ({ browser }) => {
+  const preferredEnvelope = {
+    ...structuredClone(envelopeRequest),
+    id: "00000000-0000-0000-0000-000000000007",
+    envelopeDigest: `sha256:${"7".repeat(64)}`,
+    envelopeInstanceId: "runtime-example-7",
+    templateId: "analyst",
+    templateRevision: 2,
+  };
+  preferredEnvelope.requestedEnvelope.spec.llms = [{ provider: "provider-a", model: "model-a" }];
+  preferredEnvelope.approvedEnvelope.spec.llms = [{ provider: "provider-a", model: "model-a" }];
+  const configuredStarter = structuredClone(starterTaskFixture);
+  configuredStarter.taskDefinition.runtime = {
+    agentRef: "claude-code@2.1.222",
+    model: { provider: "provider-a", model: "model-a" },
+  };
+  const developer = await guardedPage(browser, {
+    starterTask: configuredStarter,
+    taskLibraryMutable: true,
+    userEnvelopeRequests: [envelopeRequest, preferredEnvelope],
+  });
+  try {
+    await developer.page.goto(`${origin}/tasks/new`);
+    await expect(developer.page.getByLabel("Coding agent")).toHaveValue("claude-code@2.1.222");
+    await expect(developer.page.getByLabel("Model", { exact: true })).toHaveValue(
+      JSON.stringify(["provider-a", "model-a"]),
+    );
+    await expect(developer.page.getByText(/Keep current:/)).toHaveCount(0);
+    await expect(developer.page.getByText(/is not available with the selected Envelope/)).toHaveCount(0);
+
+    await developer.page.getByLabel("Envelope").selectOption(preferredEnvelope.id);
+    await developer.page.getByLabel("Name").fill("preferred-envelope");
+    await developer.page.getByRole("button", { name: "Save version 1" }).click();
+
+    const save = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/tasks");
+    expect(save.body.preferredEnvelopeDigest).toBe(`steward:${preferredEnvelope.envelopeDigest}`);
+    const savedDigest = `steward:sha256:${"1".repeat(64)}`;
+    await expect(developer.page).toHaveURL(`${origin}/tasks/${encodeURIComponent(savedDigest)}`);
+    await developer.page.getByRole("link", { name: "Run", exact: true }).click();
+    await expect(developer.page.getByRole("combobox", { name: "Envelope", exact: true })).toHaveValue(preferredEnvelope.id);
+
+    await developer.page.goto(`${origin}/tasks/${encodeURIComponent(savedDigest)}/edit`);
+    await expect(developer.page.getByText("Save immutable version 2.", { exact: false })).toBeVisible();
+    await developer.page.getByRole("combobox", { name: "Envelope", exact: true }).selectOption(envelopeRequest.id);
+    await developer.page.getByRole("button", { name: "Save version 2" }).click();
+
+    const saves = developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/tasks");
+    expect(saves).toHaveLength(2);
+    expect(saves[1].body.preferredEnvelopeDigest).toBe(`steward:${envelopeRequest.envelopeDigest}`);
+    const revisedDigest = `steward:sha256:${"2".repeat(64)}`;
+    await expect(developer.page).toHaveURL(`${origin}/tasks/${encodeURIComponent(revisedDigest)}`);
+    await developer.page.getByRole("link", { name: "Run", exact: true }).click();
+    await expect(developer.page.getByRole("combobox", { name: "Envelope", exact: true })).toHaveValue(envelopeRequest.id);
   } finally {
     await closeGuardedPage(developer);
   }
