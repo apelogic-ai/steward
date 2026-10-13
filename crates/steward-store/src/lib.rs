@@ -3258,13 +3258,20 @@ impl PgStore {
         if exhausted
             && sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS ( \
-                    SELECT 1 FROM inference_exhaustions \
-                    WHERE runtime_uid = $1 AND observed_generation = $2 AND spec_digest = $3 \
+                    SELECT 1 FROM ( \
+                        SELECT exhaustion.id \
+                        FROM inference_exhaustions exhaustion \
+                        WHERE exhaustion.runtime_uid = $1 \
+                        ORDER BY exhaustion.at DESC, exhaustion.id DESC LIMIT 1 \
+                    ) latest \
+                    LEFT JOIN envelope_instance_grants grants \
+                      ON grants.escalation_id = latest.id \
+                    LEFT JOIN cumulative_escalation_denials denials \
+                      ON denials.escalation_id = latest.id \
+                    WHERE grants.id IS NULL AND denials.escalation_id IS NULL \
                 )",
             )
             .bind(runtime_uid)
-            .bind(observed_generation)
-            .bind(spec_digest)
             .fetch_one(&mut *transaction)
             .await
             .map_err(database_error)?
@@ -3326,6 +3333,36 @@ impl PgStore {
              FROM inference_exhaustions \
              WHERE runtime_uid = $1 \
              ORDER BY at DESC, id DESC \
+             LIMIT 1",
+        )
+        .bind(runtime_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .map(|row| {
+            Ok(steward_types::SpendSummary {
+                observed_amount: row.try_get("observed_amount").map_err(database_error)?,
+                currency: row.try_get("currency").map_err(database_error)?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn pending_inference_exhaustion(
+        &self,
+        runtime_uid: &str,
+    ) -> Result<Option<steward_types::SpendSummary>, StoreError> {
+        sqlx::query(
+            "SELECT latest.observed_amount::text AS observed_amount, latest.currency \
+             FROM ( \
+                 SELECT exhaustion.* FROM inference_exhaustions exhaustion \
+                 WHERE exhaustion.runtime_uid = $1 \
+                 ORDER BY exhaustion.at DESC, exhaustion.id DESC LIMIT 1 \
+             ) latest \
+             LEFT JOIN envelope_instance_grants grants ON grants.escalation_id = latest.id \
+             LEFT JOIN cumulative_escalation_denials denials ON denials.escalation_id = latest.id \
+             WHERE true \
+               AND grants.id IS NULL AND denials.escalation_id IS NULL \
              LIMIT 1",
         )
         .bind(runtime_uid)

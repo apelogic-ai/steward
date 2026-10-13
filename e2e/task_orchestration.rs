@@ -2684,8 +2684,8 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .bind(&cleanup_runtime_uid)
         .fetch_one(&pool)
         .await?,
-        2,
-        "new authority after a top-up must be able to record its own later exhaustion"
+        1,
+        "an undecided exhaustion must remain one suspension episode across spec changes"
     );
     assert_eq!(
         store
@@ -3008,6 +3008,38 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
     assert_eq!(decided.grant_id, Some(grant.id));
     assert_eq!(decided.limit, "125.00");
     assert_eq!(decided.grant_active, Some(true));
+
+    store
+        .record_spend_observation(
+            &runtime_uid,
+            1,
+            "immutable-runtime-spec",
+            &SpendSummary {
+                observed_amount: "130.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            true,
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM inference_exhaustions WHERE runtime_uid = $1",
+        )
+        .bind(&runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        2,
+        "a resumed runtime must record a second exhaustion after its first escalation is granted"
+    );
+    let resumed_exhaustion = store
+        .admin_escalations()
+        .await?
+        .into_iter()
+        .find(|record| record.runtime_uid == runtime_uid && record.dimension == "llm_spend")
+        .ok_or_else(|| io::Error::other("resumed exhaustion was not projected"))?;
+    assert_ne!(resumed_exhaustion.escalation_id, escalation.escalation_id);
+    assert_eq!(resumed_exhaustion.grant_id, None);
+    assert_eq!(resumed_exhaustion.denial_rationale, None);
 
     let historical_archive = task_output_archive(&[
         ("out/report.md", b"historical output"),
