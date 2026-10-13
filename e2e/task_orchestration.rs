@@ -5031,6 +5031,26 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         envelope.spec.runtime_minutes_limit, None,
         "a per-Task cap must not depend on an Envelope monthly runtime allowance"
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM runtime_minute_observations WHERE envelope_instance_id = $1",
+        )
+        .bind(&envelope_instance_id)
+        .fetch_one(&pool)
+        .await?,
+        0,
+        "a per-Task cap must not create instance-wide runtime observations"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM runtime_minute_exhaustions WHERE envelope_instance_id = $1",
+        )
+        .bind(&envelope_instance_id)
+        .fetch_one(&pool)
+        .await?,
+        0,
+        "a per-Task cap must not create instance-wide runtime exhaustion"
+    );
     reconcile_current(&client, &task_runtime, &store, limited_task_uid).await?;
     let limited_deleting_runtime = kubernetes
         .runtime
