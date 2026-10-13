@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useState, type FormEvent } from "react";
 
 import {
@@ -11,7 +11,6 @@ import {
   type BrowserCapabilityCatalogResponse,
   type BrowserEnvelope,
   type BrowserEnvelopeTemplateResponse,
-  type CapabilityCatalog,
   type ModelRef,
   type RunnerPlatform,
   type ToolGrant,
@@ -29,7 +28,7 @@ import { useSession } from "@/session/session-context";
 
 type TemplateMutationState = "idle" | "saving" | "saved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
 
-type TemplateField = "templateId" | "displayName" | "memberRoles" | "currency" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "memory" | "compute" | "storage" | "models" | "tools" | "workspace";
+type TemplateField = "templateId" | "displayName" | "memberRoles" | "currency" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "platforms" | "memory" | "compute" | "storage" | "models" | "tools" | "workspace";
 
 export type TemplateFieldErrors = Partial<Record<TemplateField, string>>;
 
@@ -63,7 +62,7 @@ export const initialEnvelopeTemplate: BrowserEnvelope = {
     tools: [],
     runtimeMinutesLimit: "",
     ttl: "",
-    runner: { platforms: ["linux"] },
+    runner: { platforms: [] },
   },
 };
 
@@ -162,9 +161,8 @@ function isAutoProvisionThreshold(value: unknown): value is BrowserEnvelope | nu
   return value === undefined || value === null || isBrowserEnvelope(value);
 }
 
-export function templateMemberRoles(templateId: string, memberRoles: Array<string>, rolesEdited: boolean): Array<string> {
-  const normalizedTemplateId = templateId.trim();
-  return !rolesEdited && normalizedTemplateId ? [normalizedTemplateId] : memberRoles;
+export function templateMemberRoles(memberRoles: Array<string>): Array<string> {
+  return memberRoles;
 }
 
 export function templateBudgetCurrency(template: BrowserEnvelope): string {
@@ -179,6 +177,7 @@ export function validateTemplateFields({
   memberRoles,
   models,
   monthlyLimit,
+  requireRunnerPlatform = false,
   singleRunLimit,
   templateId,
   tools,
@@ -191,6 +190,7 @@ export function validateTemplateFields({
   memberRoles: Array<string>;
   models: Array<ModelRef>;
   monthlyLimit: string;
+  requireRunnerPlatform?: boolean;
   singleRunLimit: string;
   templateId: string;
   tools: Array<ToolGrant>;
@@ -212,6 +212,7 @@ export function validateTemplateFields({
   if (!envelope.spec.ttl) errors.ttl = "Enter a time-to-live limit.";
   else if (durationSeconds(envelope.spec.ttl) === null) errors.ttl = "Choose a non-negative number and unit.";
   if (envelope.spec.runtimeMinutesLimit && !validDecimal(envelope.spec.runtimeMinutesLimit)) errors.runtimeMinutes = decimalMessage;
+  if (requireRunnerPlatform && !envelope.spec.runner?.platforms?.length) errors.platforms = "Choose at least one runner platform.";
   for (const resource of ["memory", "compute", "storage"] as const) {
     const value = envelope.spec.runner?.[resource];
     if (value && runnerQuantity(value, resource) === null) errors[resource] = resource === "compute"
@@ -349,14 +350,8 @@ function modelLabel(model: ModelRef, choices: Array<ModelRef>): string {
     : display;
 }
 
-function initialTemplateForCatalog(capabilities: CapabilityCatalog): BrowserEnvelope {
-  return {
-    ...initialEnvelopeTemplate,
-    spec: {
-      ...initialEnvelopeTemplate.spec,
-      llms: capabilities.models.slice(0, 1),
-    },
-  };
+function initialTemplateForCatalog(): BrowserEnvelope {
+  return initialEnvelopeTemplate;
 }
 
 function toolValue(tool: ToolGrant): string {
@@ -402,7 +397,7 @@ function AuthenticatedTemplateList() {
           <Link className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas" href="/admin/envelopes/provision">Provision envelope</Link>
           <Link className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand shadow-sm hover:bg-brand-strong" href="/admin/envelopes/templates/new">Create template</Link>
         </div>}
-        description="Requests within these limits are approved automatically. Anything above goes to the approval queue. Each save creates a new immutable revision."
+        description="Requests within these limits are approved automatically. Anything above goes to the approval queue. Each save creates a new revision without changing earlier ones."
         title="Envelope templates"
       />
       <ResourceBoundary state={acceptedState}>{({ templates }) => templates.length === 0 ? (
@@ -468,7 +463,7 @@ function AuthenticatedTemplateDetail({ csrf, memberRole }: Readonly<{ csrf: stri
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader
         actions={<Link className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas" href="/admin/envelopes/templates">All templates</Link>}
-        description="Inspect the current immutable revision and author a successor."
+        description="Inspect the current revision and create the next one."
         title="Envelope template"
       />
       <ResourceBoundary state={acceptedState}>{({ allowInlineBrowserTasks, displayName: templateDisplayName, envelope, memberRoles }) => (
@@ -524,8 +519,8 @@ function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
           memberRole=""
           memberRoles={[]}
           templateDisplayName=""
-          template={initialTemplateForCatalog(capabilities)}
-          allowInlineBrowserTasks
+          template={initialTemplateForCatalog()}
+          allowInlineBrowserTasks={false}
         />
       )}</ResourceBoundary>
     </section>
@@ -534,12 +529,13 @@ function AuthenticatedNewTemplate({ csrf }: Readonly<{ csrf: string }>) {
 
 function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTasks, capabilities, create = false, csrf, memberRole, memberRoles, templateDisplayName, template }: Readonly<{ allowInlineBrowserTasks: boolean; capabilities: BrowserCapabilityCatalogResponse; create?: boolean; csrf: string; memberRole: string; memberRoles: Array<string>; templateDisplayName: string; template: BrowserEnvelope }>) {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const budgetCurrency = templateBudgetCurrency(template);
   const modelCatalog = capabilities.models;
   const allowedModels = new Set(modelCatalog.map(modelKey));
   const toolCatalog = capabilities.tools;
   const allowedTools = new Set(toolCatalog.map(toolKey));
-  const [status, setStatus] = useState<TemplateMutationState>("idle");
+  const [status, setStatus] = useState<TemplateMutationState>(searchParams.get("saved") === "new" ? "saved" : "idle");
   const [diagnostics, setDiagnostics] = useState<DiagnosticItem[]>([]);
   const [fieldErrors, setFieldErrors] = useState<TemplateFieldErrors>({});
   const [currentRevision, setCurrentRevision] = useState(template.revision);
@@ -561,7 +557,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
   const [allowInlineBrowserTasks, setAllowInlineBrowserTasks] = useState(initialAllowInlineBrowserTasks);
   const [workspaceDraft, setWorkspaceDraft] = useState(() => workspaceAuthorityDraft(template.spec.workspace, capabilities.workspace?.enabledTypes));
   const parsedRoles = [...new Set(roles.split(",").map((role) => role.trim()).filter(Boolean))].sort();
-  const selectedRoles = templateMemberRoles(templateIdDraft, parsedRoles, rolesEdited);
+  const selectedRoles = templateMemberRoles(parsedRoles);
   const missingModels = models.filter((model) => !allowedModels.has(modelKey(model)));
   const missingTools = tools.filter((tool) => !allowedTools.has(toolKey(tool)));
   const modelOptions = [...modelCatalog, ...missingModels].map((model) => ({
@@ -631,6 +627,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       memberRoles: selectedRoles,
       models,
       monthlyLimit,
+      requireRunnerPlatform: create || saveAsNew,
       singleRunLimit,
       templateId,
       tools,
@@ -659,7 +656,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       setCurrentRevision(result.data.envelope.revision);
       if (!create && !saveAsNew) setPreviousTools(dedupeToolGrants(result.data.envelope.spec.tools));
       setStatus("saved");
-      if (create || saveAsNew) router.push(`/admin/envelopes/templates/${encodeURIComponent(templateId)}`);
+      if (create || saveAsNew) router.push(`/admin/envelopes/templates/${encodeURIComponent(templateId)}${saveAsNew ? "?saved=new" : ""}`);
       return;
     }
     setStatus(classifyMutationFailure(result.response?.status));
@@ -684,7 +681,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
     return (
       <form className="overflow-hidden rounded-card border bg-panel" noValidate onSubmit={submit}>
         {limitsHelp}
-        <FormSection description="The template ID. Users with this role can request against it." title="Member role">
+        <FormSection description="Choose a template ID, then add every member role that can request it." title="Member roles">
           <div className="grid gap-4 sm:grid-cols-3">
             <label className="grid gap-2 text-sm font-semibold">Template ID<input aria-invalid={Boolean(fieldErrors.templateId)} className={`${fieldClass} font-mono`} name="newTemplateId" onChange={(event) => { setTemplateIdDraft(event.target.value); clearFieldError("templateId"); if (!rolesEdited) clearFieldError("memberRoles"); }} placeholder="developer" required value={templateIdDraft} /><FieldError message={fieldErrors.templateId} /></label>
             <label className="grid gap-2 text-sm font-semibold">Display name<input aria-invalid={Boolean(fieldErrors.displayName)} className={fieldClass} name="displayName" onChange={(event) => { setName(event.target.value); clearFieldError("displayName"); }} required value={name} /><FieldError message={fieldErrors.displayName} /></label>
@@ -729,8 +726,8 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         <FormSection description="Repository packages remain available when inline authoring is disabled." title="Browser execution">
           <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={allowInlineBrowserTasks} onChange={(event) => setAllowInlineBrowserTasks(event.target.checked)} type="checkbox" />Allow inline browser-authored packages</label>
         </FormSection>
-        <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner">
-          <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset>
+        <FormSection description="Choose at least one platform. Leave resources blank to use platform defaults." title="Runner">
+          <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" onChange={() => clearFieldError("platforms")} type="checkbox" value={platform} />{platform}</label>)}</div><FieldError message={fieldErrors.platforms} /><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset>
         </FormSection>
         {status !== "idle" && status !== "saving" ? <div className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}><p>{mutationMessage(status)}</p><DiagnosticDetails className="mt-1" items={diagnostics} /></div> : null}
         <footer className="sticky bottom-0 flex flex-wrap items-center justify-between gap-4 border-t bg-subtle px-6 py-4"><p className="text-sm text-muted-ink">{formatCount(models.length, "model")} · {formatCount(tools.length, "tool")} · Limit per run: {singleRunLimit ? formatMoney(singleRunLimit, budgetCurrency) : "—"}</p><div className="flex gap-3"><Link className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold" href="/admin/envelopes/templates">Cancel</Link><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="create">{status === "saving" ? "Saving…" : "Create template"}</button></div></footer>
@@ -764,7 +761,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
 
       <FormSection description="Choose the workspace types this template allows. Operational limits come from the deployment." title="Workspace access">{workspaceControls}</FormSection>
 
-      <FormSection description="Optional. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" type="checkbox" value={platform} />{platform}</label>)}</div><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
+      <FormSection description="Choose the platforms this template allows. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" onChange={() => clearFieldError("platforms")} type="checkbox" value={platform} />{platform}</label>)}</div><FieldError message={fieldErrors.platforms} /><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
 
       {status !== "idle" && status !== "saving" ? (
         <div className={status === "saved" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "saved" ? "status" : "alert"}><p>{mutationMessage(status)}</p><DiagnosticDetails className="mt-1" items={diagnostics} /></div>

@@ -15,8 +15,9 @@ use steward_admission::{
     AdmissionDecision, Envelope, add_budget_amount, envelope_is_within, validate_envelope,
 };
 use steward_store::{
-    EnvelopeRequestRecord, EnvelopeRequestReservationRequest, EnvelopeRequestStatusEventRecord,
-    EnvelopeRequestStatusUpdate, EnvelopeUsageRecord, PgStore, StoreError, WorkflowRevisionRecord,
+    CanonicalUserRecord, EnvelopeRequestRecord, EnvelopeRequestReservationRequest,
+    EnvelopeRequestStatusEventRecord, EnvelopeRequestStatusUpdate, EnvelopeTemplateRevisionRecord,
+    EnvelopeUsageRecord, PgStore, StoreError, WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
     DIRECT_TASK_CONTRACT_VERSION, DiagnosticsRequest, DirectAdmissionDelta, ExecutionLogMode,
@@ -115,6 +116,7 @@ pub struct UserEnvelopeRequest {
     #[schema(value_type = String, format = "uuid")]
     pub id: Uuid,
     pub template_id: Option<String>,
+    pub template_display_name: Option<String>,
     pub template_revision: Option<i64>,
     #[schema(value_type = BrowserEnvelope)]
     pub requested_envelope: Envelope,
@@ -170,6 +172,8 @@ pub struct EnvelopeRequestHistoryEvent {
     pub status: EnvelopeRequestStatus,
     pub at: String,
     pub actor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor_display_email: Option<String>,
     pub reason: Option<String>,
     pub rationale: Option<String>,
     pub evidence_url: Option<String>,
@@ -399,6 +403,85 @@ pub struct PgEnvelopeRequestBroker {
     task_identity_discovery_enabled: bool,
 }
 
+trait UserEnvelopeProjectionStore {
+    fn canonical_user<'a>(
+        &'a self,
+        user_id: &'a CanonicalUserId,
+    ) -> BoxFuture<'a, Result<Option<CanonicalUserRecord>, StoreError>>;
+
+    fn envelope_template_revision<'a>(
+        &'a self,
+        template_id: &'a str,
+        revision: i64,
+    ) -> BoxFuture<'a, Result<Option<EnvelopeTemplateRevisionRecord>, StoreError>>;
+}
+
+impl UserEnvelopeProjectionStore for PgStore {
+    fn canonical_user<'a>(
+        &'a self,
+        user_id: &'a CanonicalUserId,
+    ) -> BoxFuture<'a, Result<Option<CanonicalUserRecord>, StoreError>> {
+        Box::pin(async move { PgStore::canonical_user(self, user_id).await })
+    }
+
+    fn envelope_template_revision<'a>(
+        &'a self,
+        template_id: &'a str,
+        revision: i64,
+    ) -> BoxFuture<'a, Result<Option<EnvelopeTemplateRevisionRecord>, StoreError>> {
+        Box::pin(
+            async move { PgStore::envelope_template_revision(self, template_id, revision).await },
+        )
+    }
+}
+
+async fn attach_request_projection<S: UserEnvelopeProjectionStore>(
+    store: &S,
+    subject: &UserEnvelopeSubject,
+    mut request: UserEnvelopeRequest,
+) -> Result<UserEnvelopeRequest, EnvelopeRequestBrokerError> {
+    if let (Some(template_id), Some(template_revision)) =
+        (request.template_id.as_deref(), request.template_revision)
+    {
+        request.template_display_name = store
+            .envelope_template_revision(template_id, template_revision)
+            .await
+            .map_err(map_store_broker_error)?
+            .map(|template| template.display_name);
+    }
+    if request.history.is_empty() {
+        return Ok(request);
+    }
+
+    let Some(owner) = store
+        .canonical_user(&subject.canonical_user_id)
+        .await
+        .map_err(map_store_broker_error)?
+    else {
+        return Ok(request);
+    };
+    let mut emails = BTreeMap::from([(
+        subject.canonical_user_id.as_str().to_owned(),
+        Some(subject.display_email.as_str().to_owned()),
+    )]);
+    for event in &mut request.history {
+        if !emails.contains_key(&event.actor) {
+            let display_email = match CanonicalUserId::parse(event.actor.clone()) {
+                Ok(actor_id) => store
+                    .canonical_user(&actor_id)
+                    .await
+                    .map_err(map_store_broker_error)?
+                    .filter(|actor| actor.organization_id == owner.organization_id)
+                    .map(|actor| actor.display_email.as_str().to_owned()),
+                Err(_) => None,
+            };
+            emails.insert(event.actor.clone(), display_email);
+        }
+        event.actor_display_email = emails.get(&event.actor).cloned().flatten();
+    }
+    Ok(request)
+}
+
 impl PgEnvelopeRequestBroker {
     pub fn new(
         store: PgStore,
@@ -437,6 +520,14 @@ impl PgEnvelopeRequestBroker {
             .unwrap_or(&request.requested_envelope);
         request.usage = Some(envelope_usage_view(usage, authority));
         Ok(request)
+    }
+
+    async fn attach_projection(
+        &self,
+        session: &UserEnvelopeSession<BrowserSessionBinding>,
+        request: UserEnvelopeRequest,
+    ) -> Result<UserEnvelopeRequest, EnvelopeRequestBrokerError> {
+        attach_request_projection(&self.store, &session.subject, request).await
     }
 }
 
@@ -531,7 +622,8 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                 .map_err(map_store_broker_error)?;
             let mut requests = Vec::with_capacity(records.len());
             for record in records {
-                requests.push(self.attach_usage(user_envelope_request(record)).await?);
+                let request = self.attach_usage(user_envelope_request(record)).await?;
+                requests.push(self.attach_projection(session, request).await?);
             }
             Ok(requests)
         })
@@ -561,7 +653,8 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                 .into_iter()
                 .map(envelope_request_history_event)
                 .collect();
-            Ok(Some(self.attach_usage(request).await?))
+            let request = self.attach_usage(request).await?;
+            Ok(Some(self.attach_projection(session, request).await?))
         })
     }
 
@@ -580,9 +673,10 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                 .await
                 .map_err(map_store_broker_error)?;
             match record {
-                Some(record) => Ok(Some(
-                    self.attach_usage(user_envelope_request(record)).await?,
-                )),
+                Some(record) => {
+                    let request = self.attach_usage(user_envelope_request(record)).await?;
+                    Ok(Some(self.attach_projection(session, request).await?))
+                }
                 None => Ok(None),
             }
         })
@@ -609,7 +703,9 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                 .await
                 .map_err(map_store_broker_error)?;
             if !request.auto_provision {
-                return Ok(user_envelope_request(reservation.record));
+                return self
+                    .attach_projection(session, user_envelope_request(reservation.record))
+                    .await;
             }
             let instance_id = envelope_instance_id(reservation.record.id);
             let digest = envelope_content_digest(request.requested_envelope)
@@ -634,7 +730,10 @@ impl EnvelopeRequestBroker<BrowserSessionBinding> for PgEnvelopeRequestBroker {
                 )
                 .await
                 .map_err(map_store_broker_error)?;
-            self.attach_usage(user_envelope_request(provisioned)).await
+            let request = self
+                .attach_usage(user_envelope_request(provisioned))
+                .await?;
+            self.attach_projection(session, request).await
         })
     }
 
@@ -669,6 +768,7 @@ pub(crate) fn user_envelope_request(record: EnvelopeRequestRecord) -> UserEnvelo
     UserEnvelopeRequest {
         id: record.id,
         template_id: record.template_id,
+        template_display_name: None,
         template_revision: record.template_revision,
         requested_envelope: record.requested_envelope,
         template_envelope: record.template_envelope,
@@ -779,6 +879,7 @@ fn envelope_request_history_event(
         },
         at: event.at,
         actor: event.actor,
+        actor_display_email: None,
         reason: event.reason,
         rationale: event.rationale,
         evidence_url: event.evidence_url,
@@ -1728,6 +1829,7 @@ fn broker_error_response(error: EnvelopeRequestBrokerError) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
     use axum::body::{Body, to_bytes};
@@ -1741,9 +1843,10 @@ mod tests {
 
     use super::{
         AvailableEnvelopeTemplate, EnvelopeRequestBroker, EnvelopeRequestBrokerError,
-        EnvelopeRequestField, EnvelopeRequestStatus, PublishedWorkflowOption,
-        UserEnvelopeMutationProof, UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject,
-        ValidatedEnvelopeRequest, envelope_usage_view, inner_router, inner_router_with_agents,
+        EnvelopeRequestField, EnvelopeRequestHistoryEvent, EnvelopeRequestStatus,
+        PublishedWorkflowOption, UserEnvelopeMutationProof, UserEnvelopeProjectionStore,
+        UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest,
+        attach_request_projection, envelope_usage_view, inner_router, inner_router_with_agents,
         inner_router_with_capabilities,
     };
     use crate::connections::{
@@ -1756,8 +1859,11 @@ mod tests {
         StewardRunWorkflowInstallationMode,
     };
     use steward_admission::{AdmissionDelta, Envelope, EnvelopeSpec};
-    use steward_store::{EnvelopeUsageRecord, WorkflowRevisionRecord};
-    use steward_types::{CanonicalUserId, Email};
+    use steward_store::{
+        CanonicalUserRecord, EnvelopeTemplateRevisionRecord, EnvelopeUsageRecord, StoreError,
+        WorkflowRevisionRecord,
+    };
+    use steward_types::{CanonicalUserId, Email, OrganizationId};
     use uuid::Uuid;
 
     #[derive(Clone)]
@@ -1858,6 +1964,7 @@ mod tests {
                 Ok(Some(UserEnvelopeRequest {
                     id: request_id,
                     template_id: Some("engineer".to_owned()),
+                    template_display_name: Some("Engineer".to_owned()),
                     template_revision: Some(3),
                     requested_envelope: approved_envelope.clone(),
                     template_envelope: Some(template().ceiling),
@@ -1907,6 +2014,9 @@ mod tests {
             let owner = session.subject.canonical_user_id.clone();
             let status_actor = owner.as_str().to_owned();
             let template_id = request.template.map(|template| template.id.clone());
+            let template_display_name = request
+                .template
+                .map(|template| template.display_name.clone());
             let template_revision = request.template.map(|template| template.revision);
             let requested_envelope = request.requested_envelope.clone();
             let template_envelope = request.template.map(|template| template.ceiling.clone());
@@ -1933,6 +2043,7 @@ mod tests {
                 Ok(UserEnvelopeRequest {
                     id,
                     template_id,
+                    template_display_name,
                     template_revision,
                     requested_envelope,
                     template_envelope,
@@ -2252,6 +2363,137 @@ mod tests {
             },
             binding: (),
         })
+    }
+
+    #[derive(Clone, Default)]
+    struct TestProjectionStore {
+        users: BTreeMap<String, CanonicalUserRecord>,
+        templates: BTreeMap<(String, i64), EnvelopeTemplateRevisionRecord>,
+    }
+
+    impl UserEnvelopeProjectionStore for TestProjectionStore {
+        fn canonical_user<'a>(
+            &'a self,
+            user_id: &'a CanonicalUserId,
+        ) -> BoxFuture<'a, Result<Option<CanonicalUserRecord>, StoreError>> {
+            let user = self.users.get(user_id.as_str()).cloned();
+            Box::pin(async move { Ok(user) })
+        }
+
+        fn envelope_template_revision<'a>(
+            &'a self,
+            template_id: &'a str,
+            revision: i64,
+        ) -> BoxFuture<'a, Result<Option<EnvelopeTemplateRevisionRecord>, StoreError>> {
+            let template = self
+                .templates
+                .get(&(template_id.to_owned(), revision))
+                .cloned();
+            Box::pin(async move { Ok(template) })
+        }
+    }
+
+    fn canonical_user(
+        user_id: &str,
+        organization_id: &str,
+        display_email: &str,
+    ) -> Result<CanonicalUserRecord, String> {
+        Ok(CanonicalUserRecord {
+            user_id: CanonicalUserId::parse(user_id)?,
+            organization_id: OrganizationId::parse(organization_id)?,
+            display_email: Email::parse(display_email)?,
+            display_name: None,
+            state: "active".to_owned(),
+            created_at: "2026-08-17T00:00:00Z".to_owned(),
+            last_sign_in_at: None,
+            invited_by: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn request_projection_uses_the_pinned_template_and_same_organization_actor_emails()
+    -> Result<(), String> {
+        let session = session()?;
+        let same_organization_actor = "usr_abcdef0123456789abcdef0123456789";
+        let other_organization_actor = "usr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut request = TestBroker::default()
+            .get(&session, Uuid::from_u128(1))
+            .await
+            .map_err(|error| format!("load request fixture: {error:?}"))?
+            .ok_or_else(|| "missing request fixture".to_owned())?;
+        request.template_display_name = None;
+        request.history = [
+            session.subject.canonical_user_id.as_str(),
+            same_organization_actor,
+            other_organization_actor,
+        ]
+        .into_iter()
+        .map(|actor| EnvelopeRequestHistoryEvent {
+            status: EnvelopeRequestStatus::Pending,
+            at: "2026-08-17T00:00:00Z".to_owned(),
+            actor: actor.to_owned(),
+            actor_display_email: None,
+            reason: None,
+            rationale: None,
+            evidence_url: None,
+            expires_at: None,
+        })
+        .collect();
+
+        let envelope_template = template();
+        let store = TestProjectionStore {
+            users: [
+                canonical_user(
+                    session.subject.canonical_user_id.as_str(),
+                    "org_0123456789abcdef0123456789abcdef",
+                    "alice@example.com",
+                )?,
+                canonical_user(
+                    same_organization_actor,
+                    "org_0123456789abcdef0123456789abcdef",
+                    "bob@example.org",
+                )?,
+                canonical_user(
+                    other_organization_actor,
+                    "org_abcdef0123456789abcdef0123456789",
+                    "carol@example.com",
+                )?,
+            ]
+            .into_iter()
+            .map(|user| (user.user_id.as_str().to_owned(), user))
+            .collect(),
+            templates: [(
+                (envelope_template.id.clone(), envelope_template.revision),
+                EnvelopeTemplateRevisionRecord {
+                    template_id: envelope_template.id,
+                    display_name: "Pinned Engineer".to_owned(),
+                    member_roles: Vec::new(),
+                    ceiling: envelope_template.ceiling,
+                    auto_provision_threshold: envelope_template.auto_provision_threshold,
+                    allow_inline_browser_tasks: envelope_template.allow_inline_browser_tasks,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let projected = attach_request_projection(&store, &session.subject, request)
+            .await
+            .map_err(|error| format!("project request: {error:?}"))?;
+        assert_eq!(
+            projected.template_display_name.as_deref(),
+            Some("Pinned Engineer")
+        );
+        assert_eq!(
+            projected.history[0].actor_display_email.as_deref(),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            projected.history[1].actor_display_email.as_deref(),
+            Some("bob@example.org")
+        );
+        assert_eq!(projected.history[2].actor_display_email, None);
+        Ok(())
     }
 
     #[tokio::test]
@@ -2690,6 +2932,7 @@ mod tests {
         let replayed = UserEnvelopeRequest {
             id: Uuid::from_u128(7),
             template_id: None,
+            template_display_name: None,
             template_revision: None,
             requested_envelope: requested_envelope.clone(),
             template_envelope: None,
@@ -2784,6 +3027,7 @@ mod tests {
         let replayed = UserEnvelopeRequest {
             id: Uuid::from_u128(8),
             template_id: Some("engineer".to_owned()),
+            template_display_name: Some("Engineer".to_owned()),
             template_revision: Some(3),
             requested_envelope: requested_envelope.clone(),
             template_envelope: Some(template().ceiling),
@@ -3241,6 +3485,7 @@ mod tests {
                     Ok(UserEnvelopeRequest {
                         id: Uuid::nil(),
                         template_id: Some("engineer".to_owned()),
+                        template_display_name: Some("Engineer".to_owned()),
                         template_revision: Some(3),
                         requested_envelope,
                         template_envelope,

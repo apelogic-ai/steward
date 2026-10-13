@@ -1,9 +1,21 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 
 import type { BrowserRunView, GithubRepositoryView } from "@/api-client";
 import { automatedPackageRun } from "@/data/onboarding-progress";
 
 import { browserHelloWorldRun, governedJobOnly, repositoryOptionLabel, repositoryReadinessMessage } from "./onboarding-view";
+
+const source = readFileSync(new URL("./onboarding-view.tsx", import.meta.url), "utf8");
+
+test("Get started explains why an agent is unavailable", () => {
+  expect(source).toContain('agent.compatible ? "" : ` · ${agent.reason}`');
+  expect(source).not.toContain('agent.compatible ? "" : " · unavailable"');
+});
+
+test("Get started classifies test-run failures with the response status", () => {
+  expect(source).toContain("runNowFailureMessage(result.error, undefined, result.response?.status)");
+});
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {

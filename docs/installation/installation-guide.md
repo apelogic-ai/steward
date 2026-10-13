@@ -188,7 +188,7 @@ config:
       executionLog: "off"
       packagePath: .steward/tasks/hello-world/task-definition.json
       title: Hello world
-      description: Run a governed coding agent and collect its exact output.
+      description: Run a coding agent and collect its exact output.
       git:
         repository: https://github.com/example-org/agentic-ops.git
         revision: git:ref:main

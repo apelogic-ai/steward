@@ -321,7 +321,7 @@ function TemplateEnvelopeRequestForm({ onSubmittingChange, template, workspaceCa
         <DiagnosticDetails className="mt-2" items={diagnostics} />
         {exceedances.length ? <div className="mt-4"><EnvelopeExceedanceSummary values={exceedances} /></div> : null}
         <button className="mt-5 min-h-10 w-full rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-50" disabled={submission === "submitting" || Boolean(singleRunError) || models.size === 0 || (requiresApproval && !justification.trim())} type="submit">{submission === "submitting" ? "Submitting…" : requiresApproval ? "Submit for approval" : "Submit request"}</button>
-        <p className="mt-3 text-xs leading-5 text-muted-ink">{requiresApproval ? `${exceedances.length} ${exceedances.length === 1 ? "value exceeds" : "values exceed"} the template limits and need admin approval.` : "This request is within the template limits and will be provisioned immediately."}</p>
+        <p className="mt-3 text-xs leading-5 text-muted-ink">{requiresApproval ? `${exceedances.length} ${exceedances.length === 1 ? "value exceeds" : "values exceed"} the template limits and ${exceedances.length === 1 ? "needs" : "need"} admin approval.` : "This request is within the template limits and will be provisioned immediately."}</p>
       </SectionCard>
     </form>
   );
@@ -506,14 +506,20 @@ export function EnvelopeDetailView({ requestId }: Readonly<{ requestId: string }
 }
 
 function EnvelopeDetail({ request, workspaceCapabilities }: Readonly<{ request: UserEnvelopeRequest; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
+  const session = useSession();
   const envelope = request.approvedEnvelope ?? request.requestedEnvelope;
   const usage = request.usage?.spend;
+  const historyActor = (event: UserEnvelopeRequest["history"][number]) => {
+    if (session.status === "authenticated" && event.actor === session.value.principal.userId) return session.value.principal.displayName || session.value.principal.displayEmail;
+    if (event.actor.startsWith("system:")) return "HyperShell";
+    return event.actorDisplayEmail ?? (event.actor.includes("@") ? event.actor : "Administrator");
+  };
   return (
     <div className="space-y-6">
       <PageHeader
         actions={request.envelopeInstanceId ? <Link className="inline-flex h-10 items-center rounded-control border bg-panel px-4 text-sm font-semibold hover:bg-subtle" href={`/envelopes/${request.id}/runs`}>View runs</Link> : null}
         description={request.id}
-        title={<span className="flex flex-wrap items-center gap-3">{request.templateId ?? "Custom envelope"}<span aria-hidden="true"><StatusBadge value={request.status} /></span></span>}
+        title={<span className="flex flex-wrap items-center gap-3">{request.templateDisplayName ?? (request.templateId ? "Envelope" : "Custom envelope")}<span aria-hidden="true"><StatusBadge value={request.status} /></span></span>}
       />
       <StatStrip items={[
         {
@@ -523,6 +529,7 @@ function EnvelopeDetail({ request, workspaceCapabilities }: Readonly<{ request: 
         },
         { label: "Limit per run", value: envelope.spec.budget.singleRunLimit ? formatMoney(envelope.spec.budget.singleRunLimit, envelope.spec.budget.currency) : "Not set" },
         { label: "Time-to-live limit", value: <span className="font-mono">{formatDuration(envelope.spec.ttl)}</span> },
+        { label: "Runtime limit per month", value: envelope.spec.runtimeMinutesLimit ? formatDuration(envelope.spec.runtimeMinutesLimit, "minutes", "m") : "Not set" },
         { label: "Envelope instance", value: <span className="font-mono text-sm">{request.envelopeInstanceId ?? "Not assigned"}</span> },
       ]} />
       {request.reason ? <p className="rounded-card bg-notice p-4 text-sm"><strong>Reason:</strong> {request.reason}</p> : null}
@@ -541,7 +548,7 @@ function EnvelopeDetail({ request, workspaceCapabilities }: Readonly<{ request: 
         </SectionCard>
         <SectionCard title="History">
           {request.history.length ? <ol className="space-y-4 border-s ps-5">{request.history.map((event, index) => (
-            <li className="relative" key={`${event.at}-${index}`}><span aria-hidden="true" className="absolute -start-[1.58rem] top-1.5 size-2.5 rounded-full border-2 border-brand bg-panel" /><div className="flex flex-wrap items-center gap-2"><StatusBadge value={event.status} /><span className="text-sm text-muted-ink">by {event.actor} · {dateTime(event.at)}</span></div>{event.reason ? <p className="mt-1 text-sm text-muted-ink">{event.reason}</p> : null}</li>
+            <li className="relative" key={`${event.at}-${index}`}><span aria-hidden="true" className="absolute -start-[1.58rem] top-1.5 size-2.5 rounded-full border-2 border-brand bg-panel" /><div className="flex flex-wrap items-center gap-2"><StatusBadge value={event.status} /><span className="text-sm text-muted-ink">by {historyActor(event)} · {dateTime(event.at)}</span></div>{event.reason ? <p className="mt-1 text-sm text-muted-ink">{event.reason}</p> : null}</li>
           ))}</ol> : <EmptyState title="No history" />}
         </SectionCard>
       </div>

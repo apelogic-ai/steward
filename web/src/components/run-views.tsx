@@ -477,7 +477,7 @@ export function TaskGithubAutomationPanel({ taskUid }: Readonly<{ taskUid: strin
         </div>
       </> : <p className="mt-4 text-sm text-muted-ink">No GitHub repositories are visible to this connection.</p>}</RepositoryResource>
       {publication ? <div className="mt-4 rounded-control border bg-subtle p-3 text-sm"><p>Branch: <code>{publication.branch}</code></p><p className="mt-1">Package digest: <code className="break-all">{publication.packageDigest}</code></p><a className="mt-2 inline-block font-semibold text-brand" href={`${publication.pullRequestUrl}/files`} rel="noreferrer" target="_blank">Review the two-file pull request diff</a></div> : null}
-      {githubRun ? <div className="mt-4 rounded-control border bg-subtle p-3 text-sm" aria-live="polite"><div className="flex flex-wrap items-center gap-3"><a className="font-semibold text-brand" href={githubRun.url} rel="noreferrer" target="_blank">GitHub run {githubRun.runId}</a><StatusBadge value={runStatus?.conclusion ?? runStatus?.phase ?? "queued"} /></div>{runStatus?.jobs.length ? <ul className="mt-3 space-y-2">{runStatus.jobs.map((job) => <li className="flex flex-wrap items-center justify-between gap-2" key={job.id}><a href={job.url} rel="noreferrer" target="_blank">{job.name}</a><span>{job.conclusion ?? job.status}</span></li>)}</ul> : null}{runStatus?.failureLog ? <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap rounded-control border bg-panel p-3 text-xs">{runStatus.failureLog}</pre> : null}{runStatus?.linkedTaskUid ? <Link className="mt-3 inline-block font-semibold text-brand" href={`/runs/${runStatus.linkedTaskUid}`}>Open governed Task · {runStatus.linkedTaskPhase}</Link> : null}</div> : null}
+      {githubRun ? <div className="mt-4 rounded-control border bg-subtle p-3 text-sm" aria-live="polite"><div className="flex flex-wrap items-center gap-3"><a className="font-semibold text-brand" href={githubRun.url} rel="noreferrer" target="_blank">GitHub run {githubRun.runId}</a><StatusBadge value={runStatus?.conclusion ?? runStatus?.phase ?? "queued"} /></div>{runStatus?.jobs.length ? <ul className="mt-3 space-y-2">{runStatus.jobs.map((job) => <li className="flex flex-wrap items-center justify-between gap-2" key={job.id}><a href={job.url} rel="noreferrer" target="_blank">{job.name}</a><span>{job.conclusion ?? job.status}</span></li>)}</ul> : null}{runStatus?.failureLog ? <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap rounded-control border bg-panel p-3 text-xs">{runStatus.failureLog}</pre> : null}{runStatus?.linkedTaskUid ? <Link className="mt-3 inline-block font-semibold text-brand" href={`/runs/${runStatus.linkedTaskUid}`}>Open HyperShell Task · {runStatus.linkedTaskPhase}</Link> : null}</div> : null}
       {failure ? <p className="mt-3 text-sm text-err" role="alert">{failure}</p> : null}
     </section>
   );
@@ -517,7 +517,7 @@ export function RunsView({ admin = false }: Readonly<{ admin?: boolean }>) {
     <section aria-labelledby="page-title" className="space-y-6">
       <PageHeader
         actions={!admin ? <Link className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href="/runs/new">Run now</Link> : null}
-        description={admin ? "Every governed run across all users." : "Agent runs executed under your envelopes."}
+        description={admin ? "Every agent run across all users." : "Agent runs executed under your Envelopes."}
         title={admin ? "All runs" : "Runs"}
       />
       <ResourceBoundary state={state}>{(data) => (

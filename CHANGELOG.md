@@ -9,6 +9,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Browser pages now use plain-language run stages and refusal reasons, show Envelope display names,
+  runtime limits, actor names, and save confirmation, and start new templates without implicit
+  roles, models, platforms, or inline browser-authored packages.
 - Workspace preparation failures now fail Runs with a plain explanation and a bounded controller
   diagnostic instead of `execution_outcome_unknown`.
 - Rejected Envelope-template saves now return a stable error code, a plain explanation, and the
