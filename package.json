@@ -11,9 +11,11 @@
     "node": "26.5.0"
   },
   "devDependencies": {
-    "@playwright/test": "1.62.1"
+    "@playwright/test": "1.62.1",
+    "playwright-bdd": "9.2.0"
   },
   "scripts": {
+    "journeys:run": "bun journeys/run.mjs",
     "test:browser-e2e": "playwright test --config tests/browser/playwright.config.mjs",
     "web:build": "bun run web:generate-api && bun run --cwd web build",
     "web:check": "bun run web:check-generated && bun run --cwd web check",

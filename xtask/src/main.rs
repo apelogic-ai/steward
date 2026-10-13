@@ -61,6 +61,7 @@ fn dispatch(arguments: Vec<String>) -> TaskResult {
         "e2e-postgres-tls" if rest.is_empty() => e2e_postgres_tls(),
         "browser-e2e" if rest.is_empty() => browser_e2e(false),
         "browser-e2e" if rest == ["--browser-ready"] => browser_e2e(true),
+        "journeys" => journeys(rest),
         "policy-test" if rest.is_empty() => policy_test(),
         "migrate-check" if rest.is_empty() => migrate_check(),
         "generate-manifests" if rest.is_empty() => generate_manifests(),
@@ -90,6 +91,7 @@ fn usage() -> String {
         "  e2e-governed-connections",
         "  e2e-postgres-tls",
         "  browser-e2e [--browser-ready]",
+        "  journeys --tags <expression>",
         "  policy-test",
         "  migrate-check",
         "  generate-manifests",
@@ -477,6 +479,22 @@ fn browser_e2e(browser_ready: bool) -> TaskResult {
     run("bun", &["run", "web:check"])?;
     run("bun", &["run", "--cwd", "web", "build"])?;
     run_with_env("bun", &["run", "test:browser-e2e"], &bun_environment)
+}
+
+fn journey_tags(arguments: &[String]) -> Result<&str, String> {
+    match arguments {
+        [flag, tags] if flag == "--tags" && !tags.trim().is_empty() => Ok(tags),
+        _ => Err("usage: cargo xtask journeys --tags <expression>".to_owned()),
+    }
+}
+
+fn journeys(arguments: &[String]) -> TaskResult {
+    let tags = journey_tags(arguments)?;
+    run_with_env(
+        "bun",
+        &["run", "journeys:run"],
+        &[("STEWARD_JOURNEY_TAGS", OsStr::new(tags))],
+    )
 }
 
 fn policy_test() -> TaskResult {
@@ -1144,7 +1162,7 @@ impl Drop for TemporaryTree {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_command, git_command_in_repository, migration_changes,
+        checked_command, git_command_in_repository, journey_tags, migration_changes,
         provider_profile_bundle_directory_for_inputs, root, should_skip_directory,
         validate_conformance_test_result,
     };
@@ -1295,6 +1313,22 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn journeys_require_a_non_empty_tag_expression() {
+        assert_eq!(
+            journey_tags(&["--tags".to_owned(), "@smoke".to_owned()]),
+            Ok("@smoke")
+        );
+        for arguments in [
+            vec![],
+            vec!["--tags".to_owned()],
+            vec!["--tags".to_owned(), "  ".to_owned()],
+            vec!["@smoke".to_owned()],
+        ] {
+            assert!(journey_tags(&arguments).is_err());
+        }
     }
 
     #[test]
