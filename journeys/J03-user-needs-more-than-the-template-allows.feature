@@ -18,8 +18,7 @@ Feature: J3 - User needs more than the template allows
     And I am signed in as a user who is also an administrator
 
   # Steps 1 to 9 and "Done when".
-  # 0.3.16: BLOCKED at step 7 (case E-08; no finding number).
-  @smoke @needs-model @known-failing-0.3.16
+  @smoke @needs-model
   Scenario: Approve - a request above the template is approved and used
     When I open "Envelopes"
     And I press "Request envelope"
@@ -27,7 +26,9 @@ Feature: J3 - User needs more than the template allows
     Then the field "Runtime limit per month" shows "60"
     And I see in "Runtime limit per month":
       | min |
-    When I type "20" into "Time-to-live limit"
+    # Keeps this Envelope distinct from active Envelopes left by earlier smoke runs.
+    When I type "<run-runtime-minutes>" into "Runtime limit per month"
+    And I type "20" into "Time-to-live limit"
     And I choose "min" in "Time-to-live limit"
     Then the field "Time-to-live limit" has a warning outline
     And I see "Above limit 15 min"
@@ -36,7 +37,7 @@ Feature: J3 - User needs more than the template allows
     And I see "Submit for approval"
     # Expected sentence. 0.3.16 shows "... and need admin approval."
     And I see "1 value exceeds the template limits and needs admin approval."
-    # The journey treats the reason as required. The real label is "Justification (optional)".
+    # The reason is required for a request above the template limits.
     When I type "The nightly build needs 20 min." into "05 Request note"
     And I press "Submit for approval"
     Then I see the status "pending"

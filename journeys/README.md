@@ -2,9 +2,9 @@
 
 Ten journeys for the web UI (brand name in the UI: HyperShell), one file each. A journey is one person, one goal, from start to finish. The files are plain text that a person can read and a test runner can run.
 
-The feature set comes from the user-journey specification (J1 to J10). J1's UI text was checked
-against the 0.3.17 release candidate; later journeys retain their source annotations until their
-step implementations are added.
+The feature set comes from the user-journey specification (J1 to J10). The `@smoke` scenarios in
+J1 through J4 are executable; later scenarios retain their source annotations until their step
+implementations are added.
 
 | File | Journey |
 |---|---|
@@ -70,6 +70,7 @@ step implementations are added.
 | `<provider-a>/<model-a>`, `<provider-b>/<model-b>` | The models that work with agent A and agent B. |
 | `<provider-a>/<new-model>` | A model added in configuration only (J10). |
 | `<provider-c>/<model-c>` | A model no configured agent can use (J10). |
+| `<run-runtime-minutes>` | A within-template runtime allowance derived from the unique smoke run prefix. |
 | "member" | The role a template is meant for. |
 
 Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test installation.
@@ -84,14 +85,15 @@ Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test
 | `@two-accounts` | Needs a second signed-in person. |
 | `@operator` | Needs a change to the installation outside the UI. |
 | `@nightly` | Long. Not for every build. |
-| `@known-failing-0.3.16` | Fails or is blocked on version 0.3.16. The note above the tag names the finding (N-xx, #405) or the case. Remove the tag when the scenario passes. |
+| `@known-failing-*` | Fails for the version or public issue named by the suffix. The note above the tag names the finding or case. Remove the tag when the scenario passes. |
 
 A tag on the `Feature` line applies to every scenario in the file.
 
 ## A sentence with no code behind it
 
-A sentence runs only when a small piece of test code exists for its pattern. J1's patterns have step
-code; the remaining files are specifications until their journey implementation lands.
+A sentence runs only when a small piece of test code exists for its pattern. The `@smoke` scenarios
+in J1 through J4 have step code; the remaining scenarios are specifications until their journey
+implementation lands.
 
 When a file holds a sentence that has no code:
 
@@ -101,9 +103,9 @@ When a file holds a sentence that has no code:
 
 So a maintainer can write a new sentence at any time. The cost is one request to a test engineer, and the scenario stays unproven until it is answered. Reusing a pattern from `STEPS.md` costs nothing.
 
-J1 is the executable journey today. The runner deliberately includes only its feature file, so the
-remaining nine specifications do not look tested before their step code lands. Within the selected
-J1 scenarios, a missing sentence fails generation and no browser scenario starts.
+The runner includes J1 through J4. The remaining feature specifications do not look tested before
+their step code lands. Within the selected scenarios, a missing sentence fails generation and no
+browser scenario starts.
 
 ## Run against an installation
 
@@ -117,8 +119,8 @@ an interactive browser with a neutral placeholder URL:
 bunx playwright codegen --save-storage=/path/to/steward-storage-state.json https://steward.example.com
 ```
 
-Complete sign-in in that browser, then close it. Run J1 with environment-specific values supplied
-at execution time:
+Complete sign-in in that browser, then close it. Run the smoke set with environment-specific values
+supplied at execution time:
 
 ```console
 export STEWARD_JOURNEY_BASE_URL=https://steward.example.com
@@ -126,6 +128,9 @@ export STEWARD_JOURNEY_STORAGE_STATE=/path/to/steward-storage-state.json
 export STEWARD_JOURNEY_REPOSITORY=example-org/example-repository
 export STEWARD_JOURNEY_MEMBER_ROLE=engineer
 export STEWARD_JOURNEY_RUN_PREFIX=journey-001
+# Optional: select these instead of the Run and Task forms' defaults.
+export STEWARD_JOURNEY_AGENT=agent-ref-or-display-name
+export STEWARD_JOURNEY_MODEL=provider/model
 cargo xtask journeys --tags @smoke
 ```
 
@@ -139,12 +144,26 @@ export STEWARD_JOURNEY_IGNORE_HTTPS_ERRORS=true
 The variable accepts only `true` or `false` and defaults to `false`.
 
 The storage-state file is a credential-bearing local artifact: never put it in this repository.
-The runner reports an explicit refresh instruction if the session has expired. The repository is
-used by J4 when that journey becomes executable. The member role must be one held by the signed-in
-test account and replaces the `member` placeholder in journey text. The run prefix must be unique
-for the target installation; every object created by the journeys includes it.
+Trim it to the installation origin before use. Failure traces and `error-context.md` files under
+`target/journeys/results` can contain the signed-in person's name, email address, and session
+cookies; handle and remove them as credential-bearing local artifacts.
+The runner reports an explicit refresh instruction if the session has expired. J4 requires a
+public GitHub repository admitted by the installation, with `main` as its default branch and a root
+file whose name contains `README`; the journey verifies the resolved commit against GitHub's branch
+head. The member role must be one held by the signed-in test account and replaces the `member`
+placeholder in journey text. The account must also have administrator access because J1 and J3
+use administrator APIs and screens. Tool-connection state is recorded but is not an account
+precondition: an existing personal connection does not change these journeys. When
+`STEWARD_JOURNEY_AGENT` or `STEWARD_JOURNEY_MODEL` is set, the matching enabled option is selected;
+otherwise the forms' defaults are kept. The run prefix must be unique for the target installation;
+every object created by the journeys includes it. J2 and J3 derive a distinct, within-template
+runtime-minutes candidate from that prefix and advance to an unused active-Envelope value when
+needed, so prior active Envelopes do not turn a new request into a duplicate.
 
 The runner first validates that every selected sentence has step code. It then reports ordinary
-scenarios as the required result and runs `@known-failing-0.3.16` scenarios as a separate,
-nonfatal result. A generation error, including an undefined sentence in either group, is always
-fatal. A tag expression that selects no scenario is also fatal.
+scenarios as the required result and runs scenarios tagged `@known-failing-*` separately. It reports
+their count and treats only each tag's documented product defect as an expected failure; setup,
+authentication, selector, and infrastructure failures remain fatal. An unexpected pass also makes
+the run fail so the obsolete tag is removed deliberately. A generation error, including an
+undefined sentence in either group, is always fatal. A tag expression that selects no scenario is
+also fatal.
