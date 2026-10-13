@@ -1357,6 +1357,7 @@ impl SandboxRuntime for AmbiguousTaskRuntime {
 struct ActiveInference {
     provisions: Arc<AtomicUsize>,
     revocations: Arc<AtomicUsize>,
+    observed_spend: Arc<Mutex<Option<String>>>,
 }
 
 impl InferencePlane for ActiveInference {
@@ -1391,10 +1392,21 @@ impl InferencePlane for ActiveInference {
     }
 
     async fn observe(&self, request: &InferenceRequest) -> Result<InferenceObservation, PortError> {
+        if self.revocations.load(Ordering::SeqCst) > 0 {
+            return Ok(InferenceObservation::Absent);
+        }
+        let observed_amount = self
+            .observed_spend
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "fixture inference spend lock was poisoned".to_owned(),
+            })?
+            .clone()
+            .unwrap_or_else(|| "0".to_owned());
         Ok(InferenceObservation::Active {
             reference: format!("inference-{}", request.runtime.0),
             spend: steward_types::SpendSummary {
-                observed_amount: "0".to_owned(),
+                observed_amount,
                 currency: request.budget.currency.clone(),
             },
         })
@@ -4482,6 +4494,11 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .deletion_timestamp
             .is_some()
     );
+    *expired_inference
+        .observed_spend
+        .lock()
+        .map_err(|_| io::Error::other("inference spend fixture was poisoned"))? =
+        Some("0.42".to_owned());
     reconcile_agent_runtime_work_item(
         &client,
         task_runtime.clone(),
@@ -4502,6 +4519,15 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         expired_task.failure_reason.as_deref(),
         Some("task_runtime_ttl_expired")
     );
+    let expired_spend = store
+        .agent_run(expired_task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("expired agent run is absent"))?
+        .spend
+        .ok_or_else(|| io::Error::other("expired run final spend is absent"))?;
+    assert_eq!(expired_spend.observed_amount, "0.42");
+    assert_eq!(expired_spend.currency, "USD");
+    assert_eq!(expired_inference.revocations.load(Ordering::SeqCst), 1);
     assert!(
         kubernetes
             .runtime

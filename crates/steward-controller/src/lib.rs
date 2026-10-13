@@ -4010,6 +4010,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 context.client.clone(),
                                 &context.inference,
                                 None,
+                                context.authority.as_ref(),
                             )
                             .await;
                         }
@@ -4124,6 +4125,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         context.client.clone(),
                         &context.inference,
                         &context.sandbox_runtime,
+                        context.authority.as_ref(),
                     )
                     .await?;
                     if let ReconcileDecision::Status(status) = cleanup {
@@ -4231,6 +4233,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 context.client.clone(),
                                 &context.inference,
                                 None,
+                                context.authority.as_ref(),
                             )
                             .await;
                         }
@@ -4302,6 +4305,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                         context.client.clone(),
                                         &context.inference,
                                         None,
+                                        context.authority.as_ref(),
                                     )
                                     .await;
                                 }
@@ -4342,6 +4346,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 context.client.clone(),
                                 &context.inference,
                                 None,
+                                context.authority.as_ref(),
                             )
                             .await;
                         };
@@ -4384,6 +4389,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 context.client.clone(),
                                 &context.inference,
                                 None,
+                                context.authority.as_ref(),
                             )
                             .await;
                         }
@@ -4413,6 +4419,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 context.client.clone(),
                                 &context.inference,
                                 Some(spend),
+                                context.authority.as_ref(),
                             )
                             .await;
                         }
@@ -4495,6 +4502,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             context.client.clone(),
                             &context.inference,
                             None,
+                            context.authority.as_ref(),
                         )
                         .await;
                     }
@@ -4524,6 +4532,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         context.client.clone(),
                         &context.inference,
                         Some(spend),
+                        context.authority.as_ref(),
                     )
                     .await;
                 }
@@ -4569,6 +4578,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             context.client.clone(),
                             &context.inference,
                             Some(spend),
+                            context.authority.as_ref(),
                         )
                         .await;
                     }
@@ -4618,6 +4628,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     context.client.clone(),
                     &context.inference,
                     &context.sandbox_runtime,
+                    context.authority.as_ref(),
                 )
                 .await?;
                 match decision {
@@ -4643,6 +4654,7 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
     client: Client,
     inference: &I,
     sandbox_runtime: &R,
+    authority: Option<&PgStore>,
 ) -> Result<ReconcileDecision, ControllerError> {
     let cleanup_safety = ensure_inference_cleanup_is_safe(runtime, client.clone(), inference).await;
     let inference_request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
@@ -4664,18 +4676,22 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
         };
     }
     let (inference_result, credential_result, sandbox_result) = futures::join!(
-        revoke_inference_if_required(runtime, inference, &inference_request),
+        finalize_inference_if_required(runtime, inference, &inference_request, authority),
         delete_credential_secret(client, runtime),
         sandbox_cleanup,
     );
 
     let mut decision = sandbox_result?;
     if let ReconcileDecision::Status(status) = &mut decision {
-        if inference_result.is_err() {
-            status.refs.litellm_key = runtime
-                .status
-                .as_ref()
-                .and_then(|prior| prior.refs.litellm_key.clone());
+        match &inference_result {
+            Ok(Some(spend)) => status.spend = Some(spend.clone()),
+            Ok(None) => {}
+            Err(_) => {
+                status.refs.litellm_key = runtime
+                    .status
+                    .as_ref()
+                    .and_then(|prior| prior.refs.litellm_key.clone());
+            }
         }
         return Ok(decision);
     }
@@ -4685,6 +4701,66 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
 }
 
 const INFERENCE_REVOCATION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const FINAL_SPEND_SETTLEMENT_DELAY: StdDuration = StdDuration::from_secs(1);
+
+async fn finalize_inference_if_required<I: InferencePlane>(
+    runtime: &AgentRuntime,
+    inference: &I,
+    request: &InferenceRequest,
+    authority: Option<&PgStore>,
+) -> Result<Option<steward_types::SpendSummary>, ReconcileError> {
+    let final_spend =
+        observe_and_record_final_spend(runtime, inference, request, authority).await?;
+    revoke_inference_if_required(runtime, inference, request).await?;
+    Ok(final_spend)
+}
+
+async fn observe_and_record_final_spend<I: InferencePlane>(
+    runtime: &AgentRuntime,
+    inference: &I,
+    request: &InferenceRequest,
+    authority: Option<&PgStore>,
+) -> Result<Option<steward_types::SpendSummary>, ReconcileError> {
+    let Some(authority) = authority else {
+        return Ok(None);
+    };
+    let has_cached_reference = runtime
+        .status
+        .as_ref()
+        .and_then(|status| status.refs.litellm_key.as_ref())
+        .is_some();
+    if !inference.capabilities().runtime_credential_provisioning
+        || (request.models.is_empty() && !has_cached_reference)
+    {
+        return Ok(None);
+    }
+
+    tokio::time::sleep(FINAL_SPEND_SETTLEMENT_DELAY).await;
+    let observation = inference
+        .observe(request)
+        .await
+        .map_err(ReconcileError::Runtime)?;
+    let (spend, exhausted) = match observation {
+        InferenceObservation::Active { spend, .. } => (spend, false),
+        InferenceObservation::Exhausted { spend, .. } => (spend, true),
+        InferenceObservation::Absent => return Ok(None),
+    };
+    authority
+        .record_spend_observation(
+            runtime
+                .metadata
+                .uid
+                .as_deref()
+                .ok_or(ReconcileError::MissingRuntimeUid)?,
+            runtime.metadata.generation.unwrap_or_default(),
+            &runtime_spec_digest(runtime)?,
+            &spend,
+            exhausted,
+        )
+        .await
+        .map_err(|error| ReconcileError::Authority(error.to_string()))?;
+    Ok(Some(spend))
+}
 
 async fn ensure_inference_cleanup_is_safe<I: InferencePlane>(
     runtime: &AgentRuntime,
@@ -4781,6 +4857,7 @@ async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferenceP
     client: Client,
     inference: &I,
     spend: Option<steward_types::SpendSummary>,
+    authority: Option<&PgStore>,
 ) -> Result<Action, ControllerError> {
     let cleanup_safety = ensure_inference_cleanup_is_safe(runtime, client.clone(), inference).await;
     let request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
@@ -4788,15 +4865,15 @@ async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferenceP
         suspend_runtime(runtime, api, sandbox_runtime, spend, true).await?;
         return Err(error);
     }
-    let (revoke_result, credential_result, suspension_result) = futures::join!(
-        revoke_inference_if_required(runtime, inference, &request),
+    let (inference_result, credential_result, suspension_result) = futures::join!(
+        finalize_inference_if_required(runtime, inference, &request, authority),
         delete_credential_secret(client, runtime),
         suspend_runtime(runtime, api, sandbox_runtime, spend, false),
     );
 
     let action = suspension_result?;
     credential_result?;
-    revoke_result.map_err(ControllerError::Reconcile)?;
+    inference_result.map_err(ControllerError::Reconcile)?;
     Ok(action)
 }
 
@@ -5929,7 +6006,8 @@ mod tests {
             deleted: sandbox_deleted.clone(),
         };
 
-        let result = cleanup_runtime(&runtime, client, &ManagedInferencePlane, &sandbox).await;
+        let result =
+            cleanup_runtime(&runtime, client, &ManagedInferencePlane, &sandbox, None).await;
 
         assert!(
             matches!(
@@ -5967,6 +6045,7 @@ mod tests {
             &sandbox,
             client,
             &ManagedInferencePlane,
+            None,
             None,
         )
         .await;
@@ -7470,6 +7549,7 @@ mod tests {
             client,
             &FailingRevokeInference,
             None,
+            None,
         )
         .await
         .map_err(|error| {
@@ -7545,6 +7625,7 @@ mod tests {
             client,
             &FailingRevokeInference,
             None,
+            None,
         )
         .await;
 
@@ -7574,7 +7655,13 @@ mod tests {
             deleted: sandbox_deleted.clone(),
         };
 
-        let decision = cleanup_runtime(&runtime, client, &FailingRevokeInference, &sandbox)
+        let decision = cleanup_runtime(
+            &runtime,
+            client,
+            &FailingRevokeInference,
+            &sandbox,
+            None,
+        )
             .await
             .map_err(|error| {
                 format!(
@@ -7604,7 +7691,8 @@ mod tests {
             deleted: sandbox_deleted.clone(),
         };
 
-        let result = cleanup_runtime(&runtime, client, &FailingRevokeInference, &sandbox).await;
+        let result =
+            cleanup_runtime(&runtime, client, &FailingRevokeInference, &sandbox, None).await;
 
         assert!(
             result.is_err(),
@@ -7659,7 +7747,8 @@ mod tests {
             }),
         };
 
-        let result = cleanup_runtime(&runtime, client, &FailingRevokeInference, &sandbox).await;
+        let result =
+            cleanup_runtime(&runtime, client, &FailingRevokeInference, &sandbox, None).await;
 
         assert!(
             result.is_err(),
@@ -7706,7 +7795,7 @@ mod tests {
         };
         let result = tokio::time::timeout(
             StdDuration::from_secs(6),
-            cleanup_runtime(&runtime, client, &PendingRevokeInference, &sandbox),
+            cleanup_runtime(&runtime, client, &PendingRevokeInference, &sandbox, None),
         )
         .await
         .map_err(|_| {
@@ -7774,6 +7863,7 @@ mod tests {
                 client,
                 &PendingRevokeInference,
                 None,
+                None,
             ),
         )
         .await
@@ -7831,6 +7921,7 @@ mod tests {
                 client,
                 &PendingRevokeInference,
                 &ProvisioningDeleteRuntime,
+                None,
             ),
         )
         .await
