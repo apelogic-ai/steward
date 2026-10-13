@@ -46,7 +46,7 @@ use steward_ports::{
     ProviderControlExecutionBindings, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
     SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
     SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
-    SandboxTaskTranscript, TaskAttemptId,
+    SandboxTaskTranscript, TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
 };
 #[cfg(feature = "runtime")]
 use steward_types::direct_package::{
@@ -1838,7 +1838,7 @@ impl OpenShellRuntime {
                 },
             )
             .await
-            .map_err(port_failure)?;
+            .map_err(|_| workspace_staging_rejected())?;
         if prepare.exit_code != 0 {
             return Err(workspace_staging_rejected());
         }
@@ -1858,7 +1858,7 @@ impl OpenShellRuntime {
                     },
                 )
                 .await
-                .map_err(port_failure)?;
+                .map_err(|_| workspace_staging_rejected())?;
             if append.exit_code != 0 {
                 return Err(workspace_staging_rejected());
             }
@@ -1874,7 +1874,7 @@ impl OpenShellRuntime {
                 },
             )
             .await
-            .map_err(port_failure)?;
+            .map_err(|_| workspace_staging_rejected())?;
         if materialize.exit_code == SCRATCH_VOLUME_SIZE_NOT_ENFORCED_EXIT_CODE {
             return Err(PortError::Rejected {
                 reason: SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE.to_owned(),
@@ -3282,7 +3282,7 @@ fn input_staging_rejected() -> PortError {
 #[cfg(feature = "runtime")]
 fn workspace_staging_rejected() -> PortError {
     PortError::Rejected {
-        reason: "task workspace could not be materialized".to_owned(),
+        reason: WORKSPACE_PREPARATION_FAILURE.to_owned(),
     }
 }
 
