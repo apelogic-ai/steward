@@ -31,7 +31,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Envelope requests now offer an optional monthly runtime limit when the selected template has no
   runtime limit.
 - Workspace branch and tag fields now preserve their entered value, reject unsupported selectors
-  with inline guidance, and name a missing ref and repository when a Run is refused.
+  with inline guidance, and name a missing ref and repository when a Run is refused. GitHub's
+  missing-ref response is recognized, and other Run refusals no longer receive unrelated
+  Envelope-limit advice.
 
 ### Changed
 

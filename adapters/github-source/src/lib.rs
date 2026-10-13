@@ -1151,6 +1151,11 @@ struct ResolvedCommit {
 }
 
 #[derive(Deserialize)]
+struct GitHubErrorResponse {
+    message: String,
+}
+
+#[derive(Deserialize)]
 struct GitObjectReference {
     sha: String,
 }
@@ -1331,8 +1336,21 @@ async fn decode_response<T: DeserializeOwned>(
             }
             return Err(rejected(ACCESS_REJECTED_REASON));
         }
-        if status == StatusCode::NOT_FOUND && operation == "resolve GitHub ref" {
-            return Err(rejected("Git reference was not found"));
+        if status == StatusCode::UNPROCESSABLE_ENTITY && operation == "resolve GitHub ref" {
+            let bytes = read_bounded(response, ERROR_RESPONSE_BYTES, operation, None).await?;
+            let missing = serde_json::from_slice::<GitHubErrorResponse>(&bytes)
+                .ok()
+                .is_some_and(|error| {
+                    error
+                        .message
+                        .strip_prefix("No commit found for SHA: ")
+                        .is_some_and(|reference| !reference.is_empty())
+                });
+            return Err(rejected(if missing {
+                "Git reference was not found"
+            } else {
+                operation
+            }));
         }
         if status == StatusCode::NOT_FOUND && matches!(authentication, Authentication::App) {
             return Err(rejected(
@@ -2053,15 +2071,23 @@ mod tests {
 
     #[tokio::test]
     async fn distinguishes_a_missing_ref_from_other_client_rejections() -> Result<(), String> {
-        for (status, expected) in [
-            (404, "Git reference was not found"),
-            (401, "resolve GitHub ref"),
+        // The first response was recorded from GitHub's Get a commit endpoint for an absent ref.
+        for (status, body, expected) in [
+            (
+                422,
+                r#"{"message":"No commit found for SHA: missing-branch","documentation_url":"https://docs.github.com/rest/commits/commits#get-a-commit","status":"422"}"#,
+                "Git reference was not found",
+            ),
+            (
+                422,
+                r#"{"message":"Validation Failed","documentation_url":"https://docs.github.com/rest/commits/commits#get-a-commit","status":"422"}"#,
+                "resolve GitHub ref",
+            ),
+            (404, r#"{"message":"Not Found"}"#, "resolve GitHub ref"),
+            (401, r#"{"message":"fixture detail"}"#, "resolve GitHub ref"),
         ] {
             let mut responses = authentication_responses();
-            responses.push(ResponseSpec::status(
-                status,
-                r#"{"message":"fixture detail"}"#,
-            ));
+            responses.push(ResponseSpec::status(status, body));
             let mock = MockGitHub::start(responses)?;
             let result = adapter(&mock)?
                 .resolve_revision(&GitRevisionRequest {
@@ -2070,7 +2096,8 @@ mod tests {
                 })
                 .await;
             assert_rejected(result, expected);
-            mock.finish()?;
+            let requests = mock.finish()?;
+            assert!(requests[3].contains("/commits/missing-branch"));
         }
         Ok(())
     }

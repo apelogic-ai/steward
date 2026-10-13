@@ -94,11 +94,12 @@ function sentence(value: string): string {
   return /[.!?]$/.test(capitalized) ? capitalized : `${capitalized}.`;
 }
 
-function nextStep(reason: string): string {
+function nextStep(reason: string): string | null {
   const normalized = reason.toLocaleLowerCase("en-US");
   if ((normalized.includes("branch") || normalized.includes("tag")) && normalized.includes("not found")) return "Choose an existing branch or tag, then try again.";
   if (normalized.includes("repository") && (normalized.includes("not approved") || normalized.includes("not admitted") || normalized.includes("not allowed"))) return "Choose an approved repository or ask an administrator to approve this one.";
-  return "Reduce the Task requirements or choose a different Envelope.";
+  if (normalized.includes("this envelope allows") || normalized.includes("effective ceiling")) return "Reduce the Task requirements or choose a different Envelope.";
+  return null;
 }
 
 function alreadyHasNextStep(reason: string): boolean {
@@ -123,10 +124,14 @@ export function runNowFailureMessage(error: unknown, workspaceRepository?: strin
       && !reason.toLocaleLowerCase("en-US").includes(workspaceRepository.toLocaleLowerCase("en-US"))
       ? ` Repository: ${workspaceRepository}.`
       : "";
-    const action = alreadyHasNextStep(reason) ? "" : ` ${nextStep(reason)}`;
+    const suggestedAction = nextStep(reason);
+    const action = alreadyHasNextStep(reason) || !suggestedAction ? "" : ` ${suggestedAction}`;
     return `The run request was rejected. ${sentence(reason)}${repository}${action}`;
   }
-  if (code?.includes(" ")) return `The run request was rejected. ${sentence(code)} ${nextStep(code)}`;
+  if (code?.includes(" ")) {
+    const suggestedAction = nextStep(code);
+    return `The run request was rejected. ${sentence(code)}${suggestedAction ? ` ${suggestedAction}` : ""}`;
+  }
   return genericRunNowFailure;
 }
 

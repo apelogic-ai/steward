@@ -194,7 +194,14 @@ describe("Run now failures", () => {
   test("shows a human-readable rejection returned in the error field", () => {
     expect(runNowFailureMessage({
       error: "The selected coding agent does not support this model.",
-    })).toBe("The run request was rejected. The selected coding agent does not support this model. Reduce the Task requirements or choose a different Envelope.");
+    })).toBe("The run request was rejected. The selected coding agent does not support this model.");
+  });
+
+  test("does not invent a next step for an unrecognized server reason", () => {
+    expect(runNowFailureMessage({
+      error: "task.admission_rejected",
+      failureReason: "exact source object could not be resolved",
+    })).toBe("The run request was rejected. Exact source object could not be resolved.");
   });
 
   test("shows a repository rejection reason and names the selected repository", () => {
