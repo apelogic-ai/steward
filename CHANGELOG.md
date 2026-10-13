@@ -41,6 +41,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- Added the first real-installation browser journey for creating the initial Envelope templates,
+  together with the ten-journey feature specification and a tag-selectable Playwright runner.
 - Web spend and budget amounts now show two decimal places and their currency. Positive amounts
   below 0.01 show as `< 0.01` with the currency instead of rounding to zero.
 - New Tasks, Run now, and Get started choose their initial coding agent and model from deployment
