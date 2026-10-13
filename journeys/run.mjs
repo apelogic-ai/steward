@@ -2,6 +2,8 @@ import { existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs
 import { spawnSync } from "node:child_process";
 
 const config = "journeys/playwright.config.mjs";
+const knownFailingReport = "target/journeys/known-failing-report.json";
+const knownFailureMarker = "[steward-known-failure:#464]";
 
 function knownFailingExpression() {
   const tags = new Set();
@@ -82,10 +84,13 @@ function generatedScenarioCount(label) {
   if (!existsSync(directory)) return 0;
   return readdirSync(directory, { recursive: true })
     .filter((entry) => typeof entry === "string" && entry.endsWith(".spec.js"))
-    .length;
+    .reduce((count, entry) => {
+      const source = readFileSync(`${directory}/${entry}`, "utf8");
+      return count + (source.match(/^\s*test\('/gm)?.length ?? 0);
+    }, 0);
 }
 
-function execute(label, tags, allowEmpty = false) {
+function execute(label, tags) {
   const environment = {
     STEWARD_JOURNEY_EXECUTION: label,
     STEWARD_JOURNEY_TAG_EXPRESSION: tags,
@@ -93,9 +98,32 @@ function execute(label, tags, allowEmpty = false) {
   const generated = generate(label, tags);
   if (generated !== 0) return generated;
   process.stdout.write(`\n=== ${label}: browser scenarios ===\n`);
-  const arguments_ = ["playwright", "test", "--config", config];
-  if (allowEmpty) arguments_.push("--pass-with-no-tests");
-  return run("bunx", arguments_, environment);
+  return run("bunx", ["playwright", "test", "--config", config], environment);
+}
+
+function reportTests(suites) {
+  return suites.flatMap((suite) => [
+    ...(suite.specs ?? []).flatMap((spec) => spec.tests ?? []),
+    ...reportTests(suite.suites ?? []),
+  ]);
+}
+
+function expectedKnownFailures(count) {
+  if (!existsSync(knownFailingReport)) return false;
+  let report;
+  try {
+    report = JSON.parse(readFileSync(knownFailingReport, "utf8"));
+  } catch {
+    return false;
+  }
+  if ((report.errors?.length ?? 0) > 0) return false;
+  const tests = reportTests(report.suites ?? []);
+  if (tests.length !== count) return false;
+  return tests.every((test) => {
+    const result = test.results?.at(-1);
+    if (result?.status !== "failed" || !result.errors?.length) return false;
+    return result.errors.every((error) => `${error.message ?? ""}\n${error.value ?? ""}\n${error.stack ?? ""}`.includes(knownFailureMarker));
+  });
 }
 
 let selectedTags;
@@ -121,9 +149,20 @@ const requiredStatus = execute("required", requiredTags);
 if (requiredStatus !== 0) process.exit(requiredStatus);
 
 const knownFailingTags = `(${selectedTags}) and ${knownFailingTagsExpression}`;
-const knownFailingStatus = execute("known-failing", knownFailingTags, true);
-if (knownFailingStatus === 0) {
-  process.stdout.write("\nKnown-failing scenarios: none failed (the selected set may be empty).\n");
-} else {
-  process.stdout.write(`\nKnown-failing scenarios: failures reported above (nonfatal, status ${knownFailingStatus}).\n`);
+const knownFailingGenerated = generate("known-failing", knownFailingTags);
+if (knownFailingGenerated !== 0) process.exit(knownFailingGenerated);
+const knownFailingCount = generatedScenarioCount("known-failing");
+process.stdout.write(`\nKnown-failing scenarios selected: ${knownFailingCount}.\n`);
+if (knownFailingCount > 0) {
+  process.stdout.write("\n=== known-failing: browser scenarios ===\n");
+  rmSync(knownFailingReport, { force: true });
+  const knownFailingStatus = run("bunx", ["playwright", "test", "--config", config], {
+    STEWARD_JOURNEY_EXECUTION: "known-failing",
+    STEWARD_JOURNEY_TAG_EXPRESSION: knownFailingTags,
+  });
+  if (!expectedKnownFailures(knownFailingCount)) {
+    process.stderr.write("journeys: a known-failing scenario unexpectedly passed or could not complete.\n");
+    process.exit(knownFailingStatus || 1);
+  }
+  process.stdout.write(`\nKnown-failing scenarios: ${knownFailingCount} failed as expected.\n`);
 }

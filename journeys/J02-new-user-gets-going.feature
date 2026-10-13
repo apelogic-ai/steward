@@ -13,8 +13,7 @@ Feature: J2 - New user gets going
     And I am signed in as a user with the role "member"
 
   # All steps and "Done when".
-  # 0.3.16: FAIL at step 9 (N-06, N-08).
-  @smoke @needs-model @known-failing-0.3.16
+  @smoke @needs-model
   Scenario: Get an Envelope, run a first Task and see what it cost
     Given I hold no Envelope
     # Gap: no text is given for what a first sign-in shows besides this entry.

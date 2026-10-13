@@ -1,8 +1,12 @@
 import { expect } from "@playwright/test";
 import { createBdd, test as base } from "playwright-bdd";
 
+const shared = {
+  checkedPrefixes: new Set(),
+};
+
 export const test = base.extend({
-  journey: async ({ page }, use) => {
+  journey: async ({ page }, use, testInfo) => {
     const consoleErrors = [];
     const pageErrors = [];
     const onConsole = (message) => {
@@ -13,9 +17,16 @@ export const test = base.extend({
     page.on("pageerror", onPageError);
     await use({
       expectNoTemplates: false,
+      currentTemplate: null,
       modelAliases: new Map(),
       initialCounts: new Map(),
+      knownIssue: testInfo.tags.find((tag) => tag.startsWith("@known-failing-")) ?? null,
+      requests: new Map(),
+      repository: null,
+      run: null,
       selectedModels: [],
+      shared,
+      transientSeen: new Set(),
     });
     page.off("console", onConsole);
     page.off("pageerror", onPageError);
