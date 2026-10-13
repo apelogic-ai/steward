@@ -2,9 +2,11 @@
 
 Ten journeys for the web UI (brand name in the UI: HyperShell), one file each. A journey is one person, one goal, from start to finish. The files are plain text that a person can read and a test runner can run.
 
-The feature set comes from the user-journey specification (J1 to J10). The `@smoke` scenarios in
-J1 through J4 are executable; later scenarios retain their source annotations until their step
-implementations are added.
+The feature set comes from the user-journey specification (J1 to J10). The runner loads all ten
+files. `@smoke` executes the release-critical paths in J1 through J4; `@extended` executes the
+currently passing one-account paths in J6 through J8. J5's documented paths still carry product
+findings, J9 needs a second signed-in person, and J10 needs operator control of the installation,
+so those paths remain specifications until those prerequisites and expected outcomes are available.
 
 | File | Journey |
 |---|---|
@@ -80,6 +82,7 @@ Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test
 | Tag | Meaning |
 |---|---|
 | `@smoke` | Part of the smallest set that proves a release is usable: J1 (steps 1 to 9), J2, J3 (approve path), J4 (steps 1 to 6). Run in this order with one unique run prefix. |
+| `@extended` | Passing one-account coverage beyond smoke: J6's accepted requirements, J7's terminal captured/no-capture logs, and J8's agent/model selection and Task persistence. Run after `@smoke` with the same prefix. |
 | `@needs-model` | Makes a real model call. Costs money. |
 | `@needs-github` | Needs an external repository that the installation allows. |
 | `@two-accounts` | Needs a second signed-in person. |
@@ -91,8 +94,8 @@ A tag on the `Feature` line applies to every scenario in the file.
 
 ## A sentence with no code behind it
 
-A sentence runs only when a small piece of test code exists for its pattern. The `@smoke` scenarios
-in J1 through J4 have step code; the remaining scenarios are specifications until their journey
+A sentence runs only when a small piece of test code exists for its pattern. The `@smoke` and
+`@extended` scenarios have step code; other scenarios remain specifications until their journey
 implementation lands.
 
 When a file holds a sentence that has no code:
@@ -103,9 +106,9 @@ When a file holds a sentence that has no code:
 
 So a maintainer can write a new sentence at any time. The cost is one request to a test engineer, and the scenario stays unproven until it is answered. Reusing a pattern from `STEPS.md` costs nothing.
 
-The runner includes J1 through J4. The remaining feature specifications do not look tested before
-their step code lands. Within the selected scenarios, a missing sentence fails generation and no
-browser scenario starts.
+The runner includes all ten files, but tags select only the intended scenarios. Feature
+specifications without step code do not look tested: selecting one fails generation before a
+browser starts.
 
 ## Run against an installation
 
@@ -133,6 +136,17 @@ export STEWARD_JOURNEY_AGENT=agent-ref-or-display-name
 export STEWARD_JOURNEY_MODEL=provider/model
 cargo xtask journeys --tags @smoke
 ```
+
+Run the additional passing paths with the same prefix after smoke has created the `standard` and
+`timed` templates and their Envelopes:
+
+```console
+cargo xtask journeys --tags @extended
+```
+
+The extended fixture authors run-prefixed `basic` and `broad` templates through the real admin API
+when they do not exist, then requests their within-template Envelopes through the real user API.
+Those objects remain on the target installation, just like the smoke templates and Envelopes.
 
 For an installation that intentionally uses a private or locally trusted HTTPS certificate, opt in
 to Playwright's certificate bypass for that run:

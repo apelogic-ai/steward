@@ -1,4 +1,4 @@
-# Source: user journey J5. Checked against version 0.3.16.
+# Source: user journey J5. Original product findings were recorded against version 0.3.16.
 # The test installation gives scratch space in a fixed 2 GiB volume.
 Feature: J5 - User runs a Task with scratch space
   As a user with an Envelope that allows Scratch workspaces

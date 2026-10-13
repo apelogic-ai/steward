@@ -12,6 +12,12 @@ const testDir = defineBddConfig({
     "J02-new-user-gets-going.feature",
     "J03-user-needs-more-than-the-template-allows.feature",
     "J04-user-runs-a-task-on-a-repository.feature",
+    "J05-user-runs-a-task-with-scratch-space.feature",
+    "J06-user-asks-for-more-than-the-envelope-allows.feature",
+    "J07-user-watches-and-stops-a-run.feature",
+    "J08-user-chooses-agent-and-model.feature",
+    "J09-administrator-oversight.feature",
+    "J10-operator-changes-configuration.feature",
   ],
   steps: "steps/*.mjs",
   outputDir: `.generated/${execution}`,
@@ -26,6 +32,7 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   timeout: 360_000,
+  navigationTimeout: 30_000,
   expect: { timeout: 10_000 },
   reporter: execution === "known-failing"
     ? [["list"], ["json", { outputFile: resolve("target/journeys/known-failing-report.json") }]]

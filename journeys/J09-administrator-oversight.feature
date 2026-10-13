@@ -1,4 +1,4 @@
-# Source: user journey J9. Checked against version 0.3.16.
+# Source: user journey J9. Original product findings were recorded against version 0.3.16.
 # "I" is the administrator. "another user" owns the runs and the requests.
 @two-accounts
 Feature: J9 - Administrator oversight

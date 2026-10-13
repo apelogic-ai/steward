@@ -27,16 +27,19 @@ function templateId(name) {
 }
 
 function resolveText(journey, text) {
-  const prefixed = text
+  let prefixed = text
     .replaceAll("<run-prefix>", runPrefix)
     .replaceAll("<owner>/<repository>", repository);
   if (prefixed === "member") return memberRole;
-  if (prefixed === "Read the repository") return `task-${runPrefix}-repo`;
+  if (["Agent choice", "Read the repository", "Scratch and Git", "Scratch check", "Stated needs"].includes(prefixed)) {
+    return `${runPrefix}-${prefixed.toLocaleLowerCase("en-US").replaceAll(/[^a-z0-9]+/g, "-").replaceAll(/^-|-$/g, "")}`;
+  }
   if (prefixed === "<run-runtime-minutes>") {
     if (!journey.runRuntimeMinutes) throw new Error("the journey must choose an unused runtime-minutes value before filling the request");
     return journey.runRuntimeMinutes;
   }
-  return journey.modelAliases.get(prefixed) ?? prefixed;
+  for (const [alias, value] of journey.modelAliases) prefixed = prefixed.replaceAll(alias, value);
+  return prefixed;
 }
 
 function escapeRegExp(value) {
@@ -51,7 +54,7 @@ function fieldLocator(page, field) {
   if (["Limit per run", "Monthly limit", "Time-to-live limit", "Runtime limit per month"].includes(field)) {
     return page.getByRole("spinbutton", { name }).first();
   }
-  if (["Branch or tag", "Display name", "Expires at (optional)", "Name", "New template ID", "Package path", "Prompt", "Rationale", "Template ID", "Total size limit (optional)", "Workspace (advanced JSON array)"].includes(field)) {
+  if (["Branch or tag", "Display name", "Expires at (optional)", "Name", "New template ID", "Package path", "Prompt", "Rationale", "Requirements (optional JSON)", "Template ID", "Total size limit (optional)", "Workspace (advanced JSON array)"].includes(field)) {
     return page.getByRole("textbox", { name }).first();
   }
   if (field === "05 Request note") {
@@ -134,6 +137,77 @@ async function apiJson(page, path) {
   return response.json();
 }
 
+async function mutationJson(page, path, method, body) {
+  const session = await apiJson(page, "/admin/api/v1/session");
+  const result = await page.evaluate(async ({ csrf, mutationBody, mutationMethod, mutationPath }) => {
+    const response = await fetch(mutationPath, {
+      body: JSON.stringify(mutationBody),
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json", "X-Steward-CSRF": csrf },
+      method: mutationMethod,
+    });
+    return { body: await response.text(), ok: response.ok, status: response.status };
+  }, { csrf: session.csrf, mutationBody: body, mutationMethod: method, mutationPath: path });
+  let parsed = null;
+  try {
+    parsed = result.body ? JSON.parse(result.body) : null;
+  } catch {
+    // Keep the response status as the public failure signal; never echo an HTML error body.
+  }
+  expect(result.ok, `${method} ${path} should succeed (status ${result.status})`).toBeTruthy();
+  return parsed;
+}
+
+async function userTemplates(page) {
+  const data = await apiJson(page, "/app/api/v1/envelope-templates");
+  expect(Array.isArray(data.templates), "the Envelope template collection should be valid").toBeTruthy();
+  return data.templates;
+}
+
+async function ensureExtendedTemplate(page, name) {
+  let templates = await userTemplates(page);
+  let template = templates.find((candidate) => candidate.id === templateId(name));
+  if (template) return template;
+  expect(["basic", "broad"], `the extended fixture does not author the ${name} template`).toContain(name);
+  const standard = templates.find((candidate) => candidate.id === templateId("standard"));
+  expect(standard, `the ${templateId("standard")} template must be created by @smoke before @extended`).toBeDefined();
+  const [capabilities, catalog] = await Promise.all([
+    apiJson(page, "/app/api/v1/capabilities"),
+    apiJson(page, "/admin/api/v1/capabilities"),
+  ]);
+  const compatibleModels = [];
+  for (const agent of capabilities.agents) {
+    const model = catalog.models.find((candidate) => agent.models.providers.includes(candidate.provider));
+    if (model && !compatibleModels.some((candidate) => candidate.provider === model.provider && candidate.model === model.model)) {
+      compatibleModels.push(model);
+    }
+  }
+  const needed = name === "broad" ? 2 : 1;
+  expect(compatibleModels.length, `${name} requires ${needed} configured agent-compatible model(s)`).toBeGreaterThanOrEqual(needed);
+  const envelope = structuredClone(standard.ceiling);
+  envelope.revision = 1;
+  envelope.spec.llms = compatibleModels.slice(0, needed);
+  envelope.spec.tools = [];
+  envelope.spec.runner = { compute: null, memory: null, platforms: ["linux"], storage: null };
+  if (name === "basic") {
+    envelope.spec.budget = { currency: standard.ceiling.spec.budget.currency, monthlyLimit: "20.00", singleRunLimit: "0.75" };
+    envelope.spec.ttl = "15m";
+    delete envelope.spec.runtimeMinutesLimit;
+    delete envelope.spec.workspace;
+  }
+  await mutationJson(page, `/admin/api/v1/envelope-templates/${encodeURIComponent(templateId(name))}`, "PUT", {
+    allowInlineBrowserTasks: true,
+    displayName: `${runPrefix} ${name.charAt(0).toUpperCase()}${name.slice(1)}`,
+    envelope,
+    memberRoles: [memberRole],
+  });
+  templates = await userTemplates(page);
+  template = templates.find((candidate) => candidate.id === templateId(name));
+  expect(template, `the ${templateId(name)} template should be available after authoring`).toBeDefined();
+  return template;
+}
+
 async function userRequests(page, status = null) {
   const requests = [];
   const seenCursors = new Set();
@@ -152,6 +226,42 @@ async function userRequests(page, status = null) {
     }
   } while (cursor);
   return requests;
+}
+
+async function userRuns(page) {
+  const runs = [];
+  const seenCursors = new Set();
+  let cursor = null;
+  do {
+    const query = new URLSearchParams({ limit: "100" });
+    if (cursor) query.set("cursor", cursor);
+    const data = await apiJson(page, `/app/api/v1/runs?${query}`);
+    expect(Array.isArray(data.runs), "the Run collection should be valid").toBeTruthy();
+    runs.push(...data.runs);
+    cursor = data.nextCursor ?? null;
+    if (cursor) {
+      expect(seenCursors.has(cursor), "the Run cursor must advance").toBeFalsy();
+      seenCursors.add(cursor);
+    }
+  } while (cursor);
+  return runs;
+}
+
+async function recordInitialRuns(journey, page) {
+  if (journey.initialRunIds) return;
+  journey.initialRunIds = new Set((await userRuns(page)).map((run) => run.taskUid));
+}
+
+async function provisionExtendedEnvelope(page, name) {
+  const template = await ensureExtendedTemplate(page, name);
+  const response = await mutationJson(page, "/app/api/v1/envelope-requests", "POST", {
+    idempotencyKey: crypto.randomUUID(),
+    requestedEnvelope: template.ceiling,
+    templateId: template.id,
+    templateRevision: template.revision,
+  });
+  expect(response?.request?.status, `${template.id} should auto-provision within its template limits`).toBe("provisioned");
+  return response.request;
 }
 
 async function chooseUnusedRuntimeMinutes(page) {
@@ -225,6 +335,51 @@ async function selectConfiguredRuntime(page) {
   }
 }
 
+async function openExecutionStage(page) {
+  const jobs = page.getByRole("navigation", { name: "Run jobs" });
+  await expect(jobs).toBeVisible();
+  await jobs.getByRole("button", { name: "Agent execution", exact: true }).click();
+  const stage = page.getByRole("heading", { name: "Agent execution", exact: true }).locator("xpath=ancestor::section[1]");
+  await expect(stage).toBeVisible();
+  const logStep = stage.locator("details").first();
+  if (await logStep.count() && !(await logStep.getAttribute("open"))) await logStep.locator("summary").click();
+}
+
+function decimalBelow(value, decrement) {
+  return Math.max(0, Number(value) - decrement).toFixed(2);
+}
+
+async function fillEnvelopeRequirements(journey, page, boundary) {
+  const request = journey.requests.get(journey.currentTemplate);
+  expect(request, "an active Envelope should be selected before stating Task requirements").toBeTruthy();
+  const spec = structuredClone((request.approvedEnvelope ?? request.requestedEnvelope).spec);
+  const atLimit = boundary === "at";
+  const requirements = {
+    authority: {
+      budget: {
+        currency: spec.budget.currency,
+        monthlyLimit: atLimit ? spec.budget.monthlyLimit : decimalBelow(spec.budget.monthlyLimit, 1),
+        singleRunLimit: spec.budget.singleRunLimit == null
+          ? null
+          : atLimit ? spec.budget.singleRunLimit : decimalBelow(spec.budget.singleRunLimit, 0.25),
+      },
+      llms: spec.llms,
+      runner: {
+        compute: atLimit ? spec.runner?.compute ?? null : null,
+        memory: atLimit ? spec.runner?.memory ?? null : null,
+        platforms: atLimit ? spec.runner?.platforms ?? [] : [],
+        storage: atLimit ? spec.runner?.storage ?? null : null,
+      },
+      tools: atLimit ? spec.tools : [],
+      ttl: atLimit ? spec.ttl : "10m",
+      ...(spec.runtimeMinutesLimit == null ? {} : {
+        runtimeMinutesLimit: atLimit ? spec.runtimeMinutesLimit : String(Math.max(0, Number(spec.runtimeMinutesLimit) - 1)),
+      }),
+    },
+  };
+  await fieldLocator(page, "Requirements (optional JSON)").fill(JSON.stringify(requirements));
+}
+
 async function clickControl(page, name) {
   const button = page.getByRole("button", { name, exact: true });
   if (await button.count()) {
@@ -232,6 +387,26 @@ async function clickControl(page, name) {
     return;
   }
   await page.getByRole("link", { name, exact: true }).click();
+}
+
+async function assertDataRows(scope, journey, dataTable) {
+  for (const rawRow of dataTable.raw()) {
+    const values = rawRow.map((cell) => resolveText(journey, cell.trim())).filter(Boolean);
+    if (values.length === 0) continue;
+    if (values.length === 1) {
+      await expect(scope.getByText(values[0], { exact: !values[0].endsWith(":") }).first()).toBeVisible();
+      continue;
+    }
+    const candidates = scope.locator("tr, [role=row], dl > div, ul > li, ol > li");
+    const index = await candidates.evaluateAll((elements, expected) => elements.findIndex((element) => {
+      const text = element.innerText.replace(/\s+/g, " ").trim();
+      return expected.every((value) => text.includes(value));
+    }), values);
+    expect(index, `one visible row should contain ${values.join(" | ")}`).toBeGreaterThanOrEqual(0);
+    const row = candidates.nth(index);
+    await expect(row).toBeVisible();
+    for (const value of values) await expect(row.getByText(value, { exact: !value.endsWith(":") }).first()).toBeVisible();
+  }
 }
 
 Given(/^the optional integration "([^"]+)" is switched (off|on)$/, async ({ journey, page }, integration, state) => {
@@ -272,9 +447,14 @@ Given(/^the installation's configuration has the coding agent "([^"]+)" with the
   const index = agent === "<Agent A>" ? 0 : 1;
   const binding = capabilities.agents[index];
   expect(binding, `the installation should configure ${agent}`).toBeDefined();
-  const configuredModel = catalog.models.find((candidate) => binding.models.providers.includes(candidate.provider));
+  const alreadySelected = new Set([...journey.modelAliases.entries()]
+    .filter(([alias]) => /^<provider-[ab]>\/<model-[ab]>$/.test(alias))
+    .map(([, value]) => value));
+  const configuredModel = catalog.models.find((candidate) => binding.models.providers.includes(candidate.provider)
+    && !alreadySelected.has(`${candidate.provider}/${candidate.model}`));
   expect(configuredModel, `${agent} should have a configured model`).toBeDefined();
   journey.modelAliases.set(agent, binding.displayName ?? binding.agentRef);
+  journey.modelAliases.set(agent === "<Agent A>" ? "<agent-a>" : "<agent-b>", binding.agentRef);
   journey.modelAliases.set(model, `${configuredModel.provider}/${configuredModel.model}`);
 });
 
@@ -287,6 +467,7 @@ Given("I am signed in as a user who is also an administrator", async ({ journey,
   await assertSignedIn(page);
   await expect(page.getByRole("group", { name: "Workspace view" })).toBeVisible();
   journey.runRuntimeMinutes = await chooseUnusedRuntimeMinutes(page);
+  await recordInitialRuns(journey, page);
 });
 
 When("I choose {string} in {string}", async ({ journey, page }, choice, field) => {
@@ -333,6 +514,10 @@ When("I choose {string} in {string}", async ({ journey, page }, choice, field) =
     await select.selectOption({ label: repository });
     return;
   }
+  if (field === "Coding agent" && /^<Agent [AB]>$/.test(choice)) {
+    await selectConfiguredOption(select, resolveText(journey, choice), "Coding agent");
+    return;
+  }
   await select.selectOption({ label: resolveText(journey, choice) });
 });
 
@@ -357,7 +542,8 @@ Then("I see in {string}:", async ({ journey, page }, area, dataTable) => {
       await expect.poll(() => cells.count()).toBeGreaterThanOrEqual(expectedHeaders.length);
       for (const [index, expected] of expectedRow.entries()) {
         const value = resolveText(journey, expected.trim());
-        if (value) await expect(cells.nth(index)).toContainText(value);
+        if (value && index === 0) await expect(cells.nth(index)).toContainText(value);
+        else if (value) await expect(cells.nth(index)).toHaveText(value);
         else await expect(cells.nth(index)).toHaveText("");
       }
     }
@@ -380,13 +566,7 @@ Then("I see in {string}:", async ({ journey, page }, area, dataTable) => {
     }
     return;
   }
-  for (const row of dataTable.raw()) {
-    for (const cell of row) {
-      if (!cell.trim()) continue;
-      const expected = resolveText(journey, cell.trim());
-      await expect(scope.getByText(expected, { exact: !expected.endsWith(":") }).first()).toBeVisible();
-    }
-  }
+  await assertDataRows(scope, journey, dataTable);
 });
 
 When("I open {string}", async ({ journey, page }, destination) => {
@@ -398,6 +578,14 @@ When("I open {string}", async ({ journey, page }, destination) => {
   }
   if (name === "Repository details") {
     await page.locator("summary").filter({ hasText: name }).first().click();
+    return;
+  }
+  if (name === "Agent execution") {
+    await openExecutionStage(page);
+    return;
+  }
+  if (name === "More run actions") {
+    await page.getByRole("button", { name, exact: true }).click();
     return;
   }
   await page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name, exact: true }).click();
@@ -412,15 +600,20 @@ When("I open {string}", async ({ journey, page }, destination) => {
   }
   if (name === "Runs" && !journey.initialCounts.has("Runs")) {
     await waitForCollection(page, "Runs", "No runs yet.");
-    journey.initialCounts.set("Runs", await page.getByRole("table", { name: "Runs" }).getByRole("rowgroup").getByRole("link").count());
+    await recordInitialRuns(journey, page);
+    journey.initialCounts.set("Runs", journey.initialRunIds.size);
   }
 });
 
 When("I press {string}", async ({ journey, page }, control) => {
   const resolved = resolveText(journey, control);
-  if (["Save version 1", "Run"].includes(resolved)) {
-    const target = resolved === "Save version 1" ? /\/tasks\/[^/?#]+$/ : /\/runs\/new\?task=/;
+  if (/^Save version \d+$/.test(resolved) || resolved === "Run") {
+    const target = resolved.startsWith("Save version") ? /\/tasks\/[^/?#]+$/ : /\/runs\/new\?task=/;
     await Promise.all([page.waitForURL(target), clickControl(page, resolved)]);
+    return;
+  }
+  if (/^Edit into v\d+$/.test(resolved)) {
+    await Promise.all([page.waitForURL(/\/tasks\/[^/?#]+\/edit$/), clickControl(page, resolved)]);
     return;
   }
   if (resolved === "Run now" && await page.getByRole("link", { name: resolved, exact: true }).count()) {
@@ -472,14 +665,31 @@ Then("I see {string}", async ({ journey, page }, text) => {
     await expect(term.locator("xpath=following-sibling::dd[1]")).toHaveText(value);
     return;
   }
-  await expect(exact).toBeVisible();
+  await expect(page.getByText(expected, { exact: false }).first()).toBeVisible();
 });
 
 Then("I do not see {string}", async ({ journey, page }, text) => {
   await expect(page.getByText(resolveText(journey, text), { exact: false })).toHaveCount(0);
 });
 
-Then("{string} is disabled", async ({ page }, field) => {
+Then("I do not see {string} in {string}", async ({ journey, page }, text, area) => {
+  const expected = resolveText(journey, text);
+  const scope = fieldLocator(page, area);
+  if (await scope.count()) {
+    await expect(scope.locator("option").filter({ hasText: expected })).toHaveCount(0);
+    return;
+  }
+  await expect(areaLocator(page, area).getByText(expected, { exact: false })).toHaveCount(0);
+});
+
+Then("{string} is disabled", async ({ journey, page }, field) => {
+  if (/^<Agent [AB]>$/.test(field)) {
+    const expected = resolveText(journey, field);
+    const picker = fieldLocator(page, "Coding agent");
+    const option = picker.locator("option").filter({ hasText: expected });
+    await expect(option).toBeDisabled();
+    return;
+  }
   await expect(fieldLocator(page, field)).toBeDisabled();
 });
 
@@ -500,6 +710,12 @@ When("I open {string} in {string}", async ({ journey, page }, item, area) => {
     await scope.getByRole("link", { name: new RegExp(escapeRegExp(request.id)) }).click();
     return;
   }
+  if (area === "Tasks") {
+    const task = scope.getByRole("article").filter({ hasText: resolveText(journey, item) });
+    await expect(task).toHaveCount(1);
+    await task.getByRole("link", { name: "Review", exact: true }).click();
+    return;
+  }
   await scope.getByRole("link").filter({ hasText: resolveText(journey, item) }).click();
 });
 
@@ -515,7 +731,42 @@ Then("the field {string} shows {string}", async ({ journey, page }, field, value
     }).toBe(JSON.stringify(JSON.parse(expected)));
     return;
   }
-  await expect(fieldLocator(page, field)).toHaveValue(expected);
+  const locator = fieldLocator(page, field);
+  if (!(await locator.count())) {
+    const term = page.locator("dt").filter({ hasText: new RegExp(`^${escapeRegExp(field)}$`) }).first();
+    await expect(term).toBeVisible();
+    await expect(term.locator("xpath=following-sibling::dd[1]")).toContainText(expected);
+    return;
+  }
+  if (await locator.evaluate((element) => element.tagName === "SELECT")) {
+    await expect(locator.locator("option:checked")).toContainText(expected);
+    return;
+  }
+  await expect(locator).toHaveValue(expected);
+});
+
+When("I state requirements that are all below the Envelope's limits", async ({ journey, page }) => {
+  await fillEnvelopeRequirements(journey, page, "below");
+});
+
+When("I state requirements that are all at the Envelope's limits", async ({ journey, page }) => {
+  await fillEnvelopeRequirements(journey, page, "at");
+});
+
+Given("the installation keeps execution logs", async ({ page }) => {
+  await page.goto("/runs/new");
+  await expect(checkboxLocator(page, "Capture execution log")).toBeEnabled();
+});
+
+Then("the log holds every line printed before the run ended", async ({ journey, page }) => {
+  const taskUid = journey.run?.taskUid;
+  expect(taskUid, "a completed run should be recorded before checking its log").toBeTruthy();
+  const response = await apiJson(page, `/app/api/v1/runs/${encodeURIComponent(taskUid)}/logs/stdout`);
+  expect(response.complete, "the terminal run's stdout log should be complete").toBeTruthy();
+  expect(response.content, "the completed run should have captured stdout").not.toBe("");
+  const visible = page.getByLabel("stdout log lines");
+  await expect(visible).toBeVisible();
+  await expect(visible).toContainText(response.content.trim());
 });
 
 Then("the drop-down {string} offers {string}", async ({ journey, page }, field, offered) => {
@@ -544,15 +795,25 @@ Then(/^the page "([^"]+)" lists (\d+) new (?:entry|entries)$/, async ({ journey,
     }).toBe(initial + expected);
     return;
   }
+  if (area === "Runs") {
+    expect(journey.initialRunIds, "Runs must record its starting identities before comparing new entries").toBeTruthy();
+    let newRuns = [];
+    await expect.poll(async () => {
+      newRuns = (await userRuns(page)).filter((run) => !journey.initialRunIds.has(run.taskUid));
+      return newRuns.length;
+    }, { message: `${area} should list ${expected} new entries` }).toBe(expected);
+    for (const run of newRuns) {
+      await expect(page.getByRole("table", { name: "Runs" }).getByRole("link", { name: new RegExp(escapeRegExp(run.taskUid)) })).toBeVisible();
+    }
+    return;
+  }
   const count = area === "Envelopes"
     ? async () => {
         await waitForCollection(page, "Envelopes", "No envelopes yet.");
         return page.getByRole("table", { name: "Envelopes" }).getByRole("rowgroup").getByRole("link").filter({ hasText: runPrefix }).count();
       }
-    : async () => {
-        await waitForCollection(page, "Runs", "No runs yet.");
-        return page.getByRole("table", { name: "Runs" }).getByRole("rowgroup").getByRole("link").count();
-      };
+    : null;
+  expect(count, `${area} should have a supported collection counter`).toBeTruthy();
   await expect.poll(count, { message: `${area} should list ${expected} new entries` }).toBe(initial + expected);
 });
 
@@ -573,6 +834,7 @@ Given("I am signed in as a user with the role {string}", async ({ journey, page 
   await page.goto("/");
   await assertSignedIn(page);
   journey.runRuntimeMinutes = await chooseUnusedRuntimeMinutes(page);
+  await recordInitialRuns(journey, page);
 });
 
 Given("I hold no Envelope", async ({ journey, page }) => {
@@ -582,8 +844,10 @@ Given("I hold no Envelope", async ({ journey, page }) => {
 });
 
 Given("I hold an Envelope from the template {string}", async ({ journey, page }, name) => {
-  const request = await requestForTemplate(page, name, "provisioned");
+  let request = await requestForTemplate(page, name, "provisioned");
+  if (!request && journey.extended) request = await provisionExtendedEnvelope(page, name);
   expect(request, `a provisioned Envelope from ${templateId(name)} should exist`).toBeTruthy();
+  journey.currentTemplate = name;
   journey.requests.set(name, request);
 });
 
@@ -640,11 +904,21 @@ Then("the run ends as {string} within {int} min", async ({ journey, page }, phas
     const data = await apiJson(page, `/app/api/v1/runs/${encodeURIComponent(taskUid)}`);
     journey.run = data.run;
     if (data.run.finalized) {
-      expect(data.run.phase, `the run should end as ${phase}`).toBe(phase);
+      if (data.run.phase !== phase) {
+        throw new Error(`the run should end as ${phase}; actual phase=${data.run.phase}; category=${data.run.errorCategory ?? "none"}; reason=${data.run.failureReason ?? "none"}`);
+      }
       break;
     }
     expect(Date.now(), `the run should end as ${phase} within ${minutes} min`).toBeLessThan(deadline);
     await page.waitForTimeout(2_000);
+  }
+  const selectedRequest = journey.currentTemplate ? journey.requests.get(journey.currentTemplate) : null;
+  if (selectedRequest) {
+    expect(selectedRequest.envelopeInstanceId, `the ${templateId(journey.currentTemplate)} request should identify its provisioned Envelope`).toBeTruthy();
+    expect(journey.run.userEnvelopeInstanceId, "the run should use the Envelope selected for this scenario").toBe(selectedRequest.envelopeInstanceId);
+    expect(journey.run.userEnvelopeRevision, "the run should record the revision of the selected Envelope").toBe(
+      (selectedRequest.approvedEnvelope ?? selectedRequest.requestedEnvelope).revision,
+    );
   }
   await page.reload();
   await expect(page.locator("[data-tone]").filter({ hasText: new RegExp(`^${escapeRegExp(phase)}$`, "i") }).first()).toBeVisible();
@@ -668,11 +942,12 @@ Then("the run output contains {string}", async ({ journey, page }, expected) => 
   expect(output).toContain(expectedOutput);
 });
 
-Then("the spend of the run is above {float} USD", async ({ journey, page }, minimum) => {
-  expect(journey.run?.observedSpend?.currency).toBe("USD");
+Then(/^the spend of the run is above ([0-9]+(?:\.[0-9]+)?) ([A-Z]{3})$/, async ({ journey, page }, minimumText, unit) => {
+  const minimum = Number(minimumText);
+  expect(journey.run?.observedSpend?.currency).toBe(unit);
   expect(Number(journey.run.observedSpend.observedAmount)).toBeGreaterThan(minimum);
   const spend = page.locator("#workspace p").filter({ hasText: /^Spend$/ }).first().locator("xpath=following-sibling::p[1]");
-  await expect(spend).toHaveText(/^\d+(?:\.\d+)? USD$/);
+  await expect(spend).toHaveText(new RegExp(`^\\d+(?:\\.\\d+)? ${escapeRegExp(unit)}$`));
   expect(Number((await spend.innerText()).split(/\s+/)[0]), "the Run page should show spend above the expected minimum").toBeGreaterThan(minimum);
 });
 
@@ -698,11 +973,13 @@ When("I start a Hello world run with the Envelope from the template {string}", a
   await page.goto("/runs/new");
   const request = await requestForTemplate(page, name, "provisioned");
   expect(request, `a provisioned Envelope from ${templateId(name)} should exist`).toBeTruthy();
+  journey.currentTemplate = name;
   journey.requests.set(name, request);
   await fieldLocator(page, "Envelope").selectOption(request.id);
   await selectConfiguredRuntime(page);
   const source = fieldLocator(page, "Package source");
-  if (await source.count()) await source.selectOption({ label: "Inline package" });
+  await expect(source, "the direct Run form should expose Package source").toHaveCount(1);
+  await source.selectOption({ label: "Inline package" });
   await page.getByRole("button", { name: "Run now", exact: true }).click();
 });
 

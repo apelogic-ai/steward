@@ -17,6 +17,7 @@ export const test = base.extend({
     page.on("pageerror", onPageError);
     await use({
       expectNoTemplates: false,
+      extended: testInfo.tags.includes("@extended"),
       currentTemplate: null,
       modelAliases: new Map(),
       initialCounts: new Map(),
@@ -25,6 +26,7 @@ export const test = base.extend({
       requests: new Map(),
       repository: null,
       run: null,
+      initialRunIds: null,
       runRuntimeMinutes: null,
       selectedModels: [],
       shared,

@@ -1,4 +1,4 @@
-# Source: user journey J8. Checked against version 0.3.16.
+# Source: user journey J8. Original product findings were recorded against version 0.3.16.
 # "<Agent A>" is the name shown for an agent; "<agent-b>" is the short name shown after "·".
 Feature: J8 - User chooses agent and model
   As a user with Envelopes that allow different models
@@ -17,7 +17,7 @@ Feature: J8 - User chooses agent and model
     And I hold an Envelope from the template "basic"
 
   # Steps 1 to 7 and "Done when". PASS on 0.3.16.
-  @needs-model
+  @extended @needs-model
   Scenario: Pick agent and model, run, and keep the choice in a saved Task
     When I open "Runs"
     And I press "Run now"

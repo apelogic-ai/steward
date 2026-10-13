@@ -1,4 +1,4 @@
-# Source: user journey J7. Checked against version 0.3.16.
+# Source: user journey J7. Original product findings were recorded against version 0.3.16.
 # "The log" is the tab that is shown first when "Agent execution" is opened ("stdout").
 Feature: J7 - User watches and stops a run
   As a user who started a run that takes minutes
@@ -50,7 +50,7 @@ Feature: J7 - User watches and stops a run
     Then the Envelope from the template "standard" shows the same spend as used out of its monthly limit
 
   # Variant. Passes at its end on 0.3.16.
-  @needs-model
+  @extended @needs-model
   Scenario: Variant - a run left to finish has a complete log
     When I open "Runs"
     And I press "Run now"
@@ -63,7 +63,7 @@ Feature: J7 - User watches and stops a run
     And I do not see "Live log · polling for new output…"
 
   # F1. PASS on 0.3.16.
-  @needs-model
+  @extended @needs-model
   Scenario: A run started without log capture says so
     When I open "Runs"
     And I press "Run now"

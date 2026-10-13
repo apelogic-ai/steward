@@ -1,4 +1,4 @@
-# Source: user journey J10. Checked against version 0.3.16.
+# Source: user journey J10. Original product findings were recorded against version 0.3.16.
 # "I" is the operator, who works outside the web UI. The checks in the UI are
 # done by "an administrator" and "a user". Suited to a release candidate, not to every build.
 @operator @two-accounts @nightly

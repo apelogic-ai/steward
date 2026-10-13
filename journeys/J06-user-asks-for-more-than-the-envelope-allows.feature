@@ -1,4 +1,4 @@
-# Source: user journey J6. Checked against version 0.3.16.
+# Source: user journey J6. Original product findings were recorded against version 0.3.16.
 # Example limits of the "basic" Envelope: 20.00 USD per month, 0.75 USD per run,
 # 15 min per run, 3 tools, Linux. The "timed" Envelope allows 60 min of runtime per month.
 Feature: J6 - User asks for more than their Envelope allows in a Task
@@ -15,7 +15,7 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
     And I hold an Envelope from the template "timed"
 
   # Steps 1 and 2. PASS on 0.3.16.
-  @needs-model
+  @extended @needs-model
   Scenario: Needs at or below the Envelope's limits are accepted
     When I open "Tasks"
     And I press "New Task"
