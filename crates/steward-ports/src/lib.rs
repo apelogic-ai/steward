@@ -514,6 +514,10 @@ pub trait ToolPlane {
 }
 
 pub trait DecisionChannel: Send + Sync + 'static {
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
     fn request(
         &self,
         request: &DecisionRequest,

@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- The administrator request queue now reports whether external decision filing is enabled, so
+  browser clients can hide a filing action that cannot succeed.
 - Browser pages now use plain-language run stages and refusal reasons, show Envelope display names,
   runtime limits, actor names, and save confirmation, and start new templates without implicit
   roles, models, platforms, or inline browser-authored packages.

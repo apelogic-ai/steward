@@ -5603,12 +5603,12 @@ mod tests {
             ))?
             .workspace_deployment_capabilities();
         let admin_app = browser_admin::protected_router_with_workspace_capabilities(
-            runtime_repository,
+            runtime_repository.clone(),
             admin_ledger.clone(),
             admin_decisions.clone(),
             browser_capability_catalog(),
             workspace_capabilities,
-            admin_auth,
+            admin_auth.clone(),
         );
         let provisioned = admin_app
             .clone()
@@ -5808,6 +5808,11 @@ mod tests {
         let requests: serde_json::Value = serde_json::from_slice(&requests_body)
             .map_err(|error| format!("decode unified request queue response: {error}"))?;
         assert_eq!(
+            requests.pointer("/decisionChannelEnabled"),
+            Some(&serde_json::json!(true)),
+            "the queue must report whether optional decision filing is available"
+        );
+        assert_eq!(
             requests.pointer("/requests/0/id"),
             Some(&serde_json::json!("00000000-0000-0000-0000-000000000004"))
         );
@@ -5815,6 +5820,39 @@ mod tests {
             requests.pointer("/requests/0/deltas/0/dimension"),
             Some(&serde_json::json!("budget")),
             "the queue must expose structured authority deltas"
+        );
+
+        let disabled_decision_app = browser_admin::protected_router(
+            runtime_repository,
+            admin_ledger.clone(),
+            FakeDecisionChannel {
+                enabled: false,
+                ..FakeDecisionChannel::default()
+            },
+            browser_capability_catalog(),
+            admin_auth,
+        );
+        let disabled_requests = disabled_decision_app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/v1/requests?limit=1")
+                    .header(header::COOKIE, &admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build disabled-channel queue request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute disabled-channel queue request: {error}"))?;
+        assert_eq!(disabled_requests.status(), StatusCode::OK);
+        let disabled_requests: serde_json::Value = serde_json::from_slice(
+            &to_bytes(disabled_requests.into_body(), 1024 * 1024)
+                .await
+                .map_err(|error| format!("read disabled-channel queue response: {error}"))?,
+        )
+        .map_err(|error| format!("decode disabled-channel queue response: {error}"))?;
+        assert_eq!(
+            disabled_requests.pointer("/decisionChannelEnabled"),
+            Some(&serde_json::json!(false)),
+            "the queue must report when optional decision filing is unavailable"
         );
 
         let first_page = admin_app
@@ -7647,10 +7685,21 @@ mod tests {
         Ok(())
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     struct FakeDecisionChannel {
+        enabled: bool,
         requests: Arc<Mutex<Vec<DecisionRequest>>>,
         resolutions: Arc<Mutex<Vec<DecisionResolution>>>,
+    }
+
+    impl Default for FakeDecisionChannel {
+        fn default() -> Self {
+            Self {
+                enabled: true,
+                requests: Arc::new(Mutex::new(Vec::new())),
+                resolutions: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
     }
 
     #[derive(Clone, Default)]
@@ -7719,6 +7768,10 @@ mod tests {
     }
 
     impl DecisionChannel for FakeDecisionChannel {
+        fn is_enabled(&self) -> bool {
+            self.enabled
+        }
+
         async fn request(&self, request: &DecisionRequest) -> Result<DecisionReference, PortError> {
             self.requests
                 .lock()
