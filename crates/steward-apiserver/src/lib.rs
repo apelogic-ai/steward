@@ -8050,6 +8050,7 @@ mod tests {
         application_committed_during_park: Arc<Mutex<Option<GrantReversion>>>,
         application_revoked_during_retirement: Arc<Mutex<bool>>,
         tasks: Arc<Mutex<Vec<TaskRecord>>>,
+        fail_task_submission_error: Arc<Mutex<Option<StoreError>>>,
         task_output_transcripts: Arc<Mutex<Vec<(Uuid, steward_store::TaskOutputTranscript)>>>,
         miss_next_task_lookup: Arc<Mutex<bool>>,
         task_operations: Arc<Mutex<Vec<TaskRuntimeOperationRecord>>>,
@@ -9930,6 +9931,18 @@ mod tests {
                 if reason.is_empty() {
                     return Err(StoreError::InvalidTaskTransition);
                 }
+                if let Some(error) = self
+                    .fail_task_submission_error
+                    .lock()
+                    .map_err(|_| {
+                        StoreError::Database(
+                            "fake Task submission failure lock was poisoned".to_owned(),
+                        )
+                    })?
+                    .take()
+                {
+                    return Err(error);
+                }
                 let mut tasks = self.tasks.lock().map_err(|_| {
                     StoreError::Database("fake task ledger lock was poisoned".to_owned())
                 })?;
@@ -10191,6 +10204,7 @@ mod tests {
             application_committed_during_park: Arc::new(Mutex::new(None)),
             application_revoked_during_retirement: Arc::new(Mutex::new(false)),
             tasks: Arc::new(Mutex::new(Vec::new())),
+            fail_task_submission_error: Arc::new(Mutex::new(None)),
             task_output_transcripts: Arc::new(Mutex::new(Vec::new())),
             miss_next_task_lookup: Arc::new(Mutex::new(false)),
             task_operations: Arc::new(Mutex::new(Vec::new())),
@@ -13199,7 +13213,7 @@ mod tests {
         let (auth, session_cookie, csrf) =
             signed_in_browser(origin, LocalFakeIdentity::User).await?;
         let app = browser_task_router(ledger.clone(), config, auth);
-        let request = || {
+        let request = |idempotency_key: &str| {
             Request::builder()
                 .method("POST")
                 .uri("/app/api/v1/runs")
@@ -13207,14 +13221,14 @@ mod tests {
                 .header(header::ORIGIN, origin)
                 .header("sec-fetch-site", "same-origin")
                 .header("x-steward-csrf", &csrf)
-                .header("idempotency-key", "browser-workspace-download-failure")
+                .header("idempotency-key", idempotency_key)
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(request_body.to_string()))
                 .map_err(|error| format!("build browser workspace request: {error}"))
         };
         let response = app
             .clone()
-            .oneshot(request()?)
+            .oneshot(request("browser-workspace-download-failure")?)
             .await
             .map_err(|error| format!("submit browser workspace request: {error}"))?;
 
@@ -13262,7 +13276,8 @@ mod tests {
                 ))
         );
         let retry = app
-            .oneshot(request()?)
+            .clone()
+            .oneshot(request("browser-workspace-download-failure")?)
             .await
             .map_err(|error| format!("retry browser workspace request: {error}"))?;
         assert_eq!(retry.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -13272,13 +13287,58 @@ mod tests {
         let retry_body: serde_json::Value = serde_json::from_slice(&retry_body)
             .map_err(|error| format!("decode browser workspace retry response: {error}"))?;
         assert_eq!(retry_body, body);
+
+        let stored_admission_reason =
+            "Workspace materialized size is more than the 8 bytes this Envelope allows.";
+        {
+            let mut tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            tasks[0].failure_reason = Some(stored_admission_reason.to_owned());
+        }
+        let admission_retry = app
+            .clone()
+            .oneshot(request("browser-workspace-download-failure")?)
+            .await
+            .map_err(|error| format!("retry stored browser admission failure: {error}"))?;
+        assert_eq!(admission_retry.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let admission_retry_body = to_bytes(admission_retry.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read stored browser admission failure: {error}"))?;
+        let admission_retry_body: serde_json::Value = serde_json::from_slice(&admission_retry_body)
+            .map_err(|error| format!("decode stored browser admission failure: {error}"))?;
+        assert_eq!(
+            admission_retry_body,
+            serde_json::json!({
+                "error": "task.admission_rejected",
+                "failureReason": stored_admission_reason,
+            })
+        );
+
+        *ledger
+            .fail_task_submission_error
+            .lock()
+            .map_err(|_| "fake Task submission failure lock was poisoned")? =
+            Some(StoreError::InvalidTaskTransition);
+        let refused_failure = app
+            .oneshot(request("browser-workspace-download-refused-failure")?)
+            .await
+            .map_err(|error| format!("submit refused browser failure: {error}"))?;
+        assert_eq!(refused_failure.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let refused_failure_body = to_bytes(refused_failure.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read refused browser failure: {error}"))?;
+        let refused_failure_body: serde_json::Value = serde_json::from_slice(&refused_failure_body)
+            .map_err(|error| format!("decode refused browser failure: {error}"))?;
+        assert_eq!(refused_failure_body, body);
         assert_eq!(
             ledger
                 .tasks
                 .lock()
                 .map_err(|_| "fake Task ledger lock was poisoned")?
                 .len(),
-            1
+            2
         );
         Ok(())
     }

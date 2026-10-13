@@ -2557,12 +2557,9 @@ where
             Some(_) => {}
             None => {
                 if record.phase == TaskPhase::Failed
-                    && record.failure_reason.as_deref()
-                        == Some(WORKSPACE_SOURCE_DOWNLOAD_FAILED_REASON)
+                    && let Some(reason) = record.failure_reason.as_deref()
                 {
-                    return Err(ApiError::TaskRuntimeContractUnavailable(
-                        WORKSPACE_SOURCE_DOWNLOAD_FAILED_REASON.to_owned(),
-                    ));
+                    return Err(stored_task_input_preparation_error(reason));
                 }
                 let input_archive = match prepare_task_input_archive(
                     &self.config,
@@ -2579,15 +2576,23 @@ where
                             | ApiError::TaskRuntimeContractUnavailable(reason) => reason.as_str(),
                             _ => "Steward could not prepare the workspace input for this run.",
                         };
-                        self.ledger
+                        let failure = self
+                            .ledger
                             .fail_task_submission(
                                 record.task_uid,
                                 &identity.service,
                                 identity.canonical_user_id.as_str(),
                                 reason,
                             )
-                            .await
-                            .map_err(|store_error| self.browser_task_store_error(store_error))?;
+                            .await;
+                        if let Err(store_error) = failure
+                            && !matches!(
+                                store_error,
+                                StoreError::InvalidTaskTransition | StoreError::TaskNotFound
+                            )
+                        {
+                            return Err(self.browser_task_store_error(store_error));
+                        }
                         return Err(error);
                     }
                 };
@@ -4825,6 +4830,14 @@ fn inline_file<'a>(
         .get(path.as_str())
         .map(String::as_bytes)
         .ok_or_else(|| ApiError::Admission(format!("package file {} is missing", path.as_str())))
+}
+
+fn stored_task_input_preparation_error(reason: &str) -> ApiError {
+    if reason == WORKSPACE_SOURCE_DOWNLOAD_FAILED_REASON {
+        ApiError::TaskRuntimeContractUnavailable(reason.to_owned())
+    } else {
+        ApiError::Admission(reason.to_owned())
+    }
 }
 
 async fn prepare_task_input_archive(
