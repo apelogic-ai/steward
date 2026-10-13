@@ -331,7 +331,7 @@ async fn managed_inference_credentials_are_encrypted_replaceable_and_destroyed_o
 }
 
 #[tokio::test]
-async fn concurrent_provisioning_enforces_active_digest_uniqueness_transactionally()
+async fn concurrent_identical_custom_and_template_provisioning_reuses_active_envelope()
 -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
     let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
@@ -379,20 +379,17 @@ async fn concurrent_provisioning_enforces_active_digest_uniqueness_transactional
         },
     };
     let template_a = format!("template-a-{suffix}");
-    let template_b = format!("template-b-{suffix}");
-    for template_id in [&template_a, &template_b] {
-        store
-            .insert_envelope_template_revision(EnvelopeTemplatePublication {
-                template_id,
-                display_name: template_id,
-                member_roles: std::slice::from_ref(template_id),
-                ceiling: &envelope,
-                auto_provision_threshold: None,
-                allow_inline_browser_tasks: true,
-                authored_by: "test-bootstrap",
-            })
-            .await?;
-    }
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &template_a,
+            display_name: &template_a,
+            member_roles: std::slice::from_ref(&template_a),
+            ceiling: &envelope,
+            auto_provision_threshold: None,
+            allow_inline_browser_tasks: true,
+            authored_by: "test-bootstrap",
+        })
+        .await?;
     let request_a = store
         .reserve_envelope_request(EnvelopeRequestReservationRequest {
             owner_user_id: &identity.user_id,
@@ -409,8 +406,8 @@ async fn concurrent_provisioning_enforces_active_digest_uniqueness_transactional
     let request_b = store
         .reserve_envelope_request(EnvelopeRequestReservationRequest {
             owner_user_id: &identity.user_id,
-            template_id: Some(&template_b),
-            template_revision: Some(1),
+            template_id: None,
+            template_revision: None,
             requested_envelope: &envelope,
             idempotency_key: &format!("request-b-{suffix}"),
             justification: None,
@@ -455,21 +452,28 @@ async fn concurrent_provisioning_enforces_active_digest_uniqueness_transactional
         store.append_envelope_request_status(request_a.id, update_a),
         store.append_envelope_request_status(request_b.id, update_b),
     );
-    assert!(
-        matches!(
-            (&result_a, &result_b),
-            (Ok(_), Err(StoreError::EnvelopeRequestDigestConflict))
-                | (Err(StoreError::EnvelopeRequestDigestConflict), Ok(_))
-        ),
-        "exactly one conflicting template may win concurrent digest provisioning: {result_a:?} / {result_b:?}"
+    let result_a = result_a?;
+    let result_b = result_b?;
+    assert_eq!(
+        result_a.id, result_b.id,
+        "both approvals must resolve to the single active envelope"
     );
-    let active = store
-        .envelope_requests(&identity.user_id)
-        .await?
-        .into_iter()
-        .filter(|request| request.status == EnvelopeRequestStatus::Provisioned)
-        .count();
-    assert_eq!(active, 1);
+    let requests = store.envelope_requests(&identity.user_id).await?;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.status == EnvelopeRequestStatus::Provisioned)
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.status == EnvelopeRequestStatus::Stale)
+            .count(),
+        1,
+        "the duplicate request must be terminalized instead of remaining pending"
+    );
     Ok(())
 }
 

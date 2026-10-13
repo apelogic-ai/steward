@@ -587,14 +587,11 @@ fn active_envelope_provision_plan(
     template_id: Option<&str>,
     requested_digest: &str,
 ) -> Result<ActiveEnvelopeProvisionPlan, StoreError> {
-    for (request_id, active_template_id, active_digest) in active {
+    for (request_id, _, active_digest) in active {
         if active_digest != requested_digest {
             continue;
         }
-        if active_template_id.as_deref() == template_id {
-            return Ok(ActiveEnvelopeProvisionPlan::Existing(*request_id));
-        }
-        return Err(StoreError::EnvelopeRequestDigestConflict);
+        return Ok(ActiveEnvelopeProvisionPlan::Existing(*request_id));
     }
     Ok(ActiveEnvelopeProvisionPlan::Provision {
         stale_request_ids: active
@@ -613,7 +610,7 @@ mod browser_rbac_tests {
 
     use super::{
         ActiveEnvelopeProvisionPlan, BrowserRbacAssignment, BrowserRbacAssignments,
-        EnvelopeTemplatePublication, StoreError, active_envelope_provision_plan,
+        EnvelopeTemplatePublication, active_envelope_provision_plan,
         valid_envelope_template_publication,
     };
     use uuid::Uuid;
@@ -656,7 +653,7 @@ mod browser_rbac_tests {
     }
 
     #[test]
-    fn active_envelope_plan_enforces_template_and_digest_uniqueness() {
+    fn active_envelope_plan_reuses_identical_authority_across_request_sources() {
         let first = Uuid::from_u128(1);
         let second = Uuid::from_u128(2);
         let active = vec![
@@ -670,7 +667,11 @@ mod browser_rbac_tests {
         );
         assert_eq!(
             active_envelope_provision_plan(&active, Some("template-c"), "sha256:a"),
-            Err(StoreError::EnvelopeRequestDigestConflict)
+            Ok(ActiveEnvelopeProvisionPlan::Existing(first))
+        );
+        assert_eq!(
+            active_envelope_provision_plan(&active, None, "sha256:a"),
+            Ok(ActiveEnvelopeProvisionPlan::Existing(first))
         );
         assert_eq!(
             active_envelope_provision_plan(&active, Some("template-a"), "sha256:c"),
