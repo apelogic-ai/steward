@@ -233,6 +233,7 @@ config:
     openshellServerName: ""
     openshellRuntimeClassName: ""
     openshellTaskLogMode: "off"
+    inferenceObservationIntervalSeconds: 15
     workloadExchangeEndpoint: ""
     workloadExchangeServerName: ""
     litellmUrl: ""

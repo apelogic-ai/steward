@@ -1359,6 +1359,7 @@ struct ActiveInference {
     revocations: Arc<AtomicUsize>,
     observed_spend: Arc<Mutex<Option<String>>>,
     report_exhausted: Arc<AtomicBool>,
+    requested_budgets: Arc<Mutex<Vec<Budget>>>,
 }
 
 impl InferencePlane for ActiveInference {
@@ -1382,13 +1383,25 @@ impl InferencePlane for ActiveInference {
         request: &InferenceRequest,
     ) -> Result<ProvisionedInference, PortError> {
         self.provisions.fetch_add(1, Ordering::SeqCst);
+        self.requested_budgets
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "fixture inference budget lock was poisoned".to_owned(),
+            })?
+            .push(request.budget.clone());
         Ok(ProvisionedInference {
             reference: format!("inference-{}", request.runtime.0),
             credential: InferenceCredential::new("fixture-inference-credential".to_owned()),
         })
     }
 
-    async fn reconcile_configuration(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+    async fn reconcile_configuration(&self, request: &InferenceRequest) -> Result<(), PortError> {
+        self.requested_budgets
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "fixture inference budget lock was poisoned".to_owned(),
+            })?
+            .push(request.budget.clone());
         Ok(())
     }
 
@@ -2593,6 +2606,86 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .await?,
         1,
         "unchanged spend must not append one row per observation interval"
+    );
+    let cleanup_runtime_uid = format!("cleanup-runtime-{suffix}");
+    store
+        .record_spend_observation(
+            &cleanup_runtime_uid,
+            1,
+            "cleanup-runtime-spec",
+            &SpendSummary {
+                observed_amount: "0.40".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            true,
+        )
+        .await?;
+    store
+        .record_spend_observation(
+            &cleanup_runtime_uid,
+            1,
+            "cleanup-runtime-spec",
+            &SpendSummary {
+                observed_amount: "0.55".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            false,
+        )
+        .await?;
+    store
+        .record_spend_observation(
+            &cleanup_runtime_uid,
+            1,
+            "cleanup-runtime-spec",
+            &SpendSummary {
+                observed_amount: "0.40".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            true,
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM inference_exhaustions WHERE runtime_uid = $1",
+        )
+        .bind(&cleanup_runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        1,
+        "zero-remainder retries must keep one exhaustion record"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT observed_amount::text FROM spend_observations \
+             WHERE runtime_uid = $1 ORDER BY at DESC, id DESC LIMIT 1",
+        )
+        .bind(&cleanup_runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        "0.55",
+        "the final cleanup read must remain the latest spend observation after another zero-remainder pass"
+    );
+    store
+        .record_spend_observation(
+            &cleanup_runtime_uid,
+            2,
+            "cleanup-runtime-spec-after-top-up",
+            &SpendSummary {
+                observed_amount: "0.80".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            true,
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM inference_exhaustions WHERE runtime_uid = $1",
+        )
+        .bind(&cleanup_runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        2,
+        "new authority after a top-up must be able to record its own later exhaustion"
     );
     assert_eq!(
         store
@@ -5850,8 +5943,25 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
         .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
         .clone()
         .ok_or_else(|| io::Error::other("activated spend-limited runtime fixture is absent"))?;
-    reconcile_agent_runtime_work_item(&client, task_runtime, inference, store.clone(), runtime)
-        .await?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime,
+        inference.clone(),
+        store.clone(),
+        runtime,
+    )
+    .await?;
+    {
+        let requested_budgets = inference
+            .requested_budgets
+            .lock()
+            .map_err(|_| io::Error::other("inference budget fixture was poisoned"))?;
+        let requested = requested_budgets
+            .first()
+            .ok_or_else(|| io::Error::other("controller did not send a budget to inference"))?;
+        assert_eq!(requested.monthly_limit, "100.00");
+        assert_eq!(requested.single_run_limit.as_deref(), Some("0.50"));
+    }
 
     let failed = store
         .task(task_uid)

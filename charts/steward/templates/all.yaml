@@ -596,6 +596,7 @@ spec:
             - { name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME, value: {{ .Values.config.controller.openshellRuntimeClassName | quote }} }
 {{- end }}
             - { name: STEWARD_OPENSHELL_TASK_LOG_MODE, value: {{ .Values.config.controller.openshellTaskLogMode | quote }} }
+            - { name: STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS, value: {{ .Values.config.controller.inferenceObservationIntervalSeconds | quote }} }
             - { name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE, value: /run/openshell/ca.crt }
             - { name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE, value: /run/openshell/tls.crt }
             - { name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE, value: /run/openshell/tls.key }

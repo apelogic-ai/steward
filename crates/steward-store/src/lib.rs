@@ -3250,6 +3250,28 @@ impl PgStore {
         exhausted: bool,
     ) -> Result<(), StoreError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(runtime_uid)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        if exhausted
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                    SELECT 1 FROM inference_exhaustions \
+                    WHERE runtime_uid = $1 AND observed_generation = $2 AND spec_digest = $3 \
+                )",
+            )
+            .bind(runtime_uid)
+            .bind(observed_generation)
+            .bind(spec_digest)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?
+        {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(());
+        }
         let inserted = sqlx::query(
             "INSERT INTO spend_observations \
              (runtime_uid, observed_amount, currency, exhausted) \

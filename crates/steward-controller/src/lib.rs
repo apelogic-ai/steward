@@ -50,9 +50,9 @@ use steward_types::task_output_archive::{
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, Budget, DisposableExecutionBinding,
-    Duration, PENDING_APPROVAL_ANNOTATION, Phase, RuntimeId, RuntimeRefs,
-    TASK_EXECUTION_BINDING_ANNOTATION, TaskExecutionBinding, TaskPhase,
-    runtime_activated_condition,
+    Duration, PENDING_APPROVAL_ANNOTATION, Phase, RUNTIME_TERMINATION_STARTED_CONDITION, RuntimeId,
+    RuntimeRefs, TASK_EXECUTION_BINDING_ANNOTATION, TaskExecutionBinding, TaskPhase,
+    runtime_activated_condition, runtime_termination_started_condition,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -417,6 +417,52 @@ struct ControllerContext<R, I> {
 
 const FINAL_SPEND_SETTLEMENT_DELAY: StdDuration = StdDuration::from_secs(12);
 const FINAL_SPEND_CAPTURE_TIMEOUT: StdDuration = StdDuration::from_secs(17);
+const INFERENCE_CLEANUP_DEADLINE: StdDuration = StdDuration::from_secs(30);
+const MAX_INFERENCE_OBSERVATION_INTERVAL: StdDuration = StdDuration::from_secs(60);
+
+fn ensure_termination_started_condition(status: &mut AgentRuntimeStatus) {
+    if status.phase == Phase::Terminating
+        && !status.conditions.iter().any(|condition| {
+            condition.type_ == RUNTIME_TERMINATION_STARTED_CONDITION && condition.status == "True"
+        })
+    {
+        status
+            .conditions
+            .push(runtime_termination_started_condition(
+                status.observed_generation,
+            ));
+    }
+}
+
+fn inference_cleanup_deadline_elapsed_at(runtime: &AgentRuntime, now_epoch_seconds: i64) -> bool {
+    let Some(started_at) = runtime.status.as_ref().and_then(|status| {
+        status
+            .conditions
+            .iter()
+            .find(|condition| {
+                condition.type_ == RUNTIME_TERMINATION_STARTED_CONDITION
+                    && condition.status == "True"
+            })
+            .map(|condition| condition.last_transition_time.0.as_second())
+    }) else {
+        return false;
+    };
+    now_epoch_seconds.saturating_sub(started_at)
+        >= i64::try_from(INFERENCE_CLEANUP_DEADLINE.as_secs()).unwrap_or(i64::MAX)
+}
+
+fn inference_cleanup_deadline_elapsed(runtime: &AgentRuntime) -> Result<bool, ReconcileError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ReconcileError::InvalidSpec {
+            reason: "system clock is before the Unix epoch".to_owned(),
+        })?
+        .as_secs();
+    let now = i64::try_from(now).map_err(|_| ReconcileError::InvalidSpec {
+        reason: "system clock exceeds the supported deadline range".to_owned(),
+    })?;
+    Ok(inference_cleanup_deadline_elapsed_at(runtime, now))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeControllerConfig {
@@ -429,6 +475,9 @@ impl RuntimeControllerConfig {
             return Err(
                 "inference observation interval must not be shorter than the spend settlement delay",
             );
+        }
+        if inference_observation_interval > MAX_INFERENCE_OBSERVATION_INTERVAL {
+            return Err("inference observation interval must not exceed 60 seconds");
         }
         Ok(Self {
             inference_observation_interval,
@@ -4685,14 +4734,8 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     && !budget_amount_is_positive(remaining, &runtime.spec.budget.currency)
                         .map_err(ControllerError::Reconcile)?
                 {
-                    let spend = runtime
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.spend.clone())
-                        .unwrap_or_else(|| steward_types::SpendSummary {
-                            observed_amount: "0".to_owned(),
-                            currency: runtime.spec.budget.currency.clone(),
-                        });
+                    let zero_remaining_action =
+                        zero_remaining_spend_action(task_phase, &runtime.spec.budget);
                     let authority =
                         context
                             .authority
@@ -4700,27 +4743,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                             .ok_or(ControllerError::Reconcile(ReconcileError::Authority(
                                 "instance spend authority disappeared".to_owned(),
                             )))?;
-                    authority
-                        .record_spend_observation(
-                            runtime
-                                .metadata
-                                .uid
-                                .as_deref()
-                                .ok_or(ControllerError::Reconcile(
-                                    ReconcileError::MissingRuntimeUid,
-                                ))?,
-                            runtime.metadata.generation.unwrap_or_default(),
-                            &runtime_spec_digest(&runtime).map_err(ControllerError::Reconcile)?,
-                            &spend,
-                            true,
-                        )
-                        .await
-                        .map_err(|error| {
-                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
-                        })?;
-                    if let ZeroRemainingSpendAction::FailTask(reason) =
-                        zero_remaining_spend_action(task_phase, &runtime.spec.budget)
-                    {
+                    if let ZeroRemainingSpendAction::FailTask(reason) = zero_remaining_action {
                         let (task_uid, generation) = task_uid
                             .zip(task_operation_generation)
                             .ok_or(ControllerError::Reconcile(ReconcileError::Authority(
@@ -4740,6 +4763,49 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 ))
                             })?;
                         return Ok(Action::requeue(StdDuration::from_secs(2)));
+                    }
+                    let runtime_uid =
+                        runtime
+                            .metadata
+                            .uid
+                            .as_deref()
+                            .ok_or(ControllerError::Reconcile(
+                                ReconcileError::MissingRuntimeUid,
+                            ))?;
+                    let spend = runtime
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.spend.clone())
+                        .unwrap_or_else(|| steward_types::SpendSummary {
+                            observed_amount: "0".to_owned(),
+                            currency: runtime.spec.budget.currency.clone(),
+                        });
+                    let cleanup_already_started = runtime.status.as_ref().is_some_and(|status| {
+                        matches!(status.phase, Phase::Terminating | Phase::Suspended)
+                    });
+                    let exhaustion_already_recorded = authority
+                        .inference_exhaustion(runtime_uid)
+                        .await
+                        .map_err(|error| {
+                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
+                        })?
+                        .is_some();
+                    if !cleanup_already_started && !exhaustion_already_recorded {
+                        authority
+                            .record_spend_observation(
+                                runtime_uid,
+                                runtime.metadata.generation.unwrap_or_default(),
+                                &runtime_spec_digest(&runtime)
+                                    .map_err(ControllerError::Reconcile)?,
+                                &spend,
+                                true,
+                            )
+                            .await
+                            .map_err(|error| {
+                                ControllerError::Reconcile(ReconcileError::Authority(
+                                    error.to_string(),
+                                ))
+                            })?;
                     }
                     return suspend_runtime_with_inference_cleanup(
                         &runtime,
@@ -4945,23 +5011,35 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
             ReconcileDecision::Deleted => Err(error),
         };
     }
-    let sandbox_was_stopping = runtime
-        .status
-        .as_ref()
-        .is_some_and(|status| status.phase == Phase::Terminating);
     let mut decision = match sandbox_cleanup.await {
         Ok(decision) => decision,
         Err(error) => {
-            revoke_inference_and_delete_credential(runtime, inference, &inference_request, client)
-                .await?;
+            finalize_inference_and_delete_credential(
+                runtime,
+                inference,
+                &inference_request,
+                authority,
+                client,
+            )
+            .await?;
             return Err(error);
         }
     };
     if let ReconcileDecision::Status(status) = &mut decision {
-        if sandbox_was_stopping {
-            revoke_inference_and_delete_credential(runtime, inference, &inference_request, client)
-                .await?;
+        ensure_termination_started_condition(status);
+        if inference_cleanup_deadline_elapsed(runtime).map_err(ControllerError::Reconcile)? {
+            let final_spend = finalize_inference_and_delete_credential(
+                runtime,
+                inference,
+                &inference_request,
+                authority,
+                client,
+            )
+            .await?;
             status.refs.litellm_key = None;
+            if final_spend.is_some() {
+                status.spend = final_spend;
+            }
         } else {
             status.refs.litellm_key = runtime
                 .status
@@ -4971,7 +5049,13 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
         return Ok(decision);
     }
     let (inference_result, credential_result) = futures::join!(
-        finalize_inference_if_required(runtime, inference, &inference_request, authority),
+        finalize_inference_if_required(
+            runtime,
+            inference,
+            &inference_request,
+            authority,
+            FinalSpendCapture::AfterSettlement,
+        ),
         delete_credential_secret(client, runtime),
     );
     credential_result?;
@@ -4981,15 +5065,22 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
 
 const INFERENCE_REVOCATION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
+#[derive(Clone, Copy)]
+enum FinalSpendCapture {
+    AfterSettlement,
+    Immediate,
+}
+
 async fn finalize_inference_if_required<I: InferencePlane>(
     runtime: &AgentRuntime,
     inference: &I,
     request: &InferenceRequest,
     authority: Option<&PgStore>,
+    capture: FinalSpendCapture,
 ) -> Result<Option<steward_types::SpendSummary>, ReconcileError> {
     let final_spend = match tokio::time::timeout(
         FINAL_SPEND_CAPTURE_TIMEOUT,
-        observe_and_record_final_spend(runtime, inference, request, authority),
+        observe_and_record_final_spend(runtime, inference, request, authority, capture),
     )
     .await
     {
@@ -5009,14 +5100,21 @@ async fn finalize_inference_if_required<I: InferencePlane>(
     Ok(final_spend)
 }
 
-async fn revoke_inference_and_delete_credential<I: InferencePlane>(
+async fn finalize_inference_and_delete_credential<I: InferencePlane>(
     runtime: &AgentRuntime,
     inference: &I,
     request: &InferenceRequest,
+    authority: Option<&PgStore>,
     client: Client,
-) -> Result<(), ControllerError> {
+) -> Result<Option<steward_types::SpendSummary>, ControllerError> {
     let (inference_result, credential_result) = futures::join!(
-        revoke_inference_if_required(runtime, inference, request),
+        finalize_inference_if_required(
+            runtime,
+            inference,
+            request,
+            authority,
+            FinalSpendCapture::Immediate,
+        ),
         delete_credential_secret(client, runtime),
     );
     credential_result?;
@@ -5028,6 +5126,7 @@ async fn observe_and_record_final_spend<I: InferencePlane>(
     inference: &I,
     request: &InferenceRequest,
     authority: Option<&PgStore>,
+    capture: FinalSpendCapture,
 ) -> Result<Option<steward_types::SpendSummary>, ReconcileError> {
     let Some(authority) = authority else {
         return Ok(None);
@@ -5041,7 +5140,9 @@ async fn observe_and_record_final_spend<I: InferencePlane>(
         return Ok(None);
     }
 
-    tokio::time::sleep(FINAL_SPEND_SETTLEMENT_DELAY).await;
+    if matches!(capture, FinalSpendCapture::AfterSettlement) {
+        tokio::time::sleep(FINAL_SPEND_SETTLEMENT_DELAY).await;
+    }
     let observation = inference
         .observe(request)
         .await
@@ -5127,11 +5228,9 @@ async fn revoke_inference_with_timeout<I: InferencePlane>(
 
 async fn suspend_runtime<R: SandboxRuntime>(
     runtime: &AgentRuntime,
-    api: &Api<AgentRuntime>,
     sandbox_runtime: &R,
     spend: Option<steward_types::SpendSummary>,
-    preserve_inference_reference: bool,
-) -> Result<(Action, bool), ControllerError> {
+) -> Result<(Action, bool, AgentRuntimeStatus), ControllerError> {
     let decision = reconcile_once(runtime, ReconcileIntent::Delete, sandbox_runtime)
         .await
         .map_err(ControllerError::Reconcile)?;
@@ -5141,25 +5240,30 @@ async fn suspend_runtime<R: SandboxRuntime>(
         }
         ReconcileDecision::Status(status) => (status, StdDuration::from_secs(2), false),
     };
+    ensure_termination_started_condition(&mut status);
     status.spend = spend;
-    if preserve_inference_reference {
-        status.refs.litellm_key = runtime
-            .status
-            .as_ref()
-            .and_then(|status| status.refs.litellm_key.clone());
-    } else {
-        status.refs.litellm_key = None;
-    }
-    if runtime.status.as_ref() != Some(&status) {
+    status.refs.litellm_key = runtime
+        .status
+        .as_ref()
+        .and_then(|status| status.refs.litellm_key.clone());
+    Ok((Action::requeue(requeue_after), sandbox_stopped, status))
+}
+
+async fn patch_runtime_status(
+    api: &Api<AgentRuntime>,
+    runtime: &AgentRuntime,
+    status: &AgentRuntimeStatus,
+) -> Result<(), ControllerError> {
+    if runtime.status.as_ref() != Some(status) {
         api.patch_status(
             &runtime.name_any(),
             &PatchParams::default(),
-            &Patch::Merge(&status_merge_patch(&status)),
+            &Patch::Merge(&status_merge_patch(status)),
         )
         .await
         .map_err(ControllerError::Kubernetes)?;
     }
-    Ok((Action::requeue(requeue_after), sandbox_stopped))
+    Ok(())
 }
 
 async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferencePlane>(
@@ -5174,34 +5278,52 @@ async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferenceP
     let cleanup_safety = ensure_inference_cleanup_is_safe(runtime, client.clone(), inference).await;
     let request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
     if let Err(error) = cleanup_safety {
-        suspend_runtime(runtime, api, sandbox_runtime, spend, true).await?;
+        let (_, _, status) = suspend_runtime(runtime, sandbox_runtime, spend).await?;
+        patch_runtime_status(api, runtime, &status).await?;
         return Err(error);
     }
-    let sandbox_was_stopping = runtime
-        .status
-        .as_ref()
-        .is_some_and(|status| status.phase == Phase::Terminating);
-    let suspension =
-        suspend_runtime(runtime, api, sandbox_runtime, spend, !sandbox_was_stopping).await;
-    let (action, sandbox_stopped) = match suspension {
+    let suspension = suspend_runtime(runtime, sandbox_runtime, spend).await;
+    let (action, sandbox_stopped, mut status) = match suspension {
         Ok(result) => result,
         Err(error) => {
-            revoke_inference_and_delete_credential(runtime, inference, &request, client).await?;
+            finalize_inference_and_delete_credential(
+                runtime, inference, &request, authority, client,
+            )
+            .await?;
             return Err(error);
         }
     };
     if !sandbox_stopped {
-        if sandbox_was_stopping {
-            revoke_inference_and_delete_credential(runtime, inference, &request, client).await?;
+        if inference_cleanup_deadline_elapsed(runtime).map_err(ControllerError::Reconcile)? {
+            let final_spend = finalize_inference_and_delete_credential(
+                runtime, inference, &request, authority, client,
+            )
+            .await?;
+            status.refs.litellm_key = None;
+            if final_spend.is_some() {
+                status.spend = final_spend;
+            }
         }
+        patch_runtime_status(api, runtime, &status).await?;
         return Ok(action);
     }
     let (inference_result, credential_result) = futures::join!(
-        finalize_inference_if_required(runtime, inference, &request, authority),
+        finalize_inference_if_required(
+            runtime,
+            inference,
+            &request,
+            authority,
+            FinalSpendCapture::AfterSettlement,
+        ),
         delete_credential_secret(client, runtime),
     );
     credential_result?;
-    inference_result.map_err(ControllerError::Reconcile)?;
+    let final_spend = inference_result.map_err(ControllerError::Reconcile)?;
+    status.refs.litellm_key = None;
+    if final_spend.is_some() {
+        status.spend = final_spend;
+    }
+    patch_runtime_status(api, runtime, &status).await?;
     Ok(action)
 }
 
@@ -6210,6 +6332,115 @@ mod tests {
             Some(spend),
             "a non-Task runtime must not receive a fresh key after per-run exhaustion"
         );
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct BudgetRecordingInference {
+        requested_budgets: Mutex<Vec<Budget>>,
+    }
+
+    impl InferencePlane for BudgetRecordingInference {
+        fn capabilities(&self) -> InferenceCapabilities {
+            InferenceCapabilities::default()
+        }
+
+        async fn validate_configuration(
+            &self,
+            _models: &[ModelRef],
+            _budget: &Budget,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn provision(
+            &self,
+            request: &InferenceRequest,
+        ) -> Result<ProvisionedInference, PortError> {
+            self.requested_budgets
+                .lock()
+                .map_err(|_| PortError::Failed {
+                    reason: "budget recording fixture lock was poisoned".to_owned(),
+                })?
+                .push(request.budget.clone());
+            Ok(ProvisionedInference {
+                reference: "fixture-key".to_owned(),
+                credential: steward_ports::InferenceCredential::new(
+                    "fixture-credential".to_owned(),
+                ),
+            })
+        }
+
+        async fn reconcile_configuration(
+            &self,
+            request: &InferenceRequest,
+        ) -> Result<(), PortError> {
+            self.requested_budgets
+                .lock()
+                .map_err(|_| PortError::Failed {
+                    reason: "budget recording fixture lock was poisoned".to_owned(),
+                })?
+                .push(request.budget.clone());
+            Ok(())
+        }
+
+        async fn observe(
+            &self,
+            request: &InferenceRequest,
+        ) -> Result<InferenceObservation, PortError> {
+            Ok(InferenceObservation::Active {
+                reference: "fixture-key".to_owned(),
+                spend: steward_types::SpendSummary {
+                    observed_amount: "0".to_owned(),
+                    currency: request.budget.currency.clone(),
+                },
+            })
+        }
+
+        async fn revoke(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn remaining_instance_authority_reaches_the_gateway_for_below_equal_and_parallel_runs()
+    -> Result<(), String> {
+        let mut runtime = fixture();
+        runtime.spec.budget.monthly_limit = "100.00".to_owned();
+        runtime.spec.budget.single_run_limit = Some("10.00".to_owned());
+        let inference = BudgetRecordingInference::default();
+
+        for remaining in ["5.00", "10.00", "10.00", "10.00"] {
+            let effective = runtime_with_remaining_spend_budget(&runtime, Some(remaining))
+                .map_err(|error| format!("effective runtime budget failed: {error}"))?;
+            let request = super::inference_request(&effective)
+                .map_err(|error| format!("inference request failed: {error}"))?;
+            inference
+                .provision(&request)
+                .await
+                .map_err(|error| format!("gateway provision fixture failed: {error:?}"))?;
+        }
+        let lowered_parallel = runtime_with_remaining_spend_budget(&runtime, Some("9.00"))
+            .map_err(|error| format!("lowered parallel runtime budget failed: {error}"))?;
+        let lowered_request = super::inference_request(&lowered_parallel)
+            .map_err(|error| format!("lowered inference request failed: {error}"))?;
+        inference
+            .reconcile_configuration(&lowered_request)
+            .await
+            .map_err(|error| format!("gateway reconfiguration fixture failed: {error:?}"))?;
+
+        let budgets = inference
+            .requested_budgets
+            .lock()
+            .map_err(|_| "budget recording fixture lock was poisoned".to_owned())?;
+        let monthly_limits = budgets
+            .iter()
+            .map(|budget| budget.monthly_limit.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(monthly_limits, ["5.00", "10.00", "10.00", "10.00", "9.00"]);
+        assert!(budgets.iter().all(|budget| {
+            budget.single_run_limit.as_deref() == Some("10.00") && budget.currency == "USD"
+        }));
         Ok(())
     }
 
@@ -7893,9 +8124,15 @@ mod tests {
             revocations: revocations.clone(),
         };
 
-        super::finalize_inference_if_required(&runtime, &inference, &request, Some(&authority))
-            .await
-            .map_err(|error| format!("failed spend observation must be best effort: {error}"))?;
+        super::finalize_inference_if_required(
+            &runtime,
+            &inference,
+            &request,
+            Some(&authority),
+            super::FinalSpendCapture::Immediate,
+        )
+        .await
+        .map_err(|error| format!("failed spend observation must be best effort: {error}"))?;
 
         assert_eq!(
             revocations.load(Ordering::SeqCst),
@@ -7921,7 +8158,13 @@ mod tests {
 
         tokio::time::timeout(
             StdDuration::from_secs(18),
-            super::finalize_inference_if_required(&runtime, &inference, &request, Some(&authority)),
+            super::finalize_inference_if_required(
+                &runtime,
+                &inference,
+                &request,
+                Some(&authority),
+                super::FinalSpendCapture::AfterSettlement,
+            ),
         )
         .await
         .map_err(|_| "stalled final spend observation must be bounded".to_owned())?
@@ -7955,6 +8198,7 @@ mod tests {
     struct OrderedFinalSpendInference {
         sandbox_deleted: Arc<AtomicBool>,
         observed_after_stop: Arc<AtomicBool>,
+        observations: Arc<AtomicUsize>,
         revocations: Arc<AtomicUsize>,
     }
 
@@ -7991,6 +8235,7 @@ mod tests {
             &self,
             _request: &InferenceRequest,
         ) -> Result<InferenceObservation, PortError> {
+            self.observations.fetch_add(1, Ordering::SeqCst);
             self.observed_after_stop.store(
                 self.sandbox_deleted.load(Ordering::SeqCst),
                 Ordering::SeqCst,
@@ -8062,11 +8307,8 @@ mod tests {
     async fn suspension_requeues_promptly_while_sandbox_deletion_is_pending() -> Result<(), String>
     {
         let runtime = fixture();
-        let (client, _, _) = successful_cleanup_client(&runtime)?;
-        let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
-
-        let (action, sandbox_stopped) =
-            suspend_runtime(&runtime, &api, &ProvisioningDeleteRuntime, None, false)
+        let (action, sandbox_stopped, status) =
+            suspend_runtime(&runtime, &ProvisioningDeleteRuntime, None)
                 .await
                 .map_err(|error| {
                     format!("pending sandbox deletion must remain reconcilable: {error}")
@@ -8078,20 +8320,41 @@ mod tests {
             "a budget-exhausted runtime in Terminating must be polled promptly; a 60-second retry can make the required suspension transition miss its deadline"
         );
         assert!(!sandbox_stopped);
+        assert!(status.conditions.iter().any(|condition| {
+            condition.type_ == super::RUNTIME_TERMINATION_STARTED_CONDITION
+                && condition.status == "True"
+        }));
         Ok(())
     }
 
     #[tokio::test]
     async fn sandbox_cleanup_failure_still_revokes_the_run_key() -> Result<(), String> {
-        let runtime = fixture();
+        let mut runtime = fixture();
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Running,
+            observed_generation: 3,
+            spec_digest: "fixture-digest".to_owned(),
+            refs: RuntimeRefs {
+                workspace: Some("workspace-a".to_owned()),
+                sandbox: Some("sandbox-a".to_owned()),
+                litellm_key: Some("key-a".to_owned()),
+            },
+            conditions: Vec::new(),
+            spend: None,
+        });
         let (client, secret_deleted, _) = successful_cleanup_client(&runtime)?;
         let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
         let revocations = Arc::new(AtomicUsize::new(0));
+        let observations = Arc::new(AtomicUsize::new(0));
         let inference = OrderedFinalSpendInference {
             sandbox_deleted: Arc::new(AtomicBool::new(false)),
             observed_after_stop: Arc::new(AtomicBool::new(false)),
+            observations: observations.clone(),
             revocations: revocations.clone(),
         };
+        let authority =
+            steward_store::PgStore::connect_lazy("postgres://steward@127.0.0.1:9/steward")
+                .map_err(|error| format!("lazy store fixture must be valid: {error}"))?;
 
         let result = suspend_runtime_with_inference_cleanup(
             &runtime,
@@ -8100,13 +8363,18 @@ mod tests {
             client,
             &inference,
             None,
-            None,
+            Some(&authority),
         )
         .await;
 
         assert!(
             result.is_err(),
             "the sandbox cleanup error must remain retryable"
+        );
+        assert_eq!(
+            observations.load(Ordering::SeqCst),
+            1,
+            "sandbox failure must still attempt one immediate final spend read"
         );
         assert_eq!(
             revocations.load(Ordering::SeqCst),
@@ -8225,6 +8493,7 @@ mod tests {
         let inference = OrderedFinalSpendInference {
             sandbox_deleted,
             observed_after_stop: observed_after_stop.clone(),
+            observations: Arc::new(AtomicUsize::new(0)),
             revocations: revocations.clone(),
         };
         let authority =
@@ -8625,12 +8894,12 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn stalled_sandbox_termination_revokes_the_run_key_on_the_next_reconcile()
+    #[tokio::test(start_paused = true)]
+    async fn terminating_sandbox_gets_two_passes_then_records_final_spend_when_gone()
     -> Result<(), String> {
         let mut runtime = fixture();
         runtime.status = Some(AgentRuntimeStatus {
-            phase: Phase::Terminating,
+            phase: Phase::Running,
             observed_generation: 3,
             spec_digest: "fixture-digest".to_owned(),
             refs: RuntimeRefs {
@@ -8641,12 +8910,94 @@ mod tests {
             conditions: Vec::new(),
             spend: None,
         });
-        let (client, secret_deleted, status_patch) = successful_cleanup_client(&runtime)?;
+        let (_, sandbox_stopped, terminating_status) =
+            suspend_runtime(&runtime, &ProvisioningDeleteRuntime, None)
+                .await
+                .map_err(|error| format!("first sandbox deletion pass failed: {error}"))?;
+        assert!(!sandbox_stopped);
+        runtime.status = Some(terminating_status);
+
+        let (client, secret_deleted, _) = successful_cleanup_client(&runtime)?;
         let revocations = Arc::new(AtomicUsize::new(0));
-        let inference = FinalSpendObservationInference {
-            behavior: FinalSpendObservationBehavior::Fail,
+        let observations = Arc::new(AtomicUsize::new(0));
+        let sandbox_deleted = Arc::new(AtomicBool::new(false));
+        let inference = OrderedFinalSpendInference {
+            sandbox_deleted: sandbox_deleted.clone(),
+            observed_after_stop: Arc::new(AtomicBool::new(false)),
+            observations: observations.clone(),
             revocations: revocations.clone(),
         };
+        let authority =
+            steward_store::PgStore::connect_lazy("postgres://steward@127.0.0.1:9/steward")
+                .map_err(|error| format!("lazy store fixture must be valid: {error}"))?;
+        let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
+
+        suspend_runtime_with_inference_cleanup(
+            &runtime,
+            &api,
+            &ProvisioningDeleteRuntime,
+            client.clone(),
+            &inference,
+            None,
+            Some(&authority),
+        )
+        .await
+        .map_err(|error| format!("second sandbox deletion pass failed: {error}"))?;
+        assert_eq!(observations.load(Ordering::SeqCst), 0);
+        assert_eq!(revocations.load(Ordering::SeqCst), 0);
+        assert!(!secret_deleted.load(Ordering::SeqCst));
+
+        suspend_runtime_with_inference_cleanup(
+            &runtime,
+            &api,
+            &SignallingDeleteRuntime {
+                deleted: sandbox_deleted,
+            },
+            client,
+            &inference,
+            None,
+            Some(&authority),
+        )
+        .await
+        .map_err(|error| format!("completed sandbox deletion pass failed: {error}"))?;
+        assert_eq!(observations.load(Ordering::SeqCst), 1);
+        assert_eq!(revocations.load(Ordering::SeqCst), 1);
+        assert!(secret_deleted.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stalled_sandbox_termination_attempts_final_spend_then_revokes_at_the_deadline()
+    -> Result<(), String> {
+        let mut runtime = fixture();
+        let mut termination_started = steward_types::runtime_termination_started_condition(3);
+        termination_started.last_transition_time.0 = "1970-01-01T00:00:00Z"
+            .parse()
+            .map_err(|error| format!("termination timestamp fixture is invalid: {error}"))?;
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Terminating,
+            observed_generation: 3,
+            spec_digest: "fixture-digest".to_owned(),
+            refs: RuntimeRefs {
+                workspace: Some("workspace-a".to_owned()),
+                sandbox: Some("sandbox-a".to_owned()),
+                litellm_key: Some("key-a".to_owned()),
+            },
+            conditions: vec![termination_started],
+            spend: None,
+        });
+        let (client, secret_deleted, status_patch) = successful_cleanup_client(&runtime)?;
+        let revocations = Arc::new(AtomicUsize::new(0));
+        let observations = Arc::new(AtomicUsize::new(0));
+        let inference = OrderedFinalSpendInference {
+            sandbox_deleted: Arc::new(AtomicBool::new(false)),
+            observed_after_stop: Arc::new(AtomicBool::new(false)),
+            observations: observations.clone(),
+            revocations: revocations.clone(),
+        };
+        let authority =
+            steward_store::PgStore::connect_lazy("postgres://steward@127.0.0.1:9/steward")
+                .map_err(|error| format!("lazy store fixture must be valid: {error}"))?;
         let api = kube::Api::<AgentRuntime>::namespaced(client.clone(), "team-a");
 
         let action = suspend_runtime_with_inference_cleanup(
@@ -8656,16 +9007,21 @@ mod tests {
             client,
             &inference,
             None,
-            None,
+            Some(&authority),
         )
         .await
         .map_err(|error| format!("stalled sandbox cleanup must remain reconcilable: {error}"))?;
 
         assert_eq!(action, Action::requeue(StdDuration::from_secs(2)));
         assert_eq!(
+            observations.load(Ordering::SeqCst),
+            1,
+            "the bounded deadline must still attempt one immediate final spend read"
+        );
+        assert_eq!(
             revocations.load(Ordering::SeqCst),
             1,
-            "a second terminating observation must revoke the run key even while the sandbox remains present"
+            "the cleanup deadline must revoke the run key even while the sandbox remains present"
         );
         assert!(
             secret_deleted.load(Ordering::SeqCst),

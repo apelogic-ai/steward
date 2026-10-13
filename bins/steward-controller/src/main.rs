@@ -855,6 +855,7 @@ mod tests {
             Duration::from_secs(15)
         );
         assert!(parse_runtime_controller_config(Some("11")).is_err());
+        assert!(parse_runtime_controller_config(Some("61")).is_err());
         assert_eq!(
             parse_runtime_controller_config(Some("30"))
                 .map_err(|error| error.to_string())?
