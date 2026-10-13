@@ -2858,7 +2858,43 @@ test("users can request a custom envelope without selecting a template", async (
   }
 });
 
+test("custom workspace controls keep the complete JSON equal to the request", async ({ browser }) => {
+  const requestedEnvelope = structuredClone(envelope);
+  requestedEnvelope.spec.workspace.allowedTypes = ["git", "unsupported"];
+  const developer = await guardedPage(browser, {
+    expectedHttpStatuses: [503],
+    holdUserCapabilities: true,
+    mutationFailures: { "/app/api/v1/envelope-requests": [{ status: 503 }] },
+  });
+  try {
+    await developer.page.goto(`${origin}/envelopes/new`);
+    await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("custom");
+    const completeEnvelope = developer.page.getByLabel("Complete envelope JSON");
+    await completeEnvelope.fill(JSON.stringify(requestedEnvelope, null, 2));
+    await developer.page.getByLabel("Justification (required)").fill("Needed for a governed task.");
+
+    developer.releaseUserCapabilities();
+    const workspace = developer.page.getByRole("group", { name: "Workspace access" });
+    const git = workspace.getByRole("checkbox", { name: "Git" });
+    await expect(git).toBeChecked();
+    await expect.poll(async () => JSON.parse(await completeEnvelope.inputValue()).spec.workspace.allowedTypes).toEqual(["git"]);
+    await git.uncheck();
+    const displayedEnvelope = JSON.parse(await completeEnvelope.inputValue());
+    expect(displayedEnvelope.spec).not.toHaveProperty("workspace");
+
+    await developer.page.getByRole("button", { name: "Submit request" }).click();
+    await expect(developer.page.getByRole("alert").filter({ hasText: "HyperShell couldn't submit the request" })).toBeVisible();
+    const mutation = developer.mutations.find((entry) => entry.path === "/app/api/v1/envelope-requests");
+    expect(mutation.body.requestedEnvelope).toEqual(displayedEnvelope);
+  } finally {
+    developer.releaseUserCapabilities();
+    await closeGuardedPage(developer);
+  }
+});
+
 test("custom envelope retries keep the exact payload while capabilities load", async ({ browser }) => {
+  const requestedEnvelope = structuredClone(envelope);
+  requestedEnvelope.spec.workspace.allowedTypes = ["git", "unsupported"];
   const developer = await guardedPage(browser, {
     expectedHttpStatuses: [503],
     holdUserCapabilities: true,
@@ -2867,7 +2903,8 @@ test("custom envelope retries keep the exact payload while capabilities load", a
   try {
     await developer.page.goto(`${origin}/envelopes/new`);
     await developer.page.getByRole("combobox", { name: "Template", exact: true }).selectOption("custom");
-    await developer.page.getByLabel("Complete envelope JSON").fill(JSON.stringify(envelope, null, 2));
+    const completeEnvelope = developer.page.getByLabel("Complete envelope JSON");
+    await completeEnvelope.fill(JSON.stringify(requestedEnvelope, null, 2));
     await developer.page.getByLabel("Justification (required)").fill("Needed for a governed task.");
     await expect(developer.page.getByText("Workspace controls are unavailable.", { exact: false })).toBeVisible();
     await developer.page.getByRole("button", { name: "Submit request" }).click();
@@ -2875,6 +2912,7 @@ test("custom envelope retries keep the exact payload while capabilities load", a
 
     developer.releaseUserCapabilities();
     await expect(developer.page.getByRole("group", { name: "Workspace access" }).getByRole("checkbox", { name: "Git" })).toBeChecked();
+    expect(JSON.parse(await completeEnvelope.inputValue())).toEqual(requestedEnvelope);
     await developer.page.getByRole("button", { name: "Submit request" }).click();
     await expect(developer.page).toHaveURL(`${origin}/envelopes/${envelopeId}`);
 

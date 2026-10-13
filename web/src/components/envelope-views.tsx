@@ -29,7 +29,7 @@ import { EnvelopeExceedanceSummary, type EnvelopeExceedanceSummaryValue, envelop
 import { CodeBlock, DataTable, FilterTabs, GrantChipList, Meter, SectionCard, StatStrip, TagSelect, grantKindForAction } from "@/components/hs";
 import { DurationInput, MoneyInput, durationUnit, formatCount, formatDuration, formatMoney } from "@/components/presentation-values";
 import { WorkspaceAuthorityDetails } from "@/components/workspace-authority-details";
-import { WorkspaceAuthorityControls, workspaceAuthorityDraft, workspaceAuthorityFromDraft } from "@/components/workspace-authority-controls";
+import { WorkspaceAuthorityControls, workspaceAuthorityDraft, workspaceAuthorityFromDraft, type WorkspaceAuthorityDraft } from "@/components/workspace-authority-controls";
 import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary, StatusBadge } from "@/components/workspace-ui";
 import { classifyMutationFailure, type MutationFailureState } from "@/data/mutation-state";
 import { loadAllEnvelopeRequests } from "@/data/paginated-api";
@@ -357,6 +357,15 @@ export function withWorkspaceAuthority(envelope: BrowserEnvelope, workspace: Wor
   return { ...envelope, spec: { ...spec, ...(workspace ? { workspace } : {}) } };
 }
 
+function synchronizedCustomEnvelopeJson(value: string, workspaceCapabilities?: WorkspaceDeploymentCapabilities): string {
+  if (!workspaceCapabilities) return value;
+  const parsedEnvelope = parseCustomEnvelope(value);
+  if (!parsedEnvelope) return value;
+  const draft = workspaceAuthorityDraft(parsedEnvelope.spec.workspace, workspaceCapabilities.enabledTypes);
+  const workspace = workspaceAuthorityFromDraft(draft, workspaceCapabilities.enabledTypes);
+  return workspace === null ? value : JSON.stringify(withWorkspaceAuthority(parsedEnvelope, workspace), null, 2);
+}
+
 function CustomEnvelopeRequestForm({ onSubmittingChange, workspaceCapabilities }: Readonly<{ onSubmittingChange: (submitting: boolean) => void; workspaceCapabilities?: WorkspaceDeploymentCapabilities }>) {
   const router = useRouter();
   const session = useSession();
@@ -367,14 +376,29 @@ function CustomEnvelopeRequestForm({ onSubmittingChange, workspaceCapabilities }
   const [diagnostics, setDiagnostics] = useState<DiagnosticItem[]>([]);
   const [rejectedFields, setRejectedFields] = useState<Array<EnvelopeRequestField>>([]);
   const [failureReason, setFailureReason] = useState<string | null>(null);
+  const [attemptEnvelopeJson, setAttemptEnvelopeJson] = useState<string | null>(null);
   const idempotencyKey = useRef<string | null>(null);
   const attemptEnvelope = useRef<BrowserEnvelope | null>(null);
+  const displayedEnvelopeJson = attemptEnvelopeJson ?? synchronizedCustomEnvelopeJson(envelopeJson, workspaceCapabilities);
 
   function resetAttempt() {
     idempotencyKey.current = null;
     attemptEnvelope.current = null;
+    setAttemptEnvelopeJson(null);
     setRejectedFields([]);
     setFailureReason(null);
+  }
+
+  function updateWorkspaceDraft(next: WorkspaceAuthorityDraft) {
+    setWorkspaceDraft(next);
+    const parsedEnvelope = parseCustomEnvelope(displayedEnvelopeJson);
+    if (parsedEnvelope && workspaceCapabilities) {
+      const workspace = workspaceAuthorityFromDraft(next, workspaceCapabilities.enabledTypes);
+      if (workspace !== null) setEnvelopeJson(JSON.stringify(withWorkspaceAuthority(parsedEnvelope, workspace), null, 2));
+    }
+    resetAttempt();
+    setSubmission("idle");
+    setDiagnostics([]);
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -382,21 +406,18 @@ function CustomEnvelopeRequestForm({ onSubmittingChange, workspaceCapabilities }
     if (session.status !== "authenticated") return;
     let requestedEnvelope = attemptEnvelope.current;
     if (!requestedEnvelope) {
-      const parsedEnvelope = parseCustomEnvelope(envelopeJson);
-      if (!parsedEnvelope) {
+      const displayedEnvelope = parseCustomEnvelope(displayedEnvelopeJson);
+      if (!displayedEnvelope) {
         setSubmission("invalid");
         return;
       }
-      requestedEnvelope = parsedEnvelope;
-      if (workspaceCapabilities) {
-        const workspace = workspaceAuthorityFromDraft(workspaceDraft, workspaceCapabilities.enabledTypes);
-        if (workspace === null) {
-          setSubmission("invalid-workspace");
-          return;
-        }
-        requestedEnvelope = withWorkspaceAuthority(parsedEnvelope, workspace);
+      if (workspaceCapabilities && workspaceAuthorityFromDraft(workspaceDraft, workspaceCapabilities.enabledTypes) === null) {
+        setSubmission("invalid-workspace");
+        return;
       }
+      requestedEnvelope = displayedEnvelope;
       attemptEnvelope.current = requestedEnvelope;
+      setAttemptEnvelopeJson(JSON.stringify(requestedEnvelope, null, 2));
     }
     setSubmission("submitting");
     onSubmittingChange(true);
@@ -452,13 +473,13 @@ function CustomEnvelopeRequestForm({ onSubmittingChange, workspaceCapabilities }
           placeholder="Paste envelope JSON."
           required
           spellCheck={false}
-          value={envelopeJson}
+          value={displayedEnvelopeJson}
         />
       </label>
       <section className={`space-y-3 rounded-control border p-4 ${rejectedFields.includes("workspace") ? "border-warn ring-1 ring-warn" : ""}`} aria-labelledby="custom-workspace-title">
         <div><h3 className="font-semibold" id="custom-workspace-title">Workspace access</h3><p className="mt-1 text-sm text-muted-ink">These controls update workspace types and total size. Existing file, history, and submodule limits are preserved.</p></div>
         {workspaceCapabilities
-          ? <WorkspaceAuthorityControls deployment={workspaceCapabilities} disabled={submission === "submitting"} draft={workspaceDraft} error={workspaceError} onChange={(next) => { setWorkspaceDraft(next); resetAttempt(); setSubmission("idle"); setDiagnostics([]); }} />
+          ? <WorkspaceAuthorityControls deployment={workspaceCapabilities} disabled={submission === "submitting"} draft={workspaceDraft} error={workspaceError} onChange={updateWorkspaceDraft} />
           : <p className="text-sm text-muted-ink">Workspace controls are unavailable. Any workspace access in the envelope JSON will be preserved.</p>}
       </section>
       <label className="grid gap-2 text-sm font-semibold">Justification (required)
