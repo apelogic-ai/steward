@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- The administrator request queue now reports whether external decision filing is enabled, so
+  browser clients can hide a filing action that cannot succeed.
 - Workspace preparation failures now fail Runs with a plain explanation and a bounded controller
   diagnostic instead of `execution_outcome_unknown`.
 - Rejected Envelope-template saves now return a stable error code, a plain explanation, and the

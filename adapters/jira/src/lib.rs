@@ -69,6 +69,10 @@ impl JiraAdapter {
 }
 
 impl DecisionChannel for JiraAdapter {
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     async fn observe_request(
         &self,
         request_id: &str,
@@ -404,6 +408,7 @@ mod tests {
             String::new(),
         )
         .map_err(|error| format!("optional Jira must not block startup: {error:?}"))?;
+        assert!(!adapter.is_enabled());
         let request = DecisionRequest {
             request_id: "approval-a".to_owned(),
             runtime_uid: "runtime-a".to_owned(),
@@ -436,6 +441,7 @@ mod tests {
             "test-token".to_owned(),
         )
         .map_err(|error| format!("construct Jira: {error:?}"))?;
+        assert!(adapter.is_enabled());
         assert_eq!(
             adapter
                 .observe_request("approval-a")

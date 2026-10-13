@@ -931,6 +931,7 @@ pub(crate) struct AdminRequestView {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdminRequestsResponse {
     api_version: &'static str,
+    decision_channel_enabled: bool,
     requests: Vec<AdminRequestView>,
     next_cursor: Option<String>,
 }
@@ -2887,6 +2888,7 @@ where
         .flatten();
     Json(AdminRequestsResponse {
         api_version: BROWSER_ADMIN_API_VERSION,
+        decision_channel_enabled: state.decisions.is_enabled(),
         requests,
         next_cursor,
     })

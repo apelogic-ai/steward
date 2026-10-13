@@ -63,6 +63,7 @@ export type AdminRequestView = {
 
 export type AdminRequestsResponse = {
     apiVersion: string;
+    decisionChannelEnabled: boolean;
     nextCursor?: string | null;
     requests: Array<AdminRequestView>;
 };
