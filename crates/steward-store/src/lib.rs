@@ -3736,6 +3736,64 @@ impl PgStore {
         Ok((amount != "0").then_some(amount))
     }
 
+    /// Return the current spend authority available to one runtime after current-period spend by
+    /// the other runtimes bound to the same provisioned Envelope instance. The current runtime is
+    /// excluded because its virtual key already accounts for its own cumulative spend.
+    pub async fn remaining_envelope_instance_spend_budget(
+        &self,
+        envelope_instance_id: &str,
+        runtime_uid: &str,
+        base_limit: &str,
+    ) -> Result<String, StoreError> {
+        if envelope_instance_id.trim().is_empty() || runtime_uid.trim().is_empty() {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let base_limit = add_budget_amount(base_limit, "0")
+            .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        sqlx::query_scalar::<_, String>(
+            "WITH period AS ( \
+                 SELECT date_trunc('month', now()) AS starts_at, \
+                        date_trunc('month', now()) + interval '1 month' AS ends_at \
+             ), runtimes AS ( \
+                 SELECT DISTINCT COALESCE(orchestration.runtime_uid, tasks.runtime_uid) AS runtime_uid \
+                 FROM task_submissions tasks \
+                 LEFT JOIN task_runtime_operations orchestration \
+                   ON orchestration.task_uid = tasks.task_uid, period \
+                 WHERE tasks.user_envelope_instance_id = $1 \
+                   AND tasks.created_at >= period.starts_at \
+                   AND tasks.created_at < period.ends_at \
+                   AND COALESCE(orchestration.runtime_uid, tasks.runtime_uid) IS NOT NULL \
+             ), latest AS ( \
+                 SELECT DISTINCT ON (observations.runtime_uid) \
+                        observations.runtime_uid, observations.observed_amount \
+                 FROM spend_observations observations \
+                 JOIN runtimes ON runtimes.runtime_uid = observations.runtime_uid \
+                 CROSS JOIN period \
+                 WHERE observations.at >= period.starts_at \
+                   AND observations.at < period.ends_at \
+                 ORDER BY observations.runtime_uid, observations.at DESC, observations.id DESC \
+             ) \
+             SELECT GREATEST( \
+                 $3::numeric + COALESCE(( \
+                     SELECT sum(grants.amount) FROM envelope_instance_grants grants \
+                     WHERE grants.envelope_instance_id = $1 \
+                       AND grants.dimension = 'llm_spend' \
+                       AND grants.valid_until > clock_timestamp() \
+                 ), 0) - COALESCE(( \
+                     SELECT sum(latest.observed_amount) FROM latest \
+                     WHERE latest.runtime_uid <> $2 \
+                 ), 0), \
+                 0 \
+             )::text",
+        )
+        .bind(envelope_instance_id)
+        .bind(runtime_uid)
+        .bind(base_limit)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
     /// Observe and enforce cumulative execution time for one provisioned Envelope instance.
     /// The observation is derived from append-only Task running-to-terminal lifecycle facts and
     /// clipped to the current UTC month. The instance lock prevents duplicate pending

@@ -149,5 +149,54 @@ then
   exit 1
 fi
 
+budget_key="$(
+  curl -fsS \
+    -H "Authorization: Bearer ${master_key}" \
+    -H "Content-Type: application/json" \
+    -d '{"budget_duration":"1mo","key_alias":"runtime-budget","max_budget":0.01,"models":["openai/model-a"]}' \
+    "${base_url}/key/generate" |
+    jq -er '.key | select(type == "string" and length > 0)'
+)"
+curl -fsS \
+  -H "Authorization: Bearer ${budget_key}" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"openai/model-a","messages":[{"role":"user","content":"hello"}]}' \
+  "${base_url}/v1/chat/completions" >/dev/null
+
+for attempt in {1..20}; do
+  key_list="$(
+    curl -fsS -G \
+      -H "Authorization: Bearer ${master_key}" \
+      --data-urlencode 'key_alias=runtime-budget' \
+      --data-urlencode 'return_full_object=true' \
+      "${base_url}/key/list"
+  )"
+  if jq -e '.keys | length == 1 and (.[0].spend | tonumber) >= (.[0].max_budget | tonumber)' \
+    <<<"${key_list}" >/dev/null
+  then
+    break
+  fi
+  if [[ "${attempt}" == 20 ]]; then
+    echo "G-5 LiteLLM did not settle spend above the runtime key budget" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+budget_response="${RUN_DIR}/budget-denied.json"
+budget_status="$(
+  curl -sS \
+    -o "${budget_response}" \
+    -w '%{http_code}' \
+    -H "Authorization: Bearer ${budget_key}" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"openai/model-a","messages":[{"role":"user","content":"hello again"}]}' \
+    "${base_url}/v1/chat/completions"
+)"
+if [[ "${budget_status}" != "429" ]]; then
+  echo "G-5 exhausted LiteLLM key returned HTTP ${budget_status}, expected 429" >&2
+  exit 1
+fi
+
 echo "G-5 upstream result: 1 passed; 0 failed; 0 skipped"
 echo "G-5 ${TARGET} upstream evidence passed against LiteLLM"

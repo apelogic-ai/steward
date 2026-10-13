@@ -2484,6 +2484,42 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             active_manifest_digest: &previous_active_digest,
         })
         .await?;
+    let previous_runtime_uid = format!("previous-runtime-{suffix}");
+    store
+        .put_task_inputs(
+            previous_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"earlier execution input",
+        )
+        .await?;
+    store
+        .request_task_execution(previous_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    let previous_operation = store
+        .task_runtime_operation(previous_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .authorize_task_runtime_creation(
+            previous_task_uid,
+            previous_operation.generation,
+            "test-controller",
+        )
+        .await?;
+    let previous_operation = store
+        .task_runtime_operation(previous_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .record_task_runtime_observed(
+            previous_task_uid,
+            previous_operation.generation,
+            &previous_runtime_uid,
+            "1",
+            "test-controller",
+        )
+        .await?;
     sqlx::query(
         "INSERT INTO task_lifecycle_events \
          (task_uid, event_kind, phase, provenance, at) VALUES \
@@ -2516,6 +2552,29 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .await?
         .ok_or(StoreError::TaskNotFound)?;
     let runtime_uid = format!("runtime-{suffix}");
+    store
+        .record_spend_observation(
+            &previous_runtime_uid,
+            1,
+            "previous-runtime-spec",
+            &SpendSummary {
+                observed_amount: "40.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            false,
+        )
+        .await?;
+    assert_eq!(
+        store
+            .remaining_envelope_instance_spend_budget(
+                &envelope_instance_id,
+                &runtime_uid,
+                "100.00",
+            )
+            .await?,
+        "60.00",
+        "a runtime key must receive only the monthly authority left after earlier runs"
+    );
     store
         .record_task_runtime_observed(
             task_uid,
@@ -2751,8 +2810,19 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             .await?,
         Some("25.00".to_owned())
     );
+    assert_eq!(
+        store
+            .remaining_envelope_instance_spend_budget(
+                &envelope_instance_id,
+                &runtime_uid,
+                "100.00",
+            )
+            .await?,
+        "85.00",
+        "an active top-up must expand the remaining authority without counting this runtime twice"
+    );
     let usage = store.envelope_usage(&envelope_instance_id).await?;
-    assert_eq!(usage.observed_amount, Some("110.00".to_owned()));
+    assert_eq!(usage.observed_amount, Some("150.00".to_owned()));
     assert_eq!(usage.active_top_up_amount, Some("25.00".to_owned()));
     let retry = store
         .record_escalation_top_up(

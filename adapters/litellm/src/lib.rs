@@ -264,12 +264,22 @@ fn budget_limit(budget: &Budget) -> Result<f64, PortError> {
             ),
         });
     }
+    let monthly_limit = parse_budget_amount(&budget.monthly_limit)?;
     let limit = budget
-        .monthly_limit
-        .parse::<f64>()
-        .map_err(|_| PortError::Rejected {
-            reason: "runtime inference budget is not a decimal amount".to_owned(),
-        })?;
+        .single_run_limit
+        .as_deref()
+        .map(parse_budget_amount)
+        .transpose()?
+        .map_or(monthly_limit, |single_run_limit| {
+            monthly_limit.min(single_run_limit)
+        });
+    Ok(limit)
+}
+
+fn parse_budget_amount(value: &str) -> Result<f64, PortError> {
+    let limit = value.parse::<f64>().map_err(|_| PortError::Rejected {
+        reason: "runtime inference budget is not a decimal amount".to_owned(),
+    })?;
     if !limit.is_finite() || limit <= 0.0 {
         return Err(PortError::Rejected {
             reason: "runtime inference budget must be a positive finite amount".to_owned(),
@@ -446,8 +456,8 @@ mod tests {
     use steward_types::{Budget, ModelRef, RuntimeId, SpendSummary};
 
     use super::{
-        LiteLlmAdapter, LiteLlmConfig, configuration_update, observation_from_key_list,
-        unpriced_models,
+        LiteLlmAdapter, LiteLlmConfig, budget_limit, configuration_update,
+        observation_from_key_list, unpriced_models,
     };
 
     const MOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -582,6 +592,23 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn single_run_limit_caps_the_gateway_key_budget() -> Result<(), String> {
+        let budget = Budget {
+            monthly_limit: "100.00".to_owned(),
+            single_run_limit: Some("0.25".to_owned()),
+            currency: "USD".to_owned(),
+        };
+
+        assert_eq!(
+            budget_limit(&budget)
+                .map_err(|error| format!("fixture budget must be enforceable: {error:?}"))?,
+            0.25,
+            "a runtime key must use the smaller per-run authority instead of the monthly ceiling"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn existing_key_configuration_is_updated_without_resetting_spend() -> Result<(), String> {
         let server = MockLiteLlm::start(vec![
@@ -596,6 +623,7 @@ mod tests {
 
         let mut desired = request();
         desired.budget.monthly_limit = "2.00".to_owned();
+        desired.budget.single_run_limit = Some("0.50".to_owned());
         adapter
             .reconcile_configuration(&desired)
             .await
@@ -612,7 +640,7 @@ mod tests {
         assert!(update.starts_with("POST /key/update "));
         assert!(update.contains(r#""key":"fixture-token-hash""#));
         assert!(update.contains(r#""models":["openai/priced-model"]"#));
-        assert!(update.contains(r#""max_budget":2.0"#));
+        assert!(update.contains(r#""max_budget":0.5"#));
         assert!(
             !update.contains(r#""spend""#),
             "an in-place policy update must not reset accumulated spend: {update}"
