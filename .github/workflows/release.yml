@@ -756,7 +756,7 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.17 makes administrator approval the authority boundary for above-template and template-free Envelope requests. The retired custom safety-ceiling key remains accepted but ignored for this release, with one startup warning.\n\n'
+            printf 'Steward v0.3.17 makes administrator approval the authority boundary for above-template and template-free Envelope requests. Administrators can approve or reject directly without first filing an external decision reference. The retired custom safety-ceiling key remains accepted but ignored for this release, with one startup warning.\n\n'
             printf 'Run-request refusals and temporary unavailability now return a stable error code and separate plain-language reason. Empty browser mutations preserve their JSON proof, first-template creation starts with and validates USD currency, and failed Git workspace preparation terminates the reserved run immediately with the source cause.\n\n'
             printf 'Bounded-history Git workspace downloads accept real shallow-boundary packets, so files-only and explicit-depth checkouts work against conforming Git servers.\n\n'
             printf 'This release retains everything shipped in v0.3.16, including deployment-configured agent/model compatibility, stable Git workspace selectors, full execution-log persistence, and the one-boundary Envelope template model.\n\n'

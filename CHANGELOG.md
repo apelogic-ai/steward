@@ -33,6 +33,8 @@ accurately.
   availability is checked at both request creation and approval, and rejections return a plain
   sentence plus affected fields. Within-template auto-provisioning remains governed by the
   published template rather than the descriptive capability catalog.
+- Administrators can approve or reject an Envelope request directly without first filing an
+  external decision reference.
 
 ### Removed
 
@@ -1241,7 +1243,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.16...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.17...HEAD
+[0.3.17]: https://github.com/apelogic-ai/steward/compare/v0.3.16...v0.3.17
 [0.3.16]: https://github.com/apelogic-ai/steward/compare/v0.3.15...v0.3.16
 [0.3.15]: https://github.com/apelogic-ai/steward/compare/v0.3.14...v0.3.15
 [0.3.14]: https://github.com/apelogic-ai/steward/compare/v0.3.13...v0.3.14
