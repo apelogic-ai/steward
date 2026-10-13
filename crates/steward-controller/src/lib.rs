@@ -30,8 +30,8 @@ use steward_admission::{
 use steward_ports::{
     DecisionChannel, DecisionRequest, InferenceCapabilities, InferenceCredential,
     InferenceObservation, InferencePlane, InferenceRequest, MAX_TASK_OUTPUT_ARCHIVE_BYTES,
-    ProvisionedInference, SandboxExecutionClass, SandboxTaskObservation, SandboxTaskRequest,
-    SandboxTaskRuntime, TaskAttemptId,
+    ProvisionedInference, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxExecutionClass,
+    SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{
@@ -1357,12 +1357,22 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
     if attempt.state != TaskExecutionAttemptState::StartPending {
         return observe_execution_attempt(sandbox_runtime, authority, &request, attempt).await;
     }
-    let observation = sandbox_runtime
-        .start_task(&attempt_id, &request, input)
-        .await
-        .unwrap_or_else(|error| SandboxTaskObservation::OutcomeUnknown {
-            reason: task_failure_reason(&error),
-        });
+    let observation = task_start_observation(
+        &attempt_id,
+        sandbox_runtime
+            .start_task(&attempt_id, &request, input)
+            .await,
+    );
+    if matches!(
+        &observation,
+        SandboxTaskObservation::Failed { reason, .. }
+            if reason == SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE
+    ) {
+        eprintln!(
+            "task workspace preparation failed: task_uid={} category=scratch_volume_size_not_enforced",
+            task.task_uid
+        );
+    }
     persist_execution_observation(
         authority,
         &attempt,
@@ -3486,6 +3496,26 @@ fn task_failure_reason(error: &PortError) -> String {
     }
 }
 
+fn task_start_observation(
+    attempt_id: &TaskAttemptId,
+    result: Result<SandboxTaskObservation, PortError>,
+) -> SandboxTaskObservation {
+    match result {
+        Err(PortError::Rejected { reason })
+            if reason == SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE =>
+        {
+            SandboxTaskObservation::Failed {
+                adapter_observation_id: attempt_id.0.clone(),
+                reason,
+            }
+        }
+        Err(error) => SandboxTaskObservation::OutcomeUnknown {
+            reason: task_failure_reason(&error),
+        },
+        Ok(observation) => observation,
+    }
+}
+
 #[cfg(test)]
 async fn task_runtime(
     client: &Client,
@@ -5564,8 +5594,8 @@ mod tests {
     use steward_ports::{
         InferenceCapabilities, InferenceObservation, InferencePlane, InferenceRequest,
         MAX_TASK_OUTPUT_ARCHIVE_BYTES, PortError, ProviderControlExecutionBindings,
-        ProvisionedInference, SandboxExecutionClass, SandboxObservation, SandboxRequest,
-        SandboxRuntime,
+        ProvisionedInference, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxExecutionClass,
+        SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskObservation, TaskAttemptId,
     };
     use steward_store::{
         ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase, ConnectionOperationKind,
@@ -5598,8 +5628,41 @@ mod tests {
         server_task_runtime_manifest, status_merge_patch, suspend_runtime,
         suspend_runtime_with_inference_cleanup, task_output_archive_failure,
         task_output_archive_size_failure, task_runtime, task_runtime_action,
-        task_runtime_observation_is_failed, ttl_action,
+        task_runtime_observation_is_failed, task_start_observation, ttl_action,
     };
+
+    #[test]
+    fn scratch_volume_preparation_rejection_is_a_specific_terminal_failure() {
+        let reason = SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE;
+        assert_eq!(
+            task_start_observation(
+                &TaskAttemptId("attempt-a".to_owned()),
+                Err(PortError::Rejected {
+                    reason: reason.to_owned(),
+                }),
+            ),
+            SandboxTaskObservation::Failed {
+                adapter_observation_id: "attempt-a".to_owned(),
+                reason: reason.to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn ambiguous_task_start_rejection_remains_outcome_unknown() {
+        let reason = "execution start response was lost";
+        assert_eq!(
+            task_start_observation(
+                &TaskAttemptId("attempt-a".to_owned()),
+                Err(PortError::Rejected {
+                    reason: reason.to_owned(),
+                }),
+            ),
+            SandboxTaskObservation::OutcomeUnknown {
+                reason: reason.to_owned(),
+            }
+        );
+    }
 
     #[tokio::test]
     async fn blocked_task_start_does_not_hide_another_tasks_ready_observation() -> Result<(), String>

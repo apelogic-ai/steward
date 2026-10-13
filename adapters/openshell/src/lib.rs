@@ -43,9 +43,10 @@ use sha2::{Digest, Sha256};
 use steward_ports::PortError;
 #[cfg(feature = "runtime")]
 use steward_ports::{
-    ProviderControlExecutionBindings, SandboxExecutionClass, SandboxObservation, SandboxRequest,
-    SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest,
-    SandboxTaskRuntime, SandboxTaskTranscript, TaskAttemptId,
+    ProviderControlExecutionBindings, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
+    SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
+    SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
+    SandboxTaskTranscript, TaskAttemptId,
 };
 #[cfg(feature = "runtime")]
 use steward_types::direct_package::{
@@ -74,6 +75,8 @@ const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
 const TAR_BLOCK_BYTES: usize = 512;
 #[cfg(feature = "runtime")]
 const STAGING_EXEC_STDIN_CHUNK_BYTES: usize = 512 * 1024;
+#[cfg(feature = "runtime")]
+const SCRATCH_VOLUME_SIZE_NOT_ENFORCED_EXIT_CODE: i32 = 42;
 #[cfg(feature = "runtime")]
 const EXECUTION_TRANSCRIPT_TRUNCATION_MARKER: &str = "[... execution output truncated ...]\n";
 #[cfg(feature = "runtime")]
@@ -1872,6 +1875,11 @@ impl OpenShellRuntime {
             )
             .await
             .map_err(port_failure)?;
+        if materialize.exit_code == SCRATCH_VOLUME_SIZE_NOT_ENFORCED_EXIT_CODE {
+            return Err(PortError::Rejected {
+                reason: SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE.to_owned(),
+            });
+        }
         if materialize.exit_code != 0 {
             return Err(workspace_staging_rejected());
         }
@@ -3229,7 +3237,7 @@ fn workspace_materialization_command(evidence: &WorkspaceEvidence) -> Result<Str
                 let size_kib = size_bytes.div_ceil(1024);
                 let destination = shell_quote(&format!("/sandbox/workspace/{}", name.as_str()));
                 command.push_str(&format!(
-                    "mkdir -p {destination}; workspace_capacity_kib=$(df -Pk {destination} | awk 'NR == 2 {{ print $2 }}'); case \"$workspace_capacity_kib\" in ''|*[!0-9]*) exit 1;; esac; [ \"$workspace_capacity_kib\" -le {size_kib} ]; chmod u+rwx {destination}; "
+                    "mkdir -p {destination}; workspace_capacity_kib=$(df -Pk {destination} | awk 'NR == 2 {{ print $2 }}'); case \"$workspace_capacity_kib\" in ''|*[!0-9]*) exit 1;; esac; if [ \"$workspace_capacity_kib\" -gt {size_kib} ]; then exit {SCRATCH_VOLUME_SIZE_NOT_ENFORCED_EXIT_CODE}; fi; chmod u+rwx {destination}; "
                 ));
             }
         }
@@ -4146,7 +4154,8 @@ mod tests {
             .map_err(|error| format!("render scratch materializer: {error:?}"))?;
         assert!(command.contains("mkdir -p '/sandbox/workspace/scratch'"));
         assert!(command.contains("df -Pk '/sandbox/workspace/scratch'"));
-        assert!(command.contains("-le 2097152"));
+        assert!(command.contains("-gt 2097152"));
+        assert!(command.contains("then exit 42"));
         Ok(())
     }
 
