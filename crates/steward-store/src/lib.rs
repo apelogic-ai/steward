@@ -3250,7 +3250,33 @@ impl PgStore {
         exhausted: bool,
     ) -> Result<(), StoreError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        if exhausted {
+        let inserted = sqlx::query(
+            "INSERT INTO spend_observations \
+             (runtime_uid, observed_amount, currency, exhausted) \
+             SELECT $1, $2::numeric, $3, $4 \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM ( \
+                     SELECT observed_amount, currency, exhausted \
+                     FROM spend_observations \
+                     WHERE runtime_uid = $1 \
+                     ORDER BY at DESC, id DESC \
+                     LIMIT 1 \
+                 ) latest \
+                 WHERE latest.observed_amount = $2::numeric \
+                   AND latest.currency = $3 \
+                   AND latest.exhausted = $4 \
+             )",
+        )
+        .bind(runtime_uid)
+        .bind(&spend.observed_amount)
+        .bind(&spend.currency)
+        .bind(exhausted)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .rows_affected()
+            == 1;
+        if inserted && exhausted {
             sqlx::query(
                 "INSERT INTO inference_exhaustions \
                  (public_id, runtime_uid, observed_generation, spec_digest, observed_amount, currency) \
@@ -3266,18 +3292,6 @@ impl PgStore {
             .await
             .map_err(database_error)?;
         }
-        sqlx::query(
-            "INSERT INTO spend_observations \
-             (runtime_uid, observed_amount, currency, exhausted) \
-             VALUES ($1, $2::numeric, $3, $4)",
-        )
-        .bind(runtime_uid)
-        .bind(&spend.observed_amount)
-        .bind(&spend.currency)
-        .bind(exhausted)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
         transaction.commit().await.map_err(database_error)
     }
 
@@ -3752,8 +3766,9 @@ impl PgStore {
             .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
         sqlx::query_scalar::<_, String>(
             "WITH period AS ( \
-                 SELECT date_trunc('month', now()) AS starts_at, \
-                        date_trunc('month', now()) + interval '1 month' AS ends_at \
+                 SELECT date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS starts_at, \
+                        (date_trunc('month', now() AT TIME ZONE 'UTC') + interval '1 month') \
+                            AT TIME ZONE 'UTC' AS ends_at \
              ), runtimes AS ( \
                  SELECT DISTINCT COALESCE(orchestration.runtime_uid, tasks.runtime_uid) AS runtime_uid \
                  FROM task_submissions tasks \
