@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.17] - 2026-10-13
+
+Steward v0.3.17 makes administrator approval the authority boundary for Envelope requests outside
+a template, restores reliable browser mutations and first-template creation, returns stable and
+human-readable Run refusal errors, and makes bounded Git workspace preparation fail promptly and
+accurately.
+
 ### Changed
 
 - Git workspaces with bounded history now accept the shallow-boundary packets emitted by Git
@@ -26,6 +33,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   availability is checked at both request creation and approval, and rejections return a plain
   sentence plus affected fields. Within-template auto-provisioning remains governed by the
   published template rather than the descriptive capability catalog.
+- Administrators can approve or reject an Envelope request directly without first filing an
+  external decision reference.
 
 ### Removed
 
@@ -38,6 +47,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   release. A configured value produces one apiserver startup warning. Remove the key before the
   next release, when the chart schema will reject it. Existing pending requests are retained and
   become approvable subject to current deployment capability availability.
+- Above-template and template-free Envelope requests now require a non-empty justification. A
+  missing justification is rejected with HTTP 422 and code `justification_required`.
+- Refused and temporarily unavailable Run requests now return a stable code in `error` and the
+  plain sentence in `failureReason`; clients must not parse internal error formatting.
+- Git workspace checkout requires the selected Git host to be reachable from the apiserver in
+  addition to any provider API endpoint.
+- This release adds no database migration. A database used by v0.3.17 remains readable by v0.3.16,
+  but rollback restores v0.3.16 safety-ceiling behavior for pending Envelope requests.
 
 ## [0.3.16] - 2026-10-12
 
@@ -1226,7 +1243,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.16...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.17...HEAD
+[0.3.17]: https://github.com/apelogic-ai/steward/compare/v0.3.16...v0.3.17
 [0.3.16]: https://github.com/apelogic-ai/steward/compare/v0.3.15...v0.3.16
 [0.3.15]: https://github.com/apelogic-ai/steward/compare/v0.3.14...v0.3.15
 [0.3.14]: https://github.com/apelogic-ai/steward/compare/v0.3.13...v0.3.14
