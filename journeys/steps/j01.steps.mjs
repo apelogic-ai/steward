@@ -205,12 +205,20 @@ async function selectConfiguredOption(picker, configured, field) {
 }
 
 async function selectConfiguredRuntime(page) {
+  const exactTaskNotice = page.getByText(
+    "This exact package cannot be changed here. Choose an Envelope and optional inputs for this run.",
+    { exact: true },
+  );
+  if (await exactTaskNotice.count()) return;
+
   const agentPicker = fieldLocator(page, "Coding agent");
-  if (configuredAgent && await agentPicker.count()) {
+  if (configuredAgent) {
+    await expect(agentPicker, "the Run form should expose the configured Coding agent picker").toHaveCount(1);
     await selectConfiguredOption(agentPicker, configuredAgent, "Coding agent");
   }
   const modelPicker = fieldLocator(page, "Model");
-  if (configuredModel && await modelPicker.count()) {
+  if (configuredModel) {
+    await expect(modelPicker, "the Run form should expose the configured Model picker").toHaveCount(1);
     await selectConfiguredOption(modelPicker, configuredModel, "Model");
   } else if (await modelPicker.count()) {
     await chooseFirstOfferedModel(page);
@@ -663,7 +671,7 @@ Then("the run output contains {string}", async ({ journey, page }, expected) => 
 Then("the spend of the run is above {float} USD", async ({ journey, page }, minimum) => {
   expect(journey.run?.observedSpend?.currency).toBe("USD");
   expect(Number(journey.run.observedSpend.observedAmount)).toBeGreaterThan(minimum);
-  const spend = page.locator("#workspace dt").filter({ hasText: /^Spend$/ }).first().locator("xpath=following-sibling::dd[1]");
+  const spend = page.locator("#workspace p").filter({ hasText: /^Spend$/ }).first().locator("xpath=following-sibling::p[1]");
   await expect(spend).toHaveText(/^\d+(?:\.\d+)? USD$/);
   expect(Number((await spend.innerText()).split(/\s+/)[0]), "the Run page should show spend above the expected minimum").toBeGreaterThan(minimum);
 });
