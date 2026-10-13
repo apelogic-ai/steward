@@ -2412,6 +2412,70 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             active_manifest_digest: &active_digest,
         })
         .await?;
+    let previous_task_uid = Uuid::new_v4();
+    let previous_operation_id = Uuid::new_v4();
+    let previous_runtime_name = format!("task-{}", previous_operation_id.simple());
+    let previous_inert_digest = manifest_digest_with_binding(
+        previous_task_uid,
+        previous_operation_id,
+        &previous_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let previous_active_digest = manifest_digest_with_binding(
+        previous_task_uid,
+        previous_operation_id,
+        &previous_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: previous_task_uid,
+            operation_id: previous_operation_id,
+            idempotency_key: &format!("earlier-runtime-task-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some(email.as_str()),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: email.as_str(),
+            owner_user_id: identity.user_id.as_str(),
+            workflow: &workflow,
+            workflow_name: Some(&workflow),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &previous_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &agent_command,
+            execution_binding: Some(&execution_binding),
+            source_provenance: None,
+            direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &candidate_digest,
+            admission_decision: &admission_decision,
+            inert_manifest_digest: &previous_inert_digest,
+            active_manifest_digest: &previous_active_digest,
+        })
+        .await?;
+    sqlx::query(
+        "INSERT INTO task_lifecycle_events \
+         (task_uid, event_kind, phase, provenance, at) VALUES \
+         ($1, 'phase', 'running', 'recorded', clock_timestamp() - interval '20 minutes'), \
+         ($1, 'phase', 'succeeded', 'recorded', clock_timestamp() - interval '10 minutes')",
+    )
+    .bind(previous_task_uid)
+    .execute(&pool)
+    .await?;
     store
         .put_task_inputs(
             task_uid,
@@ -2546,6 +2610,30 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
     .bind(task_uid)
     .execute(&pool)
     .await?;
+    let task_runtime_minutes = store
+        .observe_task_runtime_minutes(task_uid, &runtime_uid, "3.00")
+        .await
+        .map_err(|error| io::Error::other(format!("observe per-Task runtime: {error:?}")))?;
+    assert!(
+        !task_runtime_minutes.exhausted,
+        "earlier usage by another Task in the same instance must not consume this Task's cap"
+    );
+    assert!(
+        task_runtime_minutes
+            .observed_minutes
+            .parse::<f64>()?
+            .is_sign_positive()
+    );
+    assert!(
+        store
+            .observe_task_runtime_minutes(task_uid, &runtime_uid, "1.00")
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("observe exhausted per-Task runtime: {error:?}"))
+            })?
+            .exhausted,
+        "the Task's own running time must exhaust its per-run cap"
+    );
     let runtime_minutes = store
         .observe_envelope_instance_runtime_minutes(
             &envelope_instance_id,
@@ -2569,19 +2657,19 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
     let runtime_grant = store
         .record_escalation_top_up(
             runtime_minutes_escalation.escalation_id,
-            "10.00",
+            "20.00",
             "2999-01-01T00:00:00Z",
             "finish the bounded task",
             "test-admin",
         )
         .await?;
     assert_eq!(runtime_grant.base_limit, "1.00");
-    assert_eq!(runtime_grant.target_limit, "11.00");
+    assert_eq!(runtime_grant.target_limit, "21.00");
     assert_eq!(
         store
             .active_envelope_instance_runtime_minutes_top_up(&envelope_instance_id)
             .await?,
-        Some("10.00".to_owned())
+        Some("20.00".to_owned())
     );
     let resumed_runtime_minutes = store
         .observe_envelope_instance_runtime_minutes(

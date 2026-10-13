@@ -438,6 +438,9 @@ pub(crate) struct BrowserRunView {
     user_envelope_instance_id: Option<String>,
     user_envelope_revision: Option<i64>,
     user_envelope_digest: Option<String>,
+    task_runtime_minutes_limit: Option<String>,
+    envelope_runtime_minutes_limit: Option<String>,
+    envelope_runtime_minutes_used: Option<String>,
     coding_agent_runtime: String,
     runtime_uid: Option<String>,
     runtime_ownership: RuntimeOwnership,
@@ -2774,6 +2777,28 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
                 .as_ref()
                 .and_then(|evidence| evidence.workspace.clone())
         });
+    let task_runtime_minutes_limit = record
+        .direct_task_evidence
+        .as_ref()
+        .and_then(|evidence| {
+            steward_types::direct_package::task_runtime_minutes_limit(
+                evidence.requested_requirements.as_ref(),
+                Some(&evidence.effective_requirements),
+            )
+        })
+        .or_else(|| {
+            record.browser_task_evidence.as_ref().and_then(|evidence| {
+                steward_types::direct_package::task_runtime_minutes_limit(
+                    evidence.requested_requirements.as_ref(),
+                    evidence.effective_requirements.as_ref(),
+                )
+            })
+        })
+        .map(|limit| limit.as_str().to_owned());
+    let envelope_runtime_minutes_limit = record
+        .user_envelope_snapshot
+        .as_ref()
+        .and_then(|envelope| envelope.spec.runtime_minutes_limit.clone());
     BrowserRunView {
         task_uid: record.task_uid,
         origin: record.task_origin,
@@ -2786,6 +2811,9 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         user_envelope_instance_id: record.user_envelope_instance_id,
         user_envelope_revision: record.user_envelope_revision,
         user_envelope_digest: record.user_envelope_digest,
+        task_runtime_minutes_limit,
+        envelope_runtime_minutes_limit,
+        envelope_runtime_minutes_used: record.envelope_runtime_minutes_used,
         coding_agent_runtime: record.coding_agent_runtime,
         runtime_uid: record.runtime_uid,
         runtime_ownership: record.runtime_ownership,
@@ -3526,6 +3554,8 @@ mod tests {
             user_envelope_instance_id: Some("envelope-instance-1".to_owned()),
             user_envelope_revision: Some(4),
             user_envelope_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            user_envelope_snapshot: None,
+            envelope_runtime_minutes_used: None,
             coding_agent_runtime: "agent-v1".to_owned(),
             runtime_uid: Some(format!("runtime-{task_uid}")),
             runtime_ownership: RuntimeOwnership::Provisioned,

@@ -1810,6 +1810,27 @@ pub struct DirectTaskBindingEvidence {
     pub prompt_source: PromptSourceKind,
 }
 
+/// Return the per-Task runtime cap recorded in source-authority evidence.
+///
+/// Historical evidence stored the Envelope's monthly allowance as the effective value while a
+/// lower package request remained in `requested`. New evidence stores only the per-Task cap as
+/// effective. This projection preserves both forms without treating a newly omitted request as a
+/// per-Task cap.
+pub fn task_runtime_minutes_limit<'a>(
+    requested: Option<&'a DirectRequirements>,
+    effective: Option<&'a DirectRequirements>,
+) -> Option<&'a Decimal> {
+    let requested_limit =
+        requested.and_then(|requirements| requirements.authority.runtime_minutes_limit.as_ref());
+    let effective_limit =
+        effective.and_then(|requirements| requirements.authority.runtime_minutes_limit.as_ref());
+    match (requested_limit, effective_limit) {
+        (Some(requested), Some(effective)) if requested != effective => Some(requested),
+        (_, Some(effective)) => Some(effective),
+        _ => None,
+    }
+}
+
 impl DirectTaskBindingEvidence {
     pub fn validate(&self) -> Result<(), String> {
         require_version(
@@ -2135,7 +2156,47 @@ pub fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, String> 
 
 #[cfg(test)]
 mod browser_submission_tests {
-    use super::{BrowserTaskEvidence, BrowserTaskSubmission, MAX_BROWSER_INPUT_BYTES};
+    use super::{
+        BrowserTaskEvidence, BrowserTaskSubmission, DirectTaskBindingEvidence,
+        MAX_BROWSER_INPUT_BYTES, task_runtime_minutes_limit,
+    };
+
+    #[test]
+    fn task_runtime_limit_preserves_historical_lower_request() -> Result<(), String> {
+        let mut evidence: DirectTaskBindingEvidence = serde_json::from_str(include_str!(
+            "../../../docs/contracts/task/v2/fixtures/positive/task-binding-evidence.json"
+        ))
+        .map_err(|error| error.to_string())?;
+        let requested = evidence
+            .requested_requirements
+            .as_ref()
+            .ok_or_else(|| "fixture has no requested requirements".to_owned())?;
+        let requested = requested.clone();
+        evidence
+            .effective_requirements
+            .authority
+            .runtime_minutes_limit = Some(super::Decimal::parse("60")?);
+        assert_eq!(
+            task_runtime_minutes_limit(Some(&requested), Some(&evidence.effective_requirements))
+                .map(super::Decimal::as_str),
+            Some("30")
+        );
+        evidence
+            .effective_requirements
+            .authority
+            .runtime_minutes_limit = Some(super::Decimal::parse("30")?);
+        assert_eq!(
+            task_runtime_minutes_limit(Some(&requested), Some(&evidence.effective_requirements))
+                .map(super::Decimal::as_str),
+            Some("30")
+        );
+        assert_eq!(
+            task_runtime_minutes_limit(Some(&requested), None),
+            None,
+            "an omitted Task request has no per-run cap even when admission inherited the Envelope"
+        );
+        Ok(())
+    }
 
     #[test]
     fn inline_package_requires_its_entry_point_and_object_inputs() -> Result<(), String> {

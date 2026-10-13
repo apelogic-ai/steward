@@ -17916,6 +17916,8 @@ mod tests {
             user_envelope_instance_id: None,
             user_envelope_revision: None,
             user_envelope_digest: None,
+            user_envelope_snapshot: None,
+            envelope_runtime_minutes_used: None,
             coding_agent_runtime: "agent-v1".to_owned(),
             runtime_uid: Some(format!("runtime-{task_uid}")),
             runtime_ownership: steward_types::RuntimeOwnership::Provisioned,

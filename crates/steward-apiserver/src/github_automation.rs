@@ -2246,6 +2246,8 @@ mod tests {
             user_envelope_instance_id: Some("envelope-instance-1".to_owned()),
             user_envelope_revision: Some(4),
             user_envelope_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            user_envelope_snapshot: None,
+            envelope_runtime_minutes_used: None,
             coding_agent_runtime: "agent-v1".to_owned(),
             runtime_uid: Some(format!("runtime-{task_uid}")),
             runtime_ownership: RuntimeOwnership::Provisioned,

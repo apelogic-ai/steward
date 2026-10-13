@@ -3008,6 +3008,32 @@ fn task_runtime_reconciliation_action(
     }
 }
 
+fn task_runtime_minutes_limit(task: &steward_store::TaskRecord) -> Option<&str> {
+    let (requested, effective) = task
+        .direct_task_evidence
+        .as_ref()
+        .map(|evidence| {
+            (
+                evidence.requested_requirements.as_ref(),
+                Some(&evidence.effective_requirements),
+            )
+        })
+        .or_else(|| {
+            task.browser_task_evidence.as_ref().map(|evidence| {
+                (
+                    evidence.requested_requirements.as_ref(),
+                    evidence.effective_requirements.as_ref(),
+                )
+            })
+        })?;
+    steward_types::direct_package::task_runtime_minutes_limit(requested, effective)
+        .map(steward_types::direct_package::Decimal::as_str)
+}
+
+fn task_runtime_limit_failure_reason(limit: &str, exhausted: bool) -> Option<String> {
+    exhausted.then(|| format!("This run reached its limit of {limit} minutes."))
+}
+
 fn task_operation_generation_matches_transition(
     operation: &steward_store::TaskRuntimeOperationRecord,
 ) -> bool {
@@ -3894,7 +3920,9 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     task_owned_runtime,
                     task_envelope_instance_id,
                     task_uid,
+                    envelope_runtime_minutes_limit,
                     task_runtime_minutes_limit,
+                    task_operation_generation,
                 ) = if let Some(authority) = &context.authority {
                     let admission = if matches!(
                         runtime.spec.principal,
@@ -3925,7 +3953,9 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     )
                     .map_err(ControllerError::Reconcile)?
                     {
-                        TaskRuntimeReconciliationAction::NotTaskOwned => (false, None, None, None),
+                        TaskRuntimeReconciliationAction::NotTaskOwned => {
+                            (false, None, None, None, None, None)
+                        }
                         TaskRuntimeReconciliationAction::Continue => {
                             let admission =
                                 admission.as_ref().and_then(Option::as_ref).ok_or_else(|| {
@@ -3940,6 +3970,8 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                 admission.task.user_envelope_snapshot.as_ref().and_then(
                                     |envelope| envelope.spec.runtime_minutes_limit.clone(),
                                 ),
+                                task_runtime_minutes_limit(&admission.task).map(str::to_owned),
+                                Some(admission.operation.generation),
                             )
                         }
                         TaskRuntimeReconciliationAction::WaitForTaskOrchestrator => {
@@ -3974,7 +4006,7 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         }
                     }
                 } else {
-                    (false, None, None, None)
+                    (false, None, None, None, None, None)
                 };
                 if !is_pending_approval(&runtime) && !has_activation_condition(&runtime) {
                     let released_hold = runtime
@@ -4377,11 +4409,55 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         }
                     }
                 }
+                if let (
+                    Some(authority),
+                    Some(task_uid),
+                    Some(runtime_limit),
+                    Some(operation_generation),
+                ) = (
+                    context.authority.as_ref(),
+                    task_uid,
+                    task_runtime_minutes_limit.as_deref(),
+                    task_operation_generation,
+                ) {
+                    let runtime_uid =
+                        runtime
+                            .metadata
+                            .uid
+                            .as_deref()
+                            .ok_or(ControllerError::Reconcile(
+                                ReconcileError::MissingRuntimeUid,
+                            ))?;
+                    let observation = authority
+                        .observe_task_runtime_minutes(task_uid, runtime_uid, runtime_limit)
+                        .await
+                        .map_err(|error| {
+                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
+                        })?;
+                    if let Some(reason) =
+                        task_runtime_limit_failure_reason(&observation.limit, observation.exhausted)
+                    {
+                        authority
+                            .enter_task_cleanup(
+                                task_uid,
+                                operation_generation,
+                                TaskCleanupCause::Failed(&reason),
+                                TASK_ORCHESTRATOR_ACTOR,
+                            )
+                            .await
+                            .map_err(|error| {
+                                ControllerError::Reconcile(ReconcileError::Authority(
+                                    error.to_string(),
+                                ))
+                            })?;
+                        return Ok(Action::requeue(StdDuration::from_secs(2)));
+                    }
+                }
                 if let (Some(authority), Some(instance_id), Some(task_uid), Some(base_limit)) = (
                     context.authority.as_ref(),
                     task_envelope_instance_id.as_deref(),
                     task_uid,
-                    task_runtime_minutes_limit.as_deref(),
+                    envelope_runtime_minutes_limit.as_deref(),
                 ) {
                     let runtime_uid =
                         runtime
@@ -5612,6 +5688,7 @@ mod tests {
         RuntimeOwnership, RuntimeRefs, TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding,
         TaskPhase,
     };
+
     use tower::service_fn;
 
     use super::{
@@ -5630,6 +5707,15 @@ mod tests {
         task_output_archive_size_failure, task_runtime, task_runtime_action,
         task_runtime_observation_is_failed, task_start_observation, ttl_action,
     };
+
+    #[test]
+    fn task_runtime_cap_has_a_plain_terminal_reason() {
+        assert_eq!(
+            super::task_runtime_limit_failure_reason("30", true).as_deref(),
+            Some("This run reached its limit of 30 minutes.")
+        );
+        assert_eq!(super::task_runtime_limit_failure_reason("30", false), None);
+    }
 
     #[test]
     fn scratch_volume_preparation_rejection_is_a_specific_terminal_failure() {

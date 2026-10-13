@@ -128,6 +128,19 @@ export function inferenceFailureGuidance(errorCategory: string | null | undefine
   return null;
 }
 
+export function runtimeMinutesSummary(run: Pick<BrowserRunView,
+  "taskRuntimeMinutesLimit" | "envelopeRuntimeMinutesLimit" | "envelopeRuntimeMinutesUsed"
+>): string | null {
+  const parts: string[] = [];
+  if (run.taskRuntimeMinutesLimit) {
+    parts.push(`This run: up to ${run.taskRuntimeMinutesLimit} minutes`);
+  }
+  if (run.envelopeRuntimeMinutesLimit) {
+    parts.push(`Envelope: ${run.envelopeRuntimeMinutesLimit} minutes per month, ${run.envelopeRuntimeMinutesUsed ?? "0"} used`);
+  }
+  return parts.length ? parts.join(" · ") : null;
+}
+
 type RunEventSnapshot = {
   eventId: number;
   run: BrowserRunView;
@@ -598,6 +611,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
         const admitted = timelineEvents.find((event) => event.kind === "admitted");
         const runtimeBound = timelineEvents.find((event) => event.kind === "runtimeBound");
         const inferenceGuidance = run.phase === "failed" ? inferenceFailureGuidance(run.errorCategory) : null;
+        const runtimeMinutes = runtimeMinutesSummary(run);
         return (
           <article className="space-y-6">
             <header className="flex flex-wrap items-start justify-between gap-5">
@@ -606,6 +620,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 <p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p>
                 {run.trigger ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.trigger.actor}</strong> via {run.trigger.event} · <a href={run.trigger.runUrl} rel="noreferrer" target="_blank">{run.trigger.repository}@{run.trigger.ref} ({run.trigger.sha.slice(0, 7)})</a> · {durationLabel(run.createdAt, run.updatedAt)}</div> : <div className="mt-2 text-sm text-muted-ink">Started {dateTime(run.createdAt)} · {durationLabel(run.createdAt, run.updatedAt)}</div>}
                 <div className="mt-1 text-sm text-muted-ink">Origin: {run.origin}{run.package ? ` · Package: ${run.package.source} @ ${run.package.revision} · ${run.package.path} · Prompt: ${run.package.promptSource}` : ""}</div>
+                {runtimeMinutes ? <div className="mt-1 text-sm text-muted-ink">{runtimeMinutes}</div> : null}
               </div>
               {!admin ? <div className="flex flex-wrap gap-2"><button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={rerunState === "working" || !run.rerunSupported} title={run.rerunSupported ? undefined : "This run cannot be re-run."} onClick={async () => {
                 if (session.status !== "authenticated") return;

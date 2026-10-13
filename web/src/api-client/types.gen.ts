@@ -669,6 +669,8 @@ export type BrowserRunTrigger = {
 export type BrowserRunView = {
     codingAgentRuntime: string;
     createdAt: string;
+    envelopeRuntimeMinutesLimit?: string | null;
+    envelopeRuntimeMinutesUsed?: string | null;
     errorCategory?: string | null;
     executionLog: ExecutionLogMode;
     finalizationRequested: boolean;
@@ -682,6 +684,7 @@ export type BrowserRunView = {
     runtimeOwnership: RuntimeOwnership;
     runtimeUid?: string | null;
     stages: Array<BrowserRunStage>;
+    taskRuntimeMinutesLimit?: string | null;
     taskUid: string;
     trigger?: null | BrowserRunTrigger;
     updatedAt: string;
