@@ -3947,12 +3947,12 @@ test("a running run shows both live logs and advances elapsed time", async ({ br
     await expect(developer.page.getByText("Codex is working", { exact: true })).toBeVisible();
     await expect(developer.page.locator("article > header").getByText(/· 5 s$/)).toBeVisible();
 
+    await developer.page.clock.fastForward(2_000);
+    await expect(developer.page.locator("article > header").getByText(/· 7 s$/)).toBeVisible();
+
     await developer.page.getByRole("tab", { name: "stdout" }).click();
     await expect(developer.page.getByRole("tab", { name: "stdout" })).toHaveAttribute("aria-selected", "true");
     await expect(developer.page.getByText("Codex is working", { exact: true })).toHaveCount(0);
-
-    await developer.page.clock.fastForward(2_000);
-    await expect(developer.page.locator("article > header").getByText(/· 7 s$/)).toBeVisible();
   } finally {
     web.useRunEventFixture(null);
     await closeGuardedPage(developer);
