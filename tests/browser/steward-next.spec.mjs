@@ -3917,10 +3917,10 @@ test("a running run can be cancelled with an empty JSON mutation body", async ({
   }
 });
 
-test("a running Codex run opens its active log and advances elapsed time", async ({ browser }) => {
+test("a running run shows both live logs and advances elapsed time", async ({ browser }) => {
   const developer = await guardedPage(browser, {
     executionLogs: {
-      stdout: { body: "", status: 200, complete: false },
+      stdout: { body: "Agent is working\n", status: 200, complete: false },
       stderr: { body: "Codex is working\n", status: 200, complete: false },
     },
     mockRunEvents: false,
@@ -3941,9 +3941,15 @@ test("a running Codex run opens its active log and advances elapsed time", async
     await developer.page.goto(`${origin}/runs/${taskUid}?job=agent_execution`);
     await developer.page.getByText("Execution", { exact: true }).click();
 
-    await expect(developer.page.getByRole("tab", { name: "stderr" })).toHaveAttribute("aria-selected", "true");
+    await expect(developer.page.getByRole("tab", { name: "stdout" })).toHaveAttribute("aria-selected", "false");
+    await expect(developer.page.getByRole("tab", { name: "stderr" })).toHaveAttribute("aria-selected", "false");
+    await expect(developer.page.getByText("Agent is working", { exact: true })).toBeVisible();
     await expect(developer.page.getByText("Codex is working", { exact: true })).toBeVisible();
     await expect(developer.page.locator("article > header").getByText(/· 5 s$/)).toBeVisible();
+
+    await developer.page.getByRole("tab", { name: "stdout" }).click();
+    await expect(developer.page.getByRole("tab", { name: "stdout" })).toHaveAttribute("aria-selected", "true");
+    await expect(developer.page.getByText("Codex is working", { exact: true })).toHaveCount(0);
 
     await developer.page.clock.fastForward(2_000);
     await expect(developer.page.locator("article > header").getByText(/· 7 s$/)).toBeVisible();
