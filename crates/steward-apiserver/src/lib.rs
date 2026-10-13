@@ -10793,7 +10793,9 @@ mod tests {
                 template_id: None,
                 eligibility_member_role: Some("engineer".to_owned()),
                 member_role: Some("engineer".to_owned()),
-                counterexample: "Monthly budget: requested $220.00, limit $200.00".to_owned(),
+                counterexample:
+                    "Monthly budget 220.00 USD is more than the 200.00 USD this Envelope allows"
+                        .to_owned(),
             }],
             "a parked over-envelope request must be filed with its structured counterexample"
         );
@@ -12637,7 +12639,7 @@ mod tests {
             response
                 .get("counterexample")
                 .and_then(|value| value.as_str()),
-            Some("Monthly budget: requested $220.00, limit $200.00")
+            Some("Monthly budget 220.00 USD is more than the 200.00 USD this Envelope allows")
         );
         assert_eq!(
             response.pointer("/proposedSpec/budget/monthlyLimit"),
@@ -16018,7 +16020,7 @@ mod tests {
             app,
             "direct-over-authority",
             StatusCode::UNPROCESSABLE_ENTITY,
-            "Monthly budget: requested $50.00, limit $25.00",
+            "Monthly budget 50.00 USD is more than the 25.00 USD this Envelope allows",
         )
         .await
     }

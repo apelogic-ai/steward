@@ -1103,6 +1103,7 @@ export type EnvelopeRequestField = 'requestedEnvelope' | 'justification' | 'rati
 
 export type EnvelopeRequestHistoryEvent = {
     actor: string;
+    actorDisplayEmail?: string | null;
     at: string;
     evidenceUrl?: string | null;
     expiresAt?: string | null;
@@ -1867,6 +1868,7 @@ export type UserEnvelopeRequest = {
     statusActor: string;
     statusAt: string;
     statusTemplateRevision?: number | null;
+    templateDisplayName?: string | null;
     templateEnvelope?: null | BrowserEnvelope;
     templateId?: string | null;
     templateRevision?: number | null;

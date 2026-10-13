@@ -351,7 +351,7 @@ impl AdmissionDelta {
                 ceiling,
                 currency,
             } => format!(
-                "Monthly budget: requested {}, limit {}",
+                "Monthly budget {} is more than the {} this Envelope allows",
                 format_money(requested, currency),
                 format_money(ceiling, currency)
             ),
@@ -359,59 +359,77 @@ impl AdmissionDelta {
                 requested,
                 ceiling,
                 currency,
-            } => format!(
-                "Per-run budget: requested {}, limit {}",
-                requested.as_deref().map_or_else(
-                    || "no limit".to_owned(),
-                    |value| format_money(value, currency)
-                ),
-                format_money(ceiling, currency)
+            } => requested.as_deref().map_or_else(
+                || {
+                    format!(
+                        "A per-run budget with no limit is more than the {} this Envelope allows",
+                        format_money(ceiling, currency)
+                    )
+                },
+                |requested| {
+                    format!(
+                        "Per-run budget {} is more than the {} this Envelope allows",
+                        format_money(requested, currency),
+                        format_money(ceiling, currency)
+                    )
+                },
             ),
             Self::RuntimeMinutes {
                 requested: Some(requested),
                 ceiling,
             } => {
-                format!("Runtime allowance: requested {requested} minutes, limit {ceiling} minutes")
+                format!(
+                    "Runtime allowance {requested} min is more than the {ceiling} min per month this Envelope allows"
+                )
             }
             Self::RuntimeMinutes {
                 requested: None,
                 ceiling,
             } => format!(
-                "Runtime allowance: requested without a limit, but this Envelope allows at most {ceiling} minutes"
+                "A runtime allowance with no limit is more than the {ceiling} min per month this Envelope allows"
             ),
             Self::Ttl { requested, ceiling } => {
-                format!("Maximum run duration: requested {requested}, limit {ceiling}")
+                format!(
+                    "Maximum run duration {} is more than the {} this Envelope allows",
+                    format_duration_label(requested),
+                    format_duration_label(ceiling)
+                )
             }
-            Self::Models { requested, ceiling } => format!(
-                "Models: requested {}, allowed {}",
+            Self::Models {
+                requested,
+                ceiling: _,
+            } => outside_values_message(
+                "Model",
+                "Models",
                 requested
                     .iter()
                     .map(|model| format!("{}/{}", model.provider, model.model))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                ceiling
-                    .iter()
-                    .map(|model| format!("{}/{}", model.provider, model.model))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                    .collect(),
+                "models",
             ),
-            Self::Tools { requested, ceiling } => format!(
-                "Tools: requested {}, allowed {}",
+            Self::Tools {
+                requested,
+                ceiling: _,
+            } => outside_values_message(
+                "Tool",
+                "Tools",
                 requested
                     .iter()
                     .map(|tool| format!("{}:{}:{}", tool.provider, tool.resource, tool.action))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                ceiling
-                    .iter()
-                    .map(|tool| format!("{}:{}:{}", tool.provider, tool.resource, tool.action))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                    .collect(),
+                "tools",
             ),
-            Self::RunnerPlatforms { requested, ceiling } => format!(
-                "Runner platforms: requested {}, allowed {}",
-                format_runner_platforms(requested),
-                format_runner_platforms(ceiling)
+            Self::RunnerPlatforms {
+                requested,
+                ceiling: _,
+            } => outside_values_message(
+                "Runner platform",
+                "Runner platforms",
+                requested
+                    .iter()
+                    .map(|platform| format_runner_platforms(std::slice::from_ref(platform)))
+                    .collect(),
+                "platforms",
             ),
             Self::RunnerMemory { requested, ceiling } => {
                 runner_resource_message("memory", requested, ceiling.as_ref())
@@ -442,10 +460,77 @@ impl AdmissionDelta {
 }
 
 fn format_money(amount: &str, currency: &str) -> String {
-    if currency == "USD" {
-        format!("${amount}")
+    let Ok((integer, fractional)) = decimal_parts(amount) else {
+        return format!("{amount} {currency}");
+    };
+    let integer = integer.trim_start_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    if integer == "0"
+        && fractional.bytes().take(2).all(|digit| digit == b'0')
+        && fractional.bytes().skip(2).any(|digit| digit != b'0')
+    {
+        return format!("< 0.01 {currency}");
+    }
+
+    let mut cents = fractional
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(2)
+        .fold(0_u8, |value, digit| value * 10 + digit - b'0');
+    let round_up = fractional
+        .as_bytes()
+        .get(2)
+        .is_some_and(|digit| *digit >= b'5');
+    let mut integer = integer.to_owned();
+    if round_up {
+        cents += 1;
+        if cents == 100 {
+            cents = 0;
+            increment_decimal_string(&mut integer);
+        }
+    }
+    format!("{integer}.{cents:02} {currency}")
+}
+
+fn increment_decimal_string(value: &mut String) {
+    let mut digits = value.as_bytes().to_vec();
+    for digit in digits.iter_mut().rev() {
+        if *digit < b'9' {
+            *digit += 1;
+            *value = digits.into_iter().map(char::from).collect();
+            return;
+        }
+        *digit = b'0';
+    }
+    digits.insert(0, b'1');
+    *value = digits.into_iter().map(char::from).collect();
+}
+
+fn format_duration_label(value: &str) -> String {
+    let split = value.len().saturating_sub(1);
+    let (amount, suffix) = value.split_at(split);
+    match suffix {
+        "s" => format!("{amount} s"),
+        "m" => format!("{amount} min"),
+        "h" => format!("{amount} h"),
+        "d" => format!("{amount} d"),
+        _ => value.to_owned(),
+    }
+}
+
+fn outside_values_message(
+    singular_label: &str,
+    plural_label: &str,
+    values: Vec<String>,
+    allowed_noun: &str,
+) -> String {
+    if let [value] = values.as_slice() {
+        format!("{singular_label} {value} is not one of the {allowed_noun} this Envelope allows")
     } else {
-        format!("{amount} {currency}")
+        format!(
+            "{plural_label} {} are not among the {allowed_noun} this Envelope allows",
+            values.join(", ")
+        )
     }
 }
 
@@ -453,9 +538,9 @@ fn format_runner_platforms(platforms: &[RunnerPlatform]) -> String {
     platforms
         .iter()
         .map(|platform| match platform {
-            RunnerPlatform::Linux => "linux",
+            RunnerPlatform::Linux => "Linux",
             RunnerPlatform::Mac => "macOS",
-            RunnerPlatform::Windows => "windows",
+            RunnerPlatform::Windows => "Windows",
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -1744,7 +1829,7 @@ mod tests {
                 .map_err(|error| format!("evaluate request: {error:?}"))?
                 .counterexample()
                 .as_deref(),
-            Some("Per-run budget: requested $3.00, limit $2.00")
+            Some("Per-run budget 3.00 USD is more than the 2.00 USD this Envelope allows")
         );
         Ok(())
     }
@@ -1759,7 +1844,7 @@ mod tests {
                 .map_err(|error| format!("evaluate request: {error:?}"))?
                 .counterexample()
                 .as_deref(),
-            Some("Per-run budget: requested no limit, limit $2.00")
+            Some("A per-run budget with no limit is more than the 2.00 USD this Envelope allows")
         );
         Ok(())
     }
@@ -1776,7 +1861,9 @@ mod tests {
                 .map_err(|error| format!("evaluate envelope request: {error:?}"))?
                 .counterexample()
                 .as_deref(),
-            Some("Runtime allowance: requested 180 minutes, limit 120 minutes")
+            Some(
+                "Runtime allowance 180 min is more than the 120 min per month this Envelope allows"
+            )
         );
         Ok(())
     }
@@ -1793,7 +1880,7 @@ mod tests {
                 .counterexample()
                 .as_deref(),
             Some(
-                "Runtime allowance: requested without a limit, but this Envelope allows at most 120 minutes"
+                "A runtime allowance with no limit is more than the 120 min per month this Envelope allows"
             )
         );
         Ok(())
@@ -1996,7 +2083,26 @@ mod tests {
         assert_eq!(
             decision.counterexample(),
             Some(
-                "Monthly budget: requested $220.00, limit $200.00; Maximum run duration: requested 25h, limit 24h"
+                "Monthly budget 220.00 USD is more than the 200.00 USD this Envelope allows; Maximum run duration 25 h is more than the 24 h this Envelope allows"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn rejection_message_formats_money_to_two_decimal_places() {
+        let decision = AdmissionDecision::Reject {
+            deltas: vec![AdmissionDelta::Budget {
+                requested: "25".to_owned(),
+                ceiling: "20.0".to_owned(),
+                currency: "USD".to_owned(),
+            }],
+        };
+
+        assert_eq!(
+            decision.counterexample(),
+            Some(
+                "Monthly budget 25.00 USD is more than the 20.00 USD this Envelope allows"
                     .to_owned()
             )
         );
@@ -2013,7 +2119,36 @@ mod tests {
 
         assert_eq!(
             decision.counterexample(),
-            Some("Runner platforms: requested windows, allowed linux".to_owned())
+            Some(
+                "Runner platform Windows is not one of the platforms this Envelope allows"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn rejection_message_names_only_the_tool_outside_the_envelope() {
+        let decision = AdmissionDecision::Reject {
+            deltas: vec![AdmissionDelta::Tools {
+                requested: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "get_file_contents".to_owned(),
+                    action: "read".to_owned(),
+                }],
+                ceiling: vec![ToolGrant {
+                    provider: "github".to_owned(),
+                    resource: "actions_list".to_owned(),
+                    action: "read".to_owned(),
+                }],
+            }],
+        };
+
+        assert_eq!(
+            decision.counterexample(),
+            Some(
+                "Tool github:get_file_contents:read is not one of the tools this Envelope allows"
+                    .to_owned()
+            )
         );
     }
 

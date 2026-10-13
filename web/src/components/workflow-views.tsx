@@ -24,7 +24,7 @@ export function AdminWorkflowsView() {
   const state = useApiResource<WorkflowListResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader actions={<PrimaryLink href="/admin/workflows/new">Create workflow</PrimaryLink>} description="Publish immutable, versioned agent definitions." title="Workflows" />
+      <PageHeader actions={<PrimaryLink href="/admin/workflows/new">Create workflow</PrimaryLink>} description="Publish versioned agent definitions without changing earlier versions." title="Workflows" />
       <ResourceBoundary state={state}>{({ workflows }) => workflows.length === 0 ? (
         <EmptyState title="No workflows yet"><p>Publish the first workflow definition to make it available for runs.</p></EmptyState>
       ) : (
@@ -50,7 +50,7 @@ export function AdminWorkflowDetailView({ name, version }: Readonly<{ name: stri
   const state = useApiResource<WorkflowRevisionResponse>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Inspect an immutable published Workflow revision." title="Workflow" />
+      <PageHeader description="Inspect an exact published Workflow revision." title="Workflow" />
       <ResourceBoundary state={state}>{({ workflow }) => <WorkflowDetail workflow={workflow} />}</ResourceBoundary>
     </section>
   );
@@ -102,7 +102,7 @@ function WorkflowForm({ agents, from }: Readonly<{ agents: WorkflowListResponse[
   }
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description={from ? "Publish the next immutable revision. The existing version will not change." : "Publish an immutable agent definition."} title={from ? `New ${from.name} version` : "New workflow"} />
+      <PageHeader description={from ? "Publish the next revision. The existing version will not change." : "Publish a versioned agent definition."} title={from ? `New ${from.name} version` : "New workflow"} />
       <form className="space-y-5 rounded-panel border bg-panel p-6 shadow-sm" onSubmit={submit}>
         <label className="grid gap-2 text-sm font-semibold">Name<input className="min-h-11 rounded-md border px-3 font-normal" defaultValue={from?.name ?? ""} disabled={Boolean(from)} name="name" pattern="[a-z](?:[a-z0-9]|-)*[a-z0-9]" required /></label>
         <label className="grid gap-2 text-sm font-semibold">Display name<input className="min-h-11 rounded-md border px-3 font-normal" defaultValue={from?.displayName ?? ""} name="displayName" required /></label>

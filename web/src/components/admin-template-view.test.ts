@@ -28,10 +28,12 @@ describe("first envelope template", () => {
         llms: [],
         tools: [],
         ttl: "",
-        runner: { platforms: ["linux"] },
+        runner: { platforms: [] },
         runtimeMinutesLimit: "",
       },
     });
+    expect(source).not.toContain("capabilities.models.slice(0, 1)");
+    expect(source).toContain("allowInlineBrowserTasks={false}");
   });
 
   test("preserves the template currency and explains TTL duration units", () => {
@@ -46,10 +48,31 @@ describe("first envelope template", () => {
     expect(source).toContain('mode="minutes"');
   });
 
-  test("follows the typed template ID until member roles are explicitly edited", () => {
-    expect(templateMemberRoles("engineer", [], false)).toEqual(["engineer"]);
-    expect(templateMemberRoles(" analyst ", [], false)).toEqual(["analyst"]);
-    expect(templateMemberRoles("operator", ["analyst", "reviewer"], true)).toEqual(["analyst", "reviewer"]);
+  test("does not turn the template ID into an eligible member role", () => {
+    expect(templateMemberRoles([])).toEqual([]);
+    expect(templateMemberRoles(["analyst", "reviewer"])).toEqual(["analyst", "reviewer"]);
+  });
+
+  test("requires an explicit runner platform before submission", () => {
+    const envelope = authoredEnvelope();
+    envelope.spec.runner.platforms = [];
+
+    expect(validateTemplateFields({
+      allowedModels: new Set([JSON.stringify(["provider-a", "model-a"])]),
+      allowedTools: new Set(),
+      displayName: "Engineering",
+      envelope,
+      memberRoles: ["engineer"],
+      models: envelope.spec.llms,
+      monthlyLimit: "10.00",
+      requireRunnerPlatform: true,
+      singleRunLimit: "1.00",
+      templateId: "engineer",
+      tools: [],
+      workspace: undefined,
+    })).toEqual({
+      platforms: "Choose at least one runner platform.",
+    });
   });
 
   test("reports each invalid authored field without reducing it to one rejection", () => {
