@@ -1390,6 +1390,7 @@ if grep -q 'name: STEWARD_OPENSHELL_RUNTIME_CLASS_NAME' "${rendered}"; then
 fi
 grep -Fq '            - { name: STEWARD_TASK_MCP_GW_ENDPOINT, value: "https://mcp-gw.example.test/mcp" }' "${rendered}"
 grep -Eq 'name: STEWARD_OPENSHELL_TASK_LOG_MODE, value: "?off"?' "${rendered}"
+grep -Eq 'name: STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS, value: "?15"?' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE' "${rendered}"
@@ -1425,6 +1426,17 @@ then
   echo "an invalid OpenShell task log mode must fail chart validation" >&2
   exit 1
 fi
+helm lint "${root}/charts/steward" "${image_values[@]}" \
+  --set config.controller.inferenceObservationIntervalSeconds=30 >/dev/null
+for invalid_inference_observation_interval in 11 61
+do
+  if helm lint "${root}/charts/steward" "${image_values[@]}" \
+    --set "config.controller.inferenceObservationIntervalSeconds=${invalid_inference_observation_interval}" >/dev/null 2>&1
+  then
+    echo "an inference observation interval outside 12 through 60 seconds must fail chart validation" >&2
+    exit 1
+  fi
+done
 for invalid_task_mcp_endpoint in \
   'ftp://mcp-gw.example.test/mcp' \
   'https://alice@mcp-gw.example.test/mcp' \

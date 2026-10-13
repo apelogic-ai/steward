@@ -72,6 +72,19 @@ pub fn runtime_activated_condition(observed_generation: i64) -> Condition {
     }
 }
 
+pub const RUNTIME_TERMINATION_STARTED_CONDITION: &str = "TerminationStarted";
+
+pub fn runtime_termination_started_condition(observed_generation: i64) -> Condition {
+    Condition {
+        type_: RUNTIME_TERMINATION_STARTED_CONDITION.to_owned(),
+        status: "True".to_owned(),
+        observed_generation: Some(observed_generation),
+        last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
+        reason: "SandboxDeletionRequested".to_owned(),
+        message: "bounded inference cleanup deadline started".to_owned(),
+    }
+}
+
 /// Stable identity for one runtime instance.
 #[derive(Clone, Debug, Eq, Hash, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]

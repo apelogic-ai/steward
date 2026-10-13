@@ -693,6 +693,10 @@ Steward release namespace also creates `steward-workflows`.
   **Warning:** `full` logging copies task-controlled output without redaction
   and may expose prompts, responses, credentials, or other sensitive information
   to anyone authorized to read or retain controller-log or Run-log output.
+- `config.controller.inferenceObservationIntervalSeconds` defaults to `15` and
+  accepts `12` through `60`. It controls how often a running inference-backed
+  runtime refreshes observed spend; Steward refuses values shorter than the
+  final-settlement window or longer than the controller's requeue ceiling.
 - In governed mode, `config.mint.issuer`, `spiffeTrustDomain`, and
   `openshellNamespace` must be supplied for the target environment; none has
   a usable default. The issuer must also be configured in MCP-GW.

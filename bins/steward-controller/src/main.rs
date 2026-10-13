@@ -144,6 +144,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             DeploymentInferencePlane::Managed(steward_controller::ManagedInferencePlane)
         }
     };
+    let controller_config = runtime_controller_config()?;
     let listener = tls_listener(
         &env::var("STEWARD_WEBHOOK_BIND").unwrap_or_else(|_| "0.0.0.0:8443".to_owned()),
         &required("STEWARD_TLS_CERT_DER")?,
@@ -163,12 +164,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let decisions = jira_adapter()?;
         let approval_dispatcher =
             steward_controller::run_task_approval_dispatcher(store.clone(), decisions);
-        let controller = steward_controller::run_controller_with_planes(
+        let controller = steward_controller::run_controller_with_planes_config(
             client,
             sandbox_runtime,
             inference,
             store,
             task_orchestration_mode,
+            controller_config,
         );
         tokio::select! {
             result = webhook => result?,
@@ -176,12 +178,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             () = controller => return Err(io::Error::other("controller exited").into()),
         }
     } else {
-        let controller = steward_controller::run_controller_with_planes(
+        let controller = steward_controller::run_controller_with_planes_config(
             client,
             sandbox_runtime,
             inference,
             store,
             task_orchestration_mode,
+            controller_config,
         );
         tokio::select! {
             result = webhook => result?,
@@ -205,6 +208,31 @@ fn execution_enabled() -> Result<bool, io::Error> {
 fn inference_mode() -> Result<InferenceMode, io::Error> {
     let value = env::var("STEWARD_INFERENCE_MODE").unwrap_or_else(|_| "stock".to_owned());
     parse_inference_mode(&value)
+}
+
+fn runtime_controller_config() -> Result<steward_controller::RuntimeControllerConfig, io::Error> {
+    match env::var("STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS") {
+        Ok(value) => parse_runtime_controller_config(Some(&value)),
+        Err(env::VarError::NotPresent) => parse_runtime_controller_config(None),
+        Err(env::VarError::NotUnicode(_)) => Err(io::Error::other(
+            "STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS must be Unicode",
+        )),
+    }
+}
+
+fn parse_runtime_controller_config(
+    interval_seconds: Option<&str>,
+) -> Result<steward_controller::RuntimeControllerConfig, io::Error> {
+    let interval_seconds = interval_seconds
+        .unwrap_or("15")
+        .parse::<u64>()
+        .map_err(|_| {
+            io::Error::other(
+                "STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS must be a whole number",
+            )
+        })?;
+    steward_controller::RuntimeControllerConfig::new(Duration::from_secs(interval_seconds))
+        .map_err(io::Error::other)
 }
 
 fn parse_inference_mode(value: &str) -> Result<InferenceMode, io::Error> {
@@ -782,8 +810,8 @@ mod tests {
         GITHUB_ATTESTATION_TRUST_MODE, OPERATOR_PINNED_TRUST_MODE, TlsListener,
         bridge_gateway_origin_for_image, bridge_gateway_version_for_image,
         connections_bridge_startup_log, decode_tls_material, install_rustls_crypto_provider,
-        openshell_task_log_mode, parse_inference_mode, verify_bridge_image_provenance,
-        verify_connections_bridge_image_configuration,
+        openshell_task_log_mode, parse_inference_mode, parse_runtime_controller_config,
+        verify_bridge_image_provenance, verify_connections_bridge_image_configuration,
     };
     use steward_adapter_openshell::OpenShellTaskLogMode;
 
@@ -816,6 +844,25 @@ mod tests {
             Some(steward_types::InferenceMode::Managed),
             "the controller must activate the managed inference plane without provisioning stock keys"
         );
+    }
+
+    #[test]
+    fn inference_observation_interval_respects_the_settlement_window() -> Result<(), String> {
+        assert_eq!(
+            parse_runtime_controller_config(None)
+                .map_err(|error| error.to_string())?
+                .inference_observation_interval(),
+            Duration::from_secs(15)
+        );
+        assert!(parse_runtime_controller_config(Some("11")).is_err());
+        assert!(parse_runtime_controller_config(Some("61")).is_err());
+        assert_eq!(
+            parse_runtime_controller_config(Some("30"))
+                .map_err(|error| error.to_string())?
+                .inference_observation_interval(),
+            Duration::from_secs(30)
+        );
+        Ok(())
     }
 
     #[test]

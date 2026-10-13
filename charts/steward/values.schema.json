@@ -901,6 +901,7 @@
             "openshellEndpoint",
             "openshellServerName",
             "openshellTaskLogMode",
+            "inferenceObservationIntervalSeconds",
             "workloadExchangeEndpoint",
             "workloadExchangeServerName",
             "litellmUrl"
@@ -914,6 +915,11 @@
               "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$"
             },
             "openshellTaskLogMode": {"type": "string", "enum": ["off", "full"]},
+            "inferenceObservationIntervalSeconds": {
+              "type": "integer",
+              "minimum": 12,
+              "maximum": 60
+            },
             "workloadExchangeEndpoint": {
               "type": "string",
               "pattern": "^$|^https://[^/?#]+(?::[0-9]+)?/v1/workload/exchange$"

@@ -1358,6 +1358,8 @@ struct ActiveInference {
     provisions: Arc<AtomicUsize>,
     revocations: Arc<AtomicUsize>,
     observed_spend: Arc<Mutex<Option<String>>>,
+    report_exhausted: Arc<AtomicBool>,
+    requested_budgets: Arc<Mutex<Vec<Budget>>>,
 }
 
 impl InferencePlane for ActiveInference {
@@ -1381,13 +1383,25 @@ impl InferencePlane for ActiveInference {
         request: &InferenceRequest,
     ) -> Result<ProvisionedInference, PortError> {
         self.provisions.fetch_add(1, Ordering::SeqCst);
+        self.requested_budgets
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "fixture inference budget lock was poisoned".to_owned(),
+            })?
+            .push(request.budget.clone());
         Ok(ProvisionedInference {
             reference: format!("inference-{}", request.runtime.0),
             credential: InferenceCredential::new("fixture-inference-credential".to_owned()),
         })
     }
 
-    async fn reconcile_configuration(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+    async fn reconcile_configuration(&self, request: &InferenceRequest) -> Result<(), PortError> {
+        self.requested_budgets
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "fixture inference budget lock was poisoned".to_owned(),
+            })?
+            .push(request.budget.clone());
         Ok(())
     }
 
@@ -1403,12 +1417,19 @@ impl InferencePlane for ActiveInference {
             })?
             .clone()
             .unwrap_or_else(|| "0".to_owned());
+        let observation = steward_types::SpendSummary {
+            observed_amount,
+            currency: request.budget.currency.clone(),
+        };
+        if self.report_exhausted.load(Ordering::SeqCst) {
+            return Ok(InferenceObservation::Exhausted {
+                reference: format!("inference-{}", request.runtime.0),
+                spend: observation,
+            });
+        }
         Ok(InferenceObservation::Active {
             reference: format!("inference-{}", request.runtime.0),
-            spend: steward_types::SpendSummary {
-                observed_amount,
-                currency: request.budget.currency.clone(),
-            },
+            spend: observation,
         })
     }
 
@@ -2484,6 +2505,42 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             active_manifest_digest: &previous_active_digest,
         })
         .await?;
+    let previous_runtime_uid = format!("previous-runtime-{suffix}");
+    store
+        .put_task_inputs(
+            previous_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"earlier execution input",
+        )
+        .await?;
+    store
+        .request_task_execution(previous_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    let previous_operation = store
+        .task_runtime_operation(previous_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .authorize_task_runtime_creation(
+            previous_task_uid,
+            previous_operation.generation,
+            "test-controller",
+        )
+        .await?;
+    let previous_operation = store
+        .task_runtime_operation(previous_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .record_task_runtime_observed(
+            previous_task_uid,
+            previous_operation.generation,
+            &previous_runtime_uid,
+            "1",
+            "test-controller",
+        )
+        .await?;
     sqlx::query(
         "INSERT INTO task_lifecycle_events \
          (task_uid, event_kind, phase, provenance, at) VALUES \
@@ -2516,6 +2573,160 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .await?
         .ok_or(StoreError::TaskNotFound)?;
     let runtime_uid = format!("runtime-{suffix}");
+    store
+        .record_spend_observation(
+            &previous_runtime_uid,
+            1,
+            "previous-runtime-spec",
+            &SpendSummary {
+                observed_amount: "40.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            false,
+        )
+        .await?;
+    store
+        .record_spend_observation(
+            &previous_runtime_uid,
+            1,
+            "previous-runtime-spec",
+            &SpendSummary {
+                observed_amount: "40.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            false,
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM spend_observations WHERE runtime_uid = $1",
+        )
+        .bind(&previous_runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        1,
+        "unchanged spend must not append one row per observation interval"
+    );
+    let cleanup_runtime_uid = format!("cleanup-runtime-{suffix}");
+    store
+        .record_spend_observation(
+            &cleanup_runtime_uid,
+            1,
+            "cleanup-runtime-spec",
+            &SpendSummary {
+                observed_amount: "0.40".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            true,
+        )
+        .await?;
+    store
+        .record_spend_observation(
+            &cleanup_runtime_uid,
+            1,
+            "cleanup-runtime-spec",
+            &SpendSummary {
+                observed_amount: "0.55".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            false,
+        )
+        .await?;
+    store
+        .record_spend_observation(
+            &cleanup_runtime_uid,
+            1,
+            "cleanup-runtime-spec",
+            &SpendSummary {
+                observed_amount: "0.40".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            true,
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM inference_exhaustions WHERE runtime_uid = $1",
+        )
+        .bind(&cleanup_runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        1,
+        "zero-remainder retries must keep one exhaustion record"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT observed_amount::text FROM spend_observations \
+             WHERE runtime_uid = $1 ORDER BY at DESC, id DESC LIMIT 1",
+        )
+        .bind(&cleanup_runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        "0.55",
+        "the final cleanup read must remain the latest spend observation after another zero-remainder pass"
+    );
+    store
+        .record_spend_observation(
+            &cleanup_runtime_uid,
+            2,
+            "cleanup-runtime-spec-after-top-up",
+            &SpendSummary {
+                observed_amount: "0.80".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            true,
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM inference_exhaustions WHERE runtime_uid = $1",
+        )
+        .bind(&cleanup_runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        1,
+        "an undecided exhaustion must remain one suspension episode across spec changes"
+    );
+    assert_eq!(
+        store
+            .remaining_envelope_instance_spend_budget(
+                &envelope_instance_id,
+                &runtime_uid,
+                "100.00",
+            )
+            .await?,
+        "60.00",
+        "a runtime key must receive only the monthly authority left after earlier runs"
+    );
+    assert_eq!(
+        store
+            .remaining_envelope_instance_spend_budget(&envelope_instance_id, &runtime_uid, "45.00",)
+            .await?,
+        "5.00",
+        "remaining monthly authority below the 10.00 per-run cap must win"
+    );
+    assert_eq!(
+        store
+            .remaining_envelope_instance_spend_budget(&envelope_instance_id, &runtime_uid, "50.00",)
+            .await?,
+        "10.00",
+        "remaining monthly authority equal to the per-run cap must be preserved exactly"
+    );
+    let parallel_runtime_uid = format!("parallel-runtime-{suffix}");
+    let (first_remaining, second_remaining) = tokio::join!(
+        store.remaining_envelope_instance_spend_budget(
+            &envelope_instance_id,
+            &runtime_uid,
+            "100.00",
+        ),
+        store.remaining_envelope_instance_spend_budget(
+            &envelope_instance_id,
+            &parallel_runtime_uid,
+            "100.00",
+        ),
+    );
+    assert_eq!(first_remaining?, "60.00");
+    assert_eq!(second_remaining?, "60.00");
     store
         .record_task_runtime_observed(
             task_uid,
@@ -2751,8 +2962,19 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             .await?,
         Some("25.00".to_owned())
     );
+    assert_eq!(
+        store
+            .remaining_envelope_instance_spend_budget(
+                &envelope_instance_id,
+                &runtime_uid,
+                "100.00",
+            )
+            .await?,
+        "85.00",
+        "an active top-up must expand the remaining authority without counting this runtime twice"
+    );
     let usage = store.envelope_usage(&envelope_instance_id).await?;
-    assert_eq!(usage.observed_amount, Some("110.00".to_owned()));
+    assert_eq!(usage.observed_amount, Some("150.00".to_owned()));
     assert_eq!(usage.active_top_up_amount, Some("25.00".to_owned()));
     let retry = store
         .record_escalation_top_up(
@@ -2786,6 +3008,38 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
     assert_eq!(decided.grant_id, Some(grant.id));
     assert_eq!(decided.limit, "125.00");
     assert_eq!(decided.grant_active, Some(true));
+
+    store
+        .record_spend_observation(
+            &runtime_uid,
+            1,
+            "immutable-runtime-spec",
+            &SpendSummary {
+                observed_amount: "130.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            true,
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM inference_exhaustions WHERE runtime_uid = $1",
+        )
+        .bind(&runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        2,
+        "a resumed runtime must record a second exhaustion after its first escalation is granted"
+    );
+    let resumed_exhaustion = store
+        .admin_escalations()
+        .await?
+        .into_iter()
+        .find(|record| record.runtime_uid == runtime_uid && record.dimension == "llm_spend")
+        .ok_or_else(|| io::Error::other("resumed exhaustion was not projected"))?;
+    assert_ne!(resumed_exhaustion.escalation_id, escalation.escalation_id);
+    assert_eq!(resumed_exhaustion.grant_id, None);
+    assert_eq!(resumed_exhaustion.denial_rationale, None);
 
     let historical_archive = task_output_archive(&[
         ("out/report.md", b"historical output"),
@@ -5463,6 +5717,307 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     );
 
     assert_eq!(reservation.record.task_uid, task_uid);
+    Ok(())
+}
+
+#[tokio::test]
+async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&database_url)
+        .await?;
+    let store = PgStore::new(pool.clone());
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let service = format!("spend-cap-{suffix}");
+    let template_id = format!("spend-cap-{suffix}");
+    let identity = store
+        .register_canonical_identity(
+            &OrganizationIdentityPolicy::new(
+                "https://accounts.google.com",
+                "example.com",
+                OrganizationId::parse("org_example")?,
+            )?
+            .validate(
+                "https://accounts.google.com",
+                &format!("spend-cap-subject-{suffix}"),
+                "example.com",
+                &format!("alice-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let envelope = Envelope {
+        revision: 1,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "example".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "100.00".to_owned(),
+                single_run_limit: Some("0.50".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            runtime_minutes_limit: None,
+            workspace: None,
+            ttl: Duration("1h".to_owned()),
+            runner: RunnerRequirements::default(),
+        },
+    };
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &template_id,
+            display_name: "Spend cap",
+            member_roles: std::slice::from_ref(&template_id),
+            ceiling: &envelope,
+            auto_provision_threshold: None,
+            allow_inline_browser_tasks: true,
+            authored_by: "admin@example.com",
+        })
+        .await?;
+    let envelope_request = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id: &identity.user_id,
+            template_id: Some(&template_id),
+            template_revision: Some(envelope.revision),
+            requested_envelope: &envelope,
+            idempotency_key: &format!("spend-cap-envelope-{suffix}"),
+            justification: None,
+            ceiling_exceedances: &[],
+            actor: "admin@example.com",
+        })
+        .await?
+        .record;
+    let envelope_instance_id = format!("env_{}", envelope_request.id.simple());
+    let envelope_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&envelope)?)
+    );
+    store
+        .append_envelope_request_status(
+            envelope_request.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: Some(Uuid::new_v4()),
+                envelope_instance_id: Some(&envelope_instance_id),
+                envelope_digest: Some(&envelope_digest),
+                reason: None,
+                rationale: None,
+                evidence_url: None,
+                expires_at: None,
+                approved_envelope: Some(&envelope),
+                actor: "steward-test",
+            },
+        )
+        .await?;
+    let workflow_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(format!("spend-cap-workflow-{suffix}"))
+    );
+    store
+        .publish_initial_workflow(WorkflowPublication {
+            name: &template_id,
+            display_name: "Spend cap",
+            agent: "example-agent@1",
+            prompt: "Exercise per-run spend enforcement.",
+            content_digest: &workflow_digest,
+            published_by: "admin@example.com",
+        })
+        .await?;
+    let spec = AgentRuntimeSpec {
+        principal: Principal::Service {
+            name: service.clone(),
+            acting_user: Some(Email("alice@example.com".to_owned())),
+        },
+        owner: Email("alice@example.com".to_owned()),
+        canonical_authority: Some(CanonicalAuthorityBinding::new(
+            identity.user_id.clone(),
+            Some(identity.user_id.clone()),
+        )?),
+        agent_type: AgentType {
+            name: "example-agent@1".to_owned(),
+        },
+        llms: envelope.spec.llms.clone(),
+        tools: envelope.spec.tools.clone(),
+        budget: envelope.spec.budget.clone(),
+        ttl: envelope.spec.ttl.clone(),
+        runner: envelope.spec.runner.clone(),
+        bindings: None,
+    };
+    let execution_binding = disposable_execution_binding()?;
+    let task_uid = Uuid::new_v4();
+    let operation_id = Uuid::new_v4();
+    let runtime_name = format!("task-{}", operation_id.simple());
+    let candidate_digest = digest(serde_json::to_value(&spec))?;
+    let inert_digest = manifest_digest_with_binding(
+        task_uid,
+        operation_id,
+        &runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let active_digest = manifest_digest_with_binding(
+        task_uid,
+        operation_id,
+        &runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    let command = ["example-agent".to_owned(), "run".to_owned()];
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid,
+            operation_id,
+            idempotency_key: &format!("spend-cap-task-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: &template_id,
+            workflow_name: Some(&template_id),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &command,
+            execution_binding: Some(&execution_binding),
+            source_provenance: None,
+            direct_task_evidence: None,
+            task_origin: TaskOrigin::Unknown,
+            browser_task_evidence: None,
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &candidate_digest,
+            admission_decision: &AdmissionDecision::Admit,
+            inert_manifest_digest: &inert_digest,
+            active_manifest_digest: &active_digest,
+        })
+        .await?;
+    store
+        .put_task_inputs(
+            task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"spend-limited task input",
+        )
+        .await?;
+    store
+        .request_task_execution(task_uid, &service, identity.user_id.as_str())
+        .await?;
+
+    let kubernetes = AmbiguousKubernetes::default();
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-spend-limited".to_owned());
+    let (admission_client, _admission_server) = router_client(
+        webhook_router_for_controller(store.clone(), CONTROLLER_USERNAME.to_owned()),
+        "steward-test",
+    )
+    .await?;
+    *kubernetes
+        .admission
+        .lock()
+        .map_err(|_| io::Error::other("admission fixture was poisoned"))? =
+        Some(WebhookAdmissionHarness {
+            client: admission_client,
+            verify_boundaries: Arc::new(AtomicBool::new(false)),
+            create_checks: Arc::new(AtomicUsize::new(0)),
+            update_checks: Arc::new(AtomicUsize::new(0)),
+            delete_checks: Arc::new(AtomicUsize::new(0)),
+        });
+    let (client, _server) = kubernetes_client(kubernetes.clone()).await?;
+    let task_runtime = AmbiguousTaskRuntime::default();
+    for _ in 0..5 {
+        reconcile_current(&client, &task_runtime, &store, task_uid).await?;
+    }
+    let runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("spend-limited runtime fixture is absent"))?;
+    let inference = ActiveInference::default();
+    *inference
+        .observed_spend
+        .lock()
+        .map_err(|_| io::Error::other("inference spend fixture was poisoned"))? =
+        Some("0.75".to_owned());
+    inference.report_exhausted.store(true, Ordering::SeqCst);
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        inference.clone(),
+        store.clone(),
+        runtime,
+    )
+    .await?;
+    let runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("activated spend-limited runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime,
+        inference.clone(),
+        store.clone(),
+        runtime,
+    )
+    .await?;
+    {
+        let requested_budgets = inference
+            .requested_budgets
+            .lock()
+            .map_err(|_| io::Error::other("inference budget fixture was poisoned"))?;
+        let requested = requested_budgets
+            .first()
+            .ok_or_else(|| io::Error::other("controller did not send a budget to inference"))?;
+        assert_eq!(requested.monthly_limit, "100.00");
+        assert_eq!(requested.single_run_limit.as_deref(), Some("0.50"));
+    }
+
+    let failed = store
+        .task(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(failed.phase, TaskPhase::Failed);
+    assert_eq!(
+        failed.failure_reason.as_deref(),
+        Some("This run reached its spending limit of 0.50 USD.")
+    );
+    assert_eq!(
+        operation(&store, task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM inference_exhaustions WHERE runtime_uid = $1",
+        )
+        .bind("runtime-uid-spend-limited")
+        .fetch_one(&pool)
+        .await?,
+        0,
+        "per-run Task failure must not create a monthly escalation"
+    );
     Ok(())
 }
 

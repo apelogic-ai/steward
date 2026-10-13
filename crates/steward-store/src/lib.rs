@@ -3250,7 +3250,62 @@ impl PgStore {
         exhausted: bool,
     ) -> Result<(), StoreError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        if exhausted {
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(runtime_uid)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        if exhausted
+            && sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS ( \
+                    SELECT 1 FROM ( \
+                        SELECT exhaustion.id \
+                        FROM inference_exhaustions exhaustion \
+                        WHERE exhaustion.runtime_uid = $1 \
+                        ORDER BY exhaustion.at DESC, exhaustion.id DESC LIMIT 1 \
+                    ) latest \
+                    LEFT JOIN envelope_instance_grants grants \
+                      ON grants.escalation_id = latest.id \
+                    LEFT JOIN cumulative_escalation_denials denials \
+                      ON denials.escalation_id = latest.id \
+                    WHERE grants.id IS NULL AND denials.escalation_id IS NULL \
+                )",
+            )
+            .bind(runtime_uid)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?
+        {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(());
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO spend_observations \
+             (runtime_uid, observed_amount, currency, exhausted) \
+             SELECT $1, $2::numeric, $3, $4 \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM ( \
+                     SELECT observed_amount, currency, exhausted \
+                     FROM spend_observations \
+                     WHERE runtime_uid = $1 \
+                     ORDER BY at DESC, id DESC \
+                     LIMIT 1 \
+                 ) latest \
+                 WHERE latest.observed_amount = $2::numeric \
+                   AND latest.currency = $3 \
+                   AND latest.exhausted = $4 \
+             )",
+        )
+        .bind(runtime_uid)
+        .bind(&spend.observed_amount)
+        .bind(&spend.currency)
+        .bind(exhausted)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .rows_affected()
+            == 1;
+        if inserted && exhausted {
             sqlx::query(
                 "INSERT INTO inference_exhaustions \
                  (public_id, runtime_uid, observed_generation, spec_digest, observed_amount, currency) \
@@ -3266,18 +3321,6 @@ impl PgStore {
             .await
             .map_err(database_error)?;
         }
-        sqlx::query(
-            "INSERT INTO spend_observations \
-             (runtime_uid, observed_amount, currency, exhausted) \
-             VALUES ($1, $2::numeric, $3, $4)",
-        )
-        .bind(runtime_uid)
-        .bind(&spend.observed_amount)
-        .bind(&spend.currency)
-        .bind(exhausted)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
         transaction.commit().await.map_err(database_error)
     }
 
@@ -3290,6 +3333,36 @@ impl PgStore {
              FROM inference_exhaustions \
              WHERE runtime_uid = $1 \
              ORDER BY at DESC, id DESC \
+             LIMIT 1",
+        )
+        .bind(runtime_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .map(|row| {
+            Ok(steward_types::SpendSummary {
+                observed_amount: row.try_get("observed_amount").map_err(database_error)?,
+                currency: row.try_get("currency").map_err(database_error)?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn pending_inference_exhaustion(
+        &self,
+        runtime_uid: &str,
+    ) -> Result<Option<steward_types::SpendSummary>, StoreError> {
+        sqlx::query(
+            "SELECT latest.observed_amount::text AS observed_amount, latest.currency \
+             FROM ( \
+                 SELECT exhaustion.* FROM inference_exhaustions exhaustion \
+                 WHERE exhaustion.runtime_uid = $1 \
+                 ORDER BY exhaustion.at DESC, exhaustion.id DESC LIMIT 1 \
+             ) latest \
+             LEFT JOIN envelope_instance_grants grants ON grants.escalation_id = latest.id \
+             LEFT JOIN cumulative_escalation_denials denials ON denials.escalation_id = latest.id \
+             WHERE true \
+               AND grants.id IS NULL AND denials.escalation_id IS NULL \
              LIMIT 1",
         )
         .bind(runtime_uid)
@@ -3734,6 +3807,65 @@ impl PgStore {
         .await
         .map_err(database_error)?;
         Ok((amount != "0").then_some(amount))
+    }
+
+    /// Return the current spend authority available to one runtime after current-period spend by
+    /// the other runtimes bound to the same provisioned Envelope instance. The current runtime is
+    /// excluded because its virtual key already accounts for its own cumulative spend.
+    pub async fn remaining_envelope_instance_spend_budget(
+        &self,
+        envelope_instance_id: &str,
+        runtime_uid: &str,
+        base_limit: &str,
+    ) -> Result<String, StoreError> {
+        if envelope_instance_id.trim().is_empty() || runtime_uid.trim().is_empty() {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let base_limit = add_budget_amount(base_limit, "0")
+            .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        sqlx::query_scalar::<_, String>(
+            "WITH period AS ( \
+                 SELECT date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS starts_at, \
+                        (date_trunc('month', now() AT TIME ZONE 'UTC') + interval '1 month') \
+                            AT TIME ZONE 'UTC' AS ends_at \
+             ), runtimes AS ( \
+                 SELECT DISTINCT COALESCE(orchestration.runtime_uid, tasks.runtime_uid) AS runtime_uid \
+                 FROM task_submissions tasks \
+                 LEFT JOIN task_runtime_operations orchestration \
+                   ON orchestration.task_uid = tasks.task_uid, period \
+                 WHERE tasks.user_envelope_instance_id = $1 \
+                   AND tasks.created_at >= period.starts_at \
+                   AND tasks.created_at < period.ends_at \
+                   AND COALESCE(orchestration.runtime_uid, tasks.runtime_uid) IS NOT NULL \
+             ), latest AS ( \
+                 SELECT DISTINCT ON (observations.runtime_uid) \
+                        observations.runtime_uid, observations.observed_amount \
+                 FROM spend_observations observations \
+                 JOIN runtimes ON runtimes.runtime_uid = observations.runtime_uid \
+                 CROSS JOIN period \
+                 WHERE observations.at >= period.starts_at \
+                   AND observations.at < period.ends_at \
+                 ORDER BY observations.runtime_uid, observations.at DESC, observations.id DESC \
+             ) \
+             SELECT GREATEST( \
+                 $3::numeric + COALESCE(( \
+                     SELECT sum(grants.amount) FROM envelope_instance_grants grants \
+                     WHERE grants.envelope_instance_id = $1 \
+                       AND grants.dimension = 'llm_spend' \
+                       AND grants.valid_until > clock_timestamp() \
+                 ), 0) - COALESCE(( \
+                     SELECT sum(latest.observed_amount) FROM latest \
+                     WHERE latest.runtime_uid <> $2 \
+                 ), 0), \
+                 0 \
+             )::text",
+        )
+        .bind(envelope_instance_id)
+        .bind(runtime_uid)
+        .bind(base_limit)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)
     }
 
     /// Observe and enforce cumulative execution time for one provisioned Envelope instance.
