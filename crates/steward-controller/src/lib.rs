@@ -4702,6 +4702,7 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
 
 const INFERENCE_REVOCATION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const FINAL_SPEND_SETTLEMENT_DELAY: StdDuration = StdDuration::from_secs(1);
+const FINAL_SPEND_OBSERVATION_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
 async fn finalize_inference_if_required<I: InferencePlane>(
     runtime: &AgentRuntime,
@@ -4709,8 +4710,24 @@ async fn finalize_inference_if_required<I: InferencePlane>(
     request: &InferenceRequest,
     authority: Option<&PgStore>,
 ) -> Result<Option<steward_types::SpendSummary>, ReconcileError> {
-    let final_spend =
-        observe_and_record_final_spend(runtime, inference, request, authority).await?;
+    let final_spend = match tokio::time::timeout(
+        FINAL_SPEND_OBSERVATION_TIMEOUT,
+        observe_and_record_final_spend(runtime, inference, request, authority),
+    )
+    .await
+    {
+        Ok(Ok(spend)) => spend,
+        Ok(Err(_)) => {
+            eprintln!("final inference spend observation failed; continuing with key revocation");
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "final inference spend observation timed out; continuing with key revocation"
+            );
+            None
+        }
+    };
     revoke_inference_if_required(runtime, inference, request).await?;
     Ok(final_spend)
 }
@@ -4740,9 +4757,9 @@ async fn observe_and_record_final_spend<I: InferencePlane>(
         .observe(request)
         .await
         .map_err(ReconcileError::Runtime)?;
-    let (spend, exhausted) = match observation {
-        InferenceObservation::Active { spend, .. } => (spend, false),
-        InferenceObservation::Exhausted { spend, .. } => (spend, true),
+    let spend = match observation {
+        InferenceObservation::Active { spend, .. }
+        | InferenceObservation::Exhausted { spend, .. } => spend,
         InferenceObservation::Absent => return Ok(None),
     };
     authority
@@ -4755,7 +4772,9 @@ async fn observe_and_record_final_spend<I: InferencePlane>(
             runtime.metadata.generation.unwrap_or_default(),
             &runtime_spec_digest(runtime)?,
             &spend,
-            exhausted,
+            // Cleanup captures accounting only. Exhaustion is recorded while the runtime is
+            // active; repeating it here would replace its escalation with a new pending row.
+            false,
         )
         .await
         .map_err(|error| ReconcileError::Authority(error.to_string()))?;
@@ -5743,7 +5762,7 @@ async fn webhook_handler<R: WebhookEnvelopeReader, C: WebhookModelCatalog>(
 #[cfg(test)]
 mod tests {
     use std::convert::Infallible;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration as StdDuration;
 
@@ -7412,6 +7431,120 @@ mod tests {
         async fn revoke(&self, _request: &InferenceRequest) -> Result<(), PortError> {
             std::future::pending().await
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FinalSpendObservationBehavior {
+        Fail,
+        Pending,
+    }
+
+    struct FinalSpendObservationInference {
+        behavior: FinalSpendObservationBehavior,
+        revocations: Arc<AtomicUsize>,
+    }
+
+    impl InferencePlane for FinalSpendObservationInference {
+        fn capabilities(&self) -> InferenceCapabilities {
+            InferenceCapabilities::default()
+        }
+
+        async fn validate_configuration(
+            &self,
+            _models: &[ModelRef],
+            _budget: &Budget,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn provision(
+            &self,
+            _request: &InferenceRequest,
+        ) -> Result<ProvisionedInference, PortError> {
+            Err(PortError::Unsupported {
+                operation: "test inference provisioning",
+            })
+        }
+
+        async fn reconcile_configuration(
+            &self,
+            _request: &InferenceRequest,
+        ) -> Result<(), PortError> {
+            Ok(())
+        }
+
+        async fn observe(
+            &self,
+            _request: &InferenceRequest,
+        ) -> Result<InferenceObservation, PortError> {
+            match self.behavior {
+                FinalSpendObservationBehavior::Fail => Err(PortError::Failed {
+                    reason: "fixture final spend observation failure".to_owned(),
+                }),
+                FinalSpendObservationBehavior::Pending => std::future::pending().await,
+            }
+        }
+
+        async fn revoke(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+            self.revocations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_spend_observation_failure_does_not_block_key_revocation() -> Result<(), String> {
+        let runtime = fixture();
+        let request = super::inference_request(&runtime)
+            .map_err(|error| format!("fixture inference request must be valid: {error}"))?;
+        let authority =
+            steward_store::PgStore::connect_lazy("postgres://steward@127.0.0.1:9/steward")
+                .map_err(|error| format!("lazy store fixture must be valid: {error}"))?;
+        let revocations = Arc::new(AtomicUsize::new(0));
+        let inference = FinalSpendObservationInference {
+            behavior: FinalSpendObservationBehavior::Fail,
+            revocations: revocations.clone(),
+        };
+
+        super::finalize_inference_if_required(&runtime, &inference, &request, Some(&authority))
+            .await
+            .map_err(|error| format!("failed spend observation must be best effort: {error}"))?;
+
+        assert_eq!(
+            revocations.load(Ordering::SeqCst),
+            1,
+            "a failed final spend observation must not keep the run key valid"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_final_spend_observation_does_not_block_key_revocation() -> Result<(), String> {
+        let runtime = fixture();
+        let request = super::inference_request(&runtime)
+            .map_err(|error| format!("fixture inference request must be valid: {error}"))?;
+        let authority =
+            steward_store::PgStore::connect_lazy("postgres://steward@127.0.0.1:9/steward")
+                .map_err(|error| format!("lazy store fixture must be valid: {error}"))?;
+        let revocations = Arc::new(AtomicUsize::new(0));
+        let inference = FinalSpendObservationInference {
+            behavior: FinalSpendObservationBehavior::Pending,
+            revocations: revocations.clone(),
+        };
+
+        tokio::time::timeout(
+            StdDuration::from_secs(6),
+            super::finalize_inference_if_required(&runtime, &inference, &request, Some(&authority)),
+        )
+        .await
+        .map_err(|_| "stalled final spend observation must be bounded".to_owned())?
+        .map_err(|error| format!("stalled spend observation must be best effort: {error}"))?;
+
+        assert_eq!(
+            revocations.load(Ordering::SeqCst),
+            1,
+            "a stalled final spend observation must not keep the run key valid"
+        );
+        Ok(())
     }
 
     struct SignallingDeleteRuntime {
