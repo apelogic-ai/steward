@@ -3400,7 +3400,12 @@ where
                         })
                         .await
                         .map_err(|error| {
-                            source_port_error_with_reporter(config, "resolve_revision", error)
+                            workspace_named_ref_error_with_reporter(
+                                config,
+                                error,
+                                reference,
+                                &description,
+                            )
                         })?,
                     steward_types::direct_package::WorkspaceGitRef::Trigger
                         if is_self && context.trigger_commit.is_some() =>
@@ -6322,6 +6327,31 @@ fn source_port_error_with_reporter(
     source_port_error(error)
 }
 
+fn workspace_named_ref_error_with_reporter(
+    config: &TaskApiConfig,
+    error: steward_ports::PortError,
+    reference: &steward_types::direct_package::WorkspaceGitNamedRef,
+    repository: &GitRepositoryDescription,
+) -> ApiError {
+    let reference_not_found = matches!(
+        &error,
+        steward_ports::PortError::Rejected { reason } if reason == "Git reference was not found"
+    );
+    let mapped = source_port_error_with_reporter(config, "resolve_revision", error);
+    if reference_not_found {
+        let reference = reference
+            .as_str()
+            .strip_prefix("git:ref:")
+            .unwrap_or(reference.as_str());
+        ApiError::Admission(format!(
+            "The branch or tag {reference} was not found in {}/{}.",
+            repository.owner, repository.name
+        ))
+    } else {
+        mapped
+    }
+}
+
 fn source_port_error(error: steward_ports::PortError) -> ApiError {
     match error {
         steward_ports::PortError::LimitExceeded { .. } => {
@@ -6941,24 +6971,24 @@ mod workflow_request_tests {
         source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
         task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
         workspace_admission_policy, workspace_git_materialized_budget,
-        workspace_submodule_is_selected, workspace_submodule_repository_url,
-        workspace_tree_inventory,
+        workspace_named_ref_error_with_reporter, workspace_submodule_is_selected,
+        workspace_submodule_repository_url, workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
         AdmissionDecision, Envelope, EnvelopeSpec, evaluate_authority_request,
     };
     use steward_ports::{
-        GitFile, GitFileRequest, GitPack, GitPackRequest, GitRepositoryDescriptionFailure,
-        GitRepositoryIdentity, GitRepositoryReference, GitRevisionRequest, GitTree, GitTreeEntry,
-        GitTreePath, GitTreeRequest, PortError, TaskExecutionAdapter, TaskExecutionPlan,
-        TaskExecutionPlanRequest,
+        GitFile, GitFileRequest, GitPack, GitPackRequest, GitRepositoryDescription,
+        GitRepositoryDescriptionFailure, GitRepositoryIdentity, GitRepositoryReference,
+        GitRevisionRequest, GitTree, GitTreeEntry, GitTreePath, GitTreeRequest, PortError,
+        TaskExecutionAdapter, TaskExecutionPlan, TaskExecutionPlanRequest,
     };
     use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, WorkflowRevisionRecord};
     use steward_types::direct_package::{
         BrowserTaskEvidence, DirectTaskBindingEvidence, DirectTaskDefinition, ExactGitCommit,
         RepositoryUrl, StableProviderId, WorkspaceAuthority, WorkspaceEntry, WorkspaceEntryType,
-        WorkspaceEvidence, WorkspacePath,
+        WorkspaceEvidence, WorkspaceGitNamedRef, WorkspacePath,
     };
     use steward_types::{
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
@@ -7029,6 +7059,51 @@ mod workflow_request_tests {
                 "task source operation failed operation=resolve_revision category=rejected diagnostic=source_rejected".to_owned(),
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn named_workspace_revision_rejection_names_the_ref_and_repository() -> Result<(), String> {
+        let config = TaskApiConfig::default();
+        let reference = WorkspaceGitNamedRef::parse("missing-branch")?;
+        let description = GitRepositoryDescription {
+            owner: "example-org".to_owned(),
+            repository_owner_id: StableProviderId::parse("1000")?,
+            name: "repository".to_owned(),
+            repository_id: StableProviderId::parse("1001")?,
+            default_branch: "main".to_owned(),
+            private: true,
+            web_url: "https://github.com/example-org/repository".to_owned(),
+        };
+
+        let missing = workspace_named_ref_error_with_reporter(
+            &config,
+            PortError::Rejected {
+                reason: "Git reference was not found".to_owned(),
+            },
+            &reference,
+            &description,
+        );
+
+        assert!(matches!(
+            missing,
+            ApiError::Admission(ref reason)
+                if reason == "The branch or tag missing-branch was not found in example-org/repository."
+        ));
+
+        let other_rejection = workspace_named_ref_error_with_reporter(
+            &config,
+            PortError::Rejected {
+                reason: "fixture provider detail".to_owned(),
+            },
+            &reference,
+            &description,
+        );
+        assert!(matches!(
+            other_rejection,
+            ApiError::Admission(ref reason)
+                if reason == "exact source object could not be resolved"
+        ));
         Ok(())
     }
 
