@@ -2771,6 +2771,24 @@ test("the per-run limit reports template-limit exceptions and cannot exceed the 
   }
 });
 
+test("a template without a runtime limit still accepts an optional runtime limit", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  try {
+    await developer.page.goto(`${origin}/envelopes/new?template=analyst`);
+    const runtimeLimit = developer.page.getByRole("spinbutton", { name: /^Runtime limit per month/ });
+    await expect(runtimeLimit).toBeVisible();
+    await expect(runtimeLimit).not.toHaveAttribute("required", "");
+    await runtimeLimit.fill("120");
+    await developer.page.getByRole("button", { name: "Submit request" }).click();
+
+    const mutation = developer.mutations.find((entry) => entry.path === "/app/api/v1/envelope-requests");
+    expectMutationProof(mutation);
+    expect(mutation.body.requestedEnvelope.spec.runtimeMinutesLimit).toBe("120");
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("a capability rejection identifies the field and clears after correction", async ({ browser }) => {
   const failureReason = "This deployment does not provide the requested models.";
   const developer = await guardedPage(browser, {
