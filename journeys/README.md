@@ -124,6 +124,7 @@ at execution time:
 export STEWARD_JOURNEY_BASE_URL=https://steward.example.com
 export STEWARD_JOURNEY_STORAGE_STATE=/path/to/steward-storage-state.json
 export STEWARD_JOURNEY_REPOSITORY=example-org/example-repository
+export STEWARD_JOURNEY_MEMBER_ROLE=engineer
 export STEWARD_JOURNEY_RUN_PREFIX=journey-001
 cargo xtask journeys --tags @smoke
 ```
@@ -139,8 +140,9 @@ The variable accepts only `true` or `false` and defaults to `false`.
 
 The storage-state file is a credential-bearing local artifact: never put it in this repository.
 The runner reports an explicit refresh instruction if the session has expired. The repository is
-used by J4 when that journey becomes executable. The run prefix must be unique for the target
-installation; every object created by the journeys includes it.
+used by J4 when that journey becomes executable. The member role must be one held by the signed-in
+test account and replaces the `member` placeholder in journey text. The run prefix must be unique
+for the target installation; every object created by the journeys includes it.
 
 The runner first validates that every selected sentence has step code. It then reports ordinary
 scenarios as the required result and runs `@known-failing-0.3.16` scenarios as a separate,

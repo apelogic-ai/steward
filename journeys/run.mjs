@@ -44,6 +44,8 @@ function validateEnvironment() {
     throw new Error("STEWARD_JOURNEY_REPOSITORY must use owner/repository form.");
   }
 
+  requiredEnvironment("STEWARD_JOURNEY_MEMBER_ROLE");
+
   const runPrefix = requiredEnvironment("STEWARD_JOURNEY_RUN_PREFIX");
   if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(runPrefix)) {
     throw new Error("STEWARD_JOURNEY_RUN_PREFIX must be 1-40 lowercase letters, numbers, or hyphens, starting with a letter or number.");

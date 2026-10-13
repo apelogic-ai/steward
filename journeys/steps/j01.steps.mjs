@@ -3,9 +3,11 @@ import { expect } from "@playwright/test";
 import { Given, Then, When } from "./fixtures.mjs";
 
 const runPrefix = process.env.STEWARD_JOURNEY_RUN_PREFIX;
+const memberRole = process.env.STEWARD_JOURNEY_MEMBER_ROLE;
 
 function resolveText(journey, text) {
   const prefixed = text.replaceAll("<run-prefix>", runPrefix);
+  if (prefixed === "member") return memberRole;
   return journey.modelAliases.get(prefixed) ?? prefixed;
 }
 
@@ -20,6 +22,9 @@ function fieldLocator(page, field) {
   }
   if (["Limit per run", "Monthly limit", "Time-to-live limit", "Runtime limit per month"].includes(field)) {
     return page.getByRole("spinbutton", { name }).first();
+  }
+  if (field === "Total size limit (optional)") {
+    return page.getByRole("textbox", { name }).first();
   }
   return page.getByLabel(name).first();
 }
@@ -223,8 +228,8 @@ Then("the field {string} shows {string}", async ({ journey, page }, field, value
 
 Then("the drop-down {string} offers {string}", async ({ journey, page }, field, offered) => {
   const expected = resolveText(journey, offered);
-  const options = await page.getByRole("combobox", { name: field, exact: true }).locator("option").allTextContents();
-  expect(options.some((option) => option.includes(expected)), `${field} should offer text containing ${expected}`).toBe(true);
+  const option = page.getByRole("combobox", { name: field, exact: true }).locator("option").filter({ hasText: expected }).first();
+  await expect(option, `${field} should offer text containing ${expected}`).toBeAttached();
 });
 
 When("I type a value the installation does not accept into {string}", async ({ page }, field) => {
