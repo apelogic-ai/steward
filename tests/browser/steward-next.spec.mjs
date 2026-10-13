@@ -2170,6 +2170,34 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
   }
 });
 
+test("the Pending envelope tab excludes stale requests", async ({ browser }) => {
+  const requests = ["pending", "pending", "stale", "stale", "stale"].map((status, index) => ({
+    ...structuredClone(envelopeRequest),
+    approvedEnvelope: null,
+    envelopeDigest: null,
+    envelopeInstanceId: null,
+    id: `00000000-0000-0000-0000-${String(index + 10).padStart(12, "0")}`,
+    status,
+  }));
+  const developer = await guardedPage(browser, { userEnvelopeRequests: requests });
+  try {
+    await developer.page.goto(`${origin}/envelopes`);
+    const pendingTab = developer.page.getByRole("tab", { name: "Pending 2", exact: true });
+    await expect(pendingTab).toBeVisible();
+    await pendingTab.click();
+
+    const envelopes = developer.page.getByRole("table", { name: "Envelopes" });
+    for (const request of requests.filter((request) => request.status === "pending")) {
+      await expect(envelopes).toContainText(request.id);
+    }
+    for (const request of requests.filter((request) => request.status === "stale")) {
+      await expect(envelopes).not.toContainText(request.id);
+    }
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("money is shown with one shared precision rule across envelope and run views", async ({ browser }) => {
   const developer = await guardedPage(browser, {
     envelopeSpend: { currency: "USD", limit: "20.00", observed: "0.0809120" },
