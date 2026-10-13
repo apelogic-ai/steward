@@ -2227,6 +2227,7 @@ mod tests {
             requested_diagnostics: None,
             requested_requirements: None,
             effective_requirements: None,
+            task_runtime_minutes_limit: None,
             requested_workspace: Vec::new(),
             workspace: None,
             prompt_source: PromptSourceKind::Inline,

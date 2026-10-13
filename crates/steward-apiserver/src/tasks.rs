@@ -2666,6 +2666,7 @@ where
             requested_diagnostics: None,
             requested_requirements: None,
             effective_requirements: None,
+            task_runtime_minutes_limit: None,
             requested_workspace: Vec::new(),
             workspace: None,
             prompt_source: PromptSourceKind::Path,
@@ -4677,6 +4678,10 @@ where
             .await?
         }
     };
+    let task_runtime_minutes_limit = definition
+        .requires
+        .as_ref()
+        .and_then(|requirements| requirements.authority.runtime_minutes_limit.clone());
     let evidence = BrowserTaskEvidence {
         source: request.package.source.clone(),
         revision,
@@ -4689,6 +4694,7 @@ where
         requested_diagnostics: Some(request.diagnostics),
         requested_requirements: Some(requested_requirements),
         effective_requirements: Some(effective_requirements),
+        task_runtime_minutes_limit,
         requested_workspace: definition.workspace.clone(),
         workspace,
         prompt_source: PromptSourceKind::for_definition(&definition),
@@ -5564,6 +5570,11 @@ fn direct_task_evidence(
         },
         requested_requirements: Some(pre_admission.requested_requirements.clone()),
         effective_requirements: pre_admission.effective_requirements.clone(),
+        task_runtime_minutes_limit: pre_admission
+            .definition
+            .requires
+            .as_ref()
+            .and_then(|requirements| requirements.authority.runtime_minutes_limit.clone()),
         diagnostics: pre_admission.diagnostics,
         requested_diagnostics: Some(pre_admission.diagnostics),
         requested_workspace: pre_admission.definition.workspace.clone(),
@@ -5666,6 +5677,10 @@ fn direct_task_evidence_matches(
         &mut comparable.requested_requirements,
     );
     align_with_historical_default(
+        &stored.task_runtime_minutes_limit,
+        &mut comparable.task_runtime_minutes_limit,
+    );
+    align_with_historical_default(
         &stored.requested_diagnostics,
         &mut comparable.requested_diagnostics,
     );
@@ -5716,7 +5731,9 @@ fn align_with_historical_runtime_limit(
         .authority
         .runtime_minutes_limit
         .as_ref();
-    if requested_limit != stored_limit && comparable_limit == Some(requested_limit) {
+    if (requested_limit != stored_limit && comparable_limit == Some(requested_limit))
+        || (requested_limit == stored_limit && comparable_limit.is_none())
+    {
         comparable_effective.authority.runtime_minutes_limit = Some(stored_limit.clone());
     }
 }
@@ -5796,6 +5813,10 @@ fn browser_task_evidence_matches(
     align_with_historical_default(
         &stored.requested_requirements,
         &mut comparable.requested_requirements,
+    );
+    align_with_historical_default(
+        &stored.task_runtime_minutes_limit,
+        &mut comparable.task_runtime_minutes_limit,
     );
     if let (Some(stored_effective), Some(comparable_effective)) = (
         stored.effective_requirements.as_ref(),
@@ -8050,6 +8071,7 @@ mod workflow_request_tests {
             serde_json::json!("30");
         direct_value["requestedRequirements"]["authority"]["runtimeMinutesLimit"] =
             serde_json::json!("30");
+        direct_value["taskRuntimeMinutesLimit"] = serde_json::json!("30");
         direct_value["workspace"] = serde_json::json!({
             "entries": [{
                 "type": "scratch",
@@ -8067,6 +8089,7 @@ mod workflow_request_tests {
             &["requestedRequirements"][..],
             &["requestedDiagnostics"][..],
             &["requestedWorkspace"][..],
+            &["taskRuntimeMinutesLimit"][..],
             &["effectiveRequirements", "authority", "runtimeMinutesLimit"][..],
             &["workspace", "maxHistoryDepth"][..],
         ] {
@@ -8081,6 +8104,7 @@ mod workflow_request_tests {
             );
         }
         let mut historical_direct = current_direct.clone();
+        historical_direct.task_runtime_minutes_limit = None;
         historical_direct
             .effective_requirements
             .authority
@@ -8088,6 +8112,27 @@ mod workflow_request_tests {
         assert!(
             direct_task_evidence_matches(&historical_direct, &current_direct),
             "retry must accept evidence created before per-Task runtime caps were projected"
+        );
+        let mut current_omitted_direct = current_direct.clone();
+        current_omitted_direct.task_runtime_minutes_limit = None;
+        current_omitted_direct
+            .requested_requirements
+            .as_mut()
+            .ok_or_else(|| "direct fixture has no requested requirements".to_owned())?
+            .authority
+            .runtime_minutes_limit = Some(steward_types::direct_package::Decimal::parse("60")?);
+        current_omitted_direct
+            .effective_requirements
+            .authority
+            .runtime_minutes_limit = None;
+        let mut historical_omitted_direct = current_omitted_direct.clone();
+        historical_omitted_direct
+            .effective_requirements
+            .authority
+            .runtime_minutes_limit = Some(steward_types::direct_package::Decimal::parse("60")?);
+        assert!(
+            direct_task_evidence_matches(&historical_omitted_direct, &current_omitted_direct),
+            "retry must accept an omitted Task cap that historical evidence inherited from the Envelope"
         );
 
         let browser_value = serde_json::json!({
@@ -8100,6 +8145,7 @@ mod workflow_request_tests {
             "requestedDiagnostics": { "executionLog": "full" },
             "requestedRequirements": direct_value["effectiveRequirements"].clone(),
             "effectiveRequirements": direct_value["effectiveRequirements"].clone(),
+            "taskRuntimeMinutesLimit": "30",
             "requestedWorkspace": direct_value["requestedWorkspace"].clone(),
             "workspace": direct_value["workspace"].clone()
         });
@@ -8110,6 +8156,7 @@ mod workflow_request_tests {
             &["requestedRequirements"][..],
             &["requestedDiagnostics"][..],
             &["requestedWorkspace"][..],
+            &["taskRuntimeMinutesLimit"][..],
             &["effectiveRequirements"][..],
             &["workspace", "maxHistoryDepth"][..],
         ] {
@@ -8124,6 +8171,7 @@ mod workflow_request_tests {
             );
         }
         let mut historical_browser = current_browser.clone();
+        historical_browser.task_runtime_minutes_limit = None;
         historical_browser
             .effective_requirements
             .as_mut()
@@ -8133,6 +8181,31 @@ mod workflow_request_tests {
         assert!(
             browser_task_evidence_matches(&historical_browser, &current_browser),
             "browser retry must accept historical Envelope runtime projection"
+        );
+        let mut current_omitted_browser = current_browser.clone();
+        current_omitted_browser.task_runtime_minutes_limit = None;
+        current_omitted_browser
+            .requested_requirements
+            .as_mut()
+            .ok_or_else(|| "browser fixture has no requested requirements".to_owned())?
+            .authority
+            .runtime_minutes_limit = Some(steward_types::direct_package::Decimal::parse("60")?);
+        current_omitted_browser
+            .effective_requirements
+            .as_mut()
+            .ok_or_else(|| "browser fixture has no effective requirements".to_owned())?
+            .authority
+            .runtime_minutes_limit = None;
+        let mut historical_omitted_browser = current_omitted_browser.clone();
+        historical_omitted_browser
+            .effective_requirements
+            .as_mut()
+            .ok_or_else(|| "browser fixture has no effective requirements".to_owned())?
+            .authority
+            .runtime_minutes_limit = Some(steward_types::direct_package::Decimal::parse("60")?);
+        assert!(
+            browser_task_evidence_matches(&historical_omitted_browser, &current_omitted_browser),
+            "browser retry must accept an omitted Task cap inherited by historical evidence"
         );
         Ok(())
     }

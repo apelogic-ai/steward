@@ -673,6 +673,7 @@ export type BrowserRunView = {
     envelopeRuntimeMinutesUsed?: string | null;
     errorCategory?: string | null;
     executionLog: ExecutionLogMode;
+    failureReason?: string | null;
     finalizationRequested: boolean;
     finalized: boolean;
     observedSpend?: null | AgentRunSpendView;
@@ -714,6 +715,7 @@ export type BrowserTaskEvidence = {
     requestedWorkspace?: Array<WorkspaceEntry>;
     revision: string;
     source: string;
+    taskRuntimeMinutesLimit?: null | Decimal;
     workspace?: null | WorkspaceEvidence;
 };
 
@@ -1003,6 +1005,7 @@ export type DirectTaskBindingEvidence = {
     requestedWorkspace?: Array<WorkspaceEntry>;
     schemaVersion: string;
     sourceProvenance: SourceProvenance;
+    taskRuntimeMinutesLimit?: null | Decimal;
     taskUid: Uuid;
     workspace?: null | WorkspaceEvidence;
 };

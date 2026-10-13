@@ -636,6 +636,12 @@ pub struct BrowserTaskEvidence {
     pub requested_requirements: Option<DirectRequirements>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_requirements: Option<DirectRequirements>,
+    /// The per-Task runtime cap explicitly requested by the package.
+    ///
+    /// Historical evidence did not distinguish an explicit cap from an Envelope allowance copied
+    /// into effective requirements, so absence remains meaningful for compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_runtime_minutes_limit: Option<Decimal>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requested_workspace: Vec<WorkspaceEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -683,6 +689,11 @@ impl BrowserTaskEvidence {
         if let Some(requirements) = &self.effective_requirements {
             requirements.validate()?;
         }
+        validate_recorded_task_runtime_limit(
+            self.task_runtime_minutes_limit.as_ref(),
+            self.requested_requirements.as_ref(),
+            self.effective_requirements.as_ref(),
+        )?;
         if self
             .requested_diagnostics
             .is_some_and(|requested| requested != self.diagnostics)
@@ -1799,6 +1810,9 @@ pub struct DirectTaskBindingEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_requirements: Option<DirectRequirements>,
     pub effective_requirements: DirectRequirements,
+    /// The per-Task runtime cap explicitly requested by the package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_runtime_minutes_limit: Option<Decimal>,
     pub diagnostics: DiagnosticsRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_diagnostics: Option<DiagnosticsRequest>,
@@ -1817,18 +1831,42 @@ pub struct DirectTaskBindingEvidence {
 /// effective. This projection preserves both forms without treating a newly omitted request as a
 /// per-Task cap.
 pub fn task_runtime_minutes_limit<'a>(
+    recorded: Option<&'a Decimal>,
     requested: Option<&'a DirectRequirements>,
     effective: Option<&'a DirectRequirements>,
 ) -> Option<&'a Decimal> {
+    if recorded.is_some() {
+        return recorded;
+    }
     let requested_limit =
         requested.and_then(|requirements| requirements.authority.runtime_minutes_limit.as_ref());
     let effective_limit =
         effective.and_then(|requirements| requirements.authority.runtime_minutes_limit.as_ref());
     match (requested_limit, effective_limit) {
         (Some(requested), Some(effective)) if requested != effective => Some(requested),
-        (_, Some(effective)) => Some(effective),
         _ => None,
     }
+}
+
+fn validate_recorded_task_runtime_limit(
+    recorded: Option<&Decimal>,
+    requested: Option<&DirectRequirements>,
+    effective: Option<&DirectRequirements>,
+) -> Result<(), String> {
+    let Some(recorded) = recorded else {
+        return Ok(());
+    };
+    let requested =
+        requested.and_then(|requirements| requirements.authority.runtime_minutes_limit.as_ref());
+    let effective =
+        effective.and_then(|requirements| requirements.authority.runtime_minutes_limit.as_ref());
+    if requested != Some(recorded) || effective != Some(recorded) {
+        return Err(
+            "recorded per-Task runtime cap differs from requested or effective requirements"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 impl DirectTaskBindingEvidence {
@@ -1856,6 +1894,11 @@ impl DirectTaskBindingEvidence {
             requirements.validate()?;
         }
         self.effective_requirements.validate()?;
+        validate_recorded_task_runtime_limit(
+            self.task_runtime_minutes_limit.as_ref(),
+            self.requested_requirements.as_ref(),
+            Some(&self.effective_requirements),
+        )?;
         if self
             .requested_diagnostics
             .is_some_and(|requested| requested != self.diagnostics)
@@ -2177,8 +2220,12 @@ mod browser_submission_tests {
             .authority
             .runtime_minutes_limit = Some(super::Decimal::parse("60")?);
         assert_eq!(
-            task_runtime_minutes_limit(Some(&requested), Some(&evidence.effective_requirements))
-                .map(super::Decimal::as_str),
+            task_runtime_minutes_limit(
+                None,
+                Some(&requested),
+                Some(&evidence.effective_requirements),
+            )
+            .map(super::Decimal::as_str),
             Some("30")
         );
         evidence
@@ -2186,14 +2233,28 @@ mod browser_submission_tests {
             .authority
             .runtime_minutes_limit = Some(super::Decimal::parse("30")?);
         assert_eq!(
-            task_runtime_minutes_limit(Some(&requested), Some(&evidence.effective_requirements))
-                .map(super::Decimal::as_str),
-            Some("30")
+            task_runtime_minutes_limit(
+                None,
+                Some(&requested),
+                Some(&evidence.effective_requirements),
+            ),
+            None,
+            "historical requested=effective evidence does not prove that the package requested a per-Task cap"
         );
         assert_eq!(
-            task_runtime_minutes_limit(Some(&requested), None),
+            task_runtime_minutes_limit(None, Some(&requested), None),
             None,
             "an omitted Task request has no per-run cap even when admission inherited the Envelope"
+        );
+        let recorded = super::Decimal::parse("30")?;
+        assert_eq!(
+            task_runtime_minutes_limit(
+                Some(&recorded),
+                Some(&requested),
+                Some(&evidence.effective_requirements),
+            ),
+            Some(&recorded),
+            "new evidence preserves an explicit cap even when requested and effective values match"
         );
         Ok(())
     }

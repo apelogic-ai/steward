@@ -146,12 +146,25 @@ export function runtimeMinutesSummary(run: Pick<BrowserRunView,
 >): string | null {
   const parts: string[] = [];
   if (run.taskRuntimeMinutesLimit) {
-    parts.push(`This run: up to ${run.taskRuntimeMinutesLimit} minutes`);
+    const limit = formatRuntimeMinutes(run.taskRuntimeMinutesLimit);
+    parts.push(`This run: up to ${limit} ${Number(limit) === 1 ? "minute" : "minutes"}`);
   }
   if (run.envelopeRuntimeMinutesLimit) {
-    parts.push(`Envelope: ${run.envelopeRuntimeMinutesLimit} minutes per month, ${run.envelopeRuntimeMinutesUsed ?? "0"} used`);
+    const limit = formatRuntimeMinutes(run.envelopeRuntimeMinutesLimit);
+    const unit = Number(limit) === 1 ? "minute" : "minutes";
+    parts.push(`Envelope: ${limit} ${unit} per month, ${formatRuntimeMinutes(run.envelopeRuntimeMinutesUsed ?? "0")} used`);
   }
   return parts.length ? parts.join(" · ") : null;
+}
+
+function formatRuntimeMinutes(value: string): string {
+  const minutes = Number(value);
+  if (!Number.isFinite(minutes)) return value;
+  return (Math.round(minutes * 10) / 10).toString();
+}
+
+export function visibleRunFailureReason(run: Pick<BrowserRunView, "failureReason" | "phase">): string | null {
+  return run.phase === "failed" ? run.failureReason ?? null : null;
 }
 
 type RunEventSnapshot = {
@@ -627,6 +640,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
         const admitted = timelineEvents.find((event) => event.kind === "admitted");
         const runtimeBound = timelineEvents.find((event) => event.kind === "runtimeBound");
         const inferenceGuidance = run.phase === "failed" ? inferenceFailureGuidance(run.errorCategory) : null;
+        const failureReason = visibleRunFailureReason(run);
         const runtimeMinutes = runtimeMinutesSummary(run);
         return (
           <article className="space-y-6">
@@ -651,6 +665,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
             {!run.rerunSupported ? <DiagnosticDetails items={[{ label: "Reason", value: run.rerunUnavailableReason }]} /> : null}
             {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="text-sm text-err" role="alert">{cancelFailureMessage(cancelState)}</p> : null}
             {inferenceGuidance ? <p className="rounded-control border border-err/30 bg-err-soft px-4 py-3 text-sm text-err" role="alert">{inferenceGuidance} <Link className="font-semibold underline" href="/connections">Open Connections</Link></p> : null}
+            {failureReason ? <p className="rounded-control border border-err/30 bg-err-soft px-4 py-3 text-sm text-err" role="alert">{failureReason}</p> : null}
             <ConfirmationDialog cancelLabel="Keep running" confirmLabel="Cancel run" description="The agent will stop and its temporary credentials will be revoked. This cannot be undone." onConfirm={() => void cancelRun()} onOpenChange={setCancelOpen} open={cancelOpen} pending={cancelState === "working"} title="Cancel this run?" />
             {run.workspace ? <WorkspaceEvidencePanel workspace={run.workspace} /> : null}
             <div className="grid min-h-[540px] overflow-hidden rounded-panel border bg-panel lg:grid-cols-[260px_minmax(0,1fr)]">

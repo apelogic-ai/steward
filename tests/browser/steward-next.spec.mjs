@@ -909,6 +909,7 @@ async function guardedPage(browser, {
   rerunResponses = [
     { status: 201, body: { apiVersion: "steward.browser-runs/v1", taskUid: rerunTaskUid } },
   ],
+  runFailureReason = undefined,
   runPhase = "succeeded",
   runSpend = run.observedSpend,
   capabilityCatalogModels = capabilityCatalog.models,
@@ -1438,7 +1439,7 @@ async function guardedPage(browser, {
       const snapshot = {
         apiVersion: "steward.browser-runs/v1",
         eventId: 1,
-        run: { ...fixtureRun, phase: runPhase },
+        run: { ...fixtureRun, phase: runPhase, failureReason: runFailureReason },
         timeline: {
           apiVersion: "steward.browser-runs/v1",
           taskUid,
@@ -1454,7 +1455,7 @@ async function guardedPage(browser, {
     }
     return route.request().url().endsWith("/timeline")
       ? json(route, { apiVersion: "steward.browser-runs/v1", taskUid, events: emptyCollections ? [] : [{ kind: "phase", phase: runPhase, at: "2026-08-24T17:03:00Z" }] })
-      : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...fixtureRun, phase: runPhase } });
+      : json(route, { apiVersion: "steward.browser-runs/v1", run: { ...fixtureRun, phase: runPhase, failureReason: runFailureReason } });
   });
   await context.route(`${origin}/app/api/v1/runs/*/package`, (route) => json(route, {
     taskUid: new URL(route.request().url()).pathname.split("/").at(-2),
@@ -4155,16 +4156,19 @@ test("capture-on succeeded runs list and download outputs without exposing diagn
 });
 
 test("failed run phases expose stdout and stderr as escaped sensitive output", async ({ browser }) => {
+  const failureReason = "This run reached its limit of 30 minutes.";
   const developer = await guardedPage(browser, {
     executionLogs: {
       stdout: { body: "checked repository\n<script id=executed>bad()</script>\n", status: 200 },
       stderr: { body: "tool call failed: example\n", status: 200 },
     },
+    runFailureReason: failureReason,
     runPhase: "failed",
   });
   try {
     await developer.context.addCookies([{ name: "execution-log-session", value: "present", url: origin }]);
     await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByRole("alert").filter({ hasText: failureReason })).toHaveText(failureReason);
     await developer.page.getByRole("button", { name: /Agent execution/ }).click();
     await developer.page.getByText("Execution", { exact: true }).click();
     const stdoutLink = developer.page.getByRole("link", { name: "Open full page" });

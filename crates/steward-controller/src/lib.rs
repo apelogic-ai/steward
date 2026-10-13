@@ -3009,11 +3009,12 @@ fn task_runtime_reconciliation_action(
 }
 
 fn task_runtime_minutes_limit(task: &steward_store::TaskRecord) -> Option<&str> {
-    let (requested, effective) = task
+    let (recorded, requested, effective) = task
         .direct_task_evidence
         .as_ref()
         .map(|evidence| {
             (
+                evidence.task_runtime_minutes_limit.as_ref(),
                 evidence.requested_requirements.as_ref(),
                 Some(&evidence.effective_requirements),
             )
@@ -3021,17 +3022,26 @@ fn task_runtime_minutes_limit(task: &steward_store::TaskRecord) -> Option<&str> 
         .or_else(|| {
             task.browser_task_evidence.as_ref().map(|evidence| {
                 (
+                    evidence.task_runtime_minutes_limit.as_ref(),
                     evidence.requested_requirements.as_ref(),
                     evidence.effective_requirements.as_ref(),
                 )
             })
         })?;
-    steward_types::direct_package::task_runtime_minutes_limit(requested, effective)
+    steward_types::direct_package::task_runtime_minutes_limit(recorded, requested, effective)
         .map(steward_types::direct_package::Decimal::as_str)
 }
 
 fn task_runtime_limit_failure_reason(limit: &str, exhausted: bool) -> Option<String> {
-    exhausted.then(|| format!("This run reached its limit of {limit} minutes."))
+    let unit = if limit == "1"
+        || limit.strip_prefix("1.").is_some_and(|fraction| {
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte == b'0')
+        }) {
+        "minute"
+    } else {
+        "minutes"
+    };
+    exhausted.then(|| format!("This run reached its limit of {limit} {unit}."))
 }
 
 fn task_operation_generation_matches_transition(
@@ -5713,6 +5723,10 @@ mod tests {
         assert_eq!(
             super::task_runtime_limit_failure_reason("30", true).as_deref(),
             Some("This run reached its limit of 30 minutes.")
+        );
+        assert_eq!(
+            super::task_runtime_limit_failure_reason("1.0", true).as_deref(),
+            Some("This run reached its limit of 1.0 minute.")
         );
         assert_eq!(super::task_runtime_limit_failure_reason("30", false), None);
     }

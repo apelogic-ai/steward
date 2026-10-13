@@ -10,7 +10,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Fixed
 
 - A Task's requested runtime-minutes limit now caps that run independently of the Envelope's
-  monthly runtime allowance, and Run details show both limits and current monthly usage.
+  monthly runtime allowance, and Run details show both limits and current monthly usage. The
+  controller checks this cap during reconciliation, so enforcement can occur up to about one
+  minute after the cap is reached.
 - Scratch workspace capacity mismatches now fail Runs with an actionable storage explanation
   instead of `execution_outcome_unknown`.
 - Cancelling a running Task now records a cancelled Run without replacing the cancellation with

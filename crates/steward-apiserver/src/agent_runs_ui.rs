@@ -451,6 +451,7 @@ pub(crate) struct BrowserRunView {
     updated_at: String,
     observed_spend: Option<AgentRunSpendView>,
     error_category: Option<String>,
+    failure_reason: Option<String>,
     trigger: Option<BrowserRunTrigger>,
     execution_log: ExecutionLogMode,
     rerun_supported: bool,
@@ -2782,6 +2783,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         .as_ref()
         .and_then(|evidence| {
             steward_types::direct_package::task_runtime_minutes_limit(
+                evidence.task_runtime_minutes_limit.as_ref(),
                 evidence.requested_requirements.as_ref(),
                 Some(&evidence.effective_requirements),
             )
@@ -2789,6 +2791,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         .or_else(|| {
             record.browser_task_evidence.as_ref().and_then(|evidence| {
                 steward_types::direct_package::task_runtime_minutes_limit(
+                    evidence.task_runtime_minutes_limit.as_ref(),
                     evidence.requested_requirements.as_ref(),
                     evidence.effective_requirements.as_ref(),
                 )
@@ -2799,6 +2802,8 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         .user_envelope_snapshot
         .as_ref()
         .and_then(|envelope| envelope.spec.runtime_minutes_limit.clone());
+    let failure_reason = public_task_runtime_limit_failure_reason(record.failure_reason.as_deref())
+        .map(str::to_owned);
     BrowserRunView {
         task_uid: record.task_uid,
         origin: record.task_origin,
@@ -2829,6 +2834,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         }),
         error_category: bounded_task_error_category(record.failure_reason.as_deref())
             .map(str::to_owned),
+        failure_reason,
         trigger,
         execution_log,
         rerun_supported,
@@ -2836,6 +2842,17 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
             .then_some("This run does not have a replayable package source."),
         stages,
     }
+}
+
+fn public_task_runtime_limit_failure_reason(reason: Option<&str>) -> Option<&str> {
+    const PREFIX: &str = "This run reached its limit of ";
+    let reason = reason?;
+    let value = reason.strip_prefix(PREFIX)?;
+    let limit = value
+        .strip_suffix(" minute.")
+        .or_else(|| value.strip_suffix(" minutes."))?;
+    steward_types::direct_package::Decimal::parse(limit).ok()?;
+    Some(reason)
 }
 
 #[cfg(test)]
@@ -3936,6 +3953,22 @@ mod tests {
     }
 
     #[test]
+    fn run_snapshot_exposes_only_the_bounded_task_runtime_limit_reason() -> Result<(), String> {
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let private = browser_run_view(run(task_uid, "usr_0123456789abcdef0123456789abcdef"));
+        assert_eq!(private.failure_reason, None);
+
+        let mut limited = run(task_uid, "usr_0123456789abcdef0123456789abcdef");
+        limited.failure_reason = Some("This run reached its limit of 30 minutes.".to_owned());
+        assert_eq!(
+            browser_run_view(limited).failure_reason.as_deref(),
+            Some("This run reached its limit of 30 minutes.")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn run_snapshot_exposes_the_immutable_workspace_evidence() -> Result<(), String> {
         let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
             .map_err(|error| error.to_string())?;
@@ -3969,6 +4002,7 @@ mod tests {
             requested_diagnostics: None,
             requested_requirements: None,
             effective_requirements: None,
+            task_runtime_minutes_limit: None,
             requested_workspace: Vec::new(),
             workspace: Some(workspace),
             prompt_source: PromptSourceKind::Inline,
@@ -4723,6 +4757,7 @@ mod tests {
             requested_diagnostics: None,
             requested_requirements: None,
             effective_requirements: None,
+            task_runtime_minutes_limit: None,
             requested_workspace: Vec::new(),
             workspace: None,
             prompt_source: PromptSourceKind::Path,
@@ -4820,6 +4855,7 @@ mod tests {
             requested_diagnostics: None,
             requested_requirements: None,
             effective_requirements: None,
+            task_runtime_minutes_limit: None,
             requested_workspace: Vec::new(),
             workspace: None,
             prompt_source: PromptSourceKind::Path,
@@ -4900,6 +4936,7 @@ mod tests {
             requested_diagnostics: None,
             requested_requirements: None,
             effective_requirements: None,
+            task_runtime_minutes_limit: None,
             requested_workspace: Vec::new(),
             workspace: None,
             prompt_source: PromptSourceKind::Path,
@@ -4937,6 +4974,7 @@ mod tests {
             requested_diagnostics: None,
             requested_requirements: None,
             effective_requirements: None,
+            task_runtime_minutes_limit: None,
             requested_workspace: Vec::new(),
             workspace: None,
             prompt_source: PromptSourceKind::Path,
@@ -4957,6 +4995,7 @@ mod tests {
             requested_diagnostics: None,
             requested_requirements: None,
             effective_requirements: None,
+            task_runtime_minutes_limit: None,
             requested_workspace: Vec::new(),
             workspace: None,
             prompt_source: PromptSourceKind::Path,
@@ -5212,6 +5251,7 @@ mod tests {
             requested_diagnostics: None,
             requested_requirements: None,
             effective_requirements: None,
+            task_runtime_minutes_limit: None,
             requested_workspace: Vec::new(),
             workspace: None,
             prompt_source: PromptSourceKind::Path,
