@@ -1600,7 +1600,7 @@ async function guardedPage(browser, {
     await route.fulfill({
       status: fixture?.status ?? 404,
       contentType: "application/json",
-      body: fixture?.status === 200 ? JSON.stringify({ stream, content, truncated: false, sizeBytes: Buffer.byteLength(content), complete: true }) : "",
+      body: fixture?.status === 200 ? JSON.stringify({ stream, content, truncated: false, sizeBytes: Buffer.byteLength(content), complete: fixture.complete ?? true }) : "",
       headers: { "cache-control": "no-store" },
     });
   });
@@ -3913,6 +3913,42 @@ test("a running run can be cancelled with an empty JSON mutation body", async ({
     expectMutationProof(cancellation);
     expect(cancellation.body).toEqual({});
   } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("a running Codex run opens its active log and advances elapsed time", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    executionLogs: {
+      stdout: { body: "", status: 200, complete: false },
+      stderr: { body: "Codex is working\n", status: 200, complete: false },
+    },
+    mockRunEvents: false,
+    runPhase: "submitted",
+  });
+  web.useRunEventFixture([{
+    delayMs: 100,
+    name: "snapshot",
+    data: {
+      apiVersion: "steward.browser-runs/v1",
+      eventId: 1,
+      run: { ...run, phase: "running" },
+      timeline: { apiVersion: "steward.browser-runs/v1", taskUid, events: [] },
+    },
+  }]);
+  try {
+    await developer.page.clock.install({ time: new Date("2026-08-24T17:02:05Z") });
+    await developer.page.goto(`${origin}/runs/${taskUid}?job=agent_execution`);
+    await developer.page.getByText("Execution", { exact: true }).click();
+
+    await expect(developer.page.getByRole("tab", { name: "stderr" })).toHaveAttribute("aria-selected", "true");
+    await expect(developer.page.getByText("Codex is working", { exact: true })).toBeVisible();
+    await expect(developer.page.locator("article > header").getByText(/· 5 s$/)).toBeVisible();
+
+    await developer.page.clock.fastForward(2_000);
+    await expect(developer.page.locator("article > header").getByText(/· 7 s$/)).toBeVisible();
+  } finally {
+    web.useRunEventFixture(null);
     await closeGuardedPage(developer);
   }
 });
