@@ -3490,6 +3490,19 @@ test("new Tasks use the configured runtime and saved Tasks reuse their Envelope"
     await expect(developer.page).toHaveURL(`${origin}/tasks/${encodeURIComponent(savedDigest)}`);
     await developer.page.getByRole("link", { name: "Run", exact: true }).click();
     await expect(developer.page.getByRole("combobox", { name: "Envelope", exact: true })).toHaveValue(preferredEnvelope.id);
+
+    await developer.page.goto(`${origin}/tasks/${encodeURIComponent(savedDigest)}/edit`);
+    await expect(developer.page.getByText("Save immutable version 2.", { exact: false })).toBeVisible();
+    await developer.page.getByRole("combobox", { name: "Envelope", exact: true }).selectOption(envelopeRequest.id);
+    await developer.page.getByRole("button", { name: "Save version 2" }).click();
+
+    const saves = developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/tasks");
+    expect(saves).toHaveLength(2);
+    expect(saves[1].body.preferredEnvelopeDigest).toBe(`steward:${envelopeRequest.envelopeDigest}`);
+    const revisedDigest = `steward:sha256:${"2".repeat(64)}`;
+    await expect(developer.page).toHaveURL(`${origin}/tasks/${encodeURIComponent(revisedDigest)}`);
+    await developer.page.getByRole("link", { name: "Run", exact: true }).click();
+    await expect(developer.page.getByRole("combobox", { name: "Envelope", exact: true })).toHaveValue(envelopeRequest.id);
   } finally {
     await closeGuardedPage(developer);
   }

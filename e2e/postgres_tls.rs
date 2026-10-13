@@ -335,8 +335,6 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         historical_before_task_library,
         "migration 0067 must not rewrite historical Tasks, runs, or canonical identities"
     );
-    verify_browser_task_library_upgrade(&store).await?;
-
     let historical_before_managed_inference = historical_task_identity_snapshot(&store).await?;
     let users_before_managed_inference =
         sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM canonical_users")
@@ -356,6 +354,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
             "Steward template-boundary migration must complete over the required TLS session: {error}"
         ))
     })?;
+    verify_browser_task_library_upgrade(&store).await?;
     assert_eq!(
         historical_task_identity_snapshot(&store).await?,
         historical_before_managed_inference,
@@ -501,6 +500,7 @@ async fn verify_browser_task_library_upgrade(store: &PgStore) -> Result<(), Box<
     let shared_roles = vec!["Platform.Eng".to_owned(), "org:eng".to_owned()];
     let v1_digest = format!("steward:sha256:{}", "1".repeat(64));
     let v2_digest = format!("steward:sha256:{}", "2".repeat(64));
+    let preferred_envelope_digest = format!("steward:sha256:{}", "4".repeat(64));
     let v1_files = BTreeMap::from([(
         "task-definition.json".to_owned(),
         serde_json::json!({
@@ -535,7 +535,7 @@ async fn verify_browser_task_library_upgrade(store: &PgStore) -> Result<(), Box<
             shared_roles: &shared_roles,
             version: 1,
             content_digest: &v1_digest,
-            preferred_envelope_digest: None,
+            preferred_envelope_digest: Some(&preferred_envelope_digest),
             package_path: "task-definition.json",
             files: &v1_files,
         })
@@ -554,6 +554,11 @@ async fn verify_browser_task_library_upgrade(store: &PgStore) -> Result<(), Box<
         })
         .await?;
     assert_eq!(v1.version, 1);
+    assert_eq!(
+        v1.preferred_envelope_digest.as_deref(),
+        Some(preferred_envelope_digest.as_str()),
+        "a preferred Envelope digest must survive a PostgreSQL write and read"
+    );
     assert_eq!(v2.version, 2);
     assert_ne!(v1.content_digest, v2.content_digest);
 
@@ -576,6 +581,24 @@ async fn verify_browser_task_library_upgrade(store: &PgStore) -> Result<(), Box<
         "an owner-scoped duplicate Task name must return the documented conflict"
     );
 
+    let malformed_preference = store
+        .save_browser_task_version(BrowserTaskVersionPublication {
+            task_id: Uuid::parse_str("00000000-0000-0000-0000-000000000281")?,
+            owner_user_id,
+            name: "invalid-envelope-task",
+            shared_roles: &shared_roles,
+            version: 1,
+            content_digest: &format!("steward:sha256:{}", "5".repeat(64)),
+            preferred_envelope_digest: Some("steward:sha256:not-a-digest"),
+            package_path: "task-definition.json",
+            files: &v1_files,
+        })
+        .await;
+    assert!(
+        matches!(malformed_preference, Err(StoreError::InvalidTaskTransition)),
+        "a malformed preferred Envelope digest must be refused"
+    );
+
     let versions = store
         .browser_task_draft_versions(owner_user_id, task_id)
         .await?;
@@ -586,6 +609,11 @@ async fn verify_browser_task_library_upgrade(store: &PgStore) -> Result<(), Box<
             .collect::<Vec<_>>(),
         [2, 1],
         "the additive Task library must preserve every immutable saved version"
+    );
+    assert_eq!(
+        versions[1].preferred_envelope_digest.as_deref(),
+        Some(preferred_envelope_digest.as_str()),
+        "the preferred Envelope digest must remain attached to its immutable Task version"
     );
     assert!(
         store
