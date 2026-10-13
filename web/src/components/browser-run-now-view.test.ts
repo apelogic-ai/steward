@@ -171,6 +171,15 @@ describe("Run now failures", () => {
     expect(message).not.toContain("task.workspace_rejected");
   });
 
+  test("does not repeat a repository already named by the server", () => {
+    const message = runNowFailureMessage({
+      error: "task.workspace_rejected",
+      failureReason: "The branch or tag missing-branch was not found in example-org/repository.",
+    }, "example-org/repository");
+
+    expect(message).toBe("The run request was rejected. The branch or tag missing-branch was not found in example-org/repository.");
+  });
+
   test("shows a non-repository workspace rejection without blaming the selected repository", () => {
     const message = runNowFailureMessage({
       error: "task.workspace_rejected",

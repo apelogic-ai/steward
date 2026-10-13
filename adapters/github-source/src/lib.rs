@@ -1331,6 +1331,9 @@ async fn decode_response<T: DeserializeOwned>(
             }
             return Err(rejected(ACCESS_REJECTED_REASON));
         }
+        if status == StatusCode::NOT_FOUND && operation == "resolve GitHub ref" {
+            return Err(rejected("Git reference was not found"));
+        }
         if status == StatusCode::NOT_FOUND && matches!(authentication, Authentication::App) {
             return Err(rejected(
                 "GitHub App is not installed on the requested repository",
@@ -2045,6 +2048,30 @@ mod tests {
         assert_eq!(commit.as_str(), format!("git:sha1:{COMMIT}"));
         let requests = mock.finish()?;
         assert!(requests[3].contains("/commits/release%2Fv1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn distinguishes_a_missing_ref_from_other_client_rejections() -> Result<(), String> {
+        for (status, expected) in [
+            (404, "Git reference was not found"),
+            (401, "resolve GitHub ref"),
+        ] {
+            let mut responses = authentication_responses();
+            responses.push(ResponseSpec::status(
+                status,
+                r#"{"message":"fixture detail"}"#,
+            ));
+            let mock = MockGitHub::start(responses)?;
+            let result = adapter(&mock)?
+                .resolve_revision(&GitRevisionRequest {
+                    repository: identity(REPOSITORY, 1001, 1000)?,
+                    reference: "git:ref:missing-branch".to_owned(),
+                })
+                .await;
+            assert_rejected(result, expected);
+            mock.finish()?;
+        }
         Ok(())
     }
 

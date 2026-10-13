@@ -3793,6 +3793,47 @@ test("Run now submits an inline package under the selected envelope", async ({ b
   }
 });
 
+test("workspace ref controls preserve selectors and explain invalid branch or tag values", async ({ browser }) => {
+  const existingDefinition = JSON.parse(browserTaskFiles[browserTaskDefinitionPath]);
+  existingDefinition.workspace = [{
+    git: {
+      repository: "example-org/agentic-ops",
+      ref: "trigger",
+    },
+  }];
+  const developer = await guardedPage(browser, {
+    inlineRun: true,
+    inlineTaskDefinition: existingDefinition,
+    taskLibraryMutable: true,
+  });
+  try {
+    await developer.page.goto(`${origin}/tasks/${encodeURIComponent(browserTaskDigest)}/edit`);
+    await expect(developer.page.getByRole("textbox", { name: "Branch or tag" })).toHaveValue("trigger");
+    await expect(developer.page.locator('p[role="alert"]')).toContainText(
+      "Workspace entry example-org/agentic-ops accepts trigger",
+    );
+
+    await developer.page.goto(`${origin}/runs/new`);
+    await developer.page.getByRole("checkbox", { name: "Check out this repository" }).check();
+    await developer.page.getByRole("combobox", { name: "Workspace repository" }).selectOption("repo_agentic_ops");
+    const reference = developer.page.getByRole("textbox", { name: "Branch or tag" });
+    await expect(reference).toHaveValue("main");
+    await reference.fill("");
+    await expect(reference).toHaveValue("");
+    await expect(developer.page.locator('p[role="alert"]')).toContainText(
+      "For example-org/agentic-ops, enter a branch or tag",
+    );
+    await expect(developer.page.getByRole("button", { name: "Run now" })).toBeDisabled();
+    await reference.fill("HEAD");
+    await expect(developer.page.locator('p[role="alert"]')).toContainText("other than HEAD or a commit ID");
+    await reference.fill("feature/ref-feedback");
+    await expect(developer.page.locator('p[role="alert"]')).toHaveCount(0);
+    await expect(developer.page.getByRole("button", { name: "Run now" })).toBeEnabled();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("the built-in starter task completes with the exact hello world output", async ({ browser }) => {
   const developer = await guardedPage(browser, {
     inlineRun: true,
