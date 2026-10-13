@@ -123,6 +123,7 @@
         }
       }
     },
+    "taskRuntimeMinutesLimit": "30",
     "diagnostics": {
       "executionLog": "full"
     },

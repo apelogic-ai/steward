@@ -9,6 +9,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- A Task's requested runtime-minutes limit now caps that run independently of the Envelope's
+  monthly runtime allowance, and Run details show both limits and current monthly usage. The
+  controller checks this cap during reconciliation, so enforcement can occur up to about one
+  minute after the cap is reached.
 - Custom Envelope workspace controls now keep the complete JSON preview identical to the request.
 - The Envelopes Pending tab now counts and shows only requests that are still awaiting a decision.
 - Scratch workspace capacity mismatches now fail Runs with an actionable storage explanation
@@ -25,6 +29,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   their selected Envelope for later runs.
 - Running Tasks show stdout and stderr together while in progress, and the displayed run duration
   now advances until the run finishes.
+
+### Upgrade and rollback
+
+- Task evidence gains the optional `taskRuntimeMinutesLimit` field. After a Task with an explicit
+  per-run cap stores this evidence, v0.3.17 and earlier binaries cannot read that row. Before such
+  a rollback, stop Task submission and prove that no stored Task evidence carries the field.
 
 ## [0.3.17] - 2026-10-13
 

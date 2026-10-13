@@ -53,8 +53,8 @@ use steward_store::{
 };
 use steward_types::direct_package::{
     BrowserTaskEvidence, ClosureEntry, ClosureEntryKind, ContentDigest, DiagnosticsRequest,
-    ExecutionLogMode, PackageClosure, PromptSourceKind, RelativePath, TaskOrigin,
-    canonical_json_bytes,
+    DirectTaskBindingEvidence, ExecutionLogMode, PackageClosure, PromptSourceKind, RelativePath,
+    TaskOrigin, canonical_json_bytes,
 };
 use steward_types::task_output_archive::{
     TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputArchiveCompatibility, task_output_archive_entries,
@@ -891,6 +891,7 @@ fn browser_direct_package_evidence(
         requested_diagnostics: None,
         requested_requirements: None,
         effective_requirements: None,
+        task_runtime_minutes_limit: None,
         requested_workspace: Vec::new(),
         workspace: None,
         prompt_source: PromptSourceKind::Inline,
@@ -2412,6 +2413,70 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             active_manifest_digest: &active_digest,
         })
         .await?;
+    let previous_task_uid = Uuid::new_v4();
+    let previous_operation_id = Uuid::new_v4();
+    let previous_runtime_name = format!("task-{}", previous_operation_id.simple());
+    let previous_inert_digest = manifest_digest_with_binding(
+        previous_task_uid,
+        previous_operation_id,
+        &previous_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let previous_active_digest = manifest_digest_with_binding(
+        previous_task_uid,
+        previous_operation_id,
+        &previous_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: previous_task_uid,
+            operation_id: previous_operation_id,
+            idempotency_key: &format!("earlier-runtime-task-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some(email.as_str()),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: email.as_str(),
+            owner_user_id: identity.user_id.as_str(),
+            workflow: &workflow,
+            workflow_name: Some(&workflow),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &previous_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &agent_command,
+            execution_binding: Some(&execution_binding),
+            source_provenance: None,
+            direct_task_evidence: None,
+            task_origin: steward_types::direct_package::TaskOrigin::Unknown,
+            browser_task_evidence: None,
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &candidate_digest,
+            admission_decision: &admission_decision,
+            inert_manifest_digest: &previous_inert_digest,
+            active_manifest_digest: &previous_active_digest,
+        })
+        .await?;
+    sqlx::query(
+        "INSERT INTO task_lifecycle_events \
+         (task_uid, event_kind, phase, provenance, at) VALUES \
+         ($1, 'phase', 'running', 'recorded', clock_timestamp() - interval '20 minutes'), \
+         ($1, 'phase', 'succeeded', 'recorded', clock_timestamp() - interval '10 minutes')",
+    )
+    .bind(previous_task_uid)
+    .execute(&pool)
+    .await?;
     store
         .put_task_inputs(
             task_uid,
@@ -2546,6 +2611,30 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
     .bind(task_uid)
     .execute(&pool)
     .await?;
+    let task_runtime_minutes = store
+        .observe_task_runtime_minutes(task_uid, &runtime_uid, "3.00")
+        .await
+        .map_err(|error| io::Error::other(format!("observe per-Task runtime: {error:?}")))?;
+    assert!(
+        !task_runtime_minutes.exhausted,
+        "earlier usage by another Task in the same instance must not consume this Task's cap"
+    );
+    assert!(
+        task_runtime_minutes
+            .observed_minutes
+            .parse::<f64>()?
+            .is_sign_positive()
+    );
+    assert!(
+        store
+            .observe_task_runtime_minutes(task_uid, &runtime_uid, "1.00")
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("observe exhausted per-Task runtime: {error:?}"))
+            })?
+            .exhausted,
+        "the Task's own running time must exhaust its per-run cap"
+    );
     let runtime_minutes = store
         .observe_envelope_instance_runtime_minutes(
             &envelope_instance_id,
@@ -2569,19 +2658,19 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
     let runtime_grant = store
         .record_escalation_top_up(
             runtime_minutes_escalation.escalation_id,
-            "10.00",
+            "20.00",
             "2999-01-01T00:00:00Z",
             "finish the bounded task",
             "test-admin",
         )
         .await?;
     assert_eq!(runtime_grant.base_limit, "1.00");
-    assert_eq!(runtime_grant.target_limit, "11.00");
+    assert_eq!(runtime_grant.target_limit, "21.00");
     assert_eq!(
         store
             .active_envelope_instance_runtime_minutes_top_up(&envelope_instance_id)
             .await?,
-        Some("10.00".to_owned())
+        Some("20.00".to_owned())
     );
     let resumed_runtime_minutes = store
         .observe_envelope_instance_runtime_minutes(
@@ -4712,6 +4801,273 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .is_none(),
         "cancelled Task finalization must remove its exact runtime"
     );
+
+    let limited_task_uid = Uuid::new_v4();
+    let limited_operation_id = Uuid::new_v4();
+    let limited_runtime_name = format!("task-{}", limited_operation_id.simple());
+    let limited_candidate_digest = digest(serde_json::to_value(&spec))?;
+    let limited_inert_digest = manifest_digest_with_binding(
+        limited_task_uid,
+        limited_operation_id,
+        &limited_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let limited_active_digest = manifest_digest_with_binding(
+        limited_task_uid,
+        limited_operation_id,
+        &limited_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    let mut limited_evidence = browser_direct_package_evidence("inline", None)?;
+    let evidence_fixture: DirectTaskBindingEvidence = serde_json::from_str(include_str!(
+        "../docs/contracts/task/v2/fixtures/positive/task-binding-evidence.json"
+    ))?;
+    let mut limited_requirements = evidence_fixture
+        .requested_requirements
+        .ok_or_else(|| io::Error::other("Task evidence fixture has no requested requirements"))?;
+    let runtime_limit = steward_types::direct_package::Decimal::parse("1")?;
+    limited_requirements.authority.runtime_minutes_limit = Some(runtime_limit.clone());
+    limited_evidence.requested_requirements = Some(limited_requirements.clone());
+    limited_evidence.effective_requirements = Some(limited_requirements);
+    limited_evidence.task_runtime_minutes_limit = Some(runtime_limit);
+    limited_evidence.validate()?;
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-limited".to_owned());
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: limited_task_uid,
+            operation_id: limited_operation_id,
+            idempotency_key: &format!("limited-runtime-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: "direct:runtime-limit@1",
+            workflow_name: None,
+            workflow_version: None,
+            workflow_digest: None,
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &limited_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &agent_command,
+            execution_binding: Some(&execution_binding),
+            source_provenance: None,
+            direct_task_evidence: None,
+            task_origin: TaskOrigin::Browser,
+            browser_task_evidence: Some(&limited_evidence),
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &limited_candidate_digest,
+            admission_decision: &admission_decision,
+            inert_manifest_digest: &limited_inert_digest,
+            active_manifest_digest: &limited_active_digest,
+        })
+        .await?;
+    store
+        .put_task_inputs(
+            limited_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"limited task input",
+        )
+        .await?;
+    store
+        .request_task_execution(limited_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    for _ in 0..5 {
+        reconcile_current(&client, &task_runtime, &store, limited_task_uid).await?;
+    }
+    let limited_activated_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("limited active runtime fixture is absent"))?;
+    let limited_inference = ActiveInference::default();
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        limited_inference.clone(),
+        store.clone(),
+        limited_activated_runtime,
+    )
+    .await?;
+    let limited_finalizing_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("limited finalized runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        limited_inference.clone(),
+        store.clone(),
+        limited_finalizing_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &task_runtime, &store, limited_task_uid).await?;
+    assert_eq!(
+        operation(&store, limited_task_uid).await?.state,
+        TaskOrchestrationState::Active
+    );
+    let limited_attempt = match store
+        .claim_task_execution_attempt(
+            limited_task_uid,
+            &format!("sha256:{}", "f".repeat(64)),
+            &format!("sha256:{}", "0".repeat(64)),
+            "test-controller",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Created(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "limited execution attempt was not created: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    let limited_attempt = match store
+        .authorize_task_execution_start(
+            limited_attempt.attempt_id,
+            limited_attempt.generation,
+            "test-controller",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Applied(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "limited execution start was not authorized: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    let limited_attempt = match store
+        .record_task_execution_observation(
+            limited_attempt.attempt_id,
+            limited_attempt.generation,
+            TaskExecutionObservation::Running {
+                adapter_observation_id: "limited-running-attempt",
+                execution_stdout: Some(b"partial limited output"),
+                execution_stderr: Some(b""),
+            },
+            "test-controller",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Applied(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "limited execution was not recorded as running: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    sqlx::query(
+        "INSERT INTO task_lifecycle_events \
+         (task_uid, event_kind, phase, provenance, at) \
+         VALUES ($1, 'phase', 'running', 'recorded', now() - interval '2 minutes')",
+    )
+    .bind(limited_task_uid)
+    .execute(&pool)
+    .await?;
+    let limited_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("limited provisioned runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        limited_inference.clone(),
+        store.clone(),
+        limited_runtime,
+    )
+    .await?;
+    assert_eq!(
+        operation(&store, limited_task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending,
+        "the runtime controller must persist cleanup after a per-Task cap is exhausted"
+    );
+    let limited_task = store
+        .task(limited_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(limited_task.phase, TaskPhase::Failed);
+    assert_eq!(
+        limited_task.failure_reason.as_deref(),
+        Some("This run reached its limit of 1 minute.")
+    );
+    assert_eq!(
+        store
+            .task_execution_attempt(limited_task_uid)
+            .await?
+            .ok_or_else(|| io::Error::other("limited execution attempt is absent"))?
+            .state,
+        steward_store::TaskExecutionAttemptState::CancelPending,
+        "Task cleanup must fence the running attempt before runtime deletion"
+    );
+    assert_eq!(
+        limited_attempt.state,
+        steward_store::TaskExecutionAttemptState::Running
+    );
+    assert_eq!(
+        envelope.spec.runtime_minutes_limit, None,
+        "a per-Task cap must not depend on an Envelope monthly runtime allowance"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM runtime_minute_observations WHERE envelope_instance_id = $1",
+        )
+        .bind(&envelope_instance_id)
+        .fetch_one(&pool)
+        .await?,
+        0,
+        "a per-Task cap must not create instance-wide runtime observations"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM runtime_minute_exhaustions WHERE envelope_instance_id = $1",
+        )
+        .bind(&envelope_instance_id)
+        .fetch_one(&pool)
+        .await?,
+        0,
+        "a per-Task cap must not create instance-wide runtime exhaustion"
+    );
+    reconcile_current(&client, &task_runtime, &store, limited_task_uid).await?;
+    let limited_deleting_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("limited deleting runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        limited_inference,
+        store.clone(),
+        limited_deleting_runtime,
+    )
+    .await?;
+    reconcile_current(&client, &task_runtime, &store, limited_task_uid).await?;
+    reconcile_current(&client, &task_runtime, &store, limited_task_uid).await?;
 
     let rejected_task_uid = Uuid::new_v4();
     let rejected_operation_id = Uuid::new_v4();

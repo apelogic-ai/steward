@@ -141,6 +141,32 @@ export function inferenceFailureGuidance(errorCategory: string | null | undefine
   return null;
 }
 
+export function runtimeMinutesSummary(run: Pick<BrowserRunView,
+  "taskRuntimeMinutesLimit" | "envelopeRuntimeMinutesLimit" | "envelopeRuntimeMinutesUsed"
+>): string | null {
+  const parts: string[] = [];
+  if (run.taskRuntimeMinutesLimit) {
+    const limit = formatRuntimeMinutes(run.taskRuntimeMinutesLimit);
+    parts.push(`This run: up to ${limit} ${Number(limit) === 1 ? "minute" : "minutes"}`);
+  }
+  if (run.envelopeRuntimeMinutesLimit) {
+    const limit = formatRuntimeMinutes(run.envelopeRuntimeMinutesLimit);
+    const unit = Number(limit) === 1 ? "minute" : "minutes";
+    parts.push(`Envelope: ${limit} ${unit} per month, ${formatRuntimeMinutes(run.envelopeRuntimeMinutesUsed ?? "0")} used`);
+  }
+  return parts.length ? parts.join(" · ") : null;
+}
+
+function formatRuntimeMinutes(value: string): string {
+  const minutes = Number(value);
+  if (!Number.isFinite(minutes)) return value;
+  return (Math.round(minutes * 10) / 10).toString();
+}
+
+export function visibleRunFailureReason(run: Pick<BrowserRunView, "failureReason" | "phase">): string | null {
+  return run.phase === "failed" ? run.failureReason ?? null : null;
+}
+
 type RunEventSnapshot = {
   eventId: number;
   run: BrowserRunView;
@@ -614,6 +640,8 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
         const admitted = timelineEvents.find((event) => event.kind === "admitted");
         const runtimeBound = timelineEvents.find((event) => event.kind === "runtimeBound");
         const inferenceGuidance = run.phase === "failed" ? inferenceFailureGuidance(run.errorCategory) : null;
+        const failureReason = visibleRunFailureReason(run);
+        const runtimeMinutes = runtimeMinutesSummary(run);
         return (
           <article className="space-y-6">
             <header className="flex flex-wrap items-start justify-between gap-5">
@@ -622,6 +650,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                 <p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p>
                 {run.trigger ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.trigger.actor}</strong> via {run.trigger.event} · <a href={run.trigger.runUrl} rel="noreferrer" target="_blank">{run.trigger.repository}@{run.trigger.ref} ({run.trigger.sha.slice(0, 7)})</a> · <RunDuration createdAt={run.createdAt} phase={run.phase} updatedAt={run.updatedAt} /></div> : <div className="mt-2 text-sm text-muted-ink">Started {dateTime(run.createdAt)} · <RunDuration createdAt={run.createdAt} phase={run.phase} updatedAt={run.updatedAt} /></div>}
                 <div className="mt-1 text-sm text-muted-ink">Origin: {run.origin}{run.package ? ` · Package: ${run.package.source} @ ${run.package.revision} · ${run.package.path} · Prompt: ${run.package.promptSource}` : ""}</div>
+                {runtimeMinutes ? <div className="mt-1 text-sm text-muted-ink">{runtimeMinutes}</div> : null}
               </div>
               {!admin ? <div className="flex flex-wrap gap-2"><button className="min-h-10 rounded-control border bg-panel px-4 py-2 text-sm font-semibold disabled:opacity-50" disabled={rerunState === "working" || !run.rerunSupported} title={run.rerunSupported ? undefined : "This run cannot be re-run."} onClick={async () => {
                 if (session.status !== "authenticated") return;
@@ -636,6 +665,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
             {!run.rerunSupported ? <DiagnosticDetails items={[{ label: "Reason", value: run.rerunUnavailableReason }]} /> : null}
             {cancelState !== "idle" && cancelState !== "working" && cancelState !== "cancelled" ? <p className="text-sm text-err" role="alert">{cancelFailureMessage(cancelState)}</p> : null}
             {inferenceGuidance ? <p className="rounded-control border border-err/30 bg-err-soft px-4 py-3 text-sm text-err" role="alert">{inferenceGuidance} <Link className="font-semibold underline" href="/connections">Open Connections</Link></p> : null}
+            {failureReason ? <p className="rounded-control border border-err/30 bg-err-soft px-4 py-3 text-sm text-err" role="alert">{failureReason}</p> : null}
             <ConfirmationDialog cancelLabel="Keep running" confirmLabel="Cancel run" description="The agent will stop and its temporary credentials will be revoked. This cannot be undone." onConfirm={() => void cancelRun()} onOpenChange={setCancelOpen} open={cancelOpen} pending={cancelState === "working"} title="Cancel this run?" />
             {run.workspace ? <WorkspaceEvidencePanel workspace={run.workspace} /> : null}
             <div className="grid min-h-[540px] overflow-hidden rounded-panel border bg-panel lg:grid-cols-[260px_minmax(0,1fr)]">

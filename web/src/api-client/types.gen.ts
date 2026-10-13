@@ -669,8 +669,11 @@ export type BrowserRunTrigger = {
 export type BrowserRunView = {
     codingAgentRuntime: string;
     createdAt: string;
+    envelopeRuntimeMinutesLimit?: string | null;
+    envelopeRuntimeMinutesUsed?: string | null;
     errorCategory?: string | null;
     executionLog: ExecutionLogMode;
+    failureReason?: string | null;
     finalizationRequested: boolean;
     finalized: boolean;
     observedSpend?: null | AgentRunSpendView;
@@ -682,6 +685,7 @@ export type BrowserRunView = {
     runtimeOwnership: RuntimeOwnership;
     runtimeUid?: string | null;
     stages: Array<BrowserRunStage>;
+    taskRuntimeMinutesLimit?: string | null;
     taskUid: string;
     trigger?: null | BrowserRunTrigger;
     updatedAt: string;
@@ -711,6 +715,7 @@ export type BrowserTaskEvidence = {
     requestedWorkspace?: Array<WorkspaceEntry>;
     revision: string;
     source: string;
+    taskRuntimeMinutesLimit?: null | Decimal;
     workspace?: null | WorkspaceEvidence;
 };
 
@@ -1000,6 +1005,7 @@ export type DirectTaskBindingEvidence = {
     requestedWorkspace?: Array<WorkspaceEntry>;
     schemaVersion: string;
     sourceProvenance: SourceProvenance;
+    taskRuntimeMinutesLimit?: null | Decimal;
     taskUid: Uuid;
     workspace?: null | WorkspaceEvidence;
 };

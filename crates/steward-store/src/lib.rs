@@ -3879,6 +3879,84 @@ impl PgStore {
         })
     }
 
+    /// Measure one Task's own running time against its immutable per-run cap.
+    ///
+    /// This deliberately ignores other Tasks in the same Envelope instance and all
+    /// instance-wide top-ups. The Task lifecycle is append-only, so the first running event and
+    /// first following terminal event are the durable clock boundaries.
+    pub async fn observe_task_runtime_minutes(
+        &self,
+        task_uid: Uuid,
+        runtime_uid: &str,
+        limit: &str,
+    ) -> Result<TaskRuntimeMinutesRecord, StoreError> {
+        if runtime_uid.trim().is_empty() {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let limit =
+            add_budget_amount("0", limit).map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        let row = sqlx::query(
+            "WITH bound AS ( \
+                SELECT tasks.task_uid \
+                FROM task_submissions tasks \
+                LEFT JOIN task_runtime_operations operation ON operation.task_uid = tasks.task_uid \
+                WHERE tasks.task_uid = $1 \
+                  AND COALESCE(operation.runtime_uid, tasks.runtime_uid) = $2), \
+             bounds AS (SELECT clock_timestamp() AS observed_at), \
+             started AS ( \
+                SELECT lifecycle.at \
+                FROM task_lifecycle_events lifecycle JOIN bound ON bound.task_uid = lifecycle.task_uid \
+                WHERE lifecycle.event_kind = 'phase' AND lifecycle.phase = 'running' \
+                ORDER BY lifecycle.at, lifecycle.id LIMIT 1), \
+             ended AS ( \
+                SELECT lifecycle.at \
+                FROM task_lifecycle_events lifecycle JOIN bound ON bound.task_uid = lifecycle.task_uid \
+                JOIN started ON lifecycle.at >= started.at \
+                WHERE lifecycle.event_kind = 'phase' \
+                  AND lifecycle.phase IN ('succeeded', 'failed', 'cancelled') \
+                ORDER BY lifecycle.at, lifecycle.id LIMIT 1) \
+             SELECT EXISTS(SELECT 1 FROM bound) AS bound, \
+                    started.at IS NOT NULL AS running, \
+                    COALESCE(GREATEST(0::numeric, EXTRACT(EPOCH FROM ( \
+                        LEAST(COALESCE(ended.at, bounds.observed_at), bounds.observed_at) \
+                        - started.at))), 0)::text AS observed_seconds, \
+                    (COALESCE(GREATEST(0::numeric, EXTRACT(EPOCH FROM ( \
+                        LEAST(COALESCE(ended.at, bounds.observed_at), bounds.observed_at) \
+                        - started.at))), 0) / 60)::text AS observed_minutes, \
+                    to_char(bounds.observed_at AT TIME ZONE 'UTC', \
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS observed_at \
+             FROM bounds LEFT JOIN started ON true LEFT JOIN ended ON true \
+             GROUP BY bounds.observed_at, started.at, ended.at",
+        )
+        .bind(task_uid)
+        .bind(runtime_uid)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if !row.try_get::<bool, _>("bound").map_err(database_error)? {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let observed_seconds: String = row.try_get("observed_seconds").map_err(database_error)?;
+        let observed_minutes: String = row.try_get("observed_minutes").map_err(database_error)?;
+        let observed_at: String = row.try_get("observed_at").map_err(database_error)?;
+        let running: bool = row.try_get("running").map_err(database_error)?;
+        let exhausted = running
+            && sqlx::query_scalar::<_, bool>("SELECT $1::numeric >= $2::numeric")
+                .bind(&observed_minutes)
+                .bind(&limit)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(database_error)?;
+        Ok(TaskRuntimeMinutesRecord {
+            running,
+            observed_seconds,
+            observed_minutes,
+            limit,
+            observed_at,
+            exhausted,
+        })
+    }
+
     pub async fn active_envelope_instance_runtime_minutes_top_up(
         &self,
         envelope_instance_id: &str,
@@ -11224,6 +11302,8 @@ pub struct AgentRunRecord {
     pub user_envelope_instance_id: Option<String>,
     pub user_envelope_revision: Option<i64>,
     pub user_envelope_digest: Option<String>,
+    pub user_envelope_snapshot: Option<Envelope>,
+    pub envelope_runtime_minutes_used: Option<String>,
     pub coding_agent_runtime: String,
     pub runtime_uid: Option<String>,
     pub runtime_ownership: steward_types::RuntimeOwnership,
@@ -12903,6 +12983,16 @@ pub struct RuntimeMinutesAuthorityRecord {
     pub observed_at: String,
     pub exhausted: bool,
     pub escalation_id: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TaskRuntimeMinutesRecord {
+    pub running: bool,
+    pub observed_seconds: String,
+    pub observed_minutes: String,
+    pub limit: String,
+    pub observed_at: String,
+    pub exhausted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -14625,6 +14715,7 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
             users.display_email AS owner_display_email, \
             tasks.workflow, tasks.workflow_name, tasks.workflow_version, tasks.workflow_digest, \
             tasks.user_envelope_instance_id, tasks.user_envelope_revision, tasks.user_envelope_digest, \
+            tasks.user_envelope_snapshot, runtime_minutes.observed_minutes AS envelope_runtime_minutes_used, \
             tasks.coding_agent_runtime, COALESCE(orchestration.runtime_uid, tasks.runtime_uid) AS runtime_uid, \
             tasks.runtime_ownership, tasks.phase, tasks.runtime_spec, \
             tasks.envelope_revision, tasks.finalize_requested, tasks.finalized, \
@@ -14644,6 +14735,13 @@ const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, 
      LEFT JOIN canonical_users users ON users.user_id = tasks.owner_user_id \
      LEFT JOIN task_runtime_operations orchestration \
        ON orchestration.task_uid = tasks.task_uid \
+     LEFT JOIN LATERAL ( \
+         SELECT (observation.observed_seconds / 60)::text AS observed_minutes \
+         FROM runtime_minute_observations observation \
+         WHERE observation.envelope_instance_id = tasks.user_envelope_instance_id \
+         ORDER BY observation.at DESC, observation.id DESC \
+         LIMIT 1 \
+     ) runtime_minutes ON true \
      LEFT JOIN LATERAL ( \
          SELECT observation.observed_amount::text AS observed_amount, \
                 observation.currency, observation.exhausted, \
@@ -14743,6 +14841,13 @@ fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreE
             .map_err(database_error)?,
         user_envelope_digest: row
             .try_get("user_envelope_digest")
+            .map_err(database_error)?,
+        user_envelope_snapshot: row
+            .try_get::<Option<Json<Envelope>>, _>("user_envelope_snapshot")
+            .map_err(database_error)?
+            .map(|value| value.0),
+        envelope_runtime_minutes_used: row
+            .try_get("envelope_runtime_minutes_used")
             .map_err(database_error)?,
         coding_agent_runtime: row
             .try_get("coding_agent_runtime")

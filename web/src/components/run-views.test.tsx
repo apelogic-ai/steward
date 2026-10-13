@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BrowserRunView, WorkspaceEvidence } from "@/api-client";
 
-import { cancelFailureMessage, inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards, WorkspaceEvidencePanel } from "./run-views";
+import { cancelFailureMessage, inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards, runtimeMinutesSummary, visibleRunFailureReason, WorkspaceEvidencePanel } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -116,6 +116,35 @@ test("managed inference failures direct the user to replace the saved key", () =
   expect(inferenceFailureGuidance("inference-budget-exhausted"))
     .toContain("Replace it in Connections");
   expect(inferenceFailureGuidance("agent")).toBeNull();
+});
+
+test("runtime minutes distinguish the run cap from the Envelope allowance", () => {
+  expect(runtimeMinutesSummary({
+    taskRuntimeMinutesLimit: "1",
+    envelopeRuntimeMinutesLimit: "600",
+    envelopeRuntimeMinutesUsed: "45.2853909333333333",
+  })).toBe("This run: up to 1 minute · Envelope: 600 minutes per month, 45.3 used");
+  expect(runtimeMinutesSummary({
+    taskRuntimeMinutesLimit: undefined,
+    envelopeRuntimeMinutesLimit: "600",
+    envelopeRuntimeMinutesUsed: undefined,
+  })).toBe("Envelope: 600 minutes per month, 0 used");
+  expect(runtimeMinutesSummary({
+    taskRuntimeMinutesLimit: undefined,
+    envelopeRuntimeMinutesLimit: undefined,
+    envelopeRuntimeMinutesUsed: undefined,
+  })).toBeNull();
+});
+
+test("failed runs show their bounded server-provided reason", () => {
+  expect(visibleRunFailureReason(run({
+    phase: "failed",
+    failureReason: "This run reached its limit of 30 minutes.",
+  }))).toBe("This run reached its limit of 30 minutes.");
+  expect(visibleRunFailureReason(run({
+    phase: "succeeded",
+    failureReason: "This run reached its limit of 30 minutes.",
+  }))).toBeNull();
 });
 
 describe("GitHub reruns", () => {

@@ -731,6 +731,7 @@
         "envelope": { "$ref": "#/$defs/envelopeEvidence" },
         "requestedRequirements": { "$ref": "#/$defs/directRequirements" },
         "effectiveRequirements": { "$ref": "#/$defs/directRequirements" },
+        "taskRuntimeMinutesLimit": { "type": "string", "pattern": "^(0|[1-9][0-9]*)(\\.[0-9]{1,6})?$" },
         "requestedDiagnostics": { "$ref": "#/$defs/diagnostics" },
         "diagnostics": { "$ref": "#/$defs/diagnostics" },
         "requestedWorkspace": {
