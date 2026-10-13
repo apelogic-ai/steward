@@ -6,6 +6,7 @@ import { useCallback, useId, useMemo, useState, type FormEvent } from "react";
 
 import {
   getUserCapabilities,
+  getStarterTask,
   listRequests,
   myTask,
   myTasks,
@@ -14,6 +15,7 @@ import {
   type BrowserTasksResponse,
   type BrowserTaskView,
   type EnvelopeRequestsResponse,
+  type StarterTaskResponse,
   type UserCapabilitiesResponse,
 } from "@/api-client";
 import {
@@ -21,7 +23,10 @@ import {
   effectiveAgentSelection,
   effectiveModelSelection,
   ModelPicker,
+  preferredTaskModel,
   requirementsWithSelectedModel,
+  qualifiedEnvelopeDigest,
+  startingSelection,
   type Model,
 } from "@/components/model-selection";
 import { WorkspaceRepositoryControls } from "@/components/workspace-repository-controls";
@@ -64,26 +69,30 @@ export function TaskLibraryView() {
 type EditorData = {
   capabilities: UserCapabilitiesResponse;
   envelopes: EnvelopeRequestsResponse;
+  starterTask: StarterTaskResponse["starterTask"];
   task: BrowserTaskView | null;
 };
 
 export function TaskEditorView({ contentDigest }: Readonly<{ contentDigest?: string }>) {
   const load = useCallback(async () => {
-    const [capabilities, envelopes, task] = await Promise.all([
+    const [capabilities, envelopes, starterTask, task] = await Promise.all([
       getUserCapabilities({ cache: "no-store", credentials: "same-origin" }),
       listRequests({ cache: "no-store", credentials: "same-origin" }),
+      getStarterTask({ cache: "no-store", credentials: "same-origin" }),
       contentDigest ? loadTask(contentDigest) : Promise.resolve(null),
     ]);
     const response = !capabilities.response?.ok
       ? capabilities.response
       : !envelopes.response?.ok
         ? envelopes.response
+        : !starterTask.response?.ok
+          ? starterTask.response
         : task && !task.response?.ok
           ? task.response
           : capabilities.response;
     return {
-      data: capabilities.data && envelopes.data && (!contentDigest || task?.data)
-        ? { capabilities: capabilities.data, envelopes: envelopes.data, task: task?.data?.task ?? null }
+      data: capabilities.data && envelopes.data && starterTask.data && (!contentDigest || task?.data)
+        ? { capabilities: capabilities.data, envelopes: envelopes.data, starterTask: starterTask.data.starterTask, task: task?.data?.task ?? null }
         : undefined,
       response,
     };
@@ -117,17 +126,28 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
   const existingRuntime = definition?.runtime && typeof definition.runtime === "object" ? definition.runtime as Record<string, unknown> : null;
   const nextVersion = existing ? Math.max(existing.version, ...existing.versions.map((version) => version.version)) + 1 : 1;
   const activeEnvelopes = data.envelopes.requests.filter((request) => request.status === "provisioned" && request.envelopeDigest);
-  const initialAgentRef = typeof existingRuntime?.agentRef === "string"
+  const configuredAgentRef = typeof existingRuntime?.agentRef === "string"
     ? existingRuntime.agentRef
-    : data.capabilities.agents[0]?.agentRef ?? "";
+    : data.starterTask.taskDefinition.runtime.agentRef;
+  const configuredModel = existing
+    ? existing.runtime.model ?? null
+    : preferredTaskModel(data.starterTask.taskDefinition);
+  const initialEnvelope = activeEnvelopes.find((request) => request.envelopeDigest
+    && qualifiedEnvelopeDigest(request.envelopeDigest) === existing?.preferredEnvelopeDigest) ?? activeEnvelopes[0];
+  const initialEnvelopeSpec = initialEnvelope?.approvedEnvelope ?? initialEnvelope?.requestedEnvelope;
+  const initialSelection = startingSelection(
+    data.capabilities.agents,
+    initialEnvelopeSpec?.spec.llms ?? [],
+    configuredAgentRef,
+    configuredModel,
+  );
+  const initialAgentRef = existing ? configuredAgentRef : initialSelection.agent?.agentRef ?? configuredAgentRef;
   const [name, setName] = useState(typeof definition?.name === "string" ? definition.name : "my-task");
   const [path, setPath] = useState(existing?.path ?? "task-definition.json");
-  const [envelopeId, setEnvelopeId] = useState(activeEnvelopes[0]?.id ?? "");
+  const [envelopeId, setEnvelopeId] = useState(initialEnvelope?.id ?? "");
   const [agentRef, setAgentRef] = useState(initialAgentRef);
   const [agentChanged, setAgentChanged] = useState(false);
-  const [model, setModel] = useState<Model | null>(() => existing
-    ? existing.runtime.model ?? null
-    : null);
+  const [model, setModel] = useState<Model | null>(existing ? existing.runtime.model ?? null : initialSelection.model);
   const [modelChanged, setModelChanged] = useState(false);
   const [prompt, setPrompt] = useState(typeof definition?.promptText === "string" ? definition.promptText : "Write the requested result under $STEWARD_OUTPUT_DIR/out/.");
   const [skills, setSkills] = useState(jsonText(definition?.skills, []));
@@ -152,10 +172,10 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
         reason: null,
       }));
   const currentAgent = agentOptions.find((agent) => agent.agentRef === agentRef);
-  const preserveCurrentAgent = Boolean(!agentChanged && agentRef && (!currentAgent || !currentAgent.compatible));
+  const preserveCurrentAgent = Boolean(existing && !agentChanged && agentRef && (!currentAgent || !currentAgent.compatible));
   const effectiveAgent = effectiveAgentSelection(agentOptions, agentRef);
   const selectedAgent = preserveCurrentAgent ? undefined : effectiveAgent.selected;
-  const effectiveAgentRef = preserveCurrentAgent ? agentRef : selectedAgent?.agentRef ?? "";
+  const effectiveAgentRef = preserveCurrentAgent || (!existing && agentRef && !selectedAgent) ? agentRef : selectedAgent?.agentRef ?? "";
   const preserveCurrentModel = Boolean(existing && !modelChanged);
   const effectiveModel = effectiveModelSelection(model, selectedAgent);
   const selectedModel = preserveCurrentModel ? model : effectiveModel.selected;
@@ -169,6 +189,22 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
       ? `${model.provider}/${model.model} is not available with the selected Envelope and coding agent. You can keep it for this draft or choose another.`
       : "No active Envelope is selected. You can keep the current model for this draft."
     : effectiveModel.warning;
+
+  function selectEnvelope(nextEnvelopeId: string) {
+    setEnvelopeId(nextEnvelopeId);
+    const nextEnvelope = activeEnvelopes.find((request) => request.id === nextEnvelopeId);
+    const nextSpec = nextEnvelope?.approvedEnvelope ?? nextEnvelope?.requestedEnvelope;
+    const nextSelection = startingSelection(
+      data.capabilities.agents,
+      nextSpec?.spec.llms ?? [],
+      configuredAgentRef,
+      configuredModel,
+    );
+    setAgentRef(nextSelection.agent?.agentRef ?? configuredAgentRef);
+    setAgentChanged(Boolean(existing));
+    setModel(nextSelection.model);
+    setModelChanged(Boolean(existing));
+  }
 
   if (existing && (!existing.editable || existing.source !== "inline" || !existing.taskId)) {
     return <div className="space-y-4"><PageHeader description="Only an owner-scoped draft can create another immutable version." title="Task is read-only" /><Link className="inline-flex rounded-control border px-4 py-2 text-sm font-semibold" href={`/tasks/${encodeURIComponent(existing.contentDigest)}`}>Back to Task</Link></div>;
@@ -221,7 +257,15 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
     setFailure(null);
     setStatus("saving");
     const result = await saveMyTask({
-      body: { taskId: existing?.taskId ?? null, path, files: preview.files, sharedRoles },
+      body: {
+        taskId: existing?.taskId ?? null,
+        path,
+        files: preview.files,
+        preferredEnvelopeDigest: selectedEnvelope?.envelopeDigest
+          ? qualifiedEnvelopeDigest(selectedEnvelope.envelopeDigest)
+          : null,
+        sharedRoles,
+      },
       cache: "no-store",
       credentials: "same-origin",
       headers: { "X-Steward-CSRF": session.value.csrf },
@@ -239,7 +283,7 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
     <section className="grid gap-4 rounded-card border bg-panel p-6 md:grid-cols-2">
       <label className="grid gap-2 text-sm font-semibold">Name<input className={fieldClass} disabled={Boolean(existing)} onChange={(event) => setName(event.target.value)} required value={name} /></label>
       <label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} required value={path} /></label>
-      <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} disabled={activeEnvelopes.length === 0} onChange={(event) => setEnvelopeId(event.target.value)} value={selectedEnvelope?.id ?? ""}>{activeEnvelopes.length === 0 ? <option value="">No active Envelope</option> : null}{activeEnvelopes.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
+      <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} disabled={activeEnvelopes.length === 0} onChange={(event) => selectEnvelope(event.target.value)} value={selectedEnvelope?.id ?? ""}>{activeEnvelopes.length === 0 ? <option value="">No active Envelope</option> : null}{activeEnvelopes.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
       <label className="grid gap-2 text-sm font-semibold">Coding agent<select aria-describedby={agentWarning ? agentWarningId : undefined} className={`${fieldClass} font-mono`} disabled={agentOptions.length === 0 && !preserveCurrentAgent} onChange={(event) => { setAgentRef(event.target.value); setAgentChanged(true); setModel(null); setModelChanged(true); }} required value={effectiveAgentRef}>{agentOptions.length === 0 && !preserveCurrentAgent ? <option value="">No coding agent configured</option> : null}{preserveCurrentAgent ? <option value={agentRef}>Keep current: {agentRef}</option> : null}{agentOptions.filter((agent) => !preserveCurrentAgent || agent.agentRef !== agentRef).map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.displayName ? `${agent.displayName} · ${agent.agentRef}` : agent.agentRef}{agent.compatible ? "" : " · unavailable"}</option>)}</select></label>
       <ModelPicker allowNoModel={preserveCurrentModel && model === null} className={fieldClass} describedBy={modelWarning ? modelWarningId : undefined} models={selectedAgent?.models ?? []} onChange={(nextModel) => { setModel(nextModel); setModelChanged(true); }} preserveUnavailable={preserveCurrentModel} selected={selectedModel} />
       {agentWarning ? <p className="text-sm text-warn" id={agentWarningId} role="status">{agentWarning}</p> : null}

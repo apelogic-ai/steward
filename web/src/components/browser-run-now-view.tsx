@@ -29,6 +29,8 @@ import {
   effectiveModelSelection,
   ModelPicker,
   preferredTaskModel,
+  qualifiedEnvelopeDigest,
+  startingSelection,
   type Model,
 } from "@/components/model-selection";
 import { canonicalWorkspaceRef, workspaceRepositoryName } from "@/components/workspace-repository-controls";
@@ -241,11 +243,21 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
   const active = data.envelopes.requests.filter((request) => request.status === "provisioned" && request.envelopeDigest);
   const exactTask = data.task;
   const starterTask = data.starterTask;
+  const initialEnvelope = active.find((request) => request.envelopeDigest
+    && qualifiedEnvelopeDigest(request.envelopeDigest) === exactTask?.preferredEnvelopeDigest) ?? active[0];
+  const initialEnvelopeSpec = initialEnvelope?.approvedEnvelope ?? initialEnvelope?.requestedEnvelope;
+  const configuredModel = preferredTaskModel(starterTask.taskDefinition);
+  const initialSelection = startingSelection(
+    data.capabilities.agents,
+    initialEnvelopeSpec?.spec.llms ?? [],
+    starterTask.taskDefinition.runtime.agentRef,
+    configuredModel,
+  );
   const initialKind: SourceKind = exactTask ? "inline" : initialWorkflow ? "registry" : "inline";
   const [sourceKind, setSourceKind] = useState<SourceKind>(initialKind);
-  const [envelopeId, setEnvelopeId] = useState(active[0]?.id ?? "");
-  const [agentRef, setAgentRef] = useState(starterTask.taskDefinition.runtime.agentRef);
-  const [model, setModel] = useState<Model | null>(() => preferredTaskModel(starterTask.taskDefinition));
+  const [envelopeId, setEnvelopeId] = useState(initialEnvelope?.id ?? "");
+  const [agentRef, setAgentRef] = useState(initialSelection.agent?.agentRef ?? starterTask.taskDefinition.runtime.agentRef);
+  const [model, setModel] = useState<Model | null>(initialSelection.model);
   const [prompt, setPrompt] = useState(starterTask.taskDefinition.promptText ?? "");
   const [repository, setRepository] = useState(starterTask.git?.repository ?? "");
   const [revision, setRevision] = useState(starterTask.git?.revision ?? "");
@@ -302,6 +314,20 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
         workspaceCheckout,
       )
     : null;
+
+  function selectEnvelope(nextEnvelopeId: string) {
+    setEnvelopeId(nextEnvelopeId);
+    const nextEnvelope = active.find((request) => request.id === nextEnvelopeId);
+    const nextSpec = nextEnvelope?.approvedEnvelope ?? nextEnvelope?.requestedEnvelope;
+    const nextSelection = startingSelection(
+      data.capabilities.agents,
+      nextSpec?.spec.llms ?? [],
+      starterTask.taskDefinition.runtime.agentRef,
+      configuredModel,
+    );
+    setAgentRef(nextSelection.agent?.agentRef ?? starterTask.taskDefinition.runtime.agentRef);
+    setModel(nextSelection.model);
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -370,7 +396,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
   return <form className="space-y-6 rounded-card border bg-panel p-6" onSubmit={(event) => void submit(event)}>
     {!exactTask ? <div className="flex flex-wrap items-start justify-between gap-4"><div><h2 className="font-semibold">{starterTask.title ?? starterTask.taskDefinition.name}</h2>{starterTask.description ? <p className="mt-1 text-sm text-muted-ink">{starterTask.description}</p> : null}</div><Link className="rounded-control border px-4 py-2 text-sm font-semibold" href="/runs/new?choose=task">Choose saved Task</Link></div> : null}
     <div className="grid gap-4 md:grid-cols-2">
-      <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} onChange={(event) => setEnvelopeId(event.target.value)} value={envelopeId}>{active.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
+      <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} onChange={(event) => selectEnvelope(event.target.value)} value={envelopeId}>{active.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
       {exactTask ? <div className="grid gap-2 text-sm font-semibold">Task<div className={`${fieldClass} flex items-center font-mono text-xs`}>{exactTask.name}@{exactTask.version} · {exactTask.contentDigest}</div></div> : <label className="grid gap-2 text-sm font-semibold">Package source<select className={fieldClass} onChange={(event) => setSourceKind(event.target.value as SourceKind)} value={sourceKind}><option disabled={!inlineAllowed} value="inline">Inline package{inlineAllowed ? "" : " (disabled by template)"}</option><option value="repository">Git repository</option><option value="registry">Published workflow</option></select></label>}
     </div>
     {exactTask ? <p className="text-sm text-muted-ink">The exact immutable package is locked. Choose an Envelope and optional inputs for this run.</p> : null}

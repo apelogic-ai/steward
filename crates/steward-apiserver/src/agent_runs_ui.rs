@@ -23,8 +23,8 @@ use steward_store::{
     BrowserTaskVersionRecord, StoreError, TaskRecord, WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
-    AgentRef, ContentDigest, DirectRequirements, DirectTaskDefinition, ExecutionLogMode,
-    PackageClosure, PromptSourceKind, RelativePath, RuntimeSelection, TaskOrigin,
+    AgentRef, ContentDigest, DirectRequirements, DirectTaskDefinition, EnvelopeDigest,
+    ExecutionLogMode, PackageClosure, PromptSourceKind, RelativePath, RuntimeSelection, TaskOrigin,
     WorkspaceEvidence,
 };
 use steward_types::task_output_archive::{
@@ -489,6 +489,7 @@ pub(crate) struct SaveBrowserTaskRequest {
     path: RelativePath,
     #[schema(value_type = Object)]
     files: BTreeMap<String, String>,
+    preferred_envelope_digest: Option<EnvelopeDigest>,
     #[serde(default)]
     shared_roles: Vec<String>,
 }
@@ -507,6 +508,8 @@ pub(crate) struct BrowserTaskListItem {
     #[schema(value_type = Option<String>, format = "uuid")]
     task_id: Option<Uuid>,
     content_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferred_envelope_digest: Option<String>,
     source: String,
     revision: String,
     path: String,
@@ -538,6 +541,8 @@ pub(crate) struct BrowserTaskView {
     #[schema(value_type = Option<String>, format = "uuid")]
     task_id: Option<Uuid>,
     content_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferred_envelope_digest: Option<String>,
     source: String,
     revision: String,
     path: String,
@@ -1039,6 +1044,7 @@ where
         BrowserTaskView {
             task_id: Some(record.task_id),
             content_digest,
+            preferred_envelope_digest: record.preferred_envelope_digest,
             source: "inline".to_owned(),
             revision: record.content_digest,
             path: record.package_path,
@@ -1093,6 +1099,7 @@ where
         BrowserTaskView {
             task_id: None,
             content_digest,
+            preferred_envelope_digest: None,
             source: evidence.source,
             revision: evidence.revision,
             path: evidence.path.as_str().to_owned(),
@@ -1133,6 +1140,7 @@ where
         BrowserTaskView {
             task_id: None,
             content_digest: workflow.content_digest.clone(),
+            preferred_envelope_digest: None,
             source: format!("steward:registry/{}", workflow.name),
             revision: format!("steward:version:{}", workflow.version),
             path: "task-definition.json".to_owned(),
@@ -1385,6 +1393,10 @@ where
             shared_roles: &body.shared_roles,
             version,
             content_digest: content_digest.as_str(),
+            preferred_envelope_digest: body
+                .preferred_envelope_digest
+                .as_ref()
+                .map(EnvelopeDigest::as_str),
             package_path: body.path.as_str(),
             files: &body.files,
         })
@@ -1438,6 +1450,7 @@ fn saved_task_list_item(
     Ok(BrowserTaskListItem {
         task_id: Some(record.task_id),
         content_digest: record.content_digest.clone(),
+        preferred_envelope_digest: record.preferred_envelope_digest.clone(),
         source: "inline".to_owned(),
         revision: record.content_digest.clone(),
         path: record.package_path.clone(),
@@ -1492,6 +1505,7 @@ fn executed_task_list_item(record: &AgentRunRecord) -> Option<BrowserTaskListIte
     Some(BrowserTaskListItem {
         task_id: None,
         content_digest: evidence.closure_digest.as_str().to_owned(),
+        preferred_envelope_digest: None,
         source: evidence.source.clone(),
         revision: evidence.revision.clone(),
         path: evidence.path.as_str().to_owned(),
@@ -1508,6 +1522,7 @@ fn workflow_task_list_item(workflow: WorkflowRevisionRecord) -> Option<BrowserTa
     Some(BrowserTaskListItem {
         task_id: None,
         content_digest: workflow.content_digest,
+        preferred_envelope_digest: None,
         source: format!("steward:registry/{}", workflow.name),
         revision: format!("steward:version:{}", workflow.version),
         path: "task-definition.json".to_owned(),
@@ -3254,6 +3269,9 @@ mod tests {
                     shared_roles: publication.shared_roles.to_vec(),
                     version: publication.version,
                     content_digest: publication.content_digest.to_owned(),
+                    preferred_envelope_digest: publication
+                        .preferred_envelope_digest
+                        .map(str::to_owned),
                     package_path: publication.package_path.to_owned(),
                     files: publication.files.clone(),
                     created_at: format!("2026-01-01T00:00:0{}Z", publication.version),
@@ -5020,6 +5038,7 @@ mod tests {
                 "taskId": task_id,
                 "path": "task-definition.json",
                 "files": {"task-definition.json": definition.to_string()},
+                "preferredEnvelopeDigest": format!("steward:sha256:{}", version.to_string().repeat(64)),
                 "sharedRoles": []
             })
         }
@@ -5110,6 +5129,10 @@ mod tests {
             )
             .map_err(|error| format!("decode Task detail response: {error}"))?;
             assert_eq!(body["task"]["version"], version);
+            assert_eq!(
+                body["task"]["preferredEnvelopeDigest"],
+                format!("steward:sha256:{}", version.to_string().repeat(64))
+            );
             assert_eq!(body["task"]["versions"].as_array().map(Vec::len), Some(2));
         }
 

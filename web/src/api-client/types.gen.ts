@@ -720,6 +720,7 @@ export type BrowserTaskListItem = {
     name: string;
     owned: boolean;
     path: string;
+    preferredEnvelopeDigest?: string | null;
     revision: string;
     sharedRoles: Array<string>;
     source: string;
@@ -757,6 +758,7 @@ export type BrowserTaskView = {
     nextCursor?: string | null;
     owned: boolean;
     path: string;
+    preferredEnvelopeDigest?: string | null;
     publicationTaskUid?: string | null;
     requires?: null | DirectRequirements;
     revision: string;
@@ -1639,6 +1641,7 @@ export type SaveBrowserTaskRequest = {
         [key: string]: unknown;
     };
     path: RelativePath;
+    preferredEnvelopeDigest?: null | EnvelopeDigest;
     sharedRoles?: Array<string>;
     taskId?: string | null;
 };
