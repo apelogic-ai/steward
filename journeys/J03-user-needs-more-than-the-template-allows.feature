@@ -26,7 +26,9 @@ Feature: J3 - User needs more than the template allows
     Then the field "Runtime limit per month" shows "60"
     And I see in "Runtime limit per month":
       | min |
-    When I type "20" into "Time-to-live limit"
+    # Keeps this Envelope distinct from active Envelopes left by earlier smoke runs.
+    When I type "<run-runtime-minutes>" into "Runtime limit per month"
+    And I type "20" into "Time-to-live limit"
     And I choose "min" in "Time-to-live limit"
     Then the field "Time-to-live limit" has a warning outline
     And I see "Above limit 15 min"

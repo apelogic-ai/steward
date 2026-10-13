@@ -70,6 +70,7 @@ implementations are added.
 | `<provider-a>/<model-a>`, `<provider-b>/<model-b>` | The models that work with agent A and agent B. |
 | `<provider-a>/<new-model>` | A model added in configuration only (J10). |
 | `<provider-c>/<model-c>` | A model no configured agent can use (J10). |
+| `<run-runtime-minutes>` | A within-template runtime allowance derived from the unique smoke run prefix. |
 | "member" | The role a template is meant for. |
 
 Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test installation.
@@ -127,6 +128,9 @@ export STEWARD_JOURNEY_STORAGE_STATE=/path/to/steward-storage-state.json
 export STEWARD_JOURNEY_REPOSITORY=example-org/example-repository
 export STEWARD_JOURNEY_MEMBER_ROLE=engineer
 export STEWARD_JOURNEY_RUN_PREFIX=journey-001
+# Optional: select these instead of the Run and Task forms' defaults.
+export STEWARD_JOURNEY_AGENT=agent-ref-or-display-name
+export STEWARD_JOURNEY_MODEL=provider/model
 cargo xtask journeys --tags @smoke
 ```
 
@@ -147,8 +151,14 @@ The runner reports an explicit refresh instruction if the session has expired. J
 public GitHub repository admitted by the installation, with `main` as its default branch and a root
 file whose name contains `README`; the journey verifies the resolved commit against GitHub's branch
 head. The member role must be one held by the signed-in test account and replaces the `member`
-placeholder in journey text. The run prefix must be unique for the target installation; every
-object created by the journeys includes it.
+placeholder in journey text. The account must also have administrator access because J1 and J3
+use administrator APIs and screens. Tool-connection state is recorded but is not an account
+precondition: an existing personal connection does not change these journeys. When
+`STEWARD_JOURNEY_AGENT` or `STEWARD_JOURNEY_MODEL` is set, the matching enabled option is selected;
+otherwise the forms' defaults are kept. The run prefix must be unique for the target installation;
+every object created by the journeys includes it. J2 and J3 derive a distinct, within-template
+runtime-minutes candidate from that prefix and advance to an unused active-Envelope value when
+needed, so prior active Envelopes do not turn a new request into a duplicate.
 
 The runner first validates that every selected sentence has step code. It then reports ordinary
 scenarios as the required result and runs scenarios tagged `@known-failing-*` separately. It reports

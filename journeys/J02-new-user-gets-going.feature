@@ -42,6 +42,8 @@ Feature: J2 - New user gets going
     And I see "This request is within the template limits and will be provisioned immediately."
     # The field is in USD.
     When I type "0.50" into "Limit per run"
+    # Keeps this Envelope distinct from active Envelopes left by earlier smoke runs.
+    And I type "<run-runtime-minutes>" into "Runtime limit per month"
     And I press "Submit request"
     Then I see "Submitting…"
     # Provisioned at once: no administrator acts in this scenario.

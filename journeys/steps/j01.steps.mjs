@@ -5,6 +5,22 @@ import { Given, Then, When } from "./fixtures.mjs";
 const runPrefix = process.env.STEWARD_JOURNEY_RUN_PREFIX;
 const memberRole = process.env.STEWARD_JOURNEY_MEMBER_ROLE;
 const repository = process.env.STEWARD_JOURNEY_REPOSITORY;
+const configuredAgent = process.env.STEWARD_JOURNEY_AGENT;
+const configuredModel = process.env.STEWARD_JOURNEY_MODEL;
+
+function runtimeMinuteSeed() {
+  let hash = 2166136261;
+  for (const character of runPrefix) {
+    hash ^= character.codePointAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % 10_000_000;
+}
+
+function formatRuntimeMinutes(offset) {
+  const microMinutes = 50_000_000 + offset;
+  return `${Math.floor(microMinutes / 1_000_000)}.${String(microMinutes % 1_000_000).padStart(6, "0")}`;
+}
 
 function templateId(name) {
   return `${runPrefix}-${name}`;
@@ -16,6 +32,10 @@ function resolveText(journey, text) {
     .replaceAll("<owner>/<repository>", repository);
   if (prefixed === "member") return memberRole;
   if (prefixed === "Read the repository") return `task-${runPrefix}-repo`;
+  if (prefixed === "<run-runtime-minutes>") {
+    if (!journey.runRuntimeMinutes) throw new Error("the journey must choose an unused runtime-minutes value before filling the request");
+    return journey.runRuntimeMinutes;
+  }
   return journey.modelAliases.get(prefixed) ?? prefixed;
 }
 
@@ -25,13 +45,13 @@ function escapeRegExp(value) {
 
 function fieldLocator(page, field) {
   const name = new RegExp(`^${escapeRegExp(field)}(?:\\s|$)`, "i");
-  if (["Eligible member roles", "Models", "Template"].includes(field)) {
+  if (["Coding agent", "Eligible member roles", "Envelope", "Model", "Models", "Package source", "Template", "Workspace repository"].includes(field)) {
     return page.getByRole("combobox", { name }).first();
   }
   if (["Limit per run", "Monthly limit", "Time-to-live limit", "Runtime limit per month"].includes(field)) {
     return page.getByRole("spinbutton", { name }).first();
   }
-  if (field === "Total size limit (optional)") {
+  if (["Branch or tag", "Display name", "Expires at (optional)", "Name", "New template ID", "Package path", "Prompt", "Rationale", "Template ID", "Total size limit (optional)", "Workspace (advanced JSON array)"].includes(field)) {
     return page.getByRole("textbox", { name }).first();
   }
   if (field === "05 Request note") {
@@ -41,7 +61,7 @@ function fieldLocator(page, field) {
 }
 
 function checkboxLocator(page, field) {
-  return page.getByRole("checkbox", { name: new RegExp(`^${escapeRegExp(field)}$`, "i") });
+  return page.getByRole("checkbox", { name: new RegExp(`^${escapeRegExp(field)}(?:\\s|$)`, "i") });
 }
 
 function templateTable(page) {
@@ -114,10 +134,38 @@ async function apiJson(page, path) {
   return response.json();
 }
 
-async function userRequests(page) {
-  const data = await apiJson(page, "/app/api/v1/envelope-requests?limit=100");
-  expect(Array.isArray(data.requests), "the Envelope request collection should be valid").toBeTruthy();
-  return data.requests;
+async function userRequests(page, status = null) {
+  const requests = [];
+  const seenCursors = new Set();
+  let cursor = null;
+  do {
+    const query = new URLSearchParams({ limit: "100" });
+    if (status) query.set("status", status);
+    if (cursor) query.set("cursor", cursor);
+    const data = await apiJson(page, `/app/api/v1/envelope-requests?${query}`);
+    expect(Array.isArray(data.requests), "the Envelope request collection should be valid").toBeTruthy();
+    requests.push(...data.requests);
+    cursor = data.nextCursor ?? null;
+    if (cursor) {
+      expect(seenCursors.has(cursor), "the Envelope request cursor must advance").toBeFalsy();
+      seenCursors.add(cursor);
+    }
+  } while (cursor);
+  return requests;
+}
+
+async function chooseUnusedRuntimeMinutes(page) {
+  const active = await userRequests(page, "provisioned");
+  const used = new Set(active.flatMap((request) => {
+    const value = (request.approvedEnvelope ?? request.requestedEnvelope)?.spec?.runtimeMinutesLimit;
+    return value ? [value] : [];
+  }));
+  const seed = runtimeMinuteSeed();
+  for (let attempt = 0; attempt < 10_000_000; attempt += 1) {
+    const candidate = formatRuntimeMinutes((seed + attempt) % 10_000_000);
+    if (!used.has(candidate)) return candidate;
+  }
+  throw new Error("No unused six-decimal runtime-minutes value remains between 50 and 60 min.");
 }
 
 async function requestForTemplate(page, name, status) {
@@ -138,6 +186,37 @@ async function chooseFirstOfferedModel(page) {
   await picker.selectOption(value);
 }
 
+async function selectConfiguredOption(picker, configured, field) {
+  let match;
+  await expect.poll(async () => {
+    const options = await picker.locator("option").evaluateAll((elements) => elements.map((element) => ({
+      disabled: element.disabled,
+      label: element.textContent?.trim() ?? "",
+      value: element.value,
+    })));
+    match = options.find((option) => !option.disabled && (
+      option.value === configured
+        || option.label === configured
+        || option.label.startsWith(`${configured} ·`)
+    ));
+    return Boolean(match);
+  }, { message: `${field} should offer the configured value ${configured}` }).toBeTruthy();
+  await picker.selectOption(match.value);
+}
+
+async function selectConfiguredRuntime(page) {
+  const agentPicker = fieldLocator(page, "Coding agent");
+  if (configuredAgent && await agentPicker.count()) {
+    await selectConfiguredOption(agentPicker, configuredAgent, "Coding agent");
+  }
+  const modelPicker = fieldLocator(page, "Model");
+  if (configuredModel && await modelPicker.count()) {
+    await selectConfiguredOption(modelPicker, configuredModel, "Model");
+  } else if (await modelPicker.count()) {
+    await chooseFirstOfferedModel(page);
+  }
+}
+
 async function clickControl(page, name) {
   const button = page.getByRole("button", { name, exact: true });
   if (await button.count()) {
@@ -147,7 +226,7 @@ async function clickControl(page, name) {
   await page.getByRole("link", { name, exact: true }).click();
 }
 
-Given(/^the optional integration "([^"]+)" is switched (off|on)$/, async ({ page }, integration, state) => {
+Given(/^the optional integration "([^"]+)" is switched (off|on)$/, async ({ journey, page }, integration, state) => {
   expect(["ticket system", "repository integration", "tool connections"]).toContain(integration);
   await page.goto("/");
   await assertSignedIn(page);
@@ -169,8 +248,10 @@ Given(/^the optional integration "([^"]+)" is switched (off|on)$/, async ({ page
   const data = await apiJson(page, "/app/api/v1/connections");
   expect(Array.isArray(data.available) && Array.isArray(data.connections), "the tool-connections response should be valid").toBeTruthy();
   const active = data.connections.filter((connection) => connection.status.phase !== "disconnected");
-  if (state === "off") expect(active, "tool connections should be disconnected in this installation").toHaveLength(0);
-  else expect(active.length, "at least one tool connection should be active in this installation").toBeGreaterThan(0);
+  journey.integrationStates.set("tool connections", {
+    activeForAccount: active.map((connection) => connection.provider),
+    enabledByInstallation: data.available.filter((connection) => connection.enabled).map((connection) => connection.provider),
+  });
 });
 
 Given(/^the installation's configuration has the coding agent "([^"]+)" with the model "([^"]+)"$/, async ({ journey, page }, agent, model) => {
@@ -193,10 +274,11 @@ Given("no template exists", async ({ journey }) => {
   journey.expectNoTemplates = !journey.shared.checkedPrefixes.has(runPrefix);
 });
 
-Given("I am signed in as a user who is also an administrator", async ({ page }) => {
+Given("I am signed in as a user who is also an administrator", async ({ journey, page }) => {
   await page.goto("/");
   await assertSignedIn(page);
   await expect(page.getByRole("group", { name: "Workspace view" })).toBeVisible();
+  journey.runRuntimeMinutes = await chooseUnusedRuntimeMinutes(page);
 });
 
 When("I choose {string} in {string}", async ({ journey, page }, choice, field) => {
@@ -236,7 +318,7 @@ When("I choose {string} in {string}", async ({ journey, page }, choice, field) =
     journey.currentTemplate = choice;
     journey.requests.set(choice, request);
     await select.selectOption(request.id);
-    await chooseFirstOfferedModel(page);
+    await selectConfiguredRuntime(page);
     return;
   }
   if (field === "Workspace repository" && choice === "<owner>/<repository>") {
@@ -366,8 +448,14 @@ When("I leave {string} empty", async ({ page }, field) => {
 Then("I see {string}", async ({ journey, page }, text) => {
   const expected = resolveText(journey, text);
   if (journey.transientSeen.has(expected)) return;
+  if (expected === "Get started") {
+    await expect(page.locator('section[aria-label="Get started"]')).toBeVisible();
+    return;
+  }
   const exact = page.getByText(expected, { exact: true }).first();
   if (await exact.count() && await exact.isVisible()) return;
+  const heading = page.getByRole("heading", { name: expected, exact: true }).first();
+  if (await heading.count() && await heading.isVisible()) return;
   for (const label of ["Limit per run", "Time-to-live limit"]) {
     if (!expected.startsWith(`${label} `)) continue;
     const value = expected.slice(label.length + 1);
@@ -424,8 +512,12 @@ Then("the field {string} shows {string}", async ({ journey, page }, field, value
 
 Then("the drop-down {string} offers {string}", async ({ journey, page }, field, offered) => {
   const expected = resolveText(journey, offered);
-  const option = page.getByRole("combobox", { name: field, exact: true }).locator("option").filter({ hasText: expected }).first();
+  const picker = page.getByRole("combobox", { name: field, exact: true });
+  const option = picker.locator("option").filter({ hasText: expected }).first();
   await expect(option, `${field} should offer text containing ${expected}`).toBeAttached();
+  if (field === "Template" && expected === "Custom envelope") {
+    await expect(picker.locator("option").last()).toHaveText(expected);
+  }
 });
 
 When("I type a value the installation does not accept into {string}", async ({ page }, field) => {
@@ -468,10 +560,11 @@ Given("the template {string} exists", async ({ page }, name) => {
   expect(template, `template ${templateId(name)} should exist in the installation`).toBeDefined();
 });
 
-Given("I am signed in as a user with the role {string}", async ({ page }, role) => {
+Given("I am signed in as a user with the role {string}", async ({ journey, page }, role) => {
   expect(resolveText({ modelAliases: new Map() }, role)).toBe(memberRole);
   await page.goto("/");
   await assertSignedIn(page);
+  journey.runRuntimeMinutes = await chooseUnusedRuntimeMinutes(page);
 });
 
 Given("I hold no Envelope", async ({ journey, page }) => {
@@ -531,7 +624,7 @@ Then("{string} is enabled", async ({ page }, control) => {
 });
 
 Then("the run ends as {string} within {int} min", async ({ journey, page }, phase, minutes) => {
-  await expect(page).toHaveURL(/\/runs\/[^/?#]+/, { timeout: 30_000 });
+  await expect(page).toHaveURL(/\/runs\/(?!new(?:[/?#]|$))[^/?#]+/, { timeout: 30_000 });
   const taskUid = new URL(page.url()).pathname.split("/").filter(Boolean).at(-1);
   expect(taskUid, "the run detail address should include the Task UID").toBeTruthy();
   const deadline = Date.now() + minutes * 60_000;
@@ -567,13 +660,16 @@ Then("the run output contains {string}", async ({ journey, page }, expected) => 
   expect(output).toContain(expectedOutput);
 });
 
-Then("the spend of the run is above {float} USD", async ({ journey }, minimum) => {
+Then("the spend of the run is above {float} USD", async ({ journey, page }, minimum) => {
   expect(journey.run?.observedSpend?.currency).toBe("USD");
   expect(Number(journey.run.observedSpend.observedAmount)).toBeGreaterThan(minimum);
+  const spend = page.locator("#workspace dt").filter({ hasText: /^Spend$/ }).first().locator("xpath=following-sibling::dd[1]");
+  await expect(spend).toHaveText(/^\d+(?:\.\d+)? USD$/);
+  expect(Number((await spend.innerText()).split(/\s+/)[0]), "the Run page should show spend above the expected minimum").toBeGreaterThan(minimum);
 });
 
 Then("every amount of money on the page has {int} decimals and the unit {string}", async ({ page }, decimals, unit) => {
-  const amounts = (await page.locator("main").innerText()).match(new RegExp(`\\b\\d+(?:\\.\\d+)? ${escapeRegExp(unit)}\\b`, "g")) ?? [];
+  const amounts = (await page.locator("#workspace").innerText()).match(new RegExp(`\\b\\d+(?:\\.\\d+)? ${escapeRegExp(unit)}\\b`, "g")) ?? [];
   expect(amounts.length, `the page should show at least one amount in ${unit}`).toBeGreaterThan(0);
   for (const amount of amounts) {
     expect(amount).toMatch(new RegExp(`\\.\\d{${decimals}} ${escapeRegExp(unit)}$`));
@@ -596,7 +692,7 @@ When("I start a Hello world run with the Envelope from the template {string}", a
   expect(request, `a provisioned Envelope from ${templateId(name)} should exist`).toBeTruthy();
   journey.requests.set(name, request);
   await fieldLocator(page, "Envelope").selectOption(request.id);
-  await chooseFirstOfferedModel(page);
+  await selectConfiguredRuntime(page);
   const source = fieldLocator(page, "Package source");
   if (await source.count()) await source.selectOption({ label: "Inline package" });
   await page.getByRole("button", { name: "Run now", exact: true }).click();
