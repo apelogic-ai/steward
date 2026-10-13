@@ -39,8 +39,9 @@ use steward_controller::{
 use steward_ports::{
     InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
     InferenceRequest, PortError, ProviderControlExecutionBindings, ProvisionedInference,
-    SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput,
-    SandboxTaskRequest, SandboxTaskRuntime, SandboxTaskTranscript, TaskAttemptId,
+    SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxObservation, SandboxRequest, SandboxRuntime,
+    SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
+    SandboxTaskTranscript, TaskAttemptId,
 };
 use steward_store::{
     AgentRunLogStream, AgentRunTimelineKind, BrowserMemberStateAction, BrowserMemberStateChange,
@@ -2741,6 +2742,156 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .await
         .is_err(),
         "a historical archive must not be relabelled after its bytes become immutable"
+    );
+
+    let scratch_failure_task_uid = Uuid::new_v4();
+    let scratch_failure_operation_id = Uuid::new_v4();
+    let scratch_failure_runtime_name = format!("scratch-failure-{suffix}");
+    insert_task_projection_fixture(
+        &pool,
+        TaskProjectionFixture {
+            source_task_uid: task_uid,
+            task_uid: scratch_failure_task_uid,
+            operation_id: scratch_failure_operation_id,
+            idempotency_key: &format!("scratch-failure-{suffix}"),
+            task_runtime_name: &scratch_failure_runtime_name,
+            operation_runtime_name: &scratch_failure_runtime_name,
+            inert_manifest_digest: &inert_digest,
+            active_manifest_digest: &active_digest,
+            direct_task_evidence: None,
+        },
+    )
+    .await?;
+    store
+        .put_task_inputs(
+            scratch_failure_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"scratch failure input",
+        )
+        .await?;
+    store
+        .request_task_execution(
+            scratch_failure_task_uid,
+            &service,
+            identity.user_id.as_str(),
+        )
+        .await?;
+    store
+        .authorize_task_runtime_creation(scratch_failure_task_uid, 1, "test-controller")
+        .await?;
+    let scratch_operation = store
+        .task_runtime_operation(scratch_failure_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    let scratch_runtime_uid = format!("scratch-runtime-{suffix}");
+    store
+        .record_task_runtime_observed(
+            scratch_failure_task_uid,
+            scratch_operation.generation,
+            &scratch_runtime_uid,
+            "1",
+            "test-controller",
+        )
+        .await?;
+    let scratch_operation = store
+        .task_runtime_operation(scratch_failure_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .decide_task_runtime_authority_v3(
+            scratch_failure_task_uid,
+            scratch_operation.generation,
+            "test-controller",
+        )
+        .await?;
+    let scratch_operation = store
+        .task_runtime_operation(scratch_failure_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .decide_task_runtime_authority_v3(
+            scratch_failure_task_uid,
+            scratch_operation.generation,
+            "test-controller",
+        )
+        .await?;
+    let scratch_operation = store
+        .task_runtime_operation(scratch_failure_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    store
+        .record_task_activation_observed(
+            scratch_failure_task_uid,
+            scratch_operation.generation,
+            &TaskActivationObservation {
+                runtime_uid: &scratch_runtime_uid,
+                resource_version: "2",
+                active_manifest_digest: &active_digest,
+                provider_set_ready: true,
+            },
+            "test-controller",
+        )
+        .await?;
+    let scratch_attempt = match store
+        .claim_task_execution_attempt(
+            scratch_failure_task_uid,
+            &format!("sha256:{}", "d".repeat(64)),
+            &format!("sha256:{}", "e".repeat(64)),
+            "test-controller",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Created(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "scratch failure execution attempt was not created: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    let scratch_attempt = match store
+        .authorize_task_execution_start(
+            scratch_attempt.attempt_id,
+            scratch_attempt.generation,
+            "test-controller",
+        )
+        .await?
+    {
+        TaskExecutionTransition::Applied(attempt) => attempt,
+        transition => {
+            return Err(io::Error::other(format!(
+                "scratch failure execution start was not authorized: {transition:?}"
+            ))
+            .into());
+        }
+    };
+    let scratch_adapter_observation_id = scratch_attempt.attempt_id.to_string();
+    let scratch_terminal = store
+        .record_task_execution_observation(
+            scratch_attempt.attempt_id,
+            scratch_attempt.generation,
+            TaskExecutionObservation::Failed {
+                adapter_observation_id: &scratch_adapter_observation_id,
+                reason: SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
+                execution_stdout: None,
+                execution_stderr: None,
+            },
+            "test-controller",
+        )
+        .await?;
+    assert!(matches!(
+        scratch_terminal,
+        TaskExecutionTransition::Applied(_)
+    ));
+    let scratch_failed = store
+        .task(scratch_failure_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(scratch_failed.phase, TaskPhase::Failed);
+    assert_eq!(
+        scratch_failed.failure_reason.as_deref(),
+        Some(SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE)
     );
     Ok(())
 }
