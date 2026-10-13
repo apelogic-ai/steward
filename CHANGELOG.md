@@ -9,6 +9,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Custom Envelope workspace controls now keep the complete JSON preview identical to the request.
 - The Envelopes Pending tab now counts and shows only requests that are still awaiting a decision.
 - Scratch workspace capacity mismatches now fail Runs with an actionable storage explanation
   instead of `execution_outcome_unknown`.
