@@ -4617,10 +4617,19 @@ test("administrator creates the first template with a valid budget currency", as
 });
 
 test("new template requires explicit eligibility and identifies invalid fields", async ({ browser }) => {
+  const failureReason = "This display name is already used by another template.";
   const administrator = await guardedPage(browser, {
     expectedHttpStatuses: [422],
     mutationFailures: {
-      "/admin/api/v1/envelope-templates/operator": { status: 422, body: { code: "template_invalid" } },
+      "/admin/api/v1/envelope-templates/operator": {
+        status: 422,
+        body: {
+          apiVersion: "steward.browser-admin/v1",
+          error: "template_invalid",
+          failureReason,
+          fields: ["displayName"],
+        },
+      },
     },
     session: administratorSession,
   });
@@ -4662,7 +4671,8 @@ test("new template requires explicit eligibility and identifies invalid fields",
     expect(administrator.mutations.some((mutation) => mutation.path.startsWith("/admin/api/v1/envelope-templates/"))).toBe(false);
 
     await templateId.fill("operator");
-    await administrator.page.getByRole("textbox", { name: "Display name" }).fill("Operator");
+    const displayName = administrator.page.getByRole("textbox", { name: "Display name" });
+    await displayName.fill("Operator");
     await roles.fill("operator");
     await roles.press("Enter");
     await administrator.page.getByRole("spinbutton", { name: /^Limit per run/ }).fill("1.00");
@@ -4674,9 +4684,14 @@ test("new template requires explicit eligibility and identifies invalid fields",
     await administrator.page.getByRole("checkbox", { name: "Linux" }).check();
     await administrator.page.getByRole("button", { name: "Create template" }).click();
 
-    await expect(administrator.page.getByText("The template couldn't be saved. Check the fields and try again.")).toBeVisible();
+    await expect(administrator.page.getByRole("alert").filter({ hasText: failureReason }).getByText(failureReason, { exact: true })).toBeVisible();
+    await expect(displayName).toHaveAttribute("aria-invalid", "true");
+    await expect(displayName).toHaveClass(/ring-err/);
     await administrator.page.getByText("Details", { exact: true }).click();
     await expect(administrator.page.getByText("template_invalid", { exact: true })).toBeVisible();
+    await displayName.fill("Operator revised");
+    await expect(displayName).not.toHaveAttribute("aria-invalid", "true");
+    await expect(displayName).not.toHaveClass(/ring-err/);
   } finally {
     await closeGuardedPage(administrator);
   }

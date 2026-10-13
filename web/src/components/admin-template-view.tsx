@@ -10,6 +10,8 @@ import {
   putAdminEnvelopeTemplate,
   type BrowserCapabilityCatalogResponse,
   type BrowserEnvelope,
+  type BrowserEnvelopeTemplateErrorResponse,
+  type BrowserEnvelopeTemplateField,
   type BrowserEnvelopeTemplateResponse,
   type ModelRef,
   type RunnerPlatform,
@@ -28,7 +30,9 @@ import { useSession } from "@/session/session-context";
 
 type TemplateMutationState = "idle" | "saving" | "saved" | "conflict" | "rejected" | "forbidden" | "unavailable" | "error";
 
-type TemplateField = "templateId" | "displayName" | "memberRoles" | "currency" | "monthlyLimit" | "singleRunLimit" | "ttl" | "runtimeMinutes" | "platforms" | "memory" | "compute" | "storage" | "models" | "tools" | "workspace";
+const editableTemplateFields = ["templateId", "displayName", "memberRoles", "currency", "monthlyLimit", "singleRunLimit", "ttl", "runtimeMinutes", "platforms", "memory", "compute", "storage", "models", "tools", "workspace"] as const satisfies ReadonlyArray<BrowserEnvelopeTemplateField>;
+
+type TemplateField = (typeof editableTemplateFields)[number];
 
 export type TemplateFieldErrors = Partial<Record<TemplateField, string>>;
 
@@ -68,6 +72,19 @@ export const initialEnvelopeTemplate: BrowserEnvelope = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function isEditableTemplateField(value: BrowserEnvelopeTemplateField): value is TemplateField {
+  return editableTemplateFields.some((field) => field === value);
+}
+
+function templateErrorResponse(value: unknown): BrowserEnvelopeTemplateErrorResponse | null {
+  if (!isRecord(value)
+    || typeof value.error !== "string"
+    || typeof value.failureReason !== "string"
+    || !Array.isArray(value.fields)
+    || value.fields.some((field) => typeof field !== "string")) return null;
+  return value as unknown as BrowserEnvelopeTemplateErrorResponse;
 }
 
 function validTemplateIdentifier(value: string): boolean {
@@ -538,6 +555,8 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
   const [status, setStatus] = useState<TemplateMutationState>(searchParams.get("saved") === "new" ? "saved" : "idle");
   const [diagnostics, setDiagnostics] = useState<DiagnosticItem[]>([]);
   const [fieldErrors, setFieldErrors] = useState<TemplateFieldErrors>({});
+  const [failureReason, setFailureReason] = useState<string | null>(null);
+  const [rejectedFields, setRejectedFields] = useState<Array<TemplateField>>([]);
   const [currentRevision, setCurrentRevision] = useState(template.revision);
   const [models, setModels] = useState<Array<ModelRef>>(template.spec.llms);
   const [tools, setTools] = useState<Array<ToolGrant>>(template.spec.tools.map((tool) => ({
@@ -576,7 +595,11 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       delete next[field];
       return next;
     });
+    setRejectedFields((current) => current.filter((candidate) => candidate !== field));
   }
+
+  const fieldInvalid = (field: TemplateField) => Boolean(fieldErrors[field]) || rejectedFields.includes(field);
+  const invalidFieldClass = (field: TemplateField) => fieldInvalid(field) ? "border-err ring-1 ring-err" : "";
 
   function updateRoles(next: Array<string>) {
     setRolesEdited(true);
@@ -640,6 +663,8 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
     }
     setStatus("saving");
     setDiagnostics([]);
+    setFailureReason(null);
+    setRejectedFields([]);
     const result = await putAdminEnvelopeTemplate({
       body: {
         displayName: name.trim(),
@@ -660,11 +685,16 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       return;
     }
     setStatus(classifyMutationFailure(result.response?.status));
-    const problem = result.error && typeof result.error === "object" ? result.error as Record<string, unknown> : {};
-    setDiagnostics([
-      { label: "Code", value: problem.error ?? problem.code },
-      { label: "Reason", value: problem.failureReason ?? problem.reason ?? problem.message },
-    ]);
+    const problem = templateErrorResponse(result.error);
+    const fallbackProblem = result.error && typeof result.error === "object" ? result.error as Record<string, unknown> : {};
+    setFailureReason(problem?.failureReason ?? null);
+    setRejectedFields(problem?.fields.filter(isEditableTemplateField) ?? []);
+    setDiagnostics(problem
+      ? [{ label: "Code", value: problem.error }]
+      : [
+          { label: "Code", value: fallbackProblem.error ?? fallbackProblem.code },
+          { label: "Reason", value: fallbackProblem.failureReason ?? fallbackProblem.reason ?? fallbackProblem.message },
+        ]);
   }
 
   const runner = template.spec.runner;
@@ -683,22 +713,23 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
         {limitsHelp}
         <FormSection description="Choose a template ID, then add every member role that can request it." title="Member roles">
           <div className="grid gap-4 sm:grid-cols-3">
-            <label className="grid gap-2 text-sm font-semibold">Template ID<input aria-invalid={Boolean(fieldErrors.templateId)} className={`${fieldClass} font-mono`} name="newTemplateId" onChange={(event) => { setTemplateIdDraft(event.target.value); clearFieldError("templateId"); if (!rolesEdited) clearFieldError("memberRoles"); }} placeholder="developer" required value={templateIdDraft} /><FieldError message={fieldErrors.templateId} /></label>
-            <label className="grid gap-2 text-sm font-semibold">Display name<input aria-invalid={Boolean(fieldErrors.displayName)} className={fieldClass} name="displayName" onChange={(event) => { setName(event.target.value); clearFieldError("displayName"); }} required value={name} /><FieldError message={fieldErrors.displayName} /></label>
-            <label className="grid gap-2 text-sm font-semibold">Eligible member roles<TagSelect addPlaceholder="Add another role…" allowCreate emptyPlaceholder="Add member role…" label="Eligible member roles" onChange={updateRoles} options={roleOptions} value={selectedRoles} /><FieldError message={fieldErrors.memberRoles} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Template ID<input aria-invalid={fieldInvalid("templateId") || undefined} className={`${fieldClass} ${invalidFieldClass("templateId")} font-mono`} name="newTemplateId" onChange={(event) => { setTemplateIdDraft(event.target.value); clearFieldError("templateId"); if (!rolesEdited) clearFieldError("memberRoles"); }} placeholder="developer" required value={templateIdDraft} /><FieldError message={fieldErrors.templateId} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Display name<input aria-invalid={fieldInvalid("displayName") || undefined} className={`${fieldClass} ${invalidFieldClass("displayName")}`} name="displayName" onChange={(event) => { setName(event.target.value); clearFieldError("displayName"); }} required value={name} /><FieldError message={fieldErrors.displayName} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Eligible member roles<TagSelect aria-invalid={fieldInvalid("memberRoles") || undefined} addPlaceholder="Add another role…" allowCreate emptyPlaceholder="Add member role…" label="Eligible member roles" onChange={updateRoles} options={roleOptions} value={selectedRoles} /><FieldError message={fieldErrors.memberRoles} /></label>
           </div>
         </FormSection>
         <FormSection description={`Set spend limits in ${budgetCurrency} and how long an envelope stays valid.`} title="Budget and lifetime">
           <FieldError message={fieldErrors.currency} />
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            <label className="grid gap-2 text-sm font-semibold">Limit per run<MoneyInput aria-invalid={Boolean(fieldErrors.singleRunLimit)} currency={budgetCurrency} onChange={(value) => { setSingleRunLimit(value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label>
-            <label className="grid gap-2 text-sm font-semibold">Monthly limit<MoneyInput aria-invalid={Boolean(fieldErrors.monthlyLimit)} currency={budgetCurrency} onChange={(value) => { setMonthlyLimit(value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label>
-            <label className="grid gap-2 text-sm font-semibold">Time-to-live limit<DurationInput aria-invalid={Boolean(fieldErrors.ttl)} onChange={(value) => { setTtl(value); clearFieldError("ttl"); }} required unitAriaLabel="Time-to-live unit" value={ttl} /><FieldError message={fieldErrors.ttl} /></label>
-            <label className="grid gap-2 text-sm font-semibold">Runtime limit per month<DurationInput aria-invalid={Boolean(fieldErrors.runtimeMinutes)} mode="minutes" onChange={(value) => { setRuntimeMinutesLimit(value); clearFieldError("runtimeMinutes"); }} value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Limit per run<MoneyInput aria-invalid={fieldInvalid("singleRunLimit") || undefined} className={invalidFieldClass("singleRunLimit")} currency={budgetCurrency} onChange={(value) => { setSingleRunLimit(value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Monthly limit<MoneyInput aria-invalid={fieldInvalid("monthlyLimit") || undefined} className={invalidFieldClass("monthlyLimit")} currency={budgetCurrency} onChange={(value) => { setMonthlyLimit(value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Time-to-live limit<DurationInput aria-invalid={fieldInvalid("ttl") || undefined} className={invalidFieldClass("ttl")} onChange={(value) => { setTtl(value); clearFieldError("ttl"); }} required unitAriaLabel="Time-to-live unit" value={ttl} /><FieldError message={fieldErrors.ttl} /></label>
+            <label className="grid gap-2 text-sm font-semibold">Runtime limit per month<DurationInput aria-invalid={fieldInvalid("runtimeMinutes") || undefined} className={invalidFieldClass("runtimeMinutes")} mode="minutes" onChange={(value) => { setRuntimeMinutesLimit(value); clearFieldError("runtimeMinutes"); }} value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label>
           </div>
         </FormSection>
         <FormSection description="Only models available in this installation can be selected." title="Models">
           <TagSelect
+            aria-invalid={fieldInvalid("models") || undefined}
             addPlaceholder="Add…"
             emptyPlaceholder="Search models…"
             inputDisabled={modelCatalog.length === 0}
@@ -717,19 +748,19 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
           {missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not available in this installation. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are available in this installation.</p> : null}
         </FormSection>
         <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Available tools"}. Tool groups appear when this installation provides them.`} title="Tools">
-          <ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} tools={tools} />
+          <div aria-invalid={fieldInvalid("tools") || undefined} className={`rounded-control ${invalidFieldClass("tools")}`}><ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} tools={tools} /></div>
           <FieldError message={fieldErrors.tools} />
         </FormSection>
         <FormSection description="Choose the workspace types this template allows. Operational limits come from the deployment." title="Workspace access">
-          {workspaceControls}
+          <div aria-invalid={fieldInvalid("workspace") || undefined} className={`rounded-control ${invalidFieldClass("workspace")}`}>{workspaceControls}</div>
         </FormSection>
         <FormSection description="Repository packages remain available when inline authoring is disabled." title="Browser execution">
           <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={allowInlineBrowserTasks} onChange={(event) => setAllowInlineBrowserTasks(event.target.checked)} type="checkbox" />Allow inline browser-authored packages</label>
         </FormSection>
         <FormSection description="Choose at least one platform. Leave resources blank to use platform defaults." title="Runner">
-          <fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" onChange={() => clearFieldError("platforms")} type="checkbox" value={platform} />{platform}</label>)}</div><FieldError message={fieldErrors.platforms} /><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset>
+          <fieldset aria-invalid={fieldInvalid("platforms") || undefined} className={`space-y-4 rounded-control ${invalidFieldClass("platforms")}`}><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input aria-invalid={fieldInvalid("platforms") || undefined} defaultChecked={runner?.platforms?.includes(platform)} name="platforms" onChange={() => clearFieldError("platforms")} type="checkbox" value={platform} />{platform}</label>)}</div><FieldError message={fieldErrors.platforms} /><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={fieldInvalid("memory") || undefined} className={`${fieldClass} ${invalidFieldClass("memory")} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={fieldInvalid("compute") || undefined} className={`${fieldClass} ${invalidFieldClass("compute")} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={fieldInvalid("storage") || undefined} className={`${fieldClass} ${invalidFieldClass("storage")} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset>
         </FormSection>
-        {status !== "idle" && status !== "saving" ? <div className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}><p>{mutationMessage(status)}</p><DiagnosticDetails className="mt-1" items={diagnostics} /></div> : null}
+        {status !== "idle" && status !== "saving" ? <div className={`px-6 py-3 text-sm ${status === "saved" ? "text-ok" : "text-err"}`} role={status === "saved" ? "status" : "alert"}><p>{status === "rejected" && failureReason ? failureReason : mutationMessage(status)}</p><DiagnosticDetails className="mt-1" items={diagnostics} /></div> : null}
         <footer className="sticky bottom-0 flex flex-wrap items-center justify-between gap-4 border-t bg-subtle px-6 py-4"><p className="text-sm text-muted-ink">{formatCount(models.length, "model")} · {formatCount(tools.length, "tool")} · Limit per run: {singleRunLimit ? formatMoney(singleRunLimit, budgetCurrency) : "—"}</p><div className="flex gap-3"><Link className="rounded-control border bg-panel px-4 py-2 text-sm font-semibold" href="/admin/envelopes/templates">Cancel</Link><button className="rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="create">{status === "saving" ? "Saving…" : "Create template"}</button></div></footer>
       </form>
     );
@@ -744,7 +775,7 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
       {limitsHelp}
 
       <FormSection description="The member roles allowed to request this template." title="Template identity and eligibility">
-        <div className="grid gap-4 sm:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Display name<input aria-invalid={Boolean(fieldErrors.displayName)} className={fieldClass} name="displayName" onChange={(event) => { setName(event.target.value); clearFieldError("displayName"); }} required value={name} /><FieldError message={fieldErrors.displayName} /></label><label className="grid gap-2 text-sm font-semibold">Eligible member roles<TagSelect addPlaceholder="Add another role…" allowCreate emptyPlaceholder="Add member role…" label="Eligible member roles" onChange={updateRoles} options={roleOptions} value={selectedRoles} /><FieldError message={fieldErrors.memberRoles} /></label></div>
+        <div className="grid gap-4 sm:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Display name<input aria-invalid={fieldInvalid("displayName") || undefined} className={`${fieldClass} ${invalidFieldClass("displayName")}`} name="displayName" onChange={(event) => { setName(event.target.value); clearFieldError("displayName"); }} required value={name} /><FieldError message={fieldErrors.displayName} /></label><label className="grid gap-2 text-sm font-semibold">Eligible member roles<TagSelect aria-invalid={fieldInvalid("memberRoles") || undefined} addPlaceholder="Add another role…" allowCreate emptyPlaceholder="Add member role…" label="Eligible member roles" onChange={updateRoles} options={roleOptions} value={selectedRoles} /><FieldError message={fieldErrors.memberRoles} /></label></div>
       </FormSection>
       <FormSection description="Repository packages remain available when inline authoring is disabled." title="Browser execution">
         <label className="flex min-h-10 items-center gap-3 text-sm font-semibold"><input checked={allowInlineBrowserTasks} onChange={(event) => setAllowInlineBrowserTasks(event.target.checked)} type="checkbox" />Allow inline browser-authored packages</label>
@@ -752,25 +783,25 @@ function TemplateEditor({ allowInlineBrowserTasks: initialAllowInlineBrowserTask
 
       <FormSection description={`Inference spend limits in ${budgetCurrency} and how long an envelope stays valid.`} title="Budget and lifetime">
         <FieldError message={fieldErrors.currency} />
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Limit per run<MoneyInput aria-invalid={Boolean(fieldErrors.singleRunLimit)} currency={budgetCurrency} onChange={(value) => { setSingleRunLimit(value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label><label className="grid gap-2 text-sm font-semibold">Monthly limit<MoneyInput aria-invalid={Boolean(fieldErrors.monthlyLimit)} currency={budgetCurrency} onChange={(value) => { setMonthlyLimit(value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label><label className="grid gap-2 text-sm font-semibold">Time-to-live limit<DurationInput aria-invalid={Boolean(fieldErrors.ttl)} onChange={(value) => { setTtl(value); clearFieldError("ttl"); }} required unitAriaLabel="Time-to-live unit" value={ttl} /><FieldError message={fieldErrors.ttl} /></label><label className="grid gap-2 text-sm font-semibold">Runtime limit per month<DurationInput aria-invalid={Boolean(fieldErrors.runtimeMinutes)} mode="minutes" onChange={(value) => { setRuntimeMinutesLimit(value); clearFieldError("runtimeMinutes"); }} value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label></div>
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"><label className="grid gap-2 text-sm font-semibold">Limit per run<MoneyInput aria-invalid={fieldInvalid("singleRunLimit") || undefined} className={invalidFieldClass("singleRunLimit")} currency={budgetCurrency} onChange={(value) => { setSingleRunLimit(value); clearFieldError("singleRunLimit"); }} required value={singleRunLimit} /><FieldError message={fieldErrors.singleRunLimit} /></label><label className="grid gap-2 text-sm font-semibold">Monthly limit<MoneyInput aria-invalid={fieldInvalid("monthlyLimit") || undefined} className={invalidFieldClass("monthlyLimit")} currency={budgetCurrency} onChange={(value) => { setMonthlyLimit(value); clearFieldError("monthlyLimit"); }} required value={monthlyLimit} /><FieldError message={fieldErrors.monthlyLimit} /></label><label className="grid gap-2 text-sm font-semibold">Time-to-live limit<DurationInput aria-invalid={fieldInvalid("ttl") || undefined} className={invalidFieldClass("ttl")} onChange={(value) => { setTtl(value); clearFieldError("ttl"); }} required unitAriaLabel="Time-to-live unit" value={ttl} /><FieldError message={fieldErrors.ttl} /></label><label className="grid gap-2 text-sm font-semibold">Runtime limit per month<DurationInput aria-invalid={fieldInvalid("runtimeMinutes") || undefined} className={invalidFieldClass("runtimeMinutes")} mode="minutes" onChange={(value) => { setRuntimeMinutesLimit(value); clearFieldError("runtimeMinutes"); }} value={runtimeMinutesLimit} /><FieldError message={fieldErrors.runtimeMinutes} /></label></div>
       </FormSection>
 
-      <FormSection description="Only models available in this installation can be selected." title="Models"><fieldset><legend className="sr-only">Models</legend><TagSelect addPlaceholder="Add…" emptyPlaceholder="Search models…" inputDisabled={modelCatalog.length === 0} label="Models" onChange={(keys) => { setModels(keys.flatMap((key) => { const model = [...modelCatalog, ...missingModels].find((candidate) => modelKey(candidate) === key); return model ? [model] : []; })); clearFieldError("models"); }} options={modelOptions} value={models.map(modelKey)} /><FieldError message={fieldErrors.models} />{missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not available in this installation. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are available in this installation.</p> : null}</fieldset></FormSection>
+      <FormSection description="Only models available in this installation can be selected." title="Models"><fieldset><legend className="sr-only">Models</legend><TagSelect aria-invalid={fieldInvalid("models") || undefined} addPlaceholder="Add…" emptyPlaceholder="Search models…" inputDisabled={modelCatalog.length === 0} label="Models" onChange={(keys) => { setModels(keys.flatMap((key) => { const model = [...modelCatalog, ...missingModels].find((candidate) => modelKey(candidate) === key); return model ? [model] : []; })); clearFieldError("models"); }} options={modelOptions} value={models.map(modelKey)} /><FieldError message={fieldErrors.models} />{missingModels.length ? <p className="mt-2 text-sm text-warn">{missingModels.length} selected model{missingModels.length === 1 ? " is" : "s are"} not available in this installation. Remove or replace before saving.</p> : modelCatalog.length === 0 ? <p className="mt-2 text-sm text-muted-ink">No models are available in this installation.</p> : null}</fieldset></FormSection>
 
-      <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Available tools"}. Tool groups appear when this installation provides them.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} previousTools={previousTools} tools={tools} /><FieldError message={fieldErrors.tools} /></fieldset></FormSection>
+      <FormSection description={`${capabilities.catalogs.map((catalog) => `${displayName(catalog.provider)} ${catalog.version}`).join(" · ") || "Available tools"}. Tool groups appear when this installation provides them.`} title="Tools"><fieldset><legend className="sr-only">Tools</legend><div aria-invalid={fieldInvalid("tools") || undefined} className={`rounded-control ${invalidFieldClass("tools")}`}><ToolPicker catalog={toolCatalog} missingTools={missingTools} onChange={(next) => { setTools(next); clearFieldError("tools"); }} previousTools={previousTools} tools={tools} /></div><FieldError message={fieldErrors.tools} /></fieldset></FormSection>
 
-      <FormSection description="Choose the workspace types this template allows. Operational limits come from the deployment." title="Workspace access">{workspaceControls}</FormSection>
+      <FormSection description="Choose the workspace types this template allows. Operational limits come from the deployment." title="Workspace access"><div aria-invalid={fieldInvalid("workspace") || undefined} className={`rounded-control ${invalidFieldClass("workspace")}`}>{workspaceControls}</div></FormSection>
 
-      <FormSection description="Choose the platforms this template allows. Leave resources blank to use platform defaults." title="Runner"><fieldset className="space-y-4"><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input defaultChecked={runner?.platforms?.includes(platform)} name="platforms" onChange={() => clearFieldError("platforms")} type="checkbox" value={platform} />{platform}</label>)}</div><FieldError message={fieldErrors.platforms} /><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={Boolean(fieldErrors.memory)} className={`${fieldClass} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={Boolean(fieldErrors.compute)} className={`${fieldClass} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={Boolean(fieldErrors.storage)} className={`${fieldClass} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
+      <FormSection description="Choose the platforms this template allows. Leave resources blank to use platform defaults." title="Runner"><fieldset aria-invalid={fieldInvalid("platforms") || undefined} className={`space-y-4 rounded-control ${invalidFieldClass("platforms")}`}><legend className="sr-only">Runner</legend><div className="grid gap-3 sm:grid-cols-3">{(["linux", "mac", "windows"] as const).map((platform) => <label className="flex min-h-11 cursor-pointer items-center gap-2 rounded-control border px-4 text-sm capitalize has-[:checked]:border-brand has-[:checked]:bg-brand-soft" key={platform}><input aria-invalid={fieldInvalid("platforms") || undefined} defaultChecked={runner?.platforms?.includes(platform)} name="platforms" onChange={() => clearFieldError("platforms")} type="checkbox" value={platform} />{platform}</label>)}</div><FieldError message={fieldErrors.platforms} /><div className="grid gap-4 sm:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Memory<input aria-invalid={fieldInvalid("memory") || undefined} className={`${fieldClass} ${invalidFieldClass("memory")} font-mono`} defaultValue={runner?.memory ?? ""} name="memory" onChange={() => clearFieldError("memory")} placeholder="2Gi" /><FieldError message={fieldErrors.memory} /></label><label className="grid gap-2 text-sm font-semibold">Compute<input aria-invalid={fieldInvalid("compute") || undefined} className={`${fieldClass} ${invalidFieldClass("compute")} font-mono`} defaultValue={runner?.compute ?? ""} name="compute" onChange={() => clearFieldError("compute")} placeholder="1000m" /><FieldError message={fieldErrors.compute} /></label><label className="grid gap-2 text-sm font-semibold">Storage<input aria-invalid={fieldInvalid("storage") || undefined} className={`${fieldClass} ${invalidFieldClass("storage")} font-mono`} defaultValue={runner?.storage ?? ""} name="storage" onChange={() => clearFieldError("storage")} placeholder="10Gi" /><FieldError message={fieldErrors.storage} /></label></div></fieldset></FormSection>
 
       {status !== "idle" && status !== "saving" ? (
-        <div className={status === "saved" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "saved" ? "status" : "alert"}><p>{mutationMessage(status)}</p><DiagnosticDetails className="mt-1" items={diagnostics} /></div>
+        <div className={status === "saved" ? "text-sm text-green-800" : "text-sm text-red-800"} role={status === "saved" ? "status" : "alert"}><p>{status === "rejected" && failureReason ? failureReason : mutationMessage(status)}</p><DiagnosticDetails className="mt-1" items={diagnostics} /></div>
       ) : null}
 
       <div className="flex flex-wrap items-end gap-3 border-t pt-5">
         <button className="min-h-11 rounded-md bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value={create ? "create" : "version"}>{status === "saving" ? "Saving…" : create ? "Create template" : "Save new version"}</button>
         <label className="grid min-w-56 flex-1 gap-2 text-sm font-semibold">{create ? "Template ID" : "New template ID"}
-          <input aria-invalid={Boolean(fieldErrors.templateId)} className={fieldClass} name="newTemplateId" onChange={() => clearFieldError("templateId")} placeholder="developer" required={create} />
+          <input aria-invalid={fieldInvalid("templateId") || undefined} className={`${fieldClass} ${invalidFieldClass("templateId")}`} name="newTemplateId" onChange={() => clearFieldError("templateId")} placeholder="developer" required={create} />
           <FieldError message={fieldErrors.templateId} />
         </label>
         {!create ? <button className="min-h-11 rounded-md border px-4 py-2 text-sm font-semibold hover:bg-canvas disabled:opacity-50" disabled={status === "saving"} name="action" type="submit" value="copy">Save as new</button> : null}
