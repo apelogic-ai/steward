@@ -9952,7 +9952,7 @@ mod webhook_tests {
         assert_eq!(response.uid, "request-a");
         assert_eq!(
             response.result.message,
-            "Monthly budget: requested $220.00, limit $200.00"
+            "Monthly budget 220.00 USD is more than the 200.00 USD this Envelope allows"
         );
         Ok(())
     }
@@ -10066,7 +10066,7 @@ mod webhook_tests {
         assert_eq!(
             review.pointer("/response/status/message"),
             Some(&serde_json::json!(
-                "Monthly budget: requested $220.00, limit $200.00"
+                "Monthly budget 220.00 USD is more than the 200.00 USD this Envelope allows"
             ))
         );
         Ok(())
@@ -10110,7 +10110,7 @@ mod webhook_tests {
         );
         assert_eq!(
             other_response.result.message,
-            "Monthly budget: requested $220.00, limit $200.00"
+            "Monthly budget 220.00 USD is more than the 200.00 USD this Envelope allows"
         );
         Ok(())
     }

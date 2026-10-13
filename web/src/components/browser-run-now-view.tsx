@@ -69,6 +69,14 @@ export function packageLocatorForTask(task: ExactTaskLocator): BrowserPackageLoc
 function failureHint(code: string | null, reason: string): string | null {
   if (code === "task.direct_package_source_disabled") return "Choose an inline task or ask an administrator to enable GitHub source packages.";
   if (reason.includes("selected model is not allowed")) return "Choose an agent compatible with this Envelope, or request an Envelope that allows its model.";
+  if (reason === "workspace type scratch is not allowed; effective choices: git") return "This Envelope allows Git workspaces, but the Task asks for a scratch workspace. Change the Task workspace or choose a different Envelope.";
+  if (reason.includes("logical agent") && reason.includes("has no deployment execution binding")) return "Ask an administrator to configure this coding agent, or choose another agent.";
+  if (reason.includes("direct package Git source resolver is unavailable")) return "Choose an inline task or ask an administrator to enable GitHub source packages.";
+  if (reason.includes("repository package revision is required")) return "Choose a branch, tag, or exact commit for the repository package, then try again.";
+  if (reason.includes("registry package revision is required")) return "Choose a published Task version, then try again.";
+  if (reason.includes("inline package entry point is missing") || reason.includes("inline packages require files")) return "Open the Task editor, restore the package files and entry point, then try again.";
+  if (reason.includes("package file") && reason.includes("is missing")) return "Open the Task editor, restore the missing package file, then try again.";
+  if (reason.includes("TaskDefinition is invalid") || (reason.includes("package revision") && reason.includes("does not match"))) return "Open the Task editor, fix and save the package, then try again.";
   return null;
 }
 
@@ -82,10 +90,23 @@ function repositoryWorkspaceFailure(reason: string): boolean {
 
 function sentence(value: string): string {
   const trimmed = value.trim();
-  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+  const capitalized = trimmed ? `${trimmed.charAt(0).toLocaleUpperCase("en-US")}${trimmed.slice(1)}` : trimmed;
+  return /[.!?]$/.test(capitalized) ? capitalized : `${capitalized}.`;
 }
 
-export function runNowFailureMessage(error: unknown, workspaceRepository?: string): string {
+function nextStep(reason: string): string {
+  const normalized = reason.toLocaleLowerCase("en-US");
+  if ((normalized.includes("branch") || normalized.includes("tag")) && normalized.includes("not found")) return "Choose an existing branch or tag, then try again.";
+  if (normalized.includes("repository") && (normalized.includes("not approved") || normalized.includes("not admitted") || normalized.includes("not allowed"))) return "Choose an approved repository or ask an administrator to approve this one.";
+  return "Reduce the Task requirements or choose a different Envelope.";
+}
+
+function alreadyHasNextStep(reason: string): boolean {
+  return /\b(?:ask|change|choose|contact|reduce|replace|retry|try|verify)\b/i.test(reason);
+}
+
+export function runNowFailureMessage(error: unknown, workspaceRepository?: string, status?: number): string {
+  if (status === 503) return "The run service is unavailable. Try again in a moment.";
   if (!error || typeof error !== "object") return genericRunNowFailure;
   const value = error as Record<string, unknown>;
   const code = typeof value.error === "string" && value.error.trim() ? value.error : null;
@@ -100,9 +121,10 @@ export function runNowFailureMessage(error: unknown, workspaceRepository?: strin
       && !reason.toLocaleLowerCase("en-US").includes(workspaceRepository.toLocaleLowerCase("en-US"))
       ? ` Repository: ${workspaceRepository}.`
       : "";
-    return `The run request was rejected. ${sentence(reason)}${repository}`;
+    const action = alreadyHasNextStep(reason) ? "" : ` ${nextStep(reason)}`;
+    return `The run request was rejected. ${sentence(reason)}${repository}${action}`;
   }
-  if (code?.includes(" ")) return `The run request was rejected. ${sentence(code)}`;
+  if (code?.includes(" ")) return `The run request was rejected. ${sentence(code)} ${nextStep(code)}`;
   return genericRunNowFailure;
 }
 
@@ -202,7 +224,7 @@ export function BrowserRunNowView() {
   const state = useApiResource<RunNowData>(load);
   return (
     <section aria-labelledby="page-title" className="space-y-6">
-      <PageHeader description="Run an immutable inline, repository, or published package under one of your active Envelopes." title="Run now" />
+      <PageHeader description="Run an inline, repository, or published package with one of your active Envelopes." title="Run now" />
       <ResourceBoundary state={state}>{(data) => !data.task && search.get("choose") === "task"
         ? <TaskPicker data={data} initialWorkflow={search.get("workflow")} onSelect={(digest) => router.replace(`/runs/new?task=${encodeURIComponent(digest)}`)} />
         : <RunNowForm data={data} initialWorkflow={search.get("workflow")} key={data.task?.contentDigest ?? "starter"} onCreated={(taskUid) => router.push(`/runs/${taskUid}`)} session={session} />}</ResourceBoundary>
@@ -228,7 +250,7 @@ function TaskPicker({ data, initialWorkflow, onSelect }: Readonly<{
   if (data.tasks.tasks.length === 0) return <div className="rounded-card border bg-panel p-6"><p className="text-sm text-muted-ink">Create and review a Task before starting a Run.</p><Link className="mt-4 inline-flex rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href="/tasks/new">Create Task</Link></div>;
   return <div className="space-y-5 rounded-card border bg-panel p-6">
     <label className="grid gap-2 text-sm font-semibold">Task<select className={fieldClass} onChange={(event) => setDigest(event.target.value)} value={digest}>{data.tasks.tasks.map((task) => <option key={`${task.contentDigest}-${task.source}`} value={task.contentDigest}>{task.name}@{task.version} · {task.source === "inline" ? "draft" : task.source.startsWith("steward:registry/") ? "published" : "Git"}</option>)}</select></label>
-    <p className="text-sm text-muted-ink">Choose one exact immutable Task version. You can review its package before selecting an Envelope and running it.</p>
+    <p className="text-sm text-muted-ink">Choose one saved Task version. You can review its exact package before selecting an Envelope and running it.</p>
     <div className="flex flex-wrap justify-end gap-2"><Link className="inline-flex min-h-10 items-center rounded-control border px-4 text-sm font-semibold" href="/tasks/new">Create Task</Link><Link className="inline-flex min-h-10 items-center rounded-control border px-4 text-sm font-semibold" href={`/tasks/${encodeURIComponent(digest)}`}>Review</Link><button className="rounded-control bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand" onClick={() => onSelect(digest)} type="button">Continue</button></div>
   </div>;
 }
@@ -391,6 +413,7 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
       checkoutRepository && failureWorkspaceRepository
         ? workspaceRepositoryName(failureWorkspaceRepository)
         : undefined,
+      result.response?.status,
     ));
     setFailureDetails(runNowDiagnostics(result.error));
     setStatus("error");
@@ -403,10 +426,10 @@ function RunNowForm({ data, initialWorkflow, onCreated, session }: Readonly<{
       <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} onChange={(event) => selectEnvelope(event.target.value)} value={envelopeId}>{active.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
       {exactTask ? <div className="grid gap-2 text-sm font-semibold">Task<div className={`${fieldClass} flex items-center font-mono text-xs`}>{exactTask.name}@{exactTask.version} · {exactTask.contentDigest}</div></div> : <label className="grid gap-2 text-sm font-semibold">Package source<select className={fieldClass} onChange={(event) => setSourceKind(event.target.value as SourceKind)} value={sourceKind}><option disabled={!inlineAllowed} value="inline">Inline package{inlineAllowed ? "" : " (disabled by template)"}</option><option value="repository">Git repository</option><option value="registry">Published workflow</option></select></label>}
     </div>
-    {exactTask ? <p className="text-sm text-muted-ink">The exact immutable package is locked. Choose an Envelope and optional inputs for this run.</p> : null}
+    {exactTask ? <p className="text-sm text-muted-ink">This exact package cannot be changed here. Choose an Envelope and optional inputs for this run.</p> : null}
     {!exactTask && sourceKind === "inline" ? <div className="grid gap-4"><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Coding agent<select aria-describedby={agentWarning ? agentWarningId : undefined} className={`${fieldClass} font-mono`} onChange={(event) => setAgentRef(event.target.value)} value={effectiveAgentRef}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.displayName ? `${agent.displayName} · ${agent.agentRef}` : agent.agentRef}{agent.compatible ? "" : ` · ${agent.reason}`}</option>)}</select></label><ModelPicker className={fieldClass} describedBy={modelWarning ? modelWarningId : undefined} models={selectedAgent?.models ?? []} onChange={setModel} selected={selectedModel} /></div>{agentWarning ? <p className="text-sm text-warn" id={agentWarningId} role="status">{agentWarning}</p> : null}{modelWarning ? <p className="text-sm text-warn" id={modelWarningId} role="status">{modelWarning}</p> : null}<label className="grid gap-2 text-sm font-semibold">Prompt<span className="text-xs font-normal text-muted-ink">Write results under <code>$STEWARD_OUTPUT_DIR/out/</code>. Only those files are collected; a run with no <code>out/</code> file fails.</span><textarea className="min-h-40 rounded-control border bg-panel p-3 font-normal" onChange={(event) => setPrompt(event.target.value)} value={prompt} /></label><p className="text-xs text-muted-ink">This inline task uses the selected compatible model and {starterTask.taskDefinition.requires ? "uses its saved access requirements" : "inherits the selected Envelope's approved tools, budget, time-to-live limit, and runner limits"}. Open the Task from the completed Run to reuse or publish the exact package.</p></div> : null}
     {!exactTask && sourceKind === "inline" ? <div className="space-y-3 rounded-control border p-4"><label className="flex items-center gap-3 text-sm font-semibold"><input checked={checkoutRepository} onChange={(event) => setCheckoutRepository(event.target.checked)} type="checkbox" />Check out this repository</label>{checkoutRepository ? <RepositoryResource onRetry={refreshRepositories} state={repositoryState}>{({ repositories }) => <div className="grid gap-4 md:grid-cols-3"><label className="grid gap-2 text-sm font-semibold">Workspace repository<select className={fieldClass} onChange={(event) => { const nextId = event.target.value; const next = repositories.find((candidate) => candidate.repositoryId === nextId); setWorkspaceRepositoryId(nextId); setWorkspaceRef(next?.defaultBranch ?? null); }} value={workspaceRepositoryId}><option value="">Default repository at trigger revision</option>{repositories.map((candidate) => <option disabled={!candidate.ready} key={candidate.repositoryId} value={candidate.repositoryId}>{workspaceRepositoryName(candidate)}{candidate.ready ? "" : " · not approved"}</option>)}</select></label><label className="grid gap-2 text-sm font-semibold">Branch or tag<input className={`${fieldClass} font-mono`} disabled={!selectedWorkspaceRepository} onChange={(event) => setWorkspaceRef(event.target.value)} placeholder={selectedWorkspaceRepository?.defaultBranch ?? "Choose a named repository first"} value={effectiveWorkspaceRef} /></label><label className="grid gap-2 text-sm font-semibold">History depth (optional)<input className={fieldClass} min={1} onChange={(event) => setHistoryDepth(event.target.value)} placeholder="Files only" step={1} type="number" value={historyDepth} /></label><p className="text-xs text-muted-ink md:col-span-3">Choose a named repository to pin a branch or tag. The default keeps the repository and revision supplied by the trigger.</p></div>}</RepositoryResource> : null}{checkoutRepository && selectedWorkspaceRepository && !workspaceRefValid ? <p className="text-sm text-err" role="alert">For {workspaceRepositoryName(selectedWorkspaceRepository)}, enter a branch or tag other than HEAD or a commit ID.</p> : null}{checkoutRepository && !historyDepthValid ? <p className="text-sm text-err" role="alert">History depth must be a positive whole number.</p> : null}{checkoutRepository && repositoryState.status === "ready" && !defaultWorkspaceRepository?.ready ? <p className="text-sm text-warn">No approved repository is available for this workspace.</p> : null}</div> : null}
-    {!exactTask && sourceKind === "repository" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Repository<input className={`${fieldClass} font-mono`} onChange={(event) => setRepository(event.target.value)} value={repository} /></label><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Ref or immutable commit<input className={`${fieldClass} font-mono`} onChange={(event) => setRevision(event.target.value)} value={revision} /></label><label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} value={path} /></label></div><p className="text-xs text-muted-ink">The repository must be in the operator&apos;s allowed source list. Steward resolves a ref to an exact commit and validates the package&apos;s declared requirements before execution.</p></div> : null}
+    {!exactTask && sourceKind === "repository" ? <div className="grid gap-4"><label className="grid gap-2 text-sm font-semibold">Repository<input className={`${fieldClass} font-mono`} onChange={(event) => setRepository(event.target.value)} value={repository} /></label><div className="grid gap-4 md:grid-cols-2"><label className="grid gap-2 text-sm font-semibold">Branch, tag, or exact commit<input className={`${fieldClass} font-mono`} onChange={(event) => setRevision(event.target.value)} value={revision} /></label><label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} value={path} /></label></div><p className="text-xs text-muted-ink">The repository must be in the installation&apos;s approved source list. HyperShell resolves a branch or tag to an exact commit and checks the package requirements before starting.</p></div> : null}
     {!exactTask && sourceKind === "registry" ? <label className="grid gap-2 text-sm font-semibold">Published workflow<select className={fieldClass} onChange={(event) => setWorkflowRef(event.target.value)} value={workflowRef}>{data.workflows.workflows.map((workflow) => <option key={`${workflow.name}@${workflow.version}`} value={`${workflow.name}@${workflow.version}`}>{workflow.displayName} · {workflow.name}@{workflow.version}</option>)}</select></label> : null}
     <label className="grid gap-2 text-sm font-semibold">Inputs (JSON object)<span className="text-xs font-normal text-muted-ink">Optional JSON (up to 16 KiB), available to the agent as <code>in/inputs.json</code>. Reference it in your prompt; it cannot change the agent, model, tools, or Envelope. Example: <code>{'{"release":"v1.2.3"}'}</code>.</span><textarea className="min-h-28 rounded-control border bg-panel p-3 font-mono text-xs font-normal" onChange={(event) => setInputs(event.target.value)} spellCheck={false} value={inputs} /></label>
     <label className="flex items-start gap-3 rounded-control border border-warn/30 bg-warn-soft p-4 text-sm"><input checked={captureExecutionLog} className="mt-1 size-4" onChange={(event) => setCaptureExecutionLog(event.target.checked)} type="checkbox" /><span><strong className="block font-semibold text-warn">Capture execution log</strong><span className="mt-1 block text-muted-ink">Retain stdout and stderr for this run. Execution logs may reproduce arbitrary user, tool, or agent output.</span></span></label>

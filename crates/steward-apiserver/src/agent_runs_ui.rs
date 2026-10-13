@@ -2945,7 +2945,7 @@ fn browser_run_stages(
     vec![
         BrowserRunStage {
             id: BrowserRunStageId::Admission,
-            display_name: "Admission",
+            display_name: "Pre-run checks",
             state: BrowserRunStageState::Succeeded,
             steps: Vec::new(),
         },
@@ -3947,6 +3947,7 @@ mod tests {
         assert_eq!(view.phase, TaskPhase::Running);
         assert_eq!(view.stages[1].id, BrowserRunStageId::ProvisionRuntime);
         assert_eq!(view.stages[1].state, BrowserRunStageState::Succeeded);
+        assert_eq!(view.stages[0].display_name, "Pre-run checks");
         assert_eq!(view.stages[2].id, BrowserRunStageId::AgentExecution);
         assert_eq!(view.stages[2].state, BrowserRunStageState::Running);
         Ok(())

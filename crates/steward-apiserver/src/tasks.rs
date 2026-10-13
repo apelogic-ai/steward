@@ -7514,7 +7514,7 @@ mod workflow_request_tests {
                 .map_err(|error| format!("evaluate runtime limit: {error:?}"))?
                 .counterexample()
                 .as_deref(),
-            Some("Runtime allowance: requested 61 minutes, limit 60 minutes")
+            Some("Runtime allowance 61 min is more than the 60 min per month this Envelope allows")
         );
         Ok(())
     }

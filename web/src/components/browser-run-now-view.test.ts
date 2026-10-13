@@ -136,6 +136,13 @@ test("exact Tasks preserve inline bytes but use only immutable locators for Git 
 });
 
 describe("Run now failures", () => {
+  test("distinguishes a temporarily unavailable service from a rejected request", () => {
+    expect(runNowFailureMessage({
+      error: "task.runtime_contract_unavailable",
+      failureReason: "logical agent codex has no deployment execution binding",
+    }, undefined, 503)).toBe("The run service is unavailable. Try again in a moment.");
+  });
+
   test("uses a plain generic message without exposing server text or codes", () => {
     expect(runNowFailureMessage({
       error: "task.persistence_failed",
@@ -152,12 +159,35 @@ describe("Run now failures", () => {
       error: "task.direct_package_source_disabled",
       failureReason: "Direct package source resolution is disabled.",
     })).toBe("The run request was rejected. Choose an inline task or ask an administrator to enable GitHub source packages.");
+    expect(runNowFailureMessage({
+      error: "task.agent_unavailable",
+      failureReason: "logical agent codex has no deployment execution binding",
+    })).toBe("The run request was rejected. Ask an administrator to configure this coding agent, or choose another agent.");
+    expect(runNowFailureMessage({
+      error: "task.admission_rejected",
+      failureReason: "inline package entry point is missing",
+    })).toBe("The run request was rejected. Open the Task editor, restore the package files and entry point, then try again.");
+    expect(runNowFailureMessage({
+      error: "task.admission_rejected",
+      failureReason: "repository package revision is required",
+    })).toBe("The run request was rejected. Choose a branch, tag, or exact commit for the repository package, then try again.");
+  });
+
+  test("explains workspace and Envelope limits in plain language with a next step", () => {
+    expect(runNowFailureMessage({
+      error: "task.admission_rejected",
+      failureReason: "workspace type scratch is not allowed; effective choices: git",
+    })).toBe("The run request was rejected. This Envelope allows Git workspaces, but the Task asks for a scratch workspace. Change the Task workspace or choose a different Envelope.");
+    expect(runNowFailureMessage({
+      error: "task.admission_rejected",
+      failureReason: "Monthly budget 25.00 USD is more than the 20.00 USD this Envelope allows.",
+    })).toBe("The run request was rejected. Monthly budget 25.00 USD is more than the 20.00 USD this Envelope allows. Reduce the Task requirements or choose a different Envelope.");
   });
 
   test("shows a human-readable rejection returned in the error field", () => {
     expect(runNowFailureMessage({
       error: "The selected coding agent does not support this model.",
-    })).toBe("The run request was rejected. The selected coding agent does not support this model.");
+    })).toBe("The run request was rejected. The selected coding agent does not support this model. Reduce the Task requirements or choose a different Envelope.");
   });
 
   test("shows a repository rejection reason and names the selected repository", () => {
@@ -171,13 +201,22 @@ describe("Run now failures", () => {
     expect(message).not.toContain("task.workspace_rejected");
   });
 
+  test("preserves an actionable repository refusal without adding a conflicting next step", () => {
+    expect(runNowFailureMessage({
+      error: "task.workspace_rejected",
+      failureReason: "The requested workspace repository is unavailable. Ask a Steward administrator to verify that it is allowed and accessible.",
+    }, "example-org/repository")).toBe(
+      "The run request was rejected. The requested workspace repository is unavailable. Ask a Steward administrator to verify that it is allowed and accessible. Repository: example-org/repository.",
+    );
+  });
+
   test("does not repeat a repository already named by the server", () => {
     const message = runNowFailureMessage({
       error: "task.workspace_rejected",
       failureReason: "The branch or tag missing-branch was not found in example-org/repository.",
     }, "example-org/repository");
 
-    expect(message).toBe("The run request was rejected. The branch or tag missing-branch was not found in example-org/repository.");
+    expect(message).toBe("The run request was rejected. The branch or tag missing-branch was not found in example-org/repository. Choose an existing branch or tag, then try again.");
   });
 
   test("shows a non-repository workspace rejection without blaming the selected repository", () => {
@@ -186,7 +225,7 @@ describe("Run now failures", () => {
       failureReason: "Workspace history depth 25 exceeds the effective ceiling 10.",
     }, "example-org/repository");
 
-    expect(message).toBe("The run request was rejected. Workspace history depth 25 exceeds the effective ceiling 10.");
+    expect(message).toBe("The run request was rejected. Workspace history depth 25 exceeds the effective ceiling 10. Reduce the Task requirements or choose a different Envelope.");
     expect(message).not.toContain("example-org/repository");
   });
 });

@@ -64,7 +64,7 @@ const builtInStarterTaskFixture = {
   executionLog: "off",
   packagePath: ".steward/tasks/browser-task/task-definition.json",
   title: "Hello world",
-  description: "Run a governed coding agent and collect its exact output.",
+  description: "Run a coding agent and collect its exact output.",
   git: {
     repository: "https://github.com/example-org/agentic-ops.git",
     revision: "git:ref:main",
@@ -262,6 +262,7 @@ const groupedGithubTools = [
 const envelopeRequest = {
   id: envelopeId,
   templateId: "developer",
+  templateDisplayName: "Developer",
   templateRevision: 4,
   requestedEnvelope: envelope,
   templateEnvelope: envelope,
@@ -314,7 +315,7 @@ const run = {
   rerunSupported: true,
   rerunUnavailableReason: null,
   stages: [
-    { id: "admission", displayName: "Admission", state: "succeeded", steps: [] },
+    { id: "admission", displayName: "Pre-run checks", state: "succeeded", steps: [] },
     { id: "provision_runtime", displayName: "Provision runtime", state: "succeeded", steps: [] },
     { id: "agent_execution", displayName: "Agent execution", state: "succeeded", steps: [{ id: "execution", displayName: "Execution", state: "succeeded", logStreams: ["stdout", "stderr"] }] },
     { id: "finalize", displayName: "Finalize", state: "succeeded", steps: [] },
@@ -397,7 +398,7 @@ const approval = {
 const presentationRoutes = [
   { path: "/envelopes", heading: "Envelopes", activeNavigation: "Envelopes" },
   { path: "/envelopes/new", heading: "Request an envelope", activeNavigation: "Envelopes" },
-  { path: `/envelopes/${envelopeId}`, heading: "developer", activeNavigation: "Envelopes" },
+  { path: `/envelopes/${envelopeId}`, heading: "Developer", activeNavigation: "Envelopes" },
   { path: `/envelopes/${envelopeId}/runs`, heading: "Recent runs", activeNavigation: "Envelopes" },
   { path: "/runs", heading: "Runs", activeNavigation: "Runs" },
   { path: "/runs/new", heading: "Run now", activeNavigation: "Runs" },
@@ -2150,7 +2151,7 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
     await expect(developer.page.getByText("Sensitivity notice", { exact: true })).toBeVisible();
 
     await developer.page.goto(`${origin}/get-started`);
-    await expect(developer.page.getByText("Seven steps from a first test run to a governed GitHub workflow. An envelope is the budget, models and tools an agent may use; the workflow runs your agent inside it.")).toBeVisible();
+    await expect(developer.page.getByText("Seven steps from a first test run to a GitHub workflow. An Envelope is the budget, models, and tools an agent may use; the workflow runs your agent inside those limits.")).toBeVisible();
     for (const title of ["Connect GitHub", "Get your first envelope", "Try a test run", "Publish the task definition", "Add the workflow to your repository", "Trigger a test run", "See the result"]) {
       await expect(developer.page.getByRole("button", { name: new RegExp(title) })).toBeVisible();
     }
@@ -2681,6 +2682,73 @@ test("typed browser APIs drive envelope, run, connection, and administrator view
   }
 });
 
+test("plain-language pages show names, limits, reasons, and least-authority template defaults", async ({ browser }) => {
+  const developer = await guardedPage(browser, { taskLibraryMutable: true });
+  try {
+    await developer.page.route(`${origin}/app/api/v1/envelope-requests/${envelopeId}`, (route) => route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        apiVersion: "steward.envelope-requests/v1",
+        request: {
+          ...envelopeRequest,
+          approvedEnvelope: null,
+          requestedEnvelope: {
+            ...envelope,
+            spec: { ...envelope.spec, runtimeMinutesLimit: "60" },
+          },
+          status: "pending",
+          history: [
+            { status: "pending", at: envelopeRequest.createdAt, actor: developerSession.principal.userId, actorDisplayEmail: developerSession.principal.displayEmail, reason: null },
+            { status: "approved", at: envelopeRequest.statusAt, actor: memberFixtures[1].userId, actorDisplayEmail: memberFixtures[1].displayEmail, reason: null },
+          ],
+        },
+      }),
+    }));
+    await developer.page.goto(`${origin}/envelopes/${envelopeId}`);
+    await expect(developer.page.getByRole("heading", { name: /Developer/ })).toBeVisible();
+    await expect(developer.page.getByText("60 min", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText(`by ${developerSession.principal.displayName}`, { exact: false })).toBeVisible();
+    await expect(developer.page.getByText(`by ${memberFixtures[1].displayEmail}`, { exact: false })).toBeVisible();
+    await expect(developer.page.getByText(developerSession.principal.userId, { exact: true })).toHaveCount(0);
+    await expect(developer.page.getByText(memberFixtures[1].userId, { exact: true })).toHaveCount(0);
+
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByRole("button", { name: "Pre-run checks" })).toBeVisible();
+    await expect(developer.page.getByText("Admission", { exact: true })).toHaveCount(0);
+
+    await developer.page.goto(`${origin}/tasks/new`);
+    await expect(developer.page.locator("main p").filter({ hasText: /\b(?:governed|immutable)\b/i })).toHaveCount(0);
+
+    await developer.page.goto(`${origin}/get-started`);
+    await expect(developer.page.locator("main p").filter({ hasText: /\b(?:governed|immutable)\b/i })).toHaveCount(0);
+
+    await developer.page.goto(`${origin}/settings`);
+    await expect(developer.page.getByText(developerSession.principal.displayEmail, { exact: true }).first()).toBeVisible();
+    await expect(developer.page.getByText(developerSession.principal.userId, { exact: true })).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+
+  const administrator = await guardedPage(browser, { session: administratorSession });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/new`);
+    await administrator.page.getByRole("textbox", { name: "Template ID" }).fill("engineer");
+    await expect(administrator.page.getByRole("button", { name: "Remove engineer" })).toHaveCount(0);
+    await expect(administrator.page.getByRole("button", { name: "Remove provider-a/model-a" })).toHaveCount(0);
+    await expect(administrator.page.getByRole("checkbox", { name: "Allow inline browser-authored packages" })).not.toBeChecked();
+    await expect(administrator.page.getByRole("checkbox", { name: "Linux" })).not.toBeChecked();
+
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/analyst`);
+    await administrator.page.getByRole("textbox", { name: "New template ID" }).fill("reviewer");
+    await administrator.page.getByRole("button", { name: "Save as new" }).click();
+    await expect(administrator.page).toHaveURL(`${origin}/admin/envelopes/templates/reviewer?saved=new`);
+    await expect(administrator.page.getByText("Template revision saved.", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
 test("a value above the template limits is submitted for administrator approval", async ({ browser }) => {
   const developer = await guardedPage(browser);
   try {
@@ -3081,7 +3149,7 @@ test("Get started completes the governed test-to-GitHub journey from server evid
     const workflowStep = await openStep("Add the workflow to your repository");
     await expect(workflowStep.getByText(`.github/workflows/hypershell-${starterTaskFixture.taskDefinition.name}.yml`, { exact: true })).toBeVisible();
     await expect(workflowStep.locator("pre")).toContainText(`package-path: ${starterTaskFixture.packagePath}`);
-    await workflowStep.getByRole("tab", { name: "Governed job only" }).click();
+    await workflowStep.getByRole("tab", { name: "HyperShell job only" }).click();
     await expect(workflowStep.locator("pre")).toContainText("jobs:\n  prepare:");
     await expect(workflowStep.locator("pre")).toContainText("  governed:");
 
@@ -3577,7 +3645,7 @@ test("new Tasks use the configured runtime and saved Tasks reuse their Envelope"
     await expect(developer.page.getByRole("combobox", { name: "Envelope", exact: true })).toHaveValue(preferredEnvelope.id);
 
     await developer.page.goto(`${origin}/tasks/${encodeURIComponent(savedDigest)}/edit`);
-    await expect(developer.page.getByText("Save immutable version 2.", { exact: false })).toBeVisible();
+    await expect(developer.page.getByText("Save version 2.", { exact: false })).toBeVisible();
     await developer.page.getByRole("combobox", { name: "Envelope", exact: true }).selectOption(envelopeRequest.id);
     await developer.page.getByRole("button", { name: "Save version 2" }).click();
 
@@ -3784,7 +3852,7 @@ test("Run now submits an inline package under the selected envelope", async ({ b
 
     await developer.page.getByRole("link", { name: "Run", exact: true }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/new?task=${encodeURIComponent(browserTaskDigest)}`);
-    await expect(developer.page.getByText("The exact immutable package is locked.")).toBeVisible();
+    await expect(developer.page.getByText("This exact package cannot be changed here.", { exact: false })).toBeVisible();
     await developer.page.getByRole("button", { name: "Run now" }).click();
     const exactSubmission = developer.mutations.filter((mutation) => mutation.path === "/app/api/v1/runs").at(-1);
     expect(exactSubmission.body.package).toEqual({ source: "inline", revision: browserTaskDigest, path: browserTaskDefinitionPath, files: browserTaskFiles });
@@ -3904,7 +3972,7 @@ test("a successful inline run publishes and dispatches the exact governed GitHub
     expectMutationProof(dispatch);
     expect(dispatch.body).toMatchObject({ owner: "example-org", repository: "agentic-ops", inputs: {} });
     await expect(developer.page.getByRole("link", { name: "GitHub run 12345" })).toBeVisible();
-    await expect(developer.page.getByRole("link", { name: "Open governed Task · succeeded" })).toHaveAttribute("href", "/runs/00000000-0000-0000-0000-000000000007", { timeout: 10_000 });
+    await expect(developer.page.getByRole("link", { name: "Open HyperShell Task · succeeded" })).toHaveAttribute("href", "/runs/00000000-0000-0000-0000-000000000007", { timeout: 10_000 });
   } finally {
     await closeGuardedPage(developer);
   }
@@ -3997,7 +4065,7 @@ test("GitHub re-run polls with one idempotency key until the new Task is correla
   });
   try {
     await developer.page.goto(`${origin}/runs/${taskUid}`);
-    await developer.page.getByRole("button", { name: "Re-run" }).click();
+    await developer.page.getByRole("button", { name: "Re-run", exact: true }).click();
     await expect(developer.page.getByRole("button", { name: "Starting…" })).toBeDisabled();
     await expect(developer.page).toHaveURL(`${origin}/runs/${rerunTaskUid}`);
 
@@ -4015,7 +4083,7 @@ test("browser-origin re-run uses the browser admission boundary", async ({ brows
   const developer = await guardedPage(browser, { inlineRun: true });
   try {
     await developer.page.goto(`${origin}/runs/${taskUid}`);
-    await developer.page.getByRole("button", { name: "Re-run" }).click();
+    await developer.page.getByRole("button", { name: "Re-run", exact: true }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${rerunTaskUid}`);
 
     const rerun = developer.mutations.find((mutation) => mutation.path.endsWith("/rerun"));
@@ -4200,7 +4268,7 @@ test("job and log stream deep links survive reload and browser history", async (
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}?job=agent_execution&stream=stderr`);
     await expect(developer.page.getByRole("tab", { name: "stderr" })).toHaveAttribute("aria-selected", "true");
 
-    await developer.page.getByRole("button", { name: "Admission" }).click();
+    await developer.page.getByRole("button", { name: "Pre-run checks" }).click();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}?job=admission`);
     await developer.page.goBack();
     await expect(developer.page).toHaveURL(`${origin}/runs/${taskUid}?job=agent_execution&stream=stderr`);
@@ -4466,7 +4534,7 @@ test("administrator templates and approvals use typed browser authority", async 
 
     await administrator.page.goto(`${origin}/admin/envelopes/templates/new`);
     const createModels = administrator.page.getByRole("combobox", { name: "Models" });
-    await expect(administrator.page.getByText("provider-a/model-a", { exact: true })).toBeVisible();
+    await expect(administrator.page.getByRole("button", { name: "Remove provider-a/model-a" })).toHaveCount(0);
     await createModels.focus();
     await expect(administrator.page.getByRole("option", { name: "provider-b/model-b" })).toBeVisible();
     await createModels.press("Enter");
@@ -4525,6 +4593,12 @@ test("administrator creates the first template with a valid budget currency", as
     await expect(administrator.page.getByText("Set spend limits in USD and how long an envelope stays valid.", { exact: true })).toBeVisible();
     await administrator.page.getByRole("textbox", { name: "Template ID" }).fill("engineer");
     await administrator.page.getByRole("textbox", { name: "Display name" }).fill("Engineering");
+    const roles = administrator.page.getByRole("combobox", { name: "Eligible member roles" });
+    await roles.fill("engineer");
+    await roles.press("Enter");
+    const models = administrator.page.getByRole("combobox", { name: "Models" });
+    await models.fill("provider-a/model-a");
+    await models.press("Enter");
     await administrator.page.getByRole("spinbutton", { name: /^Limit per run/ }).fill("1.00");
     await administrator.page.getByRole("spinbutton", { name: /^Monthly limit/ }).fill("10.00");
     await administrator.page.getByRole("spinbutton", { name: /^Time-to-live limit/ }).fill("15");
@@ -4539,7 +4613,7 @@ test("administrator creates the first template with a valid budget currency", as
   }
 });
 
-test("new template defaults eligibility to its typed ID and identifies invalid fields", async ({ browser }) => {
+test("new template requires explicit eligibility and identifies invalid fields", async ({ browser }) => {
   const administrator = await guardedPage(browser, {
     expectedHttpStatuses: [422],
     mutationFailures: {
@@ -4552,27 +4626,25 @@ test("new template defaults eligibility to its typed ID and identifies invalid f
 
     const templateId = administrator.page.getByRole("textbox", { name: "Template ID" });
     await templateId.fill("engineer");
-    await expect(administrator.page.getByRole("button", { name: "Remove engineer" })).toBeVisible();
+    await expect(administrator.page.getByRole("button", { name: "Remove engineer" })).toHaveCount(0);
 
     await templateId.fill("analyst");
-    await expect(administrator.page.getByRole("button", { name: "Remove analyst" })).toBeVisible();
+    await expect(administrator.page.getByRole("button", { name: "Remove analyst" })).toHaveCount(0);
     await expect(administrator.page.getByRole("button", { name: "Remove engineer" })).toHaveCount(0);
 
     const roles = administrator.page.getByRole("combobox", { name: "Eligible member roles" });
     await roles.fill("reviewer");
     await roles.press("Enter");
     await templateId.fill("operator");
-    await expect(administrator.page.getByRole("button", { name: "Remove analyst" })).toBeVisible();
+    await expect(administrator.page.getByRole("button", { name: "Remove analyst" })).toHaveCount(0);
     await expect(administrator.page.getByRole("button", { name: "Remove reviewer" })).toBeVisible();
     await expect(administrator.page.getByRole("button", { name: "Remove operator" })).toHaveCount(0);
 
-    await administrator.page.getByRole("button", { name: "Remove analyst" }).click();
     await administrator.page.getByRole("button", { name: "Remove reviewer" }).click();
     await templateId.fill("not valid");
     await administrator.page.getByRole("spinbutton", { name: /^Limit per run/ }).fill("-1");
     await administrator.page.getByRole("spinbutton", { name: /^Monthly limit/ }).fill("");
     await administrator.page.getByRole("spinbutton", { name: /^Time-to-live limit/ }).fill("");
-    await administrator.page.getByRole("button", { name: "Remove provider-a/model-a" }).click();
     await administrator.page.getByRole("button", { name: "Create template" }).click();
 
     await expect(administrator.page.getByText("Use 1–128 letters, numbers, periods, underscores, hyphens, or colons; start with a letter or number.")).toBeVisible();
@@ -4612,7 +4684,7 @@ test("new template reports display-name and member-role limits before submission
     await administrator.page.getByRole("textbox", { name: "Template ID" }).fill("engineer");
     await administrator.page.getByRole("textbox", { name: "Display name" }).fill("x".repeat(129));
     const roles = administrator.page.getByRole("combobox", { name: "Eligible member roles" });
-    for (let index = 0; index < 64; index += 1) {
+    for (let index = 0; index < 65; index += 1) {
       await roles.fill(`role-${index}`);
       await roles.press("Enter");
     }

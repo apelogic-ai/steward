@@ -186,7 +186,7 @@ fn built_in_starter_task(
         execution_log: ExecutionLogMode::Off,
         package_path: RelativePath::parse(BUILT_IN_PACKAGE_PATH)?,
         title: Some("Hello world".to_owned()),
-        description: Some("Run a governed coding agent and collect its exact output.".to_owned()),
+        description: Some("Run a coding agent and collect its exact output.".to_owned()),
         git: Some(StarterTaskGitExample {
             repository: "https://github.com/example-org/agentic-ops.git".to_owned(),
             revision: "git:ref:main".to_owned(),

@@ -47,7 +47,7 @@ export function TaskLibraryView() {
   return <section aria-labelledby="page-title" className="space-y-6">
     <PageHeader
       actions={<Link className="inline-flex min-h-10 items-center rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand" href="/tasks/new">New Task</Link>}
-      description="Review immutable package versions before running them. Saved drafts, exact Git packages, and published Workflows use the same Task surface."
+      description="Review saved Task versions before running them. Browser drafts, exact Git packages, and published Workflows all appear here."
       title="Tasks"
     />
     <ResourceBoundary state={state}>{({ tasks }) => tasks.length === 0
@@ -207,7 +207,7 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
   }
 
   if (existing && (!existing.editable || existing.source !== "inline" || !existing.taskId)) {
-    return <div className="space-y-4"><PageHeader description="Only an owner-scoped draft can create another immutable version." title="Task is read-only" /><Link className="inline-flex rounded-control border px-4 py-2 text-sm font-semibold" href={`/tasks/${encodeURIComponent(existing.contentDigest)}`}>Back to Task</Link></div>;
+    return <div className="space-y-4"><PageHeader description="Only your own browser draft can create another version." title="Task is read-only" /><Link className="inline-flex rounded-control border px-4 py-2 text-sm font-semibold" href={`/tasks/${encodeURIComponent(existing.contentDigest)}`}>Back to Task</Link></div>;
   }
 
   function previewPackage(): { definition: Record<string, unknown>; files: Record<string, string> } | null {
@@ -279,7 +279,7 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
   }
 
   return <form className="space-y-6" onSubmit={(event) => void submit(event)}>
-    <PageHeader description={`Save immutable version ${nextVersion}. Review the exact package below before running it.`} title={existing ? `Edit ${existing.name}` : "New Task"} />
+    <PageHeader description={`Save version ${nextVersion}. Review the exact package below before running it.`} title={existing ? `Edit ${existing.name}` : "New Task"} />
     <section className="grid gap-4 rounded-card border bg-panel p-6 md:grid-cols-2">
       <label className="grid gap-2 text-sm font-semibold">Name<input className={fieldClass} disabled={Boolean(existing)} onChange={(event) => setName(event.target.value)} required value={name} /></label>
       <label className="grid gap-2 text-sm font-semibold">Package path<input className={`${fieldClass} font-mono`} onChange={(event) => setPath(event.target.value)} required value={path} /></label>
