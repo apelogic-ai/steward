@@ -897,6 +897,7 @@ async function guardedPage(browser, {
   holdGithubRepositories = false,
   holdUserCapabilities = false,
   inlineRun = false,
+  envelopeSpend = null,
   publishedWorkflows = true,
   taskLibraryMutable = false,
   initialOnboardingDismissed = false,
@@ -909,6 +910,7 @@ async function guardedPage(browser, {
     { status: 201, body: { apiVersion: "steward.browser-runs/v1", taskUid: rerunTaskUid } },
   ],
   runPhase = "succeeded",
+  runSpend = run.observedSpend,
   capabilityCatalogModels = capabilityCatalog.models,
   capabilityCatalogTools = capabilityCatalog.tools,
   capabilityCatalogStatus = 200,
@@ -938,7 +940,15 @@ async function guardedPage(browser, {
   let githubAutomationCompleted = false;
   let publicationEvidence = null;
   let dispatchEvidence = null;
-  let currentEnvelopeRequest = structuredClone(envelopeRequest);
+  const fixtureEnvelopeRequest = envelopeSpend ? {
+    ...envelopeRequest,
+    usage: {
+      availability: { availability: "available", observedAt: "2026-08-24T17:04:00Z", source: "agent-runs" },
+      period: { start: "2026-08-01T00:00:00Z", end: "2026-09-01T00:00:00Z" },
+      spend: { ...envelopeSpend, observedAt: "2026-08-24T17:04:00Z" },
+    },
+  } : envelopeRequest;
+  let currentEnvelopeRequest = structuredClone(fixtureEnvelopeRequest);
   let currentAdminSetupStatus = adminSetupStatus;
   web.useMutationFailures(mutationFailures);
   web.useMutationSink(mutations);
@@ -951,6 +961,7 @@ async function guardedPage(browser, {
   web.useRerunFixtures(rerunResponses);
   const fixtureRun = inlineRun ? {
     ...run,
+    observedSpend: runSpend,
     origin: "browser",
     workflow: "browser-task@1",
     workflowName: null,
@@ -962,7 +973,7 @@ async function guardedPage(browser, {
       contentDigest: browserTaskDigest,
       promptSource: "inline",
     },
-  } : run;
+  } : { ...run, observedSpend: runSpend };
   await context.addInitScript(() => {
     const BrowserAbortController = AbortController;
     Object.defineProperty(window, "__stewardAbortCount", { configurable: true, value: 0, writable: true });
@@ -1118,14 +1129,14 @@ async function guardedPage(browser, {
         ? { apiVersion: "steward.envelope-requests/v1", requests: [envelopeRequest], nextCursor: null }
         : {
             apiVersion: "steward.envelope-requests/v1",
-            requests: [{ ...envelopeRequest, id: "00000000-0000-0000-0000-000000000006", envelopeInstanceId: "runtime-example-6" }],
+            requests: [{ ...fixtureEnvelopeRequest, id: "00000000-0000-0000-0000-000000000006", envelopeInstanceId: "runtime-example-6" }],
             nextCursor: "00000000-0000-0000-0000-000000000006",
           });
       return;
     }
     await json(route, {
       apiVersion: "steward.envelope-requests/v1",
-      requests: userEnvelopeRequests ?? (emptyCollections ? [] : [envelopeRequest]),
+      requests: userEnvelopeRequests ?? (emptyCollections ? [] : [fixtureEnvelopeRequest]),
     });
   });
   await context.route(`${origin}/app/api/v1/envelope-requests/**`, async (route) => {
@@ -2153,6 +2164,41 @@ test("the HyperShell handoff structure is preserved on primary workspaces", asyn
     await administrator.page.getByRole("link", { name: /Developer/ }).click();
     await expect(administrator.page).toHaveURL(`${origin}/admin/approvals/${unifiedEnvelopeRequest.id}`);
     await expect(administrator.page.getByRole("heading", { name: /Developer · above limits/i })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+});
+
+test("money is shown with one shared precision rule across envelope and run views", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    envelopeSpend: { currency: "USD", limit: "20.00", observed: "0.0809120" },
+    runSpend: { observedAmount: "0.0042", currency: "USD", exhausted: false },
+  });
+  try {
+    await developer.page.goto(`${origin}/envelopes`);
+    const envelopes = developer.page.getByRole("table", { name: "Envelopes" });
+    await expect(envelopes).toContainText("0.08 USD");
+    await expect(envelopes).toContainText("20.00 USD");
+    await expect(envelopes).not.toContainText("0.0809120 USD");
+
+    await developer.page.goto(`${origin}/runs`);
+    await expect(developer.page.getByRole("table", { name: "Runs" })).toContainText("< 0.01 USD");
+
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByText("< 0.01 USD", { exact: true })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+
+  const administrator = await guardedPage(browser, {
+    runSpend: { observedAmount: "0.1405725", currency: "USD", exhausted: false },
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/runs`);
+    const runs = administrator.page.getByRole("table", { name: "All runs" });
+    await expect(runs).toContainText("0.14 USD");
+    await expect(runs).not.toContainText("0.1405725 USD");
   } finally {
     await closeGuardedPage(administrator);
   }
