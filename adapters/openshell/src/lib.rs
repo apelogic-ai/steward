@@ -1838,9 +1838,13 @@ impl OpenShellRuntime {
                 },
             )
             .await
-            .map_err(|_| workspace_staging_rejected())?;
+            .map_err(|_| workspace_preparation_failed("prepare", "transport", None))?;
         if prepare.exit_code != 0 {
-            return Err(workspace_staging_rejected());
+            return Err(workspace_preparation_failed(
+                "prepare",
+                "exit_code",
+                Some(prepare.exit_code),
+            ));
         }
         for chunk in staging_archive_chunks(archive) {
             let append = scoped
@@ -1858,9 +1862,13 @@ impl OpenShellRuntime {
                     },
                 )
                 .await
-                .map_err(|_| workspace_staging_rejected())?;
+                .map_err(|_| workspace_preparation_failed("append", "transport", None))?;
             if append.exit_code != 0 {
-                return Err(workspace_staging_rejected());
+                return Err(workspace_preparation_failed(
+                    "append",
+                    "exit_code",
+                    Some(append.exit_code),
+                ));
             }
         }
         let command = workspace_materialization_command(evidence)?;
@@ -1874,14 +1882,21 @@ impl OpenShellRuntime {
                 },
             )
             .await
-            .map_err(|_| workspace_staging_rejected())?;
+            .map_err(|_| workspace_preparation_failed("materialize", "transport", None))?;
         if materialize.exit_code == SCRATCH_VOLUME_SIZE_NOT_ENFORCED_EXIT_CODE {
-            return Err(PortError::Rejected {
-                reason: SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE.to_owned(),
-            });
+            return Err(workspace_preparation_failure(
+                SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
+                "materialize",
+                "scratch_volume_size_not_enforced",
+                Some(materialize.exit_code),
+            ));
         }
         if materialize.exit_code != 0 {
-            return Err(workspace_staging_rejected());
+            return Err(workspace_preparation_failed(
+                "materialize",
+                "exit_code",
+                Some(materialize.exit_code),
+            ));
         }
         Ok(())
     }
@@ -2496,7 +2511,9 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         let workspace_archive = match (&request.workspace, input.workspace_archive) {
             (None, None) => None,
             (Some(_), Some(archive)) => Some(archive),
-            _ => return Err(workspace_staging_rejected()),
+            _ => {
+                return Err(workspace_preparation_failed("prepare", "contract", None));
+            }
         };
         let is_connections_bridge = request.agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE;
         if is_connections_bridge {
@@ -3155,7 +3172,7 @@ fn workspace_staging_append_command() -> &'static str {
 fn workspace_materialization_command(evidence: &WorkspaceEvidence) -> Result<String, PortError> {
     evidence
         .validate()
-        .map_err(|_| workspace_staging_rejected())?;
+        .map_err(|_| workspace_preparation_failed("materialize", "contract", None))?;
     let mut command = String::from(
         "set -eu; tar -xf /sandbox/steward-workspace.tar -C /sandbox/steward-workspace-source; rm -f /sandbox/steward-workspace.tar; cp /sandbox/steward-workspace-source/manifest.json /sandbox/workspace/.steward-workspace.json; ",
     );
@@ -3181,7 +3198,7 @@ fn workspace_materialization_command(evidence: &WorkspaceEvidence) -> Result<Str
                 let commit = commit
                     .as_str()
                     .strip_prefix("git:sha1:")
-                    .ok_or_else(workspace_staging_rejected)?;
+                    .ok_or_else(|| workspace_preparation_failed("materialize", "contract", None))?;
                 command.push_str(&format!(
                     "mkdir -p {destination}; git init -q {destination}; git -C {destination} index-pack --fix-thin --stdin < {pack} >/dev/null; if [ -f {shallow} ]; then cp {shallow} {destination}/.git/shallow; fi; git -C {destination} update-ref refs/heads/steward {commit}; git -C {destination} symbolic-ref HEAD refs/heads/steward; "
                 ));
@@ -3208,7 +3225,9 @@ fn workspace_materialization_command(evidence: &WorkspaceEvidence) -> Result<Str
                         .commit
                         .as_ref()
                         .and_then(|commit| commit.as_str().strip_prefix("git:sha1:"))
-                        .ok_or_else(workspace_staging_rejected)?;
+                        .ok_or_else(|| {
+                            workspace_preparation_failed("materialize", "contract", None)
+                        })?;
                     let submodule_destination = shell_quote(&format!(
                         "/sandbox/workspace/{}/{}",
                         name.as_str(),
@@ -3232,8 +3251,8 @@ fn workspace_materialization_command(evidence: &WorkspaceEvidence) -> Result<Str
                 }
             }
             ResolvedWorkspaceEntry::Scratch { name, size, .. } => {
-                let size_bytes =
-                    workspace_size_bytes(size.as_str()).ok_or_else(workspace_staging_rejected)?;
+                let size_bytes = workspace_size_bytes(size.as_str())
+                    .ok_or_else(|| workspace_preparation_failed("materialize", "contract", None))?;
                 let size_kib = size_bytes.div_ceil(1024);
                 let destination = shell_quote(&format!("/sandbox/workspace/{}", name.as_str()));
                 command.push_str(&format!(
@@ -3280,9 +3299,26 @@ fn input_staging_rejected() -> PortError {
 }
 
 #[cfg(feature = "runtime")]
-fn workspace_staging_rejected() -> PortError {
-    PortError::Rejected {
-        reason: WORKSPACE_PREPARATION_FAILURE.to_owned(),
+fn workspace_preparation_failed(
+    step: &'static str,
+    category: &'static str,
+    exit_code: Option<i32>,
+) -> PortError {
+    workspace_preparation_failure(WORKSPACE_PREPARATION_FAILURE, step, category, exit_code)
+}
+
+#[cfg(feature = "runtime")]
+fn workspace_preparation_failure(
+    reason: &str,
+    step: &'static str,
+    category: &'static str,
+    exit_code: Option<i32>,
+) -> PortError {
+    PortError::TaskPreparationFailed {
+        reason: reason.to_owned(),
+        step,
+        category,
+        exit_code,
     }
 }
 
@@ -3386,6 +3422,7 @@ mod tests {
         task_attempt_transcript_stream_command, task_failure_category, task_process_launch_mode,
         task_process_log_record, task_transcript_requested, validate_raw_sandbox_binding,
         validate_workload_exchange_endpoint, workspace_materialization_command,
+        workspace_preparation_failed,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -4078,6 +4115,15 @@ mod tests {
     #[cfg(feature = "runtime")]
     #[test]
     fn workspace_materializer_checks_out_exact_objects_without_a_remote() -> Result<(), String> {
+        assert_eq!(
+            workspace_preparation_failed("materialize", "exit_code", Some(17)),
+            PortError::TaskPreparationFailed {
+                reason: super::WORKSPACE_PREPARATION_FAILURE.to_owned(),
+                step: "materialize",
+                category: "exit_code",
+                exit_code: Some(17),
+            }
+        );
         let entries = vec![ResolvedWorkspaceEntry::Git {
             name: WorkspaceName::parse("source")?,
             access: WorkspaceAccess::ReadOnly,

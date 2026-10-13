@@ -134,10 +134,24 @@ pub const PORTS: [PortDescriptor; 8] = [
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PortError {
-    Unsupported { operation: &'static str },
-    Rejected { reason: String },
-    LimitExceeded { resource: &'static str },
-    Failed { reason: String },
+    Unsupported {
+        operation: &'static str,
+    },
+    Rejected {
+        reason: String,
+    },
+    TaskPreparationFailed {
+        reason: String,
+        step: &'static str,
+        category: &'static str,
+        exit_code: Option<i32>,
+    },
+    LimitExceeded {
+        resource: &'static str,
+    },
+    Failed {
+        reason: String,
+    },
     SandboxFailed,
     CredentialGrantFailed,
 }
@@ -684,6 +698,7 @@ pub trait GitHostingPlane: Send + Sync + 'static {
         match error {
             PortError::Rejected { .. } => GitRepositoryDescriptionFailure::MetadataInvalid,
             PortError::Unsupported { .. }
+            | PortError::TaskPreparationFailed { .. }
             | PortError::LimitExceeded { .. }
             | PortError::Failed { .. }
             | PortError::SandboxFailed

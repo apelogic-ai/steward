@@ -30,9 +30,8 @@ use steward_admission::{
 use steward_ports::{
     DecisionChannel, DecisionRequest, InferenceCapabilities, InferenceCredential,
     InferenceObservation, InferencePlane, InferenceRequest, MAX_TASK_OUTPUT_ARCHIVE_BYTES,
-    ProvisionedInference, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxExecutionClass,
-    SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
-    WORKSPACE_PREPARATION_FAILURE,
+    ProvisionedInference, SandboxExecutionClass, SandboxTaskObservation, SandboxTaskRequest,
+    SandboxTaskRuntime, TaskAttemptId,
 };
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{
@@ -1358,18 +1357,23 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
     if attempt.state != TaskExecutionAttemptState::StartPending {
         return observe_execution_attempt(sandbox_runtime, authority, &request, attempt).await;
     }
-    let observation = task_start_observation(
-        &attempt_id,
-        sandbox_runtime
-            .start_task(&attempt_id, &request, input)
-            .await,
-    );
-    if let Some(category) = task_workspace_preparation_failure_category(&observation) {
+    let result = sandbox_runtime
+        .start_task(&attempt_id, &request, input)
+        .await;
+    if let Err(PortError::TaskPreparationFailed {
+        step,
+        category,
+        exit_code,
+        ..
+    }) = &result
+    {
+        let exit_code = exit_code.map_or_else(|| "none".to_owned(), |code| code.to_string());
         eprintln!(
-            "task workspace preparation failed: task_uid={} category={category}",
+            "task workspace preparation failed: task_uid={} step={step} category={category} exit_code={exit_code}",
             task.task_uid,
         );
     }
+    let observation = task_start_observation(&attempt_id, result);
     persist_execution_observation(
         authority,
         &attempt,
@@ -3524,7 +3528,9 @@ fn task_failure_reason(error: &PortError) -> String {
         PortError::Unsupported { operation } => {
             format!("sandbox does not support task operation {operation}")
         }
-        PortError::Rejected { reason } | PortError::Failed { reason } => reason.clone(),
+        PortError::Rejected { reason }
+        | PortError::TaskPreparationFailed { reason, .. }
+        | PortError::Failed { reason } => reason.clone(),
         _ => "sandbox task execution failed".to_owned(),
     }
 }
@@ -3534,39 +3540,14 @@ fn task_start_observation(
     result: Result<SandboxTaskObservation, PortError>,
 ) -> SandboxTaskObservation {
     match result {
-        Err(PortError::Rejected { reason })
-            if matches!(
-                reason.as_str(),
-                SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE | WORKSPACE_PREPARATION_FAILURE
-            ) =>
-        {
-            SandboxTaskObservation::Failed {
-                adapter_observation_id: attempt_id.0.clone(),
-                reason,
-            }
-        }
+        Err(PortError::TaskPreparationFailed { reason, .. }) => SandboxTaskObservation::Failed {
+            adapter_observation_id: attempt_id.0.clone(),
+            reason,
+        },
         Err(error) => SandboxTaskObservation::OutcomeUnknown {
             reason: task_failure_reason(&error),
         },
         Ok(observation) => observation,
-    }
-}
-
-fn task_workspace_preparation_failure_category(
-    observation: &SandboxTaskObservation,
-) -> Option<&'static str> {
-    match observation {
-        SandboxTaskObservation::Failed { reason, .. }
-            if reason == SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE =>
-        {
-            Some("scratch_volume_size_not_enforced")
-        }
-        SandboxTaskObservation::Failed { reason, .. }
-            if reason == WORKSPACE_PREPARATION_FAILURE =>
-        {
-            Some("workspace_preparation_failed")
-        }
-        _ => None,
     }
 }
 
@@ -5734,8 +5715,7 @@ mod tests {
         server_task_runtime_manifest, status_merge_patch, suspend_runtime,
         suspend_runtime_with_inference_cleanup, task_output_archive_failure,
         task_output_archive_size_failure, task_runtime, task_runtime_action,
-        task_runtime_observation_is_failed, task_start_observation,
-        task_workspace_preparation_failure_category, ttl_action,
+        task_runtime_observation_is_failed, task_start_observation, ttl_action,
     };
 
     #[test]
@@ -5757,8 +5737,11 @@ mod tests {
         assert_eq!(
             task_start_observation(
                 &TaskAttemptId("attempt-a".to_owned()),
-                Err(PortError::Rejected {
+                Err(PortError::TaskPreparationFailed {
                     reason: reason.to_owned(),
+                    step: "materialize",
+                    category: "scratch_volume_size_not_enforced",
+                    exit_code: Some(42),
                 }),
             ),
             SandboxTaskObservation::Failed {
@@ -5773,8 +5756,11 @@ mod tests {
         let reason = WORKSPACE_PREPARATION_FAILURE;
         let observation = task_start_observation(
             &TaskAttemptId("attempt-a".to_owned()),
-            Err(PortError::Rejected {
+            Err(PortError::TaskPreparationFailed {
                 reason: reason.to_owned(),
+                step: "materialize",
+                category: "exit_code",
+                exit_code: Some(1),
             }),
         );
         assert_eq!(
@@ -5783,10 +5769,6 @@ mod tests {
                 adapter_observation_id: "attempt-a".to_owned(),
                 reason: reason.to_owned(),
             }
-        );
-        assert_eq!(
-            task_workspace_preparation_failure_category(&observation),
-            Some("workspace_preparation_failed")
         );
     }
 
