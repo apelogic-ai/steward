@@ -7,9 +7,11 @@ describe("shared presentation values", () => {
   test("formats money with two decimals and its supplied currency", () => {
     expect(formatMoney("2", "USD")).toBe("2.00 USD");
     expect(formatMoney("0.1", "EUR")).toBe("0.10 EUR");
-    expect(formatMoney("0.0042", "USD")).toBe("0.0042 USD");
-    expect(formatMoney("10.004", "USD")).toBe("10.004 USD");
-    expect(formatMoney("999999999999999999.995", "ABC")).toBe("999999999999999999.995 ABC");
+    expect(formatMoney("0", "USD")).toBe("0.00 USD");
+    expect(formatMoney("0.0042", "USD")).toBe("< 0.01 USD");
+    expect(formatMoney("10.004", "USD")).toBe("10.00 USD");
+    expect(formatMoney("10.005", "USD")).toBe("10.01 USD");
+    expect(formatMoney("999999999999999999.995", "ABC")).toBe("1000000000000000000.00 ABC");
     expect(formatMoney(".5", "USD")).toBe("0.50 USD");
     expect(formatMoney("", "USD")).toBe("Not set");
     expect(formatMoney("not-money", "USD")).toBe("—");

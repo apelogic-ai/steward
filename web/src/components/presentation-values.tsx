@@ -20,15 +20,24 @@ function displayDecimal(value: string | number): string | null {
   if (!match) return null;
   const negative = match[1] === "-";
   const whole = BigInt(match[2] ?? "0");
-  const fraction = (match[3] ?? match[4] ?? "").padEnd(2, "0");
-  const isZero = whole === 0n && !/[1-9]/.test(fraction);
-  return `${negative && !isZero ? "-" : ""}${whole}.${fraction}`;
+  const fraction = match[3] ?? match[4] ?? "";
+  const paddedFraction = fraction.padEnd(3, "0");
+  let cents = (whole * 100n) + BigInt(paddedFraction.slice(0, 2));
+  if (paddedFraction[2] >= "5") cents += 1n;
+  const roundedWhole = cents / 100n;
+  const roundedFraction = String(cents % 100n).padStart(2, "0");
+  return `${negative && cents !== 0n ? "-" : ""}${roundedWhole}.${roundedFraction}`;
 }
 
 export function formatMoney(value: string | number, currency: string): string {
   const source = String(value).trim();
   const unit = currency.trim();
   if (!source || !unit) return "Not set";
+  const match = /^(\+?)(?:(0+)(?:\.(\d*))?|\.(\d+))$/.exec(source);
+  const fraction = match?.[3] ?? match?.[4] ?? "";
+  if (match && BigInt(match[2] ?? "0") === 0n && !/[1-9]/.test(fraction.slice(0, 2)) && /[1-9]/.test(fraction)) {
+    return `< 0.01 ${unit}`;
+  }
   const decimal = displayDecimal(source);
   return decimal === null ? "—" : `${decimal} ${unit}`;
 }
