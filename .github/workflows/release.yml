@@ -628,7 +628,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.16"
+          test "$version" = "0.3.17"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
@@ -756,17 +756,17 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.16 makes coding-agent and model compatibility deployment-configured. Execution-binding catalogs use v2 and declare models.providers for every agent; browser model selection and Task planning consume that same catalog instead of hard-coded provider families.\n\n'
-            printf 'TaskDefinition v2 workspaces accept operator-admitted owner/repository names and stable branch or tag names while still resolving and recording an exact commit. The supported Codex reference runtime adds pinned repository-inspection tools.\n\n'
-            printf 'Full execution logging now persists bounded stdout and stderr snapshots while a Task runs and retains terminal output. Task admission accepts every requested value at or below the effective Envelope limit, including smaller scratch requests and bounded full Git history, while rejecting scratch when the deployment volume itself exceeds the Envelope. Envelope request limits use one published boundary, preserve review context through migrations 0069 and 0070, and present deployment-configured workspace controls and units consistently.\n\n'
-            printf 'This release retains everything shipped in v0.3.15, including governed workspaces, managed inference credentials, and the governed MCP-GW agentgateway path.\n\n'
+            printf 'Steward v0.3.17 makes administrator approval the authority boundary for above-template and template-free Envelope requests. The retired custom safety-ceiling key remains accepted but ignored for this release, with one startup warning.\n\n'
+            printf 'Run-request refusals and temporary unavailability now return a stable error code and separate plain-language reason. Empty browser mutations preserve their JSON proof, first-template creation starts with and validates USD currency, and failed Git workspace preparation terminates the reserved run immediately with the source cause.\n\n'
+            printf 'Bounded-history Git workspace downloads accept real shallow-boundary packets, so files-only and explicit-depth checkouts work against conforming Git servers.\n\n'
+            printf 'This release retains everything shipped in v0.3.16, including deployment-configured agent/model compatibility, stable Git workspace selectors, full execution-log persistence, and the one-boundary Envelope template model.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'The agent catalog moves to steward.execution-bindings/v2 with models.providers declared for every agent. Upgrade the catalog, deployment-preflight input, chart, apiserver, and controller in one coordinated step with Task submission and Workflow publication paused. Preflight input must add execution.binding.modelProviders covering every provider in capabilityCatalog.models. Resume only after every old apiserver and controller pod is gone. Once v0.3.16 creates any Task, do not downgrade: older binaries cannot read its v2 binding and additive evidence fields.\n\n'
-            printf 'Apply additive migrations 0069 and 0070. Migration 0069 preserves the requested values and review context for Envelope decisions. Migration 0070 appends successor template revisions where a retired automatic-provision threshold was narrower than the published limits; retain both migrations and generated revisions on rollback.\n\n'
-            printf 'Deploy the v0.3.16 chart and all component images as one release unit. Compatible full-log Agent images must provide Linux procfs plus setsid, awk, head, and tail.\n\n'
+            printf 'The agent catalog remains steward.execution-bindings/v2 with models.providers declared for every agent. Installations upgrading from before v0.3.16 must complete that coordinated catalog, preflight, chart, apiserver, and controller upgrade before accepting Tasks.\n\n'
+            printf 'This release adds no database migration. A v0.3.17 database remains readable by v0.3.16, but rollback restores v0.3.16 safety-ceiling behavior for pending Envelope requests. Above-template and template-free requests require a non-empty justification and return HTTP 422 with justification_required when it is absent.\n\n'
+            printf 'Deploy the v0.3.17 chart and all component images as one release unit. Remove config.apiserver.customEnvelopeSafetyCeiling before the next release. Ensure every selected Git host, not only its provider API endpoint, is reachable from the apiserver for workspace checkout.\n\n'
             printf 'The provider-profile bundle remains 1.2.2. Its MCP-GW profile permits the session DELETE used by the bridge.\n\n'
-            printf 'Before the first v0.3.16 Task, the exact v0.3.15 binaries and v1 catalog may be restored together while submission remains paused. After any v0.3.16 Task exists, downgrade is unsupported. If a one-boundary binary created a default-template revision, disable config.apiserver.defaultLlmTemplate.enabled before restoring v0.3.15.\n\n'
+            printf 'Run-refusal clients must read the stable code from error and the user-facing sentence from failureReason. Do not parse prior internal error formatting.\n\n'
             printf '## Required action\n\n'
             printf 'Before upgrading governed installations, set spire.className to the installed SPIRE controller class and choose exactly one owner for the OpenShell sandbox registration: keep the chart default, or disable spire.sandboxRegistration only when the platform retains the equivalent registration. Before enabling browser Run now, authorize each Git source through the operator-managed source-repository binding catalog and configure the intended Envelope templates.\n\n'
             printf '## Acceptance\n\n'
@@ -838,7 +838,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.16.json
+          subject-path: dist/steward-product-compatibility-0.3.17.json
 
       - name: Archive product compatibility verification material
         env:
@@ -848,7 +848,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.16.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.17.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 
