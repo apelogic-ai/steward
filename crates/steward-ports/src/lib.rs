@@ -46,6 +46,8 @@ use steward_types::{
 pub const MAX_TASK_INPUT_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum raw tar body returned by a Task runtime and persisted as output.
 pub const MAX_TASK_OUTPUT_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+/// Safe, actionable failure returned when scratch storage cannot enforce its approved size.
+pub const SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE: &str = "The scratch volume of this deployment does not enforce its size. Ask an administrator to check the workspace storage.";
 
 /// Vendor-neutral inputs used to render one immutable Task execution command.
 ///

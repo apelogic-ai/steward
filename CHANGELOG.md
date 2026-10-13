@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Scratch workspace capacity mismatches now fail Runs with an actionable storage explanation
+  instead of `execution_outcome_unknown`.
 - Cancelling a running Task now records a cancelled Run without replacing the cancellation with
   an `execution_outcome_unknown` failure when the sandbox cannot prove the stopped process's exit.
 
