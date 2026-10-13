@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Approving a custom or template Envelope request that exactly matches authority the user already
+  holds now reuses the active Envelope and terminalizes the duplicate request.
 - The administrator request queue now reports whether external decision filing is enabled, so
   browser clients can hide a filing action that cannot succeed.
 - Browser pages now use plain-language run stages and refusal reasons, show Envelope display names,
