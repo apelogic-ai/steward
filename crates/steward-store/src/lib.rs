@@ -9173,7 +9173,7 @@ impl PgStore {
             .transpose()?
             .ok_or(StoreError::TaskNotFound)?;
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        let _task = task_in_transaction_for_update(&mut transaction, initial.task_uid).await?;
+        let task = task_in_transaction_for_update(&mut transaction, initial.task_uid).await?;
         let operation =
             task_runtime_operation_in_transaction_for_update(&mut transaction, initial.task_uid)
                 .await?;
@@ -9380,12 +9380,14 @@ impl PgStore {
                         "UPDATE task_runtime_operations \
                          SET state = 'cleanup_pending', generation = generation + 1, \
                              cleanup_requested_at = now(), \
-                             last_error_code = 'execution_failed', retry_at = NULL, \
+                             last_error_code = CASE WHEN $3 THEN NULL ELSE 'execution_failed' END, \
+                             retry_at = NULL, \
                              lease_owner = NULL, lease_expires_at = NULL, updated_at = now() \
                          WHERE task_uid = $1 AND generation = $2 AND state <> 'finalized'",
                     )
                     .bind(current.task_uid)
                     .bind(operation.generation)
+                    .bind(task.cancel_requested)
                     .execute(&mut *transaction)
                     .await
                     .map_err(database_error)?;
@@ -9394,19 +9396,27 @@ impl PgStore {
                         current.task_uid,
                         operation.generation + 1,
                         TaskOrchestrationState::CleanupPending,
-                        "execution_failed_cleanup_requested",
+                        if task.cancel_requested {
+                            "cancellation_cleanup_requested"
+                        } else {
+                            "execution_failed_cleanup_requested"
+                        },
                         actor,
                     )
                     .await?;
                 }
                 sqlx::query(
                     "UPDATE task_submissions \
-                     SET phase = 'failed', failure_reason = COALESCE(failure_reason, $2), \
+                     SET phase = CASE WHEN $3 THEN 'cancelled' ELSE 'failed' END, \
+                         failure_reason = CASE \
+                             WHEN $3 THEN failure_reason \
+                             ELSE COALESCE(failure_reason, $2) END, \
                          finalize_requested = true, updated_at = now() \
                      WHERE task_uid = $1 AND phase IN ('queued', 'running')",
                 )
                 .bind(current.task_uid)
                 .bind(reason)
+                .bind(task.cancel_requested)
                 .execute(&mut *transaction)
                 .await
                 .map_err(database_error)?;
@@ -9431,12 +9441,15 @@ impl PgStore {
                         "UPDATE task_runtime_operations \
                          SET state = 'cleanup_pending', generation = generation + 1, \
                              cleanup_requested_at = now(), \
-                             last_error_code = 'execution_outcome_unknown', retry_at = NULL, \
+                             last_error_code = CASE \
+                                 WHEN $3 THEN NULL ELSE 'execution_outcome_unknown' END, \
+                             retry_at = NULL, \
                              lease_owner = NULL, lease_expires_at = NULL, updated_at = now() \
                          WHERE task_uid = $1 AND generation = $2 AND state <> 'finalized'",
                     )
                     .bind(current.task_uid)
                     .bind(operation.generation)
+                    .bind(task.cancel_requested)
                     .execute(&mut *transaction)
                     .await
                     .map_err(database_error)?;
@@ -9445,7 +9458,11 @@ impl PgStore {
                         current.task_uid,
                         operation.generation + 1,
                         TaskOrchestrationState::CleanupPending,
-                        "execution_outcome_unknown_cleanup_requested",
+                        if task.cancel_requested {
+                            "cancellation_cleanup_requested"
+                        } else {
+                            "execution_outcome_unknown_cleanup_requested"
+                        },
                         actor,
                     )
                     .await?;
@@ -9454,14 +9471,17 @@ impl PgStore {
                     "UPDATE task_submissions \
                      SET phase = CASE \
                              WHEN phase IN ('succeeded', 'failed', 'cancelled') THEN phase \
+                             WHEN $2 THEN 'cancelled' \
                              ELSE 'failed' END, \
                          finalize_requested = true, \
                          failure_reason = CASE \
                              WHEN phase IN ('succeeded', 'failed', 'cancelled') THEN failure_reason \
+                             WHEN $2 THEN failure_reason \
                              ELSE COALESCE(failure_reason, 'execution_outcome_unknown') END, \
                          updated_at = now() WHERE task_uid = $1 AND NOT finalized",
                 )
                 .bind(current.task_uid)
+                .bind(task.cancel_requested)
                 .execute(&mut *transaction)
                 .await
                 .map_err(database_error)?;

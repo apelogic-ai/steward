@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- Cancelling a running Task now records a cancelled Run without replacing the cancellation with
+  an `execution_outcome_unknown` failure when the sandbox cannot prove the stopped process's exit.
+
 ## [0.3.17] - 2026-10-13
 
 Steward v0.3.17 makes administrator approval the authority boundary for Envelope requests outside
