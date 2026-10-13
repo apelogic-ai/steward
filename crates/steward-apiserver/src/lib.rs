@@ -6247,9 +6247,18 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&retired_threshold_body)
                 .map_err(|error| format!("parse retired threshold response: {error}"))?
                 .pointer("/error"),
-            Some(&serde_json::json!(
-                steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE
-            ))
+            Some(&serde_json::json!("auto_provision_threshold_retired"))
+        );
+        let retired_threshold_body: serde_json::Value =
+            serde_json::from_slice(&retired_threshold_body)
+                .map_err(|error| format!("parse retired threshold response: {error}"))?;
+        assert_eq!(
+            retired_threshold_body["failureReason"],
+            steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE
+        );
+        assert_eq!(
+            retired_threshold_body["fields"],
+            serde_json::json!(["autoProvisionThreshold"])
         );
         let body = serde_json::to_vec(&next)
             .map_err(|error| format!("serialize browser admin envelope: {error}"))?;
@@ -7051,6 +7060,17 @@ mod tests {
             .await
             .map_err(|error| format!("submit stale-model template: {error}"))?;
         assert_eq!(old_model.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(old_model.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read stale-model template response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse stale-model template response: {error}"))?;
+        assert_eq!(value["error"], "capability_not_available");
+        assert_eq!(value["fields"], serde_json::json!(["models"]));
+        assert_eq!(
+            value["failureReason"],
+            "The template selects capabilities that are not available in this installation."
+        );
         assert!(
             ledger
                 .envelope_authors
@@ -7108,6 +7128,13 @@ mod tests {
             .await
             .map_err(|error| format!("submit removed-tool template: {error}"))?;
         assert_eq!(removed_tool.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(removed_tool.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read removed-tool template response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse removed-tool template response: {error}"))?;
+        assert_eq!(value["error"], "capability_not_available");
+        assert_eq!(value["fields"], serde_json::json!(["tools"]));
         assert_eq!(
             ledger
                 .envelope_authors
@@ -7139,6 +7166,13 @@ mod tests {
             .await
             .map_err(|error| format!("submit empty-candidate template: {error}"))?;
         assert_eq!(empty_candidate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(empty_candidate.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read empty-model template response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse empty-model template response: {error}"))?;
+        assert_eq!(value["error"], "template_invalid");
+        assert_eq!(value["fields"], serde_json::json!(["models"]));
         assert_eq!(
             ledger
                 .envelope_authors
@@ -7147,6 +7181,76 @@ mod tests {
                 .len(),
             1,
             "an empty model selection cannot write a new template revision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_admin_template_rejections_identify_invalid_fields() -> Result<(), String> {
+        let origin = "http://127.0.0.1:33002";
+        let ledger = ledger();
+        let (auth, cookie, csrf) = signed_in_browser(origin, LocalFakeIdentity::Admin).await?;
+        let app = browser_admin::protected_router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger.clone(),
+            FakeDecisionChannel::default(),
+            browser_capability_catalog(),
+            auth,
+        );
+        let mut envelope = ledger
+            .envelope
+            .lock()
+            .map_err(|_| "lock invalid template envelope")?
+            .clone();
+        envelope.revision += 1;
+        envelope.spec.budget.currency.clear();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/admin/api/v1/envelope-templates/engineer")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "displayName": "Engineer",
+                            "memberRoles": ["engineer"],
+                            "envelope": envelope,
+                        })
+                        .to_string(),
+                    ))
+                    .map_err(|error| format!("build invalid template request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit invalid template: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read invalid template response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse invalid template response: {error}"))?;
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "apiVersion": "steward.browser-admin/v1",
+                "error": "template_invalid",
+                "failureReason": "The template contains invalid values.",
+                "fields": ["currency"],
+            })
+        );
+        assert!(
+            ledger
+                .envelope_authors
+                .lock()
+                .map_err(|_| "lock rejected template authors")?
+                .is_empty(),
+            "an invalid template must not be persisted"
         );
         Ok(())
     }

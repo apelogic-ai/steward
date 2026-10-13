@@ -1,14 +1,14 @@
 //! Browser-session administrator APIs backed by Steward's existing authority paths.
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_admission::{
-    AdmissionDecision, AdmissionDelta, Envelope, add_budget_amount, envelope_is_within,
-    validate_envelope,
+    AdmissionDecision, AdmissionDelta, AdmissionError, Envelope, add_budget_amount,
+    envelope_is_within, validate_envelope,
 };
 use steward_store::{
     AdminApprovalRecord, AdminEnvelopeProvisionRequest, AdminEnvelopeRequestRecord,
@@ -523,6 +523,55 @@ pub(crate) struct BrowserEnvelopeTemplateListItem {
 pub(crate) struct BrowserEnvelopeTemplateListResponse {
     api_version: &'static str,
     templates: Vec<BrowserEnvelopeTemplateListItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum BrowserEnvelopeTemplateField {
+    TemplateId,
+    DisplayName,
+    MemberRoles,
+    EnvelopeRevision,
+    Currency,
+    MonthlyLimit,
+    SingleRunLimit,
+    RuntimeMinutes,
+    Ttl,
+    Models,
+    Tools,
+    Platforms,
+    Memory,
+    Compute,
+    Storage,
+    Workspace,
+    AutoProvisionThreshold,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserEnvelopeTemplateErrorResponse {
+    api_version: &'static str,
+    error: &'static str,
+    failure_reason: String,
+    fields: Vec<BrowserEnvelopeTemplateField>,
+}
+
+fn envelope_template_error_response(
+    error: &'static str,
+    failure_reason: impl Into<String>,
+    fields: Vec<BrowserEnvelopeTemplateField>,
+) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(BrowserEnvelopeTemplateErrorResponse {
+            api_version: BROWSER_ADMIN_API_VERSION,
+            error,
+            failure_reason: failure_reason.into(),
+            fields,
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, utoipa::ToSchema)]
@@ -1988,7 +2037,7 @@ where
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
         (status = 409, description = "Envelope revision is not newer than the current revision"),
-        (status = 422, description = "Member role, envelope, or deployed capability selection is invalid"),
+        (status = 422, description = "Member role, envelope, or deployed capability selection is invalid", body = BrowserEnvelopeTemplateErrorResponse),
         (status = 503, description = "Envelope templates are unavailable")
     ),
     security(("browserSession" = []))
@@ -2006,22 +2055,25 @@ where
     D: DecisionChannel + Clone,
 {
     if body.auto_provision_threshold.is_some() {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE,
-            })),
-        )
-            .into_response();
+        return envelope_template_error_response(
+            "auto_provision_threshold_retired",
+            steward_store::RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE,
+            vec![BrowserEnvelopeTemplateField::AutoProvisionThreshold],
+        );
     }
     let envelope: Envelope = body.envelope.into();
-    if !valid_template_authoring(
+    let invalid_fields = template_authoring_violation_fields(
         &template_id,
         &body.display_name,
         &body.member_roles,
         &envelope,
-    ) {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    );
+    if !invalid_fields.is_empty() {
+        return envelope_template_error_response(
+            "template_invalid",
+            "The template contains invalid values.",
+            invalid_fields,
+        );
     }
     match state.ledger.latest_envelope_template(&template_id).await {
         Ok(Some(current)) if envelope.revision <= current.ceiling.revision => {
@@ -2030,21 +2082,31 @@ where
         Ok(_) => {}
         Err(error) => return ApiError::Store(error).into_response(),
     }
+    let mut unavailable_fields = Vec::new();
     if state.capabilities.models.is_empty()
         || envelope
             .spec
             .llms
             .iter()
             .any(|model| !state.capabilities.models.contains(model))
-        || envelope.spec.tools.iter().any(|tool| {
-            !state
-                .capabilities
-                .tools
-                .iter()
-                .any(|available| available.grants(tool))
-        })
     {
-        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        unavailable_fields.push(BrowserEnvelopeTemplateField::Models);
+    }
+    if envelope.spec.tools.iter().any(|tool| {
+        !state
+            .capabilities
+            .tools
+            .iter()
+            .any(|available| available.grants(tool))
+    }) {
+        unavailable_fields.push(BrowserEnvelopeTemplateField::Tools);
+    }
+    if !unavailable_fields.is_empty() {
+        return envelope_template_error_response(
+            "capability_not_available",
+            "The template selects capabilities that are not available in this installation.",
+            unavailable_fields,
+        );
     }
     match state
         .ledger
@@ -2077,9 +2139,11 @@ where
                 .into_response()
         }
         Err(StoreError::EnvelopeRevisionNotIncreasing) => StatusCode::CONFLICT.into_response(),
-        Err(StoreError::InvalidEnvelopeTemplate) => {
-            StatusCode::UNPROCESSABLE_ENTITY.into_response()
-        }
+        Err(StoreError::InvalidEnvelopeTemplate) => envelope_template_error_response(
+            "template_invalid",
+            "The template could not be accepted.",
+            Vec::new(),
+        ),
         Err(error) => ApiError::Store(error).into_response(),
     }
 }
@@ -2098,7 +2162,7 @@ where
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Administrator role, origin, fetch metadata, or CSRF proof is invalid"),
         (status = 409, description = "Envelope revision is not newer than the current revision"),
-        (status = 422, description = "Template identifier, envelope, or deployed capability selection is invalid"),
+        (status = 422, description = "Template identifier, envelope, or deployed capability selection is invalid", body = BrowserEnvelopeTemplateErrorResponse),
         (status = 503, description = "Envelope templates are unavailable")
     ),
     security(("browserSession" = []))
@@ -2143,25 +2207,82 @@ pub fn valid_template_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
 }
 
-fn valid_template_authoring(
+fn template_authoring_violation_fields(
     template_id: &str,
     display_name: &str,
     member_roles: &[String],
     envelope: &Envelope,
-) -> bool {
-    valid_template_identifier(template_id)
-        && !display_name.is_empty()
-        && display_name.trim() == display_name
-        && display_name.chars().count() <= 128
-        && !member_roles.is_empty()
-        && member_roles.len() <= 64
-        && member_roles
+) -> Vec<BrowserEnvelopeTemplateField> {
+    let mut fields = Vec::new();
+    if !valid_template_identifier(template_id) {
+        fields.push(BrowserEnvelopeTemplateField::TemplateId);
+    }
+    if display_name.is_empty()
+        || display_name.trim() != display_name
+        || display_name.chars().count() > 128
+    {
+        fields.push(BrowserEnvelopeTemplateField::DisplayName);
+    }
+    if member_roles.is_empty()
+        || member_roles.len() > 64
+        || !member_roles
             .iter()
             .all(|role| valid_template_identifier(role))
-        && member_roles.windows(2).all(|roles| roles[0] < roles[1])
-        && envelope.revision > 0
-        && !envelope.spec.llms.is_empty()
-        && validate_envelope(envelope).is_ok()
+        || !member_roles.windows(2).all(|roles| roles[0] < roles[1])
+    {
+        fields.push(BrowserEnvelopeTemplateField::MemberRoles);
+    }
+    if envelope.revision <= 0 {
+        fields.push(BrowserEnvelopeTemplateField::EnvelopeRevision);
+    }
+    if envelope.spec.llms.is_empty() {
+        fields.push(BrowserEnvelopeTemplateField::Models);
+    }
+    if let Err(error) = validate_envelope(envelope) {
+        fields.extend(envelope_validation_fields(envelope, &error));
+    }
+    fields
+}
+
+fn envelope_validation_fields(
+    envelope: &Envelope,
+    error: &AdmissionError,
+) -> Vec<BrowserEnvelopeTemplateField> {
+    match error {
+        AdmissionError::InvalidBudget { value } => {
+            let mut fields = Vec::new();
+            if envelope.spec.budget.monthly_limit == *value {
+                fields.push(BrowserEnvelopeTemplateField::MonthlyLimit);
+            }
+            if envelope.spec.budget.single_run_limit.as_ref() == Some(value) {
+                fields.push(BrowserEnvelopeTemplateField::SingleRunLimit);
+            }
+            if envelope.spec.runtime_minutes_limit.as_ref() == Some(value) {
+                fields.push(BrowserEnvelopeTemplateField::RuntimeMinutes);
+            }
+            if fields.is_empty() {
+                fields.push(BrowserEnvelopeTemplateField::MonthlyLimit);
+            }
+            fields
+        }
+        AdmissionError::InvalidCurrency { .. } | AdmissionError::CurrencyMismatch { .. } => {
+            vec![BrowserEnvelopeTemplateField::Currency]
+        }
+        AdmissionError::InvalidTtl { .. } => vec![BrowserEnvelopeTemplateField::Ttl],
+        AdmissionError::InvalidRunnerQuantity { resource, .. } => vec![match resource.as_str() {
+            "memory" => BrowserEnvelopeTemplateField::Memory,
+            "compute" => BrowserEnvelopeTemplateField::Compute,
+            "storage" => BrowserEnvelopeTemplateField::Storage,
+            _ => BrowserEnvelopeTemplateField::Platforms,
+        }],
+        AdmissionError::DuplicateRunnerPlatform { .. } => {
+            vec![BrowserEnvelopeTemplateField::Platforms]
+        }
+        AdmissionError::InvalidWorkspaceAuthority { .. } => {
+            vec![BrowserEnvelopeTemplateField::Workspace]
+        }
+        AdmissionError::UnsupportedBindings => Vec::new(),
+    }
 }
 
 #[utoipa::path(
