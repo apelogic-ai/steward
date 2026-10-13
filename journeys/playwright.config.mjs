@@ -7,7 +7,7 @@ const tags = process.env.STEWARD_JOURNEY_TAG_EXPRESSION ?? "@smoke";
 const testDir = defineBddConfig({
   features: "J01-administrator-sets-up-a-new-installation.feature",
   steps: "steps/*.mjs",
-  outputDir: `../target/journeys/generated/${execution}`,
+  outputDir: `.generated/${execution}`,
   tags,
   missingSteps: "fail-on-gen",
 });
@@ -24,6 +24,7 @@ export default defineConfig({
     baseURL: process.env.STEWARD_JOURNEY_BASE_URL,
     browserName: "chromium",
     headless: true,
+    ignoreHTTPSErrors: process.env.STEWARD_JOURNEY_IGNORE_HTTPS_ERRORS === "true",
     screenshot: "only-on-failure",
     storageState: process.env.STEWARD_JOURNEY_STORAGE_STATE,
     trace: "retain-on-failure",

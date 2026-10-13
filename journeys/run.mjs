@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
 const config = "journeys/playwright.config.mjs";
@@ -49,6 +49,11 @@ function validateEnvironment() {
     throw new Error("STEWARD_JOURNEY_RUN_PREFIX must be 1-40 lowercase letters, numbers, or hyphens, starting with a letter or number.");
   }
 
+  const ignoreHttpsErrors = process.env.STEWARD_JOURNEY_IGNORE_HTTPS_ERRORS?.trim();
+  if (ignoreHttpsErrors && !["true", "false"].includes(ignoreHttpsErrors)) {
+    throw new Error("STEWARD_JOURNEY_IGNORE_HTTPS_ERRORS must be true or false when set.");
+  }
+
   return requiredEnvironment("STEWARD_JOURNEY_TAGS");
 }
 
@@ -62,6 +67,7 @@ function run(command, arguments_, environment) {
 }
 
 function generate(label, tags) {
+  rmSync(`journeys/.generated/${label}`, { force: true, recursive: true });
   process.stdout.write(`\n=== ${label}: validate step definitions ===\n`);
   return run("bunx", ["bddgen", "--config", config], {
     STEWARD_JOURNEY_EXECUTION: label,
@@ -69,7 +75,15 @@ function generate(label, tags) {
   });
 }
 
-function execute(label, tags) {
+function generatedScenarioCount(label) {
+  const directory = `journeys/.generated/${label}`;
+  if (!existsSync(directory)) return 0;
+  return readdirSync(directory, { recursive: true })
+    .filter((entry) => typeof entry === "string" && entry.endsWith(".spec.js"))
+    .length;
+}
+
+function execute(label, tags, allowEmpty = false) {
   const environment = {
     STEWARD_JOURNEY_EXECUTION: label,
     STEWARD_JOURNEY_TAG_EXPRESSION: tags,
@@ -77,7 +91,9 @@ function execute(label, tags) {
   const generated = generate(label, tags);
   if (generated !== 0) return generated;
   process.stdout.write(`\n=== ${label}: browser scenarios ===\n`);
-  return run("bunx", ["playwright", "test", "--config", config, "--pass-with-no-tests"], environment);
+  const arguments_ = ["playwright", "test", "--config", config];
+  if (allowEmpty) arguments_.push("--pass-with-no-tests");
+  return run("bunx", arguments_, environment);
 }
 
 let selectedTags;
@@ -92,6 +108,10 @@ if (generate("all-selected", selectedTags) !== 0) {
   process.stderr.write("journeys: a selected sentence has no step definition; no browser scenario was run.\n");
   process.exit(1);
 }
+if (generatedScenarioCount("all-selected") === 0) {
+  process.stderr.write(`journeys: tag expression ${JSON.stringify(selectedTags)} selected no scenarios.\n`);
+  process.exit(1);
+}
 
 const knownFailingTagsExpression = knownFailingExpression();
 const requiredTags = `(${selectedTags}) and not ${knownFailingTagsExpression}`;
@@ -99,7 +119,7 @@ const requiredStatus = execute("required", requiredTags);
 if (requiredStatus !== 0) process.exit(requiredStatus);
 
 const knownFailingTags = `(${selectedTags}) and ${knownFailingTagsExpression}`;
-const knownFailingStatus = execute("known-failing", knownFailingTags);
+const knownFailingStatus = execute("known-failing", knownFailingTags, true);
 if (knownFailingStatus === 0) {
   process.stdout.write("\nKnown-failing scenarios: none failed (the selected set may be empty).\n");
 } else {

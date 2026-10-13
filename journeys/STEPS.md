@@ -70,7 +70,7 @@ Actions and sights that are the same on every screen.
 
 | Pattern | Parameters | Meaning | Files | Uses | Used in |
 |---|---|---|---|---|---|
-| `no template exists` | none | The Templates list is empty. | 1 | 6 | J1 |
+| `no template exists` | none | No template whose ID starts with this run's unique prefix exists; the runner records that prefix's starting count. | 1 | 6 | J1 |
 | `the template {string} exists` | template placeholder | See the placeholder list in README.md for what each template allows. | 3 | 33 | J2, J3, J10 |
 | `{actor} type(s) a value the installation does not accept into {string}` | who; label of the field | A value that makes saving fail. The Markdown does not say which. | 1 | 1 | J1 |
 

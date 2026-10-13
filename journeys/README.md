@@ -78,7 +78,7 @@ Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test
 
 | Tag | Meaning |
 |---|---|
-| `@smoke` | Part of the smallest set that proves a release is usable: J1 (steps 1 to 9), J2, J3 (approve path), J4 (steps 1 to 6). Run in this order on a fresh installation. |
+| `@smoke` | Part of the smallest set that proves a release is usable: J1 (steps 1 to 9), J2, J3 (approve path), J4 (steps 1 to 6). Run in this order with one unique run prefix. |
 | `@needs-model` | Makes a real model call. Costs money. |
 | `@needs-github` | Needs an external repository that the installation allows. |
 | `@two-accounts` | Needs a second signed-in person. |
@@ -128,6 +128,15 @@ export STEWARD_JOURNEY_RUN_PREFIX=journey-001
 cargo xtask journeys --tags @smoke
 ```
 
+For an installation that intentionally uses a private or locally trusted HTTPS certificate, opt in
+to Playwright's certificate bypass for that run:
+
+```console
+export STEWARD_JOURNEY_IGNORE_HTTPS_ERRORS=true
+```
+
+The variable accepts only `true` or `false` and defaults to `false`.
+
 The storage-state file is a credential-bearing local artifact: never put it in this repository.
 The runner reports an explicit refresh instruction if the session has expired. The repository is
 used by J4 when that journey becomes executable. The run prefix must be unique for the target
@@ -136,4 +145,4 @@ installation; every object created by the journeys includes it.
 The runner first validates that every selected sentence has step code. It then reports ordinary
 scenarios as the required result and runs `@known-failing-0.3.16` scenarios as a separate,
 nonfatal result. A generation error, including an undefined sentence in either group, is always
-fatal.
+fatal. A tag expression that selects no scenario is also fatal.

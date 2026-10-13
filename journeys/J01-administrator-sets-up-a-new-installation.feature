@@ -28,7 +28,6 @@ Feature: J1 - Administrator sets up a new installation
       | Workflows   |
       | Settings    |
     When I open "Templates"
-    Then I see "No templates yet."
     Then I see "Create template"
     When I press "Create template"
     Then I see "Create envelope template"
@@ -77,8 +76,10 @@ Feature: J1 - Administrator sets up a new installation
     And I untick "Git"
     And I untick "Scratch"
     And I press "Save as new"
-    Then I see "Template revision saved."
     When I open "Templates"
+    And I see in "Templates":
+      | Member role       | Revision | Monthly limit | Limit per run | Time-to-live limit | Tools   |
+      | <run-prefix>-timed | rev 1    | 10.00 USD     | 1.00 USD      | 15 min             |         |
     And I open "<run-prefix>-standard" in "Templates"
     Then the field "Runtime limit per month" shows ""
     # Done when: a user with the eligible role finds the template.

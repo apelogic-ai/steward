@@ -9,6 +9,41 @@ function resolveText(journey, text) {
   return journey.modelAliases.get(prefixed) ?? prefixed;
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function fieldLocator(page, field) {
+  const name = new RegExp(`^${escapeRegExp(field)}(?:\\s|$)`, "i");
+  if (["Eligible member roles", "Models", "Template"].includes(field)) {
+    return page.getByRole("combobox", { name }).first();
+  }
+  if (["Limit per run", "Monthly limit", "Time-to-live limit", "Runtime limit per month"].includes(field)) {
+    return page.getByRole("spinbutton", { name }).first();
+  }
+  return page.getByLabel(name).first();
+}
+
+function checkboxLocator(page, field) {
+  return page.getByRole("checkbox", { name: new RegExp(`^${escapeRegExp(field)}$`, "i") });
+}
+
+function templateTable(page) {
+  return page.getByRole("table", { name: "Envelope templates" });
+}
+
+function prefixedTemplateRows(page) {
+  return templateTable(page).getByRole("rowgroup").getByRole("link").filter({ hasText: runPrefix });
+}
+
+async function waitForTemplateList(page) {
+  await expect.poll(async () => {
+    const tableCount = await templateTable(page).count();
+    const emptyCount = await page.getByText("No templates yet.", { exact: true }).count();
+    return tableCount + emptyCount;
+  }, { message: "the Templates page should finish loading its table or empty state" }).toBeGreaterThan(0);
+}
+
 async function assertSignedIn(page) {
   try {
     await expect(page.getByRole("navigation", { name: "Primary navigation" })).toBeVisible({ timeout: 10_000 });
@@ -30,10 +65,10 @@ function areaLocator(page, area) {
       return page.getByRole("table", { name: "Envelope templates" });
     case "Limit per run":
     case "Monthly limit":
-      return page.getByText(area, { exact: true }).locator("..");
+      return fieldLocator(page, area).locator("xpath=ancestor::label[1]");
     case "Tools":
     case "Workspace access":
-      return page.getByRole("heading", { name: area, exact: true }).locator("xpath=ancestor::section[1]");
+      return page.getByRole("group", { name: area, exact: true }).first();
     default:
       return page.locator("main");
   }
@@ -76,7 +111,7 @@ When("I choose {string} in {string}", async ({ journey, page }, choice, field) =
     return;
   }
   if (field === "Models" && /^<provider-[ab]>\/<model-[ab]>$/.test(choice)) {
-    const picker = page.getByRole("combobox", { name: "Models", exact: true });
+    const picker = fieldLocator(page, "Models");
     await picker.focus();
     const options = page.getByRole("listbox").getByRole("option");
     await expect.poll(() => options.count(), { message: "J1 requires at least two enabled models from different providers" }).toBeGreaterThan(0);
@@ -92,13 +127,37 @@ When("I choose {string} in {string}", async ({ journey, page }, choice, field) =
   }
   const select = field === "Time-to-live limit"
     ? page.getByRole("combobox", { name: "Time-to-live unit" })
-    : page.getByRole("combobox", { name: field, exact: true });
+    : fieldLocator(page, field);
   await select.selectOption({ label: resolveText(journey, choice) });
 });
 
 Then("I see in {string}:", async ({ journey, page }, area, dataTable) => {
   const scope = areaLocator(page, area);
   await expect(scope).toBeVisible();
+  if (area === "Templates") {
+    const [expectedHeaders, ...expectedRows] = dataTable.raw();
+    const headers = scope.getByRole("columnheader");
+    await expect.poll(() => headers.count()).toBeGreaterThanOrEqual(expectedHeaders.length);
+    for (const [index, expected] of expectedHeaders.entries()) {
+      await expect(headers.nth(index)).toHaveText(resolveText(journey, expected.trim()));
+    }
+    for (const expectedRow of expectedRows) {
+      const firstValue = expectedRow.find((cell) => cell.trim());
+      expect(firstValue, "a Templates row must contain at least one expected value").toBeTruthy();
+      const row = scope.getByRole("rowgroup").getByRole("link").filter({
+        hasText: resolveText(journey, firstValue.trim()),
+      });
+      await expect(row).toHaveCount(1);
+      const cells = row.locator(":scope > span");
+      await expect.poll(() => cells.count()).toBeGreaterThanOrEqual(expectedHeaders.length);
+      for (const [index, expected] of expectedRow.entries()) {
+        const value = resolveText(journey, expected.trim());
+        if (value) await expect(cells.nth(index)).toContainText(value);
+        else await expect(cells.nth(index)).toHaveText("");
+      }
+    }
+    return;
+  }
   for (const row of dataTable.raw()) {
     for (const cell of row) {
       if (cell.trim()) await expect(scope.getByText(resolveText(journey, cell.trim()), { exact: true })).toBeVisible();
@@ -110,8 +169,10 @@ When("I open {string}", async ({ journey, page }, destination) => {
   const name = resolveText(journey, destination);
   await page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name, exact: true }).click();
   if (name === "Templates" && journey.expectNoTemplates) {
-    await expect(page.getByText("No templates yet.", { exact: true })).toBeVisible();
-    journey.initialCounts.set("Templates", 0);
+    await waitForTemplateList(page);
+    const initialCount = await prefixedTemplateRows(page).count();
+    expect(initialCount, `no template with run prefix ${runPrefix} should exist`).toBe(0);
+    journey.initialCounts.set("Templates", initialCount);
   }
 });
 
@@ -122,13 +183,13 @@ When("I press {string}", async ({ journey, page }, control) => {
 });
 
 When("I type {string} into {string}", async ({ journey, page }, value, field) => {
-  const input = page.getByLabel(field, { exact: true });
+  const input = fieldLocator(page, field);
   await input.fill(resolveText(journey, value));
   if (["Eligible member roles", "Models"].includes(field)) await input.press("Enter");
 });
 
 When("I leave {string} empty", async ({ page }, field) => {
-  await page.getByLabel(field, { exact: true }).fill("");
+  await fieldLocator(page, field).fill("");
 });
 
 Then("I see {string}", async ({ journey, page }, text) => {
@@ -140,15 +201,15 @@ Then("I do not see {string}", async ({ journey, page }, text) => {
 });
 
 Then("{string} is disabled", async ({ page }, field) => {
-  await expect(page.getByLabel(field, { exact: true })).toBeDisabled();
+  await expect(fieldLocator(page, field)).toBeDisabled();
 });
 
 When("I tick {string}", async ({ page }, field) => {
-  await page.getByRole("checkbox", { name: field, exact: true }).check();
+  await checkboxLocator(page, field).check();
 });
 
 When("I untick {string}", async ({ page }, field) => {
-  await page.getByRole("checkbox", { name: field, exact: true }).uncheck();
+  await checkboxLocator(page, field).uncheck();
 });
 
 When("I open {string} in {string}", async ({ journey, page }, item, area) => {
@@ -157,7 +218,7 @@ When("I open {string} in {string}", async ({ journey, page }, item, area) => {
 });
 
 Then("the field {string} shows {string}", async ({ journey, page }, field, value) => {
-  await expect(page.getByLabel(field, { exact: true })).toHaveValue(resolveText(journey, value));
+  await expect(fieldLocator(page, field)).toHaveValue(resolveText(journey, value));
 });
 
 Then("the drop-down {string} offers {string}", async ({ journey, page }, field, offered) => {
@@ -167,13 +228,17 @@ Then("the drop-down {string} offers {string}", async ({ journey, page }, field, 
 });
 
 When("I type a value the installation does not accept into {string}", async ({ page }, field) => {
-  await page.getByLabel(field, { exact: true }).fill("not valid");
+  await fieldLocator(page, field).fill("not valid");
 });
 
 Then("the page {string} lists {int} new entries", async ({ journey, page }, area, expected) => {
   await page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: area, exact: true }).click();
-  const current = await page.getByRole("table", { name: "Envelope templates" }).getByRole("rowgroup").getByRole("link").count();
-  expect(current - (journey.initialCounts.get(area) ?? 0)).toBe(expected);
+  await waitForTemplateList(page);
+  const initial = journey.initialCounts.get(area);
+  expect(initial, `${area} must record its starting count before comparing new entries`).toBeDefined();
+  await expect.poll(() => prefixedTemplateRows(page).count(), {
+    message: `${area} should list ${expected} new run-prefixed entries`,
+  }).toBe(initial + expected);
 });
 
 Then("the message names {string}", async ({ page }, field) => {
