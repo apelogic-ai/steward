@@ -124,8 +124,8 @@ export function EnvelopesView() {
       <PageHeader actions={<PrimaryLink href="/envelopes/new">Request envelope</PrimaryLink>} description="Budget, models and tools your agents are allowed to use." title="Envelopes" />
       <ResourceBoundary state={state}>{({ requests, templates }) => {
         if (requests.length === 0) return <p className="rounded-card border bg-panel p-6 text-sm text-muted-ink">No envelopes yet.</p>;
-        const count = (value: string) => requests.filter((request) => value === "pending" ? request.status !== "provisioned" && request.status !== "rejected" : request.status === value).length;
-        const filtered = status === "all" ? requests : requests.filter((request) => status === "pending" ? request.status !== "provisioned" && request.status !== "rejected" : request.status === status);
+        const count = (value: string) => requests.filter((request) => request.status === value).length;
+        const filtered = status === "all" ? requests : requests.filter((request) => request.status === status);
         const names = new Map(templates.map((template) => [template.id, template.displayName]));
         return <div className="space-y-5">
           <FilterTabs active={status} items={[
