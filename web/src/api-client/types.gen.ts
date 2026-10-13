@@ -354,6 +354,15 @@ export type BrowserEnvelopeSpec = {
     workspace?: null | WorkspaceAuthority;
 };
 
+export type BrowserEnvelopeTemplateErrorResponse = {
+    apiVersion: string;
+    error: string;
+    failureReason: string;
+    fields: Array<BrowserEnvelopeTemplateField>;
+};
+
+export type BrowserEnvelopeTemplateField = 'templateId' | 'displayName' | 'memberRoles' | 'envelopeRevision' | 'currency' | 'monthlyLimit' | 'singleRunLimit' | 'runtimeMinutes' | 'ttl' | 'models' | 'tools' | 'platforms' | 'memory' | 'compute' | 'storage' | 'workspace' | 'autoProvisionThreshold';
+
 export type BrowserEnvelopeTemplateListItem = {
     allowInlineBrowserTasks: boolean;
     autoProvisionThreshold?: null | BrowserEnvelope;
@@ -2673,12 +2682,14 @@ export type AuthorAdminEnvelopeTemplateErrors = {
     /**
      * Template identifier, envelope, or deployed capability selection is invalid
      */
-    422: unknown;
+    422: BrowserEnvelopeTemplateErrorResponse;
     /**
      * Envelope templates are unavailable
      */
     503: unknown;
 };
+
+export type AuthorAdminEnvelopeTemplateError = AuthorAdminEnvelopeTemplateErrors[keyof AuthorAdminEnvelopeTemplateErrors];
 
 export type AuthorAdminEnvelopeTemplateResponses = {
     201: BrowserEnvelopeTemplateResponse;
@@ -2714,12 +2725,14 @@ export type PutAdminEnvelopeTemplateErrors = {
     /**
      * Member role, envelope, or deployed capability selection is invalid
      */
-    422: unknown;
+    422: BrowserEnvelopeTemplateErrorResponse;
     /**
      * Envelope templates are unavailable
      */
     503: unknown;
 };
+
+export type PutAdminEnvelopeTemplateError = PutAdminEnvelopeTemplateErrors[keyof PutAdminEnvelopeTemplateErrors];
 
 export type PutAdminEnvelopeTemplateResponses = {
     201: BrowserEnvelopeTemplateResponse;

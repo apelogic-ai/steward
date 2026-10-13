@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Rejected Envelope-template saves now return a stable error code, a plain explanation, and the
+  affected form fields instead of an empty 422 response.
 - A Task's requested runtime-minutes limit now caps that run independently of the Envelope's
   monthly runtime allowance, and Run details show both limits and current monthly usage. The
   controller checks this cap during reconciliation, so enforcement can occur up to about one
