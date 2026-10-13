@@ -251,6 +251,7 @@ pub struct BrowserTaskVersionRecord {
     pub shared_roles: Vec<String>,
     pub version: i64,
     pub content_digest: String,
+    pub preferred_envelope_digest: Option<String>,
     pub package_path: String,
     pub files: BTreeMap<String, String>,
     pub created_at: String,
@@ -265,6 +266,7 @@ pub struct BrowserTaskVersionPublication<'a> {
     pub shared_roles: &'a [String],
     pub version: i64,
     pub content_digest: &'a str,
+    pub preferred_envelope_digest: Option<&'a str>,
     pub package_path: &'a str,
     pub files: &'a BTreeMap<String, String>,
 }
@@ -850,6 +852,20 @@ mod migration_tests {
             "migration 70 must take its final lock mode up front instead of upgrading while an old writer waits"
         );
     }
+
+    #[test]
+    fn browser_task_preferred_envelope_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 71
+                    && migration
+                        .description
+                        .contains("browser task preferred envelope")
+            }),
+            "migration 71 must add an optional immutable Envelope preference to browser Task versions"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1380,15 +1396,16 @@ impl PgStore {
         .map_err(database_error)?;
         let row = sqlx::query(
             "INSERT INTO browser_task_versions \
-             (task_id, version, content_digest, package_path, files) \
-             VALUES ($1, $2, $3, $4, $5) \
-             RETURNING task_id, version, content_digest, package_path, files, \
+             (task_id, version, content_digest, preferred_envelope_digest, package_path, files) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             RETURNING task_id, version, content_digest, preferred_envelope_digest, package_path, files, \
                        to_char(created_at AT TIME ZONE 'UTC', \
                                'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at",
         )
         .bind(publication.task_id)
         .bind(publication.version)
         .bind(publication.content_digest)
+        .bind(publication.preferred_envelope_digest)
         .bind(publication.package_path)
         .bind(Json(publication.files))
         .fetch_one(&mut *transaction)
@@ -1420,7 +1437,7 @@ impl PgStore {
     ) -> Result<Vec<BrowserTaskVersionRecord>, StoreError> {
         let rows = sqlx::query(
             "SELECT versions.task_id, drafts.owner_user_id, drafts.name, drafts.shared_roles, \
-                    versions.version, versions.content_digest, versions.package_path, \
+                    versions.version, versions.content_digest, versions.preferred_envelope_digest, versions.package_path, \
                     versions.files, \
                     to_char(versions.created_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
@@ -1449,7 +1466,7 @@ impl PgStore {
     ) -> Result<Option<BrowserTaskVersionRecord>, StoreError> {
         let row = sqlx::query(
             "SELECT versions.task_id, drafts.owner_user_id, drafts.name, drafts.shared_roles, \
-                    versions.version, versions.content_digest, versions.package_path, \
+                    versions.version, versions.content_digest, versions.preferred_envelope_digest, versions.package_path, \
                     versions.files, \
                     to_char(versions.created_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
@@ -1477,7 +1494,7 @@ impl PgStore {
     ) -> Result<Vec<BrowserTaskVersionRecord>, StoreError> {
         let rows = sqlx::query(
             "SELECT versions.task_id, drafts.owner_user_id, drafts.name, drafts.shared_roles, \
-                    versions.version, versions.content_digest, versions.package_path, \
+                    versions.version, versions.content_digest, versions.preferred_envelope_digest, versions.package_path, \
                     versions.files, \
                     to_char(versions.created_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, \
@@ -14823,6 +14840,16 @@ fn valid_browser_task_version_publication(publication: &BrowserTaskVersionPublic
                         .bytes()
                         .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
             })
+        && publication.preferred_envelope_digest.is_none_or(|digest| {
+            digest
+                .strip_prefix("steward:sha256:")
+                .is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                })
+        })
         && !publication.package_path.is_empty()
         && publication.package_path.len() <= 512
         && !publication.files.is_empty()
@@ -14842,6 +14869,9 @@ fn browser_task_version_record(
         shared_roles,
         version: row.try_get("version").map_err(database_error)?,
         content_digest: row.try_get("content_digest").map_err(database_error)?,
+        preferred_envelope_digest: row
+            .try_get("preferred_envelope_digest")
+            .map_err(database_error)?,
         package_path: row.try_get("package_path").map_err(database_error)?,
         files: row
             .try_get::<Json<BTreeMap<String, String>>, _>("files")

@@ -535,6 +535,7 @@ async fn verify_browser_task_library_upgrade(store: &PgStore) -> Result<(), Box<
             shared_roles: &shared_roles,
             version: 1,
             content_digest: &v1_digest,
+            preferred_envelope_digest: None,
             package_path: "task-definition.json",
             files: &v1_files,
         })
@@ -547,6 +548,7 @@ async fn verify_browser_task_library_upgrade(store: &PgStore) -> Result<(), Box<
             shared_roles: &shared_roles,
             version: 2,
             content_digest: &v2_digest,
+            preferred_envelope_digest: None,
             package_path: "task-definition.json",
             files: &v2_files,
         })
@@ -564,6 +566,7 @@ async fn verify_browser_task_library_upgrade(store: &PgStore) -> Result<(), Box<
             shared_roles: &shared_roles,
             version: 1,
             content_digest: &duplicate_digest,
+            preferred_envelope_digest: None,
             package_path: "task-definition.json",
             files: &v1_files,
         })

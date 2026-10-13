@@ -7,6 +7,7 @@ import {
   modelOptionLabel,
   preferredTaskModel,
   requirementsWithSelectedModel,
+  startingSelection,
 } from "./model-selection";
 
 const agents = [
@@ -55,6 +56,46 @@ describe("configuration-driven model selection", () => {
     expect(effectiveAgentSelection(options, "limited-agent@1.0.0")).toEqual({
       selected: options[0],
       warning: "limited-agent@1.0.0 is not compatible with this Envelope. Selected Example agent; you can choose another.",
+    });
+  });
+
+  test("starts from deployment configuration, then the Envelope's model order", () => {
+    expect(startingSelection(
+      agents,
+      [
+        { provider: "example", model: "model-x" },
+        { provider: "provider-a", model: "model-a" },
+      ],
+      "example-agent@1.0.0",
+      { provider: "provider-a", model: "model-a" },
+    )).toEqual({
+      agent: {
+        agentRef: "example-agent@1.0.0",
+        displayName: "Example agent",
+        models: [
+          { provider: "example", model: "model-x" },
+          { provider: "provider-a", model: "model-a" },
+        ],
+        compatible: true,
+        reason: null,
+      },
+      model: { provider: "provider-a", model: "model-a" },
+    });
+
+    expect(startingSelection(
+      agents,
+      [{ provider: "provider-b", model: "model-b" }],
+      "missing-agent@1.0.0",
+      null,
+    )).toEqual({
+      agent: {
+        agentRef: "limited-agent@1.0.0",
+        displayName: null,
+        models: [{ provider: "provider-b", model: "model-b" }],
+        compatible: true,
+        reason: null,
+      },
+      model: { provider: "provider-b", model: "model-b" },
     });
   });
 

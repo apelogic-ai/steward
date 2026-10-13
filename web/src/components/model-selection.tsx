@@ -26,8 +26,17 @@ export type EffectiveModelSelection = {
   warning: string | null;
 };
 
+export type StartingSelection = {
+  agent: CompatibleAgent | undefined;
+  model: Model | null;
+};
+
 export function modelKey(model: Model): string {
   return JSON.stringify([model.provider, model.model]);
+}
+
+export function qualifiedEnvelopeDigest(digest: string): string {
+  return digest.startsWith("steward:") ? digest : `steward:${digest}`;
 }
 
 export function modelLabel(model: Model): string {
@@ -59,6 +68,34 @@ export function compatibleAgents(
       reason: models.length > 0 ? null : reason,
     };
   });
+}
+
+export function startingSelection(
+  agents: ExecutionBindingAdvertisement[],
+  envelopeModels: Model[],
+  configuredAgentRef: string,
+  configuredModel: Model | null,
+): StartingSelection {
+  const options = compatibleAgents(agents, envelopeModels);
+  const configuredAgent = options.find((agent) => agent.agentRef === configuredAgentRef && agent.compatible);
+  const exactConfiguredModel = configuredAgent && configuredModel
+    ? configuredAgent.models.find((model) => modelKey(model) === modelKey(configuredModel))
+    : undefined;
+  if (configuredAgent && exactConfiguredModel) {
+    return { agent: configuredAgent, model: exactConfiguredModel };
+  }
+  if (configuredAgent) {
+    return { agent: configuredAgent, model: configuredAgent.models[0] ?? null };
+  }
+  if (configuredModel) {
+    const modelAgent = options.find((agent) => agent.models.some((model) => modelKey(model) === modelKey(configuredModel)));
+    if (modelAgent) return { agent: modelAgent, model: configuredModel };
+  }
+  for (const model of envelopeModels) {
+    const modelAgent = options.find((agent) => agent.models.some((candidate) => modelKey(candidate) === modelKey(model)));
+    if (modelAgent) return { agent: modelAgent, model };
+  }
+  return { agent: undefined, model: null };
 }
 
 export function effectiveAgentSelection(

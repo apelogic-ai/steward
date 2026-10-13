@@ -40,6 +40,7 @@ import {
   effectiveModelSelection,
   ModelPicker,
   preferredTaskModel,
+  startingSelection,
   type Model,
 } from "@/components/model-selection";
 import { parseRunEventData } from "@/components/run-views";
@@ -171,8 +172,16 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
   const readyRepository = useMemo(() => defaultOnboardingRepository(repositoryList), [repositoryList]);
   const [selectedTemplateId, setSelectedTemplateId] = useState(data.templates.templates[0]?.id ?? "");
   const [selectedEnvelopeId, setSelectedEnvelopeId] = useState(provisionedRequest?.id ?? "");
-  const [agentRef, setAgentRef] = useState(data.starterTask.taskDefinition.runtime.agentRef);
-  const [model, setModel] = useState<Model | null>(() => preferredTaskModel(data.starterTask.taskDefinition));
+  const configuredModel = preferredTaskModel(data.starterTask.taskDefinition);
+  const initialEnvelopeSpec = provisionedRequest?.approvedEnvelope ?? provisionedRequest?.requestedEnvelope;
+  const initialSelection = startingSelection(
+    data.capabilities.agents,
+    initialEnvelopeSpec?.spec.llms ?? [],
+    data.starterTask.taskDefinition.runtime.agentRef,
+    configuredModel,
+  );
+  const [agentRef, setAgentRef] = useState(initialSelection.agent?.agentRef ?? data.starterTask.taskDefinition.runtime.agentRef);
+  const [model, setModel] = useState<Model | null>(initialSelection.model);
   const [prompt, setPrompt] = useState(data.starterTask.taskDefinition.promptText ?? "");
   const [checkoutRepository, setCheckoutRepository] = useState(false);
   const [historyDepth, setHistoryDepth] = useState("");
@@ -208,6 +217,20 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
     model,
     selectedAgent,
   );
+
+  function selectEnvelope(nextEnvelopeId: string) {
+    setSelectedEnvelopeId(nextEnvelopeId);
+    const nextEnvelope = activeEnvelopes.find((request) => request.id === nextEnvelopeId);
+    const nextSpec = nextEnvelope?.approvedEnvelope ?? nextEnvelope?.requestedEnvelope;
+    const nextSelection = startingSelection(
+      data.capabilities.agents,
+      nextSpec?.spec.llms ?? [],
+      data.starterTask.taskDefinition.runtime.agentRef,
+      configuredModel,
+    );
+    setAgentRef(nextSelection.agent?.agentRef ?? data.starterTask.taskDefinition.runtime.agentRef);
+    setModel(nextSelection.model);
+  }
   const parsedHistoryDepth = historyDepth.trim() === "" ? undefined : Number(historyDepth);
   const historyDepthValid = parsedHistoryDepth === undefined || (Number.isSafeInteger(parsedHistoryDepth) && parsedHistoryDepth > 0);
   const effectiveFiles = selectedAgent && selectedModel
@@ -477,7 +500,7 @@ function OnboardingChecklist({ data, onRefresh, onSelectRepository: setSelectedR
           <div className="grid content-start gap-2 text-sm">{repositoryPicker("No GitHub repositories are visible to this connection.")}</div>
           <label className="grid gap-2 text-sm font-semibold">Coding agent<select aria-describedby={agentWarning ? agentWarningId : undefined} className={fieldClass} onChange={(event) => setAgentRef(event.target.value)} value={selectedAgent?.agentRef ?? ""}>{agentOptions.map((agent) => <option disabled={!agent.compatible} key={agent.agentRef} value={agent.agentRef}>{agent.displayName ? `${agent.displayName} · ${agent.agentRef}` : agent.agentRef}{agent.compatible ? "" : " · unavailable"}</option>)}</select></label>
           <ModelPicker className={fieldClass} describedBy={modelWarning ? modelWarningId : undefined} models={selectedAgent?.models ?? []} onChange={setModel} selected={selectedModel} />
-          <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} onChange={(event) => setSelectedEnvelopeId(event.target.value)} value={selectedEnvelope?.id ?? ""}>{activeEnvelopes.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
+          <label className="grid gap-2 text-sm font-semibold">Envelope<select className={fieldClass} onChange={(event) => selectEnvelope(event.target.value)} value={selectedEnvelope?.id ?? ""}>{activeEnvelopes.map((request) => <option key={request.id} value={request.id}>{request.templateId ?? "Custom"} · rev {request.approvedEnvelope?.revision ?? request.requestedEnvelope.revision}</option>)}</select></label>
         </div>
         {readinessFailure ? <p className="text-sm text-warn">{readinessFailure}</p> : null}
         {agentWarning ? <p className="text-sm text-warn" id={agentWarningId} role="status">{agentWarning}</p> : null}
