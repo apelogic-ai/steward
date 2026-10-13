@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- Git workspaces with bounded history now accept the shallow-boundary packets emitted by Git
+  servers, so files-only and explicit-depth checkouts are no longer refused.
 - Run-request refusals and temporary unavailability now return stable error codes separately from
   their plain-language failure reasons.
 - A failed workspace-source download now immediately fails the reserved run with its source cause,

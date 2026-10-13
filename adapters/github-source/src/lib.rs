@@ -114,7 +114,7 @@ fn decode_upload_pack_result(
             _ if payload.starts_with(b"shallow ") => {
                 let commit = payload
                     .strip_prefix(b"shallow ")
-                    .and_then(|value| value.strip_suffix(b"\n"))
+                    .map(|value| value.strip_suffix(b"\n").unwrap_or(value))
                     .and_then(|value| std::str::from_utf8(value).ok())
                     .ok_or_else(|| rejected("GitHub returned an invalid shallow boundary"))?;
                 shallow.push(
@@ -1448,10 +1448,14 @@ fn failed(reason: &str) -> PortError {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         io::{Read, Write},
         net::TcpListener,
+        path::Path,
+        process::{Command, Stdio},
         sync::{Arc, Mutex},
         thread,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use futures::StreamExt as _;
@@ -1476,6 +1480,69 @@ mod tests {
     const CATALOG_TREE: &str = "cccccccccccccccccccccccccccccccccccccccc";
     const BLOB: &str = "dddddddddddddddddddddddddddddddddddddddd";
 
+    fn git_command(repository: &Path) -> Command {
+        let mut command = Command::new("git");
+        command
+            .current_dir(repository)
+            .env("GIT_CONFIG_GLOBAL", repository.join(".gitconfig-disabled"))
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        for variable in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_QUARANTINE_PATH",
+            "GIT_NAMESPACE",
+            "GIT_PREFIX",
+        ] {
+            command.env_remove(variable);
+        }
+        command
+    }
+
+    fn run_git(repository: &Path, arguments: &[&str]) -> Result<Vec<u8>, String> {
+        let output = git_command(repository)
+            .args(arguments)
+            .output()
+            .map_err(|error| format!("run git {}: {error}", arguments.join(" ")))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git {} failed: {}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(output.stdout)
+    }
+
+    fn upload_pack(repository: &Path, request: &[u8]) -> Result<Vec<u8>, String> {
+        let mut child = git_command(repository)
+            .args(["upload-pack", "--stateless-rpc", "."])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("start git upload-pack: {error}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "git upload-pack stdin is unavailable".to_owned())?
+            .write_all(request)
+            .map_err(|error| format!("write git upload-pack request: {error}"))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("wait for git upload-pack: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git upload-pack failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(output.stdout)
+    }
+
     #[test]
     fn upload_pack_request_pins_the_exact_commit_and_depth() -> Result<(), String> {
         let commit = ExactGitCommit::parse(format!("git:sha1:{COMMIT}"))?;
@@ -1495,10 +1562,9 @@ mod tests {
             encoded.extend_from_slice(payload);
             encoded
         }
-        let mut response = packet(b"NAK\n");
-        response.extend(packet(
-            b"shallow bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
-        ));
+        let mut response = packet(b"shallow bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        response.extend_from_slice(b"0000");
+        response.extend(packet(b"NAK\n"));
         response.extend(packet(b"\x02counting objects\n"));
         response.extend(packet(b"\x01PACKfixture-one"));
         response.extend(packet(b"\x01fixture-two"));
@@ -1512,6 +1578,88 @@ mod tests {
             )
         );
         assert!(decode_upload_pack_result(&response, 8).is_err());
+
+        let mut line_terminated = packet(b"shallow bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n");
+        line_terminated.extend_from_slice(b"0000");
+        line_terminated.extend(packet(b"NAK\n"));
+        line_terminated.extend(packet(b"\x01PACKfixture"));
+        assert_eq!(
+            decode_upload_pack_result(&line_terminated, 64)
+                .map_err(|error| format!("decode line-terminated shallow result: {error:?}"))?
+                .1,
+            vec![ExactGitCommit::parse(format!("git:sha1:{ROOT_TREE}"))?]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn real_upload_pack_decodes_shallow_boundaries_at_depth_one_and_three() -> Result<(), String> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let repository = std::env::temp_dir().join(format!(
+            "steward-github-source-upload-pack-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&repository).map_err(|error| error.to_string())?;
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(repository.clone());
+
+        run_git(
+            &repository,
+            &["init", "--quiet", "--object-format=sha1", "."],
+        )?;
+        let mut commits = Vec::new();
+        for generation in 1..=4 {
+            fs::write(
+                repository.join("history.txt"),
+                format!("generation {generation}\n"),
+            )
+            .map_err(|error| error.to_string())?;
+            run_git(&repository, &["add", "history.txt"])?;
+            run_git(
+                &repository,
+                &[
+                    "-c",
+                    "user.name=alice",
+                    "-c",
+                    "user.email=alice@example.com",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "commit",
+                    "--quiet",
+                    "--no-verify",
+                    "-m",
+                    &format!("generation {generation}"),
+                ],
+            )?;
+            commits.push(
+                String::from_utf8(run_git(&repository, &["rev-parse", "HEAD"])?)
+                    .map_err(|error| error.to_string())?
+                    .trim()
+                    .to_owned(),
+            );
+        }
+
+        let head = ExactGitCommit::parse(format!("git:sha1:{}", commits[3]))?;
+        for (depth, expected) in [(1, &commits[3]), (3, &commits[1])] {
+            let request = encode_upload_pack_request(&head, Some(depth))
+                .map_err(|error| format!("encode depth {depth} request: {error:?}"))?;
+            let response = upload_pack(&repository, &request)?;
+            let (pack, shallow) = decode_upload_pack_result(&response, 1024 * 1024)
+                .map_err(|error| format!("decode depth {depth} response: {error:?}"))?;
+            assert!(pack.starts_with(b"PACK"));
+            assert_eq!(
+                shallow,
+                vec![ExactGitCommit::parse(format!("git:sha1:{expected}"))?]
+            );
+        }
         Ok(())
     }
 
