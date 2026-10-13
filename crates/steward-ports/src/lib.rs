@@ -48,6 +48,8 @@ pub const MAX_TASK_INPUT_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_TASK_OUTPUT_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 /// Safe, actionable failure returned when scratch storage cannot enforce its approved size.
 pub const SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE: &str = "The scratch volume of this deployment does not enforce its size. Ask an administrator to check the workspace storage.";
+/// Safe, actionable failure returned when a workspace cannot be prepared before agent execution.
+pub const WORKSPACE_PREPARATION_FAILURE: &str = "The workspace could not be prepared. Ask an administrator to check the workspace storage and source.";
 
 /// Vendor-neutral inputs used to render one immutable Task execution command.
 ///
@@ -132,10 +134,24 @@ pub const PORTS: [PortDescriptor; 8] = [
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum PortError {
-    Unsupported { operation: &'static str },
-    Rejected { reason: String },
-    LimitExceeded { resource: &'static str },
-    Failed { reason: String },
+    Unsupported {
+        operation: &'static str,
+    },
+    Rejected {
+        reason: String,
+    },
+    TaskPreparationFailed {
+        reason: String,
+        step: &'static str,
+        category: &'static str,
+        exit_code: Option<i32>,
+    },
+    LimitExceeded {
+        resource: &'static str,
+    },
+    Failed {
+        reason: String,
+    },
     SandboxFailed,
     CredentialGrantFailed,
 }
@@ -682,6 +698,7 @@ pub trait GitHostingPlane: Send + Sync + 'static {
         match error {
             PortError::Rejected { .. } => GitRepositoryDescriptionFailure::MetadataInvalid,
             PortError::Unsupported { .. }
+            | PortError::TaskPreparationFailed { .. }
             | PortError::LimitExceeded { .. }
             | PortError::Failed { .. }
             | PortError::SandboxFailed

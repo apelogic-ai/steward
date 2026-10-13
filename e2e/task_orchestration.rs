@@ -41,7 +41,7 @@ use steward_ports::{
     InferenceRequest, PortError, ProviderControlExecutionBindings, ProvisionedInference,
     SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxObservation, SandboxRequest, SandboxRuntime,
     SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
-    SandboxTaskTranscript, TaskAttemptId,
+    SandboxTaskTranscript, TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
 };
 use steward_store::{
     AgentRunLogStream, AgentRunTimelineKind, BrowserMemberStateAction, BrowserMemberStateChange,
@@ -2833,155 +2833,150 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         "a historical archive must not be relabelled after its bytes become immutable"
     );
 
-    let scratch_failure_task_uid = Uuid::new_v4();
-    let scratch_failure_operation_id = Uuid::new_v4();
-    let scratch_failure_runtime_name = format!("scratch-failure-{suffix}");
-    insert_task_projection_fixture(
-        &pool,
-        TaskProjectionFixture {
-            source_task_uid: task_uid,
-            task_uid: scratch_failure_task_uid,
-            operation_id: scratch_failure_operation_id,
-            idempotency_key: &format!("scratch-failure-{suffix}"),
-            task_runtime_name: &scratch_failure_runtime_name,
-            operation_runtime_name: &scratch_failure_runtime_name,
-            inert_manifest_digest: &inert_digest,
-            active_manifest_digest: &active_digest,
-            direct_task_evidence: None,
-        },
-    )
-    .await?;
-    store
-        .put_task_inputs(
-            scratch_failure_task_uid,
-            &service,
-            identity.user_id.as_str(),
-            b"scratch failure input",
-        )
-        .await?;
-    store
-        .request_task_execution(
-            scratch_failure_task_uid,
-            &service,
-            identity.user_id.as_str(),
-        )
-        .await?;
-    store
-        .authorize_task_runtime_creation(scratch_failure_task_uid, 1, "test-controller")
-        .await?;
-    let scratch_operation = store
-        .task_runtime_operation(scratch_failure_task_uid)
-        .await?
-        .ok_or(StoreError::TaskNotFound)?;
-    let scratch_runtime_uid = format!("scratch-runtime-{suffix}");
-    store
-        .record_task_runtime_observed(
-            scratch_failure_task_uid,
-            scratch_operation.generation,
-            &scratch_runtime_uid,
-            "1",
-            "test-controller",
-        )
-        .await?;
-    let scratch_operation = store
-        .task_runtime_operation(scratch_failure_task_uid)
-        .await?
-        .ok_or(StoreError::TaskNotFound)?;
-    store
-        .decide_task_runtime_authority_v3(
-            scratch_failure_task_uid,
-            scratch_operation.generation,
-            "test-controller",
-        )
-        .await?;
-    let scratch_operation = store
-        .task_runtime_operation(scratch_failure_task_uid)
-        .await?
-        .ok_or(StoreError::TaskNotFound)?;
-    store
-        .decide_task_runtime_authority_v3(
-            scratch_failure_task_uid,
-            scratch_operation.generation,
-            "test-controller",
-        )
-        .await?;
-    let scratch_operation = store
-        .task_runtime_operation(scratch_failure_task_uid)
-        .await?
-        .ok_or(StoreError::TaskNotFound)?;
-    store
-        .record_task_activation_observed(
-            scratch_failure_task_uid,
-            scratch_operation.generation,
-            &TaskActivationObservation {
-                runtime_uid: &scratch_runtime_uid,
-                resource_version: "2",
+    for (failure_kind, failure_reason) in [
+        ("scratch-capacity", SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE),
+        ("workspace-preparation", WORKSPACE_PREPARATION_FAILURE),
+    ] {
+        let failure_task_uid = Uuid::new_v4();
+        let failure_operation_id = Uuid::new_v4();
+        let failure_runtime_name = format!("{failure_kind}-{suffix}");
+        insert_task_projection_fixture(
+            &pool,
+            TaskProjectionFixture {
+                source_task_uid: task_uid,
+                task_uid: failure_task_uid,
+                operation_id: failure_operation_id,
+                idempotency_key: &format!("{failure_kind}-{suffix}"),
+                task_runtime_name: &failure_runtime_name,
+                operation_runtime_name: &failure_runtime_name,
+                inert_manifest_digest: &inert_digest,
                 active_manifest_digest: &active_digest,
-                provider_set_ready: true,
+                direct_task_evidence: None,
             },
-            "test-controller",
         )
         .await?;
-    let scratch_attempt = match store
-        .claim_task_execution_attempt(
-            scratch_failure_task_uid,
-            &format!("sha256:{}", "d".repeat(64)),
-            &format!("sha256:{}", "e".repeat(64)),
-            "test-controller",
-        )
-        .await?
-    {
-        TaskExecutionTransition::Created(attempt) => attempt,
-        transition => {
-            return Err(io::Error::other(format!(
-                "scratch failure execution attempt was not created: {transition:?}"
-            ))
-            .into());
-        }
-    };
-    let scratch_attempt = match store
-        .authorize_task_execution_start(
-            scratch_attempt.attempt_id,
-            scratch_attempt.generation,
-            "test-controller",
-        )
-        .await?
-    {
-        TaskExecutionTransition::Applied(attempt) => attempt,
-        transition => {
-            return Err(io::Error::other(format!(
-                "scratch failure execution start was not authorized: {transition:?}"
-            ))
-            .into());
-        }
-    };
-    let scratch_adapter_observation_id = scratch_attempt.attempt_id.to_string();
-    let scratch_terminal = store
-        .record_task_execution_observation(
-            scratch_attempt.attempt_id,
-            scratch_attempt.generation,
-            TaskExecutionObservation::Failed {
-                adapter_observation_id: &scratch_adapter_observation_id,
-                reason: SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
-                execution_stdout: None,
-                execution_stderr: None,
-            },
-            "test-controller",
-        )
-        .await?;
-    assert!(matches!(
-        scratch_terminal,
-        TaskExecutionTransition::Applied(_)
-    ));
-    let scratch_failed = store
-        .task(scratch_failure_task_uid)
-        .await?
-        .ok_or(StoreError::TaskNotFound)?;
-    assert_eq!(scratch_failed.phase, TaskPhase::Failed);
-    assert_eq!(
-        scratch_failed.failure_reason.as_deref(),
-        Some(SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE)
-    );
+        store
+            .put_task_inputs(
+                failure_task_uid,
+                &service,
+                identity.user_id.as_str(),
+                b"workspace preparation failure input",
+            )
+            .await?;
+        store
+            .request_task_execution(failure_task_uid, &service, identity.user_id.as_str())
+            .await?;
+        store
+            .authorize_task_runtime_creation(failure_task_uid, 1, "test-controller")
+            .await?;
+        let operation = store
+            .task_runtime_operation(failure_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        let runtime_uid = format!("{failure_kind}-runtime-{suffix}");
+        store
+            .record_task_runtime_observed(
+                failure_task_uid,
+                operation.generation,
+                &runtime_uid,
+                "1",
+                "test-controller",
+            )
+            .await?;
+        let operation = store
+            .task_runtime_operation(failure_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        store
+            .decide_task_runtime_authority_v3(
+                failure_task_uid,
+                operation.generation,
+                "test-controller",
+            )
+            .await?;
+        let operation = store
+            .task_runtime_operation(failure_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        store
+            .decide_task_runtime_authority_v3(
+                failure_task_uid,
+                operation.generation,
+                "test-controller",
+            )
+            .await?;
+        let operation = store
+            .task_runtime_operation(failure_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        store
+            .record_task_activation_observed(
+                failure_task_uid,
+                operation.generation,
+                &TaskActivationObservation {
+                    runtime_uid: &runtime_uid,
+                    resource_version: "2",
+                    active_manifest_digest: &active_digest,
+                    provider_set_ready: true,
+                },
+                "test-controller",
+            )
+            .await?;
+        let attempt = match store
+            .claim_task_execution_attempt(
+                failure_task_uid,
+                &format!("sha256:{}", "d".repeat(64)),
+                &format!("sha256:{}", "e".repeat(64)),
+                "test-controller",
+            )
+            .await?
+        {
+            TaskExecutionTransition::Created(attempt) => attempt,
+            transition => {
+                return Err(io::Error::other(format!(
+                    "{failure_kind} execution attempt was not created: {transition:?}"
+                ))
+                .into());
+            }
+        };
+        let attempt = match store
+            .authorize_task_execution_start(
+                attempt.attempt_id,
+                attempt.generation,
+                "test-controller",
+            )
+            .await?
+        {
+            TaskExecutionTransition::Applied(attempt) => attempt,
+            transition => {
+                return Err(io::Error::other(format!(
+                    "{failure_kind} execution start was not authorized: {transition:?}"
+                ))
+                .into());
+            }
+        };
+        let adapter_observation_id = attempt.attempt_id.to_string();
+        let terminal = store
+            .record_task_execution_observation(
+                attempt.attempt_id,
+                attempt.generation,
+                TaskExecutionObservation::Failed {
+                    adapter_observation_id: &adapter_observation_id,
+                    reason: failure_reason,
+                    execution_stdout: None,
+                    execution_stderr: None,
+                },
+                "test-controller",
+            )
+            .await?;
+        assert!(matches!(terminal, TaskExecutionTransition::Applied(_)));
+        let failed = store
+            .task(failure_task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?;
+        assert_eq!(failed.phase, TaskPhase::Failed);
+        assert_eq!(failed.failure_reason.as_deref(), Some(failure_reason));
+    }
     Ok(())
 }
 
