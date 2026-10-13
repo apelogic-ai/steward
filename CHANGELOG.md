@@ -23,6 +23,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - New Tasks, Run now, and Get started choose their initial coding agent and model from deployment
   configuration and the selected Envelope instead of list position. Saved Task versions remember
   their selected Envelope for later runs.
+- Running Tasks show stdout and stderr together while in progress, and the displayed run duration
+  now advances until the run finishes.
 
 ## [0.3.17] - 2026-10-13
 

@@ -118,6 +118,19 @@ function isTerminalPhase(phase: string): boolean {
   return phase === "failed" || phase === "succeeded" || phase === "cancelled";
 }
 
+function RunDuration({ createdAt, phase, updatedAt }: Readonly<Pick<BrowserRunView, "createdAt" | "phase" | "updatedAt">>) {
+  const terminal = isTerminalPhase(phase);
+  const [currentTime, setCurrentTime] = useState(updatedAt);
+  useEffect(() => {
+    if (terminal) return;
+    const tick = () => setCurrentTime(new Date().toISOString());
+    tick();
+    const timer = setInterval(tick, 1_000);
+    return () => clearInterval(timer);
+  }, [terminal]);
+  return durationLabel(createdAt, terminal ? updatedAt : currentTime);
+}
+
 export function inferenceFailureGuidance(errorCategory: string | null | undefined): string | null {
   if (errorCategory === "inference-key-rejected") {
     return "The model service rejected your saved API key. Replace it in Connections, then retry the run.";
@@ -245,17 +258,20 @@ export async function pollRerun(
   return { failure: "unavailable" };
 }
 
-function RunStepRow({ admin, onStreamChange, selectedStream, step, taskUid }: Readonly<{
+function RunStepRow({ admin, onStreamChange, selectedStream, showLiveStreams, step, taskUid }: Readonly<{
   admin: boolean;
   onStreamChange: (stream: ExecutionLogStream) => void;
   selectedStream: ExecutionLogStream | null;
+  showLiveStreams: boolean;
   step: BrowserRunView["stages"][number]["steps"][number];
   taskUid: string;
 }>) {
   const streams = step.logStreams.filter((value): value is ExecutionLogStream => value === "stdout" || value === "stderr");
   const [open, setOpen] = useState(Boolean(selectedStream));
   const [localStream, setLocalStream] = useState<ExecutionLogStream>(streams[0] ?? "stdout");
+  const [streamChosen, setStreamChosen] = useState(false);
   const stream = selectedStream && streams.includes(selectedStream) ? selectedStream : localStream;
+  const showAllStreams = showLiveStreams && streams.length > 1 && !selectedStream && !streamChosen;
   return (
     <li>
       <details className="group" onToggle={(event) => setOpen(event.currentTarget.open)} open={open || Boolean(selectedStream)}>
@@ -267,10 +283,10 @@ function RunStepRow({ admin, onStreamChange, selectedStream, step, taskUid }: Re
         {open && streams.length ? (
           <div className="space-y-3 border-t border-line-soft bg-subtle px-4 py-4">
             <div className="flex flex-wrap gap-2" role="tablist" aria-label={`${step.displayName} logs`}>
-              {streams.map((availableStream) => <button aria-selected={stream === availableStream} className={`rounded-control border px-3 py-2 font-mono text-xs font-semibold ${stream === availableStream ? "border-brand bg-brand-soft" : "bg-panel"}`} key={availableStream} onClick={() => { setLocalStream(availableStream); onStreamChange(availableStream); }} role="tab" type="button">{availableStream}</button>)}
+              {streams.map((availableStream) => <button aria-selected={!showAllStreams && stream === availableStream} className={`rounded-control border px-3 py-2 font-mono text-xs font-semibold ${!showAllStreams && stream === availableStream ? "border-brand bg-brand-soft" : "bg-panel"}`} key={availableStream} onClick={() => { setStreamChosen(true); setLocalStream(availableStream); onStreamChange(availableStream); }} role="tab" type="button">{availableStream}</button>)}
               <a className="ms-auto rounded-control border bg-panel px-3 py-2 font-mono text-xs font-semibold" href={`${admin ? "/admin/runs" : "/runs"}/${encodeURIComponent(taskUid)}/logs/${stream}`}>Open full page</a>
             </div>
-            <ExecutionLogPanel admin={admin} stream={stream} taskUid={taskUid} />
+            {showAllStreams ? <div className="space-y-4">{streams.map((liveStream) => <section aria-label={`${liveStream} live log`} className="space-y-2" key={liveStream}><h4 className="font-mono text-xs font-semibold">{liveStream}</h4><ExecutionLogPanel admin={admin} stream={liveStream} taskUid={taskUid} /></section>)}</div> : <ExecutionLogPanel admin={admin} stream={stream} taskUid={taskUid} />}
           </div>
         ) : null}
       </details>
@@ -618,7 +634,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-3"><h1 className="text-[28px] font-semibold tracking-tight" id="page-title">{pinnedWorkflow}</h1><StatusBadge value={run.phase} /></div>
                 <p className="mt-1 break-all font-mono text-xs text-muted-ink">{run.taskUid}</p>
-                {run.trigger ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.trigger.actor}</strong> via {run.trigger.event} · <a href={run.trigger.runUrl} rel="noreferrer" target="_blank">{run.trigger.repository}@{run.trigger.ref} ({run.trigger.sha.slice(0, 7)})</a> · {durationLabel(run.createdAt, run.updatedAt)}</div> : <div className="mt-2 text-sm text-muted-ink">Started {dateTime(run.createdAt)} · {durationLabel(run.createdAt, run.updatedAt)}</div>}
+                {run.trigger ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.trigger.actor}</strong> via {run.trigger.event} · <a href={run.trigger.runUrl} rel="noreferrer" target="_blank">{run.trigger.repository}@{run.trigger.ref} ({run.trigger.sha.slice(0, 7)})</a> · <RunDuration createdAt={run.createdAt} phase={run.phase} updatedAt={run.updatedAt} /></div> : <div className="mt-2 text-sm text-muted-ink">Started {dateTime(run.createdAt)} · <RunDuration createdAt={run.createdAt} phase={run.phase} updatedAt={run.updatedAt} /></div>}
                 <div className="mt-1 text-sm text-muted-ink">Origin: {run.origin}{run.package ? ` · Package: ${run.package.source} @ ${run.package.revision} · ${run.package.path} · Prompt: ${run.package.promptSource}` : ""}</div>
                 {runtimeMinutes ? <div className="mt-1 text-sm text-muted-ink">{runtimeMinutes}</div> : null}
               </div>
@@ -655,7 +671,7 @@ export function RunDetailView({ admin = false, taskUid }: Readonly<{ admin?: boo
                   <div className="flex items-center justify-between gap-4"><h2 className="text-lg font-semibold" id="selected-stage">{selectedStage?.displayName ?? "Run stages"}</h2>{selectedStage ? <StatusBadge value={selectedStage.state} /> : null}</div>
                   <p className="mt-5 rounded-control border border-warn/30 bg-warn-soft px-4 py-3 text-sm text-warn"><strong className="block font-semibold text-warn" id="sensitivity-notice">Sensitivity notice</strong>Execution logs may reproduce arbitrary user, tool, or agent output.</p>
                   {selectedStage?.id === "agent_execution" && run.executionLog === "off" ? <div className="mt-5 rounded-card border p-4"><p className="text-sm font-semibold">No execution log was captured for this run.</p><p className="mt-1 text-sm text-muted-ink">Enable <strong>Capture execution log</strong> when starting a run to retain stdout and stderr. Captured output may contain sensitive data.</p></div> : null}
-                  {selectedStage?.steps.length ? <ol className="mt-5 divide-y divide-line-soft rounded-card border">{selectedStage.steps.map((step) => <RunStepRow admin={admin} key={step.id} onStreamChange={(stream) => selectLocation(selectedStage.id, stream)} selectedStream={selectedStage.id === "agent_execution" ? selectedStream : null} step={step} taskUid={taskUid} />)}</ol> : selectedStage ? <p className="mt-5 rounded-card border p-4 text-sm text-muted-ink">{stageSummary(selectedStage)}</p> : null}
+                  {selectedStage?.steps.length ? <ol className="mt-5 divide-y divide-line-soft rounded-card border">{selectedStage.steps.map((step) => <RunStepRow admin={admin} key={step.id} onStreamChange={(stream) => selectLocation(selectedStage.id, stream)} selectedStream={selectedStream} showLiveStreams={run.phase === "running"} step={step} taskUid={taskUid} />)}</ol> : selectedStage ? <p className="mt-5 rounded-card border p-4 text-sm text-muted-ink">{stageSummary(selectedStage)}</p> : null}
                   {!admin && run.phase === "succeeded" && run.finalized ? <RunOutputs taskUid={taskUid} /> : null}
                   {!admin && run.origin === "browser" && run.package?.source === "inline" && run.package.contentDigest ? <p className="mt-5 text-sm"><Link className="font-semibold text-brand" href={`/tasks/${encodeURIComponent(run.package.contentDigest)}`}>Open Task</Link> · package definition and run history</p> : null}
                 </section>
