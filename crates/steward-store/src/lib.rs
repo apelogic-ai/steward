@@ -10411,6 +10411,102 @@ impl PgStore {
         self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)
     }
 
+    pub async fn fail_task_submission(
+        &self,
+        task_uid: Uuid,
+        submitter_service: &str,
+        owner_user_id: &str,
+        reason: &str,
+    ) -> Result<TaskRecord, StoreError> {
+        if reason.is_empty() {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let current = task_in_transaction_for_update(&mut transaction, task_uid).await?;
+        if current.submitter_service != submitter_service
+            || current.owner_user_id.as_deref() != Some(owner_user_id)
+            || current.identity_binding_state != "bound"
+        {
+            return Err(StoreError::TaskNotFound);
+        }
+        if current.execute_requested
+            || current.input_archive.is_some()
+            || current.finalized
+            || !matches!(
+                current.phase,
+                steward_types::TaskPhase::Submitted
+                    | steward_types::TaskPhase::Parked
+                    | steward_types::TaskPhase::Failed
+            )
+            || current
+                .failure_reason
+                .as_deref()
+                .is_some_and(|stored| stored != reason)
+        {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        if matches!(current.orchestration_version, 2 | 3) {
+            let operation =
+                task_runtime_operation_in_transaction_for_update(&mut transaction, task_uid)
+                    .await?;
+            if operation.state == TaskOrchestrationState::Finalized {
+                return Err(StoreError::InvalidTaskTransition);
+            }
+            fence_task_execution_for_cleanup(&mut transaction, task_uid).await?;
+            if operation.state != TaskOrchestrationState::CleanupPending {
+                let updated = sqlx::query(
+                    "UPDATE task_runtime_operations \
+                     SET state = 'cleanup_pending', generation = generation + 1, \
+                         cleanup_requested_at = now(), retry_at = NULL, \
+                         last_error_code = 'task_submission_failed', \
+                         lease_owner = NULL, lease_expires_at = NULL, updated_at = now() \
+                     WHERE task_uid = $1 AND generation = $2 AND state <> 'finalized'",
+                )
+                .bind(task_uid)
+                .bind(operation.generation)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?
+                .rows_affected();
+                if updated != 1 {
+                    return Err(StoreError::InvalidTaskTransition);
+                }
+                append_task_orchestration_journal(
+                    &mut transaction,
+                    task_uid,
+                    operation.generation + 1,
+                    TaskOrchestrationState::CleanupPending,
+                    "task_submission_failed_cleanup_requested",
+                    submitter_service,
+                )
+                .await?;
+            }
+        }
+        let updated = sqlx::query(
+            "UPDATE task_submissions \
+             SET phase = 'failed', failure_reason = COALESCE(failure_reason, $4), \
+                 finalize_requested = true, updated_at = now() \
+             WHERE task_uid = $1 AND submitter_service = $2 AND owner_user_id = $3 \
+               AND identity_binding_state = 'bound' AND NOT execute_requested \
+               AND input_archive IS NULL AND NOT finalized \
+               AND phase IN ('submitted', 'parked', 'failed') \
+               AND (failure_reason IS NULL OR failure_reason = $4)",
+        )
+        .bind(task_uid)
+        .bind(submitter_service)
+        .bind(owner_user_id)
+        .bind(reason)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .rows_affected();
+        if updated != 1 {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        transaction.commit().await.map_err(database_error)?;
+        self.task(task_uid).await?.ok_or(StoreError::TaskNotFound)
+    }
+
     pub async fn task_for_submitter(
         &self,
         task_uid: Uuid,

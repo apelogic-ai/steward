@@ -4209,6 +4209,7 @@ mod tests {
         files: Arc<BTreeMap<(String, String, String), Vec<u8>>>,
         trees: Arc<BTreeMap<(String, String), Vec<GitTreeEntry>>>,
         wrong_object_path: Option<String>,
+        pack_failure: Option<PortError>,
         reads: Arc<Mutex<Vec<(String, String, String)>>>,
         resolved_revision: Arc<Mutex<ExactGitCommit>>,
     }
@@ -4342,6 +4343,9 @@ mod tests {
         }
 
         async fn read_pack(&self, request: &GitPackRequest) -> Result<GitPack, PortError> {
+            if let Some(error) = &self.pack_failure {
+                return Err(error.clone());
+            }
             Ok(GitPack {
                 repository: request.repository.clone(),
                 commit: request.commit.clone(),
@@ -4470,6 +4474,7 @@ mod tests {
             ])),
             trees: Arc::new(BTreeMap::new()),
             wrong_object_path: wrong_object_path.map(str::to_owned),
+            pack_failure: None,
             reads: Arc::new(Mutex::new(Vec::new())),
             resolved_revision: Arc::new(Mutex::new(ExactGitCommit::parse(format!(
                 "git:sha1:{}",
@@ -9914,6 +9919,64 @@ mod tests {
             })
         }
 
+        fn fail_task_submission<'a>(
+            &'a self,
+            task_uid: Uuid,
+            submitter_service: &'a str,
+            owner_user_id: &'a str,
+            reason: &'a str,
+        ) -> BoxFuture<'a, Result<TaskRecord, StoreError>> {
+            Box::pin(async move {
+                if reason.is_empty() {
+                    return Err(StoreError::InvalidTaskTransition);
+                }
+                let mut tasks = self.tasks.lock().map_err(|_| {
+                    StoreError::Database("fake task ledger lock was poisoned".to_owned())
+                })?;
+                let task = tasks
+                    .iter_mut()
+                    .find(|task| {
+                        task.task_uid == task_uid
+                            && task.submitter_service == submitter_service
+                            && task.owner_user_id.as_deref() == Some(owner_user_id)
+                    })
+                    .ok_or(StoreError::TaskNotFound)?;
+                if task.execute_requested
+                    || task.input_archive.is_some()
+                    || task.finalized
+                    || !matches!(
+                        task.phase,
+                        TaskPhase::Submitted | TaskPhase::Parked | TaskPhase::Failed
+                    )
+                    || task
+                        .failure_reason
+                        .as_deref()
+                        .is_some_and(|stored| stored != reason)
+                {
+                    return Err(StoreError::InvalidTaskTransition);
+                }
+                let mut operations = self.task_operations.lock().map_err(|_| {
+                    StoreError::Database("fake Task operation lock was poisoned".to_owned())
+                })?;
+                let operation = operations
+                    .iter_mut()
+                    .find(|operation| operation.task_uid == task_uid)
+                    .ok_or(StoreError::InvalidTaskTransition)?;
+                if operation.state == TaskOrchestrationState::Finalized {
+                    return Err(StoreError::InvalidTaskTransition);
+                }
+                if operation.state != TaskOrchestrationState::CleanupPending {
+                    operation.state = TaskOrchestrationState::CleanupPending;
+                    operation.generation += 1;
+                    operation.last_error_code = Some("task_submission_failed".to_owned());
+                }
+                task.phase = TaskPhase::Failed;
+                task.failure_reason.get_or_insert_with(|| reason.to_owned());
+                task.finalize_requested = true;
+                Ok(task.clone())
+            })
+        }
+
         fn task_for_submitter<'a>(
             &'a self,
             task_uid: Uuid,
@@ -12674,6 +12737,7 @@ mod tests {
             files: Arc::new(files),
             trees: Arc::new(BTreeMap::new()),
             wrong_object_path: None,
+            pack_failure: None,
             reads: Arc::new(Mutex::new(Vec::new())),
             resolved_revision: Arc::new(Mutex::new(ExactGitCommit::parse(format!(
                 "git:sha1:{}",
@@ -12951,6 +13015,7 @@ mod tests {
             files: Arc::new(files),
             trees: Arc::new(BTreeMap::new()),
             wrong_object_path: None,
+            pack_failure: None,
             reads: Arc::new(Mutex::new(Vec::new())),
             resolved_revision: Arc::new(Mutex::new(ExactGitCommit::parse(format!(
                 "git:sha1:{}",
@@ -13092,6 +13157,129 @@ mod tests {
             }
             _ => return Err("browser workspace evidence was not a Git entry".to_owned()),
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_workspace_download_failure_is_reported_and_never_provisionable()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        enable_inline_for_versioned_task_fixture(&ledger, true)?;
+        let mut request_body = inline_browser_task_body();
+        let definition = request_body["package"]["files"]["task-definition.json"]
+            .as_str()
+            .ok_or_else(|| "inline browser fixture omitted TaskDefinition".to_owned())?;
+        let mut definition = serde_json::from_str::<serde_json::Value>(definition)
+            .map_err(|error| format!("parse inline browser TaskDefinition: {error}"))?;
+        definition["workspace"] = serde_json::json!([{
+            "git": {
+                "repository": {"ownerId": "7890", "repositoryId": "654321"},
+                "ref": "trigger",
+                "history": {"depth": 12}
+            }
+        }]);
+        request_body["package"]["files"]["task-definition.json"] =
+            serde_json::Value::String(definition.to_string());
+
+        let mut git = browser_git_fixture()?;
+        git.pack_failure = Some(PortError::Failed {
+            reason: "source host is unreachable".to_owned(),
+        });
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let captured_reports = reports.clone();
+        let config = task_api_config()?
+            .with_git_hosting_plane(git)
+            .with_source_repository_bindings_json(Some(&direct_source_bindings_json("654321")))?
+            .with_failure_reporter(Arc::new(move |line| {
+                if let Ok(mut reports) = captured_reports.lock() {
+                    reports.push(line.to_owned());
+                }
+            }));
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let app = browser_task_router(ledger.clone(), config, auth);
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/runs")
+                .header(header::COOKIE, &session_cookie)
+                .header(header::ORIGIN, origin)
+                .header("sec-fetch-site", "same-origin")
+                .header("x-steward-csrf", &csrf)
+                .header("idempotency-key", "browser-workspace-download-failure")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(request_body.to_string()))
+                .map_err(|error| format!("build browser workspace request: {error}"))
+        };
+        let response = app
+            .clone()
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("submit browser workspace request: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read browser workspace response: {error}"))?;
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode browser workspace response: {error}"))?;
+        let reason = "Steward could not download the workspace source. Retry the request; if it persists, contact a Steward administrator.";
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "task.runtime_contract_unavailable",
+                "failureReason": reason,
+            })
+        );
+        {
+            let tasks = ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?;
+            let task = tasks
+                .first()
+                .ok_or_else(|| "failed browser run was not retained for audit".to_owned())?;
+            assert_eq!(task.phase, TaskPhase::Failed);
+            assert_eq!(task.failure_reason.as_deref(), Some(reason));
+            assert!(!task.execute_requested);
+        }
+        {
+            let operations = ledger
+                .task_operations
+                .lock()
+                .map_err(|_| "fake Task operation lock was poisoned")?;
+            assert_eq!(operations.len(), 1);
+            assert_eq!(operations[0].state, TaskOrchestrationState::CleanupPending);
+        }
+        assert!(
+            reports
+                .lock()
+                .map_err(|_| "failure report capture lock was poisoned")?
+                .iter()
+                .any(|line| line.contains(
+                    "task source operation failed operation=read_pack category=failed diagnostic=source_failed"
+                ))
+        );
+        let retry = app
+            .oneshot(request()?)
+            .await
+            .map_err(|error| format!("retry browser workspace request: {error}"))?;
+        assert_eq!(retry.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_body = to_bytes(retry.into_body(), 64 * 1024)
+            .await
+            .map_err(|error| format!("read browser workspace retry response: {error}"))?;
+        let retry_body: serde_json::Value = serde_json::from_slice(&retry_body)
+            .map_err(|error| format!("decode browser workspace retry response: {error}"))?;
+        assert_eq!(retry_body, body);
+        assert_eq!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "fake Task ledger lock was poisoned")?
+                .len(),
+            1
+        );
         Ok(())
     }
 
