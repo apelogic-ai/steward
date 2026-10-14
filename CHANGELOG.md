@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Run APIs now return the bounded workspace-preparation explanation stored for a failed Run, so
+  clients can show why the coding agent did not start without exposing internal diagnostics.
 - Coding agents now receive the exact path of every repository workspace in their prompt, so a
   plain request about a repository can find its files while staged caller input and declared
   outputs keep their existing relative paths. A run that creates no regular file beneath `out/`

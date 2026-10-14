@@ -17,7 +17,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
-use steward_ports::INFERENCE_REQUEST_REJECTED_FAILURE;
+use steward_ports::{
+    INFERENCE_REQUEST_REJECTED_FAILURE, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
+    WORKSPACE_PREPARATION_FAILURE,
+};
 use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunOutputArchive, AgentRunPage, AgentRunQuery,
     AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind, BrowserTaskVersionPublication,
@@ -2862,6 +2865,12 @@ pub(crate) fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
     if reason == INFERENCE_REQUEST_REJECTED_FAILURE {
         return Some(reason);
     }
+    if matches!(
+        reason,
+        SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE | WORKSPACE_PREPARATION_FAILURE
+    ) {
+        return Some(reason);
+    }
     if public_spending_limit_failure_reason(Some(reason)).is_some() {
         return Some(reason);
     }
@@ -4054,6 +4063,27 @@ mod tests {
         near_miss.failure_reason =
             Some("This run reached its spending limit of 0.25 usd.".to_owned());
         assert_eq!(browser_run_view(near_miss).failure_reason, None);
+        Ok(())
+    }
+
+    #[test]
+    fn run_snapshot_exposes_workspace_preparation_failure_reasons() -> Result<(), String> {
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+
+        for reason in [
+            steward_ports::SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
+            steward_ports::WORKSPACE_PREPARATION_FAILURE,
+        ] {
+            let mut record = run(task_uid, "usr_0123456789abcdef0123456789abcdef");
+            record.failure_reason = Some(reason.to_owned());
+
+            assert_eq!(
+                browser_run_view(record).failure_reason.as_deref(),
+                Some(reason)
+            );
+        }
+
         Ok(())
     }
 
