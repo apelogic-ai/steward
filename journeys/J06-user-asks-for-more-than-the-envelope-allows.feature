@@ -42,7 +42,6 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
   # every refusal must say what to do next.
   # The sentences are the EXPECTED plain wording. 0.3.16 shows
   # 'The run request was rejected. Admission("...")' with "$25" and "20m" (N-03).
-  @known-failing-412
   Scenario Outline: A need above the Envelope's limit is refused before anything starts: <requirement>
     When I open "Tasks"
     And I press "New Task"
@@ -71,6 +70,7 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
 
   # F1. 0.3.16: "Steward rejected this package. Check its paths, Task definition,
   # skills, workspace, outputs, and requirements." (J6 F1; no finding number).
+  # No dedicated issue defines the field-level invalid-Requirements message to verify.
   @known-failing-407
   Scenario: Requirements that are not valid are refused with what is wrong
     When I open "Tasks"

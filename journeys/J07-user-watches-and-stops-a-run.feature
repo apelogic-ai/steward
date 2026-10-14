@@ -15,7 +15,7 @@ Feature: J7 - User watches and stops a run
 
   # Steps 1 to 7 and "Done when".
   # 0.3.16: FAIL at step 3 (N-07) and FAIL at step 5 (N-05).
-  @needs-model @known-failing-409
+  @needs-model
   Scenario: Watch a run, cancel it and see what was captured and spent
     When I open "Runs"
     And I press "Run now"
@@ -79,7 +79,7 @@ Feature: J7 - User watches and stops a run
 
   # F2. The Markdown does not say when a run rightly cannot be cancelled.
   # 0.3.16: the owner of the run sees "You don't have permission to cancel this run." (N-05).
-  @needs-model @known-failing-409
+  @needs-model
   Scenario: A run that cannot be cancelled says why and what to do
     Given I am on the page of a run that cannot be cancelled
     When I open "More run actions"

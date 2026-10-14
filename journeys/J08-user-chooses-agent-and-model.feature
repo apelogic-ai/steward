@@ -74,7 +74,6 @@ Feature: J8 - User chooses agent and model
 
   # F1. 0.3.16: refused and nothing is created, but the text is wrapped and the
   # sentence that says what to do is not shown (N-03).
-  @known-failing-412
   Scenario: A saved Task whose model the Envelope does not allow is refused
     Given I have a saved Task named "Agent choice" with the coding agent "<Agent B>" and the model "<provider-b>/<model-b>"
     When I open "Tasks"

@@ -46,6 +46,7 @@ Feature: J10 - Operator changes configuration
 
   # Part B, steps 5 to 8 and "Done when".
   # 0.3.16: BLOCKED at step 5 (case M-06; no finding number).
+  # No dedicated issue covers this operator-controlled, two-account configuration path.
   @needs-model @known-failing-407
   Scenario: Part B - a model added only in configuration can be picked and run
     When I add the model "<provider-a>/<new-model>" to the installation's configuration without a new product build

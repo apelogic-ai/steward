@@ -172,9 +172,11 @@ file whose name contains `README`; the journey verifies the resolved commit agai
 head. The member role must be one held by the signed-in test account and replaces the `member`
 placeholder in journey text. The account must also have administrator access because J1 and J3
 use administrator APIs and screens. Tool-connection state is recorded but is not an account
-precondition: an existing personal connection does not change these journeys. When
-`STEWARD_JOURNEY_AGENT` or `STEWARD_JOURNEY_MODEL` is set, the matching enabled option is selected;
-otherwise the forms' defaults are kept. The run prefix must be unique for the target installation;
+precondition: an existing personal connection does not change these journeys. A configured
+`STEWARD_JOURNEY_AGENT` or `STEWARD_JOURNEY_MODEL` must exist in the installation and be allowed by
+the selected Envelope. The deliberately narrowed `basic` Envelope is the only exception: it keeps
+the form's compatible default when the configured runtime is unavailable. Without either setting,
+the forms' defaults are kept. The run prefix must be unique for the target installation;
 every object created by the journeys includes it. J2 and J3 derive a distinct, within-template
 runtime-minutes candidate from that prefix and advance to an unused active-Envelope value when
 needed, so prior active Envelopes do not turn a new request into a duplicate.

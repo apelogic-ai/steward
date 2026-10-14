@@ -311,7 +311,7 @@ async function selectConfiguredOption(picker, configured, field) {
   await picker.selectOption(match.value);
 }
 
-async function selectConfiguredRuntime(page, envelopeSpec) {
+async function selectConfiguredRuntime(page, envelopeSpec, envelopeName) {
   const exactTaskNotice = page.getByText(
     "This exact package cannot be changed here. Choose an Envelope and optional inputs for this run.",
     { exact: true },
@@ -319,21 +319,42 @@ async function selectConfiguredRuntime(page, envelopeSpec) {
   if (await exactTaskNotice.count()) return;
 
   const allowedModels = envelopeSpec?.llms ?? [];
-  if (configuredModel) {
-    const [provider, model] = configuredModel.split("/");
-    if (!allowedModels.some((candidate) => candidate.provider === provider && candidate.model === model)) {
-      return;
+  let configuredBinding = null;
+  let configuredModelEntry = null;
+  if (configuredAgent || configuredModel) {
+    const [capabilities, catalog] = await Promise.all([
+      apiJson(page, "/app/api/v1/capabilities"),
+      apiJson(page, "/admin/api/v1/capabilities"),
+    ]);
+    if (configuredAgent) {
+      configuredBinding = capabilities.agents.find((candidate) => (
+        candidate.agentRef === configuredAgent || candidate.displayName === configuredAgent
+      ));
+      expect(configuredBinding, `the installation should configure ${configuredAgent}`).toBeDefined();
+    }
+    if (configuredModel) {
+      const separator = configuredModel.indexOf("/");
+      expect(separator, "STEWARD_JOURNEY_MODEL should use provider/model form").toBeGreaterThan(0);
+      const provider = configuredModel.slice(0, separator);
+      const model = configuredModel.slice(separator + 1);
+      expect(model, "STEWARD_JOURNEY_MODEL should use provider/model form").not.toBe("");
+      configuredModelEntry = catalog.models.find((candidate) => candidate.provider === provider && candidate.model === model);
+      expect(configuredModelEntry, `the installation should configure ${configuredModel}`).toBeDefined();
     }
   }
+
+  const modelAllowed = !configuredModelEntry || allowedModels.some((candidate) => (
+    candidate.provider === configuredModelEntry.provider && candidate.model === configuredModelEntry.model
+  ));
+  const agentAllowed = !configuredBinding || allowedModels.some((candidate) => (
+    configuredBinding.models.providers.includes(candidate.provider)
+  ));
+  if (envelopeName === "basic" && (!modelAllowed || !agentAllowed)) return;
+  if (configuredModel) {
+    expect(modelAllowed, `${templateId(envelopeName)} should allow the configured model ${configuredModel}`).toBeTruthy();
+  }
   if (configuredAgent) {
-    const capabilities = await apiJson(page, "/app/api/v1/capabilities");
-    const binding = capabilities.agents.find((candidate) => (
-      candidate.agentRef === configuredAgent || candidate.displayName === configuredAgent
-    ));
-    expect(binding, `the installation should configure ${configuredAgent}`).toBeDefined();
-    if (!allowedModels.some((candidate) => binding.models.providers.includes(candidate.provider))) {
-      return;
-    }
+    expect(agentAllowed, `${templateId(envelopeName)} should allow a model supported by ${configuredAgent}`).toBeTruthy();
   }
 
   const agentPicker = fieldLocator(page, "Coding agent");
@@ -543,7 +564,7 @@ When("I choose {string} in {string}", async ({ journey, page }, choice, field) =
     journey.currentTemplate = choice;
     journey.requests.set(choice, request);
     await select.selectOption(request.id);
-    await selectConfiguredRuntime(page, (request.approvedEnvelope ?? request.requestedEnvelope).spec);
+    await selectConfiguredRuntime(page, (request.approvedEnvelope ?? request.requestedEnvelope).spec, choice);
     return;
   }
   if (field === "Workspace repository" && choice === "<owner>/<repository>") {
@@ -953,7 +974,14 @@ Then("the run ends as {string} within {int} min", async ({ journey, page }, phas
     if (data.run.finalized) {
       if (data.run.phase !== phase) {
         const failure = `the run should end as ${phase}; actual phase=${data.run.phase}; category=${data.run.errorCategory ?? "none"}; reason=${data.run.failureReason ?? "none"}`;
-        if (journey.knownIssue === "@known-failing-472") {
+        const selectedRequest = journey.currentTemplate ? journey.requests.get(journey.currentTemplate) : null;
+        const selectedSpec = (selectedRequest?.approvedEnvelope ?? selectedRequest?.requestedEnvelope)?.spec;
+        const issue472Failure = journey.knownIssue === "@known-failing-472"
+          && data.run.errorCategory === "execution-failed"
+          && data.run.codingAgentRuntime?.startsWith("claude-code@")
+          && Array.isArray(selectedSpec?.tools)
+          && selectedSpec.tools.length === 0;
+        if (issue472Failure) {
           throw new Error(`[steward-known-failure:#472] ${failure}`);
         }
         throw new Error(failure);
@@ -1046,7 +1074,7 @@ When("I start a Hello world run with the Envelope from the template {string}", a
   journey.currentTemplate = name;
   journey.requests.set(name, request);
   await fieldLocator(page, "Envelope").selectOption(request.id);
-  await selectConfiguredRuntime(page, (request.approvedEnvelope ?? request.requestedEnvelope).spec);
+  await selectConfiguredRuntime(page, (request.approvedEnvelope ?? request.requestedEnvelope).spec, name);
   const source = fieldLocator(page, "Package source");
   await expect(source, "the direct Run form should expose Package source").toHaveCount(1);
   await source.selectOption({ label: "Inline package" });
