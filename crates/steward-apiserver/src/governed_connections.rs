@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use steward_adapter_mcp_gw::{
-    GithubBridgeFailureDiagnostic, ProviderStatusCredential, ProviderStatusReader,
-    github_bridge_failure_diagnostic,
+    GithubBridgeFailureDiagnostic, ProviderAuthorizationStarter, ProviderStartCredential,
+    ProviderStatusCredential, ProviderStatusReader, github_bridge_failure_diagnostic,
 };
 use steward_admission::internal_authorities::{
     steward_connections_v1, steward_connections_v2, steward_connections_v3, steward_connections_v4,
@@ -75,9 +75,12 @@ const MAX_RUN_STATUS_JOBS: usize = 30;
 const MAX_RUN_STATUS_FAILURE_LOG_BYTES: usize = 8 * 1024;
 const TAR_BLOCK_BYTES: usize = 512;
 const RECONCILE_INTERVAL: StdDuration = StdDuration::from_millis(100);
-const DIRECT_STATUS_DEADLINE: StdDuration = StdDuration::from_secs(1);
+const DIRECT_PROVIDER_CONTROL_DEADLINE: StdDuration = StdDuration::from_secs(1);
 const CONNECTION_ASSOCIATION_DEADLINE: StdDuration = StdDuration::from_secs(1);
 const CONTROL_PLANE_STATUS_SCOPE: &str = "connections_status";
+const CONTROL_PLANE_START_SCOPE: &str = "connections_start";
+const CONTROL_PLANE_STATUS_PURPOSE: &str = "provider_connection_status";
+const CONTROL_PLANE_START_PURPOSE: &str = "provider_connection_start";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionOperationKind {
@@ -274,6 +277,7 @@ pub struct DirectConnectionStatusReader {
     client: reqwest::Client,
     control_plane_credential_file: PathBuf,
     gateway: ProviderStatusReader,
+    starter: ProviderAuthorizationStarter,
     mint_endpoint: Url,
     store: PgStore,
     federated_subject_issuer: Option<String>,
@@ -281,15 +285,16 @@ pub struct DirectConnectionStatusReader {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MintStatusTokenRequest {
+struct MintControlPlaneTokenRequest {
     principal: Principal,
     canonical_authority: CanonicalAuthorityBinding,
     provider: String,
+    purpose: &'static str,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MintStatusTokenResponse {
+struct MintControlPlaneTokenResponse {
     access_token: String,
     expires_in: u64,
     scope: String,
@@ -305,6 +310,14 @@ where
         session: &'a ConnectionSession<B>,
         provider: &'a str,
     ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>>;
+
+    fn start_provider_authorization<'a>(
+        &'a self,
+        _session: &'a ConnectionSession<B>,
+        _provider: &'a str,
+    ) -> BoxFuture<'a, Result<AuthorizationUrl, ConnectionBrokerError>> {
+        Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
+    }
 }
 
 #[derive(Clone)]
@@ -385,16 +398,19 @@ impl DirectConnectionStatusReader {
             .map_err(|_| GovernedConnectionPlanError::InvalidBindings)?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(DIRECT_STATUS_DEADLINE)
-            .timeout(DIRECT_STATUS_DEADLINE)
+            .connect_timeout(DIRECT_PROVIDER_CONTROL_DEADLINE)
+            .timeout(DIRECT_PROVIDER_CONTROL_DEADLINE)
             .build()
             .map_err(|_| GovernedConnectionPlanError::Unavailable)?;
         let gateway = ProviderStatusReader::new(mcp_gw_origin, mcp_gw_version)
+            .map_err(|_| GovernedConnectionPlanError::InvalidBindings)?;
+        let starter = ProviderAuthorizationStarter::new(mcp_gw_origin, mcp_gw_version)
             .map_err(|_| GovernedConnectionPlanError::InvalidBindings)?;
         Ok(Self {
             client,
             control_plane_credential_file: config.control_plane_credential_file,
             gateway,
+            starter,
             mint_endpoint,
             store,
             federated_subject_issuer: config.federated_subject_issuer,
@@ -406,10 +422,12 @@ impl DirectConnectionStatusReader {
         session: &ConnectionSession<B>,
         provider: &str,
     ) -> Result<ProviderConnectionStatus, ConnectionBrokerError> {
-        let mut status =
-            tokio::time::timeout(DIRECT_STATUS_DEADLINE, self.read_inner(session, provider))
-                .await
-                .map_err(|_| ConnectionBrokerError::Unavailable)??;
+        let mut status = tokio::time::timeout(
+            DIRECT_PROVIDER_CONTROL_DEADLINE,
+            self.read_inner(session, provider),
+        )
+        .await
+        .map_err(|_| ConnectionBrokerError::Unavailable)??;
         if provider == "github" && status.phase == ConnectionPhase::Connected {
             status.github_actions_identity_linked = tokio::time::timeout(
                 CONNECTION_ASSOCIATION_DEADLINE,
@@ -431,6 +449,75 @@ impl DirectConnectionStatusReader {
         session: &ConnectionSession<B>,
         provider: &str,
     ) -> Result<ProviderConnectionStatus, ConnectionBrokerError> {
+        let access_token = self
+            .mint_control_plane_token(
+                session,
+                provider,
+                CONTROL_PLANE_STATUS_PURPOSE,
+                CONTROL_PLANE_STATUS_SCOPE,
+            )
+            .await?;
+        let credential = ProviderStatusCredential::new(access_token)
+            .map_err(|_| ConnectionBrokerError::Unavailable)?;
+        let value = self
+            .gateway
+            .read(&credential, provider)
+            .await
+            .map_err(|_| ConnectionBrokerError::Unavailable)?;
+        let status = provider_status(&value, provider)?;
+        if provider == "github" && status.phase == ConnectionPhase::Connected {
+            self.store
+                .complete_pending_connection_oauth_flow(&session.subject.canonical_user_id)
+                .await
+                .map_err(|_| ConnectionBrokerError::Unavailable)?;
+        }
+        Ok(status)
+    }
+
+    async fn start<B>(
+        &self,
+        session: &ConnectionSession<B>,
+        provider: &str,
+    ) -> Result<AuthorizationUrl, ConnectionBrokerError> {
+        tokio::time::timeout(
+            DIRECT_PROVIDER_CONTROL_DEADLINE,
+            self.start_inner(session, provider),
+        )
+        .await
+        .map_err(|_| ConnectionBrokerError::Unavailable)?
+    }
+
+    async fn start_inner<B>(
+        &self,
+        session: &ConnectionSession<B>,
+        provider: &str,
+    ) -> Result<AuthorizationUrl, ConnectionBrokerError> {
+        let access_token = self
+            .mint_control_plane_token(
+                session,
+                provider,
+                CONTROL_PLANE_START_PURPOSE,
+                CONTROL_PLANE_START_SCOPE,
+            )
+            .await?;
+        let credential = ProviderStartCredential::new(access_token)
+            .map_err(|_| ConnectionBrokerError::Unavailable)?;
+        let authorization_url = self
+            .starter
+            .start(&credential, provider)
+            .await
+            .map_err(|_| ConnectionBrokerError::Unavailable)?;
+        AuthorizationUrl::new(authorization_url)
+            .map_err(|_| ConnectionBrokerError::ProviderResponseInvalid)
+    }
+
+    async fn mint_control_plane_token<B>(
+        &self,
+        session: &ConnectionSession<B>,
+        provider: &str,
+        purpose: &'static str,
+        expected_scope: &'static str,
+    ) -> Result<String, ConnectionBrokerError> {
         let workload_credential = std::fs::read_to_string(&self.control_plane_credential_file)
             .map_err(|_| ConnectionBrokerError::Unavailable)?;
         if workload_credential.is_empty()
@@ -450,10 +537,11 @@ impl DirectConnectionStatusReader {
             .client
             .post(self.mint_endpoint.clone())
             .header(AUTHORIZATION, format!("Bearer {workload_credential}"))
-            .json(&MintStatusTokenRequest {
+            .json(&MintControlPlaneTokenRequest {
                 principal: Principal::User { acting_user: email },
                 canonical_authority,
                 provider: provider.to_owned(),
+                purpose,
             })
             .send()
             .await
@@ -472,29 +560,15 @@ impl DirectConnectionStatusReader {
         if body.len() > MAX_BRIDGE_RESULT_BYTES {
             return Err(ConnectionBrokerError::Unavailable);
         }
-        let token: MintStatusTokenResponse =
+        let token: MintControlPlaneTokenResponse =
             serde_json::from_slice(&body).map_err(|_| ConnectionBrokerError::Unavailable)?;
         if token.token_type != "Bearer"
-            || token.scope != CONTROL_PLANE_STATUS_SCOPE
+            || token.scope != expected_scope
             || !(1..=15).contains(&token.expires_in)
         {
             return Err(ConnectionBrokerError::Unavailable);
         }
-        let credential = ProviderStatusCredential::new(token.access_token)
-            .map_err(|_| ConnectionBrokerError::Unavailable)?;
-        let value = self
-            .gateway
-            .read(&credential, provider)
-            .await
-            .map_err(|_| ConnectionBrokerError::Unavailable)?;
-        let status = provider_status(&value, provider)?;
-        if provider == "github" && status.phase == ConnectionPhase::Connected {
-            self.store
-                .complete_pending_connection_oauth_flow(&session.subject.canonical_user_id)
-                .await
-                .map_err(|_| ConnectionBrokerError::Unavailable)?;
-        }
-        Ok(status)
+        Ok(token.access_token)
     }
 
     async fn associate_github_actions_identity<B>(
@@ -550,6 +624,14 @@ where
     ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
         Box::pin(async move { self.read(session, provider).await })
     }
+
+    fn start_provider_authorization<'a>(
+        &'a self,
+        session: &'a ConnectionSession<B>,
+        provider: &'a str,
+    ) -> BoxFuture<'a, Result<AuthorizationUrl, ConnectionBrokerError>> {
+        Box::pin(async move { self.start(session, provider).await })
+    }
 }
 
 impl<B, M, S> ProviderConnectionBroker<B> for SplitConnectionsBroker<M, S>
@@ -571,6 +653,14 @@ where
         session: &'a ConnectionSession<B>,
     ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>> {
         self.mutations.start(session)
+    }
+
+    fn start_provider_authorization<'a>(
+        &'a self,
+        session: &'a ConnectionSession<B>,
+        provider: &'a str,
+    ) -> BoxFuture<'a, Result<AuthorizationUrl, ConnectionBrokerError>> {
+        self.status.start_provider_authorization(session, provider)
     }
 
     fn start_operation<'a>(

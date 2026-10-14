@@ -57,6 +57,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
+- Connections can now start sign-in for enabled catalog providers such as Jira. Steward returns
+  the provider's one-time consent URL and grants the gateway only the selected provider's start
+  action for that request; GitHub keeps its existing governed connection flow.
 - Runtime-free connection-status tokens can now carry one exact deployment-catalog provider's
   status tuple, allowing provider-neutral status reads without granting provider mutations or
   ordinary tools. Requests from older API replicas retain the previous GitHub-only tuple during

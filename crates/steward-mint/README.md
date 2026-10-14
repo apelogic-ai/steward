@@ -30,23 +30,24 @@ must fail closed. The route requires the configured gateway credential as an
 `Authorization: Bearer` value before it parses the presented token or resolves
 authority. The mint retains only the credential's SHA-256 digest.
 
-The separate `POST /control-plane/token` route supports one runtime-free,
-metadata-only operation: Steward API reading the authenticated browser user's
-connection status for one provider selected from the deployment capability catalog. The caller
+The separate `POST /control-plane/token` route supports two runtime-free,
+provider-control operations: Steward API reading the authenticated browser user's
+connection status or starting authorization for one provider selected from the deployment capability catalog. The caller
 presents that exact provider identifier and a projected Kubernetes service
 account token. The mint verifies it with Kubernetes TokenReview against the
 configured audience and exact Steward API service-account identity before
 accepting the typed browser `Principal` and canonical authority. Callers cannot
 select a service, scope, resource, action, audience, or TTL. The resulting HOP-1 token contains
-exactly `<provider>/provider-control/status`, expires in at most 15 seconds, and is never accepted
-for provider mutation or general tool use. The provider must satisfy the same bounded scalar
+exactly `<provider>/provider-control/status` for `provider_connection_status` or
+`<provider>/provider-control/start` for `provider_connection_start`, expires in at most 15 seconds,
+and is never accepted for another provider-control operation or general tool use. The provider must satisfy the same bounded scalar
 contract as a capability-catalog provider; malformed identifiers fail closed. During the rolling
 upgrade, an older request that omits `provider` retains the previous exact GitHub grant.
 
 Unlike runtime HOP-1, this control-plane token has no `AgentRuntime` whose live
 authority can be re-resolved. Introspection therefore accepts only its signed,
 unexpired, exact fixed-purpose claim shape. Its 15-second lifetime is the
-revocation bound; it is intended for one status request and must not be cached
+revocation bound; it is intended for one provider-control request and must not be cached
 as provider authority.
 
 ## HOP-1 claim contract v3
@@ -75,14 +76,14 @@ Steward-specific claims live under `steward`:
 - `acting_as`: `user`, `service_for_user`, or `service`
 - `service`: the service name for either service mode; absent for users
 - `runtime_uid`: the immutable Kubernetes runtime UID for runtime tokens;
-  omitted only for the fixed-purpose control-plane status token
+  omitted only for fixed-purpose control-plane tokens
 - `purpose`: omitted for runtime tokens; exactly
-  `provider_connection_status` for the control-plane status token
+  `provider_connection_status` or `provider_connection_start` for the matching control-plane token
 - `tools`: the exact `provider`, `resource`, and `action` attenuation
 
-The control-plane status token uses `acting_as=service_for_user`,
+The control-plane token uses `acting_as=service_for_user`,
 `service=steward-apiserver`, the browser user's canonical ID in `sub`, and one exact
-`<provider>/provider-control/status` tool grant. The trusted apiserver requests only providers
+`<provider>/provider-control/status|start` tool grant matching its purpose. The trusted apiserver requests only providers
 from its deployment capability catalog. Ordinary runtime-token claims and their online authority
 revalidation are unchanged.
 

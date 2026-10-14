@@ -694,6 +694,84 @@ impl ProviderStatusCredential {
     }
 }
 
+/// A one-request HOP-1 credential used only to start one provider authorization flow.
+/// Deliberately implements neither `Debug` nor `Display`.
+pub struct ProviderStartCredential(String);
+
+impl ProviderStartCredential {
+    pub fn new(value: String) -> Result<Self, PortError> {
+        let segments = value.split('.').collect::<Vec<_>>();
+        let compact_jwt = value.len() <= 8 * 1024
+            && segments.len() == 3
+            && segments.iter().all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            });
+        if compact_jwt {
+            Ok(Self(value))
+        } else {
+            Err(rejected("direct start credential must be one compact JWT"))
+        }
+    }
+
+    fn secret(&self) -> &str {
+        &self.0
+    }
+}
+
+/// MCP-GW provider authorization starter. It can call only the canonical authorize route.
+#[derive(Clone)]
+pub struct ProviderAuthorizationStarter {
+    client: Client,
+    origin: Url,
+}
+
+impl ProviderAuthorizationStarter {
+    pub fn new(origin: &str, version: &str) -> Result<Self, PortError> {
+        let origin = validate_origin(origin)?;
+        if GatewayContract::parse(version)? != GatewayContract::LifecycleV049 {
+            return Err(rejected(
+                "direct authorization requires the MCP-GW lifecycle contract",
+            ));
+        }
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(DIRECT_STATUS_TIMEOUT)
+            .timeout(DIRECT_STATUS_TIMEOUT)
+            .build()
+            .map_err(|_| unavailable("build direct MCP-GW authorization client"))?;
+        Ok(Self { client, origin })
+    }
+
+    pub async fn start(
+        &self,
+        credential: &ProviderStartCredential,
+        provider: &str,
+    ) -> Result<String, PortError> {
+        let target = provider_authorize_endpoint(&self.origin, provider)?;
+        let response = self
+            .client
+            .post(target)
+            .header(AUTHORIZATION, format!("Bearer {}", credential.secret()))
+            .json(&json!({}))
+            .send()
+            .await
+            .map_err(|_| unavailable("start direct provider authorization"))?;
+        let status = response.status();
+        let body = bounded_body_or_status(
+            status,
+            StatusCode::OK,
+            read_bounded(response, MAX_RESPONSE_BYTES).await?,
+        )?;
+        let object = json_object(&body, "provider authorization response")?;
+        let authorization_url = exact_string_field(&object, "authorizationUrl")?;
+        validate_authorization_url(&authorization_url)?;
+        Ok(authorization_url)
+    }
+}
+
 /// MCP-GW metadata-only status reader. It has no mutation or generic request surface.
 #[derive(Clone)]
 pub struct ProviderStatusReader {
@@ -764,6 +842,25 @@ fn provider_status_endpoint(origin: &Url, provider: &str) -> Result<Url, PortErr
         .push("connections")
         .push(provider)
         .push("status");
+    Ok(target)
+}
+
+fn provider_authorize_endpoint(origin: &Url, provider: &str) -> Result<Url, PortError> {
+    if provider.is_empty()
+        || provider.len() > 255
+        || provider.trim() != provider
+        || provider.chars().any(char::is_control)
+    {
+        return Err(rejected("provider connection identifier is invalid"));
+    }
+    let mut target = origin.clone();
+    target
+        .path_segments_mut()
+        .map_err(|_| rejected("MCP-GW origin cannot contain provider routes"))?
+        .clear()
+        .push("connections")
+        .push(provider)
+        .push("authorize");
     Ok(target)
 }
 
@@ -2852,13 +2949,14 @@ fn validate_redirect_after(value: &str) -> Result<(), PortError> {
 }
 
 fn validate_authorization_url(value: &str) -> Result<(), PortError> {
-    let url = Url::parse(value).map_err(|_| rejected("GitHub authorization URL must use HTTPS"))?;
+    let url =
+        Url::parse(value).map_err(|_| rejected("provider authorization URL must use HTTPS"))?;
     if url.scheme() != "https"
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
     {
-        return Err(rejected("GitHub authorization URL must use HTTPS"));
+        return Err(rejected("provider authorization URL must use HTTPS"));
     }
     Ok(())
 }
@@ -2927,11 +3025,12 @@ mod tests {
     use super::{
         GatewayContract, GithubBridgeFailureDiagnostic, GithubBridgeOperation, GithubBridgeRequest,
         GithubMcpGateway, GithubPublishedFile, MAX_MCP_TOOL_RESPONSE_BYTES, MAX_RESPONSE_BYTES,
-        McpSession, PROVIDER_TRANSPORT_READY_TIMEOUT, ProviderStatusCredential,
-        ProviderStatusReader, commit_sha, compatible_workflow, github_bridge_failure_diagnostic,
-        maximum_run_id, mcp_tool_payload, normalize_pull_request, normalize_repositories,
-        normalize_repository, normalize_run_status, normalized_status_response, parse_response,
-        payload_items, pre_dispatch_provider_failure, workflow_content, workflow_file_name,
+        McpSession, PROVIDER_TRANSPORT_READY_TIMEOUT, ProviderAuthorizationStarter,
+        ProviderStartCredential, ProviderStatusCredential, ProviderStatusReader, commit_sha,
+        compatible_workflow, github_bridge_failure_diagnostic, maximum_run_id, mcp_tool_payload,
+        normalize_pull_request, normalize_repositories, normalize_repository, normalize_run_status,
+        normalized_status_response, parse_response, payload_items, pre_dispatch_provider_failure,
+        workflow_content, workflow_file_name,
     };
     use reqwest::StatusCode;
     use serde_json::Value;
@@ -5797,6 +5896,108 @@ mod tests {
             }),
             "truncation must not retain trailing whitespace"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_start_uses_the_exact_provider_authorize_route() -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind direct start fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read direct start fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept direct start request: {error}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|error| format!("bound direct start fixture read: {error}"))?;
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .map_err(|error| format!("read direct start request: {error}"))?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /connections/jira/authorize HTTP/1.1\r\n"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("\r\nauthorization: bearer aaa.bbb.ccc\r\n")
+            );
+            assert!(request.ends_with("\r\n\r\n{}"));
+            let body = r#"{"authorizationUrl":"https://atlassian.test/authorize?state=one-time"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .map_err(|error| format!("write direct start response: {error}"))?;
+            Ok(())
+        });
+
+        let starter = ProviderAuthorizationStarter::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build direct start client: {error:?}"))?;
+        let credential = ProviderStartCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build direct start credential: {error:?}"))?;
+        let authorization_url = starter
+            .start(&credential, "jira")
+            .await
+            .map_err(|error| format!("start Jira authorization: {error:?}"))?;
+
+        server
+            .join()
+            .map_err(|_| "direct start fixture panicked".to_owned())??;
+        assert_eq!(
+            authorization_url,
+            "https://atlassian.test/authorize?state=one-time"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_start_refuses_a_provider_mismatch_in_the_gateway_response() -> Result<(), String>
+    {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind mismatched start fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read mismatched start fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept mismatched start request: {error}"))?;
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .map_err(|error| format!("read mismatched start request: {error}"))?;
+            assert!(
+                String::from_utf8_lossy(&request[..read])
+                    .starts_with("POST /connections/jira/authorize HTTP/1.1\r\n")
+            );
+            let body =
+                r#"{"provider":"github","authorizationUrl":"https://atlassian.test/authorize"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .map_err(|error| format!("write mismatched start response: {error}"))?;
+            Ok(())
+        });
+
+        let starter = ProviderAuthorizationStarter::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build mismatched start client: {error:?}"))?;
+        let credential = ProviderStartCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build mismatched start credential: {error:?}"))?;
+        let result = starter.start(&credential, "jira").await;
+
+        server
+            .join()
+            .map_err(|_| "mismatched start fixture panicked".to_owned())??;
+        assert!(
+            result.is_err(),
+            "a response that names another provider must fail closed"
+        );
+        Ok(())
     }
 
     #[tokio::test]

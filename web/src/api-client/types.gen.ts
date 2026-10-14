@@ -1470,6 +1470,30 @@ export type PromptSourceKind = 'path' | 'inline';
 
 export type ProviderConnectionAction = 'start' | 'disconnect';
 
+export type ProviderConnectionStartResponse = {
+    /**
+     * Present on an asynchronous governed start.
+     */
+    apiVersion?: string | null;
+    /**
+     * One-time HTTPS destination returned by a synchronous provider start.
+     * It must not be persisted or logged by clients.
+     */
+    authorizationUrl?: string | null;
+    /**
+     * Present on an asynchronous governed start.
+     */
+    operationId?: string | null;
+    /**
+     * Server-owned deadline after which the browser must stop polling an asynchronous start.
+     */
+    pollDeadlineAt?: string | null;
+    /**
+     * Present on an asynchronous governed start.
+     */
+    provider?: string | null;
+};
+
 export type ProviderConnectionStatus = {
     accountEmail?: string | null;
     accountId?: string | null;
@@ -4245,7 +4269,8 @@ export type StartProviderConnectionErrors = {
 export type StartProviderConnectionError = StartProviderConnectionErrors[keyof StartProviderConnectionErrors];
 
 export type StartProviderConnectionResponses = {
-    202: StartConnectionAcceptedResponse;
+    200: ProviderConnectionStartResponse;
+    202: ProviderConnectionStartResponse;
 };
 
 export type StartProviderConnectionResponse = StartProviderConnectionResponses[keyof StartProviderConnectionResponses];

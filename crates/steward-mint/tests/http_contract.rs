@@ -361,6 +361,27 @@ async fn control_plane_exchange_accepts_one_exact_provider_for_status_authority(
 }
 
 #[tokio::test]
+async fn control_plane_exchange_issues_one_exact_provider_start_authority() -> Result<(), String> {
+    let (app, authenticator_calls) = control_plane_app()?;
+    let body = CONTROL_PLANE_BODY.replace(
+        "\n}",
+        ",\n  \"provider\":\"jira\",\n  \"purpose\":\"provider_connection_start\"\n}",
+    );
+    let (status, _, response) = call_json_with_authorization(
+        app,
+        "/control-plane/token",
+        &body,
+        Some("Bearer projected-service-account-token"),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["scope"], "connections_start");
+    assert_eq!(authenticator_calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn control_plane_exchange_without_provider_keeps_exact_github_status_authority()
 -> Result<(), String> {
     let (app, _, verifying_key) = control_plane_app_with_verifying_key()?;
