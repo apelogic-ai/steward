@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use jwt_compact::{AlgorithmExt, UntrustedToken, alg::Ed25519};
 use rand_core::OsRng;
 use serde_json::Value;
 use steward_mint::{
@@ -150,7 +151,14 @@ fn app(
 }
 
 fn control_plane_app() -> Result<(axum::Router, Arc<AtomicUsize>), String> {
+    let (app, calls, _) = control_plane_app_with_verifying_key()?;
+    Ok((app, calls))
+}
+
+fn control_plane_app_with_verifying_key()
+-> Result<(axum::Router, Arc<AtomicUsize>, VerifyingKey), String> {
     let signing_key = SigningKey::generate(&mut OsRng);
+    let verifying_key = signing_key.verifying_key();
     let mint = Mint::new(
         MintConfig {
             issuer: "https://mint.example.test".to_owned(),
@@ -178,6 +186,7 @@ fn control_plane_app() -> Result<(axum::Router, Arc<AtomicUsize>), String> {
         ControlPlaneMintConfig::new(
             "system:serviceaccount:steward-test:steward-apiserver".to_owned(),
             std::time::Duration::from_secs(15),
+            ["github".to_owned(), "jira".to_owned()],
         )
         .map_err(|error| format!("control-plane config must be valid: {error:?}"))?,
     )
@@ -191,6 +200,7 @@ fn control_plane_app() -> Result<(axum::Router, Arc<AtomicUsize>), String> {
             },
         ),
         calls,
+        verifying_key,
     ))
 }
 
@@ -328,6 +338,81 @@ async fn control_plane_exchange_authenticates_before_parsing_and_returns_no_stor
         "successful control-plane exchange must return one compact JWT"
     );
     assert_eq!(authenticator_calls.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_plane_exchange_accepts_one_exact_provider_for_status_authority()
+-> Result<(), String> {
+    let (app, authenticator_calls) = control_plane_app()?;
+    let body = CONTROL_PLANE_BODY.replace("\n}", ",\n  \"provider\":\"jira\"\n}");
+    let (status, _, response) = call_json_with_authorization(
+        app,
+        "/control-plane/token",
+        &body,
+        Some("Bearer projected-service-account-token"),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["scope"], "connections_status");
+    assert_eq!(authenticator_calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_plane_exchange_without_provider_keeps_exact_github_status_authority()
+-> Result<(), String> {
+    let (app, _, verifying_key) = control_plane_app_with_verifying_key()?;
+    let (status, _, response) = call_json_with_authorization(
+        app,
+        "/control-plane/token",
+        CONTROL_PLANE_BODY,
+        Some("Bearer projected-service-account-token"),
+    )
+    .await?;
+
+    assert_eq!(status, StatusCode::OK);
+    let encoded = response["access_token"]
+        .as_str()
+        .ok_or_else(|| "control-plane response must contain an access token".to_owned())?;
+    let untrusted = UntrustedToken::new(encoded)
+        .map_err(|error| format!("parse control-plane token: {error}"))?;
+    let token: jwt_compact::Token<serde_json::Value> = Ed25519
+        .validator(&verifying_key)
+        .validate(&untrusted)
+        .map_err(|error| format!("validate control-plane token: {error}"))?;
+    assert_eq!(
+        token.claims().custom["steward"]["tools"],
+        serde_json::json!([{
+            "provider": "github",
+            "resource": "provider-control",
+            "action": "status"
+        }])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_plane_exchange_rejects_malformed_or_multiple_provider_selection()
+-> Result<(), String> {
+    let (app, authenticator_calls) = control_plane_app()?;
+    for body in [
+        CONTROL_PLANE_BODY.replace("\n}", ",\n  \"provider\":\" jira\"\n}"),
+        CONTROL_PLANE_BODY.replace("\n}", ",\n  \"provider\":\"linear\"\n}"),
+        CONTROL_PLANE_BODY.replace("\n}", ",\n  \"providers\":[\"github\",\"jira\"]\n}"),
+    ] {
+        let (status, _, response) = call_json_with_authorization(
+            app.clone(),
+            "/control-plane/token",
+            &body,
+            Some("Bearer projected-service-account-token"),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "invalid_request");
+    }
+    assert_eq!(authenticator_calls.load(Ordering::SeqCst), 3);
     Ok(())
 }
 

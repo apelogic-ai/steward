@@ -386,9 +386,10 @@ new binding.
 
 The browser never receives a HOP-1 token. For display-only connection status,
 the apiserver mints a short-lived `connections_status` control-plane token and
-makes one metadata-only authenticated `GET /connections/github/status` request
-to the private MCP-GW origin with a one-second deadline. Configure apiserver
-egress and MCP-GW routing for that private call. Connect, reauthorize,
+the token carries one exact `<provider>/provider-control/status` grant. Mint
+accepts only providers present in `config.apiserver.capabilityCatalog.catalogs`,
+preventing a caller from creating status authority for an unconfigured provider.
+Configure apiserver egress and MCP-GW routing for the private status call. Connect, reauthorize,
 disconnect, and rerun mutations still execute through the one-shot governed
 OpenShell bridge runtime. The bridge has no inference provider, uses one fixed
 provider-control grant, and is finalized through the normal controller
@@ -514,8 +515,11 @@ Steward release namespace also creates `steward-workflows`.
   canonical user. User Envelope admission remains unchanged.
 - `config.apiserver.capabilityCatalog` is the bounded, deployment-owned model/tool
   catalog used by the template editor. The chart validates it, renders it into an
-  immutable content-addressed ConfigMap, mounts it read-only, and rolls the apiserver
-  when its checksum changes. It is descriptive availability data and never Task authority.
+  immutable content-addressed ConfigMap, and mounts it read-only in the apiserver.
+  When governed connections are enabled, Mint reads only its provider records from
+  the same mount so it cannot sign connection-status authority for an unconfigured
+  provider. The content-addressed mount rolls each reader when the catalog changes.
+  It is descriptive availability data and never Task authority.
 
   ```yaml
   config:

@@ -10,6 +10,8 @@ version.workspace = true
 axum.workspace = true # Serves the internal token, JWKS, and authenticated introspection endpoints.
 k8s-openapi.workspace = true # Reads runtime-bound inference credentials from typed Kubernetes Secrets without custom base64 parsing.
 kube = { workspace = true, features = ["client", "ring", "rustls-tls"] } # Resolves live AgentRuntime authority from the Kubernetes source of truth.
+serde.workspace = true # Reads only the provider records Mint needs from the deployment capability catalog.
+serde_json.workspace = true # Parses the mounted deployment capability catalog without coupling Mint to the API server.
 steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.0.0", features = ["identity"] } # Resolves vendor sandbox UUIDs without leaking OpenShell labels into the mint.
 steward-adapter-spire = { path = "../../adapters/spire", version = "=0.0.0" } # Connects the workload-identity port to the mounted SPIRE socket.
 steward-mint = { path = "../../crates/steward-mint", version = "=0.0.0" } # Owns the reviewed SVID-to-HOP-1 exchange and signing-key boundary.
