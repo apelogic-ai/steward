@@ -21,6 +21,7 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
     And I press "New Task"
     And I type "Stated needs" into "Name"
     And I choose "basic" in "Envelope"
+    And I type "Write the single line hello world to out/hello.txt" into "Prompt"
     And I state requirements that are all below the Envelope's limits
     And I press "Save version 1"
     And I press "Run"
@@ -33,6 +34,7 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
       | Declared by this Task |
     # No value is refused for being equal, and none has to match exactly.
     When I press "Edit into v2"
+    And I type "Write the single line hello world to out/hello.txt" into "Prompt"
     And I state requirements that are all at the Envelope's limits
     And I press "Save version 2"
     And I press "Run"

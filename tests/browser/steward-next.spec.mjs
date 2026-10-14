@@ -911,6 +911,7 @@ async function guardedPage(browser, {
   rerunResponses = [
     { status: 201, body: { apiVersion: "steward.browser-runs/v1", taskUid: rerunTaskUid } },
   ],
+  runErrorCategory = run.errorCategory,
   runFailureReason = undefined,
   runPhase = "succeeded",
   runSpend = run.observedSpend,
@@ -964,6 +965,7 @@ async function guardedPage(browser, {
   web.useRerunFixtures(rerunResponses);
   const fixtureRun = inlineRun ? {
     ...run,
+    errorCategory: runErrorCategory,
     observedSpend: runSpend,
     origin: "browser",
     workflow: "browser-task@1",
@@ -976,7 +978,7 @@ async function guardedPage(browser, {
       contentDigest: browserTaskDigest,
       promptSource: "inline",
     },
-  } : { ...run, observedSpend: runSpend };
+  } : { ...run, errorCategory: runErrorCategory, observedSpend: runSpend };
   await context.addInitScript(() => {
     const BrowserAbortController = AbortController;
     Object.defineProperty(window, "__stewardAbortCount", { configurable: true, value: 0, writable: true });
@@ -4434,6 +4436,21 @@ test("failed run phases expose stdout and stderr as escaped sensitive output", a
       expect(request.headers().accept).toBe("application/json");
       expect(request.headers().cookie).toContain("execution-log-session=present");
     }
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("a failed run shows the bounded missing-output reason exactly", async ({ browser }) => {
+  const failureReason = "This run finished without creating an output file.";
+  const developer = await guardedPage(browser, {
+    runErrorCategory: "output-missing",
+    runFailureReason: failureReason,
+    runPhase: "failed",
+  });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByRole("alert").filter({ hasText: failureReason })).toHaveText(failureReason);
   } finally {
     await closeGuardedPage(developer);
   }
