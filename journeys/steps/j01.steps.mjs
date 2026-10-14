@@ -36,7 +36,7 @@ function resolveText(journey, text) {
     .replaceAll("<owner>/<repository>", repository)
     .replaceAll("<workspace-name>", workspaceName);
   if (prefixed === "member") return memberRole;
-  if (["Agent choice", "Read the repository", "Scratch and Git", "Scratch check", "Stated needs", "Zero per-run budget"].includes(prefixed)) {
+  if (["Agent choice", "Read Jira", "Read the repository", "Scratch and Git", "Scratch check", "Stated needs", "Zero per-run budget"].includes(prefixed)) {
     return `${runPrefix}-${prefixed.toLocaleLowerCase("en-US").replaceAll(/[^a-z0-9]+/g, "-").replaceAll(/^-|-$/g, "")}`;
   }
   if (prefixed === "<run-runtime-minutes>") {
@@ -175,10 +175,45 @@ async function userTemplates(page) {
 async function ensureExtendedTemplate(page, name) {
   let templates = await userTemplates(page);
   let template = templates.find((candidate) => candidate.id === templateId(name));
-  if (template) return template;
-  expect(["basic", "broad"], `the extended fixture does not author the ${name} template`).toContain(name);
+  expect(["basic", "broad", "jira-read"], `the journey fixture does not author the ${name} template`).toContain(name);
+  if (template && name !== "jira-read") return template;
   const standard = templates.find((candidate) => candidate.id === templateId("standard"));
-  expect(standard, `the ${templateId("standard")} template must be created by @smoke before @extended`).toBeDefined();
+  expect(standard, `the ${templateId("standard")} template must be created by @smoke before ${name === "jira-read" ? "@needs-jira" : "@extended"}`).toBeDefined();
+  if (name === "jira-read") {
+    const [catalog, connections] = await Promise.all([
+      apiJson(page, "/admin/api/v1/capabilities"),
+      apiJson(page, "/app/api/v1/connections"),
+    ]);
+    const available = connections.available.find((candidate) => candidate.provider === "jira");
+    expect(available?.enabled, "the installation should enable Jira connections").toBeTruthy();
+    const connection = connections.connections.find((candidate) => candidate.provider === "jira");
+    expect(connection?.status?.phase, "Jira should be connected for the signed-in account before @needs-jira runs").toBe("connected");
+    const tool = catalog.tools.find((candidate) => (
+      candidate.provider === "jira"
+      && candidate.resource === "jira_search_issues"
+      && candidate.action === "read"
+      && candidate.accessClass === "read"
+    ));
+    expect(tool, "the deployment catalog should contain the Jira read-only search tool").toBeDefined();
+    if (template) {
+      expect(template.ceiling.spec.tools).toEqual([{ provider: tool.provider, resource: tool.resource, action: tool.action }]);
+      return template;
+    }
+    const envelope = structuredClone(standard.ceiling);
+    envelope.revision = 1;
+    envelope.spec.tools = [{ provider: tool.provider, resource: tool.resource, action: tool.action }];
+    delete envelope.spec.workspace;
+    await mutationJson(page, `/admin/api/v1/envelope-templates/${encodeURIComponent(templateId(name))}`, "PUT", {
+      allowInlineBrowserTasks: true,
+      displayName: `${runPrefix} Jira read`,
+      envelope,
+      memberRoles: [memberRole],
+    });
+    templates = await userTemplates(page);
+    template = templates.find((candidate) => candidate.id === templateId(name));
+    expect(template, `the ${templateId(name)} template should be available after authoring`).toBeDefined();
+    return template;
+  }
   const [capabilities, catalog] = await Promise.all([
     apiJson(page, "/app/api/v1/capabilities"),
     apiJson(page, "/admin/api/v1/capabilities"),
@@ -970,8 +1005,9 @@ Given("I hold no Envelope", async ({ journey, page }) => {
 });
 
 Given("I hold an Envelope from the template {string}", async ({ journey, page }, name) => {
+  if (journey.jira && name === "jira-read") await ensureExtendedTemplate(page, name);
   let request = await requestForTemplate(page, name, "provisioned");
-  if (!request && journey.extended) request = await provisionExtendedEnvelope(journey, page, name);
+  if (!request && (journey.extended || journey.jira)) request = await provisionExtendedEnvelope(journey, page, name);
   expect(request, `a provisioned Envelope from ${templateId(name)} should exist`).toBeTruthy();
   journey.currentTemplate = name;
   journey.requests.set(name, request);
