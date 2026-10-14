@@ -177,8 +177,15 @@ impl InferencePlane for LiteLlmAdapter {
             .ok_or_else(|| PortError::Failed {
                 reason: "inference credential response omitted the bearer value".to_owned(),
             })?;
+        let reference = body
+            .get("token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| PortError::Failed {
+                reason: "inference credential response omitted its stable identifier".to_owned(),
+            })?;
         Ok(ProvisionedInference {
-            reference: alias,
+            reference: reference.to_owned(),
             credential: InferenceCredential::new(credential.to_owned()),
         })
     }
@@ -205,7 +212,7 @@ impl InferencePlane for LiteLlmAdapter {
     async fn observe(&self, request: &InferenceRequest) -> Result<InferenceObservation, PortError> {
         let alias = runtime_alias(&request.runtime.0);
         let body = self.list_alias(&alias).await?;
-        observation_from_key_list(request, &alias, &body)
+        observation_from_key_list(request, &body)
     }
 
     async fn revoke(&self, request: &InferenceRequest) -> Result<(), PortError> {
@@ -333,7 +340,6 @@ fn unpriced_models(catalog: &Value, models: &[ModelRef]) -> Vec<ModelRef> {
 
 fn observation_from_key_list(
     request: &InferenceRequest,
-    reference: &str,
     response: &Value,
 ) -> Result<InferenceObservation, PortError> {
     let keys = response
@@ -354,6 +360,13 @@ fn observation_from_key_list(
     let info: KeyInfo = serde_json::from_value(key.clone()).map_err(|_| PortError::Failed {
         reason: "inference key info omitted spend enforcement fields".to_owned(),
     })?;
+    let reference = info
+        .token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| PortError::Failed {
+            reason: "inference key info omitted its stable identifier".to_owned(),
+        })?;
     let spend = value_number(&info.spend).ok_or_else(|| PortError::Failed {
         reason: "inference key spend was not numeric".to_owned(),
     })?;
@@ -610,6 +623,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provision_returns_the_gateway_key_identity_instead_of_the_runtime_alias()
+    -> Result<(), String> {
+        let server = MockLiteLlm::start(vec![
+            "{}",
+            r#"{"key":"fixture-bearer-value","token":"fixture-token-hash"}"#,
+        ])?;
+        let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+            base_url: server.base_url.clone(),
+            master_key: "fixture-management-value".to_owned(),
+        })
+        .map_err(|error| format!("fixture adapter must be configurable: {error:?}"))?;
+        let mut request = request();
+        request.models.clear();
+
+        let provisioned = adapter
+            .provision(&request)
+            .await
+            .map_err(|error| format!("fixture key must be provisioned: {error:?}"))?;
+
+        assert_eq!(provisioned.reference, "fixture-token-hash");
+        assert_eq!(
+            provisioned.credential.expose_secret(),
+            "fixture-bearer-value"
+        );
+        let requests = server.finish()?;
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("POST /key/delete "));
+        assert!(requests[1].starts_with("POST /key/generate "));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn existing_key_configuration_is_updated_without_resetting_spend() -> Result<(), String> {
         let server = MockLiteLlm::start(vec![
             r#"{"keys":[{"token":"fixture-token-hash","models":["openai/old-model"],"spend":0.25,"max_budget":1.0,"blocked":false}]}"#,
@@ -674,9 +719,9 @@ mod tests {
     fn spend_at_the_runtime_limit_is_exhausted() -> Result<(), String> {
         let observation = observation_from_key_list(
             &request(),
-            "runtime-a",
             &json!({
                 "keys": [{
+                    "token": "fixture-token-hash-a",
                     "spend": 1.0,
                     "max_budget": 1.0,
                     "blocked": false
@@ -688,7 +733,7 @@ mod tests {
         assert_eq!(
             observation,
             InferenceObservation::Exhausted {
-                reference: "runtime-a".to_owned(),
+                reference: "fixture-token-hash-a".to_owned(),
                 spend: SpendSummary {
                     observed_amount: "1.0".to_owned(),
                     currency: "USD".to_owned(),
@@ -703,9 +748,9 @@ mod tests {
     fn null_blocked_from_pinned_key_list_is_not_blocked() -> Result<(), String> {
         let observation = observation_from_key_list(
             &request(),
-            "runtime-a",
             &json!({
                 "keys": [{
+                    "token": "fixture-token-hash-b",
                     "spend": 0.25,
                     "max_budget": 1.0,
                     "blocked": null
@@ -717,7 +762,7 @@ mod tests {
         assert_eq!(
             observation,
             InferenceObservation::Active {
-                reference: "runtime-a".to_owned(),
+                reference: "fixture-token-hash-b".to_owned(),
                 spend: SpendSummary {
                     observed_amount: "0.25".to_owned(),
                     currency: "USD".to_owned(),

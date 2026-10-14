@@ -19,8 +19,11 @@ use kube::{Client, ResourceExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, types::Json as SqlJson, types::Uuid};
+use steward_adapter_litellm::{LiteLlmAdapter, LiteLlmConfig};
 use steward_admission::internal_authorities::steward_connections_v1;
-use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec};
+use steward_admission::{
+    AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec, add_budget_amount,
+};
 use steward_apiserver::connections::{
     ConnectionBrokerError, ConnectionSession, ConnectionStartOperation, ConnectionSubject,
     ProviderConnectionBroker,
@@ -66,7 +69,7 @@ use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
     CanonicalAuthorityBinding, DisposableExecutionBinding, Duration, Email,
     ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, OrganizationId,
-    OrganizationIdentityPolicy, Phase, Principal, RunnerRequirements, RuntimeOwnership,
+    OrganizationIdentityPolicy, Phase, Principal, RunnerRequirements, RuntimeId, RuntimeOwnership,
     RuntimeRefs, SpendSummary, TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding,
     TaskPhase, ToolGrant,
 };
@@ -205,6 +208,64 @@ impl Drop for ServerGuard {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+#[derive(Clone, Default)]
+struct LiteLlmKeyListFixture {
+    responses: Arc<Mutex<VecDeque<serde_json::Value>>>,
+    queries: Arc<Mutex<Vec<String>>>,
+}
+
+async fn litellm_key_list_fixture(
+    State(state): State<LiteLlmKeyListFixture>,
+    request: Request,
+) -> Response<Body> {
+    let query = request.uri().query().unwrap_or_default().to_owned();
+    let Ok(mut queries) = state.queries.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    queries.push(query);
+    drop(queries);
+    let Ok(mut responses) = state.responses.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Some(response) = responses.pop_front() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        response.to_string(),
+    )
+        .into_response()
+}
+
+async fn litellm_observation_adapter(
+    responses: Vec<serde_json::Value>,
+) -> Result<(LiteLlmAdapter, LiteLlmKeyListFixture, ServerGuard), Box<dyn Error>> {
+    let state = LiteLlmKeyListFixture {
+        responses: Arc::new(Mutex::new(responses.into())),
+        queries: Arc::new(Mutex::new(Vec::new())),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server_state = state.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/key/list", axum::routing::get(litellm_key_list_fixture))
+                .with_state(server_state),
+        )
+        .await
+        .map_err(io::Error::other)
+    });
+    let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+        base_url: format!("http://{address}"),
+        master_key: "fixture-management-value".to_owned(),
+    })
+    .map_err(|error| io::Error::other(format!("create LiteLLM fixture adapter: {error:?}")))?;
+    Ok((adapter, state, ServerGuard(server)))
 }
 
 #[tokio::test]
@@ -2947,13 +3008,57 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         !resumed_runtime_minutes.exhausted,
         "the active instance grant must resume execution above observed runtime minutes"
     );
+    let (episode_adapter, episode_fixture, _episode_server) = litellm_observation_adapter(vec![
+        json!({
+            "keys": [{
+                "token": "fixture-first-token-hash",
+                "spend": 110.00,
+                "max_budget": 100.00,
+                "blocked": true
+            }]
+        }),
+        json!({
+            "keys": [{
+                "token": "fixture-replacement-token-hash",
+                "spend": 20.00,
+                "max_budget": 10.00,
+                "blocked": true
+            }]
+        }),
+    ])
+    .await?;
+    let inference_request = InferenceRequest {
+        runtime: RuntimeId(runtime_uid.clone()),
+        models: envelope.spec.llms.clone(),
+        budget: envelope.spec.budget.clone(),
+    };
+    let (first_key_reference, first_key_spend) = match episode_adapter
+        .observe(&inference_request)
+        .await
+        .map_err(|error| io::Error::other(format!("observe first gateway key: {error:?}")))?
+    {
+        InferenceObservation::Exhausted { reference, spend } => (reference, spend),
+        observation => {
+            return Err(io::Error::other(format!(
+                "first gateway key was not exhausted: {observation:?}"
+            ))
+            .into());
+        }
+    };
+    let first_episode_baseline = store
+        .record_runtime_spend_episode(&runtime_uid, &first_key_reference, "0", "USD")
+        .await?;
     store
         .record_spend_observation(
             &runtime_uid,
             1,
             "immutable-runtime-spec",
             &SpendSummary {
-                observed_amount: "110.00".to_owned(),
+                observed_amount: add_budget_amount(
+                    &first_episode_baseline,
+                    &first_key_spend.observed_amount,
+                )
+                .map_err(|error| io::Error::other(format!("combine first key spend: {error:?}")))?,
                 currency: "USD".to_owned(),
             },
             true,
@@ -3025,26 +3130,73 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .latest_runtime_spend_amount(&runtime_uid, "USD")
         .await?;
     assert_eq!(settled_baseline, "115.00");
-    assert_eq!(
-        store
-            .record_runtime_spend_episode(&runtime_uid, "runtime-key-2", &settled_baseline, "USD",)
-            .await?,
-        "115.00"
+    let (replacement_key_reference, replacement_key_spend) = match episode_adapter
+        .observe(&inference_request)
+        .await
+        .map_err(|error| io::Error::other(format!("observe replacement gateway key: {error:?}")))?
+    {
+        InferenceObservation::Exhausted { reference, spend } => (reference, spend),
+        observation => {
+            return Err(io::Error::other(format!(
+                "replacement gateway key was not exhausted: {observation:?}"
+            ))
+            .into());
+        }
+    };
+    assert_ne!(
+        replacement_key_reference, first_key_reference,
+        "two keys sharing one runtime alias must have distinct episode identities"
     );
     assert_eq!(
         store
-            .runtime_spend_episode_baseline(&runtime_uid, "runtime-key-2", "USD")
+            .record_runtime_spend_episode(
+                &runtime_uid,
+                &replacement_key_reference,
+                &settled_baseline,
+                "USD",
+            )
+            .await?,
+        "115.00",
+        "the replacement key must not reuse the first key's zero baseline"
+    );
+    assert_eq!(
+        store
+            .runtime_spend_episode_baseline(&runtime_uid, &replacement_key_reference, "USD")
             .await?,
         Some("115.00".to_owned()),
         "the recreated key must stay bound to the final settled cumulative spend"
     );
     assert_eq!(
         store
-            .record_runtime_spend_episode(&runtime_uid, "runtime-key-2", "999.00", "USD")
+            .record_runtime_spend_episode(
+                &runtime_uid,
+                &replacement_key_reference,
+                "999.00",
+                "USD",
+            )
             .await?,
         "115.00",
         "a retry or late grant must not rebind an existing key episode"
     );
+    let replacement_cumulative_spend = SpendSummary {
+        observed_amount: add_budget_amount(
+            &settled_baseline,
+            &replacement_key_spend.observed_amount,
+        )
+        .map_err(|error| io::Error::other(format!("combine replacement key spend: {error:?}")))?,
+        currency: "USD".to_owned(),
+    };
+    assert_eq!(replacement_cumulative_spend.observed_amount, "135.00");
+    let key_queries = episode_fixture
+        .queries
+        .lock()
+        .map_err(|_| io::Error::other("LiteLLM query fixture lock was poisoned"))?;
+    assert_eq!(key_queries.len(), 2);
+    assert_eq!(
+        key_queries[0], key_queries[1],
+        "both key generations must be looked up through the same fixed runtime alias"
+    );
+    drop(key_queries);
     assert_eq!(
         store
             .remaining_envelope_instance_spend_budget(
@@ -3101,10 +3253,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             &runtime_uid,
             1,
             "immutable-runtime-spec",
-            &SpendSummary {
-                observed_amount: "135.00".to_owned(),
-                currency: "USD".to_owned(),
-            },
+            &replacement_cumulative_spend,
             true,
         )
         .await?;

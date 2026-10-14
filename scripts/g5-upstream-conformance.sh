@@ -120,14 +120,17 @@ for attempt in {1..120}; do
   sleep 1
 done
 
-runtime_key="$(
+runtime_key_response="$(
   curl -fsS \
     -H "Authorization: Bearer ${master_key}" \
     -H "Content-Type: application/json" \
     -d '{"key_alias":"runtime-a","models":["openai/model-a"]}' \
-    "${base_url}/key/generate" |
-    jq -er '.key | select(type == "string" and length > 0)'
+    "${base_url}/key/generate"
 )"
+runtime_key="$(jq -er '.key | select(type == "string" and length > 0)' \
+  <<<"${runtime_key_response}")"
+runtime_key_identity="$(jq -er '.token | select(type == "string" and length > 0)' \
+  <<<"${runtime_key_response}")"
 response="${RUN_DIR}/denied.json"
 status="$(
   curl -sS \
@@ -146,6 +149,39 @@ if ! jq -e '.. | strings | select(test("not.*allowed|allowed.*model"; "i"))' \
   "${response}" >/dev/null
 then
   echo "G-5 denial did not identify the model allowlist" >&2
+  exit 1
+fi
+
+curl -fsS \
+  -H "Authorization: Bearer ${master_key}" \
+  -H "Content-Type: application/json" \
+  -d '{"key_aliases":["runtime-a"]}' \
+  "${base_url}/key/delete" >/dev/null
+replacement_key_response="$(
+  curl -fsS \
+    -H "Authorization: Bearer ${master_key}" \
+    -H "Content-Type: application/json" \
+    -d '{"key_alias":"runtime-a","models":["openai/model-a"]}' \
+    "${base_url}/key/generate"
+)"
+replacement_key_identity="$(
+  jq -er '.token | select(type == "string" and length > 0)' \
+    <<<"${replacement_key_response}"
+)"
+if [[ "${replacement_key_identity}" == "${runtime_key_identity}" ]]; then
+  echo "G-5 replacement key reused the prior key identity" >&2
+  exit 1
+fi
+listed_key_identity="$(
+  curl -fsS -G \
+    -H "Authorization: Bearer ${master_key}" \
+    --data-urlencode 'key_alias=runtime-a' \
+    --data-urlencode 'return_full_object=true' \
+    "${base_url}/key/list" |
+    jq -er '.keys | select(length == 1) | .[0].token | select(type == "string" and length > 0)'
+)"
+if [[ "${listed_key_identity}" != "${replacement_key_identity}" ]]; then
+  echo "G-5 key lookup did not preserve the replacement key identity" >&2
   exit 1
 fi
 

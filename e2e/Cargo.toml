@@ -36,6 +36,7 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
 steward-admission = { path = "../crates/steward-admission", version = "=0.0.0" }
 steward-adapter-codex = { path = "../adapters/codex", version = "=0.0.0" }
+steward-adapter-litellm = { path = "../adapters/litellm", version = "=0.0.0" }
 steward-adapter-openshell = { path = "../adapters/openshell", version = "=0.0.0", features = ["runtime"] }
 steward-apiserver = { path = "../crates/steward-apiserver", version = "=0.0.0" }
 steward-controller = { path = "../crates/steward-controller", version = "=0.0.0" }
