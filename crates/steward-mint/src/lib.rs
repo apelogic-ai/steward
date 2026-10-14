@@ -38,8 +38,13 @@ pub const SPIFFE_CLIENT_ASSERTION_TYPE: &str =
 const CONTROL_PLANE_SERVICE: &str = "steward-apiserver";
 const CONTROL_PLANE_STATUS_PURPOSE: &str = "provider_connection_status";
 const CONTROL_PLANE_STATUS_SCOPE: &str = "connections_status";
+const CONTROL_PLANE_START_PURPOSE: &str = "provider_connection_start";
+const CONTROL_PLANE_START_SCOPE: &str = "connections_start";
 
-fn control_plane_status_grant(provider: &str) -> Result<ToolGrant, MintError> {
+fn control_plane_grant(
+    provider: &str,
+    purpose: ControlPlaneTokenPurpose,
+) -> Result<ToolGrant, MintError> {
     if provider.is_empty()
         || provider.len() > 255
         || provider.trim() != provider
@@ -50,15 +55,18 @@ fn control_plane_status_grant(provider: &str) -> Result<ToolGrant, MintError> {
     Ok(ToolGrant {
         provider: provider.to_owned(),
         resource: "provider-control".to_owned(),
-        action: "status".to_owned(),
+        action: purpose.action().to_owned(),
     })
 }
 
-fn exact_control_plane_status_provider(grants: &[ToolGrant]) -> Option<&str> {
+fn exact_control_plane_provider(
+    grants: &[ToolGrant],
+    purpose: ControlPlaneTokenPurpose,
+) -> Option<&str> {
     let [grant] = grants else {
         return None;
     };
-    control_plane_status_grant(&grant.provider)
+    control_plane_grant(&grant.provider, purpose)
         .is_ok_and(|expected| expected == *grant)
         .then_some(grant.provider.as_str())
 }
@@ -395,6 +403,38 @@ pub struct ControlPlaneTokenRequest {
     pub principal: Principal,
     pub canonical_authority: CanonicalAuthorityBinding,
     pub provider: String,
+    pub purpose: ControlPlaneTokenPurpose,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlPlaneTokenPurpose {
+    #[default]
+    ProviderConnectionStatus,
+    ProviderConnectionStart,
+}
+
+impl ControlPlaneTokenPurpose {
+    const fn claim(self) -> &'static str {
+        match self {
+            Self::ProviderConnectionStatus => CONTROL_PLANE_STATUS_PURPOSE,
+            Self::ProviderConnectionStart => CONTROL_PLANE_START_PURPOSE,
+        }
+    }
+
+    const fn scope(self) -> &'static str {
+        match self {
+            Self::ProviderConnectionStatus => CONTROL_PLANE_STATUS_SCOPE,
+            Self::ProviderConnectionStart => CONTROL_PLANE_START_SCOPE,
+        }
+    }
+
+    const fn action(self) -> &'static str {
+        match self {
+            Self::ProviderConnectionStatus => "status",
+            Self::ProviderConnectionStart => "start",
+        }
+    }
 }
 
 /// A Kubernetes service-account bearer accepted only by the control-plane exchange.
@@ -436,10 +476,10 @@ impl ControlPlaneMintConfig {
         let allowed_status_providers = allowed_status_providers
             .into_iter()
             .collect::<BTreeSet<_>>();
-        if allowed_status_providers
-            .iter()
-            .any(|provider| control_plane_status_grant(provider).is_err())
-        {
+        if allowed_status_providers.iter().any(|provider| {
+            control_plane_grant(provider, ControlPlaneTokenPurpose::ProviderConnectionStatus)
+                .is_err()
+        }) {
             return Err(MintConfigError::InvalidControlPlaneStatusProviders);
         }
         Ok(Self {
@@ -806,7 +846,7 @@ where
             .as_ref()
             .filter(|acting_user_id| *acting_user_id == &request.canonical_authority.owner_user_id)
             .ok_or(MintError::WorkloadMismatch)?;
-        let status_grant = control_plane_status_grant(&request.provider)?;
+        let control_plane_grant = control_plane_grant(&request.provider, request.purpose)?;
         if !config.allowed_status_providers.contains(&request.provider) {
             return Err(MintError::InvalidRequest);
         }
@@ -822,8 +862,8 @@ where
                 acting_as: "service_for_user".to_owned(),
                 runtime_uid: None,
                 service: Some(CONTROL_PLANE_SERVICE.to_owned()),
-                purpose: Some(CONTROL_PLANE_STATUS_PURPOSE.to_owned()),
-                tools: vec![status_grant],
+                purpose: Some(request.purpose.claim().to_owned()),
+                tools: vec![control_plane_grant],
                 version: HOP1_CLAIMS_VERSION,
             },
             sub: acting_user_id.as_str().to_owned(),
@@ -841,7 +881,7 @@ where
         Ok(TokenGrantResponse {
             access_token,
             expires_in: config.authority_ttl.as_secs(),
-            scope: CONTROL_PLANE_STATUS_SCOPE.to_owned(),
+            scope: request.purpose.scope().to_owned(),
             token_type: "Bearer".to_owned(),
         })
     }
@@ -888,14 +928,26 @@ where
             return Ok(TokenIntrospectionResponse::inactive());
         }
 
-        if claims.custom.steward.purpose.as_deref() == Some(CONTROL_PLANE_STATUS_PURPOSE) {
+        let control_plane_purpose = match claims.custom.steward.purpose.as_deref() {
+            Some(CONTROL_PLANE_STATUS_PURPOSE) => {
+                Some(ControlPlaneTokenPurpose::ProviderConnectionStatus)
+            }
+            Some(CONTROL_PLANE_START_PURPOSE) => {
+                Some(ControlPlaneTokenPurpose::ProviderConnectionStart)
+            }
+            _ => None,
+        };
+        if let Some(control_plane_purpose) = control_plane_purpose {
             let active = self.config.control_plane.as_ref().is_some_and(|config| {
                 claims.custom.azp == config.expected_workload_identity
                     && claims.custom.steward.acting_as == "service_for_user"
                     && claims.custom.steward.service.as_deref() == Some(CONTROL_PLANE_SERVICE)
                     && claims.custom.steward.runtime_uid.is_none()
-                    && exact_control_plane_status_provider(&claims.custom.steward.tools)
-                        .is_some_and(|provider| config.allowed_status_providers.contains(provider))
+                    && exact_control_plane_provider(
+                        &claims.custom.steward.tools,
+                        control_plane_purpose,
+                    )
+                    .is_some_and(|provider| config.allowed_status_providers.contains(provider))
                     && claims.custom.steward.version == HOP1_CLAIMS_VERSION
                     && claims.custom.email.is_some()
                     && !claims.custom.sub.is_empty()
@@ -994,6 +1046,8 @@ struct ControlPlaneTokenGrantBody {
     canonical_authority: CanonicalAuthorityBinding,
     #[serde(default = "default_control_plane_provider")]
     provider: String,
+    #[serde(default)]
+    purpose: ControlPlaneTokenPurpose,
 }
 
 fn default_control_plane_provider() -> String {
@@ -1083,6 +1137,7 @@ where
             principal: body.principal,
             canonical_authority: body.canonical_authority,
             provider: body.provider,
+            purpose: body.purpose,
         })
         .map(|response| (no_store_headers(), Json(response)))
         .map_err(map_mint_error)

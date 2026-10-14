@@ -165,6 +165,10 @@ function ProviderConnection({ connection, refresh }: Readonly<{
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       const result = await startProviderConnection({ body: {}, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { provider }, signal: controller.signal });
+      if (result.response?.status === 200 && result.data?.authorizationUrl) {
+        window.location.assign(result.data.authorizationUrl);
+        return;
+      }
       if (result.response?.status !== 202 || !result.data?.operationId || !result.data.pollDeadlineAt) {
         setStartFailure(connectionOperationError(result.error));
         setAction(classifyConnectionMutationFailure(result.response?.status, result.error));

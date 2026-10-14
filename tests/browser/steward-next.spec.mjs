@@ -717,6 +717,11 @@ async function startWeb() {
         const providerConnectionMutation = /^\/(?:app|admin)\/api\/v1\/connections\/([^/]+)\/(start|disconnect)$/.exec(requestUrl.pathname);
         if (providerConnectionMutation?.[2] === "start") {
           const provider = decodeURIComponent(providerConnectionMutation[1]);
+          if (provider === "jira") {
+            response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+            response.end(JSON.stringify({ authorizationUrl: `${web.origin}/connections?oauth=started` }));
+            return;
+          }
           response.writeHead(202, { "content-type": "application/json", "cache-control": "no-store" });
           response.end(JSON.stringify({
             apiVersion: "steward.connections/v1",
@@ -5295,6 +5300,28 @@ test("Connections starts Jira sign-in through Jira's provider route", async ({ b
     await expect(developer.page).toHaveURL(`${origin}/connections?oauth=started`);
     const start = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/connections/jira/start");
     expectMutationProof(start);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Connections rejects a synchronous Jira start without an authorization URL", async ({ browser }) => {
+  const startPath = "/app/api/v1/connections/jira/start";
+  const developer = await guardedPage(browser, {
+    expectedHttpStatuses: [],
+    mutationFailures: { [startPath]: { status: 200, body: {} } },
+    providerConnections: [{
+      provider: "jira",
+      displayName: "Jira",
+      actions: ["start"],
+      status: { phase: "disconnected", accountEmail: null, scopesRequired: ["read:jira-work"], scopesGranted: [], scopesMissing: ["read:jira-work"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+    }],
+  });
+  try {
+    await developer.page.goto(`${origin}/connections`);
+    await developer.page.getByRole("button", { name: "Connect Jira" }).click();
+    await expect(developer.page.getByText("The connection action could not be completed.", { exact: true })).toBeVisible();
+    expectMutationProof(developer.mutations.find((mutation) => mutation.path === startPath));
   } finally {
     await closeGuardedPage(developer);
   }
