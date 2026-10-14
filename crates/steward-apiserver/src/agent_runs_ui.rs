@@ -43,7 +43,7 @@ use crate::connections::{
     ConnectionBrokerError, ConnectionSession, ConnectionSubject, GithubWorkflowRerunBroker,
     GithubWorkflowRerunRequest,
 };
-use crate::tasks::{BrowserTaskRerunError, BrowserTaskRerunner};
+use crate::tasks::{BrowserTaskRerunError, BrowserTaskRerunner, validate_direct_task_requirements};
 use crate::{AgentRunLedger, AgentRunSpendView, BoxFuture, bounded_task_error_category};
 
 pub const BROWSER_AGENT_RUNS_API_VERSION: &str = "steward.browser-runs/v1";
@@ -1370,6 +1370,9 @@ where
         Ok(definition) if definition.validate().is_ok() => definition,
         _ => return browser_runs_error(StatusCode::UNPROCESSABLE_ENTITY),
     };
+    if let Err(error) = validate_direct_task_requirements(&definition) {
+        return error.into_response();
+    }
     if body.task_id.is_none() && definition.version != 1 {
         return browser_runs_error(StatusCode::UNPROCESSABLE_ENTITY);
     }
@@ -5232,7 +5235,52 @@ mod tests {
         let ledger = FakeLedger::default();
         let (service, session_cookie, csrf) =
             signed_in_cookie_and_csrf(LocalFakeIdentity::User).await?;
-        let app = protected_router(ledger, service);
+        let app = protected_router(ledger.clone(), service);
+        let mut zero_limit = save_body(1, "Do not save this Task.", None);
+        let mut zero_limit_definition: serde_json::Value = serde_json::from_str(
+            zero_limit["files"]["task-definition.json"]
+                .as_str()
+                .ok_or_else(|| "zero-limit fixture omitted its definition".to_owned())?,
+        )
+        .map_err(|error| format!("parse zero-limit definition: {error}"))?;
+        zero_limit_definition["runtime"]["model"] = serde_json::json!({
+            "provider": "provider-a",
+            "model": "model-a"
+        });
+        zero_limit_definition["requires"] = serde_json::json!({
+            "authority": {
+                "llms": [{"provider": "provider-a", "model": "model-a"}],
+                "tools": [],
+                "budget": {
+                    "monthlyLimit": "10.00",
+                    "singleRunLimit": "0",
+                    "currency": "USD"
+                },
+                "ttl": "1h",
+                "runner": {
+                    "platforms": [],
+                    "memory": null,
+                    "compute": null,
+                    "storage": null
+                }
+            }
+        });
+        zero_limit["files"]["task-definition.json"] =
+            serde_json::Value::String(zero_limit_definition.to_string());
+        let (status, refusal) = save(&app, &session_cookie, &csrf, zero_limit).await?;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            refusal["failureReason"],
+            "The per-run budget must be more than 0.00 USD."
+        );
+        assert!(
+            ledger
+                .task_versions
+                .lock()
+                .map_err(|_| "lock saved Task versions")?
+                .is_empty(),
+            "a zero-limit Task must be refused before a version is saved"
+        );
         let (status, v1) = save(
             &app,
             &session_cookie,

@@ -13275,6 +13275,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_run_refuses_a_stored_zero_per_run_requirement_before_reservation()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        enable_inline_for_versioned_task_fixture(&ledger, true)?;
+        let mut request_body = inline_browser_task_body();
+        let definition = request_body["package"]["files"]["task-definition.json"]
+            .as_str()
+            .ok_or_else(|| "zero-limit fixture omitted TaskDefinition".to_owned())?;
+        let mut definition = serde_json::from_str::<serde_json::Value>(definition)
+            .map_err(|error| format!("parse zero-limit TaskDefinition: {error}"))?;
+        definition["runtime"]["model"] = serde_json::json!({
+            "provider": "openai",
+            "model": "gpt-5.4"
+        });
+        definition["requires"] = serde_json::json!({
+            "authority": {
+                "llms": [{"provider": "openai", "model": "gpt-5.4"}],
+                "tools": [],
+                "budget": {
+                    "monthlyLimit": "25.00",
+                    "singleRunLimit": "0",
+                    "currency": "USD"
+                },
+                "ttl": "4h",
+                "runner": {
+                    "platforms": ["linux"],
+                    "memory": "1Gi",
+                    "compute": "500m",
+                    "storage": "2Gi"
+                }
+            }
+        });
+        request_body["package"]["files"]["task-definition.json"] =
+            serde_json::Value::String(definition.to_string());
+
+        let origin = "http://127.0.0.1:33001";
+        let (auth, session_cookie, csrf) =
+            signed_in_browser(origin, LocalFakeIdentity::User).await?;
+        let response = browser_task_router(ledger.clone(), task_api_config()?, auth)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/app/api/v1/runs")
+                    .header(header::COOKIE, session_cookie)
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-steward-csrf", csrf)
+                    .header("idempotency-key", "stored-zero-limit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .map_err(|error| format!("build zero-limit Run request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit zero-limit Run request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .map_err(|error| format!("read zero-limit Run response: {error}"))?,
+        )
+        .map_err(|error| format!("decode zero-limit Run response: {error}"))?;
+        assert_eq!(
+            body["failureReason"],
+            "The per-run budget must be more than 0.00 USD."
+        );
+        assert!(
+            ledger
+                .tasks
+                .lock()
+                .map_err(|_| "lock zero-limit Task reservations")?
+                .is_empty(),
+            "a zero-limit stored Task must be refused before runtime reservation"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn browser_inline_checkout_repository_resolves_trigger_with_typed_git_ref()
     -> Result<(), String> {
         let ledger = versioned_task_ledger_with_runtime_minutes()?;

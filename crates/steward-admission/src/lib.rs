@@ -588,28 +588,31 @@ pub enum AdmissionError {
 }
 
 pub fn validate_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
-    Decimal::parse(&envelope.spec.budget.monthly_limit)?;
-    if let Some(single_run_limit) = &envelope.spec.budget.single_run_limit {
+    validate_envelope_spec(&envelope.spec)
+}
+
+fn validate_envelope_spec(spec: &EnvelopeSpec) -> Result<(), AdmissionError> {
+    Decimal::parse(&spec.budget.monthly_limit)?;
+    if let Some(single_run_limit) = &spec.budget.single_run_limit {
         Decimal::parse(single_run_limit)?;
     }
-    if let Some(runtime_minutes_limit) = &envelope.spec.runtime_minutes_limit {
+    if let Some(runtime_minutes_limit) = &spec.runtime_minutes_limit {
         Decimal::parse(runtime_minutes_limit)?;
     }
-    if envelope.spec.budget.currency.len() != 3
-        || !envelope
-            .spec
+    if spec.budget.currency.len() != 3
+        || !spec
             .budget
             .currency
             .bytes()
             .all(|byte| byte.is_ascii_uppercase())
     {
         return Err(AdmissionError::InvalidCurrency {
-            value: envelope.spec.budget.currency.clone(),
+            value: spec.budget.currency.clone(),
         });
     }
-    duration_seconds(&envelope.spec.ttl)?;
-    validate_runner(&envelope.spec.runner)?;
-    if let Some(workspace) = &envelope.spec.workspace {
+    duration_seconds(&spec.ttl)?;
+    validate_runner(&spec.runner)?;
+    if let Some(workspace) = &spec.workspace {
         validate_workspace_authority(workspace)?;
     }
     Ok(())
@@ -618,8 +621,13 @@ pub fn validate_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
 /// Validate an Envelope that a person can select for a run. Internal zero-budget authorities use
 /// `validate_envelope`; a selectable per-run limit must leave positive spending authority.
 pub fn validate_user_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
-    validate_envelope(envelope)?;
-    if let Some(single_run_limit) = &envelope.spec.budget.single_run_limit {
+    validate_user_envelope_spec(&envelope.spec)
+}
+
+/// Validate authority a person selected for a Task before it is stored or started.
+pub fn validate_user_envelope_spec(spec: &EnvelopeSpec) -> Result<(), AdmissionError> {
+    validate_envelope_spec(spec)?;
+    if let Some(single_run_limit) = &spec.budget.single_run_limit {
         parse_positive_single_run_limit(single_run_limit)?;
     }
     Ok(())

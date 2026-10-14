@@ -20,7 +20,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   reason when its accepted model or spending settings are later rejected. The API and Run page
   show the spending-limit reason and exhausted final spend even when the first model call exceeds
   the limit or its charge settles after the agent exits; spending in the last few seconds can
-  exceed the configured amount.
+  exceed the configured amount. Runs with a per-run limit can wait up to 20 seconds for final spend
+  to settle before their runtime key is removed.
 - Task cleanup now records one final inference-spend observation before deleting the run key, so
   short runs no longer finish with stale zero spend or disappear from monthly Envelope usage.
 - Approving a custom or template Envelope request that exactly matches authority the user already
