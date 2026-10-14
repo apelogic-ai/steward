@@ -697,6 +697,14 @@ Steward release namespace also creates `steward-workflows`.
   accepts `12` through `60`. It controls how often a running inference-backed
   runtime refreshes observed spend; Steward refuses values shorter than the
   initial final-spend delay or longer than the controller's requeue ceiling.
+- Final inference accounting is bounded by
+  `config.controller.finalSpendSettlementDelaySeconds` (`12`),
+  `finalSpendSettlementCeilingSeconds` (`20`), and
+  `finalSpendCaptureTimeoutSeconds` (`25`). The delay precedes the final read,
+  the ceiling bounds settlement polling, and the timeout bounds the complete
+  read. `config.controller.inferenceCleanupDeadlineSeconds` defaults to `30`
+  and bounds cleanup retries. Steward requires these values to be ordered so
+  cleanup cannot discard a final read that still has time remaining.
 - In governed mode, `config.mint.issuer`, `spiffeTrustDomain`, and
   `openshellNamespace` must be supplied for the target environment; none has
   a usable default. The issuer must also be configured in MCP-GW.

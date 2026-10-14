@@ -1391,6 +1391,10 @@ fi
 grep -Fq '            - { name: STEWARD_TASK_MCP_GW_ENDPOINT, value: "https://mcp-gw.example.test/mcp" }' "${rendered}"
 grep -Eq 'name: STEWARD_OPENSHELL_TASK_LOG_MODE, value: "?off"?' "${rendered}"
 grep -Eq 'name: STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS, value: "?15"?' "${rendered}"
+grep -Eq 'name: STEWARD_FINAL_SPEND_SETTLEMENT_DELAY_SECONDS, value: "?12"?' "${rendered}"
+grep -Eq 'name: STEWARD_FINAL_SPEND_SETTLEMENT_CEILING_SECONDS, value: "?20"?' "${rendered}"
+grep -Eq 'name: STEWARD_FINAL_SPEND_CAPTURE_TIMEOUT_SECONDS, value: "?25"?' "${rendered}"
+grep -Eq 'name: STEWARD_INFERENCE_CLEANUP_DEADLINE_SECONDS, value: "?30"?' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE' "${rendered}"
@@ -1428,6 +1432,11 @@ then
 fi
 helm lint "${root}/charts/steward" "${image_values[@]}" \
   --set config.controller.inferenceObservationIntervalSeconds=30 >/dev/null
+helm lint "${root}/charts/steward" "${image_values[@]}" \
+  --set config.controller.finalSpendSettlementDelaySeconds=10 \
+  --set config.controller.finalSpendSettlementCeilingSeconds=21 \
+  --set config.controller.finalSpendCaptureTimeoutSeconds=26 \
+  --set config.controller.inferenceCleanupDeadlineSeconds=31 >/dev/null
 for invalid_inference_observation_interval in 11 61
 do
   if helm lint "${root}/charts/steward" "${image_values[@]}" \

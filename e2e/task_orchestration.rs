@@ -2999,6 +2999,11 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         Some("25.00".to_owned())
     );
     assert_eq!(
+        store.runtime_spend_episode_baseline(&runtime_uid).await?,
+        "110.00",
+        "the granted exhaustion must become the recreated key's cumulative spend baseline"
+    );
+    assert_eq!(
         store
             .remaining_envelope_instance_spend_budget(
                 &envelope_instance_id,
@@ -3051,12 +3056,23 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             1,
             "immutable-runtime-spec",
             &SpendSummary {
-                observed_amount: "130.00".to_owned(),
+                observed_amount: "20.00".to_owned(),
                 currency: "USD".to_owned(),
             },
             true,
         )
         .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT observed_amount::text FROM spend_observations \
+             WHERE runtime_uid = $1 ORDER BY at DESC, id DESC LIMIT 1",
+        )
+        .bind(&runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        "130.00",
+        "a recreated key's raw spend must be added to the prior suspension episode"
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM inference_exhaustions WHERE runtime_uid = $1",
@@ -3074,6 +3090,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .find(|record| record.runtime_uid == runtime_uid && record.dimension == "llm_spend")
         .ok_or_else(|| io::Error::other("resumed exhaustion was not projected"))?;
     assert_ne!(resumed_exhaustion.escalation_id, escalation.escalation_id);
+    assert_eq!(resumed_exhaustion.observed_amount, "130.00");
     assert_eq!(resumed_exhaustion.grant_id, None);
     assert_eq!(resumed_exhaustion.denial_rationale, None);
 
@@ -3283,6 +3300,86 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         assert_eq!(failed.phase, TaskPhase::Failed);
         assert_eq!(failed.failure_reason.as_deref(), Some(failure_reason));
     }
+
+    let denied_task_uid = Uuid::new_v4();
+    let denied_operation_id = Uuid::new_v4();
+    let denied_runtime_name = format!("denied-spend-{suffix}");
+    insert_task_projection_fixture(
+        &pool,
+        TaskProjectionFixture {
+            source_task_uid: task_uid,
+            task_uid: denied_task_uid,
+            operation_id: denied_operation_id,
+            idempotency_key: &format!("denied-spend-{suffix}"),
+            task_runtime_name: &denied_runtime_name,
+            operation_runtime_name: &denied_runtime_name,
+            inert_manifest_digest: &inert_digest,
+            active_manifest_digest: &active_digest,
+            direct_task_evidence: None,
+        },
+    )
+    .await?;
+    store
+        .put_task_inputs(
+            denied_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"denied spend input",
+        )
+        .await?;
+    store
+        .request_task_execution(denied_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    store
+        .authorize_task_runtime_creation(denied_task_uid, 1, "test-controller")
+        .await?;
+    let denied_operation = store
+        .task_runtime_operation(denied_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    let denied_runtime_uid = format!("denied-spend-runtime-{suffix}");
+    store
+        .record_task_runtime_observed(
+            denied_task_uid,
+            denied_operation.generation,
+            &denied_runtime_uid,
+            "1",
+            "test-controller",
+        )
+        .await?;
+    store
+        .record_spend_observation(
+            &denied_runtime_uid,
+            1,
+            "denied-runtime-spec",
+            &SpendSummary {
+                observed_amount: "101.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            true,
+        )
+        .await?;
+    let denied_escalation = store
+        .admin_escalations()
+        .await?
+        .into_iter()
+        .find(|record| record.runtime_uid == denied_runtime_uid)
+        .ok_or_else(|| io::Error::other("denied spend escalation was not projected"))?;
+    store
+        .deny_cumulative_escalation(
+            denied_escalation.escalation_id,
+            "the request exceeds the available budget",
+            "test-admin",
+        )
+        .await?;
+    let denied = store
+        .task(denied_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(
+        denied.failure_reason.as_deref(),
+        Some("The request for more monthly budget was denied, so this run was stopped.")
+    );
     Ok(())
 }
 
@@ -6097,6 +6194,25 @@ async fn inference_budget_failures_persist_plain_reasons_without_retrying_reject
         .await?,
         0,
         "per-run Task failure must not create a monthly escalation"
+    );
+    assert_eq!(
+        store
+            .envelope_usage(&envelope_instance_id)
+            .await?
+            .observed_amount,
+        Some("0.0002".to_owned()),
+        "the full call must count toward monthly usage when the per-run outcome wins"
+    );
+    assert_eq!(
+        store
+            .remaining_envelope_instance_spend_budget(
+                &envelope_instance_id,
+                "following-runtime",
+                "0.00015",
+            )
+            .await?,
+        "0",
+        "a following Run must see that the call also used the remaining monthly amount"
     );
 
     let rejected_task_uid = Uuid::new_v4();

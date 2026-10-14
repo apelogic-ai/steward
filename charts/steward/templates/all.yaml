@@ -597,6 +597,10 @@ spec:
 {{- end }}
             - { name: STEWARD_OPENSHELL_TASK_LOG_MODE, value: {{ .Values.config.controller.openshellTaskLogMode | quote }} }
             - { name: STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS, value: {{ .Values.config.controller.inferenceObservationIntervalSeconds | quote }} }
+            - { name: STEWARD_FINAL_SPEND_SETTLEMENT_DELAY_SECONDS, value: {{ .Values.config.controller.finalSpendSettlementDelaySeconds | quote }} }
+            - { name: STEWARD_FINAL_SPEND_SETTLEMENT_CEILING_SECONDS, value: {{ .Values.config.controller.finalSpendSettlementCeilingSeconds | quote }} }
+            - { name: STEWARD_FINAL_SPEND_CAPTURE_TIMEOUT_SECONDS, value: {{ .Values.config.controller.finalSpendCaptureTimeoutSeconds | quote }} }
+            - { name: STEWARD_INFERENCE_CLEANUP_DEADLINE_SECONDS, value: {{ .Values.config.controller.inferenceCleanupDeadlineSeconds | quote }} }
             - { name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE, value: /run/openshell/ca.crt }
             - { name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE, value: /run/openshell/tls.crt }
             - { name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE, value: /run/openshell/tls.key }

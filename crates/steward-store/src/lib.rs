@@ -32,6 +32,8 @@ const MANAGED_INFERENCE_KEY_BYTES: usize = 32;
 const MANAGED_INFERENCE_NONCE_BYTES: usize = 12;
 const MANAGED_INFERENCE_KEY_VERSION: i32 = 1;
 const MAX_MANAGED_INFERENCE_CREDENTIAL_BYTES: usize = 8192;
+const SPEND_ESCALATION_DENIED_FAILURE: &str =
+    "The request for more monthly budget was denied, so this run was stopped.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskOrchestrationMode {
@@ -3297,6 +3299,34 @@ impl PgStore {
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
+        let prior_episode = sqlx::query(
+            "SELECT exhaustion.observed_amount::text AS observed_amount, exhaustion.currency \
+             FROM inference_exhaustions exhaustion \
+             JOIN envelope_instance_grants grants ON grants.escalation_id = exhaustion.id \
+             WHERE exhaustion.runtime_uid = $1 \
+             ORDER BY exhaustion.at DESC, exhaustion.id DESC LIMIT 1",
+        )
+        .bind(runtime_uid)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let observed_amount = if let Some(prior_episode) = prior_episode {
+            let prior_currency: String =
+                prior_episode.try_get("currency").map_err(database_error)?;
+            if prior_currency != spend.currency {
+                return Err(StoreError::InvalidCumulativeEscalation);
+            }
+            add_budget_amount(
+                &prior_episode
+                    .try_get::<String, _>("observed_amount")
+                    .map_err(database_error)?,
+                &spend.observed_amount,
+            )
+            .map_err(|_| StoreError::InvalidCumulativeEscalation)?
+        } else {
+            add_budget_amount("0", &spend.observed_amount)
+                .map_err(|_| StoreError::InvalidCumulativeEscalation)?
+        };
         if exhausted
             && sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS ( \
@@ -3339,7 +3369,7 @@ impl PgStore {
              )",
         )
         .bind(runtime_uid)
-        .bind(&spend.observed_amount)
+        .bind(&observed_amount)
         .bind(&spend.currency)
         .bind(exhausted)
         .execute(&mut *transaction)
@@ -3357,7 +3387,7 @@ impl PgStore {
             .bind(runtime_uid)
             .bind(observed_generation)
             .bind(spec_digest)
-            .bind(&spend.observed_amount)
+            .bind(&observed_amount)
             .bind(&spend.currency)
             .execute(&mut *transaction)
             .await
@@ -3870,6 +3900,31 @@ impl PgStore {
         Ok((amount != "0").then_some(amount))
     }
 
+    /// Return the cumulative spend recorded before the current gateway-key episode. A granted
+    /// exhaustion means the old key was revoked and the replacement key restarted its raw spend
+    /// counter at zero.
+    pub async fn runtime_spend_episode_baseline(
+        &self,
+        runtime_uid: &str,
+    ) -> Result<String, StoreError> {
+        if runtime_uid.trim().is_empty() {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        sqlx::query_scalar::<_, String>(
+            "SELECT COALESCE(( \
+                 SELECT exhaustion.observed_amount \
+                 FROM inference_exhaustions exhaustion \
+                 JOIN envelope_instance_grants grants ON grants.escalation_id = exhaustion.id \
+                 WHERE exhaustion.runtime_uid = $1 \
+                 ORDER BY exhaustion.at DESC, exhaustion.id DESC LIMIT 1 \
+             ), 0)::text",
+        )
+        .bind(runtime_uid)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
     /// Return the current spend authority available to one runtime after current-period spend by
     /// the other runtimes bound to the same provisioned Envelope instance. The current runtime is
     /// excluded because its virtual key already accounts for its own cumulative spend.
@@ -4260,10 +4315,11 @@ impl PgStore {
         sqlx::query(
             "UPDATE task_submissions SET finalize_requested = true, cancel_requested = true, \
                  phase = CASE WHEN phase IN ('submitted', 'parked', 'queued') THEN 'cancelled' ELSE phase END, \
-                 failure_reason = COALESCE(failure_reason, 'cumulative authority escalation denied'), \
+                 failure_reason = COALESCE(failure_reason, $2), \
                  updated_at = now() WHERE task_uid = $1",
         )
         .bind(task.task_uid)
+        .bind(SPEND_ESCALATION_DENIED_FAILURE)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;

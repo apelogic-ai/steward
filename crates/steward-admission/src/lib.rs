@@ -1170,6 +1170,56 @@ pub fn add_budget_amount(left: &str, right: &str) -> Result<String, AdmissionErr
     Ok(text)
 }
 
+pub fn remaining_budget_amount(limit: &str, spent: &str) -> Result<String, AdmissionError> {
+    let (limit_integer, limit_fractional) = decimal_parts(limit)?;
+    let (spent_integer, spent_fractional) = decimal_parts(spent)?;
+    let mut limit_digits = decimal_digits(limit_integer, limit_fractional);
+    let mut spent_digits = decimal_digits(spent_integer, spent_fractional);
+    let scale = limit_fractional.len().max(spent_fractional.len());
+    limit_digits.extend(std::iter::repeat_n(0, scale - limit_fractional.len()));
+    spent_digits.extend(std::iter::repeat_n(0, scale - spent_fractional.len()));
+    let width = limit_digits.len().max(spent_digits.len());
+    limit_digits.splice(0..0, std::iter::repeat_n(0, width - limit_digits.len()));
+    spent_digits.splice(0..0, std::iter::repeat_n(0, width - spent_digits.len()));
+
+    if limit_digits <= spent_digits {
+        return Ok(if scale == 0 {
+            "0".to_owned()
+        } else {
+            format!("0.{}", "0".repeat(scale))
+        });
+    }
+
+    let mut borrow = 0_i16;
+    let mut difference = Vec::with_capacity(width);
+    for (limit, spent) in limit_digits.into_iter().zip(spent_digits).rev() {
+        let mut value = i16::from(limit) - i16::from(spent) - borrow;
+        if value < 0 {
+            value += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        difference.push(u8::try_from(value).unwrap_or_default());
+    }
+    difference.reverse();
+    let first_nonzero = difference
+        .iter()
+        .position(|digit| *digit != 0)
+        .unwrap_or(difference.len().saturating_sub(scale + 1));
+    let mut text = difference[first_nonzero..]
+        .iter()
+        .map(|digit| char::from(b'0' + *digit))
+        .collect::<String>();
+    if scale > 0 {
+        if text.len() <= scale {
+            text.insert_str(0, &"0".repeat(scale + 1 - text.len()));
+        }
+        text.insert(text.len() - scale, '.');
+    }
+    Ok(text)
+}
+
 #[derive(Debug)]
 struct Decimal<'a> {
     integer: &'a str,
@@ -1401,7 +1451,8 @@ mod tests {
     use super::{
         AdmissionDecision, AdmissionDelta, AdmissionError, Envelope, EnvelopeSpec,
         add_budget_amount, envelope_is_within, evaluate, evaluate_authority_request,
-        evaluate_with_grants, validate_envelope, workspace_authority_is_within,
+        evaluate_with_grants, remaining_budget_amount, validate_envelope,
+        workspace_authority_is_within,
     };
 
     fn assert_request_relation(
@@ -2238,6 +2289,22 @@ mod tests {
             Err(AdmissionError::InvalidBudget {
                 value: "+1".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn remaining_budget_clamps_at_zero_without_losing_decimal_scale() {
+        assert_eq!(
+            remaining_budget_amount("1.50", "1.25"),
+            Ok("0.25".to_owned())
+        );
+        assert_eq!(
+            remaining_budget_amount("1.50", "1.50"),
+            Ok("0.00".to_owned())
+        );
+        assert_eq!(
+            remaining_budget_amount("1.50", "2.00"),
+            Ok("0.00".to_owned())
         );
     }
 
