@@ -428,14 +428,13 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
     .bind(historical_task_uid)
     .execute(store.pool())
     .await?;
-    let historical_spend_before_episode_migration =
-        sqlx::query_as::<_, (String, String, bool)>(
-            "SELECT runtime_uid, observed_amount::text, exhausted \
+    let historical_spend_before_episode_migration = sqlx::query_as::<_, (String, String, bool)>(
+        "SELECT runtime_uid, observed_amount::text, exhausted \
              FROM spend_observations WHERE runtime_uid LIKE 'historical-spend-%' \
              ORDER BY runtime_uid, at, id",
-        )
-        .fetch_all(store.pool())
-        .await?;
+    )
+    .fetch_all(store.pool())
+    .await?;
     migration_set(None).run(store.pool()).await.map_err(|error| {
         io::Error::other(format!(
             "Steward spend-episode migration must complete over the required TLS session: {error}"

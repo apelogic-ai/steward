@@ -3132,7 +3132,9 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         )
         .await?;
     assert_eq!(
-        store.latest_runtime_spend_amount(&runtime_uid, "USD").await?,
+        store
+            .latest_runtime_spend_amount(&runtime_uid, "USD")
+            .await?,
         "135.00",
         "an older retry must not reduce cumulative spend"
     );
