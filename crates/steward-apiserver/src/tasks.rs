@@ -7752,15 +7752,24 @@ mod workflow_request_tests {
 
     #[test]
     fn default_workspace_names_are_stable_normalized_slugs() -> Result<(), String> {
-        let normalized = |value| {
-            default_workspace_name(value).map_err(|error| format!("normalize name: {error:?}"))
-        };
-        assert_eq!(normalized("Steward")?.as_str(), "steward");
-        assert_eq!(normalized("my_repo")?.as_str(), "my-repo");
-        assert_eq!(normalized("site.io")?.as_str(), "site-io");
-        assert_eq!(normalized("---A__B...")?.as_str(), "a-b");
-        assert!(default_workspace_name("___").is_err());
-        assert_eq!(normalized(&"A".repeat(80))?.as_str().len(), 40);
+        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/workspace-name-cases.json"
+        ))
+        .map_err(|error| format!("parse workspace-name cases: {error}"))?;
+        for case in cases {
+            let repository_name = case["repositoryName"]
+                .as_str()
+                .ok_or_else(|| "workspace-name case needs repositoryName".to_owned())?;
+            let expected = case["workspaceName"].as_str();
+            let actual = default_workspace_name(repository_name)
+                .ok()
+                .map(|name| name.as_str().to_owned());
+            assert_eq!(
+                actual.as_deref(),
+                expected,
+                "repository name {repository_name}"
+            );
+        }
         Ok(())
     }
 

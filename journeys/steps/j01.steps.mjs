@@ -1,6 +1,7 @@
 import { expect } from "@playwright/test";
 
 import { isIssue414RunFailure } from "../run-failure-markers.mjs";
+import { defaultWorkspaceName } from "../workspace-name.mjs";
 import { Given, Then, When } from "./fixtures.mjs";
 
 const runPrefix = process.env.STEWARD_JOURNEY_RUN_PREFIX;
@@ -29,9 +30,11 @@ function templateId(name) {
 }
 
 function resolveText(journey, text) {
+  const workspaceName = defaultWorkspaceName(repository.split("/").at(-1));
   let prefixed = text
     .replaceAll("<run-prefix>", runPrefix)
-    .replaceAll("<owner>/<repository>", repository);
+    .replaceAll("<owner>/<repository>", repository)
+    .replaceAll("<workspace-name>", workspaceName);
   if (prefixed === "member") return memberRole;
   if (["Agent choice", "Read the repository", "Scratch and Git", "Scratch check", "Stated needs"].includes(prefixed)) {
     return `${runPrefix}-${prefixed.toLocaleLowerCase("en-US").replaceAll(/[^a-z0-9]+/g, "-").replaceAll(/^-|-$/g, "")}`;

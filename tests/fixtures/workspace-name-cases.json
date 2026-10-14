@@ -1,0 +1,30 @@
+[
+  {
+    "repositoryName": "Steward",
+    "workspaceName": "steward"
+  },
+  {
+    "repositoryName": "my_repo",
+    "workspaceName": "my-repo"
+  },
+  {
+    "repositoryName": "repo.example.com",
+    "workspaceName": "repo-example-com"
+  },
+  {
+    "repositoryName": "---A__B...",
+    "workspaceName": "a-b"
+  },
+  {
+    "repositoryName": "___",
+    "workspaceName": null
+  },
+  {
+    "repositoryName": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "workspaceName": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  {
+    "repositoryName": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_b",
+    "workspaceName": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+]
