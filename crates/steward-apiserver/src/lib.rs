@@ -2413,9 +2413,6 @@ fn agent_run_view(record: AgentRunRecord) -> AgentRunView {
     }
 }
 
-pub(crate) const REQUIRED_OUTPUT_MISSING_FAILURE: &str =
-    "This run finished without creating an output file.";
-
 pub(crate) fn bounded_task_error_category(reason: Option<&str>) -> Option<&'static str> {
     reason.map(|reason| {
         if reason.starts_with("task output archive exceeds") {
@@ -2428,8 +2425,6 @@ pub(crate) fn bounded_task_error_category(reason: Option<&str>) -> Option<&'stat
             "inference-key-rejected"
         } else if reason == "inference_budget_exhausted" {
             "inference-budget-exhausted"
-        } else if reason == REQUIRED_OUTPUT_MISSING_FAILURE {
-            "output-missing"
         } else {
             "execution-failed"
         }

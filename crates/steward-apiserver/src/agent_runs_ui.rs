@@ -44,10 +44,7 @@ use crate::connections::{
     GithubWorkflowRerunRequest,
 };
 use crate::tasks::{BrowserTaskRerunError, BrowserTaskRerunner, validate_direct_task_requirements};
-use crate::{
-    AgentRunLedger, AgentRunSpendView, BoxFuture, REQUIRED_OUTPUT_MISSING_FAILURE,
-    bounded_task_error_category,
-};
+use crate::{AgentRunLedger, AgentRunSpendView, BoxFuture, bounded_task_error_category};
 
 pub const BROWSER_AGENT_RUNS_API_VERSION: &str = "steward.browser-runs/v1";
 pub const BROWSER_TASKS_API_VERSION: &str = "steward.browser-tasks/v1";
@@ -2865,9 +2862,6 @@ pub(crate) fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
     if reason == INFERENCE_REQUEST_REJECTED_FAILURE {
         return Some(reason);
     }
-    if reason == REQUIRED_OUTPUT_MISSING_FAILURE {
-        return Some(reason);
-    }
     if public_spending_limit_failure_reason(Some(reason)).is_some() {
         return Some(reason);
     }
@@ -4526,15 +4520,11 @@ mod tests {
         let other_task = Uuid::parse_str("22222222-2222-4222-8222-222222222222")
             .map_err(|error| error.to_string())?;
         let ledger = FakeLedger::default();
-        let mut own_run = run(own_task, owner);
-        own_run.phase = TaskPhase::Failed;
-        own_run.failure_reason =
-            Some("This run finished without creating an output file.".to_owned());
         ledger
             .records
             .lock()
             .map_err(|_| "lock records")?
-            .extend([own_run, run(other_task, other_owner)]);
+            .extend([run(own_task, owner), run(other_task, other_owner)]);
 
         let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
         let absent = protected_router(ledger.clone(), service)
@@ -4548,29 +4538,6 @@ mod tests {
             .await
             .map_err(|error| format!("execute cross-owner detail request: {error}"))?;
         assert_eq!(absent.status(), StatusCode::NOT_FOUND);
-
-        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
-        let detail = protected_router(ledger.clone(), service)
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/app/api/v1/runs/{own_task}"))
-                    .header(header::COOKIE, session_cookie)
-                    .body(Body::empty())
-                    .map_err(|error| format!("build scoped detail request: {error}"))?,
-            )
-            .await
-            .map_err(|error| format!("execute scoped detail request: {error}"))?;
-        assert_eq!(detail.status(), StatusCode::OK);
-        let body = to_bytes(detail.into_body(), 16 * 1024)
-            .await
-            .map_err(|error| format!("read scoped detail response: {error}"))?;
-        let value: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|error| format!("parse scoped detail response: {error}"))?;
-        assert_eq!(
-            value["run"]["failureReason"],
-            "This run finished without creating an output file."
-        );
-        assert_eq!(value["run"]["errorCategory"], "output-missing");
 
         let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
         let timeline = protected_router(ledger.clone(), service)
