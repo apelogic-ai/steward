@@ -538,15 +538,23 @@ Steward release namespace also creates `steward-workflows`.
             toolsets: [actions]
         catalogs:
           - provider: github
+            displayName: GitHub
             catalogId: github-tools
             version: 1.6.0
             available: true
   ```
 
-  Tool access classes and provider catalog availability are display metadata. Each distinct
-  provider under `catalogs` gets one connection-status read through the gateway's version-2
-  provider route; failures are isolated to that provider. Authority, budget, TTL, template, and
-  user fields are intentionally not part of this catalog.
+  Tool access classes, optional provider `displayName`, and provider catalog availability are
+  display metadata. Each distinct available provider under `catalogs` gets one connection-status
+  read through the gateway's version-2 provider route; failures are isolated to that provider.
+  Disabled providers stay in the availability metadata but are not read or returned as connection
+  rows. A GitHub connection row supports `start` and `disconnect`; other provider rows carry no
+  actions until their browser flow is installed. Authority, budget, TTL, template, and user fields
+  are intentionally not part of this catalog.
+
+  An upgrade that needs the existing GitHub connection card must list an available `github`
+  provider entry and should set `displayName: GitHub`. An empty `catalogs` list returns no tool
+  connection rows.
 
   Optional `toolsets` are also presentation metadata. A tool may belong to at
   most 16 toolsets. The template editor groups tools only when these authoritative names are

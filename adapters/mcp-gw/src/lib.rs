@@ -5898,6 +5898,12 @@ mod tests {
                 request.starts_with("GET /connections/jira/status HTTP/1.1\r\n"),
                 "the status reader must use the exact catalog provider"
             );
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("\r\naccept: application/vnd.apelogic.connection-status.v2+json\r\n"),
+                "the provider route must request the version-2 identity contract"
+            );
             let body = r#"{"version":"2","provider":"jira","phase":"connected","connected":true,"account":{"provider":"jira","id":"account-123","displayName":"alice@example.com"},"requiredScopes":["read:jira-work"],"grantedScopes":["read:jira-work"],"missingScopes":[],"activeCredentialExpiresAt":null,"renewalCredentialExpiresAt":null,"lastAuthorizedAt":null,"lastRenewedAt":null,"lastValidatedAt":null,"capabilities":{"interactiveAuthorization":true}}"#;
             write!(
                 stream,
@@ -5919,6 +5925,55 @@ mod tests {
             .map_err(|_| "direct status fixture panicked".to_owned())??;
         let status = result.map_err(|error| format!("read Jira status: {error:?}"))?;
         assert_eq!(status["accountId"], "account-123");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_status_refuses_a_mismatched_account_provider_from_the_route()
+    -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind mismatched provider fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read mismatched provider fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept mismatched provider request: {error}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|error| format!("bound mismatched provider fixture read: {error}"))?;
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .map_err(|error| format!("read mismatched provider request: {error}"))?;
+            assert!(
+                String::from_utf8_lossy(&request[..read])
+                    .starts_with("GET /connections/jira/status HTTP/1.1\r\n")
+            );
+            let body = r#"{"version":"2","provider":"jira","phase":"connected","connected":true,"account":{"provider":"github","id":"account-123","displayName":"alice@example.com"},"requiredScopes":["read:jira-work"],"grantedScopes":["read:jira-work"],"missingScopes":[],"activeCredentialExpiresAt":null,"renewalCredentialExpiresAt":null,"lastAuthorizedAt":null,"lastRenewedAt":null,"lastValidatedAt":null,"capabilities":{"interactiveAuthorization":true}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .map_err(|error| format!("write mismatched provider response: {error}"))?;
+            Ok(())
+        });
+
+        let reader = ProviderStatusReader::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build mismatched provider reader: {error:?}"))?;
+        let credential = ProviderStatusCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build direct status credential: {error:?}"))?;
+        let result = reader.read(&credential, "jira").await;
+
+        server
+            .join()
+            .map_err(|_| "mismatched provider fixture panicked".to_owned())??;
+        assert!(
+            result.is_err(),
+            "the route must reject account identity from another provider"
+        );
         Ok(())
     }
 

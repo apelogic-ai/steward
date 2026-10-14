@@ -825,7 +825,7 @@ mod tests {
         let mut runtime_with_jira = runtime("runtime-uid-a", "workspace-a", "sandbox-a");
         runtime_with_jira.spec.tools = vec![ToolGrant {
             provider: "jira".to_owned(),
-            resource: "get_issue".to_owned(),
+            resource: "jira_get_issue".to_owned(),
             action: "read".to_owned(),
         }];
         let binding = binding();
@@ -842,7 +842,7 @@ mod tests {
             authority.tools,
             [ToolGrant {
                 provider: "jira".to_owned(),
-                resource: "get_issue".to_owned(),
+                resource: "jira_get_issue".to_owned(),
                 action: "read".to_owned(),
             }],
             "Mint's v3 claim source must preserve the exact provider-agnostic runtime grants"

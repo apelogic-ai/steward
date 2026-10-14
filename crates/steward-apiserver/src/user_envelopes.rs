@@ -2318,7 +2318,7 @@ mod tests {
         let model = requested.spec.llms[0].clone();
         let jira_read = ToolGrant {
             provider: "jira".to_owned(),
-            resource: "get_issue".to_owned(),
+            resource: "jira_get_issue".to_owned(),
             action: "read".to_owned(),
         };
         requested.spec.tools = vec![jira_read.clone()];

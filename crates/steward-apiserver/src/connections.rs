@@ -83,6 +83,14 @@ pub(crate) struct ProviderConnectionView {
     provider: String,
     display_name: String,
     status: ProviderConnectionStatus,
+    actions: Vec<ProviderConnectionAction>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderConnectionAction {
+    Start,
+    Disconnect,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -115,7 +123,10 @@ fn available_provider_connections(
         }
         providers.push(AvailableProviderConnection {
             provider: catalog.provider.clone(),
-            display_name: catalog.provider.clone(),
+            display_name: catalog
+                .display_name
+                .clone()
+                .unwrap_or_else(|| catalog.provider.clone()),
             enabled: catalog.available,
         });
     }
@@ -402,6 +413,7 @@ where
         broker,
         vec![CapabilityProviderCatalog {
             provider: "github".to_owned(),
+            display_name: Some("GitHub".to_owned()),
             catalog_id: "github-tools".to_owned(),
             version: "current".to_owned(),
             available: true,
@@ -747,8 +759,7 @@ where
     path = "/app/api/v1/connections",
     responses(
         (status = 200, body = ConnectionsCollectionResponse),
-        (status = 401, description = "Browser session is absent or invalid"),
-        (status = 503, description = "Connection broker is unavailable")
+        (status = 401, description = "Browser session is absent or invalid")
     ),
     security(("browserSession" = []))
 )]
@@ -764,18 +775,31 @@ where
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let available = available_provider_connections(&state.catalogs);
-    let connections = join_all(available.iter().map(|configured| async {
-        let status = state
-            .broker
-            .status(&session, &configured.provider)
-            .await
-            .unwrap_or_else(|_| unavailable_connection_status());
-        ProviderConnectionView {
-            provider: configured.provider.clone(),
-            display_name: configured.display_name.clone(),
-            status,
-        }
-    }))
+    let connections = join_all(
+        available
+            .iter()
+            .filter(|configured| configured.enabled)
+            .map(|configured| async {
+                let status = state
+                    .broker
+                    .status(&session, &configured.provider)
+                    .await
+                    .unwrap_or_else(|_| unavailable_connection_status());
+                ProviderConnectionView {
+                    provider: configured.provider.clone(),
+                    display_name: configured.display_name.clone(),
+                    status,
+                    actions: if configured.provider == "github" {
+                        vec![
+                            ProviderConnectionAction::Start,
+                            ProviderConnectionAction::Disconnect,
+                        ]
+                    } else {
+                        Vec::new()
+                    },
+                }
+            }),
+    )
     .await;
     Json(ConnectionsCollectionResponse {
         api_version: CONNECTIONS_API_VERSION,
@@ -1179,38 +1203,28 @@ mod tests {
     #[tokio::test]
     async fn provider_collection_advertises_configured_enabled_and_disabled_options()
     -> Result<(), String> {
-        let response = test_router_with_catalogs(
-            FakeBroker::default(),
-            vec![
-                CapabilityProviderCatalog {
-                    provider: "github".to_owned(),
-                    catalog_id: "github-tools".to_owned(),
-                    version: "current".to_owned(),
-                    available: true,
-                },
-                CapabilityProviderCatalog {
-                    provider: "gitlab".to_owned(),
-                    catalog_id: "gitlab-tools".to_owned(),
-                    version: "current".to_owned(),
-                    available: false,
-                },
-                CapabilityProviderCatalog {
-                    provider: "jira".to_owned(),
-                    catalog_id: "jira-tools".to_owned(),
-                    version: "current".to_owned(),
-                    available: false,
-                },
-            ],
-        )
-        .layer(axum::Extension(session()?))
-        .oneshot(
-            Request::builder()
-                .uri("/app/api/v1/connections")
-                .body(Body::empty())
-                .map_err(|error| format!("build provider collection request: {error}"))?,
-        )
-        .await
-        .map_err(|error| format!("request provider collection: {error}"))?;
+        let catalog = crate::browser_admin::CapabilityCatalog::from_json(
+            r#"{
+              "schemaVersion":"steward.capability-catalog/v2",
+              "models":[],
+              "tools":[],
+              "catalogs":[
+                {"provider":"github","displayName":"GitHub","catalogId":"github-tools","version":"current","available":true},
+                {"provider":"gitlab","displayName":"GitLab","catalogId":"gitlab-tools","version":"current","available":false},
+                {"provider":"jira","displayName":"Jira","catalogId":"jira-tools","version":"current","available":false}
+              ]
+            }"#,
+        )?;
+        let response = test_router_with_catalogs(FakeBroker::default(), catalog.catalogs)
+            .layer(axum::Extension(session()?))
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/connections")
+                    .body(Body::empty())
+                    .map_err(|error| format!("build provider collection request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("request provider collection: {error}"))?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), 16 * 1024)
             .await
@@ -1218,6 +1232,12 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("decode provider collection: {error}"))?;
         assert_eq!(value["connections"][0]["provider"], "github");
+        assert_eq!(value["connections"][0]["displayName"], "GitHub");
+        assert_eq!(
+            value["connections"][0]["actions"],
+            serde_json::json!(["start", "disconnect"])
+        );
+        assert_eq!(value["connections"].as_array().map(Vec::len), Some(1));
         assert_eq!(value["available"][0]["enabled"], true);
         assert_eq!(value["available"][1]["provider"], "gitlab");
         assert_eq!(value["available"][1]["enabled"], false);
@@ -1235,12 +1255,14 @@ mod tests {
             vec![
                 CapabilityProviderCatalog {
                     provider: "github".to_owned(),
+                    display_name: Some("GitHub".to_owned()),
                     catalog_id: "github-tools".to_owned(),
                     version: "current".to_owned(),
                     available: true,
                 },
                 CapabilityProviderCatalog {
                     provider: "jira".to_owned(),
+                    display_name: Some("Jira".to_owned()),
                     catalog_id: "jira-read-only".to_owned(),
                     version: "current".to_owned(),
                     available: true,
@@ -1263,7 +1285,12 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("decode provider collection: {error}"))?;
         assert_eq!(value["connections"][0]["provider"], "github");
+        assert_eq!(
+            value["connections"][0]["actions"],
+            serde_json::json!(["start", "disconnect"])
+        );
         assert_eq!(value["connections"][1]["provider"], "jira");
+        assert_eq!(value["connections"][1]["actions"], serde_json::json!([]));
         assert_eq!(value["available"][1]["provider"], "jira");
         assert_eq!(value["available"][1]["enabled"], true);
         assert_eq!(
@@ -1291,12 +1318,14 @@ mod tests {
             vec![
                 CapabilityProviderCatalog {
                     provider: "github".to_owned(),
+                    display_name: Some("GitHub".to_owned()),
                     catalog_id: "github-tools".to_owned(),
                     version: "current".to_owned(),
                     available: true,
                 },
                 CapabilityProviderCatalog {
                     provider: "jira".to_owned(),
+                    display_name: Some("Jira".to_owned()),
                     catalog_id: "jira-read-only".to_owned(),
                     version: "current".to_owned(),
                     available: true,

@@ -2114,7 +2114,7 @@ mod tests {
     fn provider_agnostic_tools_use_exact_request_at_or_below_ceiling() {
         let jira_read = ToolGrant {
             provider: "jira".to_owned(),
-            resource: "get_issue".to_owned(),
+            resource: "jira_get_issue".to_owned(),
             action: "read".to_owned(),
         };
         let jira_write = ToolGrant {
@@ -2150,6 +2150,25 @@ mod tests {
                 }],
             }),
             "a Jira write tuple absent from the ceiling must be rejected"
+        );
+
+        requested.tools = vec![ToolGrant {
+            provider: "jira".to_owned(),
+            resource: "search_issues".to_owned(),
+            action: "read".to_owned(),
+        }];
+        envelope.spec.tools = vec![ToolGrant {
+            provider: "jira".to_owned(),
+            resource: "jira_search_issues".to_owned(),
+            action: "read".to_owned(),
+        }];
+        assert!(
+            matches!(
+                evaluate(&requested, &envelope),
+                Ok(AdmissionDecision::Reject { deltas })
+                    if matches!(deltas.as_slice(), [AdmissionDelta::Tools { .. }])
+            ),
+            "a similarly named Jira resource must not receive the catalog tuple's authority"
         );
     }
 

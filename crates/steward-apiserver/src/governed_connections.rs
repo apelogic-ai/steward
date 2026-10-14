@@ -1004,6 +1004,10 @@ fn start_poll_deadline<'a>(
     }
 }
 
+fn governed_status_provider_supported(provider: &str) -> bool {
+    provider == "github"
+}
+
 impl<B> ProviderConnectionBroker<B> for GovernedConnectionsBroker<B>
 where
     B: Clone + Eq + Hash + Send + Sync + 'static,
@@ -1011,8 +1015,11 @@ where
     fn status<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
-        _provider: &'a str,
+        provider: &'a str,
     ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
+        if !governed_status_provider_supported(provider) {
+            return Box::pin(async { Err(ConnectionBrokerError::Unavailable) });
+        }
         Box::pin(async move { self.status_operation(session, true).await })
     }
 
@@ -2410,8 +2417,9 @@ mod tests {
         MCP_GW_OAUTH_STATE_LIFETIME_SECONDS, OPERATOR_PINNED_TRUST_MODE,
         ProviderConnectionStatusSource, SplitConnectionsBroker, bounded_single_file_archive,
         bridge_result, connection_operation_latency_log_line, connection_operation_timing_report,
-        connection_orchestration_error, connections_startup_warning, plan_connection_operation,
-        provider_status, single_file_archive, start_poll_deadline, valid_operator_pinned_image,
+        connection_orchestration_error, connections_startup_warning,
+        governed_status_provider_supported, plan_connection_operation, provider_status,
+        single_file_archive, start_poll_deadline, valid_operator_pinned_image,
     };
     use steward_store::{ConnectionOAuthPhase, ConnectionOperationState};
 
@@ -2540,6 +2548,12 @@ mod tests {
             "status must not reserve a governed connection operation, Task, or AgentRuntime"
         );
         Ok(())
+    }
+
+    #[test]
+    fn legacy_governed_status_reader_refuses_non_github_providers() {
+        assert!(governed_status_provider_supported("github"));
+        assert!(!governed_status_provider_supported("jira"));
     }
 
     #[test]

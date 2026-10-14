@@ -287,7 +287,7 @@ fn binding_with_tool() -> Result<AuthorityBinding, String> {
         },
         ToolGrant {
             provider: "jira".to_owned(),
-            resource: "get_issue".to_owned(),
+            resource: "jira_get_issue".to_owned(),
             action: "read".to_owned(),
         },
     ]);

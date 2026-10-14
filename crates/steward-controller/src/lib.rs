@@ -7876,7 +7876,7 @@ mod tests {
         let mut fixture = task_runtime_creation_fixture()?;
         fixture.task.runtime_spec.tools = vec![steward_types::ToolGrant {
             provider: "jira".to_owned(),
-            resource: "get_issue".to_owned(),
+            resource: "jira_get_issue".to_owned(),
             action: "read".to_owned(),
         }];
 
