@@ -50,6 +50,9 @@ pub const MAX_TASK_OUTPUT_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 pub const SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE: &str = "The scratch volume of this deployment does not enforce its size. Ask an administrator to check the workspace storage.";
 /// Safe, actionable failure returned when a workspace cannot be prepared before agent execution.
 pub const WORKSPACE_PREPARATION_FAILURE: &str = "The workspace could not be prepared. Ask an administrator to check the workspace storage and source.";
+/// Safe failure returned when the inference plane rejects settings that Steward already admitted.
+pub const INFERENCE_REQUEST_REJECTED_FAILURE: &str =
+    "This run stopped because its model access or spending settings were not accepted.";
 
 /// Vendor-neutral inputs used to render one immutable Task execution command.
 ///

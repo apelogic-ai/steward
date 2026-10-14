@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
 use std::error::Error;
@@ -1377,6 +1377,7 @@ struct ActiveInference {
     provisions: Arc<AtomicUsize>,
     revocations: Arc<AtomicUsize>,
     observed_spend: Arc<Mutex<Option<String>>>,
+    observed_spend_sequence: Arc<Mutex<VecDeque<String>>>,
     report_exhausted: Arc<AtomicBool>,
     requested_budgets: Arc<Mutex<Vec<Budget>>>,
 }
@@ -1428,14 +1429,24 @@ impl InferencePlane for ActiveInference {
         if self.revocations.load(Ordering::SeqCst) > 0 {
             return Ok(InferenceObservation::Absent);
         }
-        let observed_amount = self
-            .observed_spend
+        let sequenced_amount = self
+            .observed_spend_sequence
             .lock()
             .map_err(|_| PortError::Failed {
-                reason: "fixture inference spend lock was poisoned".to_owned(),
+                reason: "fixture inference spend sequence lock was poisoned".to_owned(),
             })?
-            .clone()
-            .unwrap_or_else(|| "0".to_owned());
+            .pop_front();
+        let observed_amount = match sequenced_amount {
+            Some(amount) => amount,
+            None => self
+                .observed_spend
+                .lock()
+                .map_err(|_| PortError::Failed {
+                    reason: "fixture inference spend lock was poisoned".to_owned(),
+                })?
+                .clone()
+                .unwrap_or_else(|| "0".to_owned()),
+        };
         let observation = steward_types::SpendSummary {
             observed_amount,
             currency: request.budget.currency.clone(),
@@ -5780,7 +5791,7 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
             tools: Vec::new(),
             budget: Budget {
                 monthly_limit: "100.00".to_owned(),
-                single_run_limit: Some("0.50".to_owned()),
+                single_run_limit: Some("0.0001".to_owned()),
                 currency: "USD".to_owned(),
             },
             runtime_minutes_limit: None,
@@ -6024,11 +6035,11 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
         "a per-run-limited failure must leave room for the final spend result"
     );
 
-    *inference
-        .observed_spend
+    inference
+        .observed_spend_sequence
         .lock()
-        .map_err(|_| io::Error::other("inference spend fixture was poisoned"))? =
-        Some("0.75".to_owned());
+        .map_err(|_| io::Error::other("inference spend sequence fixture was poisoned"))?
+        .extend(["0.00".to_owned(), "0.0002".to_owned()]);
     inference.report_exhausted.store(true, Ordering::SeqCst);
     reconcile_current(&client, &task_runtime, &store, task_uid).await?;
     let deleting_runtime = kubernetes
@@ -6055,7 +6066,7 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
             .first()
             .ok_or_else(|| io::Error::other("controller did not send a budget to inference"))?;
         assert_eq!(requested.monthly_limit, "100.00");
-        assert_eq!(requested.single_run_limit.as_deref(), Some("0.50"));
+        assert_eq!(requested.single_run_limit.as_deref(), Some("0.0001"));
     }
 
     let failed = store
@@ -6065,7 +6076,7 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
     assert_eq!(failed.phase, TaskPhase::Failed);
     assert_eq!(
         failed.failure_reason.as_deref(),
-        Some("This run reached its spending limit of 0.50 USD.")
+        Some("This run reached its spending limit of < 0.01 USD.")
     );
     assert_eq!(
         operation(&store, task_uid).await?.state,
@@ -6101,8 +6112,9 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
     let body: serde_json::Value = serde_json::from_slice(&body)?;
     assert_eq!(
         body["run"]["failureReason"],
-        "This run reached its spending limit of 0.50 USD."
+        "This run reached its spending limit of < 0.01 USD."
     );
+    assert_eq!(body["run"]["observedSpend"]["observedAmount"], "0.0002");
     assert_eq!(body["run"]["observedSpend"]["exhausted"], true);
     Ok(())
 }

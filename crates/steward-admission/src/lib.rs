@@ -577,6 +577,7 @@ fn format_binary_quantity(value: &str) -> String {
 #[serde(rename_all = "camelCase", tag = "error")]
 pub enum AdmissionError {
     InvalidBudget { value: String },
+    NonPositiveSingleRunLimit { value: String },
     InvalidCurrency { value: String },
     CurrencyMismatch { requested: String, ceiling: String },
     InvalidTtl { value: String },
@@ -610,6 +611,16 @@ pub fn validate_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
     validate_runner(&envelope.spec.runner)?;
     if let Some(workspace) = &envelope.spec.workspace {
         validate_workspace_authority(workspace)?;
+    }
+    Ok(())
+}
+
+/// Validate an Envelope that a person can select for a run. Internal zero-budget authorities use
+/// `validate_envelope`; a selectable per-run limit must leave positive spending authority.
+pub fn validate_user_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
+    validate_envelope(envelope)?;
+    if let Some(single_run_limit) = &envelope.spec.budget.single_run_limit {
+        parse_positive_single_run_limit(single_run_limit)?;
     }
     Ok(())
 }
@@ -1173,6 +1184,20 @@ impl<'a> Decimal<'a> {
             .then_with(|| self.integer.cmp(other.integer))
             .then_with(|| compare_fractional(self.fractional, other.fractional))
     }
+
+    fn is_zero(&self) -> bool {
+        self.integer.is_empty() && self.fractional.is_empty()
+    }
+}
+
+fn parse_positive_single_run_limit(value: &str) -> Result<Decimal<'_>, AdmissionError> {
+    let amount = Decimal::parse(value)?;
+    if amount.is_zero() {
+        return Err(AdmissionError::NonPositiveSingleRunLimit {
+            value: value.to_owned(),
+        });
+    }
+    Ok(amount)
 }
 
 fn decimal_parts(value: &str) -> Result<(&str, &str), AdmissionError> {
@@ -1813,9 +1838,21 @@ mod tests {
         let envelope = envelope_with_single_run_limit("100.00", "not-a-decimal");
 
         assert_eq!(
-            validate_envelope(&envelope),
+            super::validate_user_envelope(&envelope),
             Err(AdmissionError::InvalidBudget {
                 value: "not-a-decimal".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn zero_single_run_limit_is_rejected_before_it_becomes_authority() {
+        let envelope = envelope_with_single_run_limit("100.00", "0");
+
+        assert_eq!(
+            super::validate_user_envelope(&envelope),
+            Err(AdmissionError::NonPositiveSingleRunLimit {
+                value: "0".to_owned(),
             })
         );
     }

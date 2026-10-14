@@ -17,6 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
+use steward_ports::INFERENCE_REQUEST_REJECTED_FAILURE;
 use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunOutputArchive, AgentRunPage, AgentRunQuery,
     AgentRunRecord, AgentRunTimelineEvent, AgentRunTimelineKind, BrowserTaskVersionPublication,
@@ -2855,6 +2856,9 @@ pub(crate) fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
     if reason == INVALID_COMMAND {
         return Some(INVALID_COMMAND_REASON);
     }
+    if reason == INFERENCE_REQUEST_REJECTED_FAILURE {
+        return Some(reason);
+    }
     if public_spending_limit_failure_reason(Some(reason)).is_some() {
         return Some(reason);
     }
@@ -4007,6 +4011,15 @@ mod tests {
         assert_eq!(
             browser_run_view(invalid_command).failure_reason.as_deref(),
             Some("This run could not start because its coding agent settings were invalid.")
+        );
+
+        let mut inference_rejected = run(task_uid, "usr_0123456789abcdef0123456789abcdef");
+        inference_rejected.failure_reason = Some(INFERENCE_REQUEST_REJECTED_FAILURE.to_owned());
+        assert_eq!(
+            browser_run_view(inference_rejected)
+                .failure_reason
+                .as_deref(),
+            Some(INFERENCE_REQUEST_REJECTED_FAILURE)
         );
 
         let mut per_run_spend = run(task_uid, "usr_0123456789abcdef0123456789abcdef");

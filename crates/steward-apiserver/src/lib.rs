@@ -73,7 +73,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, add_budget_amount,
-    evaluate_with_grants, validate_envelope,
+    evaluate_with_grants, validate_user_envelope,
 };
 pub use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
@@ -2646,11 +2646,18 @@ where
         )
             .into_response();
     }
-    if let Err(error) = validate_envelope(&envelope) {
+    if let Err(error) = validate_user_envelope(&envelope) {
+        let failure_reason = match error {
+            steward_admission::AdmissionError::NonPositiveSingleRunLimit { .. } => format!(
+                "The per-run budget must be more than 0.00 {}.",
+                envelope.spec.budget.currency
+            ),
+            _ => "The envelope contains invalid values.".to_owned(),
+        };
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
-                "error": format!("invalid envelope: {error:?}"),
+                "error": failure_reason,
             })),
         )
             .into_response();
@@ -17671,6 +17678,44 @@ mod tests {
                 "malformed envelope authority must not be persisted"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn envelope_authoring_refuses_a_zero_per_run_budget_in_plain_language()
+    -> Result<(), String> {
+        let app = router(
+            FakeRuntimeRepository {
+                runtime: Arc::new(Mutex::new(runtime())),
+            },
+            ledger(),
+            FakeAuthenticator,
+            FakeDecisionChannel::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/envelopes/engineer")
+                    .header("authorization", "Bearer admin-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"revision":4,"spec":{"llms":[],"tools":[],"budget":{"monthlyLimit":"100.00","singleRunLimit":"0","currency":"USD"},"ttl":"24h"}}"#,
+                    ))
+                    .map_err(|error| format!("failed to build zero-budget request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("zero-budget request failed: {error}"))?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read zero-budget response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse zero-budget response: {error}"))?;
+        assert_eq!(
+            value["error"],
+            "The per-run budget must be more than 0.00 USD."
+        );
         Ok(())
     }
 

@@ -28,10 +28,10 @@ use steward_admission::{
     duration_seconds, evaluate, evaluate_with_grants,
 };
 use steward_ports::{
-    DecisionChannel, DecisionRequest, InferenceCapabilities, InferenceCredential,
-    InferenceObservation, InferencePlane, InferenceRequest, MAX_TASK_OUTPUT_ARCHIVE_BYTES,
-    ProvisionedInference, SandboxExecutionClass, SandboxTaskObservation, SandboxTaskRequest,
-    SandboxTaskRuntime, TaskAttemptId,
+    DecisionChannel, DecisionRequest, INFERENCE_REQUEST_REJECTED_FAILURE, InferenceCapabilities,
+    InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest,
+    MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SandboxExecutionClass,
+    SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
 };
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{
@@ -416,7 +416,12 @@ struct ControllerContext<R, I> {
 }
 
 const FINAL_SPEND_SETTLEMENT_DELAY: StdDuration = StdDuration::from_secs(12);
-const FINAL_SPEND_CAPTURE_TIMEOUT: StdDuration = StdDuration::from_secs(17);
+// The runtime finalizer reads the key through this ceiling. The pinned G-5 conformance allows
+// LiteLLM twenty 1-second polls to settle a first over-limit call; matching that window prevents
+// key revocation from discarding the final charge and spending-limit reason.
+const FINAL_SPEND_SETTLEMENT_CEILING: StdDuration = StdDuration::from_secs(20);
+const FINAL_SPEND_SETTLEMENT_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
+const FINAL_SPEND_CAPTURE_TIMEOUT: StdDuration = StdDuration::from_secs(25);
 const INFERENCE_CLEANUP_DEADLINE: StdDuration = StdDuration::from_secs(30);
 const MAX_INFERENCE_OBSERVATION_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
@@ -4873,12 +4878,41 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     )
                     .await;
                 }
-                let inference = reconcile_inference(
+                let inference = match reconcile_inference(
                     context.client.clone(),
                     &inference_runtime,
                     &context.inference,
                 )
-                .await?;
+                .await
+                {
+                    Ok(inference) => inference,
+                    Err(ControllerError::Reconcile(error))
+                        if runtime_inference_request_rejected(&error) =>
+                    {
+                        let (Some(authority), Some(task_uid), Some(generation)) = (
+                            context.authority.as_ref(),
+                            task_uid,
+                            task_operation_generation,
+                        ) else {
+                            return Err(ControllerError::Reconcile(error));
+                        };
+                        authority
+                            .enter_task_cleanup(
+                                task_uid,
+                                generation,
+                                TaskCleanupCause::Failed(INFERENCE_REQUEST_REJECTED_FAILURE),
+                                TASK_ORCHESTRATOR_ACTOR,
+                            )
+                            .await
+                            .map_err(|error| {
+                                ControllerError::Reconcile(ReconcileError::Authority(
+                                    error.to_string(),
+                                ))
+                            })?;
+                        return Ok(Action::requeue(StdDuration::from_secs(2)));
+                    }
+                    Err(error) => return Err(error),
+                };
                 let per_run_failure_reason = match &inference {
                     InferenceReconcile::Exhausted { spend } if task_uid.is_some() => {
                         single_run_spend_failure_reason(spend, &inference_runtime.spec.budget)
@@ -5176,19 +5210,36 @@ async fn observe_and_record_final_spend<I: InferencePlane>(
         return Ok(None);
     }
 
-    if matches!(capture, FinalSpendCapture::AfterSettlement) {
+    let settlement_deadline = if matches!(capture, FinalSpendCapture::AfterSettlement) {
         tokio::time::sleep(FINAL_SPEND_SETTLEMENT_DELAY).await;
-    }
-    let observation = inference
-        .observe(request)
-        .await
-        .map_err(ReconcileError::Runtime)?;
-    let spend = match observation {
-        InferenceObservation::Active { spend, .. }
-        | InferenceObservation::Exhausted { spend, .. } => spend,
-        InferenceObservation::Absent => return Ok(None),
+        Some(
+            tokio::time::Instant::now()
+                + FINAL_SPEND_SETTLEMENT_CEILING.saturating_sub(FINAL_SPEND_SETTLEMENT_DELAY),
+        )
+    } else {
+        None
     };
-    let failed_task_reason = single_run_spend_failure_reason(&spend, &runtime.spec.budget)?;
+    let (spend, failed_task_reason) = loop {
+        let observation = inference
+            .observe(request)
+            .await
+            .map_err(ReconcileError::Runtime)?;
+        let spend = match observation {
+            InferenceObservation::Active { spend, .. }
+            | InferenceObservation::Exhausted { spend, .. } => spend,
+            InferenceObservation::Absent => return Ok(None),
+        };
+        let failed_task_reason = single_run_spend_failure_reason(&spend, &runtime.spec.budget)?;
+        let should_retry = settlement_deadline.is_some_and(|deadline| {
+            failed_task_reason.is_none()
+                && runtime.spec.budget.single_run_limit.is_some()
+                && tokio::time::Instant::now() < deadline
+        });
+        if !should_retry {
+            break (spend, failed_task_reason);
+        }
+        tokio::time::sleep(FINAL_SPEND_SETTLEMENT_POLL_INTERVAL).await;
+    };
     authority
         .record_final_spend_observation(
             runtime
@@ -5615,7 +5666,14 @@ fn failed_runtime_status(runtime: &AgentRuntime) -> Result<AgentRuntimeStatus, C
 }
 
 fn runtime_start_failed(error: &ReconcileError) -> bool {
-    matches!(error, ReconcileError::Runtime(PortError::SandboxFailed))
+    matches!(
+        error,
+        ReconcileError::Runtime(PortError::SandboxFailed | PortError::Rejected { .. })
+    )
+}
+
+fn runtime_inference_request_rejected(error: &ReconcileError) -> bool {
+    matches!(error, ReconcileError::Runtime(PortError::Rejected { .. }))
 }
 
 async fn replace_as_controller(
@@ -7716,6 +7774,13 @@ mod tests {
         assert!(runtime_start_failed(&super::ReconcileError::Runtime(
             PortError::SandboxFailed,
         )));
+        assert!(
+            runtime_start_failed(&super::ReconcileError::Runtime(PortError::Rejected {
+                reason: "fixture admitted request was rejected".to_owned(),
+            })),
+            "a rejected admitted request must terminalize the run instead of retrying"
+        );
+        assert!(!super::INFERENCE_REQUEST_REJECTED_FAILURE.is_empty());
         assert!(
             !runtime_start_failed(&super::ReconcileError::Runtime(PortError::Failed {
                 reason: "OpenShell is temporarily unavailable".to_owned(),

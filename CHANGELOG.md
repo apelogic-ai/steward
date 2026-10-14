@@ -15,11 +15,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   now fails with a plain explanation instead of succeeding with no downloadable output.
 - Claude Code Tasks without connected tools now start normally, and Runs that cannot start
   because of invalid coding-agent settings show a plain explanation.
-- Per-run inference limits now cap each runtime's gateway key, account for spend already consumed
-  by the same Envelope instance, and fail the Run with a plain spending-limit reason after the
-  gateway refuses further model calls. The API and Run page show that reason and mark observed
-  spend exhausted, including when the agent exits before its delayed final spend arrives;
-  spending in the last few seconds can exceed the configured amount.
+- Per-run inference limits now refuse zero before a Run starts, cap each runtime's gateway key,
+  account for spend already consumed by the same Envelope instance, and fail the Run with a plain
+  reason when its accepted model or spending settings are later rejected. The API and Run page
+  show the spending-limit reason and exhausted final spend even when the first model call exceeds
+  the limit or its charge settles after the agent exits; spending in the last few seconds can
+  exceed the configured amount.
 - Task cleanup now records one final inference-spend observation before deleting the run key, so
   short runs no longer finish with stale zero spend or disappear from monthly Envelope usage.
 - Approving a custom or template Envelope request that exactly matches authority the user already

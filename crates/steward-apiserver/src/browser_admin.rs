@@ -8,7 +8,7 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_admission::{
     AdmissionDecision, AdmissionDelta, AdmissionError, Envelope, add_budget_amount,
-    envelope_is_within, validate_envelope,
+    envelope_is_within, validate_user_envelope,
 };
 use steward_store::{
     AdminApprovalRecord, AdminEnvelopeProvisionRequest, AdminEnvelopeRequestRecord,
@@ -2239,7 +2239,7 @@ fn template_authoring_violation_fields(
     if envelope.spec.llms.is_empty() {
         fields.push(BrowserEnvelopeTemplateField::Models);
     }
-    if let Err(error) = validate_envelope(envelope) {
+    if let Err(error) = validate_user_envelope(envelope) {
         fields.extend(envelope_validation_fields(envelope, &error));
     }
     fields
@@ -2250,7 +2250,8 @@ fn envelope_validation_fields(
     error: &AdmissionError,
 ) -> Vec<BrowserEnvelopeTemplateField> {
     match error {
-        AdmissionError::InvalidBudget { value } => {
+        AdmissionError::InvalidBudget { value }
+        | AdmissionError::NonPositiveSingleRunLimit { value } => {
             let mut fields = Vec::new();
             if envelope.spec.budget.monthly_limit == *value {
                 fields.push(BrowserEnvelopeTemplateField::MonthlyLimit);

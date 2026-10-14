@@ -153,7 +153,7 @@ budget_key="$(
   curl -fsS \
     -H "Authorization: Bearer ${master_key}" \
     -H "Content-Type: application/json" \
-    -d '{"budget_duration":"1mo","key_alias":"runtime-budget","max_budget":0.01,"models":["openai/model-a"]}' \
+    -d '{"budget_duration":"1mo","key_alias":"runtime-budget","max_budget":0.0001,"models":["openai/model-a"]}' \
     "${base_url}/key/generate" |
     jq -er '.key | select(type == "string" and length > 0)'
 )"
