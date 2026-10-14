@@ -60,7 +60,7 @@ impl ClaudeCodeTaskExecutionAdapter {
                     reason: format!("render Claude Code tool endpoint: {error}"),
                 })?
             }
-            None => String::new(),
+            None => "{}".to_owned(),
         };
         let tool_setup = if tool_transport_endpoint.is_some() {
             concat!(
@@ -273,6 +273,7 @@ mod tests {
             })
             .map_err(|error| format!("render adapter plan: {error:?}"))?;
 
+        assert!(plan.command.iter().all(|argument| !argument.is_empty()));
         let shell = &plan.command[2];
         let mcp_config = &plan.command[7];
         assert!(shell.contains("ANTHROPIC_API_KEY=openshell-token-grant-placeholder"));
@@ -482,7 +483,8 @@ mod tests {
     }
 
     #[test]
-    fn tool_less_plan_contains_no_mcp_server_or_tool_token() -> Result<(), String> {
+    fn tool_less_plan_contains_only_non_empty_arguments_and_no_tool_configuration()
+    -> Result<(), String> {
         let adapter =
             ClaudeCodeTaskExecutionAdapter::new("https://inference.example.test".to_owned())
                 .map_err(|error| format!("configure adapter: {error:?}"))?;
@@ -496,7 +498,7 @@ mod tests {
                 binding: &binding,
             })
             .map_err(|error| format!("render adapter plan: {error:?}"))?;
-        assert!(plan.command[7].is_empty());
+        assert!(plan.command.iter().all(|argument| !argument.is_empty()));
         assert!(!plan.command[7].contains("mcpServers"));
         assert!(!plan.command[2].contains("STEWARD_MCP_GW_BEARER_TOKEN"));
         Ok(())
