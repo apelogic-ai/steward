@@ -4476,6 +4476,20 @@ test("failed run phases expose stdout and stderr as escaped sensitive output", a
   }
 });
 
+test("a failed run shows the missing-output explanation", async ({ browser }) => {
+  const failureReason = "This run finished without creating an output file.";
+  const developer = await guardedPage(browser, {
+    runFailureReason: failureReason,
+    runPhase: "failed",
+  });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByRole("alert").filter({ hasText: failureReason })).toHaveText(failureReason);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("administrator run logs use the administrator boundary and report unavailable logs", async ({ browser }) => {
   const administrator = await guardedPage(browser, {
     executionLogs: {
