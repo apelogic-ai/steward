@@ -1,4 +1,5 @@
 const onboardingRequestPath = /^\/app\/api\/v1\/runs\/[^/]+\/github\//;
+const runWorkflowPath = /^\/app\/api\/v1\/runs\/[^/]+\/github\/workflow$/;
 
 export function onlyOnboardingRequestUnavailable(errors, pageUrl) {
   if (errors.length === 0) return false;
@@ -12,6 +13,27 @@ export function onlyOnboardingRequestUnavailable(errors, pageUrl) {
       return false;
     }
   });
+}
+
+export function onlyRunWorkflowUnavailable(errors, responses, pageUrl) {
+  if (errors.length !== 1 || responses.length !== 1) return false;
+  const [{ text, url }] = errors;
+  const [response] = responses;
+  if (!url || !/\b503\b/.test(text)) return false;
+  try {
+    const pageOrigin = new URL(pageUrl).origin;
+    const source = new URL(url);
+    const responseSource = new URL(response.url);
+    const exactWorkflowPath = (candidate) => candidate.origin === pageOrigin
+      && runWorkflowPath.test(candidate.pathname)
+      && candidate.search === "";
+    return exactWorkflowPath(source)
+      && exactWorkflowPath(responseSource)
+      && response.method === "POST"
+      && response.status === 503;
+  } catch {
+    return false;
+  }
 }
 
 export function onlyZeroBudgetTaskSaveRejected(errors, responses, pageUrl) {

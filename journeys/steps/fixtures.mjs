@@ -3,6 +3,7 @@ import { createBdd, test as base } from "playwright-bdd";
 
 import {
   onlyOnboardingRequestUnavailable,
+  onlyRunWorkflowUnavailable,
   onlyZeroBudgetTaskSaveRejected,
 } from "../onboarding-console-errors.mjs";
 
@@ -14,6 +15,7 @@ export const test = base.extend({
   journey: async ({ page }, use, testInfo) => {
     const consoleErrors = [];
     const pageErrors = [];
+    const runWorkflowResponses = [];
     const taskSaveRejections = [];
     const onConsole = (message) => {
       if (message.type() === "error") {
@@ -31,8 +33,15 @@ export const test = base.extend({
             url: response.url(),
           });
         }
+        if (/^\/app\/api\/v1\/runs\/[^/]+\/github\/workflow$/.test(source.pathname)) {
+          runWorkflowResponses.push({
+            method: response.request().method(),
+            status: response.status(),
+            url: response.url(),
+          });
+        }
       } catch {
-        // A malformed response URL cannot match the expected local Task endpoint.
+        // A malformed response URL cannot match the expected local endpoints.
       }
     };
     page.on("console", onConsole);
@@ -64,6 +73,9 @@ export const test = base.extend({
     expect(pageErrors, "the journey must not emit uncaught page errors").toEqual([]);
     if (state.knownIssue === "@known-failing-478" && onlyOnboardingRequestUnavailable(consoleErrors, page.url())) {
       throw new Error(`[steward-known-failure:#478] the onboarding page emitted browser console errors: ${consoleErrors.length}`);
+    }
+    if (state.knownIssue === "@known-failing-478" && onlyRunWorkflowUnavailable(consoleErrors, runWorkflowResponses, page.url())) {
+      throw new Error("[steward-known-failure:#478] the Task page emitted one unavailable workflow-publication request");
     }
     if (state.statedSingleRunLimit === "0" && onlyZeroBudgetTaskSaveRejected(consoleErrors, taskSaveRejections, page.url())) return;
     expect(consoleErrors, "the journey must not emit browser console errors").toEqual([]);

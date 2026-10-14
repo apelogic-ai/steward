@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   onlyOnboardingRequestUnavailable,
+  onlyRunWorkflowUnavailable,
   onlyZeroBudgetTaskSaveRejected,
 } from "./onboarding-console-errors.mjs";
 
@@ -30,6 +31,46 @@ describe("onlyOnboardingRequestUnavailable", () => {
     ["a missing source", [{ text: "Failed to load resource: 503", url: "" }]],
   ])("rejects %s", (_name, errors) => {
     expect(onlyOnboardingRequestUnavailable(errors, pageUrl)).toBe(false);
+  });
+});
+
+describe("onlyRunWorkflowUnavailable", () => {
+  const rejection = {
+    method: "POST",
+    status: 503,
+    url: "https://localhost:28443/app/api/v1/runs/task-1/github/workflow",
+  };
+
+  test("accepts exactly one 503 from the run workflow endpoint", () => {
+    expect(onlyRunWorkflowUnavailable([
+      {
+        text: "Failed to load resource: the server responded with a status of 503",
+        url: rejection.url,
+      },
+    ], [rejection], pageUrl)).toBe(true);
+  });
+
+  test.each([
+    ["no errors", [], [rejection]],
+    ["two matching errors", [
+      { text: "Failed to load resource: 503", url: rejection.url },
+      { text: "Failed to load resource: 503", url: rejection.url },
+    ], [rejection]],
+    ["another status", [{ text: "Failed to load resource: 500", url: rejection.url }], [rejection]],
+    ["another endpoint", [{ text: "Failed to load resource: 503", url: "https://localhost:28443/app/api/v1/runs/task-1/github/evidence" }], [rejection]],
+    ["a query string", [{ text: "Failed to load resource: 503", url: `${rejection.url}?retry=1` }], [{ ...rejection, url: `${rejection.url}?retry=1` }]],
+    ["another origin", [{ text: "Failed to load resource: 503", url: "https://example.com/app/api/v1/runs/task-1/github/workflow" }], [{ ...rejection, url: "https://example.com/app/api/v1/runs/task-1/github/workflow" }]],
+    ["a page console error", [{ text: "503 is not a valid state", url: "https://localhost:28443/_next/static/app.js" }], [rejection]],
+    ["a missing source", [{ text: "Failed to load resource: 503", url: "" }], [rejection]],
+    ["no matching response", [{ text: "Failed to load resource: 503", url: rejection.url }], []],
+    ["two matching responses", [{ text: "Failed to load resource: 503", url: rejection.url }], [rejection, rejection]],
+    ["another method", [{ text: "Failed to load resource: 503", url: rejection.url }], [{ ...rejection, method: "GET" }]],
+    ["another response status", [{ text: "Failed to load resource: 503", url: rejection.url }], [{ ...rejection, status: 500 }]],
+    ["another response endpoint", [{ text: "Failed to load resource: 503", url: rejection.url }], [{ ...rejection, url: "https://localhost:28443/app/api/v1/runs/task-1/github/evidence" }]],
+    ["a response query string", [{ text: "Failed to load resource: 503", url: rejection.url }], [{ ...rejection, url: `${rejection.url}?retry=1` }]],
+    ["another response origin", [{ text: "Failed to load resource: 503", url: rejection.url }], [{ ...rejection, url: "https://example.com/app/api/v1/runs/task-1/github/workflow" }]],
+  ])("rejects %s", (_name, errors, responses) => {
+    expect(onlyRunWorkflowUnavailable(errors, responses, pageUrl)).toBe(false);
   });
 });
 
