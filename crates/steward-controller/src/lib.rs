@@ -424,6 +424,28 @@ fn spend_with_episode_baseline(
     })
 }
 
+fn larger_budget_amount(left: &str, right: &str, currency: &str) -> Result<String, ReconcileError> {
+    let left_is_at_or_above_right = budget_is_exhausted(
+        &steward_types::SpendSummary {
+            observed_amount: left.to_owned(),
+            currency: currency.to_owned(),
+        },
+        &Budget {
+            monthly_limit: right.to_owned(),
+            single_run_limit: None,
+            currency: currency.to_owned(),
+        },
+    )
+    .map_err(|error| ReconcileError::InvalidSpec {
+        reason: format!("runtime cumulative spend baseline is invalid: {error:?}"),
+    })?;
+    Ok(if left_is_at_or_above_right {
+        left.to_owned()
+    } else {
+        right.to_owned()
+    })
+}
+
 fn runtime_spec_digest(runtime: &AgentRuntime) -> Result<String, ReconcileError> {
     spec_digest(&runtime.spec)
 }
@@ -4225,9 +4247,12 @@ async fn provision_inference<I: InferencePlane>(
 async fn reconcile_inference<I: InferencePlane>(
     client: Client,
     runtime: &AgentRuntime,
+    replacement_runtime: &AgentRuntime,
     inference: &I,
 ) -> Result<InferenceReconcile, ControllerError> {
     let request = inference_request(runtime).map_err(ControllerError::Reconcile)?;
+    let replacement_request =
+        inference_request(replacement_runtime).map_err(ControllerError::Reconcile)?;
     let namespace = runtime
         .namespace()
         .ok_or(ControllerError::Reconcile(ReconcileError::MissingNamespace))?;
@@ -4264,6 +4289,7 @@ async fn reconcile_inference<I: InferencePlane>(
         return Ok(InferenceReconcile::Inactive);
     }
 
+    let mut observation_request = &request;
     if let Some(secret) = secret.as_ref() {
         credential_secret_is_bound(runtime, secret).map_err(ControllerError::Reconcile)?;
         inference
@@ -4271,18 +4297,19 @@ async fn reconcile_inference<I: InferencePlane>(
             .await
             .map_err(|error| ControllerError::Reconcile(ReconcileError::Runtime(error)))?;
     } else {
-        provision_inference(client.clone(), runtime, inference, &request).await?;
+        provision_inference(client.clone(), runtime, inference, &replacement_request).await?;
+        observation_request = &replacement_request;
     }
 
     let mut observation = inference
-        .observe(&request)
+        .observe(observation_request)
         .await
         .map_err(|error| ControllerError::Reconcile(ReconcileError::Runtime(error)))?;
     if observation == InferenceObservation::Absent {
         delete_credential_secret(client.clone(), runtime).await?;
-        provision_inference(client.clone(), runtime, inference, &request).await?;
+        provision_inference(client.clone(), runtime, inference, &replacement_request).await?;
         observation = inference
-            .observe(&request)
+            .observe(&replacement_request)
             .await
             .map_err(|error| ControllerError::Reconcile(ReconcileError::Runtime(error)))?;
     }
@@ -4896,19 +4923,25 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         .await;
                     }
                 }
-                let mut spend_episode_baseline = if context
+                let status_inference_reference = runtime
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.refs.litellm_key.as_deref());
+                let (mut spend_episode_baseline, replacement_spend_episode_baseline) = if context
                     .inference
                     .capabilities()
                     .runtime_credential_provisioning
                     && let (Some(authority), Some(runtime_uid)) =
                         (context.authority.as_ref(), runtime.metadata.uid.as_deref())
                 {
-                    if let Some(reference) = runtime
-                        .status
-                        .as_ref()
-                        .and_then(|status| status.refs.litellm_key.as_deref())
-                    {
-                        match authority
+                    let latest_spend = authority
+                        .latest_runtime_spend_amount(runtime_uid, &runtime.spec.budget.currency)
+                        .await
+                        .map_err(|error| {
+                            ControllerError::Reconcile(ReconcileError::Authority(error.to_string()))
+                        })?;
+                    if let Some(reference) = status_inference_reference {
+                        let status_reference_baseline = match authority
                             .runtime_spend_episode_baseline(
                                 runtime_uid,
                                 reference,
@@ -4929,19 +4962,19 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                                         error.to_string(),
                                     ))
                                 })?,
-                        }
+                        };
+                        let replacement_baseline = larger_budget_amount(
+                            &latest_spend,
+                            &status_reference_baseline,
+                            &runtime.spec.budget.currency,
+                        )
+                        .map_err(ControllerError::Reconcile)?;
+                        (status_reference_baseline, replacement_baseline)
                     } else {
-                        authority
-                            .latest_runtime_spend_amount(runtime_uid, &runtime.spec.budget.currency)
-                            .await
-                            .map_err(|error| {
-                                ControllerError::Reconcile(ReconcileError::Authority(
-                                    error.to_string(),
-                                ))
-                            })?
+                        (latest_spend.clone(), latest_spend)
                     }
                 } else {
-                    "0".to_owned()
+                    ("0".to_owned(), "0".to_owned())
                 };
                 let remaining_instance_spend =
                     if let (Some(authority), Some(instance_id), Some(runtime_uid)) = (
@@ -4969,13 +5002,12 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                 let remaining_episode_spend = remaining_instance_spend
                     .as_deref()
                     .map(|remaining| {
-                        remaining_budget_amount(remaining, &spend_episode_baseline).map_err(
-                            |error| ReconcileError::InvalidSpec {
+                        remaining_budget_amount(remaining, &replacement_spend_episode_baseline)
+                            .map_err(|error| ReconcileError::InvalidSpec {
                                 reason: format!(
                                     "remaining runtime episode spend is invalid: {error:?}"
                                 ),
-                            },
-                        )
+                            })
                     })
                     .transpose()
                     .map_err(ControllerError::Reconcile)?;
@@ -5107,9 +5139,19 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                 let inference_runtime =
                     runtime_with_spend_episode_budget(&inference_runtime, &spend_episode_baseline)
                         .map_err(ControllerError::Reconcile)?;
+                let replacement_inference_runtime = runtime_with_spend_episode_budget(
+                    &runtime_with_remaining_spend_budget(
+                        &runtime,
+                        remaining_instance_spend.as_deref(),
+                    )
+                    .map_err(ControllerError::Reconcile)?,
+                    &replacement_spend_episode_baseline,
+                )
+                .map_err(ControllerError::Reconcile)?;
                 let inference = match reconcile_inference(
                     context.client.clone(),
                     &inference_runtime,
+                    &replacement_inference_runtime,
                     &context.inference,
                 )
                 .await
@@ -5142,6 +5184,12 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                     }
                     Err(error) => return Err(error),
                 };
+                if let InferenceReconcile::Active { reference, .. }
+                | InferenceReconcile::Exhausted { reference, .. } = &inference
+                    && status_inference_reference != Some(reference.as_str())
+                {
+                    spend_episode_baseline = replacement_spend_episode_baseline;
+                }
                 if context
                     .inference
                     .capabilities()
@@ -7165,6 +7213,7 @@ mod tests {
             super::reconcile_inference(
                 inference_reconcile_client(&runtime)?,
                 &effective,
+                &effective,
                 &inference,
             )
             .await
@@ -7173,14 +7222,24 @@ mod tests {
         let parallel_client = inference_reconcile_client(&runtime)?;
         let initial_parallel = runtime_with_remaining_spend_budget(&runtime, Some("10.00"))
             .map_err(|error| format!("initial parallel runtime budget failed: {error}"))?;
-        super::reconcile_inference(parallel_client.clone(), &initial_parallel, &inference)
-            .await
-            .map_err(|error| format!("parallel inference provision failed: {error:?}"))?;
+        super::reconcile_inference(
+            parallel_client.clone(),
+            &initial_parallel,
+            &initial_parallel,
+            &inference,
+        )
+        .await
+        .map_err(|error| format!("parallel inference provision failed: {error:?}"))?;
         let lowered_parallel = runtime_with_remaining_spend_budget(&runtime, Some("9.00"))
             .map_err(|error| format!("lowered parallel runtime budget failed: {error}"))?;
-        super::reconcile_inference(parallel_client, &lowered_parallel, &inference)
-            .await
-            .map_err(|error| format!("parallel inference reconfiguration failed: {error:?}"))?;
+        super::reconcile_inference(
+            parallel_client,
+            &lowered_parallel,
+            &lowered_parallel,
+            &inference,
+        )
+        .await
+        .map_err(|error| format!("parallel inference reconfiguration failed: {error:?}"))?;
 
         let budgets = inference
             .requested_budgets

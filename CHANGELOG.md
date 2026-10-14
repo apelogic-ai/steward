@@ -29,7 +29,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   full charge still counts toward monthly usage, no unusable top-up request is opened for that Run,
   and the next Run receives the monthly-limit refusal. Non-Task runtimes stop at their per-run
   limit, denied monthly-budget requests use a plain reason, and controller final-spend and cleanup
-  timing can be configured through the chart's controller settings.
+  timing can be configured through the chart's controller settings. Run status identifies each
+  recreated gateway key with the service's non-secret key identifier rather than the reusable
+  runtime name.
 - Task cleanup now records one final inference-spend observation before deleting the run key, so
   short runs no longer finish with stale zero spend or disappear from monthly Envelope usage.
 - Approving a custom or template Envelope request that exactly matches authority the user already
