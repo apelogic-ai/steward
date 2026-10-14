@@ -32,13 +32,16 @@ authority. The mint retains only the credential's SHA-256 digest.
 
 The separate `POST /control-plane/token` route supports one runtime-free,
 metadata-only operation: Steward API reading the authenticated browser user's
-GitHub connection status. The caller presents a projected Kubernetes service
+connection status for one provider selected from the deployment capability catalog. The caller
+presents that exact provider identifier and a projected Kubernetes service
 account token. The mint verifies it with Kubernetes TokenReview against the
 configured audience and exact Steward API service-account identity before
 accepting the typed browser `Principal` and canonical authority. Callers cannot
-select a service, scope, tool, audience, or TTL. The resulting HOP-1 token is
-limited to `github/provider-control/status`, expires in at most 15 seconds, and
-is never accepted for provider mutation or general tool use.
+select a service, scope, resource, action, audience, or TTL. The resulting HOP-1 token contains
+exactly `<provider>/provider-control/status`, expires in at most 15 seconds, and is never accepted
+for provider mutation or general tool use. The provider must satisfy the same bounded scalar
+contract as a capability-catalog provider; malformed identifiers fail closed. During the rolling
+upgrade, an older request that omits `provider` retains the previous exact GitHub grant.
 
 Unlike runtime HOP-1, this control-plane token has no `AgentRuntime` whose live
 authority can be re-resolved. Introspection therefore accepts only its signed,
@@ -59,10 +62,10 @@ retaining its service name below. A pure service uses
 `service:<name>` for both `sub` and `email`; this is a service identifier for
 gateway compatibility, not a human acting user.
 
-No organization, identity-provider subject, or provider name is serialized into
-HOP-1. Consumers isolate user grants by the exact `(iss, sub, provider)` tuple and
-must not infer or adopt identity from `email`. A person-bound runtime without a
-valid canonical authority is a legacy runtime that must reconnect; it cannot mint.
+No organization or identity-provider subject is serialized into HOP-1. Provider
+names appear only in exact tool grants. Consumers isolate user grants by the exact
+`(iss, sub, provider)` tuple and must not infer or adopt identity from `email`. A
+person-bound runtime without a valid canonical authority is a legacy runtime that must reconnect; it cannot mint.
 Introspection revalidates the stable canonical subject but deliberately does not
 revoke a token merely because the user's verified display email changed.
 
@@ -78,9 +81,10 @@ Steward-specific claims live under `steward`:
 - `tools`: the exact `provider`, `resource`, and `action` attenuation
 
 The control-plane status token uses `acting_as=service_for_user`,
-`service=steward-apiserver`, the browser user's canonical ID in `sub`, and only
-the `github/provider-control/status` tool grant. Ordinary runtime-token claims
-and their online authority revalidation are unchanged.
+`service=steward-apiserver`, the browser user's canonical ID in `sub`, and one exact
+`<provider>/provider-control/status` tool grant. The trusted apiserver requests only providers
+from its deployment capability catalog. Ordinary runtime-token claims and their online authority
+revalidation are unchanged.
 
 Changing or adding a claim changes this wire contract and requires coordinated
 consumer updates under `crates/steward-mint/AGENTS.md`.

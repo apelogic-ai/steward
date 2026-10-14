@@ -39,12 +39,28 @@ const CONTROL_PLANE_SERVICE: &str = "steward-apiserver";
 const CONTROL_PLANE_STATUS_PURPOSE: &str = "provider_connection_status";
 const CONTROL_PLANE_STATUS_SCOPE: &str = "connections_status";
 
-fn control_plane_status_grant() -> ToolGrant {
-    ToolGrant {
-        provider: "github".to_owned(),
+fn control_plane_status_grant(provider: &str) -> Result<ToolGrant, MintError> {
+    if provider.is_empty()
+        || provider.len() > 255
+        || provider.trim() != provider
+        || provider.chars().any(char::is_control)
+    {
+        return Err(MintError::InvalidRequest);
+    }
+    Ok(ToolGrant {
+        provider: provider.to_owned(),
         resource: "provider-control".to_owned(),
         action: "status".to_owned(),
-    }
+    })
+}
+
+fn exact_control_plane_status_provider(grants: &[ToolGrant]) -> Option<&str> {
+    let [grant] = grants else {
+        return None;
+    };
+    control_plane_status_grant(&grant.provider)
+        .is_ok_and(|expected| expected == *grant)
+        .then_some(grant.provider.as_str())
 }
 
 /// A signed HOP-1 presented for online authority verification.
@@ -352,6 +368,7 @@ pub enum MintConfigError {
     InvalidAllowedScopes,
     InvalidAuthorityTtl,
     InvalidControlPlaneAuthorityTtl,
+    InvalidControlPlaneStatusProviders,
     InvalidControlPlaneWorkloadIdentity,
     InvalidIntrospectionClientCredential,
 }
@@ -377,6 +394,7 @@ pub struct ControlPlaneTokenRequest {
     pub workload: AuthenticatedControlPlaneWorkload,
     pub principal: Principal,
     pub canonical_authority: CanonicalAuthorityBinding,
+    pub provider: String,
 }
 
 /// A Kubernetes service-account bearer accepted only by the control-plane exchange.
@@ -398,6 +416,7 @@ pub trait ControlPlaneWorkloadAuthenticator: Clone + Send + Sync + 'static {
 
 #[derive(Clone)]
 pub struct ControlPlaneMintConfig {
+    allowed_status_providers: BTreeSet<String>,
     expected_workload_identity: String,
     authority_ttl: Duration,
 }
@@ -406,6 +425,7 @@ impl ControlPlaneMintConfig {
     pub fn new(
         expected_workload_identity: String,
         authority_ttl: Duration,
+        allowed_status_providers: impl IntoIterator<Item = String>,
     ) -> Result<Self, MintConfigError> {
         if expected_workload_identity.trim().is_empty() {
             return Err(MintConfigError::InvalidControlPlaneWorkloadIdentity);
@@ -413,7 +433,17 @@ impl ControlPlaneMintConfig {
         if authority_ttl.is_zero() || authority_ttl > MAX_CONTROL_PLANE_AUTHORITY_TTL {
             return Err(MintConfigError::InvalidControlPlaneAuthorityTtl);
         }
+        let allowed_status_providers = allowed_status_providers
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if allowed_status_providers
+            .iter()
+            .any(|provider| control_plane_status_grant(provider).is_err())
+        {
+            return Err(MintConfigError::InvalidControlPlaneStatusProviders);
+        }
         Ok(Self {
+            allowed_status_providers,
             expected_workload_identity,
             authority_ttl,
         })
@@ -776,6 +806,10 @@ where
             .as_ref()
             .filter(|acting_user_id| *acting_user_id == &request.canonical_authority.owner_user_id)
             .ok_or(MintError::WorkloadMismatch)?;
+        let status_grant = control_plane_status_grant(&request.provider)?;
+        if !config.allowed_status_providers.contains(&request.provider) {
+            return Err(MintError::InvalidRequest);
+        }
         let authority_ttl = ChronoDuration::from_std(config.authority_ttl)
             .map_err(|_| MintError::InvalidRequest)?;
         let claims = Claims::new(Hop1Claims {
@@ -789,7 +823,7 @@ where
                 runtime_uid: None,
                 service: Some(CONTROL_PLANE_SERVICE.to_owned()),
                 purpose: Some(CONTROL_PLANE_STATUS_PURPOSE.to_owned()),
-                tools: vec![control_plane_status_grant()],
+                tools: vec![status_grant],
                 version: HOP1_CLAIMS_VERSION,
             },
             sub: acting_user_id.as_str().to_owned(),
@@ -860,7 +894,8 @@ where
                     && claims.custom.steward.acting_as == "service_for_user"
                     && claims.custom.steward.service.as_deref() == Some(CONTROL_PLANE_SERVICE)
                     && claims.custom.steward.runtime_uid.is_none()
-                    && claims.custom.steward.tools == [control_plane_status_grant()]
+                    && exact_control_plane_status_provider(&claims.custom.steward.tools)
+                        .is_some_and(|provider| config.allowed_status_providers.contains(provider))
                     && claims.custom.steward.version == HOP1_CLAIMS_VERSION
                     && claims.custom.email.is_some()
                     && !claims.custom.sub.is_empty()
@@ -957,6 +992,12 @@ struct TokenIntrospectionForm {
 struct ControlPlaneTokenGrantBody {
     principal: Principal,
     canonical_authority: CanonicalAuthorityBinding,
+    #[serde(default = "default_control_plane_provider")]
+    provider: String,
+}
+
+fn default_control_plane_provider() -> String {
+    "github".to_owned()
 }
 
 #[derive(Serialize)]
@@ -1041,6 +1082,7 @@ where
             workload,
             principal: body.principal,
             canonical_authority: body.canonical_authority,
+            provider: body.provider,
         })
         .map(|response| (no_store_headers(), Json(response)))
         .map_err(map_mint_error)

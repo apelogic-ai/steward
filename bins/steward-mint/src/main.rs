@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -9,6 +10,7 @@ use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec};
 use k8s_openapi::api::core::v1::Secret;
 use kube::Client;
 use kube::api::{Api, ListParams, PostParams};
+use serde::Deserialize;
 use steward_adapter_openshell::{IdentityResolutionError, OpenShellIdentityResolver};
 use steward_adapter_spire::SpireSvidValidator;
 use steward_mint::{
@@ -27,6 +29,75 @@ use tokio::net::TcpListener;
 const RUNTIME_UID_LABEL: &str = "agents.apelogic.ai/runtime-uid";
 const INFERENCE_CREDENTIAL_DATA_KEY: &str = "access-token";
 const CONTROL_PLANE_TOKEN_REVIEW_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_CAPABILITY_CATALOG_BYTES: usize = 256 * 1024;
+const MAX_CAPABILITY_CATALOGS: usize = 128;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeploymentCapabilityCatalog {
+    schema_version: String,
+    #[serde(rename = "models")]
+    _models: Vec<serde_json::Value>,
+    #[serde(rename = "tools")]
+    _tools: Vec<serde_json::Value>,
+    catalogs: Vec<DeploymentProviderCatalog>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeploymentProviderCatalog {
+    provider: String,
+    catalog_id: String,
+    version: String,
+    #[serde(rename = "available")]
+    _available: bool,
+}
+
+fn status_providers_from_catalog_json(value: &str) -> Result<BTreeSet<String>, io::Error> {
+    if value.len() > MAX_CAPABILITY_CATALOG_BYTES {
+        return Err(io::Error::other(
+            "the capability catalog exceeds 262144 bytes",
+        ));
+    }
+    let catalog: DeploymentCapabilityCatalog = serde_json::from_str(value)
+        .map_err(|error| io::Error::other(format!("the capability catalog is invalid: {error}")))?;
+    if catalog.schema_version != "steward.capability-catalog/v2" {
+        return Err(io::Error::other(
+            "the capability catalog schemaVersion must be steward.capability-catalog/v2",
+        ));
+    }
+    if catalog.catalogs.len() > MAX_CAPABILITY_CATALOGS {
+        return Err(io::Error::other(
+            "the capability catalog has more than 128 provider records",
+        ));
+    }
+    let valid = |entry: &str| {
+        !entry.is_empty()
+            && entry.len() <= 255
+            && entry.trim() == entry
+            && !entry.chars().any(char::is_control)
+    };
+    let mut provider_catalogs = BTreeSet::new();
+    let mut providers = BTreeSet::new();
+    for entry in catalog.catalogs {
+        if !valid(&entry.provider) || !valid(&entry.catalog_id) || !valid(&entry.version) {
+            return Err(io::Error::other(
+                "capability catalog provider records must contain bounded exact identifiers",
+            ));
+        }
+        if !provider_catalogs.insert((entry.provider.clone(), entry.catalog_id)) {
+            return Err(io::Error::other(
+                "capability catalog provider records must be unique",
+            ));
+        }
+        providers.insert(entry.provider);
+    }
+    Ok(providers)
+}
+
+fn load_status_providers(path: &str) -> Result<BTreeSet<String>, io::Error> {
+    status_providers_from_catalog_json(&fs::read_to_string(path)?)
+}
 
 fn credential_secret_name(runtime: &RuntimeId) -> Result<&str, MintError> {
     let bytes = runtime.0.as_bytes();
@@ -309,16 +380,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let control_plane = match (
         env::var("STEWARD_MINT_CONTROL_PLANE_AUDIENCE").ok(),
         env::var("STEWARD_MINT_CONTROL_PLANE_WORKLOAD_ID").ok(),
+        env::var("STEWARD_MINT_CAPABILITY_CATALOG_FILE").ok(),
     ) {
-        (None, None) => None,
-        (Some(audience), Some(expected_username))
+        (None, None, None) => None,
+        (Some(audience), Some(expected_username), Some(capability_catalog_file))
             if !audience.trim().is_empty() && !expected_username.trim().is_empty() =>
         {
+            let allowed_status_providers = load_status_providers(&capability_catalog_file)?;
             mint = mint
                 .with_control_plane(
                     ControlPlaneMintConfig::new(
                         expected_username.clone(),
                         MAX_CONTROL_PLANE_AUTHORITY_TTL,
+                        allowed_status_providers,
                     )
                     .map_err(|error| {
                         io::Error::other(format!(
@@ -339,7 +413,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(io::Error::other(
-                "control-plane mint audience and workload identity must be configured together",
+                "control-plane mint audience, workload identity, and capability catalog must be configured together",
             )
             .into());
         }
@@ -407,7 +481,7 @@ fn load_signing_key(path: &str) -> Result<MintSigningKey, io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use k8s_openapi::ByteString;
     use k8s_openapi::api::core::v1::Secret;
@@ -425,8 +499,38 @@ mod tests {
 
     use super::{
         INFERENCE_CREDENTIAL_DATA_KEY, RUNTIME_UID_LABEL, credential_from_secret,
-        credential_secret_name, managed_inference_store_error,
+        credential_secret_name, managed_inference_store_error, status_providers_from_catalog_json,
     };
+
+    #[test]
+    fn status_providers_are_derived_only_from_exact_catalog_records() -> Result<(), String> {
+        let providers = status_providers_from_catalog_json(
+            r#"{
+              "schemaVersion":"steward.capability-catalog/v2",
+              "models":[],
+              "tools":[],
+              "catalogs":[
+                {"provider":"github","catalogId":"github-tools","version":"1.0.0","available":true},
+                {"provider":"jira","catalogId":"jira-read-only","version":"2.0.0","available":false},
+                {"provider":"jira","catalogId":"jira-extra","version":"2.0.0","available":true}
+              ]
+            }"#,
+        )
+        .map_err(|error| format!("parse deployment capability catalog: {error}"))?;
+        assert_eq!(
+            providers,
+            BTreeSet::from(["github".to_owned(), "jira".to_owned()])
+        );
+
+        for invalid in [
+            r#"{"schemaVersion":"other","models":[],"tools":[],"catalogs":[]}"#,
+            r#"{"schemaVersion":"steward.capability-catalog/v2","models":[],"tools":[],"catalogs":[{"provider":" jira","catalogId":"jira","version":"1","available":true}]}"#,
+            r#"{"schemaVersion":"steward.capability-catalog/v2","models":[],"tools":[],"catalogs":[{"provider":"jira","catalogId":"jira","version":"1","available":true},{"provider":"jira","catalogId":"jira","version":"2","available":true}]}"#,
+        ] {
+            assert!(status_providers_from_catalog_json(invalid).is_err());
+        }
+        Ok(())
+    }
 
     fn runtime(uid: &str, workspace: &str, sandbox: &str) -> AgentRuntime {
         let mut runtime = AgentRuntime::new(

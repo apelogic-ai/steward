@@ -4115,6 +4115,8 @@ dependencies = [
  "axum",
  "k8s-openapi",
  "kube",
+ "serde",
+ "serde_json",
  "steward-adapter-openshell",
  "steward-adapter-spire",
  "steward-mint",
