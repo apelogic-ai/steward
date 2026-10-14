@@ -1433,10 +1433,39 @@ fi
 helm lint "${root}/charts/steward" "${image_values[@]}" \
   --set config.controller.inferenceObservationIntervalSeconds=30 >/dev/null
 helm lint "${root}/charts/steward" "${image_values[@]}" \
-  --set config.controller.finalSpendSettlementDelaySeconds=10 \
+  --set config.controller.finalSpendSettlementDelaySeconds=13 \
   --set config.controller.finalSpendSettlementCeilingSeconds=21 \
   --set config.controller.finalSpendCaptureTimeoutSeconds=26 \
   --set config.controller.inferenceCleanupDeadlineSeconds=31 >/dev/null
+for invalid_final_spend_timing in \
+  'finalSpendSettlementDelaySeconds=11' \
+  'finalSpendSettlementDelaySeconds=61' \
+  'finalSpendSettlementCeilingSeconds=12' \
+  'finalSpendSettlementCeilingSeconds=91' \
+  'finalSpendCaptureTimeoutSeconds=13' \
+  'finalSpendCaptureTimeoutSeconds=106' \
+  'inferenceCleanupDeadlineSeconds=14' \
+  'inferenceCleanupDeadlineSeconds=121'
+do
+  if helm lint "${root}/charts/steward" "${image_values[@]}" \
+    --set "config.controller.${invalid_final_spend_timing}" >/dev/null 2>&1
+  then
+    echo "an out-of-range final-spend timing must fail chart validation: ${invalid_final_spend_timing}" >&2
+    exit 1
+  fi
+done
+for invalid_final_spend_order in \
+  'finalSpendSettlementDelaySeconds=20,config.controller.finalSpendSettlementCeilingSeconds=20' \
+  'finalSpendSettlementCeilingSeconds=25,config.controller.finalSpendCaptureTimeoutSeconds=25' \
+  'finalSpendCaptureTimeoutSeconds=30,config.controller.inferenceCleanupDeadlineSeconds=30'
+do
+  if helm template steward "${root}/charts/steward" "${image_values[@]}" \
+    --set "config.controller.${invalid_final_spend_order}" >/dev/null 2>&1
+  then
+    echo "unordered final-spend timing must fail chart rendering: ${invalid_final_spend_order}" >&2
+    exit 1
+  fi
+done
 for invalid_inference_observation_interval in 11 61
 do
   if helm lint "${root}/charts/steward" "${image_values[@]}" \

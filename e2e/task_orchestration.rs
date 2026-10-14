@@ -2998,10 +2998,52 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             .await?,
         Some("25.00".to_owned())
     );
+    store
+        .record_final_spend_observation(
+            &runtime_uid,
+            1,
+            "immutable-runtime-spec",
+            &SpendSummary {
+                observed_amount: "115.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            None,
+        )
+        .await?;
     assert_eq!(
-        store.runtime_spend_episode_baseline(&runtime_uid).await?,
-        "110.00",
-        "the granted exhaustion must become the recreated key's cumulative spend baseline"
+        sqlx::query_scalar::<_, String>(
+            "SELECT observed_amount::text FROM spend_observations \
+             WHERE runtime_uid = $1 ORDER BY at DESC, id DESC LIMIT 1",
+        )
+        .bind(&runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        "115.00",
+        "late settlement on the old key must remain the cumulative baseline without double counting"
+    );
+    let settled_baseline = store
+        .latest_runtime_spend_amount(&runtime_uid, "USD")
+        .await?;
+    assert_eq!(settled_baseline, "115.00");
+    assert_eq!(
+        store
+            .record_runtime_spend_episode(&runtime_uid, "runtime-key-2", &settled_baseline, "USD",)
+            .await?,
+        "115.00"
+    );
+    assert_eq!(
+        store
+            .runtime_spend_episode_baseline(&runtime_uid, "runtime-key-2", "USD")
+            .await?,
+        Some("115.00".to_owned()),
+        "the recreated key must stay bound to the final settled cumulative spend"
+    );
+    assert_eq!(
+        store
+            .record_runtime_spend_episode(&runtime_uid, "runtime-key-2", "999.00", "USD")
+            .await?,
+        "115.00",
+        "a retry or late grant must not rebind an existing key episode"
     );
     assert_eq!(
         store
@@ -3015,7 +3057,11 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         "an active top-up must expand the remaining authority without counting this runtime twice"
     );
     let usage = store.envelope_usage(&envelope_instance_id).await?;
-    assert_eq!(usage.observed_amount, Some("150.00".to_owned()));
+    assert_eq!(
+        usage.observed_amount,
+        Some("155.00".to_owned()),
+        "late settlement must increase the instance's cumulative usage"
+    );
     assert_eq!(usage.active_top_up_amount, Some("25.00".to_owned()));
     let retry = store
         .record_escalation_top_up(
@@ -3056,7 +3102,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             1,
             "immutable-runtime-spec",
             &SpendSummary {
-                observed_amount: "20.00".to_owned(),
+                observed_amount: "135.00".to_owned(),
                 currency: "USD".to_owned(),
             },
             true,
@@ -3070,8 +3116,25 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .bind(&runtime_uid)
         .fetch_one(&pool)
         .await?,
-        "130.00",
-        "a recreated key's raw spend must be added to the prior suspension episode"
+        "135.00",
+        "a recreated key's cumulative observation must not decrease"
+    );
+    store
+        .record_spend_observation(
+            &runtime_uid,
+            1,
+            "immutable-runtime-spec",
+            &SpendSummary {
+                observed_amount: "134.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            false,
+        )
+        .await?;
+    assert_eq!(
+        store.latest_runtime_spend_amount(&runtime_uid, "USD").await?,
+        "135.00",
+        "an older retry must not reduce cumulative spend"
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -3090,7 +3153,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .find(|record| record.runtime_uid == runtime_uid && record.dimension == "llm_spend")
         .ok_or_else(|| io::Error::other("resumed exhaustion was not projected"))?;
     assert_ne!(resumed_exhaustion.escalation_id, escalation.escalation_id);
-    assert_eq!(resumed_exhaustion.observed_amount, "130.00");
+    assert_eq!(resumed_exhaustion.observed_amount, "135.00");
     assert_eq!(resumed_exhaustion.grant_id, None);
     assert_eq!(resumed_exhaustion.denial_rationale, None);
 

@@ -703,8 +703,10 @@ Steward release namespace also creates `steward-workflows`.
   `finalSpendCaptureTimeoutSeconds` (`25`). The delay precedes the final read,
   the ceiling bounds settlement polling, and the timeout bounds the complete
   read. `config.controller.inferenceCleanupDeadlineSeconds` defaults to `30`
-  and bounds cleanup retries. Steward requires these values to be ordered so
-  cleanup cannot discard a final read that still has time remaining.
+  and bounds cleanup retries. The accepted ranges are respectively `12`–`60`,
+  `13`–`90`, `14`–`105`, and `15`–`120` seconds. The chart requires strict
+  `delay < ceiling < capture timeout < cleanup deadline` ordering so cleanup
+  cannot discard a final read that still has time remaining.
 - In governed mode, `config.mint.issuer`, `spiffeTrustDomain`, and
   `openshellNamespace` must be supplied for the target environment; none has
   a usable default. The issuer must also be configured in MCP-GW.

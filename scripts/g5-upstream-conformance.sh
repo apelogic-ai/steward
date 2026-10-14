@@ -236,7 +236,7 @@ done
 curl -fsS \
   -H "Authorization: Bearer ${master_key}" \
   -H "Content-Type: application/json" \
-  -d "{\"key\":\"${lowered_token}\",\"max_budget\":0.000001}" \
+  -d "{\"key\":\"${lowered_token}\",\"max_budget\":0.000001,\"models\":[\"openai/model-a\"]}" \
   "${base_url}/key/update" >/dev/null
 lowered_response="${RUN_DIR}/lowered-budget-denied.json"
 lowered_status="$(

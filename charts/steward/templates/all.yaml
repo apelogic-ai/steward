@@ -39,6 +39,13 @@
 {{- if and .Values.connectionsBridge.enabled (not .Values.execution.enabled) }}
 {{- fail "connectionsBridge.enabled requires execution.enabled so the Mint trust boundary is available" }}
 {{- end }}
+{{- $settlementDelay := int .Values.config.controller.finalSpendSettlementDelaySeconds }}
+{{- $settlementCeiling := int .Values.config.controller.finalSpendSettlementCeilingSeconds }}
+{{- $captureTimeout := int .Values.config.controller.finalSpendCaptureTimeoutSeconds }}
+{{- $cleanupDeadline := int .Values.config.controller.inferenceCleanupDeadlineSeconds }}
+{{- if not (and (lt $settlementDelay $settlementCeiling) (lt $settlementCeiling $captureTimeout) (lt $captureTimeout $cleanupDeadline)) }}
+{{- fail "controller final-spend timing must satisfy delay < ceiling < capture timeout < cleanup deadline" }}
+{{- end }}
 {{- range $component := list "apiserver" "controller" "mint" }}
 {{- if or (ne $component "mint") $.Values.execution.enabled }}
 ---

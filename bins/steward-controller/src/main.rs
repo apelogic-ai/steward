@@ -904,7 +904,7 @@ mod tests {
         assert_eq!(
             parse_runtime_controller_config(
                 Some("30"),
-                Some("10"),
+                Some("13"),
                 Some("21"),
                 Some("26"),
                 Some("31"),
@@ -915,7 +915,7 @@ mod tests {
         );
         let configured = parse_runtime_controller_config(
             Some("30"),
-            Some("10"),
+            Some("13"),
             Some("21"),
             Some("26"),
             Some("31"),
@@ -923,7 +923,7 @@ mod tests {
         .map_err(|error| error.to_string())?;
         assert_eq!(
             configured.final_spend_settlement_delay(),
-            Duration::from_secs(10)
+            Duration::from_secs(13)
         );
         assert_eq!(
             configured.final_spend_settlement_ceiling(),
@@ -938,6 +938,14 @@ mod tests {
             Duration::from_secs(31)
         );
         assert!(parse_runtime_controller_config(None, Some("20"), Some("19"), None, None).is_err());
+        assert!(parse_runtime_controller_config(None, Some("11"), None, None, None).is_err());
+        assert!(parse_runtime_controller_config(None, Some("61"), None, None, None).is_err());
+        assert!(parse_runtime_controller_config(None, None, Some("91"), None, None).is_err());
+        assert!(parse_runtime_controller_config(None, None, None, Some("106"), None).is_err());
+        assert!(parse_runtime_controller_config(None, None, None, None, Some("121")).is_err());
+        assert!(parse_runtime_controller_config(None, Some("20"), Some("20"), None, None).is_err());
+        assert!(parse_runtime_controller_config(None, None, Some("25"), Some("25"), None).is_err());
+        assert!(parse_runtime_controller_config(None, None, None, Some("30"), Some("30")).is_err());
         Ok(())
     }
 

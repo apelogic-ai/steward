@@ -3299,34 +3299,38 @@ impl PgStore {
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
-        let prior_episode = sqlx::query(
-            "SELECT exhaustion.observed_amount::text AS observed_amount, exhaustion.currency \
-             FROM inference_exhaustions exhaustion \
-             JOIN envelope_instance_grants grants ON grants.escalation_id = exhaustion.id \
-             WHERE exhaustion.runtime_uid = $1 \
-             ORDER BY exhaustion.at DESC, exhaustion.id DESC LIMIT 1",
+        let observed_amount = add_budget_amount("0", &spend.observed_amount)
+            .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        let latest = sqlx::query(
+            "SELECT observed_amount::text AS observed_amount, currency \
+             FROM spend_observations WHERE runtime_uid = $1 \
+             ORDER BY at DESC, id DESC LIMIT 1",
         )
         .bind(runtime_uid)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
-        let observed_amount = if let Some(prior_episode) = prior_episode {
-            let prior_currency: String =
-                prior_episode.try_get("currency").map_err(database_error)?;
-            if prior_currency != spend.currency {
+        if let Some(latest) = latest {
+            if latest
+                .try_get::<String, _>("currency")
+                .map_err(database_error)?
+                != spend.currency
+            {
                 return Err(StoreError::InvalidCumulativeEscalation);
             }
-            add_budget_amount(
-                &prior_episode
-                    .try_get::<String, _>("observed_amount")
-                    .map_err(database_error)?,
-                &spend.observed_amount,
-            )
-            .map_err(|_| StoreError::InvalidCumulativeEscalation)?
-        } else {
-            add_budget_amount("0", &spend.observed_amount)
-                .map_err(|_| StoreError::InvalidCumulativeEscalation)?
-        };
+            let latest_amount: String =
+                latest.try_get("observed_amount").map_err(database_error)?;
+            if sqlx::query_scalar::<_, bool>("SELECT $1::numeric > $2::numeric")
+                .bind(&latest_amount)
+                .bind(&observed_amount)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(database_error)?
+            {
+                transaction.commit().await.map_err(database_error)?;
+                return Ok(());
+            }
+        }
         if exhausted
             && sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS ( \
@@ -3900,10 +3904,136 @@ impl PgStore {
         Ok((amount != "0").then_some(amount))
     }
 
-    /// Return the cumulative spend recorded before the current gateway-key episode. A granted
-    /// exhaustion means the old key was revoked and the replacement key restarted its raw spend
-    /// counter at zero.
+    /// Return the latest cumulative spend observation for a runtime.
+    pub async fn latest_runtime_spend_amount(
+        &self,
+        runtime_uid: &str,
+        currency: &str,
+    ) -> Result<String, StoreError> {
+        if runtime_uid.trim().is_empty() || currency.len() != 3 {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let latest = sqlx::query(
+            "SELECT observed_amount::text AS observed_amount, currency \
+             FROM spend_observations WHERE runtime_uid = $1 \
+             ORDER BY at DESC, id DESC LIMIT 1",
+        )
+        .bind(runtime_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let Some(latest) = latest else {
+            return Ok("0".to_owned());
+        };
+        if latest
+            .try_get::<String, _>("currency")
+            .map_err(database_error)?
+            != currency
+        {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        latest.try_get("observed_amount").map_err(database_error)
+    }
+
+    /// Return the immutable cumulative baseline bound to one gateway-key reference.
     pub async fn runtime_spend_episode_baseline(
+        &self,
+        runtime_uid: &str,
+        inference_reference: &str,
+        currency: &str,
+    ) -> Result<Option<String>, StoreError> {
+        if runtime_uid.trim().is_empty()
+            || inference_reference.trim().is_empty()
+            || currency.len() != 3
+        {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let baseline = sqlx::query(
+            "SELECT baseline_amount::text AS baseline_amount, currency \
+             FROM inference_spend_episodes \
+             WHERE runtime_uid = $1 AND inference_reference = $2",
+        )
+        .bind(runtime_uid)
+        .bind(inference_reference)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let Some(baseline) = baseline else {
+            return Ok(None);
+        };
+        if baseline
+            .try_get::<String, _>("currency")
+            .map_err(database_error)?
+            != currency
+        {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        Ok(Some(
+            baseline
+                .try_get("baseline_amount")
+                .map_err(database_error)?,
+        ))
+    }
+
+    /// Bind a gateway-key reference to the cumulative spend observed before that key existed.
+    pub async fn record_runtime_spend_episode(
+        &self,
+        runtime_uid: &str,
+        inference_reference: &str,
+        baseline_amount: &str,
+        currency: &str,
+    ) -> Result<String, StoreError> {
+        if runtime_uid.trim().is_empty()
+            || inference_reference.trim().is_empty()
+            || currency.len() != 3
+        {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let baseline_amount = add_budget_amount("0", baseline_amount)
+            .map_err(|_| StoreError::InvalidCumulativeEscalation)?;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(runtime_uid)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        sqlx::query(
+            "INSERT INTO inference_spend_episodes \
+             (runtime_uid, inference_reference, baseline_amount, currency) \
+             VALUES ($1, $2, $3::numeric, $4) \
+             ON CONFLICT (runtime_uid, inference_reference) DO NOTHING",
+        )
+        .bind(runtime_uid)
+        .bind(inference_reference)
+        .bind(&baseline_amount)
+        .bind(currency)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let stored = sqlx::query(
+            "SELECT baseline_amount::text AS baseline_amount, currency \
+             FROM inference_spend_episodes \
+             WHERE runtime_uid = $1 AND inference_reference = $2",
+        )
+        .bind(runtime_uid)
+        .bind(inference_reference)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if stored
+            .try_get::<String, _>("currency")
+            .map_err(database_error)?
+            != currency
+        {
+            return Err(StoreError::InvalidCumulativeEscalation);
+        }
+        let stored_amount = stored.try_get("baseline_amount").map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(stored_amount)
+    }
+
+    /// Compatibility baseline for a key that predates inference-spend episode records.
+    pub async fn legacy_runtime_spend_episode_baseline(
         &self,
         runtime_uid: &str,
     ) -> Result<String, StoreError> {

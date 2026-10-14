@@ -347,13 +347,121 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
             io::Error::other(format!(
                 "Steward pre-template-boundary migrations must complete over the required TLS session: {error}"
             ))
-        })?;
+    })?;
     seed_template_one_boundary_upgrade_fixture(&store).await?;
+    migration_set(Some(71))
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward pre-spend-episode migrations must complete over the required TLS session: {error}"
+            ))
+        })?;
+    let (historical_task_uid, historical_envelope_instance_id) =
+        sqlx::query_as::<_, (Uuid, String)>(
+            "SELECT task_uid, user_envelope_instance_id \
+             FROM task_submissions WHERE user_envelope_instance_id IS NOT NULL \
+             ORDER BY task_uid LIMIT 1",
+        )
+        .fetch_one(store.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO spend_observations \
+         (runtime_uid, observed_amount, currency, exhausted) \
+         VALUES \
+         ('historical-spend-exhausted', 7.50, 'USD', true), \
+         ('historical-spend-granted', 8.00, 'USD', true), \
+         ('historical-spend-denied', 9.00, 'USD', true), \
+         ('historical-spend-mid-episode', 2.00, 'USD', false), \
+         ('historical-spend-mid-episode', 3.00, 'USD', false)",
+    )
+    .execute(store.pool())
+    .await?;
+    let exhausted_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO inference_exhaustions \
+         (runtime_uid, observed_generation, spec_digest, observed_amount, currency, public_id) \
+         VALUES ('historical-spend-exhausted', 1, 'historical-exhausted-spec', \
+                 7.50, 'USD', $1) RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .fetch_one(store.pool())
+    .await?;
+    assert!(exhausted_id > 0);
+    let granted_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO inference_exhaustions \
+         (runtime_uid, observed_generation, spec_digest, observed_amount, currency, public_id) \
+         VALUES ('historical-spend-granted', 1, 'historical-granted-spec', \
+                 8.00, 'USD', $1) RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .fetch_one(store.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO envelope_instance_grants \
+         (id, escalation_id, envelope_instance_id, task_uid, dimension, amount, base_limit, \
+          target_limit, unit, valid_until, rationale, granted_by) \
+         VALUES ($1, $2, $3, $4, 'llm_spend', 2.00, 8.00, 10.00, 'USD', \
+                 '2999-01-01T00:00:00Z', 'historical grant', 'alice')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(granted_id)
+    .bind(&historical_envelope_instance_id)
+    .bind(historical_task_uid)
+    .execute(store.pool())
+    .await?;
+    let denied_id = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO inference_exhaustions \
+         (runtime_uid, observed_generation, spec_digest, observed_amount, currency, public_id) \
+         VALUES ('historical-spend-denied', 1, 'historical-denied-spec', \
+                 9.00, 'USD', $1) RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .fetch_one(store.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO cumulative_escalation_denials \
+         (escalation_id, envelope_instance_id, task_uid, rationale, denied_by) \
+         VALUES ($1, $2, $3, 'historical denial', 'alice')",
+    )
+    .bind(denied_id)
+    .bind(&historical_envelope_instance_id)
+    .bind(historical_task_uid)
+    .execute(store.pool())
+    .await?;
+    let historical_spend_before_episode_migration =
+        sqlx::query_as::<_, (String, String, bool)>(
+            "SELECT runtime_uid, observed_amount::text, exhausted \
+             FROM spend_observations WHERE runtime_uid LIKE 'historical-spend-%' \
+             ORDER BY runtime_uid, at, id",
+        )
+        .fetch_all(store.pool())
+        .await?;
     migration_set(None).run(store.pool()).await.map_err(|error| {
         io::Error::other(format!(
-            "Steward template-boundary migration must complete over the required TLS session: {error}"
+            "Steward spend-episode migration must complete over the required TLS session: {error}"
         ))
     })?;
+    assert_eq!(
+        sqlx::query_as::<_, (String, String, bool)>(
+            "SELECT runtime_uid, observed_amount::text, exhausted \
+             FROM spend_observations WHERE runtime_uid LIKE 'historical-spend-%' \
+             ORDER BY runtime_uid, at, id",
+        )
+        .fetch_all(store.pool())
+        .await?,
+        historical_spend_before_episode_migration,
+        "migration 0072 must preserve exhausted, granted, denied, and mid-episode cumulative spend without decreasing it"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)::bigint FROM inference_spend_episodes \
+             WHERE runtime_uid LIKE 'historical-spend-%'",
+        )
+        .fetch_one(store.pool())
+        .await?,
+        0,
+        "migration 0072 must not invent gateway-key baselines for historical spend states"
+    );
     verify_browser_task_library_upgrade(&store).await?;
     assert_eq!(
         historical_task_identity_snapshot(&store).await?,
