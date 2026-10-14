@@ -1,5 +1,6 @@
 import { expect } from "@playwright/test";
 
+import { isIssue414RunFailure } from "../run-failure-markers.mjs";
 import { Given, Then, When } from "./fixtures.mjs";
 
 const runPrefix = process.env.STEWARD_JOURNEY_RUN_PREFIX;
@@ -435,6 +436,7 @@ async function fillEnvelopeRequirements(journey, page, boundary) {
       }),
     },
   };
+  journey.statedSingleRunLimit = requirements.authority.budget.singleRunLimit;
   await fieldLocator(page, "Requirements (optional JSON)").fill(JSON.stringify(requirements));
 }
 
@@ -1016,27 +1018,30 @@ Then("the run ends as {string} within {int} min", async ({ journey, page }, phas
     if (data.run.finalized) {
       if (data.run.phase !== phase) {
         const failure = `the run should end as ${phase}; actual phase=${data.run.phase}; category=${data.run.errorCategory ?? "none"}; reason=${data.run.failureReason ?? "none"}`;
-        const selectedRequest = journey.currentTemplate ? journey.requests.get(journey.currentTemplate) : null;
-        const selectedSpec = (selectedRequest?.approvedEnvelope ?? selectedRequest?.requestedEnvelope)?.spec;
-        const issue472Failure = journey.knownIssue === "@known-failing-472"
-          && data.run.errorCategory === "execution-failed"
-          && data.run.codingAgentRuntime?.startsWith("claude-code@")
-          && Array.isArray(selectedSpec?.tools)
-          && selectedSpec.tools.length === 0;
-        if (issue472Failure) {
-          throw new Error(`[steward-known-failure:#472] ${failure}`);
+        if (isIssue414RunFailure({
+          knownIssue: journey.knownIssue,
+          statedSingleRunLimit: journey.statedSingleRunLimit,
+          phase: data.run.phase,
+          finalized: data.run.finalized,
+          failureReason: data.run.failureReason,
+          atDeadline: false,
+        })) {
+          throw new Error(`[steward-known-failure:#414] ${failure}`);
         }
         throw new Error(failure);
       }
       break;
     }
-    const agentExecutionRunning = data.run.stages?.some((stage) => stage.id === "agent_execution" && stage.state === "running");
-    if (Date.now() >= deadline && journey.knownIssue === "@known-failing-472" && data.run.codingAgentRuntime?.startsWith("claude-code@") && agentExecutionRunning) {
-      const pendingRequest = journey.currentTemplate ? journey.requests.get(journey.currentTemplate) : null;
-      const pendingSpec = (pendingRequest?.approvedEnvelope ?? pendingRequest?.requestedEnvelope)?.spec;
-      if (Array.isArray(pendingSpec?.tools) && pendingSpec.tools.length === 0) {
-        throw new Error(`[steward-known-failure:#472] the run did not finish within ${minutes} min; phase=${data.run.phase}; finalized=false`);
-      }
+    const atDeadline = Date.now() >= deadline;
+    if (isIssue414RunFailure({
+      knownIssue: journey.knownIssue,
+      statedSingleRunLimit: journey.statedSingleRunLimit,
+      phase: data.run.phase,
+      finalized: data.run.finalized,
+      failureReason: data.run.failureReason,
+      atDeadline,
+    })) {
+      throw new Error(`[steward-known-failure:#414] the run did not finish within ${minutes} min; phase=${data.run.phase}; finalized=false; reason=none`);
     }
     expect(Date.now(), `the run should end as ${phase} within ${minutes} min`).toBeLessThan(deadline);
     await page.waitForTimeout(2_000);

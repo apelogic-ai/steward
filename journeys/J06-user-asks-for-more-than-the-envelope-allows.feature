@@ -15,7 +15,8 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
     And I hold an Envelope from the template "timed"
 
   # Steps 1 and 2. PASS on 0.3.16.
-  @extended @needs-model @known-failing-472
+  # A below-limit per-run budget currently becomes 0; the runtime rejects it without a reason (#414).
+  @extended @needs-model @known-failing-414
   Scenario: Needs at or below the Envelope's limits are accepted
     When I open "Tasks"
     And I press "New Task"

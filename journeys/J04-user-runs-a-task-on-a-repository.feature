@@ -15,7 +15,7 @@ Feature: J4 - User runs a Task on a repository
     And I hold an Envelope from the template "standard"
 
   # Steps 1 to 6.
-  # The runtime does not find the checked-out repository yet (#464).
+  # The runtime reads the checked-out repository and publishes the requested output.
   @smoke @needs-model
   Scenario: Run a Task on a named repository and branch
     When I open "Tasks"

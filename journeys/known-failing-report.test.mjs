@@ -22,14 +22,14 @@ function report(tags, marker) {
 
 test("accepts Playwright JSON tags without the Gherkin at-sign", () => {
   assert.equal(expectedKnownFailures(
-    report(["extended", "known-failing-472"], "[steward-known-failure:#472] expected failure"),
+    report(["extended", "known-failing-414"], "[steward-known-failure:#414] expected failure"),
     1,
   ), true);
 });
 
 test("requires the marker issue to match the scenario tag", () => {
   assert.equal(expectedKnownFailures(
-    report(["extended", "known-failing-472"], "[steward-known-failure:#464] different failure"),
+    report(["extended", "known-failing-414"], "[steward-known-failure:#464] different failure"),
     1,
   ), false);
 });

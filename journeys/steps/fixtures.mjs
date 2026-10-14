@@ -32,6 +32,7 @@ export const test = base.extend({
       run: null,
       initialRunIds: null,
       runRuntimeMinutes: null,
+      statedSingleRunLimit: null,
       selectedModels: [],
       shared,
       transientSeen: new Set(),

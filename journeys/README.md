@@ -110,9 +110,9 @@ The runner includes all ten files, but tags select only the intended scenarios. 
 specifications without step code do not look tested: selecting one fails generation before a
 browser starts.
 
-J6's accepted-requirements scenario currently runs in the known-failing lane for issue #472 when
-the compatible agent is Claude Code and the Envelope has no tools. The other selected extended
-scenarios remain required.
+J6's accepted-requirements scenario currently runs in the known-failing lane for issue #414 only
+when it states a per-run budget of zero and the run either fails or remains running at its deadline
+with no failure reason. The other selected extended scenarios remain required.
 
 ## Run against an installation
 
