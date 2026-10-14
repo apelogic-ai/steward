@@ -5923,7 +5923,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_status_response_refuses_a_different_provider_identity() {
+    fn provider_status_response_refuses_a_different_provider_identity() -> Result<(), String> {
         let value = serde_json::json!({
             "version": "2",
             "provider": "github",
@@ -5941,14 +5941,14 @@ mod tests {
             "capabilities": {"interactiveAuthorization": true}
         });
 
+        let object = value
+            .as_object()
+            .ok_or_else(|| "test status must be an object".to_owned())?;
         assert!(
-            normalized_status_response(
-                value.as_object().expect("test status is an object"),
-                "jira",
-            )
-            .is_err(),
+            normalized_status_response(object, "jira").is_err(),
             "a Jira status read must reject a response for another provider"
         );
+        Ok(())
     }
 
     #[tokio::test]
