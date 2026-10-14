@@ -273,8 +273,8 @@ fn budget_amount_is_positive(amount: &str, currency: &str) -> Result<bool, Recon
 
 fn monthly_spend_start_failure_reason(budget: &Budget) -> String {
     format!(
-        "This run could not start because the monthly spending limit of {} {} has been reached.",
-        budget.monthly_limit, budget.currency
+        "This run could not start because the monthly spending limit of {} has been reached.",
+        steward_admission::format_money(&budget.monthly_limit, &budget.currency)
     )
 }
 
@@ -315,8 +315,8 @@ fn single_run_spend_failure_reason(
         .map(|exhausted| {
             exhausted.then(|| {
                 format!(
-                    "This run reached its spending limit of {limit} {}.",
-                    budget.currency
+                    "This run reached its spending limit of {}.",
+                    steward_admission::format_money(limit, &budget.currency)
                 )
             })
         })
@@ -6317,6 +6317,28 @@ mod tests {
             )
             .map_err(|error| format!("fixture spend must be comparable: {error:?}"))?,
             None
+        );
+
+        let unformatted_budget = Budget {
+            monthly_limit: "5".to_owned(),
+            single_run_limit: Some("1".to_owned()),
+            currency: "USD".to_owned(),
+        };
+        assert_eq!(
+            super::single_run_spend_failure_reason(
+                &steward_types::SpendSummary {
+                    observed_amount: "1".to_owned(),
+                    currency: "USD".to_owned(),
+                },
+                &unformatted_budget,
+            )
+            .map_err(|error| format!("fixture spend must be comparable: {error:?}"))?
+            .as_deref(),
+            Some("This run reached its spending limit of 1.00 USD.")
+        );
+        assert_eq!(
+            super::monthly_spend_start_failure_reason(&unformatted_budget),
+            "This run could not start because the monthly spending limit of 5.00 USD has been reached."
         );
         Ok(())
     }

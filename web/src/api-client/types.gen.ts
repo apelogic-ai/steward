@@ -154,6 +154,7 @@ export type AgentRunView = {
     createdAt: string;
     envelopeRevision?: number | null;
     errorCategory?: string | null;
+    failureReason?: string | null;
     finalizationRequested: boolean;
     finalized: boolean;
     githubRun: AgentRunDataStatus;

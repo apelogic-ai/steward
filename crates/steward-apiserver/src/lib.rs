@@ -905,6 +905,8 @@ pub struct AgentRunView {
     pub github_run: AgentRunDataStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, utoipa::ToSchema)]
@@ -2328,10 +2330,15 @@ where
 fn agent_run_view(record: AgentRunRecord) -> AgentRunView {
     let authority_observed_at = record.created_at.clone();
     let spend_observed_at = record.spend.as_ref().map(|spend| spend.observed_at.clone());
+    let failure_reason = agent_runs_ui::public_run_failure_reason(record.failure_reason.as_deref())
+        .map(str::to_owned);
+    let spending_limit_reached =
+        agent_runs_ui::public_spending_limit_failure_reason(record.failure_reason.as_deref())
+            .is_some();
     let observed_spend = record.spend.as_ref().map(|spend| AgentRunSpendView {
         observed_amount: spend.observed_amount.clone(),
         currency: spend.currency.clone(),
-        exhausted: spend.exhausted,
+        exhausted: spend.exhausted || spending_limit_reached,
     });
     let unavailable = |reason: &str| AgentRunDataStatus {
         availability: AgentRunAvailability::Unavailable,
@@ -2402,6 +2409,7 @@ fn agent_run_view(record: AgentRunRecord) -> AgentRunView {
         github_run: unavailable("notRecorded"),
         error_category: bounded_task_error_category(record.failure_reason.as_deref())
             .map(str::to_owned),
+        failure_reason,
     }
 }
 

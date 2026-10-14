@@ -2804,6 +2804,8 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         .and_then(|envelope| envelope.spec.runtime_minutes_limit.clone());
     let failure_reason =
         public_run_failure_reason(record.failure_reason.as_deref()).map(str::to_owned);
+    let spending_limit_reached =
+        public_spending_limit_failure_reason(record.failure_reason.as_deref()).is_some();
     BrowserRunView {
         task_uid: record.task_uid,
         origin: record.task_origin,
@@ -2830,7 +2832,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         observed_spend: record.spend.map(|spend| AgentRunSpendView {
             observed_amount: spend.observed_amount,
             currency: spend.currency,
-            exhausted: spend.exhausted,
+            exhausted: spend.exhausted || spending_limit_reached,
         }),
         error_category: bounded_task_error_category(record.failure_reason.as_deref())
             .map(str::to_owned),
@@ -2844,7 +2846,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
     }
 }
 
-fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
+pub(crate) fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
     const INVALID_COMMAND: &str = "task command must contain only non-empty arguments";
     const INVALID_COMMAND_REASON: &str =
         "This run could not start because its coding agent settings were invalid.";
@@ -2853,12 +2855,38 @@ fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
     if reason == INVALID_COMMAND {
         return Some(INVALID_COMMAND_REASON);
     }
+    if public_spending_limit_failure_reason(Some(reason)).is_some() {
+        return Some(reason);
+    }
     let value = reason.strip_prefix(PREFIX)?;
     let limit = value
         .strip_suffix(" minute.")
         .or_else(|| value.strip_suffix(" minutes."))?;
     steward_types::direct_package::Decimal::parse(limit).ok()?;
     Some(reason)
+}
+
+pub(crate) fn public_spending_limit_failure_reason(reason: Option<&str>) -> Option<&str> {
+    const PER_RUN_PREFIX: &str = "This run reached its spending limit of ";
+    const PER_RUN_SUFFIX: &str = ".";
+    const MONTHLY_PREFIX: &str = "This run could not start because the monthly spending limit of ";
+    const MONTHLY_SUFFIX: &str = " has been reached.";
+
+    let reason = reason?;
+    let money = reason
+        .strip_prefix(PER_RUN_PREFIX)
+        .and_then(|value| value.strip_suffix(PER_RUN_SUFFIX))
+        .or_else(|| {
+            reason
+                .strip_prefix(MONTHLY_PREFIX)
+                .and_then(|value| value.strip_suffix(MONTHLY_SUFFIX))
+        })?;
+    let (amount, currency) = money.rsplit_once(' ')?;
+    let amount_is_valid =
+        steward_types::direct_package::Decimal::parse(amount).is_ok() || amount == "< 0.01";
+    let currency_is_valid =
+        currency.len() == 3 && currency.bytes().all(|byte| byte.is_ascii_uppercase());
+    (amount_is_valid && currency_is_valid).then_some(reason)
 }
 
 #[cfg(test)]
@@ -3980,6 +4008,36 @@ mod tests {
             browser_run_view(invalid_command).failure_reason.as_deref(),
             Some("This run could not start because its coding agent settings were invalid.")
         );
+
+        let mut per_run_spend = run(task_uid, "usr_0123456789abcdef0123456789abcdef");
+        per_run_spend.failure_reason =
+            Some("This run reached its spending limit of 0.25 USD.".to_owned());
+        let per_run_spend = browser_run_view(per_run_spend);
+        assert_eq!(
+            per_run_spend.failure_reason.as_deref(),
+            Some("This run reached its spending limit of 0.25 USD.")
+        );
+        assert_eq!(
+            per_run_spend.observed_spend.map(|spend| spend.exhausted),
+            Some(true)
+        );
+
+        let mut monthly_spend = run(task_uid, "usr_0123456789abcdef0123456789abcdef");
+        monthly_spend.failure_reason = Some(
+            "This run could not start because the monthly spending limit of 100.00 USD has been reached."
+                .to_owned(),
+        );
+        assert_eq!(
+            browser_run_view(monthly_spend).failure_reason.as_deref(),
+            Some(
+                "This run could not start because the monthly spending limit of 100.00 USD has been reached."
+            )
+        );
+
+        let mut near_miss = run(task_uid, "usr_0123456789abcdef0123456789abcdef");
+        near_miss.failure_reason =
+            Some("This run reached its spending limit of 0.25 usd.".to_owned());
+        assert_eq!(browser_run_view(near_miss).failure_reason, None);
         Ok(())
     }
 
