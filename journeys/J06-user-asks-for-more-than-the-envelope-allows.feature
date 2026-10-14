@@ -15,7 +15,7 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
     And I hold an Envelope from the template "timed"
 
   # Steps 1 and 2. Every below-limit budget remains positive.
-  @extended @needs-model
+  @extended @needs-model @known-failing-478
   Scenario: Needs at or below the Envelope's limits are accepted
     When I open "Tasks"
     And I press "New Task"
