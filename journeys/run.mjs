@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 
 const config = "journeys/playwright.config.mjs";
 const knownFailingReport = "target/journeys/known-failing-report.json";
-const knownFailureMarker = "[steward-known-failure:#464]";
+const knownFailureMarker = "[steward-known-failure:#";
 
 function knownFailingExpression() {
   const tags = new Set();

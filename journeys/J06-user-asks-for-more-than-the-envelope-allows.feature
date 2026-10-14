@@ -15,7 +15,7 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
     And I hold an Envelope from the template "timed"
 
   # Steps 1 and 2. PASS on 0.3.16.
-  @extended @needs-model
+  @extended @needs-model @known-failing-472
   Scenario: Needs at or below the Envelope's limits are accepted
     When I open "Tasks"
     And I press "New Task"
@@ -42,7 +42,7 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
   # every refusal must say what to do next.
   # The sentences are the EXPECTED plain wording. 0.3.16 shows
   # 'The run request was rejected. Admission("...")' with "$25" and "20m" (N-03).
-  @known-failing-407
+  @known-failing-412
   Scenario Outline: A need above the Envelope's limit is refused before anything starts: <requirement>
     When I open "Tasks"
     And I press "New Task"

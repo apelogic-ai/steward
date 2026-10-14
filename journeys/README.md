@@ -82,7 +82,7 @@ Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test
 | Tag | Meaning |
 |---|---|
 | `@smoke` | Part of the smallest set that proves a release is usable: J1 (steps 1 to 9), J2, J3 (approve path), J4 (steps 1 to 6). Run in this order with one unique run prefix. |
-| `@extended` | Passing one-account coverage beyond smoke: J6's accepted requirements, J7's terminal captured/no-capture logs, and J8's agent/model selection and Task persistence. Run after `@smoke` with the same prefix. |
+| `@extended` | One-account coverage beyond smoke: J6's accepted requirements, J7's terminal captured/no-capture logs, and J8's agent/model selection and Task persistence. Run after `@smoke` with the same prefix. |
 | `@needs-model` | Makes a real model call. Costs money. |
 | `@needs-github` | Needs an external repository that the installation allows. |
 | `@two-accounts` | Needs a second signed-in person. |
@@ -109,6 +109,10 @@ So a maintainer can write a new sentence at any time. The cost is one request to
 The runner includes all ten files, but tags select only the intended scenarios. Feature
 specifications without step code do not look tested: selecting one fails generation before a
 browser starts.
+
+J6's accepted-requirements scenario currently runs in the known-failing lane for issue #472 when
+the compatible agent is Claude Code and the Envelope has no tools. The other selected extended
+scenarios remain required.
 
 ## Run against an installation
 
@@ -137,8 +141,9 @@ export STEWARD_JOURNEY_MODEL=provider/model
 cargo xtask journeys --tags @smoke
 ```
 
-Run the additional passing paths with the same prefix after smoke has created the `standard` and
-`timed` templates and their Envelopes:
+Run the additional paths with the same prefix after smoke has created the `standard` and `timed`
+templates and their Envelopes. The extended set is not standalone; it depends on those smoke-created
+objects under that prefix:
 
 ```console
 cargo xtask journeys --tags @extended
