@@ -22,7 +22,7 @@ Feature: J4 - User runs a Task on a repository
     And I press "New Task"
     And I type "Read the repository" into "Name"
     And I choose "standard" in "Envelope"
-    And I type "List the files in the top folder of the repository and write them to files.txt." into "Prompt"
+    And I type "List the files in the top folder of the repository and write them to out/files.txt." into "Prompt"
     Then the drop-down "Workspace repository" offers "No repository checkout"
     And the drop-down "Workspace repository" offers "<owner>/<repository>"
     When I choose "<owner>/<repository>" in "Workspace repository"

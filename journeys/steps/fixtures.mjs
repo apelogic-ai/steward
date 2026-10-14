@@ -15,7 +15,7 @@ export const test = base.extend({
     const onPageError = (error) => pageErrors.push(error.message);
     page.on("console", onConsole);
     page.on("pageerror", onPageError);
-    await use({
+    const state = {
       expectNoTemplates: false,
       extended: testInfo.tags.includes("@extended"),
       currentTemplate: null,
@@ -31,9 +31,13 @@ export const test = base.extend({
       selectedModels: [],
       shared,
       transientSeen: new Set(),
-    });
+    };
+    await use(state);
     page.off("console", onConsole);
     page.off("pageerror", onPageError);
+    if (state.knownIssue === "@known-failing-478" && consoleErrors.length > 0) {
+      throw new Error(`[steward-known-failure:#478] the onboarding page emitted browser console errors: ${consoleErrors.length}`);
+    }
     expect(consoleErrors, "the journey must not emit browser console errors").toEqual([]);
     expect(pageErrors, "the journey must not emit uncaught page errors").toEqual([]);
   },

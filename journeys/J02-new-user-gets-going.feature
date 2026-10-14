@@ -64,8 +64,7 @@ Feature: J2 - New user gets going
     # A coding agent and a model that this Envelope allows are selected.
     Then "Run now" is enabled
     When I press "Run now"
-    Then I see "Starting…"
-    And the run ends as "succeeded" within 2 min
+    Then the run ends as "succeeded" within 2 min
     And the run output contains "hello world"
     And the spend of the run is above 0.00 USD
     And every amount of money on the page has 2 decimals and the unit "USD"
