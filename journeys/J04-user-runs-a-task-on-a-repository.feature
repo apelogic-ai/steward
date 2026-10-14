@@ -16,7 +16,7 @@ Feature: J4 - User runs a Task on a repository
 
   # Steps 1 to 6.
   # The runtime does not find the checked-out repository yet (#464).
-  @smoke @needs-model @known-failing-464
+  @smoke @needs-model
   Scenario: Run a Task on a named repository and branch
     When I open "Tasks"
     And I press "New Task"
