@@ -1,4 +1,4 @@
-# Source: user journey J4. Checked against version 0.3.16.
+# Source: user journey J4. UI text aligned with the 0.3.17 release candidate.
 # This journey is about the repository integration, so it is switched on.
 @needs-github
 Feature: J4 - User runs a Task on a repository
@@ -15,14 +15,14 @@ Feature: J4 - User runs a Task on a repository
     And I hold an Envelope from the template "standard"
 
   # Steps 1 to 6.
-  # The runtime does not find the checked-out repository yet (#464).
-  @smoke @needs-model @known-failing-464
+  # The runtime reads the checked-out repository and publishes the requested output.
+  @smoke @needs-model
   Scenario: Run a Task on a named repository and branch
     When I open "Tasks"
     And I press "New Task"
     And I type "Read the repository" into "Name"
     And I choose "standard" in "Envelope"
-    And I type "List the files in the top folder of the repository and write them to files.txt." into "Prompt"
+    And I type "List the files in the top folder of the repository and write them to out/files.txt." into "Prompt"
     Then the drop-down "Workspace repository" offers "No repository checkout"
     And the drop-down "Workspace repository" offers "<owner>/<repository>"
     When I choose "<owner>/<repository>" in "Workspace repository"

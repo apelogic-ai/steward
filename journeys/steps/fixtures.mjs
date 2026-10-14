@@ -1,6 +1,8 @@
 import { expect } from "@playwright/test";
 import { createBdd, test as base } from "playwright-bdd";
 
+import { onlyOnboardingRequestUnavailable } from "../onboarding-console-errors.mjs";
+
 const shared = {
   checkedPrefixes: new Set(),
 };
@@ -10,13 +12,16 @@ export const test = base.extend({
     const consoleErrors = [];
     const pageErrors = [];
     const onConsole = (message) => {
-      if (message.type() === "error") consoleErrors.push(message.text());
+      if (message.type() === "error") {
+        consoleErrors.push({ text: message.text(), url: message.location().url });
+      }
     };
     const onPageError = (error) => pageErrors.push(error.message);
     page.on("console", onConsole);
     page.on("pageerror", onPageError);
-    await use({
+    const state = {
       expectNoTemplates: false,
+      extended: testInfo.tags.includes("@extended"),
       currentTemplate: null,
       modelAliases: new Map(),
       initialCounts: new Map(),
@@ -25,15 +30,21 @@ export const test = base.extend({
       requests: new Map(),
       repository: null,
       run: null,
+      initialRunIds: null,
       runRuntimeMinutes: null,
+      statedSingleRunLimit: null,
       selectedModels: [],
       shared,
       transientSeen: new Set(),
-    });
+    };
+    await use(state);
     page.off("console", onConsole);
     page.off("pageerror", onPageError);
-    expect(consoleErrors, "the journey must not emit browser console errors").toEqual([]);
     expect(pageErrors, "the journey must not emit uncaught page errors").toEqual([]);
+    if (state.knownIssue === "@known-failing-478" && onlyOnboardingRequestUnavailable(consoleErrors, page.url())) {
+      throw new Error(`[steward-known-failure:#478] the onboarding page emitted browser console errors: ${consoleErrors.length}`);
+    }
+    expect(consoleErrors, "the journey must not emit browser console errors").toEqual([]);
   },
 });
 
