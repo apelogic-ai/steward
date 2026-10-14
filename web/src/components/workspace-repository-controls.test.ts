@@ -1,11 +1,13 @@
 import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { readFileSync } from "node:fs";
 
 import type { GithubRepositoryView } from "@/api-client";
 
 import {
   canonicalWorkspaceRef,
+  defaultWorkspaceName,
   editWorkspaceReference,
   matchingWorkspaceRepository,
   readableWorkspaceRef,
@@ -13,6 +15,11 @@ import {
   validWorkspaceBranchOrTag,
   WorkspaceRepositoryControls,
 } from "./workspace-repository-controls";
+
+const workspaceNameCases = JSON.parse(readFileSync(new URL("../../../tests/fixtures/workspace-name-cases.json", import.meta.url), "utf8")) as Array<{
+  repositoryName: string;
+  workspaceName: string | null;
+}>;
 
 const repository: GithubRepositoryView = {
   defaultBranch: "main",
@@ -24,6 +31,12 @@ const repository: GithubRepositoryView = {
   repositoryId: "1001",
   url: "https://github.com/example-org/repository.git",
 };
+
+test("Task-form workspace paths follow the server workspace-name cases", () => {
+  for (const { repositoryName, workspaceName } of workspaceNameCases) {
+    expect(defaultWorkspaceName(repositoryName)).toBe(workspaceName);
+  }
+});
 
 test("the structured picker adds a readable repository and canonical named ref", () => {
   const updated = updateWorkspaceRepository("[]", repository, "release-v1");

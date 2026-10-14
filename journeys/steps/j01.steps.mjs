@@ -1,6 +1,7 @@
 import { expect } from "@playwright/test";
 
 import { isIssue414RunFailure } from "../run-failure-markers.mjs";
+import { defaultWorkspaceName } from "../workspace-name.mjs";
 import { Given, Then, When } from "./fixtures.mjs";
 
 const runPrefix = process.env.STEWARD_JOURNEY_RUN_PREFIX;
@@ -26,24 +27,6 @@ function formatRuntimeMinutes(offset) {
 
 function templateId(name) {
   return `${runPrefix}-${name}`;
-}
-
-function defaultWorkspaceName(repositoryName) {
-  let normalized = "";
-  let previousDash = false;
-  for (const byte of new TextEncoder().encode(repositoryName)) {
-    const alphaNumeric = byte >= 48 && byte <= 57 || byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122;
-    const next = alphaNumeric ? String.fromCharCode(byte).toLocaleLowerCase("en-US") : "-";
-    if (next === "-") {
-      if (!normalized || previousDash) continue;
-      previousDash = true;
-    } else {
-      previousDash = false;
-    }
-    if (normalized.length === 40) break;
-    normalized += next;
-  }
-  return normalized.replace(/-+$/, "");
 }
 
 function resolveText(journey, text) {

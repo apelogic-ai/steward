@@ -32,7 +32,7 @@ function firstGitEntry(entries: unknown[]): { index: number; entry: WorkspaceObj
   return null;
 }
 
-function defaultWorkspaceName(repositoryName: string): string | null {
+export function defaultWorkspaceName(repositoryName: string): string | null {
   let normalized = "";
   let previousDash = false;
   for (const byte of new TextEncoder().encode(repositoryName)) {
