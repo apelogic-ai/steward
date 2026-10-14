@@ -279,11 +279,18 @@ async fn managed_inference_returns_credential_for_verified_owner_and_model_autho
 
 fn binding_with_tool() -> Result<AuthorityBinding, String> {
     let mut binding = active_binding()?;
-    binding.tools.push(ToolGrant {
-        provider: "github".to_owned(),
-        resource: "repositories".to_owned(),
-        action: "list".to_owned(),
-    });
+    binding.tools.extend([
+        ToolGrant {
+            provider: "github".to_owned(),
+            resource: "repositories".to_owned(),
+            action: "list".to_owned(),
+        },
+        ToolGrant {
+            provider: "jira".to_owned(),
+            resource: "jira_get_issue".to_owned(),
+            action: "read".to_owned(),
+        },
+    ]);
     Ok(binding)
 }
 

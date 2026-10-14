@@ -1453,7 +1453,8 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     let status_count = harness.operation_count(&alice_id, "status").await?;
     let status_broker = broker.clone();
     let status_session = alice.clone();
-    let status_task = tokio::spawn(async move { status_broker.status(&status_session).await });
+    let status_task =
+        tokio::spawn(async move { status_broker.status(&status_session, "github").await });
     let restarted_status = harness
         .latest_operation(&alice_id, "status", status_count)
         .await?;
@@ -1468,7 +1469,8 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     let status_count = harness.operation_count(&alice_id, "status").await?;
     let status_broker = broker.clone();
     let status_session = alice.clone();
-    let status_task = tokio::spawn(async move { status_broker.status(&status_session).await });
+    let status_task =
+        tokio::spawn(async move { status_broker.status(&status_session, "github").await });
     let reconciler_restart_status = harness
         .latest_operation(&alice_id, "status", status_count)
         .await?;
@@ -1485,7 +1487,8 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     let status_count = harness.operation_count(&alice_id, "status").await?;
     let cancelled_broker = broker.clone();
     let cancelled_session = alice.clone();
-    let cancelled = tokio::spawn(async move { cancelled_broker.status(&cancelled_session).await });
+    let cancelled =
+        tokio::spawn(async move { cancelled_broker.status(&cancelled_session, "github").await });
     let cancelled_status = harness
         .latest_operation(&alice_id, "status", status_count)
         .await?;
@@ -1501,7 +1504,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     let preempted_status_session = alice.clone();
     let preempted_status_task = tokio::spawn(async move {
         preempted_status_broker
-            .status(&preempted_status_session)
+            .status(&preempted_status_session, "github")
             .await
     });
     let preempted_status = harness
@@ -1755,7 +1758,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
 
     harness.callback(state)?;
     assert_eq!(
-        connection_result(broker.status(&alice).await)?.phase,
+        connection_result(broker.status(&alice, "github").await)?.phase,
         ConnectionPhase::Connected
     );
     harness.assert_agentgateway_requires_a_session(ALICE_NAMESPACE, ALICE_RUNTIME)?;
@@ -1799,7 +1802,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
         .await?;
     harness.callback(oauth_state(reauthorization.authorization_url.as_str())?)?;
     assert_eq!(
-        connection_result(broker.status(&alice).await)?.phase,
+        connection_result(broker.status(&alice, "github").await)?.phase,
         ConnectionPhase::Connected,
         "connected-state start must complete as reauthorization without an intervening disconnect"
     );
@@ -1929,7 +1932,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
 
     let bob_status_count = harness.operation_count(&bob_id, "status").await?;
     assert_eq!(
-        connection_result(broker.status(&bob).await)?.phase,
+        connection_result(broker.status(&bob, "github").await)?.phase,
         ConnectionPhase::Disconnected
     );
     let bob_status = harness
@@ -1981,7 +1984,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     let operator_status_session = alice.clone();
     let operator_status_task = tokio::spawn(async move {
         operator_status_broker
-            .status(&operator_status_session)
+            .status(&operator_status_session, "github")
             .await
     });
     let operator_status = harness
@@ -2016,8 +2019,11 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     let drifted_status_count = harness.operation_count(&alice_id, "status").await?;
     let drifted_status_broker = broker.clone();
     let drifted_status_session = alice.clone();
-    let drifted_status_task =
-        tokio::spawn(async move { drifted_status_broker.status(&drifted_status_session).await });
+    let drifted_status_task = tokio::spawn(async move {
+        drifted_status_broker
+            .status(&drifted_status_session, "github")
+            .await
+    });
     let drifted_status = harness
         .latest_operation(&alice_id, "status", drifted_status_count)
         .await?;
@@ -2026,7 +2032,7 @@ async fn governed_connections_share_the_runtime_credential_owner_and_cleanup_exa
     let replacement_status_session = alice.clone();
     let replacement_status_task = tokio::spawn(async move {
         replacement_status_broker
-            .status(&replacement_status_session)
+            .status(&replacement_status_session, "github")
             .await
     });
     let replacement_status = harness

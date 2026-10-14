@@ -838,6 +838,7 @@ export type CapabilityCatalog = {
 export type CapabilityProviderCatalog = {
     available: boolean;
     catalogId: string;
+    displayName?: string | null;
     provider: string;
     version: string;
 };
@@ -1467,6 +1468,8 @@ export type Principal = {
 
 export type PromptSourceKind = 'path' | 'inline';
 
+export type ProviderConnectionAction = 'start' | 'disconnect';
+
 export type ProviderConnectionStatus = {
     accountEmail?: string | null;
     accountId?: string | null;
@@ -1482,6 +1485,7 @@ export type ProviderConnectionStatus = {
 };
 
 export type ProviderConnectionView = {
+    actions: Array<ProviderConnectionAction>;
     displayName: string;
     provider: string;
     status: ProviderConnectionStatus;
@@ -4021,10 +4025,6 @@ export type ListProviderConnectionsErrors = {
      * Browser session is absent or invalid
      */
     401: unknown;
-    /**
-     * Connection broker is unavailable
-     */
-    503: unknown;
 };
 
 export type ListProviderConnectionsResponses = {

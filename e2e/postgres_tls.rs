@@ -60,6 +60,7 @@ impl ProviderConnectionBroker<String> for NoopConnectionMutations {
     fn status<'a>(
         &'a self,
         _session: &'a ConnectionSession<String>,
+        _provider: &'a str,
     ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
         Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
     }
@@ -1894,13 +1895,16 @@ async fn direct_connection_status(
     })?;
     let broker = SplitConnectionsBroker::new(NoopConnectionMutations, reader);
     broker
-        .status(&ConnectionSession {
-            subject: ConnectionSubject {
-                canonical_user_id: canonical_user_id.clone(),
-                display_email: "alice@example.com".to_owned(),
+        .status(
+            &ConnectionSession {
+                subject: ConnectionSubject {
+                    canonical_user_id: canonical_user_id.clone(),
+                    display_email: "alice@example.com".to_owned(),
+                },
+                binding: "browser-session".to_owned(),
             },
-            binding: "browser-session".to_owned(),
-        })
+            "github",
+        )
         .await
         .map_err(|error| io::Error::other(format!("direct status failed: {error:?}")))
         .map_err(Into::into)
