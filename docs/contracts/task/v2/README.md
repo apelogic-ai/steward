@@ -102,7 +102,9 @@ packages retain their exact bytes, closure, digest and runtime behavior.
 An optional `workspace` array supplies working data without giving the sandbox source
 credentials. Each item is exactly one of `{"git": {...}}` or
 `{"scratch": {...}}` and is materialized beneath `/sandbox/workspace/<name>` before
-the agent starts. Omitting `workspace` preserves the prior runtime behavior.
+the agent starts. The extracted input root remains the working directory. Before a coding
+agent starts, its prompt names every repository and its exact materialized path, including
+whether the checkout is read-only. Omitting `workspace` preserves the prior runtime behavior.
 
 A Git entry normally identifies a repository by its familiar `owner/repository` name:
 
@@ -223,6 +225,10 @@ The caller cannot supply this shape. Retries must match it exactly and cannot sw
 source bytes, authority, provenance, or diagnostics.
 
 ## Successful execution transcript
+
+A successful agent Task must create at least one regular file beneath `out/`. A missing or
+empty `out/` tree fails the run with `This run finished without creating an output file.`
+instead of publishing an empty archive.
 
 When and only when snapshotted diagnostics is `full`, the successful Task output archive
 delivered to the authenticated runner at `GET /v1/tasks/{taskUid}/outputs` contains two

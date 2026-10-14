@@ -77,6 +77,8 @@ impl ClaudeCodeTaskExecutionAdapter {
                 "test \"$#\" -ge 8; ",
                 "prompt=$1; model=$2; inference_endpoint=$3; mcp_config=$4; ",
                 "config_dir=$5; executable=$6; expected_version=$7; shift 7; ",
+                "repository_context=${{STEWARD_REPOSITORY_CONTEXT-}}; ",
+                "if [ -n \"$repository_context\" ]; then prompt=$(printf '%s\\n\\n%s' \"$repository_context\" \"$prompt\"); fi; ",
                 "command -v id >/dev/null 2>&1; test \"$(id -u)\" -ne 0; ",
                 "export CLAUDE_CONFIG_DIR=\"$config_dir\"; ",
                 "unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX ",
@@ -297,6 +299,8 @@ mod tests {
         assert!(shell.contains("--permission-mode bypassPermissions"));
         assert!(shell.contains("--no-session-persistence"));
         assert!(shell.contains("--disable-slash-commands"));
+        assert!(shell.contains("STEWARD_REPOSITORY_CONTEXT"));
+        assert!(shell.contains("prompt=$(printf"));
         assert!(shell.contains("--strict-mcp-config --mcp-config"));
         assert!(shell.contains("| tee \"$STEWARD_OUTPUT_DIR/result.txt\""));
         assert!(shell.contains("status=$(cat \"$status_file\")"));

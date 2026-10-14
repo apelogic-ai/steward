@@ -101,6 +101,8 @@ impl TaskExecutionAdapter for CodexTaskExecutionAdapter {
                 "test \"$#\" -ge 6; ",
                 "prompt=$1; model=$2; adapter_config=$3; executable=$4; expected_version=$5; ",
                 "shift 5; ",
+                "repository_context=${{STEWARD_REPOSITORY_CONTEXT-}}; ",
+                "if [ -n \"$repository_context\" ]; then prompt=$(printf '%s\\n\\n%s' \"$repository_context\" \"$prompt\"); fi; ",
                 "test \"$(\"$executable\" \"$@\")\" = \"$expected_version\"; ",
                 "export CODEX_HOME=/sandbox/steward-codex; ",
                 "mkdir -p \"$CODEX_HOME\" \"$STEWARD_OUTPUT_DIR/out\"; ",
@@ -202,6 +204,8 @@ mod tests {
         assert!(shell.contains("OPENAI_API_KEY=openshell-token-grant-placeholder"));
         assert!(shell.contains("STEWARD_MCP_GW_BEARER_TOKEN=openshell-token-grant-placeholder"));
         assert!(shell.contains("--model \"$model\""));
+        assert!(shell.contains("STEWARD_REPOSITORY_CONTEXT"));
+        assert!(shell.contains("prompt=$(printf"));
         assert!(shell.contains("ln -s \"$STEWARD_OUTPUT_DIR/out\" out"));
         assert!(!shell.contains("$STEWARD_OUTPUT_DIR/out/result.txt"));
         assert!(shell.contains("--ephemeral"));
