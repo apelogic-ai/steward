@@ -12,7 +12,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Coding agents now receive the exact path of every repository workspace in their prompt, so a
   plain request about a repository can find its files while staged caller input and declared
   outputs keep their existing relative paths. A run that creates no regular file beneath `out/`
-  now fails with a plain explanation instead of succeeding with no downloadable output.
+  now fails with a plain explanation instead of succeeding with no downloadable output. Task
+  pages show known repository checkout paths and identify paths resolved when a Run starts; Run
+  pages show every resolved checkout path. Both surfaces identify read-only checkouts.
 - Claude Code Tasks without connected tools now start normally, and Runs that cannot start
   because of invalid coding-agent settings show a plain explanation.
 - Per-run inference limits now cap each runtime's gateway key, account for spend already consumed

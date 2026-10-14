@@ -98,7 +98,7 @@ test("run details show pinned Git and skipped submodule workspace evidence", () 
   const html = renderToStaticMarkup(<WorkspaceEvidencePanel workspace={workspace} />);
 
   expect(html).toContain("Workspace");
-  expect(html).toContain("example-org/source");
+  expect(html).toContain('<strong class="block">example-org/source</strong><span class="block text-xs text-muted-ink">Workspace entry: source</span><span class="text-xs text-muted-ink"><code class="text-ink">/sandbox/workspace/source</code> · read-only</span>');
   expect(html).toContain("depth 25");
   expect(html).toContain("Repository details");
   expect(html).toContain("1000");
