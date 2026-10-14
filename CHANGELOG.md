@@ -13,7 +13,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   because of invalid coding-agent settings show a plain explanation.
 - Per-run inference limits now cap each runtime's gateway key, account for spend already consumed
   by the same Envelope instance, and fail the Run with a plain spending-limit reason after the
-  gateway refuses the next model call. The last call can exceed the configured amount.
+  gateway refuses further model calls. The API and Run page show that reason and mark observed
+  spend exhausted; spending in the last few seconds can exceed the configured amount.
 - Task cleanup now records one final inference-spend observation before deleting the run key, so
   short runs no longer finish with stale zero spend or disappear from monthly Envelope usage.
 - Approving a custom or template Envelope request that exactly matches authority the user already

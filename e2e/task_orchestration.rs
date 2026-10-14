@@ -30,15 +30,17 @@ use steward_apiserver::governed_connections::{
     GovernedConnectionsConfig,
 };
 use steward_apiserver::{
-    AuthenticatedCaller, AuthenticationError, BoxFuture, RequestAuthenticator, operator_admin,
+    AuthenticatedCaller, AuthenticationError, BoxFuture, KubeRuntimeRepository,
+    RequestAuthenticator, operator_admin,
 };
 use steward_controller::{
     ManagedInferencePlane, TaskControllerError, reconcile_agent_runtime_work_item,
     reconcile_task_orchestration_work_item, webhook_router_for_controller,
 };
 use steward_ports::{
-    InferenceCapabilities, InferenceCredential, InferenceObservation, InferencePlane,
-    InferenceRequest, PortError, ProviderControlExecutionBindings, ProvisionedInference,
+    DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, InferenceCapabilities,
+    InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest, PortError,
+    ProviderControlExecutionBindings, ProvisionedInference,
     SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxObservation, SandboxRequest, SandboxRuntime,
     SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
     SandboxTaskTranscript, TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
@@ -80,6 +82,23 @@ const OPERATOR_USERNAME: &str = "system:serviceaccount:steward-test:operator";
 
 #[derive(Clone)]
 struct OperatorTestAuthenticator;
+
+#[derive(Clone)]
+struct UnavailableDecisionChannel;
+
+impl DecisionChannel for UnavailableDecisionChannel {
+    async fn request(&self, _request: &DecisionRequest) -> Result<DecisionReference, PortError> {
+        Err(PortError::Rejected {
+            reason: "decision channel is unavailable in this run-view test".to_owned(),
+        })
+    }
+
+    async fn record_resolution(&self, _resolution: &DecisionResolution) -> Result<(), PortError> {
+        Err(PortError::Rejected {
+            reason: "decision channel is unavailable in this run-view test".to_owned(),
+        })
+    }
+}
 
 impl RequestAuthenticator for OperatorTestAuthenticator {
     fn authenticate<'a>(
@@ -6018,6 +6037,29 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
         0,
         "per-run Task failure must not create a monthly escalation"
     );
+
+    let app = steward_apiserver::router(
+        KubeRuntimeRepository::new(client.clone()),
+        store,
+        OperatorTestAuthenticator,
+        UnavailableDecisionChannel,
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/admin/api/v1/runs/{task_uid}"))
+                .header("authorization", "Bearer operator-token")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        body["run"]["failureReason"],
+        "This run reached its spending limit of 0.50 USD."
+    );
+    assert_eq!(body["run"]["observedSpend"]["exhausted"], true);
     Ok(())
 }
 

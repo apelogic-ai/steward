@@ -459,7 +459,8 @@ impl AdmissionDelta {
     }
 }
 
-fn format_money(amount: &str, currency: &str) -> String {
+/// Formats a validated decimal amount for user-facing messages.
+pub fn format_money(amount: &str, currency: &str) -> String {
     let Ok((integer, fractional)) = decimal_parts(amount) else {
         return format!("{amount} {currency}");
     };
