@@ -41,6 +41,7 @@ export const test = base.extend({
     const state = {
       expectNoTemplates: false,
       extended: testInfo.tags.includes("@extended"),
+      jira: testInfo.tags.includes("@needs-jira"),
       currentTemplate: null,
       modelAliases: new Map(),
       initialCounts: new Map(),

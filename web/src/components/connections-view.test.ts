@@ -17,7 +17,7 @@ describe("governed provider connection controls", () => {
   });
 
   test("distinguishes an outstanding OAuth flow from an ordinary conflict", () => {
-    expect(source).toContain("Finish or wait for the pending GitHub authorization");
+    expect(source).toContain("Finish or wait for the pending ${providerName} authorization");
   });
 
   test("explains that connections stay disabled until task runs are enabled", () => {
@@ -43,32 +43,32 @@ describe("governed provider connection controls", () => {
   });
 
   test("shows the bounded terminal connection failure category", () => {
-    expect(source).toContain("GitHub authorization couldn't be completed");
+    expect(source).toContain("${providerName} authorization couldn't be completed");
     expect(source).toContain("<summary className=\"cursor-pointer\">Details</summary>");
     expect(source).toContain("{startFailure.error}");
     expect(source).toContain("{startFailure.code}");
     expect(source).toContain("runtime_authentication_failed");
-    expect(source).toContain("Re-authorize GitHub");
+    expect(source).toContain("Re-authorize ${providerName}");
     expect(source).toContain("proxy_policy_denied");
     expect(source).toContain("current connection settings");
     expect(source).toContain("provider_authorization_failed");
     expect(source).toContain("review its access");
     expect(source).toContain("token_grant_failed");
-    expect(source).toContain("GitHub access couldn't be prepared");
+    expect(source).toContain("${providerName} access couldn't be prepared");
     expect(source).toContain("provider_response_invalid");
-    expect(source).toContain("GitHub returned an unexpected response");
+    expect(source).toContain("${providerName} returned an unexpected response");
     expect(source).toContain("gateway_transport_failed");
-    expect(source).toContain("Steward couldn't reach GitHub");
+    expect(source).toContain("Steward couldn't reach ${providerName}");
     expect(source).toContain("gateway_status_invalid");
     expect(source).toContain("installed connection services");
     expect(source).toContain("gateway_body_unavailable");
     expect(source).toContain("gateway_unavailable");
     expect(source).toContain("gateway_session_failed");
-    expect(source).toContain("GitHub connection couldn't be started");
+    expect(source).toContain("${providerName} connection couldn't be started");
     expect(source).toContain("runtime_create_failed");
-    expect(source).toContain("temporary GitHub connection couldn't be created");
+    expect(source).toContain("temporary ${providerName} connection couldn't be created");
     expect(source).toContain("runtime_start_failed");
-    expect(source).toContain("temporary GitHub connection couldn't start");
+    expect(source).toContain("temporary ${providerName} connection couldn't start");
     expect(source).toContain("connection_deadline_exceeded");
     expect(source).toContain("did not become ready in time");
     expect(source).toContain("bridge_result_too_large");
@@ -93,20 +93,21 @@ describe("governed provider connection controls", () => {
 
   test("shows a reauthorization action when a reported credential deadline approaches", () => {
     expect(source).toContain('connectionHealth(status)');
-    expect(source).toContain('Re-authorize GitHub');
+    expect(source).toContain('`Re-authorize ${providerName}`');
     expect(source).toContain('renewalCredentialExpiresAt');
   });
 
-  test("keeps the provider card and recovery action available without status metadata", () => {
-    expect(source).toContain('<ProviderConnection metadataState={state.status}');
-    expect(source).toContain('Authorize / re-authorize GitHub');
-    expect(source).toContain('Status unavailable');
+  test("renders server-owned provider rows and only their advertised actions", () => {
+    expect(source).toContain("state.value.connections");
+    expect(source).toContain('connection.actions.includes("start")');
+    expect(source).toContain('connection.actions.includes("disconnect")');
+    expect(source).not.toContain("providerConnectionCards");
   });
 
   test("shows the stable GitHub account identity and Actions link state", () => {
-    expect(source).toContain('GitHub ID ${status.accountId}');
+    expect(source).toContain('connection.provider === "github" ? "GitHub ID" : "Account ID"');
     expect(source).toContain('GitHub Actions runs as you: linked.');
-    expect(source).toContain('status?.githubActionsIdentityLinked === false');
+    expect(source).toContain('connection.provider === "github" && status.githubActionsIdentityLinked === false');
   });
 
   test("separates tool connections from deployment-mode-aware inference custody", () => {

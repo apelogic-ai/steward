@@ -1,8 +1,9 @@
 # User journeys as feature files
 
-Ten journeys for the web UI (brand name in the UI: HyperShell), one file each. A journey is one person, one goal, from start to finish. The files are plain text that a person can read and a test runner can run.
+Eleven journeys for the web UI (brand name in the UI: HyperShell), one file each. A journey is one person, one goal, from start to finish. The files are plain text that a person can read and a test runner can run.
 
-The feature set comes from the user-journey specification (J1 to J10). The runner loads all ten
+The feature set comes from the user-journey specification (J1 to J10), plus the Jira acceptance
+journey J11. The runner loads all eleven
 files. `@smoke` executes the release-critical paths in J1 through J4; `@extended` executes the
 currently passing one-account paths in J6 through J8. J5's documented paths still carry product
 findings, J9 needs a second signed-in person, and J10 needs operator control of the installation,
@@ -20,6 +21,7 @@ so those paths remain specifications until those prerequisites and expected outc
 | `J08-…` | User chooses agent and model |
 | `J09-…` | Administrator oversight |
 | `J10-…` | Operator changes configuration |
+| `J11-…` | User runs a Task with Jira |
 
 `STEPS.md` lists every sentence pattern the files use.
 
@@ -66,6 +68,7 @@ so those paths remain specifications until those prerequisites and expected outc
 | `timed` | Template: runtime limit of 60 min per month, no workspace types. |
 | `basic` | Template: no workspace access, one allowed model, no runtime limit. |
 | `broad` | Template: models from two providers. |
+| `jira-read` | Template: exactly one Jira read tool and no workspace access. |
 | `no-agent` | Template whose only model works with no configured agent (added for J8; not in the specification). |
 | `<owner>/<repository>` | A repository the installation allows. `<owner>/<other-repository>` is one it does not allow. |
 | `<Agent A>`, `<Agent B>` | The two coding agents, by the name the UI shows. `<agent-b>` is the short name. |
@@ -85,6 +88,7 @@ Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test
 | `@extended` | One-account coverage beyond smoke: J6's accepted requirements, J7's terminal captured/no-capture logs, and J8's agent/model selection and Task persistence. Run after `@smoke` with the same prefix. |
 | `@needs-model` | Makes a real model call. Costs money. |
 | `@needs-github` | Needs an external repository that the installation allows. |
+| `@needs-jira` | Needs a connected Jira account and the `jira-read` template fixture created after `@smoke` with the same run prefix. |
 | `@two-accounts` | Needs a second signed-in person. |
 | `@operator` | Needs a change to the installation outside the UI. |
 | `@nightly` | Long. Not for every build. |
@@ -106,7 +110,7 @@ When a file holds a sentence that has no code:
 
 So a maintainer can write a new sentence at any time. The cost is one request to a test engineer, and the scenario stays unproven until it is answered. Reusing a pattern from `STEPS.md` costs nothing.
 
-The runner includes all ten files, but tags select only the intended scenarios. Feature
+The runner includes all eleven files, but tags select only the intended scenarios. Feature
 specifications without step code do not look tested: selecting one fails generation before a
 browser starts.
 
@@ -147,6 +151,13 @@ objects under that prefix:
 
 ```console
 cargo xtask journeys --tags @extended
+```
+
+After the owner connects Jira, run its acceptance journey with the same prefix that created the
+`standard` template during smoke:
+
+```console
+cargo xtask journeys --tags @needs-jira
 ```
 
 The extended fixture authors run-prefixed `basic` and `broad` templates through the real admin API
