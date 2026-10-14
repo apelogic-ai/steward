@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Claude Code Tasks without connected tools now start normally, and Runs that cannot start
+  because of invalid coding-agent settings show a plain explanation.
 - Per-run inference limits now cap each runtime's gateway key, account for spend already consumed
   by the same Envelope instance, and fail the Run with a plain spending-limit reason after the
   gateway refuses the next model call. The last call can exceed the configured amount.

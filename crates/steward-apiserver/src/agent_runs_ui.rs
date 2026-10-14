@@ -2802,8 +2802,8 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         .user_envelope_snapshot
         .as_ref()
         .and_then(|envelope| envelope.spec.runtime_minutes_limit.clone());
-    let failure_reason = public_task_runtime_limit_failure_reason(record.failure_reason.as_deref())
-        .map(str::to_owned);
+    let failure_reason =
+        public_run_failure_reason(record.failure_reason.as_deref()).map(str::to_owned);
     BrowserRunView {
         task_uid: record.task_uid,
         origin: record.task_origin,
@@ -2844,9 +2844,15 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
     }
 }
 
-fn public_task_runtime_limit_failure_reason(reason: Option<&str>) -> Option<&str> {
+fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
+    const INVALID_COMMAND: &str = "task command must contain only non-empty arguments";
+    const INVALID_COMMAND_REASON: &str =
+        "This run could not start because its coding agent settings were invalid.";
     const PREFIX: &str = "This run reached its limit of ";
     let reason = reason?;
+    if reason == INVALID_COMMAND {
+        return Some(INVALID_COMMAND_REASON);
+    }
     let value = reason.strip_prefix(PREFIX)?;
     let limit = value
         .strip_suffix(" minute.")
@@ -3954,7 +3960,7 @@ mod tests {
     }
 
     #[test]
-    fn run_snapshot_exposes_only_the_bounded_task_runtime_limit_reason() -> Result<(), String> {
+    fn run_snapshot_exposes_only_bounded_plain_failure_reasons() -> Result<(), String> {
         let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
             .map_err(|error| error.to_string())?;
         let private = browser_run_view(run(task_uid, "usr_0123456789abcdef0123456789abcdef"));
@@ -3965,6 +3971,14 @@ mod tests {
         assert_eq!(
             browser_run_view(limited).failure_reason.as_deref(),
             Some("This run reached its limit of 30 minutes.")
+        );
+
+        let mut invalid_command = run(task_uid, "usr_0123456789abcdef0123456789abcdef");
+        invalid_command.failure_reason =
+            Some("task command must contain only non-empty arguments".to_owned());
+        assert_eq!(
+            browser_run_view(invalid_command).failure_reason.as_deref(),
+            Some("This run could not start because its coding agent settings were invalid.")
         );
         Ok(())
     }
