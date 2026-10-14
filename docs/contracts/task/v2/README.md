@@ -102,10 +102,9 @@ packages retain their exact bytes, closure, digest and runtime behavior.
 An optional `workspace` array supplies working data without giving the sandbox source
 credentials. Each item is exactly one of `{"git": {...}}` or
 `{"scratch": {...}}` and is materialized beneath `/sandbox/workspace/<name>` before
-the agent starts. When the resolved workspace contains exactly one Git entry, the agent
-starts in that repository directory; zero or multiple Git entries keep the extracted input
-root as the working directory. Staged caller input remains available at
-`/sandbox/steward-input`. Omitting `workspace` preserves the prior runtime behavior.
+the agent starts. The extracted input root remains the working directory. Before a coding
+agent starts, its prompt names every repository and its exact materialized path, including
+whether the checkout is read-only. Omitting `workspace` preserves the prior runtime behavior.
 
 A Git entry normally identifies a repository by its familiar `owner/repository` name:
 

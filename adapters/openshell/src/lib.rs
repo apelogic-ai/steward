@@ -505,17 +505,27 @@ fn output_archive_command(
 }
 
 #[cfg(feature = "runtime")]
-fn task_process_workdir(workspace: Option<&WorkspaceEvidence>) -> String {
-    let mut repositories = workspace.into_iter().flat_map(|workspace| {
-        workspace.entries.iter().filter_map(|entry| match entry {
-            ResolvedWorkspaceEntry::Git { name, .. } => Some(name.as_str()),
+fn repository_prompt_context(workspace: Option<&WorkspaceEvidence>) -> String {
+    workspace
+        .into_iter()
+        .flat_map(|workspace| &workspace.entries)
+        .filter_map(|entry| match entry {
+            ResolvedWorkspaceEntry::Git { name, access, .. } => Some(match access {
+                WorkspaceAccess::ReadOnly => format!(
+                    "Repository `{}` is checked out read-only at `/sandbox/workspace/{}`.",
+                    name.as_str(),
+                    name.as_str()
+                ),
+                WorkspaceAccess::Copy => format!(
+                    "Repository `{}` is checked out at `/sandbox/workspace/{}`.",
+                    name.as_str(),
+                    name.as_str()
+                ),
+            }),
             ResolvedWorkspaceEntry::Scratch { .. } => None,
         })
-    });
-    match (repositories.next(), repositories.next()) {
-        (Some(name), None) => format!("/sandbox/workspace/{name}"),
-        _ => "/sandbox/steward-input".to_owned(),
-    }
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(feature = "runtime")]
@@ -1750,7 +1760,6 @@ impl OpenShellRuntime {
         &self,
         sandbox_id: &str,
         command: &[String],
-        workdir: &str,
         environment: HashMap<String, String>,
         execution_class: SandboxExecutionClass,
         context: TaskProcessLogContext<'_>,
@@ -1760,7 +1769,7 @@ impl OpenShellRuntime {
             .exec_sandbox(ExecSandboxRequest {
                 sandbox_id: sandbox_id.to_owned(),
                 command: command.to_vec(),
-                workdir: workdir.to_owned(),
+                workdir: "/sandbox/steward-input".to_owned(),
                 environment,
                 timeout_seconds: 30 * 60,
                 stdin: Vec::new(),
@@ -2624,7 +2633,6 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             self.stage_workspace_archive(workspace, sandbox, archive, evidence)
                 .await?;
         }
-        let workdir = task_process_workdir(request.workspace.as_ref());
         let sandbox_id = self
             .resolve_raw_sandbox_binding(
                 workspace,
@@ -2638,6 +2646,10 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         environment.insert(
             "STEWARD_OUTPUT_DIR".to_owned(),
             "/sandbox/steward-output".to_owned(),
+        );
+        environment.insert(
+            "STEWARD_REPOSITORY_CONTEXT".to_owned(),
+            repository_prompt_context(request.workspace.as_ref()),
         );
         if is_connections_bridge {
             let origin = match request.execution_class {
@@ -2679,7 +2691,6 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             .exec_task_process(
                 &sandbox_id,
                 &["/bin/sh".to_owned(), "-c".to_owned(), process_command],
-                &workdir,
                 environment,
                 request.execution_class,
                 TaskProcessLogContext {
@@ -3452,16 +3463,16 @@ mod tests {
         WorkloadExchangeTokenProvider, attach_task_agent_failure_category,
         collect_task_process_stream, delete_owned_sandbox, deletion_names, load_source_credential,
         output_archive_command, project_request, provider_reconciliation,
-        provider_reconciliation_plan, provider_reconciliation_targets, request_model_providers,
-        sandbox_spec, sanitized_provider_control_transcript, staging_append_command,
-        staging_archive_chunks, staging_extract_command, staging_prepare_command,
-        task_agent_failure_category, task_attempt_cancel_command,
+        provider_reconciliation_plan, provider_reconciliation_targets, repository_prompt_context,
+        request_model_providers, sandbox_spec, sanitized_provider_control_transcript,
+        staging_append_command, staging_archive_chunks, staging_extract_command,
+        staging_prepare_command, task_agent_failure_category, task_attempt_cancel_command,
         task_attempt_detached_launch_command, task_attempt_directory,
         task_attempt_execution_command, task_attempt_observation_command,
         task_attempt_transcript_stream_command, task_failure_category, task_process_launch_mode,
-        task_process_log_record, task_process_workdir, task_transcript_requested,
-        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
-        workspace_materialization_command, workspace_preparation_failed,
+        task_process_log_record, task_transcript_requested, validate_raw_sandbox_binding,
+        validate_workload_exchange_endpoint, workspace_materialization_command,
+        workspace_preparation_failed,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -4218,7 +4229,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn one_repository_workspace_is_the_agent_working_directory() -> Result<(), String> {
+    fn repository_prompt_context_names_every_git_checkout() -> Result<(), String> {
         let repository = |name: &str, commit: char| -> Result<ResolvedWorkspaceEntry, String> {
             Ok(ResolvedWorkspaceEntry::Git {
                 name: WorkspaceName::parse(name)?,
@@ -4260,17 +4271,14 @@ mod tests {
         };
 
         assert_eq!(
-            task_process_workdir(Some(&workspace(vec![repository("source", 'a')?, scratch])?)),
-            "/sandbox/workspace/source"
-        );
-        assert_eq!(
-            task_process_workdir(Some(&workspace(vec![
+            repository_prompt_context(Some(&workspace(vec![
                 repository("source", 'a')?,
+                scratch,
                 repository("other", 'b')?,
             ])?)),
-            "/sandbox/steward-input"
+            "Repository `source` is checked out read-only at `/sandbox/workspace/source`.\nRepository `other` is checked out read-only at `/sandbox/workspace/other`."
         );
-        assert_eq!(task_process_workdir(None), "/sandbox/steward-input");
+        assert_eq!(repository_prompt_context(None), "");
         Ok(())
     }
 

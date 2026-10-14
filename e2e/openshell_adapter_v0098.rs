@@ -1,17 +1,20 @@
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+use steward_adapter_codex::{CODEX_V1_ADAPTER, CodexTaskExecutionAdapter};
 use steward_adapter_openshell::{
     OpenShellConnectionConfig, OpenShellRuntime, OpenShellTaskLogMode,
 };
 use steward_ports::{
     PortError, SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
     SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
+    TaskExecutionAdapter, TaskExecutionPlanRequest,
 };
 use steward_types::direct_package::{
     ContentDigest, DiagnosticsRequest, ExactGitCommit, ExecutionLogMode,
@@ -22,7 +25,10 @@ use steward_types::task_input_archive::frame_task_input_archive;
 use steward_types::task_output_archive::{
     TaskOutputArchiveCompatibility, task_output_archive_entries,
 };
-use steward_types::{AgentType, RuntimeId, RuntimeRefs};
+use steward_types::{
+    AgentType, DisposableExecutionBinding, ExecutionModelCompatibility, ExecutionProviderProfile,
+    ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, RuntimeId, RuntimeRefs,
+};
 use tokio::time::sleep;
 
 const EXPECTED_RELEASE: &str = "v0.0.98";
@@ -94,6 +100,45 @@ fn make_input_archive(run_dir: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
     let payload = vec![b'x'; 1_100_000];
     fs::write(&input_path, &payload)
         .map_err(|error| format!("failed to write input fixture: {error}"))?;
+    let stub_path = input_root.join("in/codex-stub");
+    fs::write(
+        &stub_path,
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' 'codex-stub 1.0.0'
+  exit 0
+fi
+prompt=
+for argument do prompt=$argument; done
+repository=$(printf '%s\n' "$prompt" | sed -n 's/^Repository `source` is checked out read-only at `\([^`]*\)`\.$/\1/p' | head -n 1)
+test -n "$repository"
+test "$(git -C "$repository" log --format=%s -2)" = 'second revision
+first revision'
+git -C "$repository" blame --porcelain tracked.txt | grep -Fq 'summary first revision'
+test -z "$(git -C "$repository" remote)"
+! git -C "$repository" push >/dev/null 2>&1
+test -f in/payload.bin
+case "$prompt" in
+  *"Do not create any output files."*) exit 0 ;;
+esac
+find "$repository" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; | sort > out/files.txt
+cp in/payload.bin out/payload.bin
+printf task-
+printf task- >&2
+sleep 5
+printf stdout
+printf stderr >&2
+sleep 5
+"#,
+    )
+    .map_err(|error| format!("failed to write Codex stub: {error}"))?;
+    let mut permissions = fs::metadata(&stub_path)
+        .map_err(|error| format!("failed to read Codex stub permissions: {error}"))?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&stub_path, permissions)
+        .map_err(|error| format!("failed to make Codex stub executable: {error}"))?;
     let archive_path = run_dir.join("adapter-input.tar");
     run(
         Command::new("tar")
@@ -101,12 +146,56 @@ fn make_input_archive(run_dir: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
             .arg(&archive_path)
             .arg("-C")
             .arg(&input_root)
-            .arg("in/payload.bin"),
+            .args(["in/payload.bin", "in/codex-stub"]),
         "input archive creation",
     )?;
     let archive = fs::read(&archive_path)
         .map_err(|error| format!("failed to read input archive: {error}"))?;
     Ok((archive, payload))
+}
+
+fn codex_task_command(prompt: &str) -> Result<Vec<String>, String> {
+    let binding = DisposableExecutionBinding {
+        schema_version: "steward/task-execution-binding/v1".to_owned(),
+        binding_id: format!("sha256:{}", "a".repeat(64)),
+        binding_digest: format!("sha256:{}", "a".repeat(64)),
+        agent_ref: "example-agent@1.0.0".to_owned(),
+        display_name: None,
+        adapter: CODEX_V1_ADAPTER.to_owned(),
+        image: format!(
+            "registry.example.test/agents/example@sha256:{}",
+            "b".repeat(64)
+        ),
+        executable: "/sandbox/steward-input/in/codex-stub".to_owned(),
+        version_probe: ExecutionVersionProbe {
+            arguments: vec!["--version".to_owned()],
+            expected_stdout: "codex-stub 1.0.0".to_owned(),
+        },
+        models: Some(ExecutionModelCompatibility {
+            providers: vec!["example-model".to_owned()],
+        }),
+        provider_profiles: ExecutionProviderProfiles {
+            tools: None,
+            inference: Some(ExecutionProviderProfile {
+                id: "example-inference-profile-v7".to_owned(),
+                digest: format!("sha256:{}", "c".repeat(64)),
+            }),
+        },
+    };
+    CodexTaskExecutionAdapter::new("http://inference.example.test:4000/v1".to_owned())
+        .map_err(|error| format!("configure Codex adapter: {error:?}"))?
+        .render(TaskExecutionPlanRequest {
+            workflow_prompt: prompt,
+            model: &ModelRef {
+                provider: "example-model".to_owned(),
+                model: "large".to_owned(),
+            },
+            tools: &[],
+            tool_transport_endpoint: None,
+            binding: &binding,
+        })
+        .map(|plan| plan.command)
+        .map_err(|error| format!("render Codex task: {error:?}"))
 }
 
 fn command_stdout(command: &mut Command, description: &str) -> Result<Vec<u8>, String> {
@@ -213,7 +302,7 @@ fn make_workspace_archive(
     let content_digest = ContentDigest::parse(format!("steward:sha256:{}", "a".repeat(64)))?;
     let entries = vec![ResolvedWorkspaceEntry::Git {
         name: WorkspaceName::parse("source")?,
-        access: WorkspaceAccess::Copy,
+        access: WorkspaceAccess::ReadOnly,
         repository: RepositoryUrl::parse("https://github.com/example-org/source.git")?,
         repository_id: StableProviderId::parse("123456")?,
         repository_owner_id: StableProviderId::parse("7890")?,
@@ -274,10 +363,14 @@ fn output_payload(run_dir: &Path, archive: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("failed to create output directory: {error}"))?;
     let entries = task_output_archive_entries(archive, TaskOutputArchiveCompatibility::Strict)
         .map_err(|_| "adapter returned an archive outside the out/-only contract".to_owned())?;
-    if entries.len() != 1 || entries[0].path != "payload.bin" {
+    let paths = entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<Vec<_>>();
+    if paths != ["files.txt", "payload.bin"] {
         return Err(format!(
             "adapter returned unexpected output entries: {:?}",
-            entries.iter().map(|entry| &entry.path).collect::<Vec<_>>()
+            paths
         ));
     }
     run(
@@ -288,6 +381,11 @@ fn output_payload(run_dir: &Path, archive: &[u8]) -> Result<Vec<u8>, String> {
             .arg(&output_root),
         "output archive extraction",
     )?;
+    let files = fs::read_to_string(output_root.join("out/files.txt"))
+        .map_err(|error| format!("declared output out/files.txt is missing: {error}"))?;
+    if files != "tracked.txt\n" {
+        return Err(format!("repository listing was unexpected: {files:?}"));
+    }
     fs::read(output_root.join("out/payload.bin"))
         .map_err(|error| format!("declared output out/payload.bin is missing: {error}"))
 }
@@ -381,7 +479,9 @@ async fn delete_sandbox(
 async fn verify_attempt_failure_semantics(
     runtime: &OpenShellRuntime,
     sandbox: &SandboxRequest,
-    input_archive: &[u8],
+    caller_archive: &[u8],
+    workspace_input_archive: &[u8],
+    workspace: &WorkspaceEvidence,
 ) -> Result<(), String> {
     let task = SandboxTaskRequest {
         runtime: sandbox.runtime.clone(),
@@ -402,7 +502,7 @@ async fn verify_attempt_failure_semantics(
     };
     let attempt = TaskAttemptId("00000000-0000-4000-8000-000000000002".to_owned());
     let started = runtime
-        .start_task(&attempt, &task, input_archive)
+        .start_task(&attempt, &task, caller_archive)
         .await
         .map_err(|error| format!("detached cancellation task failed to start: {error:?}"))?;
     if !matches!(
@@ -445,7 +545,7 @@ async fn verify_attempt_failure_semantics(
         ..task.clone()
     };
     let mut oversized = runtime
-        .start_task(&oversized_attempt, &oversized_task, input_archive)
+        .start_task(&oversized_attempt, &oversized_task, caller_archive)
         .await
         .map_err(|error| format!("oversized transcript task failed to start: {error:?}"))?;
     let oversized_deadline = Instant::now() + Duration::from_secs(120);
@@ -498,7 +598,11 @@ async fn verify_attempt_failure_semantics(
         ..task.clone()
     };
     let launch_error = runtime
-        .start_task(&launch_failure_attempt, &launch_failure_task, input_archive)
+        .start_task(
+            &launch_failure_attempt,
+            &launch_failure_task,
+            caller_archive,
+        )
         .await
         .expect_err("an oversized launcher request was reported as accepted");
     if !matches!(launch_error, PortError::Failed { .. }) {
@@ -507,7 +611,7 @@ async fn verify_attempt_failure_semantics(
         ));
     }
     let launch_retry = runtime
-        .start_task(&launch_failure_attempt, &task, input_archive)
+        .start_task(&launch_failure_attempt, &task, caller_archive)
         .await
         .map_err(|error| format!("launch failure retry could not observe its claim: {error:?}"))?;
     if !matches!(launch_retry, SandboxTaskObservation::Accepted { .. }) {
@@ -527,7 +631,7 @@ async fn verify_attempt_failure_semantics(
         ..task.clone()
     };
     let _ = runtime
-        .start_task(&orphan_attempt, &orphan_task, input_archive)
+        .start_task(&orphan_attempt, &orphan_task, caller_archive)
         .await;
     let orphan_deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -550,7 +654,7 @@ async fn verify_attempt_failure_semantics(
         sleep(Duration::from_secs(1)).await;
     }
     let orphan_retry = runtime
-        .start_task(&orphan_attempt, &orphan_task, input_archive)
+        .start_task(&orphan_attempt, &orphan_task, caller_archive)
         .await
         .map_err(|error| format!("orphan retry could not observe its marker: {error:?}"))?;
     if !matches!(orphan_retry, SandboxTaskObservation::OutcomeUnknown { .. }) {
@@ -561,18 +665,19 @@ async fn verify_attempt_failure_semantics(
 
     let empty_output_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000007".to_owned());
     let empty_output_task = SandboxTaskRequest {
-        command: vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            "mkdir -p \"$STEWARD_OUTPUT_DIR/out\"".to_owned(),
-        ],
+        command: codex_task_command("Do not create any output files.")?,
         diagnostics: DiagnosticsRequest {
             execution_log: ExecutionLogMode::Off,
         },
+        workspace: Some(workspace.clone()),
         ..task.clone()
     };
     match runtime
-        .start_task(&empty_output_attempt, &empty_output_task, input_archive)
+        .start_task(
+            &empty_output_attempt,
+            &empty_output_task,
+            workspace_input_archive,
+        )
         .await
         .map_err(|error| format!("empty-output task could not be observed: {error:?}"))?
     {
@@ -600,7 +705,7 @@ async fn verify_attempt_failure_semantics(
     };
     if !matches!(
         runtime
-            .start_task(&synchronous_attempt, &synchronous_task, input_archive)
+            .start_task(&synchronous_attempt, &synchronous_task, caller_archive)
             .await,
         Ok(SandboxTaskObservation::Succeeded { .. })
     ) {
@@ -690,15 +795,13 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
         execution_class: SandboxExecutionClass::Agent,
         agent_type: request.agent_type.clone(),
         models: request.models.clone(),
-        command: vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            "set -eu; test \"$(pwd)\" = /sandbox/workspace/source; test \"$(git log --format=%s -2)\" = 'second revision\nfirst revision'; git blame --porcelain tracked.txt | grep -Fq 'summary first revision'; test -z \"$(git remote)\"; ! git push >/dev/null 2>&1; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; printf task-; printf task- >&2; sleep 5; printf stdout; printf stderr >&2; sleep 5; cp /sandbox/steward-input/in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"".to_owned(),
-        ],
+        command: codex_task_command(
+            "List the files in the top folder of the repository and write them to files.txt.",
+        )?,
         diagnostics: DiagnosticsRequest {
             execution_log: ExecutionLogMode::Full,
         },
-        workspace: Some(workspace),
+        workspace: Some(workspace.clone()),
         execution_binding: None,
     };
     let task_result = async {
@@ -756,7 +859,14 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
     .await;
 
     let failure_semantics = if task_result.is_ok() {
-        verify_attempt_failure_semantics(&runtime, &request, &caller_archive).await
+        verify_attempt_failure_semantics(
+            &runtime,
+            &request,
+            &caller_archive,
+            &input_archive,
+            &workspace,
+        )
+        .await
     } else {
         Ok(())
     };

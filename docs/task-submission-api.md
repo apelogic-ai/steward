@@ -69,10 +69,9 @@ empty-catalog behavior.
 The tar body is a workspace snapshot, not a second naming scheme:
 
 - Every uploaded member name is workspace-relative, for example `in/payload.bin`.
-- The task command runs with the extracted input root as its working directory unless the Task
-  has exactly one resolved Git workspace entry. In that case it runs from
-  `/sandbox/workspace/<name>`, and uploaded members remain available beneath
-  `/sandbox/steward-input`.
+- The task command runs with the extracted input root as its working directory.
+- Before a coding agent starts, its prompt names each repository checkout and its exact
+  `/sandbox/workspace/<name>` path, including whether the checkout is read-only.
 - `STEWARD_OUTPUT_DIR` names a separate, initially empty collection root. Commands preserve
   declared output roots beneath it, for example `$STEWARD_OUTPUT_DIR/out/payload.bin`.
 - A successful agent Task creates at least one regular file beneath `out/`; an absent or empty
