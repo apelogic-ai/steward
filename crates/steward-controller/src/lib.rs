@@ -7871,6 +7871,24 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn task_runtime_manifest_preserves_exact_provider_agnostic_tools() -> Result<(), String> {
+        let mut fixture = task_runtime_creation_fixture()?;
+        fixture.task.runtime_spec.tools = vec![steward_types::ToolGrant {
+            provider: "jira".to_owned(),
+            resource: "get_issue".to_owned(),
+            action: "read".to_owned(),
+        }];
+
+        let runtime = super::task_runtime_manifest(&fixture.task)
+            .map_err(|error| format!("build Jira Task runtime: {error}"))?;
+        assert_eq!(
+            runtime.spec.tools, fixture.task.runtime_spec.tools,
+            "the runtime authority consumed by Mint must contain exactly the Task-approved tuples"
+        );
+        Ok(())
+    }
+
     #[test]
     fn oversized_task_output_is_rejected_before_persistence() {
         assert_eq!(

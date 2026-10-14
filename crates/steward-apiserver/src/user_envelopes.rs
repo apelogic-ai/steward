@@ -1859,9 +1859,10 @@ mod tests {
         EnvelopeRequestField, EnvelopeRequestHistoryEvent, EnvelopeRequestStatus,
         PublishedWorkflowOption, UserEnvelopeMutationProof, UserEnvelopeProjectionStore,
         UserEnvelopeRequest, UserEnvelopeSession, UserEnvelopeSubject, ValidatedEnvelopeRequest,
-        attach_request_projection, envelope_usage_view, inner_router, inner_router_with_agents,
-        inner_router_with_capabilities,
+        attach_request_projection, capability_catalog_violation_fields, envelope_usage_view,
+        inner_router, inner_router_with_agents, inner_router_with_capabilities,
     };
+    use crate::browser_admin::{CapabilityCatalog, CapabilityTool, ToolAccessClass};
     use crate::connections::{
         ConnectionBrokerError, ConnectionPhase, ConnectionSession, ConnectionStartOperation,
         ConnectionSubject, ProviderConnectionBroker, ProviderConnectionStatus,
@@ -2309,6 +2310,46 @@ mod tests {
             allow_inline_browser_tasks: true,
             ceiling,
         }
+    }
+
+    #[test]
+    fn read_only_live_catalog_accepts_jira_reads_and_refuses_jira_writes() {
+        let mut requested = template().ceiling;
+        let model = requested.spec.llms[0].clone();
+        let jira_read = ToolGrant {
+            provider: "jira".to_owned(),
+            resource: "get_issue".to_owned(),
+            action: "read".to_owned(),
+        };
+        requested.spec.tools = vec![jira_read.clone()];
+        let capabilities = CapabilityCatalog {
+            schema_version: "steward.capability-catalog/v2".to_owned(),
+            models: vec![model],
+            tools: vec![CapabilityTool {
+                provider: jira_read.provider.clone(),
+                resource: jira_read.resource.clone(),
+                action: jira_read.action.clone(),
+                access_class: ToolAccessClass::Read,
+                toolsets: Vec::new(),
+            }],
+            catalogs: Vec::new(),
+        };
+
+        assert!(
+            capability_catalog_violation_fields(&capabilities, &requested).is_empty(),
+            "a Jira read tuple published by the gateway must be available to Envelope approval"
+        );
+
+        requested.spec.tools = vec![ToolGrant {
+            provider: "jira".to_owned(),
+            resource: "edit_issue".to_owned(),
+            action: "write".to_owned(),
+        }];
+        assert_eq!(
+            capability_catalog_violation_fields(&capabilities, &requested),
+            [EnvelopeRequestField::Tools],
+            "a Jira write tuple omitted by the read-only gateway preset must not be approvable"
+        );
     }
 
     #[test]

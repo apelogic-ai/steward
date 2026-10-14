@@ -367,6 +367,32 @@ mod capability_catalog_tests {
     }
 
     #[test]
+    fn accepts_a_provider_unknown_to_steward_without_hard_coded_rules() -> Result<(), String> {
+        let value = r#"{
+          "schemaVersion":"steward.capability-catalog/v2",
+          "models":[],
+          "tools":[{
+            "provider":"jira",
+            "resource":"get_issue",
+            "action":"read",
+            "accessClass":"read"
+          }],
+          "catalogs":[{
+            "provider":"jira",
+            "catalogId":"provider-live",
+            "version":"current",
+            "available":true
+          }]
+        }"#;
+        let parsed = CapabilityCatalog::from_json(value)?;
+
+        assert_eq!(parsed.tools[0].provider, "jira");
+        assert_eq!(parsed.tools[0].resource, "get_issue");
+        assert_eq!(parsed.tools[0].action, "read");
+        Ok(())
+    }
+
+    #[test]
     fn rejects_unknown_fields_duplicates_and_malformed_identifiers() {
         let unknown = r#"{"schemaVersion":"steward.capability-catalog/v2","models":[],"tools":[],"catalogs":[],"budget":{}}"#;
         assert!(CapabilityCatalog::from_json(unknown).is_err());

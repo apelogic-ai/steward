@@ -819,4 +819,34 @@ mod tests {
         assert_eq!(authority.state, AuthorityState::Active);
         Ok(())
     }
+
+    #[test]
+    fn authority_resolution_preserves_jira_grants_for_the_v3_claim() -> Result<(), String> {
+        let mut runtime = runtime("runtime-uid-a", "workspace-a", "sandbox-a");
+        runtime.spec.tools = vec![ToolGrant {
+            provider: "jira".to_owned(),
+            resource: "get_issue".to_owned(),
+            action: "read".to_owned(),
+        }];
+        let binding = binding();
+
+        let authority = authority_from_runtime_refs(
+            &workload(),
+            binding.workspace.as_str(),
+            binding.sandbox.as_str(),
+            &[runtime],
+        )
+        .map_err(|error| format!("resolve Jira runtime authority: {error:?}"))?;
+
+        assert_eq!(
+            authority.tools,
+            [ToolGrant {
+                provider: "jira".to_owned(),
+                resource: "get_issue".to_owned(),
+                action: "read".to_owned(),
+            }],
+            "Mint's v3 claim source must preserve the exact provider-agnostic runtime grants"
+        );
+        Ok(())
+    }
 }
