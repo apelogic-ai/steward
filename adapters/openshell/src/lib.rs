@@ -43,10 +43,10 @@ use sha2::{Digest, Sha256};
 use steward_ports::PortError;
 #[cfg(feature = "runtime")]
 use steward_ports::{
-    ProviderControlExecutionBindings, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
-    SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
-    SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
-    SandboxTaskTranscript, TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
+    ProviderControlExecutionBindings, REQUIRED_OUTPUT_MISSING_FAILURE,
+    SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxExecutionClass, SandboxObservation,
+    SandboxRequest, SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest,
+    SandboxTaskRuntime, SandboxTaskTranscript, TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
 };
 #[cfg(feature = "runtime")]
 use steward_types::direct_package::{
@@ -81,8 +81,6 @@ const SCRATCH_VOLUME_SIZE_NOT_ENFORCED_EXIT_CODE: i32 = 42;
 const REQUIRED_OUTPUT_MISSING_EXIT_CODE: i32 = 66;
 #[cfg(feature = "runtime")]
 const REQUIRED_OUTPUT_MISSING_REASON: &str = "required_output_missing";
-#[cfg(feature = "runtime")]
-const REQUIRED_OUTPUT_MISSING_MESSAGE: &str = "This run finished without creating an output file.";
 #[cfg(feature = "runtime")]
 const EXECUTION_TRANSCRIPT_TRUNCATION_MARKER: &str = "[... execution output truncated ...]\n";
 #[cfg(feature = "runtime")]
@@ -732,7 +730,7 @@ fn attach_task_agent_failure_category(
             reason,
         } => SandboxTaskObservation::Failed {
             adapter_observation_id,
-            reason: if reason == REQUIRED_OUTPUT_MISSING_MESSAGE {
+            reason: if reason == REQUIRED_OUTPUT_MISSING_FAILURE {
                 reason
             } else {
                 task_failure_category(stderr, managed_inference, model_providers).to_owned()
@@ -744,7 +742,7 @@ fn attach_task_agent_failure_category(
             transcript,
         } => SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
-            reason: if reason == REQUIRED_OUTPUT_MISSING_MESSAGE {
+            reason: if reason == REQUIRED_OUTPUT_MISSING_FAILURE {
                 reason
             } else {
                 task_failure_category(stderr, managed_inference, model_providers).to_owned()
@@ -2869,7 +2867,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                         MAX_EXECUTION_STREAM_BYTES / (1024 * 1024)
                     )
                 } else if payload == REQUIRED_OUTPUT_MISSING_REASON.as_bytes() {
-                    REQUIRED_OUTPUT_MISSING_MESSAGE.to_owned()
+                    REQUIRED_OUTPUT_MISSING_FAILURE.to_owned()
                 } else {
                     transcript.as_ref().map_or_else(
                         || {
@@ -5909,7 +5907,7 @@ mod tests {
             attach_task_agent_failure_category(
                 SandboxTaskObservation::Failed {
                     adapter_observation_id: "attempt-c".to_owned(),
-                    reason: super::REQUIRED_OUTPUT_MISSING_MESSAGE.to_owned(),
+                    reason: super::REQUIRED_OUTPUT_MISSING_FAILURE.to_owned(),
                 },
                 b"",
                 false,
@@ -5917,7 +5915,7 @@ mod tests {
             ),
             SandboxTaskObservation::Failed {
                 adapter_observation_id: "attempt-c".to_owned(),
-                reason: super::REQUIRED_OUTPUT_MISSING_MESSAGE.to_owned(),
+                reason: super::REQUIRED_OUTPUT_MISSING_FAILURE.to_owned(),
             },
             "a missing-output failure must not be replaced by a generic agent category"
         );
