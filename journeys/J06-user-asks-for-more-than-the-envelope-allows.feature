@@ -42,6 +42,7 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
   # every refusal must say what to do next.
   # The sentences are the EXPECTED plain wording. 0.3.16 shows
   # 'The run request was rejected. Admission("...")' with "$25" and "20m" (N-03).
+  # Specification only: the historical release label is not a dedicated issue identity.
   Scenario Outline: A need above the Envelope's limit is refused before anything starts: <requirement>
     When I open "Tasks"
     And I press "New Task"

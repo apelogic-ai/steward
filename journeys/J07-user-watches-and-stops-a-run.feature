@@ -15,11 +15,14 @@ Feature: J7 - User watches and stops a run
 
   # Steps 1 to 7 and "Done when".
   # 0.3.16: FAIL at step 3 (N-07) and FAIL at step 5 (N-05).
+  # Specification only until cancellation coverage is executable; no dedicated issue replaces the release label.
   @needs-model
   Scenario: Watch a run, cancel it and see what was captured and spent
     When I open "Runs"
     And I press "Run now"
+    # Select the Background Envelope explicitly; the Run form otherwise chooses the newest active one.
     And I choose "standard" in "Envelope"
+    # The long loop exercises live logs; writing under out/ lets a successful inline run publish output.
     And I type "Print one line every 10 s for 2 min, then write the complete transcript to out/result.txt." into "Prompt"
     And I tick "Capture execution log"
     And I press "Run now"
@@ -55,7 +58,9 @@ Feature: J7 - User watches and stops a run
   Scenario: Variant - a run left to finish has a complete log
     When I open "Runs"
     And I press "Run now"
+    # Select the Background Envelope explicitly; the Run form otherwise chooses the newest active one.
     And I choose "standard" in "Envelope"
+    # The long loop exercises complete logs; writing under out/ lets a successful inline run publish output.
     And I type "Print one line every 10 s for 2 min, then write the complete transcript to out/result.txt." into "Prompt"
     And I tick "Capture execution log"
     And I press "Run now"
@@ -69,6 +74,7 @@ Feature: J7 - User watches and stops a run
   Scenario: A run started without log capture says so
     When I open "Runs"
     And I press "Run now"
+    # Select the Background Envelope explicitly; the Run form otherwise chooses the newest active one.
     And I choose "standard" in "Envelope"
     And I untick "Capture execution log"
     And I press "Run now"
@@ -79,6 +85,7 @@ Feature: J7 - User watches and stops a run
 
   # F2. The Markdown does not say when a run rightly cannot be cancelled.
   # 0.3.16: the owner of the run sees "You don't have permission to cancel this run." (N-05).
+  # Specification only: the historical release label is not a dedicated issue identity.
   @needs-model
   Scenario: A run that cannot be cancelled says why and what to do
     Given I am on the page of a run that cannot be cancelled

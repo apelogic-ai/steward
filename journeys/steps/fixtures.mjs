@@ -1,6 +1,8 @@
 import { expect } from "@playwright/test";
 import { createBdd, test as base } from "playwright-bdd";
 
+import { onlyOnboardingRequestUnavailable } from "../onboarding-console-errors.mjs";
+
 const shared = {
   checkedPrefixes: new Set(),
 };
@@ -10,7 +12,9 @@ export const test = base.extend({
     const consoleErrors = [];
     const pageErrors = [];
     const onConsole = (message) => {
-      if (message.type() === "error") consoleErrors.push(message.text());
+      if (message.type() === "error") {
+        consoleErrors.push({ text: message.text(), url: message.location().url });
+      }
     };
     const onPageError = (error) => pageErrors.push(error.message);
     page.on("console", onConsole);
@@ -35,11 +39,11 @@ export const test = base.extend({
     await use(state);
     page.off("console", onConsole);
     page.off("pageerror", onPageError);
-    if (state.knownIssue === "@known-failing-478" && consoleErrors.length > 0) {
+    expect(pageErrors, "the journey must not emit uncaught page errors").toEqual([]);
+    if (state.knownIssue === "@known-failing-478" && onlyOnboardingRequestUnavailable(consoleErrors, page.url())) {
       throw new Error(`[steward-known-failure:#478] the onboarding page emitted browser console errors: ${consoleErrors.length}`);
     }
     expect(consoleErrors, "the journey must not emit browser console errors").toEqual([]);
-    expect(pageErrors, "the journey must not emit uncaught page errors").toEqual([]);
   },
 });
 

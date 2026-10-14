@@ -41,6 +41,7 @@ Feature: J5 - User runs a Task with scratch space
 
   # F1, F2 and the first case of F3.
   # 0.3.16: the decision is right, but each text is wrapped (N-03).
+  # Specification only: the historical release label is not a dedicated issue identity.
   Scenario Outline: Scratch space the Envelope cannot give is refused: <case>
     Given I hold an Envelope from the template "<template>"
     When I open "Tasks"
@@ -65,6 +66,7 @@ Feature: J5 - User runs a Task with scratch space
 
   # F3, second case.
   # 0.3.16: the decision is right, but the text is wrapped (N-03).
+  # Specification only: the historical release label is not a dedicated issue identity.
   Scenario: Scratch space that uses the whole allowance next to a Git entry is refused
     When I open "Tasks"
     And I press "New Task"

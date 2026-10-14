@@ -1030,7 +1030,8 @@ Then("the run ends as {string} within {int} min", async ({ journey, page }, phas
       }
       break;
     }
-    if (Date.now() >= deadline && journey.knownIssue === "@known-failing-472" && data.run.codingAgentRuntime?.startsWith("claude-code@")) {
+    const agentExecutionRunning = data.run.stages?.some((stage) => stage.id === "agent_execution" && stage.state === "running");
+    if (Date.now() >= deadline && journey.knownIssue === "@known-failing-472" && data.run.codingAgentRuntime?.startsWith("claude-code@") && agentExecutionRunning) {
       const pendingRequest = journey.currentTemplate ? journey.requests.get(journey.currentTemplate) : null;
       const pendingSpec = (pendingRequest?.approvedEnvelope ?? pendingRequest?.requestedEnvelope)?.spec;
       if (Array.isArray(pendingSpec?.tools) && pendingSpec.tools.length === 0) {

@@ -45,6 +45,7 @@ Feature: J2 - New user gets going
     # Keeps this Envelope distinct from active Envelopes left by earlier smoke runs.
     And I type "<run-runtime-minutes>" into "Runtime limit per month"
     And I press "Submit request"
+    # The request detail can replace the transient "Submitting…" label before it is observed.
     # Provisioned at once: no administrator acts in this scenario.
     Then I see the status "provisioned"
     And I see "Limit per run 0.50 USD"
@@ -64,6 +65,7 @@ Feature: J2 - New user gets going
     # A coding agent and a model that this Envelope allows are selected.
     Then "Run now" is enabled
     When I press "Run now"
+    # The Run detail can replace the transient "Starting…" label before it is observed.
     Then the run ends as "succeeded" within 2 min
     And the run output contains "hello world"
     And the spend of the run is above 0.00 USD
