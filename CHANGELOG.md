@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Runtime cleanup now retries quietly while sandbox deletion is making progress, while a deletion
+  that remains incomplete past the cleanup deadline still produces a controller error.
 - Coding agents now receive the exact path of every repository workspace in their prompt, so a
   plain request about a repository can find its files while staged caller input and declared
   outputs keep their existing relative paths. A run that creates no regular file beneath `out/`
