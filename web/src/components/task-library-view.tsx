@@ -36,6 +36,13 @@ import { useApiResource } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
 
 const fieldClass = "min-h-11 w-full rounded-control border bg-panel px-3 font-normal";
+const genericTaskSaveFailure = "Steward rejected this package. Check its paths, Task definition, skills, workspace, outputs, and requirements.";
+
+export function taskSaveFailureMessage(error: unknown): string {
+  if (!error || typeof error !== "object") return genericTaskSaveFailure;
+  const reason = (error as Record<string, unknown>).failureReason;
+  return typeof reason === "string" && reason.trim() ? reason : genericTaskSaveFailure;
+}
 
 async function loadTask(contentDigest: string): Promise<{ data?: BrowserTaskResponse; response?: Response }> {
   return myTask({ cache: "no-store", credentials: "same-origin", path: { content_digest: contentDigest }, query: { limit: 1 } });
@@ -274,7 +281,7 @@ function TaskEditor({ data }: Readonly<{ data: EditorData }>) {
       router.push(`/tasks/${encodeURIComponent(result.data.task.contentDigest)}`);
       return;
     }
-    setFailure("Steward rejected this package. Check its paths, Task definition, skills, workspace, outputs, and requirements.");
+    setFailure(taskSaveFailureMessage(result.error));
     setStatus("error");
   }
 

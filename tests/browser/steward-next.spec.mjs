@@ -901,6 +901,7 @@ async function guardedPage(browser, {
   envelopeSpend = null,
   publishedWorkflows = true,
   taskLibraryMutable = false,
+  taskSaveFailure = null,
   initialOnboardingDismissed = false,
   initialWorkflowAcknowledged = false,
   onboardingJourney = false,
@@ -1246,6 +1247,10 @@ async function guardedPage(browser, {
     const request = route.request();
     if (request.method() === "POST") {
       const body = request.postDataJSON();
+      if (taskSaveFailure) {
+        mutations.push({ path: new URL(request.url()).pathname, headers: await request.allHeaders(), body });
+        return json(route, taskSaveFailure.body, taskSaveFailure.status);
+      }
       const definition = JSON.parse(body.files[body.path]);
       const contentDigest = `steward:sha256:${String(definition.version).repeat(64)}`;
       const taskId = body.taskId ?? browserTaskId;
@@ -3599,6 +3604,39 @@ test("a Task draft remains saveable without an active Envelope or model", async 
     const save = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/tasks");
     const definition = JSON.parse(save.body.files[browserTaskDefinitionPath]);
     expect(definition.runtime).toEqual({ agentRef: "codex@0.140.0" });
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("a Task save refusal shows the server's plain failure reason", async ({ browser }) => {
+  const failureReason = "The per-run budget must be more than 0.00 USD.";
+  const developer = await guardedPage(browser, {
+    expectedHttpStatuses: [422],
+    taskSaveFailure: {
+      status: 422,
+      body: { error: "admission_rejected", failureReason },
+    },
+  });
+  try {
+    await developer.page.goto(`${origin}/tasks/new`);
+    await developer.page.getByLabel("Requirements (optional JSON)").fill(JSON.stringify({
+      authority: {
+        budget: { currency: "USD", monthlyLimit: "5.00", singleRunLimit: "0" },
+        llms: [{ provider: "openai", model: "gpt-5.4" }],
+        runner: { platforms: [] },
+        tools: [],
+        ttl: "15m",
+      },
+    }));
+    await developer.page.getByRole("button", { name: "Save version 1" }).click();
+
+    await expect(developer.page.getByRole("alert").filter({ hasText: failureReason })).toHaveText(failureReason);
+    await expect(developer.page).toHaveURL(`${origin}/tasks/new`);
+    await expect(developer.page.getByRole("button", { name: "Save version 1" })).toBeEnabled();
+    const save = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/tasks");
+    expectInterceptedMutationProof(save);
+    expect(JSON.parse(save.body.files[browserTaskDefinitionPath]).requires.authority.budget.singleRunLimit).toBe("0");
   } finally {
     await closeGuardedPage(developer);
   }
