@@ -12,7 +12,7 @@ use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, EnvelopeSpec,
-    add_budget_amount, envelope_is_within, evaluate, validate_envelope,
+    add_budget_amount, envelope_is_within, evaluate, validate_envelope, validate_user_envelope,
 };
 use steward_types::direct_package::{
     BrowserTaskEvidence, DirectTaskBindingEvidence, MAX_EXECUTION_STREAM_BYTES,
@@ -5276,7 +5276,7 @@ impl PgStore {
         if request.actor.trim().is_empty()
             || request.idempotency_key.trim().is_empty()
             || request.requested_envelope.revision != request.template_revision
-            || validate_envelope(request.requested_envelope).is_err()
+            || validate_user_envelope(request.requested_envelope).is_err()
         {
             return Err(StoreError::InvalidEnvelopeRequest);
         }

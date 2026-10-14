@@ -577,6 +577,7 @@ fn format_binary_quantity(value: &str) -> String {
 #[serde(rename_all = "camelCase", tag = "error")]
 pub enum AdmissionError {
     InvalidBudget { value: String },
+    NonPositiveSingleRunLimit { value: String },
     InvalidCurrency { value: String },
     CurrencyMismatch { requested: String, ceiling: String },
     InvalidTtl { value: String },
@@ -587,29 +588,47 @@ pub enum AdmissionError {
 }
 
 pub fn validate_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
-    Decimal::parse(&envelope.spec.budget.monthly_limit)?;
-    if let Some(single_run_limit) = &envelope.spec.budget.single_run_limit {
+    validate_envelope_spec(&envelope.spec)
+}
+
+fn validate_envelope_spec(spec: &EnvelopeSpec) -> Result<(), AdmissionError> {
+    Decimal::parse(&spec.budget.monthly_limit)?;
+    if let Some(single_run_limit) = &spec.budget.single_run_limit {
         Decimal::parse(single_run_limit)?;
     }
-    if let Some(runtime_minutes_limit) = &envelope.spec.runtime_minutes_limit {
+    if let Some(runtime_minutes_limit) = &spec.runtime_minutes_limit {
         Decimal::parse(runtime_minutes_limit)?;
     }
-    if envelope.spec.budget.currency.len() != 3
-        || !envelope
-            .spec
+    if spec.budget.currency.len() != 3
+        || !spec
             .budget
             .currency
             .bytes()
             .all(|byte| byte.is_ascii_uppercase())
     {
         return Err(AdmissionError::InvalidCurrency {
-            value: envelope.spec.budget.currency.clone(),
+            value: spec.budget.currency.clone(),
         });
     }
-    duration_seconds(&envelope.spec.ttl)?;
-    validate_runner(&envelope.spec.runner)?;
-    if let Some(workspace) = &envelope.spec.workspace {
+    duration_seconds(&spec.ttl)?;
+    validate_runner(&spec.runner)?;
+    if let Some(workspace) = &spec.workspace {
         validate_workspace_authority(workspace)?;
+    }
+    Ok(())
+}
+
+/// Validate an Envelope that a person can select for a run. Internal zero-budget authorities use
+/// `validate_envelope`; a selectable per-run limit must leave positive spending authority.
+pub fn validate_user_envelope(envelope: &Envelope) -> Result<(), AdmissionError> {
+    validate_user_envelope_spec(&envelope.spec)
+}
+
+/// Validate authority a person selected for a Task before it is stored or started.
+pub fn validate_user_envelope_spec(spec: &EnvelopeSpec) -> Result<(), AdmissionError> {
+    validate_envelope_spec(spec)?;
+    if let Some(single_run_limit) = &spec.budget.single_run_limit {
+        parse_positive_single_run_limit(single_run_limit)?;
     }
     Ok(())
 }
@@ -1173,6 +1192,20 @@ impl<'a> Decimal<'a> {
             .then_with(|| self.integer.cmp(other.integer))
             .then_with(|| compare_fractional(self.fractional, other.fractional))
     }
+
+    fn is_zero(&self) -> bool {
+        self.integer.is_empty() && self.fractional.is_empty()
+    }
+}
+
+fn parse_positive_single_run_limit(value: &str) -> Result<Decimal<'_>, AdmissionError> {
+    let amount = Decimal::parse(value)?;
+    if amount.is_zero() {
+        return Err(AdmissionError::NonPositiveSingleRunLimit {
+            value: value.to_owned(),
+        });
+    }
+    Ok(amount)
 }
 
 fn decimal_parts(value: &str) -> Result<(&str, &str), AdmissionError> {
@@ -1813,9 +1846,21 @@ mod tests {
         let envelope = envelope_with_single_run_limit("100.00", "not-a-decimal");
 
         assert_eq!(
-            validate_envelope(&envelope),
+            super::validate_user_envelope(&envelope),
             Err(AdmissionError::InvalidBudget {
                 value: "not-a-decimal".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn zero_single_run_limit_is_rejected_before_it_becomes_authority() {
+        let envelope = envelope_with_single_run_limit("100.00", "0");
+
+        assert_eq!(
+            super::validate_user_envelope(&envelope),
+            Err(AdmissionError::NonPositiveSingleRunLimit {
+                value: "0".to_owned(),
             })
         );
     }

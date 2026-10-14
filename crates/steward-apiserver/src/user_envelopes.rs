@@ -12,7 +12,7 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_admission::{
-    AdmissionDecision, Envelope, add_budget_amount, envelope_is_within, validate_envelope,
+    AdmissionDecision, Envelope, add_budget_amount, envelope_is_within, validate_user_envelope,
 };
 use steward_store::{
     CanonicalUserRecord, EnvelopeRequestRecord, EnvelopeRequestReservationRequest,
@@ -1455,11 +1455,24 @@ where
         None => None,
     };
     let requested_envelope: Envelope = body.requested_envelope.into();
-    if validate_envelope(&requested_envelope).is_err() {
+    if let Err(error) = validate_user_envelope(&requested_envelope) {
+        let (code, reason) = match error {
+            steward_admission::AdmissionError::NonPositiveSingleRunLimit { .. } => (
+                "invalid_single_run_limit",
+                format!(
+                    "The per-run budget must be more than 0.00 {}.",
+                    requested_envelope.spec.budget.currency
+                ),
+            ),
+            _ => (
+                "invalid_requested_envelope",
+                "The requested envelope is invalid.".to_owned(),
+            ),
+        };
         return envelope_request_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_requested_envelope",
-            "The requested envelope is invalid.",
+            code,
+            reason,
             vec![EnvelopeRequestField::RequestedEnvelope],
         );
     }
@@ -3885,6 +3898,44 @@ mod tests {
                 .to_string(),
             ))
             .map_err(|error| format!("build envelope request: {error}"))
+    }
+
+    #[tokio::test]
+    async fn zero_single_run_limit_is_refused_with_a_plain_reason() -> Result<(), String> {
+        let broker = TestBroker::default();
+        let mut requested = template()
+            .auto_provision_threshold
+            .ok_or_else(|| "missing requested envelope".to_owned())?;
+        requested.spec.budget.single_run_limit = Some("0".to_owned());
+
+        let response = inner_router(broker.clone())
+            .layer(axum::Extension(session()?))
+            .layer(axum::Extension(UserEnvelopeMutationProof))
+            .oneshot(create_request_for(requested, "zero-single-run-limit")?)
+            .await
+            .map_err(|error| format!("submit zero-limit request: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read zero-limit response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse zero-limit response: {error}"))?;
+        assert_eq!(value["error"], "invalid_single_run_limit");
+        assert_eq!(
+            value["failureReason"],
+            "The per-run budget must be more than 0.00 USD."
+        );
+        assert_eq!(value["fields"], serde_json::json!(["requestedEnvelope"]));
+        assert!(
+            broker
+                .create_owners
+                .lock()
+                .map_err(|_| "lock zero-limit create calls".to_owned())?
+                .is_empty(),
+            "a refused zero limit must not persist an envelope request"
+        );
+        Ok(())
     }
 
     #[tokio::test]

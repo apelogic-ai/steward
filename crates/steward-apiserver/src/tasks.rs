@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec, evaluate_authority_request,
-    evaluate_with_grants,
+    evaluate_with_grants, validate_user_envelope_spec,
 };
 use steward_ports::{
     GitFile, GitFileRequest, GitHostingPlane, GitPack, GitPackRequest, GitRepositoryDescription,
@@ -6431,7 +6431,33 @@ fn direct_requirements_for_task(
             })
             .transpose()?;
     }
+    validate_direct_user_requirements(&requirements)?;
     Ok(requirements)
+}
+
+pub(crate) fn validate_direct_task_requirements(
+    definition: &DirectTaskDefinition,
+) -> Result<(), ApiError> {
+    match definition.requires.as_ref() {
+        Some(requirements) => validate_direct_user_requirements(requirements),
+        None => Ok(()),
+    }
+}
+
+fn validate_direct_user_requirements(requirements: &DirectRequirements) -> Result<(), ApiError> {
+    let spec = direct_authority_spec(requirements)?;
+    match validate_user_envelope_spec(&spec) {
+        Ok(()) => Ok(()),
+        Err(steward_admission::AdmissionError::NonPositiveSingleRunLimit { .. }) => {
+            Err(ApiError::Admission(format!(
+                "The per-run budget must be more than 0.00 {}.",
+                spec.budget.currency
+            )))
+        }
+        Err(_) => Err(ApiError::Admission(
+            "The Task requirements contain invalid values.".to_owned(),
+        )),
+    }
 }
 
 fn direct_authority_spec(requirements: &DirectRequirements) -> Result<EnvelopeSpec, ApiError> {

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
 use std::error::Error;
@@ -1375,8 +1375,10 @@ impl SandboxRuntime for AmbiguousTaskRuntime {
 #[derive(Clone, Default)]
 struct ActiveInference {
     provisions: Arc<AtomicUsize>,
+    reject_provision: Arc<AtomicBool>,
     revocations: Arc<AtomicUsize>,
     observed_spend: Arc<Mutex<Option<String>>>,
+    observed_spend_sequence: Arc<Mutex<VecDeque<String>>>,
     report_exhausted: Arc<AtomicBool>,
     requested_budgets: Arc<Mutex<Vec<Budget>>>,
 }
@@ -1402,6 +1404,11 @@ impl InferencePlane for ActiveInference {
         request: &InferenceRequest,
     ) -> Result<ProvisionedInference, PortError> {
         self.provisions.fetch_add(1, Ordering::SeqCst);
+        if self.reject_provision.load(Ordering::SeqCst) {
+            return Err(PortError::Rejected {
+                reason: "fixture inference settings were rejected".to_owned(),
+            });
+        }
         self.requested_budgets
             .lock()
             .map_err(|_| PortError::Failed {
@@ -1428,14 +1435,24 @@ impl InferencePlane for ActiveInference {
         if self.revocations.load(Ordering::SeqCst) > 0 {
             return Ok(InferenceObservation::Absent);
         }
-        let observed_amount = self
-            .observed_spend
+        let sequenced_amount = self
+            .observed_spend_sequence
             .lock()
             .map_err(|_| PortError::Failed {
-                reason: "fixture inference spend lock was poisoned".to_owned(),
+                reason: "fixture inference spend sequence lock was poisoned".to_owned(),
             })?
-            .clone()
-            .unwrap_or_else(|| "0".to_owned());
+            .pop_front();
+        let observed_amount = match sequenced_amount {
+            Some(amount) => amount,
+            None => self
+                .observed_spend
+                .lock()
+                .map_err(|_| PortError::Failed {
+                    reason: "fixture inference spend lock was poisoned".to_owned(),
+                })?
+                .clone()
+                .unwrap_or_else(|| "0".to_owned()),
+        };
         let observation = steward_types::SpendSummary {
             observed_amount,
             currency: request.budget.currency.clone(),
@@ -5740,7 +5757,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
 }
 
 #[tokio::test]
-async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
+async fn inference_budget_failures_persist_plain_reasons_without_retrying_rejections()
 -> Result<(), Box<dyn Error>> {
     install_rustls_crypto_provider()?;
     let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
@@ -5780,7 +5797,7 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
             tools: Vec::new(),
             budget: Budget {
                 monthly_limit: "100.00".to_owned(),
-                single_run_limit: Some("0.50".to_owned()),
+                single_run_limit: Some("0.0001".to_owned()),
                 currency: "USD".to_owned(),
             },
             runtime_minutes_limit: None,
@@ -6024,11 +6041,11 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
         "a per-run-limited failure must leave room for the final spend result"
     );
 
-    *inference
-        .observed_spend
+    inference
+        .observed_spend_sequence
         .lock()
-        .map_err(|_| io::Error::other("inference spend fixture was poisoned"))? =
-        Some("0.75".to_owned());
+        .map_err(|_| io::Error::other("inference spend sequence fixture was poisoned"))?
+        .extend(["0.00".to_owned(), "0.0002".to_owned()]);
     inference.report_exhausted.store(true, Ordering::SeqCst);
     reconcile_current(&client, &task_runtime, &store, task_uid).await?;
     let deleting_runtime = kubernetes
@@ -6055,7 +6072,7 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
             .first()
             .ok_or_else(|| io::Error::other("controller did not send a budget to inference"))?;
         assert_eq!(requested.monthly_limit, "100.00");
-        assert_eq!(requested.single_run_limit.as_deref(), Some("0.50"));
+        assert_eq!(requested.single_run_limit.as_deref(), Some("0.0001"));
     }
 
     let failed = store
@@ -6065,7 +6082,7 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
     assert_eq!(failed.phase, TaskPhase::Failed);
     assert_eq!(
         failed.failure_reason.as_deref(),
-        Some("This run reached its spending limit of 0.50 USD.")
+        Some("This run reached its spending limit of < 0.01 USD.")
     );
     assert_eq!(
         operation(&store, task_uid).await?.state,
@@ -6080,6 +6097,175 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
         .await?,
         0,
         "per-run Task failure must not create a monthly escalation"
+    );
+
+    let rejected_task_uid = Uuid::new_v4();
+    let rejected_operation_id = Uuid::new_v4();
+    let rejected_runtime_name = format!("task-{}", rejected_operation_id.simple());
+    let rejected_candidate_digest = digest(serde_json::to_value(&spec))?;
+    let rejected_inert_digest = manifest_digest_with_binding(
+        rejected_task_uid,
+        rejected_operation_id,
+        &rejected_runtime_name,
+        &inert_spec(&spec, &envelope),
+        "inert",
+        Some(&execution_binding),
+    )?;
+    let rejected_active_digest = manifest_digest_with_binding(
+        rejected_task_uid,
+        rejected_operation_id,
+        &rejected_runtime_name,
+        &spec,
+        "active",
+        Some(&execution_binding),
+    )?;
+    store
+        .reserve_task(&TaskReservationRequest {
+            task_uid: rejected_task_uid,
+            operation_id: rejected_operation_id,
+            idempotency_key: &format!("rejected-inference-task-{suffix}"),
+            submitter_service: &service,
+            acting_user: Some("alice@example.com"),
+            acting_user_id: Some(identity.user_id.as_str()),
+            owner: "alice@example.com",
+            owner_user_id: identity.user_id.as_str(),
+            workflow: &template_id,
+            workflow_name: Some(&template_id),
+            workflow_version: Some(1),
+            workflow_digest: Some(&workflow_digest),
+            user_envelope_instance_id: Some(&envelope_instance_id),
+            user_envelope_revision: Some(envelope.revision),
+            user_envelope_digest: Some(&envelope_digest),
+            coding_agent_runtime: "example-agent@1",
+            runtime_uid: None,
+            runtime_namespace: "steward-test",
+            runtime_name: &rejected_runtime_name,
+            runtime_ownership: RuntimeOwnership::Provisioned,
+            runtime_spec: &spec,
+            agent_command: &command,
+            execution_binding: Some(&execution_binding),
+            source_provenance: None,
+            direct_task_evidence: None,
+            task_origin: TaskOrigin::Unknown,
+            browser_task_evidence: None,
+            user_envelope_snapshot: Some(&envelope),
+            candidate_digest: &rejected_candidate_digest,
+            admission_decision: &AdmissionDecision::Admit,
+            inert_manifest_digest: &rejected_inert_digest,
+            active_manifest_digest: &rejected_active_digest,
+        })
+        .await?;
+    store
+        .put_task_inputs(
+            rejected_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"rejected inference task input",
+        )
+        .await?;
+    store
+        .request_task_execution(rejected_task_uid, &service, identity.user_id.as_str())
+        .await?;
+
+    let rejected_kubernetes = AmbiguousKubernetes::default();
+    *rejected_kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("rejected runtime UID fixture was poisoned"))? =
+        Some("runtime-uid-inference-rejected".to_owned());
+    let (rejected_admission_client, _rejected_admission_server) = router_client(
+        webhook_router_for_controller(store.clone(), CONTROLLER_USERNAME.to_owned()),
+        "steward-test",
+    )
+    .await?;
+    *rejected_kubernetes
+        .admission
+        .lock()
+        .map_err(|_| io::Error::other("rejected admission fixture was poisoned"))? =
+        Some(WebhookAdmissionHarness {
+            client: rejected_admission_client,
+            verify_boundaries: Arc::new(AtomicBool::new(false)),
+            create_checks: Arc::new(AtomicUsize::new(0)),
+            update_checks: Arc::new(AtomicUsize::new(0)),
+            delete_checks: Arc::new(AtomicUsize::new(0)),
+        });
+    let (rejected_client, _rejected_server) =
+        kubernetes_client(rejected_kubernetes.clone()).await?;
+    let rejected_task_runtime = AmbiguousTaskRuntime::default();
+    for _ in 0..5 {
+        reconcile_current(
+            &rejected_client,
+            &rejected_task_runtime,
+            &store,
+            rejected_task_uid,
+        )
+        .await?;
+    }
+    let rejected_runtime = rejected_kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("rejected runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("rejected runtime fixture is absent"))?;
+    let rejected_inference = ActiveInference::default();
+    rejected_inference
+        .reject_provision
+        .store(true, Ordering::SeqCst);
+    reconcile_agent_runtime_work_item(
+        &rejected_client,
+        rejected_task_runtime.clone(),
+        rejected_inference.clone(),
+        store.clone(),
+        rejected_runtime,
+    )
+    .await?;
+    let finalizing_rejected_runtime = rejected_kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("finalizing rejected runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("finalizing rejected runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &rejected_client,
+        rejected_task_runtime.clone(),
+        rejected_inference.clone(),
+        store.clone(),
+        finalizing_rejected_runtime,
+    )
+    .await?;
+    let rejected = store
+        .task(rejected_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(rejected.phase, TaskPhase::Failed);
+    assert_eq!(
+        rejected.failure_reason.as_deref(),
+        Some("This run stopped because its model access or spending settings were not accepted.")
+    );
+    assert_eq!(
+        operation(&store, rejected_task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending,
+        "a rejected inference request must stop retrying within two runtime reconciles"
+    );
+    assert_eq!(rejected_inference.provisions.load(Ordering::SeqCst), 1);
+    let cleanup_rejected_runtime = rejected_kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("cleanup rejected runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("cleanup rejected runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &rejected_client,
+        rejected_task_runtime,
+        rejected_inference.clone(),
+        store.clone(),
+        cleanup_rejected_runtime,
+    )
+    .await?;
+    assert_eq!(
+        rejected_inference.provisions.load(Ordering::SeqCst),
+        1,
+        "cleanup must not retry rejected inference provisioning"
     );
 
     let app = steward_apiserver::router(
@@ -6101,8 +6287,9 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
     let body: serde_json::Value = serde_json::from_slice(&body)?;
     assert_eq!(
         body["run"]["failureReason"],
-        "This run reached its spending limit of 0.50 USD."
+        "This run reached its spending limit of < 0.01 USD."
     );
+    assert_eq!(body["run"]["observedSpend"]["observedAmount"], "0.0002");
     assert_eq!(body["run"]["observedSpend"]["exhausted"], true);
     Ok(())
 }
