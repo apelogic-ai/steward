@@ -2313,7 +2313,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_live_catalog_accepts_jira_reads_and_refuses_jira_writes() {
+    fn deployment_catalog_allows_templates_and_envelopes_only_listed_jira_tools() {
         let mut requested = template().ceiling;
         let model = requested.spec.llms[0].clone();
         let jira_read = ToolGrant {
@@ -2337,7 +2337,7 @@ mod tests {
 
         assert!(
             capability_catalog_violation_fields(&capabilities, &requested).is_empty(),
-            "a Jira read tuple published by the gateway must be available to Envelope approval"
+            "a Jira read tuple in deployment configuration must be available to Envelope approval"
         );
 
         requested.spec.tools = vec![ToolGrant {
@@ -2348,7 +2348,7 @@ mod tests {
         assert_eq!(
             capability_catalog_violation_fields(&capabilities, &requested),
             [EnvelopeRequestField::Tools],
-            "a Jira write tuple omitted by the read-only gateway preset must not be approvable"
+            "a Jira write tuple omitted by deployment configuration must not be approvable"
         );
     }
 
@@ -3873,6 +3873,7 @@ mod tests {
         fn status<'a>(
             &'a self,
             _session: &'a ConnectionSession<()>,
+            _provider: &'a str,
         ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
             let result = self
                 .result

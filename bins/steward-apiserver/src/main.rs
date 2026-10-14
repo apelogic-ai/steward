@@ -882,7 +882,7 @@ async fn browser_application_router(
             runtimes.clone(),
             store.clone(),
             decisions,
-            capability_catalog,
+            capability_catalog.clone(),
             task_api_config.workspace_deployment_capabilities(),
             auth.clone(),
         ))
@@ -927,7 +927,11 @@ async fn browser_application_router(
                 github_automation_config,
                 auth.clone(),
             ))
-            .merge(connections::protected_router(broker, auth.clone())),
+            .merge(connections::protected_router(
+                broker,
+                capability_catalog.catalogs,
+                auth.clone(),
+            )),
         None => app.merge(agent_runs_ui::protected_router_with_task_reruns(
             store.clone(),
             browser_task_rerunner,

@@ -60,6 +60,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   status tuple, allowing provider-neutral status reads without granting provider mutations or
   ordinary tools. Requests from older API replicas retain the previous GitHub-only tuple during
   rolling upgrades.
+- Deployment capability catalogs now support tool choices from any configured provider, including
+  Jira read tools, in Templates, Envelopes, Tasks, and Runs. Each Run receives only the tools its
+  Task approved. The Connections API now lists every configured catalog provider and reads each
+  status independently through the gateway's stable provider route.
 - Added the first real-installation browser journey for creating the initial Envelope templates,
   together with the ten-journey feature specification and a tag-selectable Playwright runner.
 - Web spend and budget amounts now show two decimal places and their currency. Positive amounts

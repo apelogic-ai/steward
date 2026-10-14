@@ -667,11 +667,11 @@ pub struct GithubMcpGateway {
     contract: GatewayContract,
 }
 
-/// A one-request HOP-1 credential used only by the fixed connection-status reader.
+/// A one-request HOP-1 credential used only by the provider connection-status reader.
 /// Deliberately implements neither `Debug` nor `Display`.
-pub struct GithubStatusCredential(String);
+pub struct ProviderStatusCredential(String);
 
-impl GithubStatusCredential {
+impl ProviderStatusCredential {
     pub fn new(value: String) -> Result<Self, PortError> {
         let segments = value.split('.').collect::<Vec<_>>();
         let compact_jwt = value.len() <= 8 * 1024
@@ -696,13 +696,13 @@ impl GithubStatusCredential {
 
 /// MCP-GW metadata-only status reader. It has no mutation or generic request surface.
 #[derive(Clone)]
-pub struct GithubStatusReader {
+pub struct ProviderStatusReader {
     client: Client,
     origin: Url,
     contract: GatewayContract,
 }
 
-impl GithubStatusReader {
+impl ProviderStatusReader {
     pub fn new(origin: &str, version: &str) -> Result<Self, PortError> {
         let origin = validate_origin(origin)?;
         let contract = GatewayContract::parse(version)?;
@@ -724,8 +724,12 @@ impl GithubStatusReader {
         })
     }
 
-    pub async fn read(&self, credential: &GithubStatusCredential) -> Result<Value, PortError> {
-        let target = endpoint(&self.origin, LIFECYCLE_STATUS_PATH)?;
+    pub async fn read(
+        &self,
+        credential: &ProviderStatusCredential,
+        provider: &str,
+    ) -> Result<Value, PortError> {
+        let target = provider_status_endpoint(&self.origin, provider)?;
         let response = self
             .client
             .get(target)
@@ -733,15 +737,34 @@ impl GithubStatusReader {
             .header(ACCEPT, CONNECTION_STATUS_V2_MEDIA_TYPE)
             .send()
             .await
-            .map_err(|_| unavailable("read direct GitHub connection status"))?;
+            .map_err(|_| unavailable("read direct provider connection status"))?;
         let status = response.status();
         let body = bounded_body_or_status(
             status,
             StatusCode::OK,
             read_bounded(response, MAX_RESPONSE_BYTES).await?,
         )?;
-        parse_response(self.contract, GithubBridgeOperation::Status, status, &body)
+        parse_status_response(self.contract, status, &body, provider)
     }
+}
+
+fn provider_status_endpoint(origin: &Url, provider: &str) -> Result<Url, PortError> {
+    if provider.is_empty()
+        || provider.len() > 255
+        || provider.trim() != provider
+        || provider.chars().any(char::is_control)
+    {
+        return Err(rejected("provider connection identifier is invalid"));
+    }
+    let mut target = origin.clone();
+    target
+        .path_segments_mut()
+        .map_err(|_| rejected("MCP-GW origin cannot contain provider routes"))?
+        .clear()
+        .push("connections")
+        .push(provider)
+        .push("status");
+    Ok(target)
 }
 
 impl GithubMcpGateway {
@@ -1630,17 +1653,7 @@ fn parse_response(
     body: &[u8],
 ) -> Result<Value, PortError> {
     match operation {
-        GithubBridgeOperation::Status => {
-            require_status(status, StatusCode::OK, body)?;
-            let object = json_object(body, "GitHub status response")?;
-            match contract {
-                GatewayContract::LegacyV032 => {
-                    validate_status_response(&object)?;
-                    Ok(Value::Object(object))
-                }
-                GatewayContract::LifecycleV049 => normalized_status_response(&object),
-            }
-        }
+        GithubBridgeOperation::Status => parse_status_response(contract, status, body, "github"),
         GithubBridgeOperation::Start => {
             require_status(status, StatusCode::OK, body)?;
             let object = json_object(body, "GitHub start response")?;
@@ -1689,6 +1702,28 @@ fn parse_response(
         | GithubBridgeOperation::Publish => Err(rejected(
             "GitHub automation responses require the typed multi-call adapter path",
         )),
+    }
+}
+
+fn parse_status_response(
+    contract: GatewayContract,
+    status: StatusCode,
+    body: &[u8],
+    provider: &str,
+) -> Result<Value, PortError> {
+    require_status(status, StatusCode::OK, body)?;
+    let object = json_object(body, "provider status response")?;
+    match contract {
+        GatewayContract::LegacyV032 => {
+            if provider != "github" {
+                return Err(rejected(
+                    "legacy connection status is available only for its fixed provider",
+                ));
+            }
+            validate_status_response(&object)?;
+            Ok(Value::Object(object))
+        }
+        GatewayContract::LifecycleV049 => normalized_status_response(&object, provider),
     }
 }
 
@@ -2461,7 +2496,10 @@ fn validate_status_response(object: &Map<String, Value>) -> Result<(), PortError
     Ok(())
 }
 
-fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, PortError> {
+fn normalized_status_response(
+    object: &Map<String, Value>,
+    provider: &str,
+) -> Result<Value, PortError> {
     // Validate only the fields Steward consumes. MCP-GW may add lifecycle metadata without
     // changing this contract, and the projection below prevents unconsumed values from entering
     // Steward's governed archive or browser response.
@@ -2469,10 +2507,10 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
         .get("version")
         .and_then(Value::as_str)
         .filter(|version| matches!(*version, "1" | "2"))
-        .ok_or_else(|| rejected("GitHub lifecycle status has an invalid identity or schema"))?;
-    if object.get("provider").and_then(Value::as_str) != Some("github") {
+        .ok_or_else(|| rejected("provider lifecycle status has an invalid identity or schema"))?;
+    if object.get("provider").and_then(Value::as_str) != Some(provider) {
         return Err(rejected(
-            "GitHub lifecycle status has an invalid identity or schema",
+            "provider lifecycle status has an invalid identity or schema",
         ));
     }
 
@@ -2492,45 +2530,40 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
                     | "unavailable"
             )
         })
-        .ok_or_else(|| rejected("GitHub lifecycle phase is invalid"))?;
+        .ok_or_else(|| rejected("provider lifecycle phase is invalid"))?;
     let connected = object
         .get("connected")
         .and_then(Value::as_bool)
-        .ok_or_else(|| rejected("GitHub lifecycle connected state is invalid"))?;
+        .ok_or_else(|| rejected("provider lifecycle connected state is invalid"))?;
     let account = object
         .get("account")
         .map(|value| {
             let account = value
                 .as_object()
-                .ok_or_else(|| rejected("GitHub lifecycle account is invalid"))?;
+                .ok_or_else(|| rejected("provider lifecycle account is invalid"))?;
             let display_name = account
                 .get("displayName")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty() && name.len() <= 320)
                 .map(str::to_owned)
-                .ok_or_else(|| rejected("GitHub lifecycle account is invalid"))?;
+                .ok_or_else(|| rejected("provider lifecycle account is invalid"))?;
             if version == "1" {
                 if account.len() != 1 {
-                    return Err(rejected("GitHub lifecycle account is invalid"));
+                    return Err(rejected("provider lifecycle account is invalid"));
                 }
                 return Ok((display_name, None, None));
             }
-            if account.get("provider").and_then(Value::as_str) != Some("github") {
-                return Err(rejected("GitHub lifecycle account is invalid"));
+            if account.get("provider").and_then(Value::as_str) != Some(provider) {
+                return Err(rejected("provider lifecycle account is invalid"));
             }
             let account_id = account
                 .get("id")
                 .map(|value| {
                     value
                         .as_str()
-                        .filter(|id| {
-                            !id.is_empty()
-                                && id.len() <= 20
-                                && id.bytes().all(|byte| byte.is_ascii_digit())
-                                && !id.starts_with('0')
-                        })
+                        .filter(|id| valid_provider_account_id(provider, id))
                         .map(str::to_owned)
-                        .ok_or_else(|| rejected("GitHub lifecycle account ID is invalid"))
+                        .ok_or_else(|| rejected("provider lifecycle account ID is invalid"))
                 })
                 .transpose()?;
             let login = account
@@ -2540,7 +2573,7 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
                         .as_str()
                         .filter(|login| !login.is_empty() && login.len() <= 128)
                         .map(str::to_owned)
-                        .ok_or_else(|| rejected("GitHub lifecycle account login is invalid"))
+                        .ok_or_else(|| rejected("provider lifecycle account login is invalid"))
                 })
                 .transpose()?;
             Ok((display_name, account_id, login))
@@ -2556,7 +2589,7 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
                     .as_array()
                     .is_some_and(|values| !values.is_empty())))
     {
-        return Err(rejected("GitHub lifecycle phase and account disagree"));
+        return Err(rejected("provider lifecycle phase and account disagree"));
     }
     let active_expiry = nullable_utc_timestamp(object, "activeCredentialExpiresAt")?;
     let renewal_expiry = nullable_utc_timestamp(object, "renewalCredentialExpiresAt")?;
@@ -2566,7 +2599,7 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
     let capabilities = object
         .get("capabilities")
         .and_then(Value::as_object)
-        .ok_or_else(|| rejected("GitHub lifecycle capabilities are invalid"))?;
+        .ok_or_else(|| rejected("provider lifecycle capabilities are invalid"))?;
     if capabilities.iter().any(|(key, value)| {
         matches!(
             key.as_str(),
@@ -2586,7 +2619,7 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
         .is_some_and(|value| value.as_str().is_none_or(|category| category.len() > 64))
     {
         return Err(rejected(
-            "GitHub lifecycle capabilities or error are invalid",
+            "provider lifecycle capabilities or error are invalid",
         ));
     }
 
@@ -2610,22 +2643,35 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
     Ok(Value::Object(projection))
 }
 
+fn valid_provider_account_id(provider: &str, value: &str) -> bool {
+    if provider == "github" {
+        return !value.is_empty()
+            && value.len() <= 20
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && !value.starts_with('0');
+    }
+    !value.is_empty()
+        && value.len() <= 255
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
 fn required_string_array(object: &Map<String, Value>, key: &str) -> Result<Value, PortError> {
     object
         .get(key)
         .filter(|value| string_array(Some(value)))
         .cloned()
-        .ok_or_else(|| rejected("GitHub lifecycle scope list is invalid"))
+        .ok_or_else(|| rejected("provider lifecycle scope list is invalid"))
 }
 
 fn nullable_utc_timestamp(object: &Map<String, Value>, key: &str) -> Result<Value, PortError> {
     let value = object
         .get(key)
-        .ok_or_else(|| rejected("GitHub lifecycle timestamp is missing"))?;
+        .ok_or_else(|| rejected("provider lifecycle timestamp is missing"))?;
     if value.is_null() || value.as_str().is_some_and(valid_utc_timestamp) {
         Ok(value.clone())
     } else {
-        Err(rejected("GitHub lifecycle timestamp is invalid"))
+        Err(rejected("provider lifecycle timestamp is invalid"))
     }
 }
 
@@ -2880,11 +2926,11 @@ mod tests {
 
     use super::{
         GatewayContract, GithubBridgeFailureDiagnostic, GithubBridgeOperation, GithubBridgeRequest,
-        GithubMcpGateway, GithubPublishedFile, GithubStatusCredential, GithubStatusReader,
-        MAX_MCP_TOOL_RESPONSE_BYTES, MAX_RESPONSE_BYTES, McpSession,
-        PROVIDER_TRANSPORT_READY_TIMEOUT, commit_sha, compatible_workflow,
-        github_bridge_failure_diagnostic, maximum_run_id, mcp_tool_payload, normalize_pull_request,
-        normalize_repositories, normalize_repository, normalize_run_status, parse_response,
+        GithubMcpGateway, GithubPublishedFile, MAX_MCP_TOOL_RESPONSE_BYTES, MAX_RESPONSE_BYTES,
+        McpSession, PROVIDER_TRANSPORT_READY_TIMEOUT, ProviderStatusCredential,
+        ProviderStatusReader, commit_sha, compatible_workflow, github_bridge_failure_diagnostic,
+        maximum_run_id, mcp_tool_payload, normalize_pull_request, normalize_repositories,
+        normalize_repository, normalize_run_status, normalized_status_response, parse_response,
         payload_items, pre_dispatch_provider_failure, workflow_content, workflow_file_name,
     };
     use reqwest::StatusCode;
@@ -5799,12 +5845,12 @@ mod tests {
             Ok(())
         });
 
-        let reader = GithubStatusReader::new(&format!("http://{address}"), "0.4.9")
+        let reader = ProviderStatusReader::new(&format!("http://{address}"), "0.4.9")
             .map_err(|error| format!("build direct status reader: {error:?}"))?;
-        let credential = GithubStatusCredential::new("aaa.bbb.ccc".to_owned())
+        let credential = ProviderStatusCredential::new("aaa.bbb.ccc".to_owned())
             .map_err(|error| format!("build direct status credential: {error:?}"))?;
         let status = reader
-            .read(&credential)
+            .read(&credential, "github")
             .await
             .map_err(|error| format!("read direct status: {error:?}"))?;
 
@@ -5827,6 +5873,82 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_status_uses_the_exact_configured_provider_route() -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind direct status fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read direct status fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept direct status request: {error}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|error| format!("bound direct status fixture read: {error}"))?;
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .map_err(|error| format!("read direct status request: {error}"))?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.starts_with("GET /connections/jira/status HTTP/1.1\r\n"),
+                "the status reader must use the exact catalog provider"
+            );
+            let body = r#"{"version":"2","provider":"jira","phase":"connected","connected":true,"account":{"provider":"jira","id":"account-123","displayName":"alice@example.com"},"requiredScopes":["read:jira-work"],"grantedScopes":["read:jira-work"],"missingScopes":[],"activeCredentialExpiresAt":null,"renewalCredentialExpiresAt":null,"lastAuthorizedAt":null,"lastRenewedAt":null,"lastValidatedAt":null,"capabilities":{"interactiveAuthorization":true}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .map_err(|error| format!("write direct status response: {error}"))?;
+            Ok(())
+        });
+
+        let reader = ProviderStatusReader::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build direct status reader: {error:?}"))?;
+        let credential = ProviderStatusCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build direct status credential: {error:?}"))?;
+        let result = reader.read(&credential, "jira").await;
+
+        server
+            .join()
+            .map_err(|_| "direct status fixture panicked".to_owned())??;
+        let status = result.map_err(|error| format!("read Jira status: {error:?}"))?;
+        assert_eq!(status["accountId"], "account-123");
+        Ok(())
+    }
+
+    #[test]
+    fn provider_status_response_refuses_a_different_provider_identity() {
+        let value = serde_json::json!({
+            "version": "2",
+            "provider": "github",
+            "phase": "disconnected",
+            "connected": false,
+            "account": null,
+            "requiredScopes": [],
+            "grantedScopes": [],
+            "missingScopes": [],
+            "activeCredentialExpiresAt": null,
+            "renewalCredentialExpiresAt": null,
+            "lastAuthorizedAt": null,
+            "lastRenewedAt": null,
+            "lastValidatedAt": null,
+            "capabilities": {"interactiveAuthorization": true}
+        });
+
+        assert!(
+            normalized_status_response(
+                value.as_object().expect("test status is an object"),
+                "jira",
+            )
+            .is_err(),
+            "a Jira status read must reject a response for another provider"
+        );
     }
 
     #[tokio::test]
@@ -6038,11 +6160,11 @@ mod tests {
     fn direct_status_credential_requires_exactly_three_compact_jwt_segments() {
         for invalid in ["aaa.bbb", "aaa.bbb.ccc.ddd", "aaa..ccc", "aaa.bbb.ccc="] {
             assert!(
-                GithubStatusCredential::new(invalid.to_owned()).is_err(),
+                ProviderStatusCredential::new(invalid.to_owned()).is_err(),
                 "direct status credential must reject {invalid}"
             );
         }
-        assert!(GithubStatusCredential::new("aaa.bbb.ccc".to_owned()).is_ok());
+        assert!(ProviderStatusCredential::new("aaa.bbb.ccc".to_owned()).is_ok());
     }
 
     #[tokio::test]

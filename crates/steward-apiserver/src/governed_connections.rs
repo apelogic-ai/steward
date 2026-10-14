@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use steward_adapter_mcp_gw::{
-    GithubBridgeFailureDiagnostic, GithubStatusCredential, GithubStatusReader,
+    GithubBridgeFailureDiagnostic, ProviderStatusCredential, ProviderStatusReader,
     github_bridge_failure_diagnostic,
 };
 use steward_admission::internal_authorities::{
@@ -273,7 +273,7 @@ pub struct DirectConnectionStatusConfig {
 pub struct DirectConnectionStatusReader {
     client: reqwest::Client,
     control_plane_credential_file: PathBuf,
-    gateway: GithubStatusReader,
+    gateway: ProviderStatusReader,
     mint_endpoint: Url,
     store: PgStore,
     federated_subject_issuer: Option<String>,
@@ -284,6 +284,7 @@ pub struct DirectConnectionStatusReader {
 struct MintStatusTokenRequest {
     principal: Principal,
     canonical_authority: CanonicalAuthorityBinding,
+    provider: String,
 }
 
 #[derive(Deserialize)]
@@ -302,6 +303,7 @@ where
     fn status<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
+        provider: &'a str,
     ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>>;
 }
 
@@ -387,7 +389,7 @@ impl DirectConnectionStatusReader {
             .timeout(DIRECT_STATUS_DEADLINE)
             .build()
             .map_err(|_| GovernedConnectionPlanError::Unavailable)?;
-        let gateway = GithubStatusReader::new(mcp_gw_origin, mcp_gw_version)
+        let gateway = ProviderStatusReader::new(mcp_gw_origin, mcp_gw_version)
             .map_err(|_| GovernedConnectionPlanError::InvalidBindings)?;
         Ok(Self {
             client,
@@ -402,11 +404,13 @@ impl DirectConnectionStatusReader {
     async fn read<B>(
         &self,
         session: &ConnectionSession<B>,
+        provider: &str,
     ) -> Result<ProviderConnectionStatus, ConnectionBrokerError> {
-        let mut status = tokio::time::timeout(DIRECT_STATUS_DEADLINE, self.read_inner(session))
-            .await
-            .map_err(|_| ConnectionBrokerError::Unavailable)??;
-        if status.phase == ConnectionPhase::Connected {
+        let mut status =
+            tokio::time::timeout(DIRECT_STATUS_DEADLINE, self.read_inner(session, provider))
+                .await
+                .map_err(|_| ConnectionBrokerError::Unavailable)??;
+        if provider == "github" && status.phase == ConnectionPhase::Connected {
             status.github_actions_identity_linked = tokio::time::timeout(
                 CONNECTION_ASSOCIATION_DEADLINE,
                 self.associate_github_actions_identity(session, &status),
@@ -425,6 +429,7 @@ impl DirectConnectionStatusReader {
     async fn read_inner<B>(
         &self,
         session: &ConnectionSession<B>,
+        provider: &str,
     ) -> Result<ProviderConnectionStatus, ConnectionBrokerError> {
         let workload_credential = std::fs::read_to_string(&self.control_plane_credential_file)
             .map_err(|_| ConnectionBrokerError::Unavailable)?;
@@ -448,6 +453,7 @@ impl DirectConnectionStatusReader {
             .json(&MintStatusTokenRequest {
                 principal: Principal::User { acting_user: email },
                 canonical_authority,
+                provider: provider.to_owned(),
             })
             .send()
             .await
@@ -474,15 +480,15 @@ impl DirectConnectionStatusReader {
         {
             return Err(ConnectionBrokerError::Unavailable);
         }
-        let credential = GithubStatusCredential::new(token.access_token)
+        let credential = ProviderStatusCredential::new(token.access_token)
             .map_err(|_| ConnectionBrokerError::Unavailable)?;
         let value = self
             .gateway
-            .read(&credential)
+            .read(&credential, provider)
             .await
             .map_err(|_| ConnectionBrokerError::Unavailable)?;
-        let status = provider_status(&value)?;
-        if status.phase == ConnectionPhase::Connected {
+        let status = provider_status(&value, provider)?;
+        if provider == "github" && status.phase == ConnectionPhase::Connected {
             self.store
                 .complete_pending_connection_oauth_flow(&session.subject.canonical_user_id)
                 .await
@@ -540,8 +546,9 @@ where
     fn status<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
+        provider: &'a str,
     ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
-        Box::pin(async move { self.read(session).await })
+        Box::pin(async move { self.read(session, provider).await })
     }
 }
 
@@ -554,8 +561,9 @@ where
     fn status<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
+        provider: &'a str,
     ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
-        self.status.status(session)
+        self.status.status(session, provider)
     }
 
     fn start<'a>(
@@ -953,6 +961,7 @@ impl<B> GovernedConnectionsBroker<B> {
                 .as_ref()
                 .or(completed.cached_status.as_ref())
                 .ok_or(ConnectionBrokerError::Unavailable)?,
+            "github",
         )?;
         if allow_cache && status.phase == ConnectionPhase::Connected {
             self.store
@@ -1002,6 +1011,7 @@ where
     fn status<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
+        _provider: &'a str,
     ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
         Box::pin(async move { self.status_operation(session, true).await })
     }
@@ -1855,7 +1865,8 @@ fn bridge_result_value(operation: StoredOperationKind, body: &[u8]) -> Result<Va
         serde_json::from_slice(body).map_err(|_| StoreError::InvalidConnectionOperation)?;
     match operation {
         StoredOperationKind::Status => {
-            provider_status(&value).map_err(|_| StoreError::InvalidConnectionOperation)?;
+            provider_status(&value, "github")
+                .map_err(|_| StoreError::InvalidConnectionOperation)?;
         }
         StoredOperationKind::Start => {
             let Some(object) = value.as_object() else {
@@ -2067,7 +2078,10 @@ fn validate_publish_result(value: &Value) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn provider_status(value: &Value) -> Result<ProviderConnectionStatus, ConnectionBrokerError> {
+fn provider_status(
+    value: &Value,
+    provider: &str,
+) -> Result<ProviderConnectionStatus, ConnectionBrokerError> {
     let object = value
         .as_object()
         .ok_or(ConnectionBrokerError::Unavailable)?;
@@ -2095,9 +2109,10 @@ fn provider_status(value: &Value) -> Result<ProviderConnectionStatus, Connection
     let email = optional_string(object, "email")?;
     let account_id = optional_string(object, "accountId")?;
     let account_login = optional_string(object, "accountLogin")?;
-    if account_id
-        .as_deref()
-        .is_some_and(|value| github_actions_subject(value).is_none())
+    if provider == "github"
+        && account_id
+            .as_deref()
+            .is_some_and(|value| github_actions_subject(value).is_none())
     {
         return Err(ConnectionBrokerError::Unavailable);
     }
@@ -2439,6 +2454,7 @@ mod tests {
         fn status<'a>(
             &'a self,
             _session: &'a ConnectionSession<String>,
+            _provider: &'a str,
         ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
             self.status_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
@@ -2475,6 +2491,7 @@ mod tests {
         fn status<'a>(
             &'a self,
             _session: &'a ConnectionSession<String>,
+            _provider: &'a str,
         ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
             Box::pin(async {
                 Ok(ProviderConnectionStatus {
@@ -2512,7 +2529,7 @@ mod tests {
         };
 
         let status = broker
-            .status(&session)
+            .status(&session, "github")
             .await
             .map_err(|error| format!("read split status: {error:?}"))?;
 
@@ -3007,18 +3024,21 @@ mod tests {
 
     #[test]
     fn normalized_status_retains_precise_credential_expiries() -> Result<(), String> {
-        let status = provider_status(&serde_json::json!({
-            "phase": "connected",
-            "connected": true,
-            "email": "alice@example.com",
-            "accountId": "123456",
-            "accountLogin": "mutable-login",
-            "scopesRequired": ["repo"],
-            "scopesGranted": ["repo"],
-            "missingScopes": [],
-            "activeCredentialExpiresAt": "2026-09-15T12:00:00.000Z",
-            "renewalCredentialExpiresAt": "2026-09-16T12:00:00.000Z"
-        }))
+        let status = provider_status(
+            &serde_json::json!({
+                "phase": "connected",
+                "connected": true,
+                "email": "alice@example.com",
+                "accountId": "123456",
+                "accountLogin": "mutable-login",
+                "scopesRequired": ["repo"],
+                "scopesGranted": ["repo"],
+                "missingScopes": [],
+                "activeCredentialExpiresAt": "2026-09-15T12:00:00.000Z",
+                "renewalCredentialExpiresAt": "2026-09-16T12:00:00.000Z"
+            }),
+            "github",
+        )
         .map_err(|error| format!("normalized status was rejected: {error:?}"))?;
         assert_eq!(
             status.active_credential_expires_at.as_deref(),
@@ -3045,10 +3065,34 @@ mod tests {
                 "renewalCredentialExpiresAt": null
             });
             assert!(
-                provider_status(&invalid_status).is_err(),
+                provider_status(&invalid_status, "github").is_err(),
                 "invalid GitHub account ID {invalid} must not become identity evidence"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_status_keeps_non_github_account_ids_out_of_github_identity_rules()
+    -> Result<(), String> {
+        let status = provider_status(
+            &serde_json::json!({
+                "phase": "connected",
+                "connected": true,
+                "email": "alice@example.com",
+                "accountId": "account-123",
+                "scopesRequired": ["read:jira-work"],
+                "scopesGranted": ["read:jira-work"],
+                "missingScopes": [],
+                "activeCredentialExpiresAt": null,
+                "renewalCredentialExpiresAt": null
+            }),
+            "jira",
+        )
+        .map_err(|error| format!("provider status was rejected: {error:?}"))?;
+
+        assert_eq!(status.account_id.as_deref(), Some("account-123"));
+        assert!(status.github_actions_identity_linked.is_none());
         Ok(())
     }
 

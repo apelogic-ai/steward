@@ -822,8 +822,8 @@ mod tests {
 
     #[test]
     fn authority_resolution_preserves_jira_grants_for_the_v3_claim() -> Result<(), String> {
-        let mut runtime = runtime("runtime-uid-a", "workspace-a", "sandbox-a");
-        runtime.spec.tools = vec![ToolGrant {
+        let mut runtime_with_jira = runtime("runtime-uid-a", "workspace-a", "sandbox-a");
+        runtime_with_jira.spec.tools = vec![ToolGrant {
             provider: "jira".to_owned(),
             resource: "get_issue".to_owned(),
             action: "read".to_owned(),
@@ -834,7 +834,7 @@ mod tests {
             &workload(),
             binding.workspace.as_str(),
             binding.sandbox.as_str(),
-            &[runtime],
+            &[runtime_with_jira],
         )
         .map_err(|error| format!("resolve Jira runtime authority: {error:?}"))?;
 
@@ -846,6 +846,22 @@ mod tests {
                 action: "read".to_owned(),
             }],
             "Mint's v3 claim source must preserve the exact provider-agnostic runtime grants"
+        );
+
+        let runtime_without_jira = runtime("runtime-uid-a", "workspace-a", "sandbox-a");
+        let authority_without_jira = authority_from_runtime_refs(
+            &workload(),
+            binding.workspace.as_str(),
+            binding.sandbox.as_str(),
+            &[runtime_without_jira],
+        )
+        .map_err(|error| format!("resolve runtime authority without Jira: {error:?}"))?;
+        assert!(
+            authority_without_jira
+                .tools
+                .iter()
+                .all(|tool| tool.provider != "jira"),
+            "Mint's v3 claim source must not add a Jira tuple the Task runtime did not approve"
         );
         Ok(())
     }

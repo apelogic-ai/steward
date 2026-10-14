@@ -513,13 +513,13 @@ Steward release namespace also creates `steward-workflows`.
   `steward-task-v3` contracts. A verified v3 subject is recorded but receives
   no authority until an administrator associates it with an existing active
   canonical user. User Envelope admission remains unchanged.
-- `config.apiserver.capabilityCatalog` is the bounded, deployment-owned model/tool
-  catalog used by the template editor. The chart validates it, renders it into an
-  immutable content-addressed ConfigMap, and mounts it read-only in the apiserver.
-  When governed connections are enabled, Mint reads only its provider records from
-  the same mount so it cannot sign connection-status authority for an unconfigured
-  provider. The content-addressed mount rolls each reader when the catalog changes.
-  It is descriptive availability data and never Task authority.
+- `config.apiserver.capabilityCatalog` is the bounded, deployment-owned model/tool and provider
+  catalog used by the template editor and Connections page. The chart validates it, renders it
+  into an immutable content-addressed ConfigMap, and mounts it read-only in the apiserver. When
+  governed connections are enabled, Mint reads only its provider records from the same mount so
+  it cannot create a connection-status token for an unconfigured provider. The content-addressed
+  mount rolls each reader when the catalog changes. It describes availability and never grants a
+  Task permission.
 
   ```yaml
   config:
@@ -543,8 +543,10 @@ Steward release namespace also creates `steward-workflows`.
             available: true
   ```
 
-  Tool access classes and provider catalog availability are display metadata. Authority,
-  budget, TTL, template, and user fields are intentionally not part of this catalog.
+  Tool access classes and provider catalog availability are display metadata. Each distinct
+  provider under `catalogs` gets one connection-status read through the gateway's version-2
+  provider route; failures are isolated to that provider. Authority, budget, TTL, template, and
+  user fields are intentionally not part of this catalog.
 
   Optional `toolsets` are also presentation metadata. A tool may belong to at
   most 16 toolsets. The template editor groups tools only when these authoritative names are
