@@ -559,6 +559,32 @@ async fn verify_attempt_failure_semantics(
         ));
     }
 
+    let empty_output_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000007".to_owned());
+    let empty_output_task = SandboxTaskRequest {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "mkdir -p \"$STEWARD_OUTPUT_DIR/out\"".to_owned(),
+        ],
+        diagnostics: DiagnosticsRequest {
+            execution_log: ExecutionLogMode::Off,
+        },
+        ..task.clone()
+    };
+    match runtime
+        .start_task(&empty_output_attempt, &empty_output_task, input_archive)
+        .await
+        .map_err(|error| format!("empty-output task could not be observed: {error:?}"))?
+    {
+        SandboxTaskObservation::Failed { reason, .. }
+            if reason == "This run finished without creating an output file." => {}
+        other => {
+            return Err(format!(
+                "empty-output task did not fail with the expected reason: {other:?}"
+            ));
+        }
+    }
+
     let synchronous_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000006".to_owned());
     let synchronous_task = SandboxTaskRequest {
         command: vec![
@@ -667,7 +693,7 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
         command: vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            "set -eu; repository=/sandbox/workspace/source; test \"$(git -C \"$repository\" log --format=%s -2)\" = 'second revision\nfirst revision'; git -C \"$repository\" blame --porcelain tracked.txt | grep -Fq 'summary first revision'; test -z \"$(git -C \"$repository\" remote)\"; ! git -C \"$repository\" push >/dev/null 2>&1; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; printf task-; printf task- >&2; sleep 5; printf stdout; printf stderr >&2; sleep 5; cp in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"".to_owned(),
+            "set -eu; test \"$(pwd)\" = /sandbox/workspace/source; test \"$(git log --format=%s -2)\" = 'second revision\nfirst revision'; git blame --porcelain tracked.txt | grep -Fq 'summary first revision'; test -z \"$(git remote)\"; ! git push >/dev/null 2>&1; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; printf task-; printf task- >&2; sleep 5; printf stdout; printf stderr >&2; sleep 5; cp /sandbox/steward-input/in/payload.bin \"$STEWARD_OUTPUT_DIR/out/payload.bin\"".to_owned(),
         ],
         diagnostics: DiagnosticsRequest {
             execution_log: ExecutionLogMode::Full,

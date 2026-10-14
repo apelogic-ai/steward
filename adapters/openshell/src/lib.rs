@@ -78,6 +78,12 @@ const STAGING_EXEC_STDIN_CHUNK_BYTES: usize = 512 * 1024;
 #[cfg(feature = "runtime")]
 const SCRATCH_VOLUME_SIZE_NOT_ENFORCED_EXIT_CODE: i32 = 42;
 #[cfg(feature = "runtime")]
+const REQUIRED_OUTPUT_MISSING_EXIT_CODE: i32 = 66;
+#[cfg(feature = "runtime")]
+const REQUIRED_OUTPUT_MISSING_REASON: &str = "required_output_missing";
+#[cfg(feature = "runtime")]
+const REQUIRED_OUTPUT_MISSING_MESSAGE: &str = "This run finished without creating an output file.";
+#[cfg(feature = "runtime")]
 const EXECUTION_TRANSCRIPT_TRUNCATION_MARKER: &str = "[... execution output truncated ...]\n";
 #[cfg(feature = "runtime")]
 const KUBERNETES_DNS_SUBDOMAIN_MAX_LENGTH: usize = 253;
@@ -482,15 +488,33 @@ fn output_archive_command(
     execution_class: SandboxExecutionClass,
     agent_type: &AgentType,
     execution_binding: Option<&steward_types::DisposableExecutionBinding>,
-) -> &'static str {
+) -> String {
     if agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE {
-        "set -eu; test -f /sandbox/steward-output/response.json; tar -cf - -C /sandbox/steward-output response.json"
+        "set -eu; test -f /sandbox/steward-output/response.json; tar -cf - -C /sandbox/steward-output response.json".to_owned()
     } else if execution_class == SandboxExecutionClass::Agent && execution_binding.is_some() {
-        "set -eu; test -s /sandbox/steward-output/result.txt; test -d /sandbox/steward-output/out; tar -cf - -C /sandbox/steward-output out"
+        format!(
+            "set -eu; test -s /sandbox/steward-output/result.txt; if ! test -d /sandbox/steward-output/out || test -z \"$(find /sandbox/steward-output/out -type f -print -quit)\"; then exit {REQUIRED_OUTPUT_MISSING_EXIT_CODE}; fi; tar -cf - -C /sandbox/steward-output out"
+        )
     } else if execution_class == SandboxExecutionClass::Agent {
-        "set -eu; test -d /sandbox/steward-output/out; tar -cf - -C /sandbox/steward-output out"
+        format!(
+            "set -eu; if ! test -d /sandbox/steward-output/out || test -z \"$(find /sandbox/steward-output/out -type f -print -quit)\"; then exit {REQUIRED_OUTPUT_MISSING_EXIT_CODE}; fi; tar -cf - -C /sandbox/steward-output out"
+        )
     } else {
-        "set -eu; tar -cf - -C /sandbox/steward-output ."
+        "set -eu; tar -cf - -C /sandbox/steward-output .".to_owned()
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn task_process_workdir(workspace: Option<&WorkspaceEvidence>) -> String {
+    let mut repositories = workspace.into_iter().flat_map(|workspace| {
+        workspace.entries.iter().filter_map(|entry| match entry {
+            ResolvedWorkspaceEntry::Git { name, .. } => Some(name.as_str()),
+            ResolvedWorkspaceEntry::Scratch { .. } => None,
+        })
+    });
+    match (repositories.next(), repositories.next()) {
+        (Some(name), None) => format!("/sandbox/workspace/{name}"),
+        _ => "/sandbox/steward-input".to_owned(),
     }
 }
 
@@ -695,18 +719,26 @@ fn attach_task_agent_failure_category(
     match observation {
         SandboxTaskObservation::Failed {
             adapter_observation_id,
-            ..
+            reason,
         } => SandboxTaskObservation::Failed {
             adapter_observation_id,
-            reason: task_failure_category(stderr, managed_inference, model_providers).to_owned(),
+            reason: if reason == REQUIRED_OUTPUT_MISSING_MESSAGE {
+                reason
+            } else {
+                task_failure_category(stderr, managed_inference, model_providers).to_owned()
+            },
         },
         SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
+            reason,
             transcript,
-            ..
         } => SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
-            reason: task_failure_category(stderr, managed_inference, model_providers).to_owned(),
+            reason: if reason == REQUIRED_OUTPUT_MISSING_MESSAGE {
+                reason
+            } else {
+                task_failure_category(stderr, managed_inference, model_providers).to_owned()
+            },
             transcript,
         },
         observation => observation,
@@ -1718,6 +1750,7 @@ impl OpenShellRuntime {
         &self,
         sandbox_id: &str,
         command: &[String],
+        workdir: &str,
         environment: HashMap<String, String>,
         execution_class: SandboxExecutionClass,
         context: TaskProcessLogContext<'_>,
@@ -1727,7 +1760,7 @@ impl OpenShellRuntime {
             .exec_sandbox(ExecSandboxRequest {
                 sandbox_id: sandbox_id.to_owned(),
                 command: command.to_vec(),
-                workdir: "/sandbox/steward-input".to_owned(),
+                workdir: workdir.to_owned(),
                 environment,
                 timeout_seconds: 30 * 60,
                 stdin: Vec::new(),
@@ -2591,6 +2624,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             self.stage_workspace_archive(workspace, sandbox, archive, evidence)
                 .await?;
         }
+        let workdir = task_process_workdir(request.workspace.as_ref());
         let sandbox_id = self
             .resolve_raw_sandbox_binding(
                 workspace,
@@ -2630,7 +2664,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         let wrapped_command = task_attempt_execution_command(
             &attempt_directory,
             &request.command,
-            output_archive_command,
+            &output_archive_command,
             task_transcript_requested(request.execution_class, request.diagnostics.execution_log),
         );
         let launch_mode =
@@ -2645,6 +2679,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             .exec_task_process(
                 &sandbox_id,
                 &["/bin/sh".to_owned(), "-c".to_owned(), process_command],
+                &workdir,
                 environment,
                 request.execution_class,
                 TaskProcessLogContext {
@@ -2822,6 +2857,8 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                         "The execution log exceeded the {} MiB limit per stream.",
                         MAX_EXECUTION_STREAM_BYTES / (1024 * 1024)
                     )
+                } else if payload == REQUIRED_OUTPUT_MISSING_REASON.as_bytes() {
+                    REQUIRED_OUTPUT_MISSING_MESSAGE.to_owned()
                 } else {
                     transcript.as_ref().map_or_else(
                         || {
@@ -3102,6 +3139,8 @@ fn task_attempt_execution_command(
            printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
          ({output_archive_command}) > {directory}/output.tar; status=$?; \
          if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
+           if [ \"$status\" -eq {REQUIRED_OUTPUT_MISSING_EXIT_CODE} ]; then \
+             printf '%s' {REQUIRED_OUTPUT_MISSING_REASON} > {failure_reason_path}; fi; \
            printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
          printf succeeded > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state"
     )
@@ -3420,9 +3459,9 @@ mod tests {
         task_attempt_detached_launch_command, task_attempt_directory,
         task_attempt_execution_command, task_attempt_observation_command,
         task_attempt_transcript_stream_command, task_failure_category, task_process_launch_mode,
-        task_process_log_record, task_transcript_requested, validate_raw_sandbox_binding,
-        validate_workload_exchange_endpoint, workspace_materialization_command,
-        workspace_preparation_failed,
+        task_process_log_record, task_process_workdir, task_transcript_requested,
+        validate_raw_sandbox_binding, validate_workload_exchange_endpoint,
+        workspace_materialization_command, workspace_preparation_failed,
     };
     #[cfg(feature = "runtime")]
     use super::{EXECUTION_BINDING_LABEL, RUNTIME_UID_LABEL};
@@ -4174,6 +4213,64 @@ mod tests {
         assert!(command.contains("chmod -R a-w '/sandbox/workspace/source'"));
         assert!(!command.contains("remote add"));
         assert!(!command.contains("github.example.test"));
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn one_repository_workspace_is_the_agent_working_directory() -> Result<(), String> {
+        let repository = |name: &str, commit: char| -> Result<ResolvedWorkspaceEntry, String> {
+            Ok(ResolvedWorkspaceEntry::Git {
+                name: WorkspaceName::parse(name)?,
+                access: WorkspaceAccess::ReadOnly,
+                repository: RepositoryUrl::parse(format!(
+                    "https://github.example.test/example-org/{name}.git"
+                ))?,
+                repository_id: StableProviderId::parse("123")?,
+                repository_owner_id: StableProviderId::parse("456")?,
+                commit: ExactGitCommit::parse(format!(
+                    "git:sha1:{}",
+                    commit.to_string().repeat(40)
+                ))?,
+                history: WorkspaceGitHistory::None,
+                paths: Vec::new(),
+                submodules: Vec::new(),
+                max_materialized_bytes: 1024,
+                content_digest: ContentDigest::parse(format!(
+                    "steward:sha256:{}",
+                    commit.to_string().repeat(64)
+                ))?,
+            })
+        };
+        let scratch = ResolvedWorkspaceEntry::Scratch {
+            name: WorkspaceName::parse("notes")?,
+            size: ResourceQuantity::parse("1Mi")?,
+            content_digest: ContentDigest::parse(format!("steward:sha256:{}", "c".repeat(64)))?,
+        };
+        let workspace = |entries| -> Result<WorkspaceEvidence, String> {
+            Ok(WorkspaceEvidence {
+                entries,
+                max_materialized_bytes: 1024,
+                max_history_depth: None,
+                workspace_digest: ContentDigest::parse(format!(
+                    "steward:sha256:{}",
+                    "d".repeat(64)
+                ))?,
+            })
+        };
+
+        assert_eq!(
+            task_process_workdir(Some(&workspace(vec![repository("source", 'a')?, scratch])?)),
+            "/sandbox/workspace/source"
+        );
+        assert_eq!(
+            task_process_workdir(Some(&workspace(vec![
+                repository("source", 'a')?,
+                repository("other", 'b')?,
+            ])?)),
+            "/sandbox/steward-input"
+        );
+        assert_eq!(task_process_workdir(None), "/sandbox/steward-input");
         Ok(())
     }
 
@@ -5132,7 +5229,25 @@ mod tests {
             None,
         );
         assert!(command.contains("test -d /sandbox/steward-output/out"));
+        assert!(
+            command.contains("find /sandbox/steward-output/out -type f"),
+            "an agent run must not succeed without publishing an output file"
+        );
         assert!(command.ends_with(" out"));
+        let execution = task_attempt_execution_command(
+            "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef",
+            &["/bin/true".to_owned()],
+            &command,
+            false,
+        );
+        assert!(execution.contains("required_output_missing"));
+        assert!(
+            Command::new("/bin/sh")
+                .args(["-n", "-c", &execution])
+                .status()
+                .is_ok_and(|status| status.success()),
+            "the missing-output failure wrapper must be valid POSIX shell"
+        );
 
         let provider_control = output_archive_command(
             SandboxExecutionClass::ProviderControl,
@@ -5780,6 +5895,23 @@ mod tests {
                 transcript,
             },
             "successful observations must remain unchanged"
+        );
+
+        assert_eq!(
+            attach_task_agent_failure_category(
+                SandboxTaskObservation::Failed {
+                    adapter_observation_id: "attempt-c".to_owned(),
+                    reason: super::REQUIRED_OUTPUT_MISSING_MESSAGE.to_owned(),
+                },
+                b"",
+                false,
+                &[],
+            ),
+            SandboxTaskObservation::Failed {
+                adapter_observation_id: "attempt-c".to_owned(),
+                reason: super::REQUIRED_OUTPUT_MISSING_MESSAGE.to_owned(),
+            },
+            "a missing-output failure must not be replaced by a generic agent category"
         );
     }
 
