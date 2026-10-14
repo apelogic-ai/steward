@@ -27,6 +27,9 @@ Feature: J4 - User runs a Task on a repository
     And the drop-down "Workspace repository" offers "<owner>/<repository>"
     When I choose "<owner>/<repository>" in "Workspace repository"
     Then the field "Branch or tag" shows "main"
+    And I see in "Repository checkout":
+      | /sandbox/workspace/<workspace-name> |
+      | read-only                          |
     # The repository is shown by name, not by a number.
     And the field "Workspace (advanced JSON array)" shows '[{"git": {"repository": "<owner>/<repository>", "ref": "git:ref:main"}}]'
     When I open "Review exact Task definition"
@@ -41,10 +44,11 @@ Feature: J4 - User runs a Task on a repository
     And I press "Run now"
     Then I do not see "The run request was rejected."
     And I see in "Workspace":
-      | <owner>/<repository> |
-      | Workspace entry:     |
-      | Git · read-only      |
-      | files only           |
+      | <owner>/<repository>                |
+      | Workspace entry:                    |
+      | /sandbox/workspace/<workspace-name> |
+      | Git · read-only                     |
+      | files only                          |
     When I open "Repository details"
     Then I see in "Repository details":
       | Owner ID      |

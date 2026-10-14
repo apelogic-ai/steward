@@ -32,6 +32,54 @@ function firstGitEntry(entries: unknown[]): { index: number; entry: WorkspaceObj
   return null;
 }
 
+export function defaultWorkspaceName(repositoryName: string): string | null {
+  let normalized = "";
+  let previousDash = false;
+  for (const byte of new TextEncoder().encode(repositoryName)) {
+    const alphaNumeric = byte >= 48 && byte <= 57 || byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122;
+    const next = alphaNumeric ? String.fromCharCode(byte).toLocaleLowerCase("en-US") : "-";
+    if (next === "-") {
+      if (!normalized || previousDash) continue;
+      previousDash = true;
+    } else {
+      previousDash = false;
+    }
+    if (normalized.length === 40) break;
+    normalized += next;
+  }
+  normalized = normalized.replace(/-+$/, "");
+  return normalized || null;
+}
+
+function describedWorkspaceRepository(value: unknown, repositories: readonly GithubRepositoryView[]): GithubRepositoryView | null {
+  if (typeof value === "string") return matchingWorkspaceRepository(value, repositories);
+  const identity = record(value);
+  if (typeof identity?.ownerId !== "string" || typeof identity.repositoryId !== "string") return null;
+  return repositories.find((repository) => repository.ownerId === identity.ownerId && repository.repositoryId === identity.repositoryId) ?? null;
+}
+
+function workspaceCheckoutRows(entries: unknown[], repositories: readonly GithubRepositoryView[]): Array<{ access: string; name: string | null; repository: string }> {
+  return entries.flatMap((value) => {
+    const git = record(record(value)?.git);
+    if (!git) return [];
+    const described = describedWorkspaceRepository(git.repository, repositories);
+    const name = typeof git.name === "string"
+      ? git.name
+      : described
+        ? defaultWorkspaceName(described.name)
+        : null;
+    return [{
+      access: git.access === "copy" ? "copy" : "read-only",
+      name,
+      repository: described
+        ? workspaceRepositoryName(described)
+        : typeof git.repository === "string"
+          ? git.repository === "self" ? "Current repository" : git.repository
+          : "Repository workspace",
+    }];
+  });
+}
+
 function repositorySelector(value: string): { host: string | null; path: string } {
   const trimmed = value.trim().replace(/\.git$/i, "");
   try {
@@ -133,6 +181,7 @@ export function WorkspaceRepositoryControls({
 }>) {
   const entries = workspaceEntries(value);
   const selection = entries ? firstGitEntry(entries) : null;
+  const checkouts = entries ? workspaceCheckoutRows(entries, repositories) : [];
   const matched = matchingWorkspaceRepository(selection?.git.repository, repositories);
   const currentReference = readableWorkspaceRef(selection?.git.ref);
   const derivedReference = currentReference ?? matched?.defaultBranch ?? "";
@@ -176,5 +225,6 @@ export function WorkspaceRepositoryControls({
     {!entries ? <p className="text-sm text-err md:col-span-2" role="alert">Workspace must be a valid JSON array before using the repository picker.</p> : null}
     {matched && !validWorkspaceBranchOrTag(reference) ? <p className="text-sm text-err md:col-span-2" role="alert">Workspace entry {workspaceRepositoryName(matched)} accepts trigger, a full git:sha1 commit, or a branch or tag in JSON. Enter a branch or tag other than HEAD or a commit ID in this field.</p> : null}
     {preservesLegacySelector ? <p className="text-xs text-muted-ink md:col-span-2">The existing repository and revision selection remains unchanged until you choose a repository and branch or tag.</p> : null}
+    {checkouts.length ? <ul className="space-y-2 text-xs text-muted-ink md:col-span-2">{checkouts.map((checkout, index) => <li className="flex flex-wrap items-center gap-x-2" key={`${checkout.repository}-${index}`}><span>{checkout.repository}</span>{checkout.name ? <code className="text-ink">/sandbox/workspace/{checkout.name}</code> : <span>Checkout path resolves when the run starts; set <code className="text-ink">git.name</code> to make it explicit.</span>}<span>· {checkout.access}</span></li>)}</ul> : null}
   </div>;
 }

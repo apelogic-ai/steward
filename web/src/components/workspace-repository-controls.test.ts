@@ -1,11 +1,13 @@
 import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { readFileSync } from "node:fs";
 
 import type { GithubRepositoryView } from "@/api-client";
 
 import {
   canonicalWorkspaceRef,
+  defaultWorkspaceName,
   editWorkspaceReference,
   matchingWorkspaceRepository,
   readableWorkspaceRef,
@@ -13,6 +15,11 @@ import {
   validWorkspaceBranchOrTag,
   WorkspaceRepositoryControls,
 } from "./workspace-repository-controls";
+
+const workspaceNameCases = JSON.parse(readFileSync(new URL("../../../tests/fixtures/workspace-name-cases.json", import.meta.url), "utf8")) as Array<{
+  repositoryName: string;
+  workspaceName: string | null;
+}>;
 
 const repository: GithubRepositoryView = {
   defaultBranch: "main",
@@ -24,6 +31,12 @@ const repository: GithubRepositoryView = {
   repositoryId: "1001",
   url: "https://github.com/example-org/repository.git",
 };
+
+test("Task-form workspace paths follow the server workspace-name cases", () => {
+  for (const { repositoryName, workspaceName } of workspaceNameCases) {
+    expect(defaultWorkspaceName(repositoryName)).toBe(workspaceName);
+  }
+});
 
 test("the structured picker adds a readable repository and canonical named ref", () => {
   const updated = updateWorkspaceRepository("[]", repository, "release-v1");
@@ -122,4 +135,59 @@ test("the Task editor shows the trigger selector instead of the repository defau
   expect(html).toContain('value="trigger"');
   expect(html).not.toContain('value="main"');
   expect(html).toContain("Workspace entry example-org/repository accepts trigger");
+});
+
+test("the Task editor shows each repository checkout path and access", () => {
+  const html = renderToStaticMarkup(createElement(WorkspaceRepositoryControls, {
+    onChange: () => undefined,
+    repositories: [repository],
+    value: JSON.stringify([
+      {
+        git: {
+          repository: "example-org/repository",
+          ref: "git:ref:main",
+        },
+      },
+      {
+        git: {
+          access: "copy",
+          name: "source",
+          repository: "example-org/other",
+          ref: "git:ref:main",
+        },
+      },
+    ]),
+  }));
+
+  expect(html).toContain('<span>example-org/repository</span><code class="text-ink">/sandbox/workspace/repository</code><span>· read-only</span>');
+  expect(html).toContain('<span>example-org/other</span><code class="text-ink">/sandbox/workspace/source</code><span>· copy</span>');
+});
+
+test("the Task editor uses catalog names for stable IDs and server-equivalent path normalization", () => {
+  const siteRepository = { ...repository, name: "site.git", repositoryId: "1002" };
+  const html = renderToStaticMarkup(createElement(WorkspaceRepositoryControls, {
+    onChange: () => undefined,
+    repositories: [siteRepository],
+    value: JSON.stringify([{
+      git: {
+        repository: { ownerId: "1000", repositoryId: "1002" },
+        ref: "git:ref:main",
+      },
+    }]),
+  }));
+
+  expect(html).toContain('<span>example-org/site.git</span><code class="text-ink">/sandbox/workspace/site-git</code><span>· read-only</span>');
+});
+
+test("the Task editor keeps unresolved repository entries visible without inventing a checkout path", () => {
+  const html = renderToStaticMarkup(createElement(WorkspaceRepositoryControls, {
+    onChange: () => undefined,
+    repositories: [],
+    value: JSON.stringify([{ git: { repository: "self", ref: "trigger" } }]),
+  }));
+
+  expect(html).toContain("Current repository");
+  expect(html).toContain("Checkout path resolves when the run starts");
+  expect(html).toContain("· read-only");
+  expect(html).not.toContain("/sandbox/workspace/self");
 });
