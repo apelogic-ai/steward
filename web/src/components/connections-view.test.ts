@@ -110,6 +110,11 @@ describe("governed provider connection controls", () => {
     expect(source).toContain('connection.provider === "github" && status.githubActionsIdentityLinked === false');
   });
 
+  test("uses a plain provider status fallback when scope evidence is unavailable", () => {
+    expect(source).toContain("{providerName} status couldn&apos;t be read right now.");
+    expect(source).toContain('scopeStatus === "unavailable"');
+  });
+
   test("separates tool connections from deployment-mode-aware inference custody", () => {
     expect(source).toContain("Tools / MCP servers");
     expect(source).toContain("<h2 className=\"text-lg font-semibold\">Models</h2>");

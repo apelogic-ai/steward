@@ -15,7 +15,7 @@ import {
   type InferenceConnectionResponse,
   type ProviderConnectionView,
 } from "@/api-client";
-import { connectionHealth } from "@/components/connection-health";
+import { connectionHealth, connectionScopeStatus } from "@/components/connection-health";
 import { classifyConnectionMutationFailure, type ConnectionMutationState } from "@/components/connection-mutation-state";
 import { boundedConnectionPollDeadline } from "@/components/connection-poll-deadline";
 import { ConfirmationDialog, SectionCard } from "@/components/hs";
@@ -147,6 +147,7 @@ function ProviderConnection({ connection, refresh }: Readonly<{
   const status = connection.status;
   const providerName = connection.displayName.trim() || connection.provider;
   const health = connectionHealth(status);
+  const scopeStatus = connectionScopeStatus(status);
   const canStart = connection.actions.includes("start");
   const canDisconnect = connection.actions.includes("disconnect");
   const reauthorizationRecommended = health === "expiring_soon" || health === "expired";
@@ -307,7 +308,7 @@ function ProviderConnection({ connection, refresh }: Readonly<{
       <div className="space-y-4">
         {connection.provider === "github" && status.githubActionsIdentityLinked === true ? <p className="text-sm text-ok">GitHub Actions runs as you: linked.</p> : connection.provider === "github" && status.githubActionsIdentityLinked === false ? <p className="text-sm text-err">GitHub Actions identity is not linked to this Steward user.</p> : null}
         <div><p className="mb-2 text-xs font-semibold text-muted-ink">Scopes</p>{status.scopesGranted.length ? <ul className="flex flex-wrap gap-2">{status.scopesGranted.map((scope) => <li className="rounded-full bg-ok-soft px-3 py-1 font-mono text-xs" key={scope}>{scope} <span className="font-sans font-semibold text-ok">✓ granted</span></li>)}</ul> : <p className="text-sm text-muted-ink">No granted scopes reported.</p>}</div>
-        {status.scopesMissing.length ? <p className="text-sm text-err">Missing required scopes: {status.scopesMissing.join(", ")}.</p> : <p className="text-sm text-ok">All required scopes granted.</p>}
+        {scopeStatus === "unavailable" ? <p className="text-sm text-muted-ink">{providerName} status couldn&apos;t be read right now.</p> : scopeStatus === "missing" ? <p className="text-sm text-err">Missing required scopes: {status.scopesMissing.join(", ")}.</p> : <p className="text-sm text-ok">All required scopes granted.</p>}
         <dl className="grid gap-3 text-sm sm:grid-cols-2"><div><dt className="text-xs font-semibold text-muted-ink">Active credential expires</dt><dd className="mt-1">{status.activeCredentialExpiresAt ?? "Not reported"}</dd></div><div><dt className="text-xs font-semibold text-muted-ink">Renewal credential expires</dt><dd className="mt-1">{status.renewalCredentialExpiresAt ?? "Not reported"}</dd></div></dl>
         {canStart && (status.phase !== "connected" || reauthorizationRecommended) ? <button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">{status.phase === "disconnected" ? `Connect ${providerName}` : `Re-authorize ${providerName}`}</button> : null}
         {action !== "idle" && action !== "working" ? <div className="text-sm text-err" role="alert"><p>{action !== "orchestration-not-active" && startFailure ? connectionFailureMessage(startFailure, providerName) : { "orchestration-not-active": "Connections are disabled until task runs are enabled for this installation.", "oauth-pending": `Finish or wait for the pending ${providerName} authorization before disconnecting.`, "poll-expired": "The connection operation did not finish in time. Retry it; if it continues, contact an administrator.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "The connection action was rejected.", forbidden: "You are not allowed to manage this connection.", unavailable: "Connections are unavailable. Try again.", error: "The connection action could not be completed." }[action]}</p>{action !== "orchestration-not-active" && startFailure ? <details className="mt-1 text-xs"><summary className="cursor-pointer">Details</summary><dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-2"><dt>Category</dt><dd><code>{startFailure.error}</code></dd>{startFailure.code ? <><dt>Code</dt><dd><code>{startFailure.code}</code></dd></> : null}{startFailure.detail ? <><dt>Reason</dt><dd><code>{startFailure.detail}</code></dd></> : null}</dl></details> : null}</div> : null}
