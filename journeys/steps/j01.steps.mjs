@@ -36,7 +36,7 @@ function resolveText(journey, text) {
     .replaceAll("<owner>/<repository>", repository)
     .replaceAll("<workspace-name>", workspaceName);
   if (prefixed === "member") return memberRole;
-  if (["Agent choice", "Read the repository", "Scratch and Git", "Scratch check", "Stated needs"].includes(prefixed)) {
+  if (["Agent choice", "Read the repository", "Scratch and Git", "Scratch check", "Stated needs", "Zero per-run budget"].includes(prefixed)) {
     return `${runPrefix}-${prefixed.toLocaleLowerCase("en-US").replaceAll(/[^a-z0-9]+/g, "-").replaceAll(/^-|-$/g, "")}`;
   }
   if (prefixed === "<run-runtime-minutes>") {
@@ -390,13 +390,12 @@ function decimalBelow(value, label) {
   const match = /^(0|[1-9][0-9]*)(?:\.([0-9]{1,6}))?$/.exec(value);
   expect(match, `${label} should use the authority decimal syntax`).toBeTruthy();
   const fractional = match[2] ?? "";
-  const scale = 10n ** BigInt(fractional.length);
-  const units = BigInt(match[1]) * scale + BigInt(fractional || "0");
-  expect(units > 0n, `${label} must be positive so a lower requirement exists`).toBeTruthy();
+  const scale = 1_000_000n;
+  const units = BigInt(match[1]) * scale + BigInt(fractional.padEnd(6, "0") || "0");
+  expect(units > 1n, `${label} must allow a lower positive requirement`).toBeTruthy();
   const lower = units / 2n;
-  if (fractional.length === 0) return lower.toString();
   const whole = lower / scale;
-  const remainder = (lower % scale).toString().padStart(fractional.length, "0").replace(/0+$/, "");
+  const remainder = (lower % scale).toString().padStart(6, "0").replace(/0+$/, "");
   return remainder ? `${whole}.${remainder}` : whole.toString();
 }
 
@@ -481,7 +480,10 @@ async function assertDataRows(scope, journey, dataTable, layout = "rows") {
     expect(index, `one visible row should contain ${values.join(" | ")}`).toBeGreaterThanOrEqual(0);
     const row = candidates.nth(index);
     await expect(row).toBeVisible();
-    for (const value of values) await expect(row.getByText(value, { exact: !value.endsWith(":") }).first()).toBeVisible();
+    for (const value of values) {
+      if (layout === "contained-row") await expect(row).toContainText(value);
+      else await expect(row.getByText(value, { exact: !value.endsWith(":") }).first()).toBeVisible();
+    }
   }
 }
 
@@ -642,7 +644,7 @@ Then("I see in {string}:", async ({ journey, page }, area, dataTable) => {
     }
     return;
   }
-  await assertDataRows(scope, journey, dataTable, area === "Workspace access" ? "columns" : "rows");
+  await assertDataRows(scope, journey, dataTable, area === "Workspace access" ? "columns" : area === "Repository checkout" ? "contained-row" : "rows");
 });
 
 When("I open {string}", async ({ journey, page }, destination) => {
@@ -864,6 +866,15 @@ When("I state requirements that are all below the Envelope's limits", async ({ j
 
 When("I state requirements that are all at the Envelope's limits", async ({ journey, page }) => {
   await fillEnvelopeRequirements(journey, page, "at");
+});
+
+When("I state a per-run budget of zero", async ({ journey, page }) => {
+  await fillEnvelopeRequirements(journey, page, "below");
+  const field = fieldLocator(page, "Requirements (optional JSON)");
+  const requirements = JSON.parse(await field.inputValue());
+  requirements.authority.budget.singleRunLimit = "0";
+  journey.statedSingleRunLimit = "0";
+  await field.fill(JSON.stringify(requirements));
 });
 
 Given("the installation keeps execution logs", async ({ page }) => {

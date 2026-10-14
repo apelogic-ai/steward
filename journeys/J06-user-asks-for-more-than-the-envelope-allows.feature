@@ -14,9 +14,8 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
     And I hold an Envelope from the template "basic"
     And I hold an Envelope from the template "timed"
 
-  # Steps 1 and 2. PASS on 0.3.16.
-  # A below-limit per-run budget currently becomes 0; the runtime rejects it without a reason (#414).
-  @extended @needs-model @known-failing-414
+  # Steps 1 and 2. Every below-limit budget remains positive.
+  @extended @needs-model
   Scenario: Needs at or below the Envelope's limits are accepted
     When I open "Tasks"
     And I press "New Task"
@@ -27,6 +26,7 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
     And I press "Run"
     And I press "Run now"
     Then the run ends as "succeeded" within 2 min
+
     When I open "Tasks"
     And I open "Stated needs" in "Tasks"
     Then I see in "Access":
@@ -38,6 +38,17 @@ Feature: J6 - User asks for more than their Envelope allows in a Task
     And I press "Run"
     And I press "Run now"
     Then the run ends as "succeeded" within 2 min
+
+  @extended
+  Scenario: A zero per-run budget is refused when the Task is saved
+    When I open "Tasks"
+    And I press "New Task"
+    And I type "Zero per-run budget" into "Name"
+    And I choose "basic" in "Envelope"
+    And I state a per-run budget of zero
+    And I press "Save version 1"
+    Then I see "The per-run budget must be more than 0.00 USD."
+    And I see "Save version 1"
 
   # Steps 3 and 4 and "Done when". Failure path F2 is checked here too:
   # every refusal must say what to do next.
