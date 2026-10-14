@@ -363,10 +363,11 @@ fn output_payload(run_dir: &Path, archive: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("failed to create output directory: {error}"))?;
     let entries = task_output_archive_entries(archive, TaskOutputArchiveCompatibility::Strict)
         .map_err(|_| "adapter returned an archive outside the out/-only contract".to_owned())?;
-    let paths = entries
+    let mut paths = entries
         .iter()
         .map(|entry| entry.path.as_str())
         .collect::<Vec<_>>();
+    paths.sort_unstable();
     if paths != ["files.txt", "payload.bin"] {
         return Err(format!(
             "adapter returned unexpected output entries: {:?}",
