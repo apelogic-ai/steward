@@ -1,4 +1,4 @@
-# Source: user journey J10. Checked against version 0.3.16.
+# Source: user journey J10. Original product findings were recorded against version 0.3.16.
 # "I" is the operator, who works outside the web UI. The checks in the UI are
 # done by "an administrator" and "a user". Suited to a release candidate, not to every build.
 @operator @two-accounts @nightly
@@ -46,7 +46,8 @@ Feature: J10 - Operator changes configuration
 
   # Part B, steps 5 to 8 and "Done when".
   # 0.3.16: BLOCKED at step 5 (case M-06; no finding number).
-  @needs-model @known-failing-0.3.16
+  # No dedicated issue covers this operator-controlled, two-account configuration path.
+  @needs-model @known-failing-407
   Scenario: Part B - a model added only in configuration can be picked and run
     When I add the model "<provider-a>/<new-model>" to the installation's configuration without a new product build
     Then every service is running with 0 restarts and 0 error lines

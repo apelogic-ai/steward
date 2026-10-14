@@ -1,10 +1,10 @@
 import { existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
+import { expectedKnownFailures as reportHasExpectedKnownFailures } from "./known-failing-report.mjs";
+
 const config = "journeys/playwright.config.mjs";
 const knownFailingReport = "target/journeys/known-failing-report.json";
-const knownFailureMarker = "[steward-known-failure:#464]";
-
 function knownFailingExpression() {
   const tags = new Set();
   for (const name of readdirSync("journeys").filter((candidate) => candidate.endsWith(".feature"))) {
@@ -101,13 +101,6 @@ function execute(label, tags) {
   return run("bunx", ["playwright", "test", "--config", config], environment);
 }
 
-function reportTests(suites) {
-  return suites.flatMap((suite) => [
-    ...(suite.specs ?? []).flatMap((spec) => spec.tests ?? []),
-    ...reportTests(suite.suites ?? []),
-  ]);
-}
-
 function expectedKnownFailures(count) {
   if (!existsSync(knownFailingReport)) return false;
   let report;
@@ -116,14 +109,7 @@ function expectedKnownFailures(count) {
   } catch {
     return false;
   }
-  if ((report.errors?.length ?? 0) > 0) return false;
-  const tests = reportTests(report.suites ?? []);
-  if (tests.length !== count) return false;
-  return tests.every((test) => {
-    const result = test.results?.at(-1);
-    if (result?.status !== "failed" || !result.errors?.length) return false;
-    return result.errors.every((error) => `${error.message ?? ""}\n${error.value ?? ""}\n${error.stack ?? ""}`.includes(knownFailureMarker));
-  });
+  return reportHasExpectedKnownFailures(report, count);
 }
 
 let selectedTags;

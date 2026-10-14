@@ -12,13 +12,13 @@ Feature: J1 - Administrator sets up a new installation
     And the optional integration "tool connections" is switched off
     And the installation's configuration has the coding agent "<Agent A>" with the model "<provider-a>/<model-a>"
     And the installation's configuration has the coding agent "<Agent B>" with the model "<provider-b>/<model-b>"
-    And no template exists
     And I am signed in as a user who is also an administrator
     And I choose "Admin workspace" in "Workspace view"
 
   # Steps 1 to 9 and "Done when".
   @smoke
   Scenario: Create the first template, then a second one from it
+    Given no template exists
     Then I see in "Admin workspace":
       | Get started |
       | Members     |

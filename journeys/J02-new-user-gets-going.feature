@@ -1,4 +1,4 @@
-# Source: user journey J2. Checked against version 0.3.16.
+# Source: user journey J2. UI text exercised against the 0.3.17 release candidate.
 # "member" stands for the role the template is meant for.
 Feature: J2 - New user gets going
   As a user who signs in for the first time
@@ -45,9 +45,9 @@ Feature: J2 - New user gets going
     # Keeps this Envelope distinct from active Envelopes left by earlier smoke runs.
     And I type "<run-runtime-minutes>" into "Runtime limit per month"
     And I press "Submit request"
-    Then I see "Submitting…"
+    # The request detail can replace the transient "Submitting…" label before it is observed.
     # Provisioned at once: no administrator acts in this scenario.
-    And I see the status "provisioned"
+    Then I see the status "provisioned"
     And I see "Limit per run 0.50 USD"
     And I see in "Approved access":
       | Total size limit | Deployment limit · 2 GiB             |
@@ -65,8 +65,8 @@ Feature: J2 - New user gets going
     # A coding agent and a model that this Envelope allows are selected.
     Then "Run now" is enabled
     When I press "Run now"
-    Then I see "Starting…"
-    And the run ends as "succeeded" within 2 min
+    # The Run detail can replace the transient "Starting…" label before it is observed.
+    Then the run ends as "succeeded" within 2 min
     And the run output contains "hello world"
     And the spend of the run is above 0.00 USD
     And every amount of money on the page has 2 decimals and the unit "USD"

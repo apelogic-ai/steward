@@ -16,7 +16,8 @@
   },
   "scripts": {
     "journeys:run": "bun journeys/run.mjs",
-    "test:browser-e2e": "playwright test --config tests/browser/playwright.config.mjs",
+    "test:browser-e2e": "bun run test:journeys && playwright test --config tests/browser/playwright.config.mjs",
+    "test:journeys": "bun test journeys/*.test.mjs",
     "web:build": "bun run web:generate-api && bun run --cwd web build",
     "web:check": "bun run web:check-generated && bun run --cwd web check",
     "web:check-generated": "bun run web:generate-api && git diff --exit-code -- web/src/api-client",

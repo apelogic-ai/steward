@@ -1,4 +1,4 @@
-# Source: user journey J9. Checked against version 0.3.16.
+# Source: user journey J9. Original product findings were recorded against version 0.3.16.
 # "I" is the administrator. "another user" owns the runs and the requests.
 @two-accounts
 Feature: J9 - Administrator oversight
@@ -19,7 +19,8 @@ Feature: J9 - Administrator oversight
 
   # Steps 1 to 6 and "Done when".
   # 0.3.16: FAIL at step 1 (N-08, N-06); step 3 gives no reason (N-02, N-04).
-  @known-failing-0.3.16
+  # Current public defects in this path: #469 and #465.
+  @known-failing-469
   Scenario: See every user's runs, a log, the spend and the requests
     When I open "Runs"
     Then I see "Every governed run across all users."
