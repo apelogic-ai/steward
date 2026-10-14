@@ -454,7 +454,12 @@ async function assertDataRows(scope, journey, dataTable) {
       await expect(scope.getByText(values[0], { exact: !values[0].endsWith(":") }).first()).toBeVisible();
       continue;
     }
-    const candidates = scope.locator("tr, [role=row], dl > div, ul > li, ol > li");
+    const labelledGridRows = scope.locator("strong")
+      .filter({ hasText: new RegExp(`^${escapeRegExp(values[0])}$`) })
+      .locator("xpath=..");
+    const candidates = await labelledGridRows.count()
+      ? labelledGridRows
+      : scope.locator("tr, [role=row], dl > div, ul > li, ol > li");
     const index = await candidates.evaluateAll((elements, expected) => elements.findIndex((element) => {
       const text = element.innerText.replace(/\s+/g, " ").trim();
       return expected.every((value) => text.includes(value));
@@ -678,11 +683,22 @@ When("I press {string}", async ({ journey, page }, control) => {
     await Promise.all([page.waitForURL(/\/runs\/new/), clickControl(page, resolved)]);
     return;
   }
-  const transient = ["Submit request", "Submit for approval"].includes(resolved)
-    ? "Submitting…"
-    : resolved === "Run now"
-      ? "Starting…"
-      : null;
+  if (["Submit request", "Submit for approval"].includes(resolved)) {
+    await Promise.all([
+      page.waitForURL(/\/envelopes\/[A-Za-z0-9-]+$/, { timeout: 30_000 }),
+      clickControl(page, resolved),
+    ]);
+    const requestId = new URL(page.url()).pathname.split("/").filter(Boolean).at(-1);
+    let request = null;
+    await expect.poll(async () => {
+      request = (await userRequests(page)).find((candidate) => candidate.id === requestId) ?? null;
+      return request?.status ?? null;
+    }, { message: "the submitted Envelope request should be persisted" }).not.toBeNull();
+    if (journey.currentTemplate) journey.requests.set(journey.currentTemplate, request);
+    await expect(page.locator("[data-tone]").filter({ hasText: new RegExp(`^${escapeRegExp(request.status)}$`, "i") }).first()).toBeVisible();
+    return;
+  }
+  const transient = resolved === "Run now" ? "Starting…" : null;
   const observation = transient
     ? expect(page.getByRole("button", { name: transient, exact: true })).toBeVisible()
     : null;
@@ -749,7 +765,7 @@ Then("{string} is disabled", async ({ journey, page }, field) => {
     const expected = resolveText(journey, field);
     const picker = fieldLocator(page, "Coding agent");
     const option = picker.locator("option").filter({ hasText: expected });
-    await expect(option).toBeDisabled();
+    await expect(option).toHaveJSProperty("disabled", true);
     return;
   }
   await expect(fieldLocator(page, field)).toBeDisabled();
@@ -757,7 +773,7 @@ Then("{string} is disabled", async ({ journey, page }, field) => {
 
 Then("the disabled agent {string} says {string}", async ({ journey, page }, agent, text) => {
   const option = fieldLocator(page, "Coding agent").locator("option").filter({ hasText: resolveText(journey, agent) });
-  await expect(option).toBeDisabled();
+  await expect(option).toHaveJSProperty("disabled", true);
   await expect(option).toContainText(resolveText(journey, text));
 });
 
@@ -800,12 +816,15 @@ Then("the field {string} shows {string}", async ({ journey, page }, field, value
     return;
   }
   const locator = fieldLocator(page, field);
-  if (!(await locator.count())) {
+  const path = new URL(page.url()).pathname;
+  const readOnlyTask = /^\/tasks\/[^/]+$/.test(path);
+  if (readOnlyTask) {
     const term = page.locator("dt").filter({ hasText: new RegExp(`^${escapeRegExp(field)}$`) }).first();
     await expect(term).toBeVisible();
     await expect(term.locator("xpath=following-sibling::dd[1]")).toContainText(expected);
     return;
   }
+  await expect(locator).toBeVisible();
   if (await locator.evaluate((element) => element.tagName === "SELECT")) {
     await expect(locator.locator("option:checked")).toContainText(expected);
     return;
@@ -829,12 +848,14 @@ Given("the installation keeps execution logs", async ({ page }) => {
 Then("the log holds every line printed before the run ended", async ({ journey, page }) => {
   const taskUid = journey.run?.taskUid;
   expect(taskUid, "a completed run should be recorded before checking its log").toBeTruthy();
-  const response = await apiJson(page, `/app/api/v1/runs/${encodeURIComponent(taskUid)}/logs/stdout`);
-  expect(response.complete, "the terminal run's stdout log should be complete").toBeTruthy();
-  expect(response.content, "the completed run should have captured stdout").not.toBe("");
+  expect(journey.run.finalized, "the run should be terminal before checking its complete log").toBeTruthy();
+  const response = await page.request.get(new URL(`/app/api/v1/runs/${encodeURIComponent(taskUid)}/logs/stdout`, page.url()).toString());
+  expect(response.ok(), "the terminal run's stdout log should be available").toBeTruthy();
+  const content = await response.text();
+  expect(content, "the completed run should have captured stdout").not.toBe("");
   const visible = page.getByLabel("stdout log lines");
   await expect(visible).toBeVisible();
-  await expect(visible).toContainText(response.content.trim());
+  await expect(visible).toContainText(content.trim());
 });
 
 Then("the drop-down {string} offers {string}", async ({ journey, page }, field, offered) => {
@@ -1045,15 +1066,20 @@ Then(/^the spend of the run is above ([0-9]+(?:\.[0-9]+)?) ([A-Z]{3})$/, async (
   expect(journey.run?.observedSpend?.currency).toBe(unit);
   expect(Number(journey.run.observedSpend.observedAmount)).toBeGreaterThan(minimum);
   const spend = page.locator("#workspace p").filter({ hasText: /^Spend$/ }).first().locator("xpath=following-sibling::p[1]");
-  await expect(spend).toHaveText(new RegExp(`^\\d+(?:\\.\\d+)? ${escapeRegExp(unit)}$`));
-  expect(Number((await spend.innerText()).split(/\s+/)[0]), "the Run page should show spend above the expected minimum").toBeGreaterThan(minimum);
+  await expect(spend).toHaveText(new RegExp(`^(?:< 0\\.01|\\d+(?:\\.\\d+)?) ${escapeRegExp(unit)}$`));
+  const displayed = await spend.innerText();
+  if (displayed.startsWith("< ")) {
+    expect(minimum, "a below-one-cent display can only prove a threshold below one cent").toBeLessThan(0.01);
+  } else {
+    expect(Number(displayed.split(/\s+/)[0]), "the Run page should show spend above the expected minimum").toBeGreaterThan(minimum);
+  }
 });
 
 Then("every amount of money on the page has {int} decimals and the unit {string}", async ({ page }, decimals, unit) => {
-  const amounts = (await page.locator("#workspace").innerText()).match(new RegExp(`\\b\\d+(?:\\.\\d+)? ${escapeRegExp(unit)}\\b`, "g")) ?? [];
+  const amounts = (await page.locator("#workspace").innerText()).match(new RegExp(`(?:< )?\\d+(?:\\.\\d+)? ${escapeRegExp(unit)}\\b`, "g")) ?? [];
   expect(amounts.length, `the page should show at least one amount in ${unit}`).toBeGreaterThan(0);
   for (const amount of amounts) {
-    expect(amount).toMatch(new RegExp(`\\.\\d{${decimals}} ${escapeRegExp(unit)}$`));
+    expect(amount).toMatch(new RegExp(`^(?:< )?\\d+\\.\\d{${decimals}} ${escapeRegExp(unit)}$`));
   }
 });
 

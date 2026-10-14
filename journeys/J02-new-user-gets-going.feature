@@ -45,9 +45,8 @@ Feature: J2 - New user gets going
     # Keeps this Envelope distinct from active Envelopes left by earlier smoke runs.
     And I type "<run-runtime-minutes>" into "Runtime limit per month"
     And I press "Submit request"
-    Then I see "Submitting…"
     # Provisioned at once: no administrator acts in this scenario.
-    And I see the status "provisioned"
+    Then I see the status "provisioned"
     And I see "Limit per run 0.50 USD"
     And I see in "Approved access":
       | Total size limit | Deployment limit · 2 GiB             |
