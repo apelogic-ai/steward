@@ -1661,7 +1661,7 @@ async fn reconcile_shared_runtime_observation(
             .enter_task_cleanup(
                 work.task.task_uid,
                 work.operation.generation,
-                TaskCleanupCause::Failed("runtime_start_failed"),
+                failed_task_runtime_cleanup_cause(&work.task),
                 TASK_ORCHESTRATOR_ACTOR,
             )
             .await
@@ -1750,6 +1750,16 @@ fn task_runtime_observation_is_failed(runtime: &AgentRuntime) -> Result<bool, Ta
             && status.observed_generation == runtime.metadata.generation.unwrap_or_default()
             && status.spec_digest == digest
     }))
+}
+
+fn failed_task_runtime_cleanup_cause(task: &TaskRecord) -> TaskCleanupCause<'static> {
+    if sandbox_execution_class(&task.runtime_spec) == SandboxExecutionClass::Agent
+        && task.runtime_spec.budget.single_run_limit.is_some()
+    {
+        TaskCleanupCause::RuntimeFailedPendingSpend
+    } else {
+        TaskCleanupCause::Failed("runtime_start_failed")
+    }
 }
 
 async fn reconcile_task_cancellation<R: SandboxTaskRuntime>(
@@ -1997,7 +2007,7 @@ async fn reconcile_runtime_activation(
                 .enter_task_cleanup(
                     work.task.task_uid,
                     work.operation.generation,
-                    TaskCleanupCause::Failed("runtime_start_failed"),
+                    failed_task_runtime_cleanup_cause(&work.task),
                     TASK_ORCHESTRATOR_ACTOR,
                 )
                 .await
@@ -2121,7 +2131,7 @@ async fn reconcile_runtime_activation(
             .enter_task_cleanup(
                 work.task.task_uid,
                 work.operation.generation,
-                TaskCleanupCause::Failed("runtime_start_failed"),
+                failed_task_runtime_cleanup_cause(&work.task),
                 TASK_ORCHESTRATOR_ACTOR,
             )
             .await
@@ -5178,8 +5188,9 @@ async fn observe_and_record_final_spend<I: InferencePlane>(
         | InferenceObservation::Exhausted { spend, .. } => spend,
         InferenceObservation::Absent => return Ok(None),
     };
+    let failed_task_reason = single_run_spend_failure_reason(&spend, &runtime.spec.budget)?;
     authority
-        .record_spend_observation(
+        .record_final_spend_observation(
             runtime
                 .metadata
                 .uid
@@ -5188,9 +5199,7 @@ async fn observe_and_record_final_spend<I: InferencePlane>(
             runtime.metadata.generation.unwrap_or_default(),
             &runtime_spec_digest(runtime)?,
             &spend,
-            // Cleanup captures accounting only. Exhaustion is recorded while the runtime is
-            // active; repeating it here would replace its escalation with a new pending row.
-            false,
+            failed_task_reason.as_deref(),
         )
         .await
         .map_err(|error| ReconcileError::Authority(error.to_string()))?;

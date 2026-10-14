@@ -4183,9 +4183,9 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             .task(failed_start_task_uid)
             .await?
             .ok_or(StoreError::TaskNotFound)?
-            .failure_reason
-            .as_deref(),
-        Some("runtime_start_failed")
+            .failure_reason,
+        None,
+        "a limited agent failure remains open to the final spend observation during cleanup"
     );
     for _ in 0..4 {
         if store
@@ -5978,8 +5978,7 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
         .observed_spend
         .lock()
         .map_err(|_| io::Error::other("inference spend fixture was poisoned"))? =
-        Some("0.75".to_owned());
-    inference.report_exhausted.store(true, Ordering::SeqCst);
+        Some("0.00".to_owned());
     reconcile_agent_runtime_work_item(
         &client,
         task_runtime.clone(),
@@ -5988,7 +5987,8 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
         runtime,
     )
     .await?;
-    let runtime = kubernetes
+    task_runtime.fail_next_ensure.store(true, Ordering::SeqCst);
+    let running_runtime = kubernetes
         .runtime
         .lock()
         .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
@@ -5996,10 +5996,54 @@ async fn per_run_spend_cap_fails_the_persisted_task_with_a_plain_reason()
         .ok_or_else(|| io::Error::other("activated spend-limited runtime fixture is absent"))?;
     reconcile_agent_runtime_work_item(
         &client,
+        task_runtime.clone(),
+        inference.clone(),
+        store.clone(),
+        running_runtime,
+    )
+    .await?;
+    let failed_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("failed spend-limited runtime fixture is absent"))?;
+    assert_eq!(
+        failed_runtime.status.as_ref().map(|status| status.phase),
+        Some(Phase::Failed),
+        "the agent must fail before its delayed spend observation arrives"
+    );
+    reconcile_current(&client, &task_runtime, &store, task_uid).await?;
+    let pending_final_spend = store
+        .task(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(pending_final_spend.phase, TaskPhase::Failed);
+    assert_eq!(
+        pending_final_spend.failure_reason, None,
+        "a per-run-limited failure must leave room for the final spend result"
+    );
+
+    *inference
+        .observed_spend
+        .lock()
+        .map_err(|_| io::Error::other("inference spend fixture was poisoned"))? =
+        Some("0.75".to_owned());
+    inference.report_exhausted.store(true, Ordering::SeqCst);
+    reconcile_current(&client, &task_runtime, &store, task_uid).await?;
+    let deleting_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("deleting spend-limited runtime fixture is absent"))?;
+    assert!(deleting_runtime.metadata.deletion_timestamp.is_some());
+    reconcile_agent_runtime_work_item(
+        &client,
         task_runtime,
         inference.clone(),
         store.clone(),
-        runtime,
+        deleting_runtime,
     )
     .await?;
     {

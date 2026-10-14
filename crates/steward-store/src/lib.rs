@@ -3249,6 +3249,48 @@ impl PgStore {
         spend: &steward_types::SpendSummary,
         exhausted: bool,
     ) -> Result<(), StoreError> {
+        self.record_spend_observation_with_task_failure(
+            runtime_uid,
+            observed_generation,
+            spec_digest,
+            spend,
+            exhausted,
+            None,
+        )
+        .await
+    }
+
+    pub async fn record_final_spend_observation(
+        &self,
+        runtime_uid: &str,
+        observed_generation: i64,
+        spec_digest: &str,
+        spend: &steward_types::SpendSummary,
+        failed_task_reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if failed_task_reason.is_some_and(str::is_empty) {
+            return Err(StoreError::InvalidTaskTransition);
+        }
+        self.record_spend_observation_with_task_failure(
+            runtime_uid,
+            observed_generation,
+            spec_digest,
+            spend,
+            false,
+            failed_task_reason,
+        )
+        .await
+    }
+
+    async fn record_spend_observation_with_task_failure(
+        &self,
+        runtime_uid: &str,
+        observed_generation: i64,
+        spec_digest: &str,
+        spend: &steward_types::SpendSummary,
+        exhausted: bool,
+        failed_task_reason: Option<&str>,
+    ) -> Result<(), StoreError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(runtime_uid)
@@ -3317,6 +3359,25 @@ impl PgStore {
             .bind(spec_digest)
             .bind(&spend.observed_amount)
             .bind(&spend.currency)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+        if let Some(reason) = failed_task_reason {
+            sqlx::query(
+                "UPDATE task_submissions tasks \
+                 SET failure_reason = $2, updated_at = now() \
+                 FROM task_runtime_operations operation \
+                 WHERE operation.task_uid = tasks.task_uid \
+                   AND operation.runtime_uid = $1 \
+                   AND operation.state = 'cleanup_pending' \
+                   AND tasks.phase = 'failed' \
+                   AND tasks.failure_reason IS NULL \
+                   AND tasks.finalize_requested \
+                   AND NOT tasks.finalized",
+            )
+            .bind(runtime_uid)
+            .bind(reason)
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
@@ -9019,7 +9080,12 @@ impl PgStore {
             return Ok(TaskOperationTransition::Superseded(current));
         }
         sqlx::query(
-            "UPDATE task_submissions SET finalized = true, updated_at = now() \
+            "UPDATE task_submissions \
+             SET failure_reason = CASE \
+                     WHEN phase = 'failed' THEN COALESCE(failure_reason, 'runtime_start_failed') \
+                     ELSE failure_reason \
+                 END, \
+                 finalized = true, updated_at = now() \
              WHERE task_uid = $1 AND finalize_requested AND NOT finalized",
         )
         .bind(task_uid)
@@ -12423,6 +12489,7 @@ pub enum TaskCleanupCause<'a> {
     Cancelled,
     AuthorityInactive(&'a str),
     Failed(&'a str),
+    RuntimeFailedPendingSpend,
     ExecutionOutcomeUnknown,
 }
 
@@ -12433,6 +12500,7 @@ impl<'a> TaskCleanupCause<'a> {
             Self::AuthorityInactive(reason) | Self::Failed(reason) if !reason.is_empty() => {
                 Ok(("failed", Some(reason)))
             }
+            Self::RuntimeFailedPendingSpend => Ok(("failed", None)),
             Self::ExecutionOutcomeUnknown => Ok(("failed", Some("execution_outcome_unknown"))),
             Self::AuthorityInactive(_) | Self::Failed(_) => Err(StoreError::InvalidTaskTransition),
         }
@@ -12444,6 +12512,7 @@ impl<'a> TaskCleanupCause<'a> {
             Self::Cancelled => "cancellation_cleanup_requested",
             Self::AuthorityInactive(_) => "authority_inactive_cleanup_requested",
             Self::Failed(_) => "failure_cleanup_requested",
+            Self::RuntimeFailedPendingSpend => "runtime_failure_cleanup_requested",
             Self::ExecutionOutcomeUnknown => "execution_outcome_unknown_cleanup_requested",
         }
     }
