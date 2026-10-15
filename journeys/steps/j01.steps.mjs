@@ -127,6 +127,8 @@ function areaLocator(page, area) {
       return fieldLocator(page, area).locator("xpath=ancestor::label[1]");
     case "Access":
       return page.locator("dt").filter({ hasText: /^Access$/ }).first().locator("xpath=following-sibling::dd[1]");
+    case "Jira":
+      return page.locator('[data-provider-action-footer="jira"]').locator("xpath=ancestor::section[1]");
     case "Tools":
     case "Workspace access":
       return page.getByRole("heading", { name: area, exact: true }).first().locator("xpath=ancestor::section[1]");
