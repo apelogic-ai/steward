@@ -1876,7 +1876,7 @@ async fn internal_authority_provisions_and_recovers_cleanup_without_a_service_en
         // Drive the actual broker through reservation, then drop its HTTP wait:
         // the controller must recover entirely from the committed intent.
         let reserved = tokio::select! {
-            result = broker.status(&session) => {
+            result = broker.status(&session, "github") => {
                 return Err(io::Error::other(format!("broker returned before reconciliation: {result:?}")).into());
             }
             result = tokio::time::timeout(std::time::Duration::from_secs(5), async {

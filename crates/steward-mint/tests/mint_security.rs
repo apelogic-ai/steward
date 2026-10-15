@@ -11,8 +11,8 @@ use rand_core::OsRng;
 use serde::Deserialize;
 use steward_mint::{
     AuthenticatedControlPlaneWorkload, AuthorityBinding, AuthorityResolver, AuthorityState,
-    ControlPlaneMintConfig, ControlPlaneTokenRequest, CredentialGrant, CredentialGrantResolver,
-    DEFAULT_AUTHORITY_TTL, Hop1Token, IntrospectionClientCredential,
+    ControlPlaneMintConfig, ControlPlaneTokenPurpose, ControlPlaneTokenRequest, CredentialGrant,
+    CredentialGrantResolver, DEFAULT_AUTHORITY_TTL, Hop1Token, IntrospectionClientCredential,
     ManagedCredentialGrantResolver, ManagedInferenceCredentialSource, Mint, MintConfig,
     MintConfigError, MintError, MintSigningKey, OpaqueAccessToken, SPIFFE_CLIENT_ASSERTION_TYPE,
     SvidAssertion, SvidValidationError, SvidValidator, TokenGrantRequest, ValidatedWorkload,
@@ -279,11 +279,18 @@ async fn managed_inference_returns_credential_for_verified_owner_and_model_autho
 
 fn binding_with_tool() -> Result<AuthorityBinding, String> {
     let mut binding = active_binding()?;
-    binding.tools.push(ToolGrant {
-        provider: "github".to_owned(),
-        resource: "repositories".to_owned(),
-        action: "list".to_owned(),
-    });
+    binding.tools.extend([
+        ToolGrant {
+            provider: "github".to_owned(),
+            resource: "repositories".to_owned(),
+            action: "list".to_owned(),
+        },
+        ToolGrant {
+            provider: "jira".to_owned(),
+            resource: "jira_get_issue".to_owned(),
+            action: "read".to_owned(),
+        },
+    ]);
     Ok(binding)
 }
 
@@ -338,15 +345,18 @@ async fn control_plane_status_token_is_short_lived_status_only_and_runtime_free(
             ControlPlaneMintConfig::new(
                 "system:serviceaccount:steward-test:steward-apiserver".to_owned(),
                 std::time::Duration::from_secs(15),
+                ["github".to_owned(), "jira".to_owned()],
             )
             .map_err(|error| format!("build control-plane mint config: {error:?}"))?,
         )
         .map_err(|error| format!("control-plane mint config must be valid: {error:?}"))?;
     let canonical_authority = person_authority()?;
-    let request = |workload: &str, principal: Principal| ControlPlaneTokenRequest {
+    let request = |workload: &str, principal: Principal, provider: &str| ControlPlaneTokenRequest {
         workload: AuthenticatedControlPlaneWorkload::new(workload.to_owned()),
         principal,
         canonical_authority: canonical_authority.clone(),
+        provider: provider.to_owned(),
+        purpose: ControlPlaneTokenPurpose::ProviderConnectionStatus,
     };
 
     assert!(
@@ -356,6 +366,7 @@ async fn control_plane_status_token_is_short_lived_status_only_and_runtime_free(
                 Principal::User {
                     acting_user: Email("alice@example.com".to_owned()),
                 },
+                "jira",
             )),
             Err(MintError::WorkloadMismatch)
         ),
@@ -369,6 +380,7 @@ async fn control_plane_status_token_is_short_lived_status_only_and_runtime_free(
                     name: "other".to_owned(),
                     acting_user: None,
                 },
+                "jira",
             )),
             Err(MintError::InvalidRequest)
         ),
@@ -381,6 +393,7 @@ async fn control_plane_status_token_is_short_lived_status_only_and_runtime_free(
             Principal::User {
                 acting_user: Email("alice@example.com".to_owned()),
             },
+            "jira",
         ))
         .map_err(|error| format!("mint control-plane status token: {error:?}"))?;
     assert_eq!(response.expires_in(), 15);
@@ -410,7 +423,7 @@ async fn control_plane_status_token_is_short_lived_status_only_and_runtime_free(
     assert_eq!(
         claims["steward"]["tools"],
         serde_json::json!([{
-            "provider": "github",
+            "provider": "jira",
             "resource": "provider-control",
             "action": "status"
         }])
@@ -435,6 +448,111 @@ async fn control_plane_status_token_is_short_lived_status_only_and_runtime_free(
         resolver_calls.load(Ordering::SeqCst),
         0,
         "runtime authority resolution must not be involved in control-plane status"
+    );
+
+    for invalid_provider in [
+        String::new(),
+        " jira".to_owned(),
+        "jira\n".to_owned(),
+        "p".repeat(256),
+        "linear".to_owned(),
+    ] {
+        assert!(
+            matches!(
+                mint.issue_control_plane_token(request(
+                    "system:serviceaccount:steward-test:steward-apiserver",
+                    Principal::User {
+                        acting_user: Email("alice@example.com".to_owned()),
+                    },
+                    &invalid_provider,
+                )),
+                Err(MintError::InvalidRequest)
+            ),
+            "a malformed provider must never enter a signed status grant"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_plane_start_token_is_short_lived_exact_and_catalog_bounded() -> Result<(), String>
+{
+    let (mint, resolver_calls, verifying_key) =
+        mint(Ok(validated_workload()), Ok(active_binding()?))?;
+    let mint = mint
+        .with_control_plane(
+            ControlPlaneMintConfig::new(
+                "system:serviceaccount:steward-test:steward-apiserver".to_owned(),
+                std::time::Duration::from_secs(15),
+                ["github".to_owned(), "jira".to_owned()],
+            )
+            .map_err(|error| format!("build control-plane mint config: {error:?}"))?,
+        )
+        .map_err(|error| format!("control-plane mint config must be valid: {error:?}"))?;
+    let canonical_authority = person_authority()?;
+    let request = |provider: &str| ControlPlaneTokenRequest {
+        workload: AuthenticatedControlPlaneWorkload::new(
+            "system:serviceaccount:steward-test:steward-apiserver".to_owned(),
+        ),
+        principal: Principal::User {
+            acting_user: Email("alice@example.com".to_owned()),
+        },
+        canonical_authority: canonical_authority.clone(),
+        provider: provider.to_owned(),
+        purpose: ControlPlaneTokenPurpose::ProviderConnectionStart,
+    };
+
+    assert!(
+        matches!(
+            mint.issue_control_plane_token(request("linear")),
+            Err(MintError::InvalidRequest)
+        ),
+        "a provider absent from the deployment catalog must receive no start token"
+    );
+
+    let response = mint
+        .issue_control_plane_token(request("jira"))
+        .map_err(|error| format!("mint control-plane start token: {error:?}"))?;
+    assert_eq!(response.expires_in(), 15);
+    assert_eq!(response.scope(), "connections_start");
+    let untrusted = UntrustedToken::new(response.access_token())
+        .map_err(|error| format!("parse start token: {error}"))?;
+    let token: Token<serde_json::Value> = Ed25519
+        .validator(&verifying_key)
+        .validate(&untrusted)
+        .map_err(|error| format!("validate start token: {error}"))?;
+    let claims = &token.claims().custom;
+    assert_eq!(claims["steward"]["acting_as"], "service_for_user");
+    assert_eq!(claims["steward"]["service"], "steward-apiserver");
+    assert_eq!(claims["steward"]["purpose"], "provider_connection_start");
+    assert!(claims["steward"].get("runtime_uid").is_none());
+    assert_eq!(
+        claims["steward"]["tools"],
+        serde_json::json!([{
+            "provider": "jira",
+            "resource": "provider-control",
+            "action": "start"
+        }])
+    );
+    let hop1: Hop1Token = serde_json::from_value(serde_json::Value::String(
+        response.access_token().to_owned(),
+    ))
+    .map_err(|error| format!("wrap start token for introspection: {error}"))?;
+    let introspection = mint
+        .introspect(&hop1)
+        .await
+        .map_err(|error| format!("introspect start token: {error:?}"))?;
+    assert!(
+        serde_json::to_value(introspection)
+            .map_err(|error| format!("serialize start introspection: {error}"))?["active"]
+            .as_bool()
+            .unwrap_or(false),
+        "MCP-GW must be able to introspect the short-lived start token"
+    );
+    assert_eq!(
+        resolver_calls.load(Ordering::SeqCst),
+        0,
+        "runtime authority resolution must not mint provider start authority"
     );
     Ok(())
 }
@@ -546,6 +664,17 @@ fn mint_config_rejects_empty_identity_fields_and_out_of_bounds_ttls() {
     let mut config = valid_config();
     config.authority_ttl = DEFAULT_AUTHORITY_TTL + std::time::Duration::from_secs(1);
     assert_eq!(config.validate(), Err(MintConfigError::InvalidAuthorityTtl));
+
+    for invalid_provider in [" jira", "jira\n", ""] {
+        assert!(matches!(
+            ControlPlaneMintConfig::new(
+                "system:serviceaccount:steward-test:steward-apiserver".to_owned(),
+                std::time::Duration::from_secs(15),
+                [invalid_provider.to_owned()],
+            ),
+            Err(MintConfigError::InvalidControlPlaneStatusProviders)
+        ));
+    }
 }
 
 #[tokio::test]

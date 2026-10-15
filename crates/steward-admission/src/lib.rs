@@ -2111,6 +2111,68 @@ mod tests {
     }
 
     #[test]
+    fn provider_agnostic_tools_use_exact_request_at_or_below_ceiling() {
+        let jira_read = ToolGrant {
+            provider: "jira".to_owned(),
+            resource: "jira_get_issue".to_owned(),
+            action: "read".to_owned(),
+        };
+        let jira_write = ToolGrant {
+            provider: "jira".to_owned(),
+            resource: "edit_issue".to_owned(),
+            action: "write".to_owned(),
+        };
+        let mut envelope = envelope_with_budget("200.00");
+        envelope.spec.tools = vec![jira_read.clone()];
+
+        let mut requested = request_with_budget("100.00");
+        requested.tools = vec![jira_read.clone()];
+        assert_eq!(
+            evaluate(&requested, &envelope),
+            Ok(AdmissionDecision::Admit),
+            "an exact Jira read tuple at the ceiling must be admitted"
+        );
+
+        requested.tools.clear();
+        assert_eq!(
+            evaluate(&requested, &envelope),
+            Ok(AdmissionDecision::Admit),
+            "a Task may request fewer tools than its Envelope allows"
+        );
+
+        requested.tools = vec![jira_write.clone()];
+        assert_eq!(
+            evaluate(&requested, &envelope),
+            Ok(AdmissionDecision::Reject {
+                deltas: vec![AdmissionDelta::Tools {
+                    requested: vec![jira_write],
+                    ceiling: vec![jira_read],
+                }],
+            }),
+            "a Jira write tuple absent from the ceiling must be rejected"
+        );
+
+        requested.tools = vec![ToolGrant {
+            provider: "jira".to_owned(),
+            resource: "search_issues".to_owned(),
+            action: "read".to_owned(),
+        }];
+        envelope.spec.tools = vec![ToolGrant {
+            provider: "jira".to_owned(),
+            resource: "jira_search_issues".to_owned(),
+            action: "read".to_owned(),
+        }];
+        assert!(
+            matches!(
+                evaluate(&requested, &envelope),
+                Ok(AdmissionDecision::Reject { deltas })
+                    if matches!(deltas.as_slice(), [AdmissionDelta::Tools { .. }])
+            ),
+            "a similarly named Jira resource must not receive the catalog tuple's authority"
+        );
+    }
+
+    #[test]
     fn rejection_message_uses_plain_labels_and_units_for_both_front_doors() {
         let decision = AdmissionDecision::Reject {
             deltas: vec![

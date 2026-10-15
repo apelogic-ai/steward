@@ -75,6 +75,7 @@ use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, add_budget_amount,
     evaluate_with_grants, validate_user_envelope,
 };
+use steward_ports::REQUIRED_OUTPUT_MISSING_FAILURE;
 pub use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
 };
@@ -2415,7 +2416,9 @@ fn agent_run_view(record: AgentRunRecord) -> AgentRunView {
 
 pub(crate) fn bounded_task_error_category(reason: Option<&str>) -> Option<&'static str> {
     reason.map(|reason| {
-        if reason.starts_with("task output archive exceeds") {
+        if reason == REQUIRED_OUTPUT_MISSING_FAILURE {
+            "output-missing"
+        } else if reason.starts_with("task output archive exceeds") {
             "output-limit"
         } else if reason.starts_with("sandbox does not support task operation") {
             "unsupported-operation"

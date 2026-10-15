@@ -4,6 +4,10 @@ Priority: P0 operator UX and reliability fix
 
 Status: ready for architecture approval and implementation
 
+Historical scope: this ticket describes the initial GitHub-only design. Steward 0.3.18
+generalizes the same runtime-free status token to one exact deployment-catalog provider per token;
+the Mint README is the current claim contract.
+
 ## Goal
 
 Make the Steward Connections page read the authenticated user's provider connection

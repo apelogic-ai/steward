@@ -36,7 +36,7 @@ function resolveText(journey, text) {
     .replaceAll("<owner>/<repository>", repository)
     .replaceAll("<workspace-name>", workspaceName);
   if (prefixed === "member") return memberRole;
-  if (["Agent choice", "Read the repository", "Scratch and Git", "Scratch check", "Stated needs"].includes(prefixed)) {
+  if (["Agent choice", "Read Jira", "Read the repository", "Scratch and Git", "Scratch check", "Stated needs", "Zero per-run budget"].includes(prefixed)) {
     return `${runPrefix}-${prefixed.toLocaleLowerCase("en-US").replaceAll(/[^a-z0-9]+/g, "-").replaceAll(/^-|-$/g, "")}`;
   }
   if (prefixed === "<run-runtime-minutes>") {
@@ -127,6 +127,8 @@ function areaLocator(page, area) {
       return fieldLocator(page, area).locator("xpath=ancestor::label[1]");
     case "Access":
       return page.locator("dt").filter({ hasText: /^Access$/ }).first().locator("xpath=following-sibling::dd[1]");
+    case "Jira":
+      return page.locator('[data-provider-action-footer="jira"]').locator("xpath=ancestor::section[1]");
     case "Tools":
     case "Workspace access":
       return page.getByRole("heading", { name: area, exact: true }).first().locator("xpath=ancestor::section[1]");
@@ -175,10 +177,45 @@ async function userTemplates(page) {
 async function ensureExtendedTemplate(page, name) {
   let templates = await userTemplates(page);
   let template = templates.find((candidate) => candidate.id === templateId(name));
-  if (template) return template;
-  expect(["basic", "broad"], `the extended fixture does not author the ${name} template`).toContain(name);
+  expect(["basic", "broad", "jira-read"], `the journey fixture does not author the ${name} template`).toContain(name);
+  if (template && name !== "jira-read") return template;
   const standard = templates.find((candidate) => candidate.id === templateId("standard"));
-  expect(standard, `the ${templateId("standard")} template must be created by @smoke before @extended`).toBeDefined();
+  expect(standard, `the ${templateId("standard")} template must be created by @smoke before ${name === "jira-read" ? "@needs-jira" : "@extended"}`).toBeDefined();
+  if (name === "jira-read") {
+    const [catalog, connections] = await Promise.all([
+      apiJson(page, "/admin/api/v1/capabilities"),
+      apiJson(page, "/app/api/v1/connections"),
+    ]);
+    const available = connections.available.find((candidate) => candidate.provider === "jira");
+    expect(available?.enabled, "the installation should enable Jira connections").toBeTruthy();
+    const connection = connections.connections.find((candidate) => candidate.provider === "jira");
+    expect(connection?.status?.phase, "Jira should be connected for the signed-in account before @needs-jira runs").toBe("connected");
+    const tool = catalog.tools.find((candidate) => (
+      candidate.provider === "jira"
+      && candidate.resource === "jira_search_issues"
+      && candidate.action === "read"
+      && candidate.accessClass === "read"
+    ));
+    expect(tool, "the deployment catalog should contain the Jira read-only search tool").toBeDefined();
+    if (template) {
+      expect(template.ceiling.spec.tools).toEqual([{ provider: tool.provider, resource: tool.resource, action: tool.action }]);
+      return template;
+    }
+    const envelope = structuredClone(standard.ceiling);
+    envelope.revision = 1;
+    envelope.spec.tools = [{ provider: tool.provider, resource: tool.resource, action: tool.action }];
+    delete envelope.spec.workspace;
+    await mutationJson(page, `/admin/api/v1/envelope-templates/${encodeURIComponent(templateId(name))}`, "PUT", {
+      allowInlineBrowserTasks: true,
+      displayName: `${runPrefix} Jira read`,
+      envelope,
+      memberRoles: [memberRole],
+    });
+    templates = await userTemplates(page);
+    template = templates.find((candidate) => candidate.id === templateId(name));
+    expect(template, `the ${templateId(name)} template should be available after authoring`).toBeDefined();
+    return template;
+  }
   const [capabilities, catalog] = await Promise.all([
     apiJson(page, "/app/api/v1/capabilities"),
     apiJson(page, "/admin/api/v1/capabilities"),
@@ -252,8 +289,7 @@ async function recordInitialRuns(journey, page) {
   journey.initialRunIds = new Set((await userRuns(page)).map((run) => run.taskUid));
 }
 
-async function provisionExtendedEnvelope(journey, page, name) {
-  const template = await ensureExtendedTemplate(page, name);
+async function provisionEnvelope(journey, page, template) {
   const requestedEnvelope = structuredClone(template.ceiling);
   requestedEnvelope.spec.runtimeMinutesLimit = journey.runRuntimeMinutes;
   const response = await mutationJson(page, "/app/api/v1/envelope-requests", "POST", {
@@ -264,6 +300,10 @@ async function provisionExtendedEnvelope(journey, page, name) {
   });
   expect(response?.request?.status, `${template.id} should auto-provision within its template limits`).toBe("provisioned");
   return response.request;
+}
+
+async function provisionExtendedEnvelope(journey, page, name) {
+  return provisionEnvelope(journey, page, await ensureExtendedTemplate(page, name));
 }
 
 async function chooseUnusedRuntimeMinutes(page) {
@@ -390,13 +430,12 @@ function decimalBelow(value, label) {
   const match = /^(0|[1-9][0-9]*)(?:\.([0-9]{1,6}))?$/.exec(value);
   expect(match, `${label} should use the authority decimal syntax`).toBeTruthy();
   const fractional = match[2] ?? "";
-  const scale = 10n ** BigInt(fractional.length);
-  const units = BigInt(match[1]) * scale + BigInt(fractional || "0");
-  expect(units > 0n, `${label} must be positive so a lower requirement exists`).toBeTruthy();
+  const scale = 1_000_000n;
+  const units = BigInt(match[1]) * scale + BigInt(fractional.padEnd(6, "0") || "0");
+  expect(units > 1n, `${label} must allow a lower positive requirement`).toBeTruthy();
   const lower = units / 2n;
-  if (fractional.length === 0) return lower.toString();
   const whole = lower / scale;
-  const remainder = (lower % scale).toString().padStart(fractional.length, "0").replace(/0+$/, "");
+  const remainder = (lower % scale).toString().padStart(6, "0").replace(/0+$/, "");
   return remainder ? `${whole}.${remainder}` : whole.toString();
 }
 
@@ -481,7 +520,10 @@ async function assertDataRows(scope, journey, dataTable, layout = "rows") {
     expect(index, `one visible row should contain ${values.join(" | ")}`).toBeGreaterThanOrEqual(0);
     const row = candidates.nth(index);
     await expect(row).toBeVisible();
-    for (const value of values) await expect(row.getByText(value, { exact: !value.endsWith(":") }).first()).toBeVisible();
+    for (const value of values) {
+      if (layout === "contained-row") await expect(row).toContainText(value);
+      else await expect(row.getByText(value, { exact: !value.endsWith(":") }).first()).toBeVisible();
+    }
   }
 }
 
@@ -642,7 +684,7 @@ Then("I see in {string}:", async ({ journey, page }, area, dataTable) => {
     }
     return;
   }
-  await assertDataRows(scope, journey, dataTable, area === "Workspace access" ? "columns" : "rows");
+  await assertDataRows(scope, journey, dataTable, area === "Workspace access" ? "columns" : area === "Repository checkout" ? "contained-row" : "rows");
 });
 
 When("I open {string}", async ({ journey, page }, destination) => {
@@ -866,6 +908,15 @@ When("I state requirements that are all at the Envelope's limits", async ({ jour
   await fillEnvelopeRequirements(journey, page, "at");
 });
 
+When("I state a per-run budget of zero", async ({ journey, page }) => {
+  await fillEnvelopeRequirements(journey, page, "below");
+  const field = fieldLocator(page, "Requirements (optional JSON)");
+  const requirements = JSON.parse(await field.inputValue());
+  requirements.authority.budget.singleRunLimit = "0";
+  journey.statedSingleRunLimit = "0";
+  await field.fill(JSON.stringify(requirements));
+});
+
 Given("the installation keeps execution logs", async ({ page }) => {
   await page.goto("/runs/new");
   await expect(checkboxLocator(page, "Capture execution log")).toBeEnabled();
@@ -952,6 +1003,46 @@ Given("I am signed in as a user with the role {string}", async ({ journey, page 
   await recordInitialRuns(journey, page);
 });
 
+Given("the Get started guide is visible", async ({ journey, page }) => {
+  const preferences = await apiJson(page, "/app/api/v1/preferences");
+  expect(typeof preferences.onboardingDismissed, "the onboarding dismissal preference should be a boolean").toBe("boolean");
+  const originalOnboardingDismissed = preferences.onboardingDismissed;
+  journey.restoreOnboardingDismissal = async () => {
+    const current = await apiJson(page, "/app/api/v1/preferences");
+    if (current.onboardingDismissed !== originalOnboardingDismissed) {
+      await mutationJson(page, "/app/api/v1/preferences", "PUT", { onboardingDismissed: originalOnboardingDismissed });
+    }
+    const restored = await apiJson(page, "/app/api/v1/preferences");
+    expect(restored.onboardingDismissed, "the onboarding dismissal preference should be restored after the scenario").toBe(originalOnboardingDismissed);
+  };
+  if (preferences.onboardingDismissed) {
+    await mutationJson(page, "/app/api/v1/preferences", "PUT", { onboardingDismissed: false });
+    await page.reload();
+  }
+  const guide = page.locator('section[aria-label="Get started"]');
+  await expect(guide, "the signed-in account should have an incomplete Get started guide").toBeVisible();
+  journey.onboardingProgressLabel = await guide.getByRole("progressbar").getAttribute("aria-label");
+  expect(journey.onboardingProgressLabel, "the Get started guide should expose its current progress").toBeTruthy();
+});
+
+Then("the Get started guide and sidebar entry are hidden", async ({ page }) => {
+  await expect.poll(async () => (await apiJson(page, "/app/api/v1/preferences")).onboardingDismissed, {
+    message: "hiding Get started should persist the dismissal preference",
+  }).toBe(true);
+  await expect(page.locator('section[aria-label="Get started"]')).toHaveCount(0);
+  await expect(page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: /^Get started/ })).toHaveCount(0);
+});
+
+Then("the Get started guide and sidebar entry are visible with the same progress", async ({ journey, page }) => {
+  await expect.poll(async () => (await apiJson(page, "/app/api/v1/preferences")).onboardingDismissed, {
+    message: "reopening Get started should persist the visible preference",
+  }).toBe(false);
+  const guide = page.locator('section[aria-label="Get started"]');
+  await expect(guide).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: /^Get started/ })).toBeVisible();
+  await expect(guide.getByRole("progressbar")).toHaveAttribute("aria-label", journey.onboardingProgressLabel);
+});
+
 Given("I hold no Envelope", async ({ journey, page }) => {
   const count = (await userRequests(page)).filter((request) => request.templateId?.startsWith(`${runPrefix}-`)).length;
   expect(count, `run prefix ${runPrefix} should not already have an Envelope request`).toBe(0);
@@ -959,8 +1050,14 @@ Given("I hold no Envelope", async ({ journey, page }) => {
 });
 
 Given("I hold an Envelope from the template {string}", async ({ journey, page }, name) => {
+  if (journey.jira && name === "jira-read") await ensureExtendedTemplate(page, name);
   let request = await requestForTemplate(page, name, "provisioned");
-  if (!request && journey.extended) request = await provisionExtendedEnvelope(journey, page, name);
+  if (!request && name === "standard") {
+    const template = (await userTemplates(page)).find((candidate) => candidate.id === templateId(name));
+    expect(template, `template ${templateId(name)} should exist in the installation`).toBeDefined();
+    request = await provisionEnvelope(journey, page, template);
+  }
+  if (!request && (journey.extended || journey.jira)) request = await provisionExtendedEnvelope(journey, page, name);
   expect(request, `a provisioned Envelope from ${templateId(name)} should exist`).toBeTruthy();
   journey.currentTemplate = name;
   journey.requests.set(name, request);

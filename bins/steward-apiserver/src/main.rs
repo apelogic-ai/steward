@@ -882,7 +882,7 @@ async fn browser_application_router(
             runtimes.clone(),
             store.clone(),
             decisions,
-            capability_catalog,
+            capability_catalog.clone(),
             task_api_config.workspace_deployment_capabilities(),
             auth.clone(),
         ))
@@ -927,7 +927,11 @@ async fn browser_application_router(
                 github_automation_config,
                 auth.clone(),
             ))
-            .merge(connections::protected_router(broker, auth.clone())),
+            .merge(connections::protected_router(
+                broker,
+                capability_catalog.catalogs,
+                auth.clone(),
+            )),
         None => app.merge(agent_runs_ui::protected_router_with_task_reruns(
             store.clone(),
             browser_task_rerunner,
@@ -999,6 +1003,7 @@ fn governed_connections_configuration(
                 "STEWARD_CONNECTIONS_CONTROL_PLANE_CREDENTIAL_FILE",
             )?),
             mint_origin: required("STEWARD_CONNECTIONS_MINT_ORIGIN")?,
+            provider_origins: connections_provider_origins()?,
             federated_subject_issuer: connection_auto_association_issuer,
         },
         &bindings.mcp_gw_origin,
@@ -1013,6 +1018,21 @@ fn governed_connections_configuration(
     Ok(Some(governed_connections::SplitConnectionsBroker::new(
         mutations, status,
     )))
+}
+
+fn connections_provider_origins() -> Result<BTreeMap<String, String>, io::Error> {
+    let value = match env::var("STEWARD_CONNECTIONS_MCP_GW_PROVIDER_ORIGINS") {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return Ok(BTreeMap::new()),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::other(
+                "STEWARD_CONNECTIONS_MCP_GW_PROVIDER_ORIGINS must be Unicode",
+            ));
+        }
+    };
+    serde_json::from_str(&value).map_err(|_| {
+        io::Error::other("STEWARD_CONNECTIONS_MCP_GW_PROVIDER_ORIGINS must be a JSON object")
+    })
 }
 
 fn task_orchestration_mode() -> Result<TaskOrchestrationMode, io::Error> {

@@ -18,8 +18,8 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_ports::{
-    INFERENCE_REQUEST_REJECTED_FAILURE, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
-    WORKSPACE_PREPARATION_FAILURE,
+    INFERENCE_REQUEST_REJECTED_FAILURE, REQUIRED_OUTPUT_MISSING_FAILURE,
+    SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, WORKSPACE_PREPARATION_FAILURE,
 };
 use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunOutputArchive, AgentRunPage, AgentRunQuery,
@@ -2867,7 +2867,9 @@ pub(crate) fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
     }
     if matches!(
         reason,
-        SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE | WORKSPACE_PREPARATION_FAILURE
+        REQUIRED_OUTPUT_MISSING_FAILURE
+            | SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE
+            | WORKSPACE_PREPARATION_FAILURE
     ) {
         return Some(reason);
     }
@@ -4600,6 +4602,47 @@ mod tests {
             ledger.queries.lock().map_err(|_| "lock queries")?[1].task_uid,
             Some(own_task)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn my_run_detail_exposes_the_output_missing_failure() -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let task_uid = Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        let mut record = run(task_uid, owner);
+        record.phase = TaskPhase::Failed;
+        record.failure_reason =
+            Some("This run finished without creating an output file.".to_owned());
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .push(record);
+
+        let (service, session_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let response = protected_router(ledger, service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{task_uid}"))
+                    .header(header::COOKIE, session_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build scoped run-detail request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute scoped run-detail request: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read scoped run-detail response: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("parse scoped run-detail response: {error}"))?;
+        assert_eq!(
+            value["run"]["failureReason"],
+            "This run finished without creating an output file."
+        );
+        assert_eq!(value["run"]["errorCategory"], "output-missing");
         Ok(())
     }
 

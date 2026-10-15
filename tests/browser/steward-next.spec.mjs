@@ -258,6 +258,13 @@ const groupedGithubTools = [
   { provider: "github", resource: "issues_update", action: "write", accessClass: "write", toolsets: ["issues"] },
   { provider: "github", resource: "repository_delete", action: "delete", accessClass: "destructive" },
 ];
+const jiraReadTool = {
+  provider: "jira",
+  resource: "jira_search_issues",
+  action: "read",
+  accessClass: "read",
+  toolsets: ["issues"],
+};
 
 const envelopeRequest = {
   id: envelopeId,
@@ -517,10 +524,7 @@ async function startWeb() {
         || requestUrl.pathname === `/admin/api/v1/envelope-requests/${pendingEnvelopeRequest.requestId}/file`
         || requestUrl.pathname === `/admin/api/v1/approvals/${approvalId}/approve`
         || requestUrl.pathname === `/admin/api/v1/approvals/${approvalId}/file`
-        || requestUrl.pathname === "/app/api/v1/connections/github/start"
-        || requestUrl.pathname === "/app/api/v1/connections/github/disconnect"
-        || requestUrl.pathname === "/admin/api/v1/connections/github/start"
-        || requestUrl.pathname === "/admin/api/v1/connections/github/disconnect"
+        || /^\/(?:app|admin)\/api\/v1\/connections\/[^/]+\/(?:start|disconnect)$/.test(requestUrl.pathname)
         || requestUrl.pathname.endsWith("/github/publish")
         || requestUrl.pathname.endsWith("/github/dispatch")
         || requestUrl.pathname.endsWith("/cancel")
@@ -710,17 +714,24 @@ async function startWeb() {
           response.end();
           return;
         }
-        if (requestUrl.pathname.endsWith("/connections/github/start")) {
+        const providerConnectionMutation = /^\/(?:app|admin)\/api\/v1\/connections\/([^/]+)\/(start|disconnect)$/.exec(requestUrl.pathname);
+        if (providerConnectionMutation?.[2] === "start") {
+          const provider = decodeURIComponent(providerConnectionMutation[1]);
+          if (provider === "jira") {
+            response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+            response.end(JSON.stringify({ authorizationUrl: `${web.origin}/connections?oauth=started` }));
+            return;
+          }
           response.writeHead(202, { "content-type": "application/json", "cache-control": "no-store" });
           response.end(JSON.stringify({
             apiVersion: "steward.connections/v1",
-            provider: "github",
+            provider,
             operationId: "00000000-0000-0000-0000-000000000225",
             pollDeadlineAt: new Date(Date.now() + connectionStartDeadlineMs).toISOString(),
           }));
           return;
         }
-        if (requestUrl.pathname.endsWith("/connections/github/disconnect")) {
+        if (providerConnectionMutation?.[2] === "disconnect") {
           response.writeHead(204, { "cache-control": "no-store" });
           response.end();
           return;
@@ -735,7 +746,9 @@ async function startWeb() {
         return;
       }
 
-      if (requestUrl.pathname === "/app/api/v1/connections/github/operations/00000000-0000-0000-0000-000000000225") {
+      const providerOperation = /^\/app\/api\/v1\/connections\/([^/]+)\/operations\/00000000-0000-0000-0000-000000000225$/.exec(requestUrl.pathname);
+      if (providerOperation) {
+        const provider = decodeURIComponent(providerOperation[1]);
         connectionStartPolls += 1;
         if (connectionStartPollHangs) {
           await new Promise((resolve) => response.once("close", resolve));
@@ -745,7 +758,7 @@ async function startWeb() {
         response.writeHead(pending ? 202 : 200, { "content-type": "application/json", "cache-control": "no-store" });
         response.end(JSON.stringify({
           apiVersion: "steward.connections/v1",
-          provider: "github",
+          provider,
           operationId: "00000000-0000-0000-0000-000000000225",
           state: pending ? "pending" : "succeeded",
           ...(pending ? {} : { authorizationUrl: `${web.origin}/connections?oauth=started`, expiresAt: "2026-09-01T12:10:30Z" }),
@@ -880,6 +893,7 @@ async function guardedPage(browser, {
   mockSignIn = true,
   colorScheme = "dark",
   connectionPhase = "connected",
+  providerConnections = null,
   decisionChannelEnabled = true,
   connectionStartFailure = null,
   connectionStartHangPoll = false,
@@ -901,6 +915,7 @@ async function guardedPage(browser, {
   envelopeSpend = null,
   publishedWorkflows = true,
   taskLibraryMutable = false,
+  taskSaveFailure = null,
   initialOnboardingDismissed = false,
   initialWorkflowAcknowledged = false,
   onboardingJourney = false,
@@ -915,6 +930,7 @@ async function guardedPage(browser, {
   runSpend = run.observedSpend,
   capabilityCatalogModels = capabilityCatalog.models,
   capabilityCatalogTools = capabilityCatalog.tools,
+  templateTools = null,
   capabilityCatalogStatus = 200,
   inlineTaskDefinition = null,
   session = developerSession,
@@ -1063,9 +1079,9 @@ async function guardedPage(browser, {
     });
   });
   if (connectionStartFailure) {
-    await context.route(`${origin}/app/api/v1/connections/github/operations/*`, (route) => json(route, {
+    await context.route(`${origin}/app/api/v1/connections/*/operations/*`, (route) => json(route, {
       apiVersion: "steward.connections/v1",
-      provider: "github",
+      provider: new URL(route.request().url()).pathname.split("/")[5],
       operationId: "00000000-0000-0000-0000-000000000225",
       state: "failed",
       error: connectionStartFailure.error,
@@ -1076,8 +1092,8 @@ async function guardedPage(browser, {
   await context.route(`${origin}/app/api/v1/envelope-templates`, (route) => json(route, {
     apiVersion: "steward.envelope-requests/v1",
     templates: emptyCollections ? [] : [
-      { id: "analyst", displayName: "Analyst", revision: 2, ceiling: analystEnvelope, autoProvisionThreshold: null, githubConnection: "connected" },
-      { id: "developer", displayName: "Developer", revision: 4, ceiling: envelope, autoProvisionThreshold: null, githubConnection: "connected" },
+      { id: "analyst", displayName: "Analyst", revision: 2, ceiling: templateTools ? { ...analystEnvelope, spec: { ...analystEnvelope.spec, tools: templateTools } } : analystEnvelope, autoProvisionThreshold: null, githubConnection: "connected" },
+      { id: "developer", displayName: "Developer", revision: 4, ceiling: templateTools ? { ...envelope, spec: { ...envelope.spec, tools: templateTools } } : envelope, autoProvisionThreshold: null, githubConnection: "connected" },
     ],
   }));
   await context.route(`${origin}/app/api/v1/workflows`, (route) => json(route, {
@@ -1246,6 +1262,10 @@ async function guardedPage(browser, {
     const request = route.request();
     if (request.method() === "POST") {
       const body = request.postDataJSON();
+      if (taskSaveFailure) {
+        mutations.push({ path: new URL(request.url()).pathname, headers: await request.allHeaders(), body });
+        return json(route, taskSaveFailure.body, taskSaveFailure.status);
+      }
       const definition = JSON.parse(body.files[body.path]);
       const contentDigest = `steward:sha256:${String(definition.version).repeat(64)}`;
       const taskId = body.taskId ?? browserTaskId;
@@ -1861,16 +1881,18 @@ async function guardedPage(browser, {
       : { phase: connectionPhase, accountEmail: null, scopesRequired: ["repo"], scopesGranted: [], scopesMissing: ["repo"], expiresAt: null },
   }));
   await context.route(`${origin}/admin/api/v1/connections/github/*`, (route) => route.continue());
+  const providerConnectionFixtures = providerConnections ?? [{
+    provider: "github",
+    displayName: "GitHub",
+    actions: ["start", "disconnect"],
+    status: connectionPhase === "connected"
+      ? { phase: "connected", accountEmail: "alice@example.com", scopesRequired: ["repo"], scopesGranted: ["repo"], scopesMissing: [], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null }
+      : { phase: connectionPhase, accountEmail: null, scopesRequired: ["repo"], scopesGranted: [], scopesMissing: ["repo"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+  }];
   await context.route(`${origin}/app/api/v1/connections`, (route) => json(route, {
     apiVersion: "steward.connections/v1",
-    connections: [{
-      provider: "github",
-      displayName: "GitHub",
-      status: connectionPhase === "connected"
-        ? { phase: "connected", accountEmail: "alice@example.com", scopesRequired: ["repo"], scopesGranted: ["repo"], scopesMissing: [], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null }
-        : { phase: connectionPhase, accountEmail: null, scopesRequired: ["repo"], scopesGranted: [], scopesMissing: ["repo"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
-    }],
-    available: [{ provider: "github", displayName: "GitHub", enabled: true }],
+    connections: providerConnectionFixtures,
+    available: providerConnectionFixtures.map(({ displayName, provider }) => ({ provider, displayName, enabled: true })),
   }));
   let inferenceCredential = null;
   await context.route(`${origin}/app/api/v1/connections/inference`, async (route) => {
@@ -3604,6 +3626,64 @@ test("a Task draft remains saveable without an active Envelope or model", async 
   }
 });
 
+test("a Task save refusal shows the server's plain failure reason", async ({ browser }) => {
+  const failureReason = "The per-run budget must be more than 0.00 USD.";
+  const developer = await guardedPage(browser, {
+    expectedHttpStatuses: [422],
+    taskSaveFailure: {
+      status: 422,
+      body: { error: "admission_rejected", failureReason },
+    },
+  });
+  try {
+    await developer.page.goto(`${origin}/tasks/new`);
+    await developer.page.getByLabel("Requirements (optional JSON)").fill(JSON.stringify({
+      authority: {
+        budget: { currency: "USD", monthlyLimit: "5.00", singleRunLimit: "0" },
+        llms: [{ provider: "openai", model: "gpt-5.4" }],
+        runner: { platforms: [] },
+        tools: [],
+        ttl: "15m",
+      },
+    }));
+    await developer.page.getByRole("button", { name: "Save version 1" }).click();
+
+    await expect(developer.page.getByRole("alert").filter({ hasText: failureReason })).toHaveText(failureReason);
+    await expect(developer.page).toHaveURL(`${origin}/tasks/new`);
+    await expect(developer.page.getByRole("button", { name: "Save version 1" })).toBeEnabled();
+    const save = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/tasks");
+    expectInterceptedMutationProof(save);
+    expect(JSON.parse(save.body.files[browserTaskDefinitionPath]).requires.authority.budget.singleRunLimit).toBe("0");
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("a Task requirement keeps one exact Jira read tool", async ({ browser }) => {
+  const developer = await guardedPage(browser, { taskLibraryMutable: true });
+  try {
+    await developer.page.goto(`${origin}/tasks/new`);
+    await developer.page.getByLabel("Requirements (optional JSON)").fill(JSON.stringify({
+      authority: {
+        budget: { currency: "USD", monthlyLimit: "5.00", singleRunLimit: "1.00" },
+        llms: [{ provider: "openai", model: "gpt-5.4" }],
+        runner: { platforms: [] },
+        tools: [{ provider: jiraReadTool.provider, resource: jiraReadTool.resource, action: jiraReadTool.action }],
+        ttl: "15m",
+      },
+    }));
+    await developer.page.getByRole("button", { name: "Save version 1" }).click();
+
+    const save = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/tasks");
+    expectInterceptedMutationProof(save);
+    expect(JSON.parse(save.body.files[browserTaskDefinitionPath]).requires.authority.tools).toEqual([
+      { provider: "jira", resource: "jira_search_issues", action: "read" },
+    ]);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("new Tasks use the configured runtime and saved Tasks reuse their Envelope", async ({ browser }) => {
   const preferredEnvelope = {
     ...structuredClone(envelopeRequest),
@@ -4401,6 +4481,20 @@ test("failed run phases expose stdout and stderr as escaped sensitive output", a
   }
 });
 
+test("a failed run shows the missing-output explanation", async ({ browser }) => {
+  const failureReason = "This run finished without creating an output file.";
+  const developer = await guardedPage(browser, {
+    runFailureReason: failureReason,
+    runPhase: "failed",
+  });
+  try {
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByRole("alert").filter({ hasText: failureReason })).toHaveText(failureReason);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("administrator run logs use the administrator boundary and report unavailable logs", async ({ browser }) => {
   const administrator = await guardedPage(browser, {
     executionLogs: {
@@ -4884,6 +4978,34 @@ test("administrator selects every grouped read tool as exact authority tuples", 
   }
 });
 
+test("Template and Envelope tool controls present Jira read tools without GitHub-only copy", async ({ browser }) => {
+  const administrator = await guardedPage(browser, {
+    capabilityCatalogTools: [jiraReadTool],
+    session: administratorSession,
+  });
+  try {
+    await administrator.page.goto(`${origin}/admin/envelopes/templates/new`);
+    const tools = administrator.page.getByRole("group", { name: "Tools" });
+    await expect(tools.getByRole("checkbox", { name: "jira:jira_search_issues:read" })).toBeVisible();
+  } finally {
+    await closeGuardedPage(administrator);
+  }
+
+  const developer = await guardedPage(browser, { templateTools: [jiraReadTool] });
+  try {
+    await developer.page.goto(`${origin}/envelopes/new`);
+    const tools = developer.page.getByRole("heading", { name: "03 Tools" }).locator("xpath=ancestor::section[1]");
+    await expect(tools.getByText("jira:jira_search_issues:read", { exact: true })).toBeVisible();
+    await tools.getByRole("button", { name: "Remove jira:jira_search_issues:read" }).click();
+    const picker = tools.getByRole("combobox", { name: "Tools" });
+    await expect(picker).toHaveAttribute("placeholder", "Search tools…");
+    await picker.fill("jira");
+    await expect(tools.getByRole("option", { name: /jira:jira_search_issues:read/ })).toBeVisible();
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
 test("successive template saves diff tools against the accepted prior revision", async ({ browser }) => {
   const administrator = await guardedPage(browser, {
     adminTemplateTools: [],
@@ -5141,13 +5263,222 @@ test("the deployed admin template contract is accepted during the rolling Next c
   }
 });
 
-test("connection OAuth starts through a same-origin Rust mutation", async ({ browser }) => {
+test("connection OAuth polling opens provider sign-in in a new tab", async ({ browser }) => {
   const developer = await guardedPage(browser, { connectionPhase: "disconnected" });
   try {
     await developer.page.goto(`${origin}/connections`);
-    await developer.page.getByRole("button", { name: "Connect GitHub" }).click();
-    await expect(developer.page).toHaveURL(`${origin}/connections?oauth=started`);
+    const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+    const popupPromise = developer.page.waitForEvent("popup");
+    await github.getByRole("button", { name: "Connect", exact: true }).click();
+    const popup = await popupPromise;
+    await expect(popup).toHaveURL(`${origin}/connections?oauth=started`);
+    await expect(developer.page).toHaveURL(`${origin}/connections`);
+    expect(await popup.evaluate(() => window.opener)).toBeNull();
+    await popup.close();
     expectMutationProof(developer.mutations.find((mutation) => mutation.path.endsWith("/start")));
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Connections starts Jira sign-in through Jira's provider route", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    providerConnections: [
+      {
+        provider: "github",
+        displayName: "GitHub",
+        actions: ["start", "disconnect"],
+        status: { phase: "connected", accountEmail: "alice@example.com", scopesRequired: ["repo"], scopesGranted: ["repo"], scopesMissing: [], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+      },
+      {
+        provider: "jira",
+        displayName: "Jira",
+        actions: ["start"],
+        status: { phase: "disconnected", accountEmail: null, scopesRequired: ["read:jira-work"], scopesGranted: [], scopesMissing: ["read:jira-work"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+      },
+    ],
+  });
+  try {
+    await developer.page.goto(`${origin}/connections`);
+    await expect(developer.page.getByRole("heading", { name: "GitHub" })).toBeVisible();
+    await expect(developer.page.getByRole("heading", { name: "Jira" })).toBeVisible();
+    const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
+    const popupPromise = developer.page.waitForEvent("popup");
+    await jira.getByRole("button", { name: "Connect", exact: true }).click();
+    const popup = await popupPromise;
+    await expect(popup).toHaveURL(`${origin}/connections?oauth=started`);
+    await expect(developer.page).toHaveURL(`${origin}/connections`);
+    expect(await popup.evaluate(() => window.opener)).toBeNull();
+    await popup.close();
+    const start = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/connections/jira/start");
+    expectMutationProof(start);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Connections rejects a synchronous Jira start without an authorization URL", async ({ browser }) => {
+  const startPath = "/app/api/v1/connections/jira/start";
+  const developer = await guardedPage(browser, {
+    expectedHttpStatuses: [],
+    mutationFailures: { [startPath]: { status: 200, body: {} } },
+    providerConnections: [{
+      provider: "jira",
+      displayName: "Jira",
+      actions: ["start"],
+      status: { phase: "disconnected", accountEmail: null, scopesRequired: ["read:jira-work"], scopesGranted: [], scopesMissing: ["read:jira-work"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+    }],
+  });
+  try {
+    await developer.page.goto(`${origin}/connections`);
+    const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
+    const popupPromise = developer.page.waitForEvent("popup");
+    await jira.getByRole("button", { name: "Connect", exact: true }).click();
+    const popup = await popupPromise;
+    await expect(developer.page.getByText("The connection action could not be completed.", { exact: true })).toBeVisible();
+    await expect.poll(() => popup.isClosed()).toBe(true);
+    expectMutationProof(developer.mutations.find((mutation) => mutation.path === startPath));
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Connections falls back to same-tab sign-in when the new tab is blocked", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    providerConnections: [{
+      provider: "jira",
+      displayName: "Jira",
+      actions: ["start"],
+      status: { phase: "disconnected", accountEmail: null, scopesRequired: ["read:jira-work"], scopesGranted: [], scopesMissing: ["read:jira-work"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+    }],
+  });
+  try {
+    await developer.page.goto(`${origin}/connections`);
+    await developer.page.evaluate(() => { window.open = () => null; });
+    const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
+    await jira.getByRole("button", { name: "Connect", exact: true }).click();
+    await expect(developer.page).toHaveURL(`${origin}/connections?oauth=started`);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Connections refreshes provider status when the page regains focus", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  try {
+    await developer.page.goto(`${origin}/connections`);
+    await expect(developer.page.getByRole("heading", { name: "GitHub" })).toBeVisible();
+    const refreshed = developer.page.waitForRequest((request) => new URL(request.url()).pathname === "/app/api/v1/connections");
+    await developer.page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await refreshed;
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Connections shows no controls when a provider advertises no actions", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    providerConnections: [{
+      provider: "jira",
+      displayName: "Jira",
+      actions: [],
+      status: { phase: "disconnected", accountEmail: null, scopesRequired: ["read:jira-work"], scopesGranted: [], scopesMissing: ["read:jira-work"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null, githubActionsIdentityLinked: true },
+    }],
+  });
+  try {
+    await developer.page.goto(`${origin}/connections`);
+    const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
+    await expect(jira).toBeVisible();
+    await expect(jira.getByRole("button", { name: "Connect", exact: true })).toHaveCount(0);
+    await expect(jira.getByRole("button", { name: "Reconnect", exact: true })).toHaveCount(0);
+    await expect(jira.getByRole("button", { name: "Disconnect…", exact: true })).toHaveCount(0);
+    await expect(jira.getByText("GitHub Actions runs as you: linked.", { exact: true })).toHaveCount(0);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("GitHub and Jira cards share action footers across disconnected, connected, and reauthorization states", async ({ browser }) => {
+  const scenarios = [
+    {
+      name: "disconnected",
+      actions: ["start"],
+      status: { phase: "disconnected", accountEmail: null, scopesRequired: ["read"], scopesGranted: [], scopesMissing: ["read"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+      buttons: ["Connect"],
+      primary: true,
+    },
+    {
+      name: "connected",
+      actions: ["start", "disconnect"],
+      status: { phase: "connected", accountEmail: "alice@example.com", scopesRequired: ["read"], scopesGranted: ["read"], scopesMissing: [], activeCredentialExpiresAt: "2026-09-14T11:00:00.000Z", renewalCredentialExpiresAt: null },
+      buttons: ["Reconnect", "Disconnect…"],
+      primary: false,
+    },
+    {
+      name: "reauthorization",
+      actions: ["start", "disconnect"],
+      status: { phase: "reauth_required", accountEmail: "alice@example.com", scopesRequired: ["read"], scopesGranted: [], scopesMissing: ["read"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+      buttons: ["Reconnect", "Disconnect…"],
+      primary: true,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const developer = await guardedPage(browser, {
+      providerConnections: [
+        { provider: "github", displayName: "GitHub", actions: scenario.actions, status: scenario.status },
+        { provider: "jira", displayName: "", actions: scenario.actions, status: scenario.status },
+      ],
+    });
+    try {
+      await developer.page.goto(`${origin}/connections`);
+      const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+      const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
+      const githubFooter = github.locator('[data-provider-action-footer="github"]');
+      const jiraFooter = jira.locator('[data-provider-action-footer="jira"]');
+
+      await expect(githubFooter, `${scenario.name} GitHub footer`).toBeVisible();
+      await expect(jiraFooter, `${scenario.name} Jira footer`).toBeVisible();
+      expect(await githubFooter.getByRole("button").allTextContents()).toEqual(scenario.buttons);
+      expect(await jiraFooter.getByRole("button").allTextContents()).toEqual(scenario.buttons);
+      const actionLabel = scenario.buttons[0];
+      if (scenario.primary) {
+        await expect(githubFooter.getByRole("button", { name: actionLabel, exact: true })).toHaveClass(/bg-brand/);
+        await expect(jiraFooter.getByRole("button", { name: actionLabel, exact: true })).toHaveClass(/bg-brand/);
+      } else {
+        await expect(githubFooter.getByRole("button", { name: actionLabel, exact: true })).not.toHaveClass(/bg-brand/);
+        await expect(jiraFooter.getByRole("button", { name: actionLabel, exact: true })).not.toHaveClass(/bg-brand/);
+      }
+
+      if (scenario.name === "connected") {
+        await expect(jira.getByText("Credential expired", { exact: true })).toHaveCount(0);
+        await expect(jira.getByText("Renews automatically", { exact: true })).toBeVisible();
+        const formattedActiveExpiry = await developer.page.evaluate((value) => new Date(value).toLocaleString(), scenario.status.activeCredentialExpiresAt);
+        await expect(jira.getByText(formattedActiveExpiry, { exact: true })).toBeVisible();
+        await expect(jira.getByText(scenario.status.activeCredentialExpiresAt, { exact: true })).toHaveCount(0);
+      }
+    } finally {
+      await closeGuardedPage(developer);
+    }
+  }
+});
+
+test("Jira disconnect names the provider-wide effect and Atlassian cleanup", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    providerConnections: [{
+      provider: "jira",
+      displayName: "Jira",
+      actions: ["disconnect"],
+      status: { phase: "connected", accountEmail: "alice@example.com", scopesRequired: ["read:jira-work"], scopesGranted: ["read:jira-work"], scopesMissing: [], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+    }],
+  });
+  try {
+    await developer.page.goto(`${origin}/connections`);
+    const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
+    await expect(jira.getByText("Disconnecting removes Jira access from every current and future run using your account.", { exact: true })).toBeVisible();
+    await expect(jira.getByText("Also remove the app under Atlassian Connected Apps.", { exact: true })).toBeVisible();
+    await jira.getByRole("button", { name: "Disconnect…" }).click();
+    await expect(developer.page.getByRole("button", { name: "Disconnect Jira", exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
@@ -5196,7 +5527,8 @@ test("connection OAuth polling keeps a bounded terminal failure explicit", async
   });
   try {
     await developer.page.goto(`${origin}/connections`);
-    await developer.page.getByRole("button", { name: "Connect GitHub" }).click();
+    const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+    await github.getByRole("button", { name: "Connect", exact: true }).click();
     const failure = developer.page.getByRole("alert");
     await expect(failure.getByText("GitHub authorization couldn't be completed. Retry once. If it continues, ask an administrator to check the connection.", { exact: true })).toBeVisible();
     await failure.getByText("Details", { exact: true }).click();
@@ -5215,7 +5547,8 @@ test("connection OAuth stops a perpetually pending poll after the bounded observ
   });
   try {
     await developer.page.goto(`${origin}/connections`);
-    const connect = developer.page.getByRole("button", { name: "Connect GitHub" });
+    const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+    const connect = github.getByRole("button", { name: "Connect", exact: true });
     await connect.click();
     await expect(developer.page.getByText(
       "The connection operation did not finish in time. Retry it; if it continues, contact an administrator.",
@@ -5236,7 +5569,8 @@ test("connection OAuth keeps its deadline failure when the operation request abo
   });
   try {
     await developer.page.goto(`${origin}/connections`);
-    const connect = developer.page.getByRole("button", { name: "Connect GitHub" });
+    const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+    const connect = github.getByRole("button", { name: "Connect", exact: true });
     await connect.click();
     await expect(developer.page.getByText(
       "The connection operation did not finish in time. Retry it; if it continues, contact an administrator.",
@@ -5291,7 +5625,8 @@ test("connection action keeps an authorization denial explicit", async ({ browse
   });
   try {
     await developer.page.goto(`${origin}/connections`);
-    await developer.page.getByRole("button", { name: "Connect GitHub" }).click();
+    const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+    await github.getByRole("button", { name: "Connect", exact: true }).click();
     await expect(developer.page.getByText("You are not allowed to manage this connection.")).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
