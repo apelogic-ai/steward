@@ -60,6 +60,7 @@ impl ProviderConnectionBroker<String> for NoopConnectionMutations {
     fn status<'a>(
         &'a self,
         _session: &'a ConnectionSession<String>,
+        _provider: &'a str,
     ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
         Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
     }
@@ -349,11 +350,21 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
             ))
         })?;
     seed_template_one_boundary_upgrade_fixture(&store).await?;
+    migration_set(Some(70))
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward template-boundary migration must complete over the required TLS session: {error}"
+            ))
+        })?;
+    seed_browser_task_preferred_envelope_upgrade_fixture(&store).await?;
     migration_set(None).run(store.pool()).await.map_err(|error| {
         io::Error::other(format!(
-            "Steward template-boundary migration must complete over the required TLS session: {error}"
+            "Steward preferred-Envelope migration must complete over the required TLS session: {error}"
         ))
     })?;
+    assert_browser_task_preferred_envelope_upgrade_result(&store).await?;
     verify_browser_task_library_upgrade(&store).await?;
     assert_eq!(
         historical_task_identity_snapshot(&store).await?,
@@ -648,6 +659,72 @@ async fn verify_browser_task_library_upgrade(store: &PgStore) -> Result<(), Box<
     assert!(
         mutation.is_err(),
         "saved Task package bytes must remain immutable after migration"
+    );
+    Ok(())
+}
+
+async fn seed_browser_task_preferred_envelope_upgrade_fixture(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    sqlx::query(
+        "INSERT INTO browser_task_drafts \
+         (task_id, owner_user_id, name, shared_roles) \
+         VALUES ('00000000-0000-0000-0000-000000000278', \
+                 'usr_0123456789abcdef0123456789abcdef', \
+                 'historical-task', ARRAY['engineer'])",
+    )
+    .execute(store.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO browser_task_versions \
+         (task_id, version, content_digest, package_path, files) \
+         VALUES ('00000000-0000-0000-0000-000000000278', 1, $1, \
+                 'task-definition.json', $2)",
+    )
+    .bind(format!("steward:sha256:{}", "0".repeat(64)))
+    .bind(serde_json::json!({
+        "task-definition.json": "{\"schemaVersion\":\"steward.task-definition/v2\"}"
+    }))
+    .execute(store.pool())
+    .await?;
+    Ok(())
+}
+
+async fn assert_browser_task_preferred_envelope_upgrade_result(
+    store: &PgStore,
+) -> Result<(), Box<dyn Error>> {
+    let historical = sqlx::query_as::<_, (i64, String, String, serde_json::Value, Option<String>)>(
+        "SELECT version, content_digest, package_path, files, preferred_envelope_digest \
+         FROM browser_task_versions \
+         WHERE task_id = '00000000-0000-0000-0000-000000000278'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert_eq!(historical.0, 1);
+    assert_eq!(historical.1, format!("steward:sha256:{}", "0".repeat(64)));
+    assert_eq!(historical.2, "task-definition.json");
+    assert_eq!(
+        historical.3,
+        serde_json::json!({
+            "task-definition.json": "{\"schemaVersion\":\"steward.task-definition/v2\"}"
+        }),
+        "migration 0071 must preserve the package bytes of historical Task versions"
+    );
+    assert!(
+        historical.4.is_none(),
+        "migration 0071 must leave historical Task versions without an invented Envelope preference"
+    );
+
+    let mutation = sqlx::query(
+        "UPDATE browser_task_versions SET preferred_envelope_digest = $1 \
+         WHERE task_id = '00000000-0000-0000-0000-000000000278'",
+    )
+    .bind(format!("steward:sha256:{}", "9".repeat(64)))
+    .execute(store.pool())
+    .await;
+    assert!(
+        mutation.is_err(),
+        "migration 0071 must keep historical Task versions immutable after adding the column"
     );
     Ok(())
 }
@@ -1884,6 +1961,7 @@ async fn direct_connection_status(
         DirectConnectionStatusConfig {
             control_plane_credential_file: credential_path,
             mint_origin,
+            provider_origins: std::collections::BTreeMap::new(),
             federated_subject_issuer: issuer.map(str::to_owned),
         },
         &gateway_origin,
@@ -1894,13 +1972,16 @@ async fn direct_connection_status(
     })?;
     let broker = SplitConnectionsBroker::new(NoopConnectionMutations, reader);
     broker
-        .status(&ConnectionSession {
-            subject: ConnectionSubject {
-                canonical_user_id: canonical_user_id.clone(),
-                display_email: "alice@example.com".to_owned(),
+        .status(
+            &ConnectionSession {
+                subject: ConnectionSubject {
+                    canonical_user_id: canonical_user_id.clone(),
+                    display_email: "alice@example.com".to_owned(),
+                },
+                binding: "browser-session".to_owned(),
             },
-            binding: "browser-session".to_owned(),
-        })
+            "github",
+        )
         .await
         .map_err(|error| io::Error::other(format!("direct status failed: {error:?}")))
         .map_err(Into::into)

@@ -8,12 +8,14 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use futures::future::join_all;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use steward_types::CanonicalUserId;
 use uuid::Uuid;
 
 use crate::BoxFuture;
+use crate::browser_admin::CapabilityProviderCatalog;
 use crate::browser_auth::{
     BrowserAuthService, BrowserMutationProof, BrowserMutationRequest, BrowserSessionBinding,
     BrowserSessionContext, protect_browser_routes,
@@ -71,23 +73,31 @@ pub struct ProviderConnectionStatus {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConnectionStatusResponse {
     api_version: &'static str,
-    provider: &'static str,
+    provider: String,
     status: ProviderConnectionStatus,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ProviderConnectionView {
-    provider: &'static str,
-    display_name: &'static str,
+    provider: String,
+    display_name: String,
     status: ProviderConnectionStatus,
+    actions: Vec<ProviderConnectionAction>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderConnectionAction {
+    Start,
+    Disconnect,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AvailableProviderConnection {
-    provider: &'static str,
-    display_name: &'static str,
+    provider: String,
+    display_name: String,
     enabled: bool,
 }
 
@@ -99,24 +109,28 @@ pub(crate) struct ConnectionsCollectionResponse {
     available: Vec<AvailableProviderConnection>,
 }
 
-fn available_provider_connections() -> Vec<AvailableProviderConnection> {
-    vec![
-        AvailableProviderConnection {
-            provider: "github",
-            display_name: "GitHub",
-            enabled: true,
-        },
-        AvailableProviderConnection {
-            provider: "gitlab",
-            display_name: "GitLab",
-            enabled: false,
-        },
-        AvailableProviderConnection {
-            provider: "jira",
-            display_name: "Jira",
-            enabled: false,
-        },
-    ]
+fn available_provider_connections(
+    catalogs: &[CapabilityProviderCatalog],
+) -> Vec<AvailableProviderConnection> {
+    let mut providers = Vec::<AvailableProviderConnection>::new();
+    for catalog in catalogs {
+        if let Some(existing) = providers
+            .iter_mut()
+            .find(|existing| existing.provider == catalog.provider)
+        {
+            existing.enabled |= catalog.available;
+            continue;
+        }
+        providers.push(AvailableProviderConnection {
+            provider: catalog.provider.clone(),
+            display_name: catalog
+                .display_name
+                .clone()
+                .unwrap_or_else(|| catalog.provider.clone()),
+            enabled: catalog.available,
+        });
+    }
+    providers
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -134,6 +148,28 @@ pub(crate) struct StartConnectionAcceptedResponse {
     operation_id: Uuid,
     /// Server-owned deadline after which the browser must stop polling.
     poll_deadline_at: String,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderConnectionStartResponse {
+    /// Present on an asynchronous governed start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_version: Option<String>,
+    /// Present on an asynchronous governed start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    /// Present on an asynchronous governed start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    operation_id: Option<Uuid>,
+    /// Server-owned deadline after which the browser must stop polling an asynchronous start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    poll_deadline_at: Option<String>,
+    /// One-time HTTPS destination returned by a synchronous provider start.
+    /// It must not be persisted or logged by clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization_url: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -264,12 +300,21 @@ where
     fn status<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
+        provider: &'a str,
     ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>>;
 
     fn start<'a>(
         &'a self,
         session: &'a ConnectionSession<B>,
     ) -> BoxFuture<'a, Result<ReservedConnectionStart, ConnectionBrokerError>>;
+
+    fn start_provider_authorization<'a>(
+        &'a self,
+        _session: &'a ConnectionSession<B>,
+        _provider: &'a str,
+    ) -> BoxFuture<'a, Result<AuthorizationUrl, ConnectionBrokerError>> {
+        Box::pin(async { Err(ConnectionBrokerError::Unavailable) })
+    }
 
     fn start_operation<'a>(
         &'a self,
@@ -309,9 +354,10 @@ where
 #[derive(Clone)]
 pub(crate) struct ConnectionsState<P> {
     broker: P,
+    catalogs: Vec<CapabilityProviderCatalog>,
 }
 
-fn inner_router<P, B>(broker: P) -> Router
+fn inner_router<P, B>(broker: P, catalogs: Vec<CapabilityProviderCatalog>) -> Router
 where
     P: ProviderConnectionBroker<B>,
     B: Clone + Eq + Hash + Send + Sync + 'static,
@@ -346,7 +392,7 @@ where
             "/admin/api/v1/connections/github/disconnect",
             post(disconnect_connection::<P, B>),
         )
-        .with_state(ConnectionsState { broker })
+        .with_state(ConnectionsState { broker, catalogs })
 }
 
 /// Mount the Connections surface behind Steward's browser-session boundary.
@@ -354,11 +400,16 @@ where
 /// Keeping the unprotected router private makes it impossible for production callers to
 /// accidentally expose connection state or mutations without the session, origin, fetch-site,
 /// JSON, and per-session CSRF checks enforced by `protect_browser_routes`.
-pub fn protected_router<P>(broker: P, browser_auth: BrowserAuthService) -> Router
+pub fn protected_router<P>(
+    broker: P,
+    catalogs: Vec<CapabilityProviderCatalog>,
+    browser_auth: BrowserAuthService,
+) -> Router
 where
     P: ProviderConnectionBroker<BrowserSessionBinding>,
 {
-    let routes = inner_router(broker).route_layer(middleware::from_fn(adapt_browser_context));
+    let routes =
+        inner_router(broker, catalogs).route_layer(middleware::from_fn(adapt_browser_context));
     protect_browser_routes(routes, browser_auth)
 }
 
@@ -388,7 +439,28 @@ where
     P: ProviderConnectionBroker<B>,
     B: Clone + Eq + Hash + Send + Sync + 'static,
 {
-    inner_router(broker)
+    inner_router(
+        broker,
+        vec![CapabilityProviderCatalog {
+            provider: "github".to_owned(),
+            display_name: Some("GitHub".to_owned()),
+            catalog_id: "github-tools".to_owned(),
+            version: "current".to_owned(),
+            available: true,
+        }],
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_router_with_catalogs<P, B>(
+    broker: P,
+    catalogs: Vec<CapabilityProviderCatalog>,
+) -> Router
+where
+    P: ProviderConnectionBroker<B>,
+    B: Clone + Eq + Hash + Send + Sync + 'static,
+{
+    inner_router(broker, catalogs)
 }
 
 #[utoipa::path(
@@ -449,7 +521,8 @@ where
     params(("provider" = String, Path), ("X-Steward-CSRF" = String, Header)),
     request_body = BrowserMutationRequest,
     responses(
-        (status = 202, body = StartConnectionAcceptedResponse),
+        (status = 200, body = ProviderConnectionStartResponse),
+        (status = 202, body = ProviderConnectionStartResponse),
         (status = 401, description = "Browser session is absent or invalid"),
         (status = 403, description = "Origin, fetch metadata, or CSRF proof is invalid"),
         (status = 404, description = "Provider is unavailable"),
@@ -468,10 +541,45 @@ where
     P: ProviderConnectionBroker<B>,
     B: Clone + Eq + Hash + Send + Sync + 'static,
 {
-    if provider != "github" {
+    let Some(Extension(session)) = session else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::CACHE_CONTROL, "no-store")],
+        )
+            .into_response();
+    };
+    if !state
+        .catalogs
+        .iter()
+        .any(|catalog| catalog.available && catalog.provider == provider)
+    {
         return StatusCode::NOT_FOUND.into_response();
     }
-    start_connection(session, proof, State(state), Json(request)).await
+    if proof.is_none() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if provider == "github" {
+        return start_connection(Some(Extension(session)), proof, State(state), Json(request))
+            .await;
+    }
+    match state
+        .broker
+        .start_provider_authorization(&session, &provider)
+        .await
+    {
+        Ok(authorization_url) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(ProviderConnectionStartResponse {
+                api_version: None,
+                provider: None,
+                operation_id: None,
+                poll_deadline_at: None,
+                authorization_url: Some(authorization_url.as_str().to_owned()),
+            }),
+        )
+            .into_response(),
+        Err(error) => connection_broker_error_response(error),
+    }
 }
 
 #[utoipa::path(
@@ -700,10 +808,10 @@ where
     let Some(Extension(session)) = session else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    match state.broker.status(&session).await {
+    match state.broker.status(&session, "github").await {
         Ok(status) => Json(ConnectionStatusResponse {
             api_version: CONNECTIONS_API_VERSION,
-            provider: "github",
+            provider: "github".to_owned(),
             status,
         })
         .into_response(),
@@ -717,8 +825,7 @@ where
     path = "/app/api/v1/connections",
     responses(
         (status = 200, body = ConnectionsCollectionResponse),
-        (status = 401, description = "Browser session is absent or invalid"),
-        (status = 503, description = "Connection broker is unavailable")
+        (status = 401, description = "Browser session is absent or invalid")
     ),
     security(("browserSession" = []))
 )]
@@ -733,46 +840,55 @@ where
     let Some(Extension(session)) = session else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let status = match state.broker.status(&session).await {
-        Ok(status) => status,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ConnectionsCollectionResponse {
-                    api_version: CONNECTIONS_API_VERSION,
-                    connections: vec![ProviderConnectionView {
-                        provider: "github",
-                        display_name: "GitHub",
-                        status: ProviderConnectionStatus {
-                            phase: ConnectionPhase::Unavailable,
-                            account_email: None,
-                            account_id: None,
-                            account_login: None,
-                            github_actions_identity_linked: None,
-                            scopes_required: Vec::new(),
-                            scopes_granted: Vec::new(),
-                            scopes_missing: Vec::new(),
-                            expires_at: None,
-                            active_credential_expires_at: None,
-                            renewal_credential_expires_at: None,
-                        },
-                    }],
-                    available: available_provider_connections(),
-                }),
-            )
-                .into_response();
-        }
-    };
+    let available = available_provider_connections(&state.catalogs);
+    let connections = join_all(
+        available
+            .iter()
+            .filter(|configured| configured.enabled)
+            .map(|configured| async {
+                let status = state
+                    .broker
+                    .status(&session, &configured.provider)
+                    .await
+                    .unwrap_or_else(|_| unavailable_connection_status());
+                ProviderConnectionView {
+                    provider: configured.provider.clone(),
+                    display_name: configured.display_name.clone(),
+                    status,
+                    actions: if configured.provider == "github" {
+                        vec![
+                            ProviderConnectionAction::Start,
+                            ProviderConnectionAction::Disconnect,
+                        ]
+                    } else {
+                        vec![ProviderConnectionAction::Start]
+                    },
+                }
+            }),
+    )
+    .await;
     Json(ConnectionsCollectionResponse {
         api_version: CONNECTIONS_API_VERSION,
-        connections: vec![ProviderConnectionView {
-            provider: "github",
-            display_name: "GitHub",
-            status,
-        }],
-        available: available_provider_connections(),
+        connections,
+        available,
     })
     .into_response()
+}
+
+fn unavailable_connection_status() -> ProviderConnectionStatus {
+    ProviderConnectionStatus {
+        phase: ConnectionPhase::Unavailable,
+        account_email: None,
+        account_id: None,
+        account_login: None,
+        github_actions_identity_linked: None,
+        scopes_required: Vec::new(),
+        scopes_granted: Vec::new(),
+        scopes_missing: Vec::new(),
+        expires_at: None,
+        active_credential_expires_at: None,
+        renewal_credential_expires_at: None,
+    }
 }
 
 fn oauth_flow_pending_response() -> Response {
@@ -930,10 +1046,12 @@ mod tests {
     struct FakeBrokerState {
         flow: Option<(CanonicalUserId, TestSessionBinding)>,
         connected_user: Option<CanonicalUserId>,
+        status_providers: Vec<String>,
         oauth_pending: bool,
         operation_pending: bool,
         operation_failure: Option<(u16, String)>,
         unavailable: bool,
+        unavailable_providers: Vec<String>,
     }
 
     #[derive(Clone, Default)]
@@ -945,13 +1063,20 @@ mod tests {
         fn status<'a>(
             &'a self,
             session: &'a ConnectionSession<TestSessionBinding>,
+            provider: &'a str,
         ) -> BoxFuture<'a, Result<ProviderConnectionStatus, ConnectionBrokerError>> {
             Box::pin(async move {
-                let state = self
+                let mut state = self
                     .state
                     .lock()
                     .map_err(|_| ConnectionBrokerError::Unavailable)?;
-                if state.unavailable {
+                state.status_providers.push(provider.to_owned());
+                if state.unavailable
+                    || state
+                        .unavailable_providers
+                        .iter()
+                        .any(|unavailable| unavailable == provider)
+                {
                     return Err(ConnectionBrokerError::Unavailable);
                 }
                 let connected =
@@ -999,6 +1124,31 @@ mod tests {
                     operation_id: Uuid::from_u128(1),
                     poll_deadline_at: "2026-09-01T12:00:30Z".to_owned(),
                 })
+            })
+        }
+
+        fn start_provider_authorization<'a>(
+            &'a self,
+            session: &'a ConnectionSession<TestSessionBinding>,
+            provider: &'a str,
+        ) -> BoxFuture<'a, Result<AuthorizationUrl, ConnectionBrokerError>> {
+            Box::pin(async move {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ConnectionBrokerError::Unavailable)?;
+                if state.unavailable {
+                    return Err(ConnectionBrokerError::Unavailable);
+                }
+                if provider != "jira" {
+                    return Err(ConnectionBrokerError::Unavailable);
+                }
+                state.flow = Some((
+                    session.subject.canonical_user_id.clone(),
+                    session.binding.clone(),
+                ));
+                AuthorizationUrl::new("https://atlassian.test/authorize?state=one-time".to_owned())
+                    .map_err(|_| ConnectionBrokerError::Unavailable)
             })
         }
 
@@ -1142,8 +1292,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_collection_advertises_enabled_and_disabled_options() -> Result<(), String> {
-        let response = router(FakeBroker::default())
+    async fn provider_collection_advertises_configured_enabled_and_disabled_options()
+    -> Result<(), String> {
+        let catalog = crate::browser_admin::CapabilityCatalog::from_json(
+            r#"{
+              "schemaVersion":"steward.capability-catalog/v2",
+              "models":[],
+              "tools":[],
+              "catalogs":[
+                {"provider":"github","displayName":"GitHub","catalogId":"github-tools","version":"current","available":true},
+                {"provider":"gitlab","displayName":"GitLab","catalogId":"gitlab-tools","version":"current","available":false},
+                {"provider":"jira","displayName":"Jira","catalogId":"jira-tools","version":"current","available":false}
+              ]
+            }"#,
+        )?;
+        let response = test_router_with_catalogs(FakeBroker::default(), catalog.catalogs)
             .layer(axum::Extension(session()?))
             .oneshot(
                 Request::builder()
@@ -1160,11 +1323,215 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|error| format!("decode provider collection: {error}"))?;
         assert_eq!(value["connections"][0]["provider"], "github");
+        assert_eq!(value["connections"][0]["displayName"], "GitHub");
+        assert_eq!(
+            value["connections"][0]["actions"],
+            serde_json::json!(["start", "disconnect"])
+        );
+        assert_eq!(value["connections"].as_array().map(Vec::len), Some(1));
         assert_eq!(value["available"][0]["enabled"], true);
         assert_eq!(value["available"][1]["provider"], "gitlab");
         assert_eq!(value["available"][1]["enabled"], false);
         assert_eq!(value["available"][2]["provider"], "jira");
         assert_eq!(value["available"][2]["enabled"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_collection_reads_each_catalog_provider_without_a_hard_coded_list()
+    -> Result<(), String> {
+        let broker = FakeBroker::default();
+        let response = test_router_with_catalogs(
+            broker.clone(),
+            vec![
+                CapabilityProviderCatalog {
+                    provider: "github".to_owned(),
+                    display_name: Some("GitHub".to_owned()),
+                    catalog_id: "github-tools".to_owned(),
+                    version: "current".to_owned(),
+                    available: true,
+                },
+                CapabilityProviderCatalog {
+                    provider: "jira".to_owned(),
+                    display_name: Some("Jira".to_owned()),
+                    catalog_id: "jira-read-only".to_owned(),
+                    version: "current".to_owned(),
+                    available: true,
+                },
+            ],
+        )
+        .layer(axum::Extension(session()?))
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/connections")
+                .body(Body::empty())
+                .map_err(|error| format!("build provider collection request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("request provider collection: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read provider collection: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode provider collection: {error}"))?;
+        assert_eq!(value["connections"][0]["provider"], "github");
+        assert_eq!(
+            value["connections"][0]["actions"],
+            serde_json::json!(["start", "disconnect"])
+        );
+        assert_eq!(value["connections"][1]["provider"], "jira");
+        assert_eq!(
+            value["connections"][1]["actions"],
+            serde_json::json!(["start"])
+        );
+        assert_eq!(value["available"][1]["provider"], "jira");
+        assert_eq!(value["available"][1]["enabled"], true);
+        assert_eq!(
+            broker
+                .state
+                .lock()
+                .map_err(|_| "read status calls".to_owned())?
+                .status_providers,
+            ["github", "jira"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_start_requires_a_session_and_an_enabled_catalog_provider()
+    -> Result<(), String> {
+        let broker = FakeBroker::default();
+        let catalogs = vec![CapabilityProviderCatalog {
+            provider: "jira".to_owned(),
+            display_name: Some("Jira".to_owned()),
+            catalog_id: "jira-read-only".to_owned(),
+            version: "current".to_owned(),
+            available: true,
+        }];
+        let request = |provider: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/app/api/v1/connections/{provider}/start"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .map_err(|error| format!("build provider start request: {error}"))
+        };
+
+        let unauthenticated = test_router_with_catalogs(broker.clone(), catalogs.clone())
+            .oneshot(request("jira")?)
+            .await
+            .map_err(|error| format!("request unauthenticated Jira start: {error}"))?;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let unlisted = test_router_with_catalogs(broker.clone(), catalogs)
+            .layer(axum::Extension(ConnectionMutationProof))
+            .layer(axum::Extension(session()?))
+            .oneshot(request("linear")?)
+            .await
+            .map_err(|error| format!("request unlisted provider start: {error}"))?;
+        assert_eq!(unlisted.status(), StatusCode::NOT_FOUND);
+        assert!(
+            broker
+                .state
+                .lock()
+                .map_err(|_| "read fake start state".to_owned())?
+                .flow
+                .is_none(),
+            "an unlisted provider must be refused before any broker start"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn jira_provider_start_returns_the_authorization_url_synchronously() -> Result<(), String>
+    {
+        let response = test_router_with_catalogs(
+            FakeBroker::default(),
+            vec![CapabilityProviderCatalog {
+                provider: "jira".to_owned(),
+                display_name: Some("Jira".to_owned()),
+                catalog_id: "jira-read-only".to_owned(),
+                version: "current".to_owned(),
+                available: true,
+            }],
+        )
+        .layer(axum::Extension(ConnectionMutationProof))
+        .layer(axum::Extension(session()?))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/app/api/v1/connections/jira/start")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .map_err(|error| format!("build Jira start request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("request Jira start: {error}"))?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read Jira start response: {error}"))?;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map_err(|error| format!("parse Jira start response: {error}"))?,
+            serde_json::json!({
+                "authorizationUrl": "https://atlassian.test/authorize?state=one-time"
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_collection_isolates_one_provider_status_failure() -> Result<(), String> {
+        let broker = FakeBroker::default();
+        broker
+            .state
+            .lock()
+            .map_err(|_| "configure status refusal".to_owned())?
+            .unavailable_providers
+            .push("jira".to_owned());
+        let response = test_router_with_catalogs(
+            broker,
+            vec![
+                CapabilityProviderCatalog {
+                    provider: "github".to_owned(),
+                    display_name: Some("GitHub".to_owned()),
+                    catalog_id: "github-tools".to_owned(),
+                    version: "current".to_owned(),
+                    available: true,
+                },
+                CapabilityProviderCatalog {
+                    provider: "jira".to_owned(),
+                    display_name: Some("Jira".to_owned()),
+                    catalog_id: "jira-read-only".to_owned(),
+                    version: "current".to_owned(),
+                    available: true,
+                },
+            ],
+        )
+        .layer(axum::Extension(session()?))
+        .oneshot(
+            Request::builder()
+                .uri("/app/api/v1/connections")
+                .body(Body::empty())
+                .map_err(|error| format!("build provider collection request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("request provider collection: {error}"))?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .map_err(|error| format!("read provider collection: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| format!("decode provider collection: {error}"))?;
+
+        assert_eq!(value["connections"][0]["provider"], "github");
+        assert_eq!(value["connections"][0]["status"]["phase"], "disconnected");
+        assert_eq!(value["connections"][1]["provider"], "jira");
+        assert_eq!(value["connections"][1]["status"]["phase"], "unavailable");
         Ok(())
     }
 

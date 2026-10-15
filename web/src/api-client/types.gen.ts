@@ -838,6 +838,7 @@ export type CapabilityCatalog = {
 export type CapabilityProviderCatalog = {
     available: boolean;
     catalogId: string;
+    displayName?: string | null;
     provider: string;
     version: string;
 };
@@ -1467,6 +1468,32 @@ export type Principal = {
 
 export type PromptSourceKind = 'path' | 'inline';
 
+export type ProviderConnectionAction = 'start' | 'disconnect';
+
+export type ProviderConnectionStartResponse = {
+    /**
+     * Present on an asynchronous governed start.
+     */
+    apiVersion?: string | null;
+    /**
+     * One-time HTTPS destination returned by a synchronous provider start.
+     * It must not be persisted or logged by clients.
+     */
+    authorizationUrl?: string | null;
+    /**
+     * Present on an asynchronous governed start.
+     */
+    operationId?: string | null;
+    /**
+     * Server-owned deadline after which the browser must stop polling an asynchronous start.
+     */
+    pollDeadlineAt?: string | null;
+    /**
+     * Present on an asynchronous governed start.
+     */
+    provider?: string | null;
+};
+
 export type ProviderConnectionStatus = {
     accountEmail?: string | null;
     accountId?: string | null;
@@ -1482,6 +1509,7 @@ export type ProviderConnectionStatus = {
 };
 
 export type ProviderConnectionView = {
+    actions: Array<ProviderConnectionAction>;
     displayName: string;
     provider: string;
     status: ProviderConnectionStatus;
@@ -4021,10 +4049,6 @@ export type ListProviderConnectionsErrors = {
      * Browser session is absent or invalid
      */
     401: unknown;
-    /**
-     * Connection broker is unavailable
-     */
-    503: unknown;
 };
 
 export type ListProviderConnectionsResponses = {
@@ -4245,7 +4269,8 @@ export type StartProviderConnectionErrors = {
 export type StartProviderConnectionError = StartProviderConnectionErrors[keyof StartProviderConnectionErrors];
 
 export type StartProviderConnectionResponses = {
-    202: StartConnectionAcceptedResponse;
+    200: ProviderConnectionStartResponse;
+    202: ProviderConnectionStartResponse;
 };
 
 export type StartProviderConnectionResponse = StartProviderConnectionResponses[keyof StartProviderConnectionResponses];

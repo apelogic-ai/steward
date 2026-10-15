@@ -21,6 +21,7 @@ pub const IMPLEMENTED_PORTS: [&str; 1] = ["GitHostingPlane"];
 
 const API_ORIGIN: &str = "https://api.github.com";
 const CLONE_ORIGIN: &str = "https://github.com";
+const USER_AGENT: &str = concat!("steward-github-source/", env!("CARGO_PKG_VERSION"));
 const METADATA_RESPONSE_BYTES: u64 = 1024 * 1024;
 const ERROR_RESPONSE_BYTES: u64 = 64 * 1024;
 const THROTTLED_REASON_SUFFIX: &str = " [throttled]";
@@ -51,7 +52,7 @@ fn encode_upload_pack_request(
     append_pkt_line(
         &mut request,
         format!(
-            "want {sha} multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent=steward-github-source/0.0.0\n"
+            "want {sha} multi_ack_detailed no-done side-band-64k thin-pack ofs-delta agent={USER_AGENT}\n"
         )
         .as_bytes(),
     )?;
@@ -263,7 +264,7 @@ impl GitHubSourceAdapter {
             .redirect(Policy::none())
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(20))
-            .user_agent("steward-github-source/0.0.0")
+            .user_agent(USER_AGENT)
             .build()
             .map_err(|_| failed("GitHub source client initialization failed"))?;
         Ok(Self {

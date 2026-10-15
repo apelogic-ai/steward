@@ -1,4 +1,4 @@
-# Source: user journey J4. UI text aligned with the 0.3.17 release candidate.
+# Source: user journey J4. UI text aligned with the 0.3.18 release candidate.
 # This journey is about the repository integration, so it is switched on.
 @needs-github
 Feature: J4 - User runs a Task on a repository
@@ -28,8 +28,7 @@ Feature: J4 - User runs a Task on a repository
     When I choose "<owner>/<repository>" in "Workspace repository"
     Then the field "Branch or tag" shows "main"
     And I see in "Repository checkout":
-      | /sandbox/workspace/<workspace-name> |
-      | read-only                          |
+      | <owner>/<repository> | /sandbox/workspace/<workspace-name> | read-only |
     # The repository is shown by name, not by a number.
     And the field "Workspace (advanced JSON array)" shows '[{"git": {"repository": "<owner>/<repository>", "ref": "git:ref:main"}}]'
     When I open "Review exact Task definition"

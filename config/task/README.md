@@ -48,7 +48,8 @@ independently of authority.
 ## Capability catalog
 
 The Helm value `config.apiserver.capabilityCatalog` is schema-validated and mounted through an
-immutable checksum-named ConfigMap. It contains only model and tool identities:
+immutable checksum-named ConfigMap. It contains model and tool identities plus the provider
+catalogs shown on the Connections page:
 
 ```yaml
 config:
@@ -80,6 +81,12 @@ Access classes and provider availability are descriptive UI metadata. It contain
 TTL, user, template, Envelope, or admission fields. Changing it changes
 what the editor can offer; it does not change an existing template, User Envelope, Task, or
 admission decision.
+
+Steward reads connection status once for every distinct provider named by `catalogs`, using that
+exact provider identifier with the gateway's stable version-2 status route. Multiple catalog
+entries for one provider produce one Connections entry, and the entry is enabled when any of its
+catalogs is available. A status failure marks only that provider unavailable; it does not hide the
+other configured providers. Provider credentials remain in the gateway.
 
 ## Controller inputs
 

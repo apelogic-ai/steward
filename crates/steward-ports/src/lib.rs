@@ -53,6 +53,9 @@ pub const WORKSPACE_PREPARATION_FAILURE: &str = "The workspace could not be prep
 /// Safe failure returned when the inference plane rejects settings that Steward already admitted.
 pub const INFERENCE_REQUEST_REJECTED_FAILURE: &str =
     "This run stopped because its model access or spending settings were not accepted.";
+/// Safe failure returned when a required Task output archive contains no regular files.
+pub const REQUIRED_OUTPUT_MISSING_FAILURE: &str =
+    "This run finished without creating an output file.";
 
 /// Vendor-neutral inputs used to render one immutable Task execution command.
 ///

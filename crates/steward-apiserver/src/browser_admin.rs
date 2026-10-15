@@ -78,6 +78,8 @@ impl CapabilityTool {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilityProviderCatalog {
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub catalog_id: String,
     pub version: String,
     pub available: bool,
@@ -274,7 +276,13 @@ impl CapabilityCatalog {
                 !valid(&tool.provider) || !valid(&tool.resource) || !valid(&tool.action)
             })
             || self.catalogs.iter().any(|catalog| {
-                !valid(&catalog.provider) || !valid(&catalog.catalog_id) || !valid(&catalog.version)
+                !valid(&catalog.provider)
+                    || catalog
+                        .display_name
+                        .as_deref()
+                        .is_some_and(|display_name| !valid(display_name))
+                    || !valid(&catalog.catalog_id)
+                    || !valid(&catalog.version)
             })
         {
             return Err(
@@ -346,6 +354,7 @@ mod capability_catalog_tests {
             }],
             catalogs: vec![CapabilityProviderCatalog {
                 provider: "github".to_owned(),
+                display_name: Some("GitHub".to_owned()),
                 catalog_id: "github-tools".to_owned(),
                 version: "1.6.0".to_owned(),
                 available: true,
@@ -363,6 +372,32 @@ mod capability_catalog_tests {
             )?,
             catalog
         );
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_a_provider_unknown_to_steward_without_hard_coded_rules() -> Result<(), String> {
+        let value = r#"{
+          "schemaVersion":"steward.capability-catalog/v2",
+          "models":[],
+          "tools":[{
+            "provider":"jira",
+            "resource":"jira_get_issue",
+            "action":"read",
+            "accessClass":"read"
+          }],
+          "catalogs":[{
+            "provider":"jira",
+            "catalogId":"provider-live",
+            "version":"current",
+            "available":true
+          }]
+        }"#;
+        let parsed = CapabilityCatalog::from_json(value)?;
+
+        assert_eq!(parsed.tools[0].provider, "jira");
+        assert_eq!(parsed.tools[0].resource, "jira_get_issue");
+        assert_eq!(parsed.tools[0].action, "read");
         Ok(())
     }
 

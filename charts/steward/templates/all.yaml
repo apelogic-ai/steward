@@ -439,6 +439,7 @@ spec:
             - { name: STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE, value: {{ .Values.connectionsBridge.artifactTrust.mode | quote }} }
             - { name: STEWARD_CONNECTIONS_BRIDGE_IMAGE, value: {{ .Values.connectionsBridge.image | quote }} }
             - { name: STEWARD_CONNECTIONS_MCP_GW_ORIGIN, value: {{ .Values.connectionsBridge.mcpGatewayOrigin | quote }} }
+            - { name: STEWARD_CONNECTIONS_MCP_GW_PROVIDER_ORIGINS, value: {{ .Values.connectionsBridge.providerOrigins | toJson | quote }} }
             - { name: STEWARD_CONNECTIONS_MCP_GW_VERSION, value: {{ include "steward.mcpGwInternalVersion" . | quote }} }
             - { name: STEWARD_CONNECTIONS_RUNTIME_NAMESPACE, value: {{ .Values.connectionsBridge.runtimeNamespace | quote }} }
             - { name: STEWARD_CONNECTIONS_MINT_ORIGIN, value: {{ printf "http://%s:%v" (include "steward.mintName" .) .Values.services.mintPort | quote }} }
@@ -731,12 +732,16 @@ spec:
 {{- if .Values.connectionsBridge.enabled }}
             - { name: STEWARD_MINT_CONTROL_PLANE_AUDIENCE, value: {{ .Values.config.mint.controlPlaneAudience | quote }} }
             - { name: STEWARD_MINT_CONTROL_PLANE_WORKLOAD_ID, value: {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "steward.apiserverName" .) | quote }} }
+            - { name: STEWARD_MINT_CAPABILITY_CATALOG_FILE, value: /run/capability-catalog/capability-catalog.json }
 {{- end }}
             - { name: STEWARD_MINT_SVID_AUDIENCE, value: {{ .Values.config.mint.svidAudience | quote }} }
             - { name: STEWARD_SPIFFE_TRUST_DOMAIN, value: {{ .Values.config.mint.spiffeTrustDomain | quote }} }
             - { name: STEWARD_OPENSHELL_NAMESPACE, value: {{ .Values.config.mint.openshellNamespace | quote }} }
           volumeMounts:
             - { name: mint-secret, mountPath: /run/mint, readOnly: true }
+{{- if .Values.connectionsBridge.enabled }}
+            - { name: capability-catalog, mountPath: /run/capability-catalog, readOnly: true }
+{{- end }}
 {{- if eq .Values.inference.mode "managed" }}
             - { name: managed-inference, mountPath: /run/managed-inference, readOnly: true }
 {{- end }}
@@ -753,6 +758,12 @@ spec:
             items:
               - { key: {{ .Values.secrets.mint.signingKey }}, path: signing-key }
               - { key: {{ .Values.secrets.mint.introspectionCredential }}, path: introspection-credential }
+{{- if .Values.connectionsBridge.enabled }}
+        - name: capability-catalog
+          configMap:
+            name: {{ $capabilityCatalogConfigMapName }}
+            items: [{ key: capability-catalog.json, path: capability-catalog.json }]
+{{- end }}
 {{- if eq .Values.inference.mode "managed" }}
         - name: managed-inference
           secret:

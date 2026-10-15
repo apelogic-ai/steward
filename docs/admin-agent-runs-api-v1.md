@@ -5,7 +5,7 @@ contract for the Agent Runs dashboard. It deliberately distinguishes
 recorded facts from desired configuration and from data Steward does not
 persist. The browser must never fill an unavailable field from a heuristic.
 
-Applies to Steward 0.3.17.
+Applies to Steward 0.3.18.
 
 ## Authority and privacy boundary
 
@@ -19,8 +19,10 @@ browser authority.
 The run read model contains no input or output archives, command arguments,
 provider payloads, raw logs, prompts, model output, tokens, credentials,
 assertions, HTTP headers or bodies. A Task failure is reduced to a bounded
-category; the stored free-form failure reason is not returned. Execution logs
-are available only through the separate bounded stream endpoint.
+category and, for an allowlisted set of actionable failures, a fixed or
+strictly validated plain-language `failureReason`; arbitrary stored failure
+text is not returned. Execution logs are available only through the separate
+bounded stream endpoint.
 
 ## Source and gap matrix
 
@@ -36,14 +38,16 @@ are available only through the separate bounded stream endpoint.
 | Configured models and tool grants | immutable `task_submissions.runtime_spec` snapshot | Submission snapshot | Available as configured authority only, never described as calls. |
 | Budget allocation | `task_submissions.runtime_spec.budget` | Submission snapshot | Available. |
 | Observed spend | latest append-only `spend_observations` row joined by `runtime_uid` | Observation timestamp | Available when observed; otherwise unavailable. Spend is observed, never custodied. |
+| Per-run runtime limit | immutable direct or browser Task evidence | Submission snapshot | Available as `taskRuntimeMinutesLimit` when the Task requests an explicit limit at or below its effective ceiling. |
 | Runtime-minute authority and usage | immutable User Envelope snapshot plus append-only `task_lifecycle_events` and runtime-minute observations/grants | Envelope-instance period/current observation | Available when the Envelope sets a limit. Usage is derived from running-to-terminal intervals clipped to the UTC month; it is not inferred from runtime age or added to the AgentRuntime CRD. |
 | Inference calls, actual model, input/output tokens | Not persisted by Steward | Unknown | Explicitly unavailable. Configured models are returned separately. |
 | Tool calls and outcomes | Not persisted by Steward | Unknown | Explicitly unavailable. Granted tools are returned separately. |
 | Runtime CPU, memory, storage and network use | Not persisted by Steward | Unknown | Explicitly unavailable. |
 | GitHub repository/workflow/run URL | validated `DirectTaskBindingEvidence.sourceProvenance` submission snapshot | Submission snapshot | Available for direct GitHub Tasks; otherwise absent. The submitter idempotency key is never interpreted as GitHub metadata. |
+| Workspace repositories and checkout paths | immutable direct or browser Task evidence | Submission snapshot | Available when the Task requested a workspace. Each entry preserves the exact repository, revision, destination, history request, and resolved evidence used for the Run. |
 | Stages | append-only lifecycle stage events plus current Task binding/state | Transactional/current | Admission, runtime binding, execution, and finalization are available. |
 | Execution step | bounded run presentation | Current | One agent-execution step names its stdout/stderr streams. Fine-grained agent steps are not claimed. |
-| Failure | `task_submissions.failure_reason` | Terminal Task snapshot | A bounded category only; the stored reason is never returned. |
+| Failure | `task_submissions.failure_reason` | Terminal Task snapshot | A bounded category is always derived when possible. `failureReason` is returned only for allowlisted actionable cases such as invalid coding-agent settings, missing required output, runtime or spending limits, and rejected inference requests; other stored text is withheld. |
 
 `runtime_events` is not used for this API. It is not populated by the Task
 controller and current runtime phase remains a CRD-status concern. Treating it

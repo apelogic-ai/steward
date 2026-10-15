@@ -4,6 +4,7 @@
 //! supervisor replaces it at the governed egress boundary; this adapter never
 //! accepts or reads a credential, provider origin, or caller identity.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -21,7 +22,11 @@ const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 const MAX_MCP_TOOL_RESPONSE_BYTES: usize = 1024 * 1024;
 const PROVIDER_TRANSPORT_READY_TIMEOUT: Duration = Duration::from_secs(12);
 const PROVIDER_TRANSPORT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
 const DIRECT_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
+// Tests only: a busy test runner must not trip the production one-second bound.
+#[cfg(test)]
+const DIRECT_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_STATUS_V2_MEDIA_TYPE: &str = "application/vnd.apelogic.connection-status.v2+json";
 pub const MAX_GATEWAY_FAILURE_DETAIL_BYTES: usize = 200;
 const MAX_GATEWAY_FAILURE_CODE_BYTES: usize = 100;
@@ -667,11 +672,11 @@ pub struct GithubMcpGateway {
     contract: GatewayContract,
 }
 
-/// A one-request HOP-1 credential used only by the fixed connection-status reader.
+/// A one-request HOP-1 credential used only by the provider connection-status reader.
 /// Deliberately implements neither `Debug` nor `Display`.
-pub struct GithubStatusCredential(String);
+pub struct ProviderStatusCredential(String);
 
-impl GithubStatusCredential {
+impl ProviderStatusCredential {
     pub fn new(value: String) -> Result<Self, PortError> {
         let segments = value.split('.').collect::<Vec<_>>();
         let compact_jwt = value.len() <= 8 * 1024
@@ -694,17 +699,120 @@ impl GithubStatusCredential {
     }
 }
 
-/// MCP-GW metadata-only status reader. It has no mutation or generic request surface.
+/// A one-request HOP-1 credential used only to start one provider authorization flow.
+/// Deliberately implements neither `Debug` nor `Display`.
+pub struct ProviderStartCredential(String);
+
+impl ProviderStartCredential {
+    pub fn new(value: String) -> Result<Self, PortError> {
+        let segments = value.split('.').collect::<Vec<_>>();
+        let compact_jwt = value.len() <= 8 * 1024
+            && segments.len() == 3
+            && segments.iter().all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            });
+        if compact_jwt {
+            Ok(Self(value))
+        } else {
+            Err(rejected("direct start credential must be one compact JWT"))
+        }
+    }
+
+    fn secret(&self) -> &str {
+        &self.0
+    }
+}
+
+/// MCP-GW provider authorization starter. It can call only the canonical authorize route.
 #[derive(Clone)]
-pub struct GithubStatusReader {
+pub struct ProviderAuthorizationStarter {
     client: Client,
     origin: Url,
+    provider_origins: BTreeMap<String, Url>,
+}
+
+impl ProviderAuthorizationStarter {
+    pub fn new(origin: &str, version: &str) -> Result<Self, PortError> {
+        Self::new_with_provider_origins(origin, &BTreeMap::new(), version)
+    }
+
+    pub fn new_with_provider_origins(
+        origin: &str,
+        provider_origins: &BTreeMap<String, String>,
+        version: &str,
+    ) -> Result<Self, PortError> {
+        let origin = validate_origin(origin)?;
+        let provider_origins = validate_provider_origins(provider_origins)?;
+        if GatewayContract::parse(version)? != GatewayContract::LifecycleV049 {
+            return Err(rejected(
+                "direct authorization requires the MCP-GW lifecycle contract",
+            ));
+        }
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(DIRECT_STATUS_TIMEOUT)
+            .timeout(DIRECT_STATUS_TIMEOUT)
+            .build()
+            .map_err(|_| unavailable("build direct MCP-GW authorization client"))?;
+        Ok(Self {
+            client,
+            origin,
+            provider_origins,
+        })
+    }
+
+    pub async fn start(
+        &self,
+        credential: &ProviderStartCredential,
+        provider: &str,
+    ) -> Result<String, PortError> {
+        let origin = self.provider_origins.get(provider).unwrap_or(&self.origin);
+        let target = provider_authorize_endpoint(origin, provider)?;
+        let response = self
+            .client
+            .post(target)
+            .header(AUTHORIZATION, format!("Bearer {}", credential.secret()))
+            .json(&json!({}))
+            .send()
+            .await
+            .map_err(|_| unavailable("start direct provider authorization"))?;
+        let status = response.status();
+        let body = bounded_body_or_status(
+            status,
+            StatusCode::OK,
+            read_bounded(response, MAX_RESPONSE_BYTES).await?,
+        )?;
+        let object = json_object(&body, "provider authorization response")?;
+        let authorization_url = provider_authorization_url(&object)?;
+        validate_authorization_url(&authorization_url)?;
+        Ok(authorization_url)
+    }
+}
+
+/// MCP-GW metadata-only status reader. It has no mutation or generic request surface.
+#[derive(Clone)]
+pub struct ProviderStatusReader {
+    client: Client,
+    origin: Url,
+    provider_origins: BTreeMap<String, Url>,
     contract: GatewayContract,
 }
 
-impl GithubStatusReader {
+impl ProviderStatusReader {
     pub fn new(origin: &str, version: &str) -> Result<Self, PortError> {
+        Self::new_with_provider_origins(origin, &BTreeMap::new(), version)
+    }
+
+    pub fn new_with_provider_origins(
+        origin: &str,
+        provider_origins: &BTreeMap<String, String>,
+        version: &str,
+    ) -> Result<Self, PortError> {
         let origin = validate_origin(origin)?;
+        let provider_origins = validate_provider_origins(provider_origins)?;
         let contract = GatewayContract::parse(version)?;
         if contract != GatewayContract::LifecycleV049 {
             return Err(rejected(
@@ -720,12 +828,18 @@ impl GithubStatusReader {
         Ok(Self {
             client,
             origin,
+            provider_origins,
             contract,
         })
     }
 
-    pub async fn read(&self, credential: &GithubStatusCredential) -> Result<Value, PortError> {
-        let target = endpoint(&self.origin, LIFECYCLE_STATUS_PATH)?;
+    pub async fn read(
+        &self,
+        credential: &ProviderStatusCredential,
+        provider: &str,
+    ) -> Result<Value, PortError> {
+        let origin = self.provider_origins.get(provider).unwrap_or(&self.origin);
+        let target = provider_status_endpoint(origin, provider)?;
         let response = self
             .client
             .get(target)
@@ -733,15 +847,64 @@ impl GithubStatusReader {
             .header(ACCEPT, CONNECTION_STATUS_V2_MEDIA_TYPE)
             .send()
             .await
-            .map_err(|_| unavailable("read direct GitHub connection status"))?;
+            .map_err(|_| unavailable("read direct provider connection status"))?;
         let status = response.status();
         let body = bounded_body_or_status(
             status,
             StatusCode::OK,
             read_bounded(response, MAX_RESPONSE_BYTES).await?,
         )?;
-        parse_response(self.contract, GithubBridgeOperation::Status, status, &body)
+        parse_status_response(self.contract, status, &body, provider)
     }
+}
+
+fn provider_status_endpoint(origin: &Url, provider: &str) -> Result<Url, PortError> {
+    validate_provider_connection_identifier(provider)?;
+    let mut target = origin.clone();
+    target
+        .path_segments_mut()
+        .map_err(|_| rejected("MCP-GW origin cannot contain provider routes"))?
+        .clear()
+        .push("connections")
+        .push(provider)
+        .push("status");
+    Ok(target)
+}
+
+fn provider_authorize_endpoint(origin: &Url, provider: &str) -> Result<Url, PortError> {
+    validate_provider_connection_identifier(provider)?;
+    let mut target = origin.clone();
+    target
+        .path_segments_mut()
+        .map_err(|_| rejected("MCP-GW origin cannot contain provider routes"))?
+        .clear()
+        .push("connections")
+        .push(provider)
+        .push("authorize");
+    Ok(target)
+}
+
+fn validate_provider_connection_identifier(provider: &str) -> Result<(), PortError> {
+    if provider.is_empty()
+        || provider.len() > 255
+        || provider.trim() != provider
+        || provider.chars().any(char::is_control)
+    {
+        return Err(rejected("provider connection identifier is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_provider_origins(
+    provider_origins: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, Url>, PortError> {
+    provider_origins
+        .iter()
+        .map(|(provider, origin)| {
+            validate_provider_connection_identifier(provider)?;
+            Ok((provider.clone(), validate_origin(origin)?))
+        })
+        .collect()
 }
 
 impl GithubMcpGateway {
@@ -1630,17 +1793,7 @@ fn parse_response(
     body: &[u8],
 ) -> Result<Value, PortError> {
     match operation {
-        GithubBridgeOperation::Status => {
-            require_status(status, StatusCode::OK, body)?;
-            let object = json_object(body, "GitHub status response")?;
-            match contract {
-                GatewayContract::LegacyV032 => {
-                    validate_status_response(&object)?;
-                    Ok(Value::Object(object))
-                }
-                GatewayContract::LifecycleV049 => normalized_status_response(&object),
-            }
-        }
+        GithubBridgeOperation::Status => parse_status_response(contract, status, body, "github"),
         GithubBridgeOperation::Start => {
             require_status(status, StatusCode::OK, body)?;
             let object = json_object(body, "GitHub start response")?;
@@ -1689,6 +1842,28 @@ fn parse_response(
         | GithubBridgeOperation::Publish => Err(rejected(
             "GitHub automation responses require the typed multi-call adapter path",
         )),
+    }
+}
+
+fn parse_status_response(
+    contract: GatewayContract,
+    status: StatusCode,
+    body: &[u8],
+    provider: &str,
+) -> Result<Value, PortError> {
+    require_status(status, StatusCode::OK, body)?;
+    let object = json_object(body, "provider status response")?;
+    match contract {
+        GatewayContract::LegacyV032 => {
+            if provider != "github" {
+                return Err(rejected(
+                    "legacy connection status is available only for its fixed provider",
+                ));
+            }
+            validate_status_response(&object)?;
+            Ok(Value::Object(object))
+        }
+        GatewayContract::LifecycleV049 => normalized_status_response(&object, provider),
     }
 }
 
@@ -2461,7 +2636,10 @@ fn validate_status_response(object: &Map<String, Value>) -> Result<(), PortError
     Ok(())
 }
 
-fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, PortError> {
+fn normalized_status_response(
+    object: &Map<String, Value>,
+    provider: &str,
+) -> Result<Value, PortError> {
     // Validate only the fields Steward consumes. MCP-GW may add lifecycle metadata without
     // changing this contract, and the projection below prevents unconsumed values from entering
     // Steward's governed archive or browser response.
@@ -2469,10 +2647,10 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
         .get("version")
         .and_then(Value::as_str)
         .filter(|version| matches!(*version, "1" | "2"))
-        .ok_or_else(|| rejected("GitHub lifecycle status has an invalid identity or schema"))?;
-    if object.get("provider").and_then(Value::as_str) != Some("github") {
+        .ok_or_else(|| rejected("provider lifecycle status has an invalid identity or schema"))?;
+    if object.get("provider").and_then(Value::as_str) != Some(provider) {
         return Err(rejected(
-            "GitHub lifecycle status has an invalid identity or schema",
+            "provider lifecycle status has an invalid identity or schema",
         ));
     }
 
@@ -2492,45 +2670,40 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
                     | "unavailable"
             )
         })
-        .ok_or_else(|| rejected("GitHub lifecycle phase is invalid"))?;
+        .ok_or_else(|| rejected("provider lifecycle phase is invalid"))?;
     let connected = object
         .get("connected")
         .and_then(Value::as_bool)
-        .ok_or_else(|| rejected("GitHub lifecycle connected state is invalid"))?;
+        .ok_or_else(|| rejected("provider lifecycle connected state is invalid"))?;
     let account = object
         .get("account")
         .map(|value| {
             let account = value
                 .as_object()
-                .ok_or_else(|| rejected("GitHub lifecycle account is invalid"))?;
+                .ok_or_else(|| rejected("provider lifecycle account is invalid"))?;
             let display_name = account
                 .get("displayName")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty() && name.len() <= 320)
                 .map(str::to_owned)
-                .ok_or_else(|| rejected("GitHub lifecycle account is invalid"))?;
+                .ok_or_else(|| rejected("provider lifecycle account is invalid"))?;
             if version == "1" {
                 if account.len() != 1 {
-                    return Err(rejected("GitHub lifecycle account is invalid"));
+                    return Err(rejected("provider lifecycle account is invalid"));
                 }
                 return Ok((display_name, None, None));
             }
-            if account.get("provider").and_then(Value::as_str) != Some("github") {
-                return Err(rejected("GitHub lifecycle account is invalid"));
+            if account.get("provider").and_then(Value::as_str) != Some(provider) {
+                return Err(rejected("provider lifecycle account is invalid"));
             }
             let account_id = account
                 .get("id")
                 .map(|value| {
                     value
                         .as_str()
-                        .filter(|id| {
-                            !id.is_empty()
-                                && id.len() <= 20
-                                && id.bytes().all(|byte| byte.is_ascii_digit())
-                                && !id.starts_with('0')
-                        })
+                        .filter(|id| valid_provider_account_id(provider, id))
                         .map(str::to_owned)
-                        .ok_or_else(|| rejected("GitHub lifecycle account ID is invalid"))
+                        .ok_or_else(|| rejected("provider lifecycle account ID is invalid"))
                 })
                 .transpose()?;
             let login = account
@@ -2540,7 +2713,7 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
                         .as_str()
                         .filter(|login| !login.is_empty() && login.len() <= 128)
                         .map(str::to_owned)
-                        .ok_or_else(|| rejected("GitHub lifecycle account login is invalid"))
+                        .ok_or_else(|| rejected("provider lifecycle account login is invalid"))
                 })
                 .transpose()?;
             Ok((display_name, account_id, login))
@@ -2556,7 +2729,7 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
                     .as_array()
                     .is_some_and(|values| !values.is_empty())))
     {
-        return Err(rejected("GitHub lifecycle phase and account disagree"));
+        return Err(rejected("provider lifecycle phase and account disagree"));
     }
     let active_expiry = nullable_utc_timestamp(object, "activeCredentialExpiresAt")?;
     let renewal_expiry = nullable_utc_timestamp(object, "renewalCredentialExpiresAt")?;
@@ -2566,7 +2739,7 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
     let capabilities = object
         .get("capabilities")
         .and_then(Value::as_object)
-        .ok_or_else(|| rejected("GitHub lifecycle capabilities are invalid"))?;
+        .ok_or_else(|| rejected("provider lifecycle capabilities are invalid"))?;
     if capabilities.iter().any(|(key, value)| {
         matches!(
             key.as_str(),
@@ -2586,7 +2759,7 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
         .is_some_and(|value| value.as_str().is_none_or(|category| category.len() > 64))
     {
         return Err(rejected(
-            "GitHub lifecycle capabilities or error are invalid",
+            "provider lifecycle capabilities or error are invalid",
         ));
     }
 
@@ -2610,22 +2783,35 @@ fn normalized_status_response(object: &Map<String, Value>) -> Result<Value, Port
     Ok(Value::Object(projection))
 }
 
+fn valid_provider_account_id(provider: &str, value: &str) -> bool {
+    if provider == "github" {
+        return !value.is_empty()
+            && value.len() <= 20
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && !value.starts_with('0');
+    }
+    !value.is_empty()
+        && value.len() <= 255
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
 fn required_string_array(object: &Map<String, Value>, key: &str) -> Result<Value, PortError> {
     object
         .get(key)
         .filter(|value| string_array(Some(value)))
         .cloned()
-        .ok_or_else(|| rejected("GitHub lifecycle scope list is invalid"))
+        .ok_or_else(|| rejected("provider lifecycle scope list is invalid"))
 }
 
 fn nullable_utc_timestamp(object: &Map<String, Value>, key: &str) -> Result<Value, PortError> {
     let value = object
         .get(key)
-        .ok_or_else(|| rejected("GitHub lifecycle timestamp is missing"))?;
+        .ok_or_else(|| rejected("provider lifecycle timestamp is missing"))?;
     if value.is_null() || value.as_str().is_some_and(valid_utc_timestamp) {
         Ok(value.clone())
     } else {
-        Err(rejected("GitHub lifecycle timestamp is invalid"))
+        Err(rejected("provider lifecycle timestamp is invalid"))
     }
 }
 
@@ -2755,6 +2941,28 @@ fn exact_string_field(object: &Map<String, Value>, expected: &str) -> Result<Str
         .ok_or_else(|| rejected("Connections bridge request is missing its exact string field"))
 }
 
+fn provider_authorization_url(object: &Map<String, Value>) -> Result<String, PortError> {
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "authorizationUrl" | "state"))
+    {
+        return Err(rejected(
+            "provider authorization response has unexpected fields",
+        ));
+    }
+    if object.get("state").is_some_and(|state| !state.is_string()) {
+        return Err(rejected(
+            "provider authorization response has an invalid state",
+        ));
+    }
+    object
+        .get("authorizationUrl")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| rejected("provider authorization response is missing its consent URL"))
+}
+
 fn valid_repository_component(value: &str, maximum: usize) -> bool {
     !value.is_empty()
         && value.len() <= maximum
@@ -2806,13 +3014,14 @@ fn validate_redirect_after(value: &str) -> Result<(), PortError> {
 }
 
 fn validate_authorization_url(value: &str) -> Result<(), PortError> {
-    let url = Url::parse(value).map_err(|_| rejected("GitHub authorization URL must use HTTPS"))?;
+    let url =
+        Url::parse(value).map_err(|_| rejected("provider authorization URL must use HTTPS"))?;
     if url.scheme() != "https"
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
     {
-        return Err(rejected("GitHub authorization URL must use HTTPS"));
+        return Err(rejected("provider authorization URL must use HTTPS"));
     }
     Ok(())
 }
@@ -2873,23 +3082,90 @@ fn failed(reason: &str) -> PortError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         GatewayContract, GithubBridgeFailureDiagnostic, GithubBridgeOperation, GithubBridgeRequest,
-        GithubMcpGateway, GithubPublishedFile, GithubStatusCredential, GithubStatusReader,
-        MAX_MCP_TOOL_RESPONSE_BYTES, MAX_RESPONSE_BYTES, McpSession,
-        PROVIDER_TRANSPORT_READY_TIMEOUT, commit_sha, compatible_workflow,
-        github_bridge_failure_diagnostic, maximum_run_id, mcp_tool_payload, normalize_pull_request,
-        normalize_repositories, normalize_repository, normalize_run_status, parse_response,
-        payload_items, pre_dispatch_provider_failure, workflow_content, workflow_file_name,
+        GithubMcpGateway, GithubPublishedFile, MAX_MCP_TOOL_RESPONSE_BYTES, MAX_RESPONSE_BYTES,
+        McpSession, PROVIDER_TRANSPORT_READY_TIMEOUT, ProviderAuthorizationStarter,
+        ProviderStartCredential, ProviderStatusCredential, ProviderStatusReader, commit_sha,
+        compatible_workflow, github_bridge_failure_diagnostic, maximum_run_id, mcp_tool_payload,
+        normalize_pull_request, normalize_repositories, normalize_repository, normalize_run_status,
+        normalized_status_response, parse_response, payload_items, pre_dispatch_provider_failure,
+        workflow_content, workflow_file_name,
     };
     use reqwest::StatusCode;
     use serde_json::Value;
     use steward_ports::PortError;
+
+    fn provider_control_fixture(
+        exchanges: Vec<(&'static str, &'static str)>,
+    ) -> Result<(String, thread::JoinHandle<Result<(), String>>), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind provider-control fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read provider-control fixture address: {error}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| format!("bound provider-control fixture accept: {error}"))?;
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+        let server = thread::spawn(move || -> Result<(), String> {
+            ready_sender
+                .send(())
+                .map_err(|_| "signal provider-control fixture readiness".to_owned())?;
+            for (expected_request, body) in exchanges {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return Err(format!(
+                                    "provider-control fixture did not receive {expected_request}"
+                                ));
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => {
+                            return Err(format!("accept provider-control request: {error}"));
+                        }
+                    }
+                };
+                stream.set_nonblocking(false).map_err(|error| {
+                    format!("restore blocking provider-control fixture: {error}")
+                })?;
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .map_err(|error| format!("bound provider-control fixture read: {error}"))?;
+                let mut request = [0_u8; 4096];
+                let read = stream
+                    .read(&mut request)
+                    .map_err(|error| format!("read provider-control request: {error}"))?;
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(
+                    request.starts_with(expected_request),
+                    "expected {expected_request}, got {request}"
+                );
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .map_err(|error| format!("write provider-control response: {error}"))?;
+            }
+            Ok(())
+        });
+        ready_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("await provider-control fixture readiness: {error}"))?;
+        Ok((format!("http://{address}"), server))
+    }
 
     fn write_mcp_result(
         mut stream: TcpStream,
@@ -5754,6 +6030,225 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_provider_control_uses_exact_provider_origins_with_default_fallback()
+    -> Result<(), String> {
+        let github_status = r#"{"version":"2","provider":"github","phase":"connected","connected":true,"account":{"provider":"github","id":"123456","login":"alice","displayName":"alice@example.com"},"requiredScopes":["repo"],"grantedScopes":["repo"],"missingScopes":[],"activeCredentialExpiresAt":null,"renewalCredentialExpiresAt":null,"lastAuthorizedAt":null,"lastRenewedAt":null,"lastValidatedAt":null,"capabilities":{"interactiveAuthorization":true}}"#;
+        let jira_status = r#"{"version":"2","provider":"jira","phase":"connected","connected":true,"account":{"provider":"jira","id":"account-123","displayName":"alice@example.com"},"requiredScopes":["read:jira-work"],"grantedScopes":["read:jira-work"],"missingScopes":[],"activeCredentialExpiresAt":null,"renewalCredentialExpiresAt":null,"lastAuthorizedAt":null,"lastRenewedAt":null,"lastValidatedAt":null,"capabilities":{"interactiveAuthorization":true}}"#;
+        let (default_origin, default_server) = provider_control_fixture(vec![
+            ("GET /connections/github/status HTTP/1.1\r\n", github_status),
+            (
+                "POST /connections/github/authorize HTTP/1.1\r\n",
+                r#"{"authorizationUrl":"https://github.test/authorize"}"#,
+            ),
+        ])?;
+        let (jira_origin, jira_server) = provider_control_fixture(vec![
+            ("GET /connections/jira/status HTTP/1.1\r\n", jira_status),
+            (
+                "POST /connections/jira/authorize HTTP/1.1\r\n",
+                r#"{"authorizationUrl":"https://atlassian.test/authorize"}"#,
+            ),
+        ])?;
+        let provider_origins = BTreeMap::from([("jira".to_owned(), jira_origin)]);
+        let reader = ProviderStatusReader::new_with_provider_origins(
+            &default_origin,
+            &provider_origins,
+            "0.4.9",
+        )
+        .map_err(|error| format!("build routed status reader: {error:?}"))?;
+        let starter = ProviderAuthorizationStarter::new_with_provider_origins(
+            &default_origin,
+            &provider_origins,
+            "0.4.9",
+        )
+        .map_err(|error| format!("build routed authorization starter: {error:?}"))?;
+        let status_credential = ProviderStatusCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build routed status credential: {error:?}"))?;
+        let start_credential = ProviderStartCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build routed start credential: {error:?}"))?;
+
+        let jira = reader
+            .read(&status_credential, "jira")
+            .await
+            .map_err(|error| format!("read routed Jira status: {error:?}"))?;
+        let jira_authorization = starter
+            .start(&start_credential, "jira")
+            .await
+            .map_err(|error| format!("start routed Jira authorization: {error:?}"))?;
+        let github = reader
+            .read(&status_credential, "github")
+            .await
+            .map_err(|error| format!("read default GitHub status: {error:?}"))?;
+        let github_authorization = starter
+            .start(&start_credential, "github")
+            .await
+            .map_err(|error| format!("start default GitHub authorization: {error:?}"))?;
+
+        jira_server
+            .join()
+            .map_err(|_| "Jira provider-control fixture panicked".to_owned())??;
+        default_server
+            .join()
+            .map_err(|_| "default provider-control fixture panicked".to_owned())??;
+        assert_eq!(jira["accountId"], "account-123");
+        assert_eq!(jira_authorization, "https://atlassian.test/authorize");
+        assert_eq!(github["accountId"], "123456");
+        assert_eq!(github_authorization, "https://github.test/authorize");
+        Ok(())
+    }
+
+    #[test]
+    fn direct_provider_control_rejects_invalid_provider_origin() {
+        let provider_origins = BTreeMap::from([(
+            "jira".to_owned(),
+            "https://mcp-gw.example.test/provider-path".to_owned(),
+        )]);
+        assert!(
+            ProviderStatusReader::new_with_provider_origins(
+                "https://mcp-gw.example.test",
+                &provider_origins,
+                "0.4.9",
+            )
+            .is_err(),
+            "status configuration must reject a mapped origin containing a path"
+        );
+        assert!(
+            ProviderAuthorizationStarter::new_with_provider_origins(
+                "https://mcp-gw.example.test",
+                &provider_origins,
+                "0.4.9",
+            )
+            .is_err(),
+            "start configuration must reject a mapped origin containing a path"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_start_uses_the_exact_provider_authorize_route() -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind direct start fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read direct start fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept direct start request: {error}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|error| format!("bound direct start fixture read: {error}"))?;
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .map_err(|error| format!("read direct start request: {error}"))?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /connections/jira/authorize HTTP/1.1\r\n"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("\r\nauthorization: bearer aaa.bbb.ccc\r\n")
+            );
+            assert!(request.ends_with("\r\n\r\n{}"));
+            // MCP-GW owns this response contract. ProviderAuthorizationStarter is the reader;
+            // copying the real shape prevents a one-field fixture from hiding response drift.
+            let body = r#"{"authorizationUrl":"https://atlassian.test/authorize?state=one-time","state":"one-time"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .map_err(|error| format!("write direct start response: {error}"))?;
+            Ok(())
+        });
+
+        let starter = ProviderAuthorizationStarter::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build direct start client: {error:?}"))?;
+        let credential = ProviderStartCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build direct start credential: {error:?}"))?;
+        let authorization_url = starter
+            .start(&credential, "jira")
+            .await
+            .map_err(|error| format!("start Jira authorization: {error:?}"))?;
+
+        server
+            .join()
+            .map_err(|_| "direct start fixture panicked".to_owned())??;
+        assert_eq!(
+            authorization_url,
+            "https://atlassian.test/authorize?state=one-time"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_start_refuses_an_unknown_gateway_response_field() -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind mismatched start fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read mismatched start fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept mismatched start request: {error}"))?;
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .map_err(|error| format!("read mismatched start request: {error}"))?;
+            assert!(
+                String::from_utf8_lossy(&request[..read])
+                    .starts_with("POST /connections/jira/authorize HTTP/1.1\r\n")
+            );
+            let body =
+                r#"{"authorizationUrl":"https://atlassian.test/authorize","unexpected":"value"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .map_err(|error| format!("write mismatched start response: {error}"))?;
+            Ok(())
+        });
+
+        let starter = ProviderAuthorizationStarter::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build mismatched start client: {error:?}"))?;
+        let credential = ProviderStartCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build mismatched start credential: {error:?}"))?;
+        let result = starter.start(&credential, "jira").await;
+
+        server
+            .join()
+            .map_err(|_| "mismatched start fixture panicked".to_owned())??;
+        assert!(
+            result.is_err(),
+            "an unknown response field must fail closed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_start_refuses_a_missing_authorization_url() -> Result<(), String> {
+        let (origin, server) = provider_control_fixture(vec![(
+            "POST /connections/jira/authorize HTTP/1.1\r\n",
+            r#"{"state":"one-time"}"#,
+        )])?;
+        let starter = ProviderAuthorizationStarter::new(&origin, "0.4.9")
+            .map_err(|error| format!("build direct start client: {error:?}"))?;
+        let credential = ProviderStartCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build direct start credential: {error:?}"))?;
+
+        let result = starter.start(&credential, "jira").await;
+
+        server
+            .join()
+            .map_err(|_| "missing authorization URL fixture panicked".to_owned())??;
+        assert!(
+            result.is_err(),
+            "a response without authorizationUrl must fail closed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn direct_status_uses_one_exact_authenticated_get_without_a_runtime_retry()
     -> Result<(), String> {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -5799,12 +6294,12 @@ mod tests {
             Ok(())
         });
 
-        let reader = GithubStatusReader::new(&format!("http://{address}"), "0.4.9")
+        let reader = ProviderStatusReader::new(&format!("http://{address}"), "0.4.9")
             .map_err(|error| format!("build direct status reader: {error:?}"))?;
-        let credential = GithubStatusCredential::new("aaa.bbb.ccc".to_owned())
+        let credential = ProviderStatusCredential::new("aaa.bbb.ccc".to_owned())
             .map_err(|error| format!("build direct status credential: {error:?}"))?;
         let status = reader
-            .read(&credential)
+            .read(&credential, "github")
             .await
             .map_err(|error| format!("read direct status: {error:?}"))?;
 
@@ -5825,6 +6320,137 @@ mod tests {
                 "activeCredentialExpiresAt": null,
                 "renewalCredentialExpiresAt": null
             })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_status_uses_the_exact_configured_provider_route() -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind direct status fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read direct status fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept direct status request: {error}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|error| format!("bound direct status fixture read: {error}"))?;
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .map_err(|error| format!("read direct status request: {error}"))?;
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.starts_with("GET /connections/jira/status HTTP/1.1\r\n"),
+                "the status reader must use the exact catalog provider"
+            );
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("\r\naccept: application/vnd.apelogic.connection-status.v2+json\r\n"),
+                "the provider route must request the version-2 identity contract"
+            );
+            let body = r#"{"version":"2","provider":"jira","phase":"connected","connected":true,"account":{"provider":"jira","id":"account-123","displayName":"alice@example.com"},"requiredScopes":["read:jira-work"],"grantedScopes":["read:jira-work"],"missingScopes":[],"activeCredentialExpiresAt":null,"renewalCredentialExpiresAt":null,"lastAuthorizedAt":null,"lastRenewedAt":null,"lastValidatedAt":null,"capabilities":{"interactiveAuthorization":true}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .map_err(|error| format!("write direct status response: {error}"))?;
+            Ok(())
+        });
+
+        let reader = ProviderStatusReader::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build direct status reader: {error:?}"))?;
+        let credential = ProviderStatusCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build direct status credential: {error:?}"))?;
+        let result = reader.read(&credential, "jira").await;
+
+        server
+            .join()
+            .map_err(|_| "direct status fixture panicked".to_owned())??;
+        let status = result.map_err(|error| format!("read Jira status: {error:?}"))?;
+        assert_eq!(status["accountId"], "account-123");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_status_refuses_a_mismatched_account_provider_from_the_route()
+    -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|error| format!("bind mismatched provider fixture: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read mismatched provider fixture address: {error}"))?;
+        let server = thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener
+                .accept()
+                .map_err(|error| format!("accept mismatched provider request: {error}"))?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .map_err(|error| format!("bound mismatched provider fixture read: {error}"))?;
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .map_err(|error| format!("read mismatched provider request: {error}"))?;
+            assert!(
+                String::from_utf8_lossy(&request[..read])
+                    .starts_with("GET /connections/jira/status HTTP/1.1\r\n")
+            );
+            let body = r#"{"version":"2","provider":"jira","phase":"connected","connected":true,"account":{"provider":"github","id":"account-123","displayName":"alice@example.com"},"requiredScopes":["read:jira-work"],"grantedScopes":["read:jira-work"],"missingScopes":[],"activeCredentialExpiresAt":null,"renewalCredentialExpiresAt":null,"lastAuthorizedAt":null,"lastRenewedAt":null,"lastValidatedAt":null,"capabilities":{"interactiveAuthorization":true}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .map_err(|error| format!("write mismatched provider response: {error}"))?;
+            Ok(())
+        });
+
+        let reader = ProviderStatusReader::new(&format!("http://{address}"), "0.4.9")
+            .map_err(|error| format!("build mismatched provider reader: {error:?}"))?;
+        let credential = ProviderStatusCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build direct status credential: {error:?}"))?;
+        let result = reader.read(&credential, "jira").await;
+
+        server
+            .join()
+            .map_err(|_| "mismatched provider fixture panicked".to_owned())??;
+        assert!(
+            result.is_err(),
+            "the route must reject account identity from another provider"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_status_response_refuses_a_different_provider_identity() -> Result<(), String> {
+        let value = serde_json::json!({
+            "version": "2",
+            "provider": "github",
+            "phase": "disconnected",
+            "connected": false,
+            "account": null,
+            "requiredScopes": [],
+            "grantedScopes": [],
+            "missingScopes": [],
+            "activeCredentialExpiresAt": null,
+            "renewalCredentialExpiresAt": null,
+            "lastAuthorizedAt": null,
+            "lastRenewedAt": null,
+            "lastValidatedAt": null,
+            "capabilities": {"interactiveAuthorization": true}
+        });
+
+        let object = value
+            .as_object()
+            .ok_or_else(|| "test status must be an object".to_owned())?;
+        assert!(
+            normalized_status_response(object, "jira").is_err(),
+            "a Jira status read must reject a response for another provider"
         );
         Ok(())
     }
@@ -6038,11 +6664,11 @@ mod tests {
     fn direct_status_credential_requires_exactly_three_compact_jwt_segments() {
         for invalid in ["aaa.bbb", "aaa.bbb.ccc.ddd", "aaa..ccc", "aaa.bbb.ccc="] {
             assert!(
-                GithubStatusCredential::new(invalid.to_owned()).is_err(),
+                ProviderStatusCredential::new(invalid.to_owned()).is_err(),
                 "direct status credential must reject {invalid}"
             );
         }
-        assert!(GithubStatusCredential::new("aaa.bbb.ccc".to_owned()).is_ok());
+        assert!(ProviderStatusCredential::new("aaa.bbb.ccc".to_owned()).is_ok());
     }
 
     #[tokio::test]

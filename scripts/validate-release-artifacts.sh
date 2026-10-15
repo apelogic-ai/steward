@@ -271,6 +271,7 @@ connections_bridge_values=(
   --set-string connectionsBridge.sourceRepository=https://github.com/example-org/steward
   --set-string connectionsBridge.sourceCommit=0123456789abcdef0123456789abcdef01234567
   --set-string connectionsBridge.mcpGatewayOrigin=https://mcp-gw.example.test
+  --set-string connectionsBridge.providerOrigins.jira=https://jira-mcp-gw.example.test
   --set-string connectionsBridge.mcpGatewayVersion=0.3.2
   --set-string connectionsBridge.runtimeNamespace=team-a
 )
@@ -1144,6 +1145,11 @@ do
   grep -Fxq "${required}" "${connections_bridge_apiserver_deployment}"
   grep -Fxq "${required}" "${connections_bridge_controller_deployment}"
 done
+grep -Fxq '            - { name: STEWARD_CONNECTIONS_MCP_GW_PROVIDER_ORIGINS, value: "{\"jira\":\"https://jira-mcp-gw.example.test\"}" }' "${connections_bridge_apiserver_deployment}"
+if grep -Fq 'STEWARD_CONNECTIONS_MCP_GW_PROVIDER_ORIGINS' "${connections_bridge_controller_deployment}"; then
+  echo "provider-specific MCP-GW origins must remain limited to direct apiserver calls" >&2
+  exit 1
+fi
 
 helm template steward "${root}/charts/steward" \
   --namespace steward \
@@ -1236,6 +1242,25 @@ if helm template steward "${root}/charts/steward" \
   --set connectionsBridge.enabled=true >/dev/null 2>&1
 then
   echo "an enabled Connections bridge without immutable bindings must fail chart validation" >&2
+  exit 1
+fi
+if helm template steward "${root}/charts/steward" \
+  --namespace steward \
+  --include-crds \
+  "${image_values[@]}" \
+  "${connections_bridge_values[@]}" \
+  --set-string connectionsBridge.providerOrigins.jira=https://jira-mcp-gw.example.test/provider-path \
+  --set browserAuth.enabled=true \
+  --set-string browserAuth.google.clientId=google-client-id \
+  --set-string browserAuth.google.origin=https://steward.example.test \
+  --set-string browserAuth.google.workspaceDomain=example.test \
+  --set-string browserAuth.google.organizationId=org_example \
+  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
+  --set-string browserAuth.google.clientSecret.key=client-secret \
+  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' \
+  --set-file "connectionsBridge.attestationBundle=${connections_bridge_bundle}" >/dev/null 2>&1
+then
+  echo "Connections provider origins must reject routes instead of exact origins" >&2
   exit 1
 fi
 for invalid_connections_version in '' '0.3.1' 'v0.3.2'; do
