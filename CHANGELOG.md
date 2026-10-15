@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Provider display names in the deployment capability catalog no longer prevent the token service
+  from starting; unsupported provider fields are still refused.
 - Jira sign-in now accepts the gateway's one-time state alongside its consent URL while still
   refusing incomplete or unexpected responses.
 - Coding agents now receive the exact path of every repository workspace in their prompt, so a

@@ -47,6 +47,8 @@ struct DeploymentCapabilityCatalog {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DeploymentProviderCatalog {
     provider: String,
+    #[serde(rename = "displayName")]
+    _display_name: Option<String>,
     catalog_id: String,
     version: String,
     #[serde(rename = "available")]
@@ -530,6 +532,38 @@ mod tests {
             assert!(status_providers_from_catalog_json(invalid).is_err());
         }
         Ok(())
+    }
+
+    #[test]
+    fn status_provider_catalog_accepts_optional_display_name() -> Result<(), String> {
+        let providers = status_providers_from_catalog_json(
+            r#"{
+              "schemaVersion":"steward.capability-catalog/v2",
+              "models":[],
+              "tools":[],
+              "catalogs":[
+                {"provider":"jira","displayName":"Jira","catalogId":"jira-read-only","version":"2.0.0","available":true}
+              ]
+            }"#,
+        )
+        .map_err(|error| format!("parse deployment capability catalog: {error}"))?;
+
+        assert_eq!(providers, BTreeSet::from(["jira".to_owned()]));
+        Ok(())
+    }
+
+    #[test]
+    fn status_provider_catalog_rejects_other_unknown_fields() {
+        let invalid = r#"{
+          "schemaVersion":"steward.capability-catalog/v2",
+          "models":[],
+          "tools":[],
+          "catalogs":[
+            {"provider":"jira","catalogId":"jira-read-only","version":"2.0.0","available":true,"unexpected":true}
+          ]
+        }"#;
+
+        assert!(status_providers_from_catalog_json(invalid).is_err());
     }
 
     fn runtime(uid: &str, workspace: &str, sandbox: &str) -> AgentRuntime {
