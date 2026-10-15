@@ -903,6 +903,10 @@
             "openshellServerName",
             "openshellTaskLogMode",
             "inferenceObservationIntervalSeconds",
+            "finalSpendSettlementDelaySeconds",
+            "finalSpendSettlementCeilingSeconds",
+            "finalSpendCaptureTimeoutSeconds",
+            "inferenceCleanupDeadlineSeconds",
             "workloadExchangeEndpoint",
             "workloadExchangeServerName",
             "litellmUrl"
@@ -921,6 +925,10 @@
               "minimum": 12,
               "maximum": 60
             },
+            "finalSpendSettlementDelaySeconds": {"type": "integer", "minimum": 12, "maximum": 60},
+            "finalSpendSettlementCeilingSeconds": {"type": "integer", "minimum": 13, "maximum": 90},
+            "finalSpendCaptureTimeoutSeconds": {"type": "integer", "minimum": 14, "maximum": 105},
+            "inferenceCleanupDeadlineSeconds": {"type": "integer", "minimum": 15, "maximum": 120},
             "workloadExchangeEndpoint": {
               "type": "string",
               "pattern": "^$|^https://[^/?#]+(?::[0-9]+)?/v1/workload/exchange$"

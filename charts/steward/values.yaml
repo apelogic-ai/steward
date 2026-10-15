@@ -234,6 +234,10 @@ config:
     openshellRuntimeClassName: ""
     openshellTaskLogMode: "off"
     inferenceObservationIntervalSeconds: 15
+    finalSpendSettlementDelaySeconds: 12
+    finalSpendSettlementCeilingSeconds: 20
+    finalSpendCaptureTimeoutSeconds: 25
+    inferenceCleanupDeadlineSeconds: 30
     workloadExchangeEndpoint: ""
     workloadExchangeServerName: ""
     litellmUrl: ""

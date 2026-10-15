@@ -1416,6 +1416,10 @@ fi
 grep -Fq '            - { name: STEWARD_TASK_MCP_GW_ENDPOINT, value: "https://mcp-gw.example.test/mcp" }' "${rendered}"
 grep -Eq 'name: STEWARD_OPENSHELL_TASK_LOG_MODE, value: "?off"?' "${rendered}"
 grep -Eq 'name: STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS, value: "?15"?' "${rendered}"
+grep -Eq 'name: STEWARD_FINAL_SPEND_SETTLEMENT_DELAY_SECONDS, value: "?12"?' "${rendered}"
+grep -Eq 'name: STEWARD_FINAL_SPEND_SETTLEMENT_CEILING_SECONDS, value: "?20"?' "${rendered}"
+grep -Eq 'name: STEWARD_FINAL_SPEND_CAPTURE_TIMEOUT_SECONDS, value: "?25"?' "${rendered}"
+grep -Eq 'name: STEWARD_INFERENCE_CLEANUP_DEADLINE_SECONDS, value: "?30"?' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE' "${rendered}"
 grep -q 'name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE' "${rendered}"
@@ -1453,6 +1457,40 @@ then
 fi
 helm lint "${root}/charts/steward" "${image_values[@]}" \
   --set config.controller.inferenceObservationIntervalSeconds=30 >/dev/null
+helm lint "${root}/charts/steward" "${image_values[@]}" \
+  --set config.controller.finalSpendSettlementDelaySeconds=13 \
+  --set config.controller.finalSpendSettlementCeilingSeconds=21 \
+  --set config.controller.finalSpendCaptureTimeoutSeconds=26 \
+  --set config.controller.inferenceCleanupDeadlineSeconds=31 >/dev/null
+for invalid_final_spend_timing in \
+  'finalSpendSettlementDelaySeconds=11' \
+  'finalSpendSettlementDelaySeconds=61' \
+  'finalSpendSettlementCeilingSeconds=12' \
+  'finalSpendSettlementCeilingSeconds=91' \
+  'finalSpendCaptureTimeoutSeconds=13' \
+  'finalSpendCaptureTimeoutSeconds=106' \
+  'inferenceCleanupDeadlineSeconds=14' \
+  'inferenceCleanupDeadlineSeconds=121'
+do
+  if helm lint "${root}/charts/steward" "${image_values[@]}" \
+    --set "config.controller.${invalid_final_spend_timing}" >/dev/null 2>&1
+  then
+    echo "an out-of-range final-spend timing must fail chart validation: ${invalid_final_spend_timing}" >&2
+    exit 1
+  fi
+done
+for invalid_final_spend_order in \
+  'finalSpendSettlementDelaySeconds=20,config.controller.finalSpendSettlementCeilingSeconds=20' \
+  'finalSpendSettlementCeilingSeconds=25,config.controller.finalSpendCaptureTimeoutSeconds=25' \
+  'finalSpendCaptureTimeoutSeconds=30,config.controller.inferenceCleanupDeadlineSeconds=30'
+do
+  if helm template steward "${root}/charts/steward" "${image_values[@]}" \
+    --set "config.controller.${invalid_final_spend_order}" >/dev/null 2>&1
+  then
+    echo "unordered final-spend timing must fail chart rendering: ${invalid_final_spend_order}" >&2
+    exit 1
+  fi
+done
 for invalid_inference_observation_interval in 11 61
 do
   if helm lint "${root}/charts/steward" "${image_values[@]}" \

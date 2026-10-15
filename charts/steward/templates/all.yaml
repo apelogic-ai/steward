@@ -39,6 +39,13 @@
 {{- if and .Values.connectionsBridge.enabled (not .Values.execution.enabled) }}
 {{- fail "connectionsBridge.enabled requires execution.enabled so the Mint trust boundary is available" }}
 {{- end }}
+{{- $settlementDelay := int .Values.config.controller.finalSpendSettlementDelaySeconds }}
+{{- $settlementCeiling := int .Values.config.controller.finalSpendSettlementCeilingSeconds }}
+{{- $captureTimeout := int .Values.config.controller.finalSpendCaptureTimeoutSeconds }}
+{{- $cleanupDeadline := int .Values.config.controller.inferenceCleanupDeadlineSeconds }}
+{{- if not (and (lt $settlementDelay $settlementCeiling) (lt $settlementCeiling $captureTimeout) (lt $captureTimeout $cleanupDeadline)) }}
+{{- fail "controller final-spend timing must satisfy delay < ceiling < capture timeout < cleanup deadline" }}
+{{- end }}
 {{- range $component := list "apiserver" "controller" "mint" }}
 {{- if or (ne $component "mint") $.Values.execution.enabled }}
 ---
@@ -598,6 +605,10 @@ spec:
 {{- end }}
             - { name: STEWARD_OPENSHELL_TASK_LOG_MODE, value: {{ .Values.config.controller.openshellTaskLogMode | quote }} }
             - { name: STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS, value: {{ .Values.config.controller.inferenceObservationIntervalSeconds | quote }} }
+            - { name: STEWARD_FINAL_SPEND_SETTLEMENT_DELAY_SECONDS, value: {{ .Values.config.controller.finalSpendSettlementDelaySeconds | quote }} }
+            - { name: STEWARD_FINAL_SPEND_SETTLEMENT_CEILING_SECONDS, value: {{ .Values.config.controller.finalSpendSettlementCeilingSeconds | quote }} }
+            - { name: STEWARD_FINAL_SPEND_CAPTURE_TIMEOUT_SECONDS, value: {{ .Values.config.controller.finalSpendCaptureTimeoutSeconds | quote }} }
+            - { name: STEWARD_INFERENCE_CLEANUP_DEADLINE_SECONDS, value: {{ .Values.config.controller.inferenceCleanupDeadlineSeconds | quote }} }
             - { name: STEWARD_OPENSHELL_CA_CERTIFICATE_FILE, value: /run/openshell/ca.crt }
             - { name: STEWARD_OPENSHELL_CLIENT_CERTIFICATE_FILE, value: /run/openshell/tls.crt }
             - { name: STEWARD_OPENSHELL_CLIENT_PRIVATE_KEY_FILE, value: /run/openshell/tls.key }

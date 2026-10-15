@@ -31,6 +31,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   the limit or its charge settles after the agent exits; spending in the last few seconds can
   exceed the configured amount. Runs with a per-run limit can wait up to 20 seconds for final spend
   to settle before their runtime key is removed.
+- Inference spending limits now cover a Run across budget suspensions and recreated gateway keys.
+  A per-run limit takes precedence when one model call also uses the remaining monthly amount; the
+  full charge still counts toward monthly usage, no unusable top-up request is opened for that Run,
+  and the next Run receives the monthly-limit refusal. Non-Task runtimes stop at their per-run
+  limit, denied monthly-budget requests use a plain reason, and controller final-spend and cleanup
+  timing can be configured through the chart's controller settings. Run status identifies each
+  recreated gateway key with the service's non-secret key identifier rather than the reusable
+  runtime name.
 - Task cleanup now records one final inference-spend observation before deleting the run key, so
   short runs no longer finish with stale zero spend or disappear from monthly Envelope usage.
 - Approving a custom or template Envelope request that exactly matches authority the user already

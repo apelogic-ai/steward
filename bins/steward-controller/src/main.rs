@@ -211,28 +211,73 @@ fn inference_mode() -> Result<InferenceMode, io::Error> {
 }
 
 fn runtime_controller_config() -> Result<steward_controller::RuntimeControllerConfig, io::Error> {
-    match env::var("STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS") {
-        Ok(value) => parse_runtime_controller_config(Some(&value)),
-        Err(env::VarError::NotPresent) => parse_runtime_controller_config(None),
-        Err(env::VarError::NotUnicode(_)) => Err(io::Error::other(
-            "STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS must be Unicode",
-        )),
+    let observation = optional_unicode_env("STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS")?;
+    let settlement_delay = optional_unicode_env("STEWARD_FINAL_SPEND_SETTLEMENT_DELAY_SECONDS")?;
+    let settlement_ceiling =
+        optional_unicode_env("STEWARD_FINAL_SPEND_SETTLEMENT_CEILING_SECONDS")?;
+    let capture_timeout = optional_unicode_env("STEWARD_FINAL_SPEND_CAPTURE_TIMEOUT_SECONDS")?;
+    let cleanup_deadline = optional_unicode_env("STEWARD_INFERENCE_CLEANUP_DEADLINE_SECONDS")?;
+    parse_runtime_controller_config(
+        observation.as_deref(),
+        settlement_delay.as_deref(),
+        settlement_ceiling.as_deref(),
+        capture_timeout.as_deref(),
+        cleanup_deadline.as_deref(),
+    )
+}
+
+fn optional_unicode_env(name: &str) -> Result<Option<String>, io::Error> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(io::Error::other(format!("{name} must be Unicode")))
+        }
     }
 }
 
 fn parse_runtime_controller_config(
     interval_seconds: Option<&str>,
+    settlement_delay_seconds: Option<&str>,
+    settlement_ceiling_seconds: Option<&str>,
+    capture_timeout_seconds: Option<&str>,
+    cleanup_deadline_seconds: Option<&str>,
 ) -> Result<steward_controller::RuntimeControllerConfig, io::Error> {
-    let interval_seconds = interval_seconds
-        .unwrap_or("15")
-        .parse::<u64>()
-        .map_err(|_| {
-            io::Error::other(
-                "STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS must be a whole number",
-            )
-        })?;
-    steward_controller::RuntimeControllerConfig::new(Duration::from_secs(interval_seconds))
-        .map_err(io::Error::other)
+    fn seconds(name: &str, value: Option<&str>, default: u64) -> Result<Duration, io::Error> {
+        value
+            .map_or_else(|| Ok(default), str::parse::<u64>)
+            .map(Duration::from_secs)
+            .map_err(|_| io::Error::other(format!("{name} must be a whole number")))
+    }
+
+    steward_controller::RuntimeControllerConfig::new(
+        seconds(
+            "STEWARD_INFERENCE_OBSERVATION_INTERVAL_SECONDS",
+            interval_seconds,
+            15,
+        )?,
+        seconds(
+            "STEWARD_FINAL_SPEND_SETTLEMENT_DELAY_SECONDS",
+            settlement_delay_seconds,
+            12,
+        )?,
+        seconds(
+            "STEWARD_FINAL_SPEND_SETTLEMENT_CEILING_SECONDS",
+            settlement_ceiling_seconds,
+            20,
+        )?,
+        seconds(
+            "STEWARD_FINAL_SPEND_CAPTURE_TIMEOUT_SECONDS",
+            capture_timeout_seconds,
+            25,
+        )?,
+        seconds(
+            "STEWARD_INFERENCE_CLEANUP_DEADLINE_SECONDS",
+            cleanup_deadline_seconds,
+            30,
+        )?,
+    )
+    .map_err(io::Error::other)
 }
 
 fn parse_inference_mode(value: &str) -> Result<InferenceMode, io::Error> {
@@ -849,19 +894,58 @@ mod tests {
     #[test]
     fn inference_observation_interval_respects_the_settlement_window() -> Result<(), String> {
         assert_eq!(
-            parse_runtime_controller_config(None)
+            parse_runtime_controller_config(None, None, None, None, None)
                 .map_err(|error| error.to_string())?
                 .inference_observation_interval(),
             Duration::from_secs(15)
         );
-        assert!(parse_runtime_controller_config(Some("11")).is_err());
-        assert!(parse_runtime_controller_config(Some("61")).is_err());
+        assert!(parse_runtime_controller_config(Some("11"), None, None, None, None).is_err());
+        assert!(parse_runtime_controller_config(Some("61"), None, None, None, None).is_err());
         assert_eq!(
-            parse_runtime_controller_config(Some("30"))
-                .map_err(|error| error.to_string())?
-                .inference_observation_interval(),
+            parse_runtime_controller_config(
+                Some("30"),
+                Some("13"),
+                Some("21"),
+                Some("26"),
+                Some("31"),
+            )
+            .map_err(|error| error.to_string())?
+            .inference_observation_interval(),
             Duration::from_secs(30)
         );
+        let configured = parse_runtime_controller_config(
+            Some("30"),
+            Some("13"),
+            Some("21"),
+            Some("26"),
+            Some("31"),
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            configured.final_spend_settlement_delay(),
+            Duration::from_secs(13)
+        );
+        assert_eq!(
+            configured.final_spend_settlement_ceiling(),
+            Duration::from_secs(21)
+        );
+        assert_eq!(
+            configured.final_spend_capture_timeout(),
+            Duration::from_secs(26)
+        );
+        assert_eq!(
+            configured.inference_cleanup_deadline(),
+            Duration::from_secs(31)
+        );
+        assert!(parse_runtime_controller_config(None, Some("20"), Some("19"), None, None).is_err());
+        assert!(parse_runtime_controller_config(None, Some("11"), None, None, None).is_err());
+        assert!(parse_runtime_controller_config(None, Some("61"), None, None, None).is_err());
+        assert!(parse_runtime_controller_config(None, None, Some("91"), None, None).is_err());
+        assert!(parse_runtime_controller_config(None, None, None, Some("106"), None).is_err());
+        assert!(parse_runtime_controller_config(None, None, None, None, Some("121")).is_err());
+        assert!(parse_runtime_controller_config(None, Some("20"), Some("20"), None, None).is_err());
+        assert!(parse_runtime_controller_config(None, None, Some("25"), Some("25"), None).is_err());
+        assert!(parse_runtime_controller_config(None, None, None, Some("30"), Some("30")).is_err());
         Ok(())
     }
 

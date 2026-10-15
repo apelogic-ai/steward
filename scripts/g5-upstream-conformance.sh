@@ -120,14 +120,17 @@ for attempt in {1..120}; do
   sleep 1
 done
 
-runtime_key="$(
+runtime_key_response="$(
   curl -fsS \
     -H "Authorization: Bearer ${master_key}" \
     -H "Content-Type: application/json" \
     -d '{"key_alias":"runtime-a","models":["openai/model-a"]}' \
-    "${base_url}/key/generate" |
-    jq -er '.key | select(type == "string" and length > 0)'
+    "${base_url}/key/generate"
 )"
+runtime_key="$(jq -er '.key | select(type == "string" and length > 0)' \
+  <<<"${runtime_key_response}")"
+runtime_key_identity="$(jq -er '.token | select(type == "string" and length > 0)' \
+  <<<"${runtime_key_response}")"
 response="${RUN_DIR}/denied.json"
 status="$(
   curl -sS \
@@ -146,6 +149,39 @@ if ! jq -e '.. | strings | select(test("not.*allowed|allowed.*model"; "i"))' \
   "${response}" >/dev/null
 then
   echo "G-5 denial did not identify the model allowlist" >&2
+  exit 1
+fi
+
+curl -fsS \
+  -H "Authorization: Bearer ${master_key}" \
+  -H "Content-Type: application/json" \
+  -d '{"key_aliases":["runtime-a"]}' \
+  "${base_url}/key/delete" >/dev/null
+replacement_key_response="$(
+  curl -fsS \
+    -H "Authorization: Bearer ${master_key}" \
+    -H "Content-Type: application/json" \
+    -d '{"key_alias":"runtime-a","models":["openai/model-a"]}' \
+    "${base_url}/key/generate"
+)"
+replacement_key_identity="$(
+  jq -er '.token | select(type == "string" and length > 0)' \
+    <<<"${replacement_key_response}"
+)"
+if [[ "${replacement_key_identity}" == "${runtime_key_identity}" ]]; then
+  echo "G-5 replacement key reused the prior key identity" >&2
+  exit 1
+fi
+listed_key_identity="$(
+  curl -fsS -G \
+    -H "Authorization: Bearer ${master_key}" \
+    --data-urlencode 'key_alias=runtime-a' \
+    --data-urlencode 'return_full_object=true' \
+    "${base_url}/key/list" |
+    jq -er '.keys | select(length == 1) | .[0].token | select(type == "string" and length > 0)'
+)"
+if [[ "${listed_key_identity}" != "${replacement_key_identity}" ]]; then
+  echo "G-5 key lookup did not preserve the replacement key identity" >&2
   exit 1
 fi
 
@@ -195,6 +231,61 @@ budget_status="$(
 )"
 if [[ "${budget_status}" != "429" ]]; then
   echo "G-5 exhausted LiteLLM key returned HTTP ${budget_status}, expected 429" >&2
+  exit 1
+fi
+
+lowered_budget_key="$(
+  curl -fsS \
+    -H "Authorization: Bearer ${master_key}" \
+    -H "Content-Type: application/json" \
+    -d '{"budget_duration":"1mo","key_alias":"runtime-lowered-budget","max_budget":1,"models":["openai/model-a"]}' \
+    "${base_url}/key/generate" |
+    jq -er '.key | select(type == "string" and length > 0)'
+)"
+curl -fsS \
+  -H "Authorization: Bearer ${lowered_budget_key}" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"openai/model-a","messages":[{"role":"user","content":"hello"}]}' \
+  "${base_url}/v1/chat/completions" >/dev/null
+
+for attempt in {1..20}; do
+  lowered_key_list="$(
+    curl -fsS -G \
+      -H "Authorization: Bearer ${master_key}" \
+      --data-urlencode 'key_alias=runtime-lowered-budget' \
+      --data-urlencode 'return_full_object=true' \
+      "${base_url}/key/list"
+  )"
+  lowered_spend="$(jq -er '.keys | select(length == 1) | .[0].spend | tonumber | select(. > 0)' \
+    <<<"${lowered_key_list}" || true)"
+  if [[ -n "${lowered_spend}" ]]; then
+    lowered_token="$(jq -er '.keys[0].token' <<<"${lowered_key_list}")"
+    break
+  fi
+  if [[ "${attempt}" == 20 ]]; then
+    echo "G-5 LiteLLM did not settle spend before the runtime key budget was lowered" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+curl -fsS \
+  -H "Authorization: Bearer ${master_key}" \
+  -H "Content-Type: application/json" \
+  -d "{\"key\":\"${lowered_token}\",\"max_budget\":0.000001,\"models\":[\"openai/model-a\"]}" \
+  "${base_url}/key/update" >/dev/null
+lowered_response="${RUN_DIR}/lowered-budget-denied.json"
+lowered_status="$(
+  curl -sS \
+    -o "${lowered_response}" \
+    -w '%{http_code}' \
+    -H "Authorization: Bearer ${lowered_budget_key}" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"openai/model-a","messages":[{"role":"user","content":"hello after lowering"}]}' \
+    "${base_url}/v1/chat/completions"
+)"
+if [[ "${lowered_status}" != "429" ]]; then
+  echo "G-5 lowered LiteLLM key returned HTTP ${lowered_status}, expected 429" >&2
   exit 1
 fi
 

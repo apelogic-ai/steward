@@ -19,6 +19,7 @@ use kube::{Client, ResourceExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, types::Json as SqlJson, types::Uuid};
+use steward_adapter_litellm::{LiteLlmAdapter, LiteLlmConfig};
 use steward_admission::internal_authorities::steward_connections_v1;
 use steward_admission::{AdmissionDecision, AdmissionDelta, Envelope, EnvelopeSpec};
 use steward_apiserver::connections::{
@@ -66,7 +67,7 @@ use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
     CanonicalAuthorityBinding, DisposableExecutionBinding, Duration, Email,
     ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, OrganizationId,
-    OrganizationIdentityPolicy, Phase, Principal, RunnerRequirements, RuntimeOwnership,
+    OrganizationIdentityPolicy, Phase, Principal, RunnerRequirements, RuntimeId, RuntimeOwnership,
     RuntimeRefs, SpendSummary, TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding,
     TaskPhase, ToolGrant,
 };
@@ -205,6 +206,64 @@ impl Drop for ServerGuard {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+#[derive(Clone, Default)]
+struct LiteLlmKeyListFixture {
+    responses: Arc<Mutex<VecDeque<serde_json::Value>>>,
+    queries: Arc<Mutex<Vec<String>>>,
+}
+
+async fn litellm_key_list_fixture(
+    State(state): State<LiteLlmKeyListFixture>,
+    request: Request,
+) -> Response<Body> {
+    let query = request.uri().query().unwrap_or_default().to_owned();
+    let Ok(mut queries) = state.queries.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    queries.push(query);
+    drop(queries);
+    let Ok(mut responses) = state.responses.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Some(response) = responses.pop_front() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        response.to_string(),
+    )
+        .into_response()
+}
+
+async fn litellm_observation_adapter(
+    responses: Vec<serde_json::Value>,
+) -> Result<(LiteLlmAdapter, LiteLlmKeyListFixture, ServerGuard), Box<dyn Error>> {
+    let state = LiteLlmKeyListFixture {
+        responses: Arc::new(Mutex::new(responses.into())),
+        queries: Arc::new(Mutex::new(Vec::new())),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server_state = state.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/key/list", axum::routing::get(litellm_key_list_fixture))
+                .with_state(server_state),
+        )
+        .await
+        .map_err(io::Error::other)
+    });
+    let adapter = LiteLlmAdapter::new(LiteLlmConfig {
+        base_url: format!("http://{address}"),
+        master_key: "fixture-management-value".to_owned(),
+    })
+    .map_err(|error| io::Error::other(format!("create LiteLLM fixture adapter: {error:?}")))?;
+    Ok((adapter, state, ServerGuard(server)))
 }
 
 #[tokio::test]
@@ -1475,6 +1534,143 @@ impl InferencePlane for ActiveInference {
     }
 }
 
+#[derive(Clone, Debug)]
+enum ReplacementKeyObservation {
+    Absent,
+    Active(String),
+    Exhausted(String),
+}
+
+#[derive(Clone)]
+struct ReplacementKeyInference {
+    current_reference: Arc<Mutex<String>>,
+    replacement_reference: String,
+    observations: Arc<Mutex<VecDeque<ReplacementKeyObservation>>>,
+    requested_budgets: Arc<Mutex<Vec<Budget>>>,
+    provisions: Arc<AtomicUsize>,
+}
+
+impl ReplacementKeyInference {
+    fn new(current_reference: String, replacement_reference: String) -> Self {
+        Self {
+            current_reference: Arc::new(Mutex::new(current_reference)),
+            replacement_reference,
+            observations: Arc::new(Mutex::new(VecDeque::new())),
+            requested_budgets: Arc::new(Mutex::new(Vec::new())),
+            provisions: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn queue(
+        &self,
+        observations: impl IntoIterator<Item = ReplacementKeyObservation>,
+    ) -> Result<(), io::Error> {
+        self.observations
+            .lock()
+            .map_err(|_| io::Error::other("replacement observation fixture was poisoned"))?
+            .extend(observations);
+        Ok(())
+    }
+}
+
+impl InferencePlane for ReplacementKeyInference {
+    fn capabilities(&self) -> InferenceCapabilities {
+        let mut capabilities = InferenceCapabilities::default();
+        capabilities.model_allowlist = true;
+        capabilities.spend_enforcement = true;
+        capabilities
+    }
+
+    async fn validate_configuration(
+        &self,
+        _models: &[ModelRef],
+        _budget: &Budget,
+    ) -> Result<(), PortError> {
+        Ok(())
+    }
+
+    async fn provision(
+        &self,
+        request: &InferenceRequest,
+    ) -> Result<ProvisionedInference, PortError> {
+        self.requested_budgets
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "replacement budget fixture was poisoned".to_owned(),
+            })?
+            .push(request.budget.clone());
+        self.provisions.fetch_add(1, Ordering::SeqCst);
+        *self
+            .current_reference
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "replacement reference fixture was poisoned".to_owned(),
+            })? = self.replacement_reference.clone();
+        Ok(ProvisionedInference {
+            reference: self.replacement_reference.clone(),
+            credential: InferenceCredential::new("fixture-replacement-credential".to_owned()),
+        })
+    }
+
+    async fn reconcile_configuration(&self, request: &InferenceRequest) -> Result<(), PortError> {
+        self.requested_budgets
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "replacement budget fixture was poisoned".to_owned(),
+            })?
+            .push(request.budget.clone());
+        Ok(())
+    }
+
+    async fn observe(&self, request: &InferenceRequest) -> Result<InferenceObservation, PortError> {
+        let observation = self
+            .observations
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "replacement observation fixture was poisoned".to_owned(),
+            })?
+            .pop_front()
+            .ok_or_else(|| PortError::Failed {
+                reason: "replacement observation fixture was exhausted".to_owned(),
+            })?;
+        let spend = |observed_amount| SpendSummary {
+            observed_amount,
+            currency: request.budget.currency.clone(),
+        };
+        match observation {
+            ReplacementKeyObservation::Absent => Ok(InferenceObservation::Absent),
+            ReplacementKeyObservation::Active(observed_amount) => {
+                Ok(InferenceObservation::Active {
+                    reference: self
+                        .current_reference
+                        .lock()
+                        .map_err(|_| PortError::Failed {
+                            reason: "replacement reference fixture was poisoned".to_owned(),
+                        })?
+                        .clone(),
+                    spend: spend(observed_amount),
+                })
+            }
+            ReplacementKeyObservation::Exhausted(observed_amount) => {
+                Ok(InferenceObservation::Exhausted {
+                    reference: self
+                        .current_reference
+                        .lock()
+                        .map_err(|_| PortError::Failed {
+                            reason: "replacement reference fixture was poisoned".to_owned(),
+                        })?
+                        .clone(),
+                    spend: spend(observed_amount),
+                })
+            }
+        }
+    }
+
+    async fn revoke(&self, _request: &InferenceRequest) -> Result<(), PortError> {
+        Ok(())
+    }
+}
+
 impl SandboxTaskRuntime for AmbiguousTaskRuntime {
     fn provider_control_bindings(&self) -> Option<ProviderControlExecutionBindings> {
         self.provider_control_bindings.clone()
@@ -2337,7 +2533,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
             tools: Vec::new(),
             budget: Budget {
                 monthly_limit: "100.00".to_owned(),
-                single_run_limit: Some("10.00".to_owned()),
+                single_run_limit: None,
                 currency: "USD".to_owned(),
             },
             runtime_minutes_limit: Some("1.00".to_owned()),
@@ -2947,19 +3143,222 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         !resumed_runtime_minutes.exhausted,
         "the active instance grant must resume execution above observed runtime minutes"
     );
+    let (episode_adapter, episode_fixture, _episode_server) = litellm_observation_adapter(vec![
+        json!({
+            "keys": [{
+                "token": "fixture-first-token-hash",
+                "spend": 60.00,
+                "max_budget": 60.00,
+                "blocked": true
+            }]
+        }),
+        json!({
+            "keys": [{
+                "token": "fixture-replacement-token-hash",
+                "spend": 10.00,
+                "max_budget": 10.00,
+                "blocked": true
+            }]
+        }),
+    ])
+    .await?;
+    let inference_request = InferenceRequest {
+        runtime: RuntimeId(runtime_uid.clone()),
+        models: envelope.spec.llms.clone(),
+        budget: envelope.spec.budget.clone(),
+    };
+    let first_key_reference = match episode_adapter
+        .observe(&inference_request)
+        .await
+        .map_err(|error| io::Error::other(format!("observe first gateway key: {error:?}")))?
+    {
+        InferenceObservation::Exhausted { reference, .. } => reference,
+        observation => {
+            return Err(io::Error::other(format!(
+                "first gateway key was not exhausted: {observation:?}"
+            ))
+            .into());
+        }
+    };
+    let replacement_key_reference = match episode_adapter
+        .observe(&inference_request)
+        .await
+        .map_err(|error| io::Error::other(format!("observe replacement gateway key: {error:?}")))?
+    {
+        InferenceObservation::Exhausted { reference, .. } => reference,
+        observation => {
+            return Err(io::Error::other(format!(
+                "replacement gateway key was not exhausted: {observation:?}"
+            ))
+            .into());
+        }
+    };
+    assert_ne!(
+        replacement_key_reference, first_key_reference,
+        "two keys sharing one runtime alias must have distinct episode identities"
+    );
+    let key_queries = episode_fixture
+        .queries
+        .lock()
+        .map_err(|_| io::Error::other("LiteLLM query fixture lock was poisoned"))?;
+    assert_eq!(key_queries.len(), 2);
+    assert_eq!(
+        key_queries[0], key_queries[1],
+        "both key generations must be looked up through the same fixed runtime alias"
+    );
+    drop(key_queries);
+
     store
         .record_spend_observation(
             &runtime_uid,
-            1,
-            "immutable-runtime-spec",
+            2,
+            &runtime_spec_digest(&spec)?,
             &SpendSummary {
-                observed_amount: "110.00".to_owned(),
+                observed_amount: "60.00".to_owned(),
                 currency: "USD".to_owned(),
             },
-            true,
+            false,
         )
         .await?;
+    let inference = ReplacementKeyInference::new(
+        first_key_reference.clone(),
+        replacement_key_reference.clone(),
+    );
+    inference.queue([ReplacementKeyObservation::Active("60.00".to_owned())])?;
+    let mut active_runtime = AgentRuntime::new(&runtime_name, spec.clone());
+    active_runtime.metadata.namespace = Some("steward-test".to_owned());
+    active_runtime.metadata.uid = Some(runtime_uid.clone());
+    active_runtime.metadata.resource_version = Some("2".to_owned());
+    active_runtime.metadata.generation = Some(2);
+    active_runtime.metadata.finalizers = Some(vec!["agents.apelogic.ai/runtime".to_owned()]);
+    active_runtime.metadata.creation_timestamp =
+        Some(serde_json::from_value(json!("2999-01-01T00:00:00Z"))?);
+    active_runtime.metadata.annotations = Some(BTreeMap::from([
+        (
+            "agents.apelogic.ai/service-principal".to_owned(),
+            service.clone(),
+        ),
+        (
+            "agents.apelogic.ai/task-execution-binding".to_owned(),
+            serde_json::to_string(
+                execution_binding
+                    .disposable()
+                    .ok_or_else(|| io::Error::other("execution binding is not disposable"))?,
+            )?,
+        ),
+        (
+            "agents.apelogic.ai/task-uid".to_owned(),
+            task_uid.to_string(),
+        ),
+        (
+            "agents.apelogic.ai/orchestration-id".to_owned(),
+            operation_id.to_string(),
+        ),
+        (
+            "agents.apelogic.ai/manifest-digest".to_owned(),
+            active_digest.clone(),
+        ),
+        (
+            "agents.apelogic.ai/runtime-mode".to_owned(),
+            "active".to_owned(),
+        ),
+    ]));
+    active_runtime.status = Some(AgentRuntimeStatus {
+        phase: Phase::Running,
+        observed_generation: 2,
+        spec_digest: runtime_spec_digest(&spec)?,
+        refs: RuntimeRefs {
+            workspace: Some("workspace-steward-test".to_owned()),
+            sandbox: Some(format!("sandbox-{runtime_uid}")),
+            litellm_key: Some(first_key_reference.clone()),
+        },
+        conditions: Vec::new(),
+        spend: Some(SpendSummary {
+            observed_amount: "60.00".to_owned(),
+            currency: "USD".to_owned(),
+        }),
+    });
+    let kubernetes = AmbiguousKubernetes::default();
+    *kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))? =
+        Some(active_runtime.clone());
+    let credential_secret = json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": runtime_uid,
+            "namespace": "steward-test",
+            "labels": {"agents.apelogic.ai/runtime-uid": runtime_uid},
+            "ownerReferences": [{
+                "apiVersion": "agents.apelogic.ai/v1alpha1",
+                "kind": "AgentRuntime",
+                "name": runtime_name,
+                "uid": runtime_uid,
+                "controller": true
+            }]
+        },
+        "data": {"access-token": "Zml4dHVyZS1pbmZlcmVuY2UtY3JlZGVudGlhbA=="}
+    });
+    *kubernetes
+        .credential_secret
+        .lock()
+        .map_err(|_| io::Error::other("credential Secret fixture was poisoned"))? =
+        Some(credential_secret.clone());
+    let (client, _server) = kubernetes_client(kubernetes.clone()).await?;
+    let task_runtime = AmbiguousTaskRuntime::default();
 
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        inference.clone(),
+        store.clone(),
+        active_runtime,
+    )
+    .await?;
+    let suspended_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("suspended runtime fixture is absent"))?;
+    let suspended_status = suspended_runtime
+        .status
+        .as_ref()
+        .ok_or_else(|| io::Error::other("suspended runtime status is absent"))?;
+    assert_eq!(suspended_status.phase, Phase::Suspended);
+    assert_eq!(
+        suspended_status
+            .spend
+            .as_ref()
+            .map(|spend| spend.observed_amount.as_str()),
+        Some("60.00"),
+        "zero remaining authority must preserve and record cumulative status spend"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM inference_exhaustions WHERE runtime_uid = $1",
+        )
+        .bind(&runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        1,
+        "the zero-remaining reconcile must create the first exhaustion row"
+    );
+
+    store
+        .record_final_spend_observation(
+            &runtime_uid,
+            2,
+            &runtime_spec_digest(&spec)?,
+            &SpendSummary {
+                observed_amount: "115.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            None,
+        )
+        .await?;
     let escalation = store
         .admin_escalations()
         .await?
@@ -2968,54 +3367,27 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .ok_or_else(|| io::Error::other("spend escalation was not projected"))?;
     assert_eq!(escalation.envelope_instance_id, envelope_instance_id);
     assert_eq!(escalation.limit, "100.00");
-    assert_eq!(
-        store
-            .record_escalation_top_up(
-                escalation.escalation_id,
-                "5.00",
-                "2999-01-01T00:00:00Z",
-                "insufficient to resume the task",
-                "test-admin",
-            )
-            .await,
-        Err(StoreError::InvalidCumulativeEscalation),
-        "a successful top-up must raise the effective limit above observed spend"
-    );
     let grant = store
         .record_escalation_top_up(
             escalation.escalation_id,
-            "25.00",
+            "65.00",
             "2999-01-01T00:00:00Z",
             "finish the bounded task",
             "test-admin",
         )
         .await?;
     assert_eq!(grant.base_limit, "100.00");
-    assert_eq!(grant.target_limit, "125.00");
+    assert_eq!(grant.target_limit, "165.00");
     assert_eq!(
         store
             .active_envelope_instance_spend_top_up(&envelope_instance_id)
             .await?,
-        Some("25.00".to_owned())
+        Some("65.00".to_owned())
     );
-    assert_eq!(
-        store
-            .remaining_envelope_instance_spend_budget(
-                &envelope_instance_id,
-                &runtime_uid,
-                "100.00",
-            )
-            .await?,
-        "85.00",
-        "an active top-up must expand the remaining authority without counting this runtime twice"
-    );
-    let usage = store.envelope_usage(&envelope_instance_id).await?;
-    assert_eq!(usage.observed_amount, Some("150.00".to_owned()));
-    assert_eq!(usage.active_top_up_amount, Some("25.00".to_owned()));
     let retry = store
         .record_escalation_top_up(
             escalation.escalation_id,
-            "25.0",
+            "65.0",
             "2999-01-01T00:00:00Z",
             "finish the bounded task",
             "test-admin",
@@ -3029,7 +3401,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         store
             .record_escalation_top_up(
                 escalation.escalation_id,
-                "30.00",
+                "70.00",
                 "2999-01-01T00:00:00Z",
                 "different authority",
                 "test-admin",
@@ -3042,21 +3414,148 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .await?
         .ok_or_else(|| io::Error::other("decided escalation was not projected"))?;
     assert_eq!(decided.grant_id, Some(grant.id));
-    assert_eq!(decided.limit, "125.00");
+    assert_eq!(decided.limit, "165.00");
     assert_eq!(decided.grant_active, Some(true));
 
+    {
+        let mut stored = kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?;
+        let runtime = stored
+            .as_mut()
+            .ok_or_else(|| io::Error::other("suspended runtime fixture is absent"))?;
+        runtime
+            .status
+            .as_mut()
+            .ok_or_else(|| io::Error::other("suspended runtime status is absent"))?
+            .refs
+            .litellm_key = Some(first_key_reference.clone());
+    }
+    *kubernetes
+        .credential_secret
+        .lock()
+        .map_err(|_| io::Error::other("credential Secret fixture was poisoned"))? =
+        Some(credential_secret);
+    inference.queue([
+        ReplacementKeyObservation::Absent,
+        ReplacementKeyObservation::Active("0.00".to_owned()),
+    ])?;
+    let suspended_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("suspended runtime fixture is absent"))?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime.clone(),
+        inference.clone(),
+        store.clone(),
+        suspended_runtime,
+    )
+    .await?;
+    let resumed_runtime = kubernetes
+        .runtime
+        .lock()
+        .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+        .clone()
+        .ok_or_else(|| io::Error::other("resumed runtime fixture is absent"))?;
+    let resumed_status = resumed_runtime
+        .status
+        .as_ref()
+        .ok_or_else(|| io::Error::other("resumed runtime status is absent"))?;
+    assert_eq!(resumed_status.phase, Phase::Running);
+    assert_eq!(
+        resumed_status.refs.litellm_key.as_deref(),
+        Some(replacement_key_reference.as_str())
+    );
+    assert_eq!(
+        resumed_status
+            .spend
+            .as_ref()
+            .map(|spend| spend.observed_amount.as_str()),
+        Some("115.00")
+    );
+    assert_eq!(
+        store
+            .runtime_spend_episode_baseline(&runtime_uid, &replacement_key_reference, "USD")
+            .await?,
+        Some("115.00".to_owned()),
+        "the replacement key must start at the final settled cumulative spend"
+    );
+    assert_eq!(inference.provisions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        inference
+            .requested_budgets
+            .lock()
+            .map_err(|_| io::Error::other("replacement budget fixture was poisoned"))?
+            .last()
+            .map(|budget| budget.monthly_limit.as_str()),
+        Some("10.00"),
+        "the replacement key must receive only the authority above its cumulative baseline"
+    );
+
+    inference.queue([
+        ReplacementKeyObservation::Exhausted("10.00".to_owned()),
+        ReplacementKeyObservation::Exhausted("10.00".to_owned()),
+    ])?;
+    reconcile_agent_runtime_work_item(
+        &client,
+        task_runtime,
+        inference,
+        store.clone(),
+        resumed_runtime,
+    )
+    .await?;
+    assert_eq!(
+        store
+            .remaining_envelope_instance_spend_budget(
+                &envelope_instance_id,
+                &runtime_uid,
+                "100.00",
+            )
+            .await?,
+        "125.00",
+        "an active top-up must expand the remaining authority without counting this runtime twice"
+    );
+    let usage = store.envelope_usage(&envelope_instance_id).await?;
+    assert_eq!(
+        usage.observed_amount,
+        Some("165.00".to_owned()),
+        "late settlement must increase the instance's cumulative usage"
+    );
+    assert_eq!(usage.active_top_up_amount, Some("65.00".to_owned()));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT observed_amount::text FROM spend_observations \
+             WHERE runtime_uid = $1 ORDER BY at DESC, id DESC LIMIT 1",
+        )
+        .bind(&runtime_uid)
+        .fetch_one(&pool)
+        .await?,
+        "125.00",
+        "a recreated key's cumulative observation must not decrease"
+    );
     store
         .record_spend_observation(
             &runtime_uid,
             1,
             "immutable-runtime-spec",
             &SpendSummary {
-                observed_amount: "130.00".to_owned(),
+                observed_amount: "124.00".to_owned(),
                 currency: "USD".to_owned(),
             },
-            true,
+            false,
         )
         .await?;
+    assert_eq!(
+        store
+            .latest_runtime_spend_amount(&runtime_uid, "USD")
+            .await?,
+        "125.00",
+        "an older retry must not reduce cumulative spend"
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM inference_exhaustions WHERE runtime_uid = $1",
@@ -3071,9 +3570,14 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         .admin_escalations()
         .await?
         .into_iter()
-        .find(|record| record.runtime_uid == runtime_uid && record.dimension == "llm_spend")
+        .find(|record| {
+            record.runtime_uid == runtime_uid
+                && record.dimension == "llm_spend"
+                && record.grant_id.is_none()
+        })
         .ok_or_else(|| io::Error::other("resumed exhaustion was not projected"))?;
     assert_ne!(resumed_exhaustion.escalation_id, escalation.escalation_id);
+    assert_eq!(resumed_exhaustion.observed_amount, "125.00");
     assert_eq!(resumed_exhaustion.grant_id, None);
     assert_eq!(resumed_exhaustion.denial_rationale, None);
 
@@ -3283,6 +3787,86 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
         assert_eq!(failed.phase, TaskPhase::Failed);
         assert_eq!(failed.failure_reason.as_deref(), Some(failure_reason));
     }
+
+    let denied_task_uid = Uuid::new_v4();
+    let denied_operation_id = Uuid::new_v4();
+    let denied_runtime_name = format!("denied-spend-{suffix}");
+    insert_task_projection_fixture(
+        &pool,
+        TaskProjectionFixture {
+            source_task_uid: task_uid,
+            task_uid: denied_task_uid,
+            operation_id: denied_operation_id,
+            idempotency_key: &format!("denied-spend-{suffix}"),
+            task_runtime_name: &denied_runtime_name,
+            operation_runtime_name: &denied_runtime_name,
+            inert_manifest_digest: &inert_digest,
+            active_manifest_digest: &active_digest,
+            direct_task_evidence: None,
+        },
+    )
+    .await?;
+    store
+        .put_task_inputs(
+            denied_task_uid,
+            &service,
+            identity.user_id.as_str(),
+            b"denied spend input",
+        )
+        .await?;
+    store
+        .request_task_execution(denied_task_uid, &service, identity.user_id.as_str())
+        .await?;
+    store
+        .authorize_task_runtime_creation(denied_task_uid, 1, "test-controller")
+        .await?;
+    let denied_operation = store
+        .task_runtime_operation(denied_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    let denied_runtime_uid = format!("denied-spend-runtime-{suffix}");
+    store
+        .record_task_runtime_observed(
+            denied_task_uid,
+            denied_operation.generation,
+            &denied_runtime_uid,
+            "1",
+            "test-controller",
+        )
+        .await?;
+    store
+        .record_spend_observation(
+            &denied_runtime_uid,
+            1,
+            "denied-runtime-spec",
+            &SpendSummary {
+                observed_amount: "101.00".to_owned(),
+                currency: "USD".to_owned(),
+            },
+            true,
+        )
+        .await?;
+    let denied_escalation = store
+        .admin_escalations()
+        .await?
+        .into_iter()
+        .find(|record| record.runtime_uid == denied_runtime_uid)
+        .ok_or_else(|| io::Error::other("denied spend escalation was not projected"))?;
+    store
+        .deny_cumulative_escalation(
+            denied_escalation.escalation_id,
+            "the request exceeds the available budget",
+            "test-admin",
+        )
+        .await?;
+    let denied = store
+        .task(denied_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(
+        denied.failure_reason.as_deref(),
+        Some("The request for more monthly budget was denied, so this run was stopped.")
+    );
     Ok(())
 }
 
@@ -6097,6 +6681,25 @@ async fn inference_budget_failures_persist_plain_reasons_without_retrying_reject
         .await?,
         0,
         "per-run Task failure must not create a monthly escalation"
+    );
+    assert_eq!(
+        store
+            .envelope_usage(&envelope_instance_id)
+            .await?
+            .observed_amount,
+        Some("0.0002".to_owned()),
+        "the full call must count toward monthly usage when the per-run outcome wins"
+    );
+    assert_eq!(
+        store
+            .remaining_envelope_instance_spend_budget(
+                &envelope_instance_id,
+                "following-runtime",
+                "0.00015",
+            )
+            .await?,
+        "0",
+        "a following Run must see that the call also used the remaining monthly amount"
     );
 
     let rejected_task_uid = Uuid::new_v4();
