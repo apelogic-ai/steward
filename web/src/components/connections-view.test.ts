@@ -91,10 +91,21 @@ describe("governed provider connection controls", () => {
     expect(source).toMatch(/operation\.data\?\.state === "succeeded" && !operation\.data\.authorizationUrl/);
   });
 
-  test("shows a reauthorization action when a reported credential deadline approaches", () => {
+  test("uses one advertised-action footer for every provider state", () => {
     expect(source).toContain('connectionHealth(status)');
-    expect(source).toContain('`Re-authorize ${providerName}`');
-    expect(source).toContain('renewalCredentialExpiresAt');
+    expect(source).toContain("function ProviderConnectionFooter");
+    expect(source).toContain('data-provider-action-footer');
+    expect(source).toContain('canStart={canStart}');
+    expect(source).toContain('canDisconnect={canDisconnect}');
+    expect(source).toContain('{connected ? "Reconnect" : "Connect"}');
+    expect(source).not.toContain('`Re-authorize ${providerName}`');
+  });
+
+  test("uses server display names with a capitalized fallback and locale credential dates", () => {
+    expect(source).toContain("providerDisplayName(connection)");
+    expect(source).toContain("formatCredentialDate(status.activeCredentialExpiresAt)");
+    expect(source).toContain("formatCredentialDate(status.renewalCredentialExpiresAt)");
+    expect(source).not.toContain('status.activeCredentialExpiresAt ?? "Not reported"');
   });
 
   test("renders server-owned provider rows and only their advertised actions", () => {

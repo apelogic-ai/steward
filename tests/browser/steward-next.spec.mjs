@@ -5267,7 +5267,8 @@ test("connection OAuth starts through a same-origin Rust mutation", async ({ bro
   const developer = await guardedPage(browser, { connectionPhase: "disconnected" });
   try {
     await developer.page.goto(`${origin}/connections`);
-    await developer.page.getByRole("button", { name: "Connect GitHub" }).click();
+    const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+    await github.getByRole("button", { name: "Connect", exact: true }).click();
     await expect(developer.page).toHaveURL(`${origin}/connections?oauth=started`);
     expectMutationProof(developer.mutations.find((mutation) => mutation.path.endsWith("/start")));
   } finally {
@@ -5296,7 +5297,8 @@ test("Connections starts Jira sign-in through Jira's provider route", async ({ b
     await developer.page.goto(`${origin}/connections`);
     await expect(developer.page.getByRole("heading", { name: "GitHub" })).toBeVisible();
     await expect(developer.page.getByRole("heading", { name: "Jira" })).toBeVisible();
-    await developer.page.getByRole("button", { name: "Connect Jira" }).click();
+    const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
+    await jira.getByRole("button", { name: "Connect", exact: true }).click();
     await expect(developer.page).toHaveURL(`${origin}/connections?oauth=started`);
     const start = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/connections/jira/start");
     expectMutationProof(start);
@@ -5319,7 +5321,8 @@ test("Connections rejects a synchronous Jira start without an authorization URL"
   });
   try {
     await developer.page.goto(`${origin}/connections`);
-    await developer.page.getByRole("button", { name: "Connect Jira" }).click();
+    const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
+    await jira.getByRole("button", { name: "Connect", exact: true }).click();
     await expect(developer.page.getByText("The connection action could not be completed.", { exact: true })).toBeVisible();
     expectMutationProof(developer.mutations.find((mutation) => mutation.path === startPath));
   } finally {
@@ -5340,12 +5343,77 @@ test("Connections shows no controls when a provider advertises no actions", asyn
     await developer.page.goto(`${origin}/connections`);
     const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
     await expect(jira).toBeVisible();
-    await expect(jira.getByRole("button", { name: "Connect Jira", exact: true })).toHaveCount(0);
-    await expect(jira.getByRole("button", { name: "Re-authorize Jira", exact: true })).toHaveCount(0);
+    await expect(jira.getByRole("button", { name: "Connect", exact: true })).toHaveCount(0);
+    await expect(jira.getByRole("button", { name: "Reconnect", exact: true })).toHaveCount(0);
     await expect(jira.getByRole("button", { name: "Disconnect…", exact: true })).toHaveCount(0);
     await expect(jira.getByText("GitHub Actions runs as you: linked.", { exact: true })).toHaveCount(0);
   } finally {
     await closeGuardedPage(developer);
+  }
+});
+
+test("GitHub and Jira cards share action footers across disconnected, connected, and reauthorization states", async ({ browser }) => {
+  const scenarios = [
+    {
+      name: "disconnected",
+      actions: ["start"],
+      status: { phase: "disconnected", accountEmail: null, scopesRequired: ["read"], scopesGranted: [], scopesMissing: ["read"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+      buttons: ["Connect"],
+      primary: true,
+    },
+    {
+      name: "connected",
+      actions: ["start", "disconnect"],
+      status: { phase: "connected", accountEmail: "alice@example.com", scopesRequired: ["read"], scopesGranted: ["read"], scopesMissing: [], activeCredentialExpiresAt: "2026-09-14T11:00:00.000Z", renewalCredentialExpiresAt: null },
+      buttons: ["Reconnect", "Disconnect…"],
+      primary: false,
+    },
+    {
+      name: "reauthorization",
+      actions: ["start", "disconnect"],
+      status: { phase: "reauth_required", accountEmail: "alice@example.com", scopesRequired: ["read"], scopesGranted: [], scopesMissing: ["read"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+      buttons: ["Reconnect", "Disconnect…"],
+      primary: true,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const developer = await guardedPage(browser, {
+      providerConnections: [
+        { provider: "github", displayName: "GitHub", actions: scenario.actions, status: scenario.status },
+        { provider: "jira", displayName: "", actions: scenario.actions, status: scenario.status },
+      ],
+    });
+    try {
+      await developer.page.goto(`${origin}/connections`);
+      const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+      const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
+      const githubFooter = github.locator('[data-provider-action-footer="github"]');
+      const jiraFooter = jira.locator('[data-provider-action-footer="jira"]');
+
+      await expect(githubFooter, `${scenario.name} GitHub footer`).toBeVisible();
+      await expect(jiraFooter, `${scenario.name} Jira footer`).toBeVisible();
+      expect(await githubFooter.getByRole("button").allTextContents()).toEqual(scenario.buttons);
+      expect(await jiraFooter.getByRole("button").allTextContents()).toEqual(scenario.buttons);
+      const actionLabel = scenario.buttons[0];
+      if (scenario.primary) {
+        await expect(githubFooter.getByRole("button", { name: actionLabel, exact: true })).toHaveClass(/bg-brand/);
+        await expect(jiraFooter.getByRole("button", { name: actionLabel, exact: true })).toHaveClass(/bg-brand/);
+      } else {
+        await expect(githubFooter.getByRole("button", { name: actionLabel, exact: true })).not.toHaveClass(/bg-brand/);
+        await expect(jiraFooter.getByRole("button", { name: actionLabel, exact: true })).not.toHaveClass(/bg-brand/);
+      }
+
+      if (scenario.name === "connected") {
+        await expect(jira.getByText("Credential expired", { exact: true })).toHaveCount(0);
+        await expect(jira.getByText("Renews automatically", { exact: true })).toBeVisible();
+        const formattedActiveExpiry = await developer.page.evaluate((value) => new Date(value).toLocaleString(), scenario.status.activeCredentialExpiresAt);
+        await expect(jira.getByText(formattedActiveExpiry, { exact: true })).toBeVisible();
+        await expect(jira.getByText(scenario.status.activeCredentialExpiresAt, { exact: true })).toHaveCount(0);
+      }
+    } finally {
+      await closeGuardedPage(developer);
+    }
   }
 });
 
@@ -5413,7 +5481,8 @@ test("connection OAuth polling keeps a bounded terminal failure explicit", async
   });
   try {
     await developer.page.goto(`${origin}/connections`);
-    await developer.page.getByRole("button", { name: "Connect GitHub" }).click();
+    const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+    await github.getByRole("button", { name: "Connect", exact: true }).click();
     const failure = developer.page.getByRole("alert");
     await expect(failure.getByText("GitHub authorization couldn't be completed. Retry once. If it continues, ask an administrator to check the connection.", { exact: true })).toBeVisible();
     await failure.getByText("Details", { exact: true }).click();
@@ -5432,7 +5501,8 @@ test("connection OAuth stops a perpetually pending poll after the bounded observ
   });
   try {
     await developer.page.goto(`${origin}/connections`);
-    const connect = developer.page.getByRole("button", { name: "Connect GitHub" });
+    const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+    const connect = github.getByRole("button", { name: "Connect", exact: true });
     await connect.click();
     await expect(developer.page.getByText(
       "The connection operation did not finish in time. Retry it; if it continues, contact an administrator.",
@@ -5453,7 +5523,8 @@ test("connection OAuth keeps its deadline failure when the operation request abo
   });
   try {
     await developer.page.goto(`${origin}/connections`);
-    const connect = developer.page.getByRole("button", { name: "Connect GitHub" });
+    const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+    const connect = github.getByRole("button", { name: "Connect", exact: true });
     await connect.click();
     await expect(developer.page.getByText(
       "The connection operation did not finish in time. Retry it; if it continues, contact an administrator.",
@@ -5508,7 +5579,8 @@ test("connection action keeps an authorization denial explicit", async ({ browse
   });
   try {
     await developer.page.goto(`${origin}/connections`);
-    await developer.page.getByRole("button", { name: "Connect GitHub" }).click();
+    const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+    await github.getByRole("button", { name: "Connect", exact: true }).click();
     await expect(developer.page.getByText("You are not allowed to manage this connection.")).toBeVisible();
   } finally {
     await closeGuardedPage(developer);

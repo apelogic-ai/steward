@@ -15,7 +15,7 @@ const connected: ProviderConnectionStatus = {
   renewalCredentialExpiresAt: "2026-09-20T12:00:00.000Z",
 };
 
-describe("GitHub credential health", () => {
+describe("provider credential health", () => {
   test("a renewable active credential stays green until its renewal deadline approaches", () => {
     expect(connectionHealth(connected, now)).toBe("healthy");
   });
@@ -28,6 +28,17 @@ describe("GitHub credential health", () => {
   test("unknown expiry is not fabricated and explicit reauthorization takes precedence", () => {
     expect(connectionHealth({ ...connected, activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null }, now)).toBe("healthy");
     expect(connectionHealth({ ...connected, phase: "reauth_required" }, now)).toBe("reauth_required");
+  });
+
+  test("an expired active credential remains healthy when renewal happens on next use", () => {
+    const renewalOnUse = {
+      ...connected,
+      activeCredentialExpiresAt: "2026-09-14T11:00:00.000Z",
+      renewalCredentialExpiresAt: null,
+    };
+
+    expect(connectionHealth(renewalOnUse, now)).toBe("healthy");
+    expect(connectionHealth({ ...renewalOnUse, renewalCredentialExpiresAt: "2026-09-14T11:00:00.000Z" }, now)).toBe("expired");
   });
 });
 
