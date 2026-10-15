@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Provider sign-in now opens in a new tab and refreshes connection status when users return, while
+  retaining a same-tab fallback when the browser blocks the new tab.
 - Provider display names in the deployment capability catalog no longer prevent the token service
   from starting; unsupported provider fields are still refused.
 - Jira sign-in now accepts the gateway's one-time state alongside its consent URL while still

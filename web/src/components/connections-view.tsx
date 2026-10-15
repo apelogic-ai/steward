@@ -26,6 +26,17 @@ import { useSession } from "@/session/session-context";
 
 export function ConnectionsView() {
   const [generation, setGeneration] = useState(0);
+  useEffect(() => {
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") setGeneration((value) => value + 1);
+    };
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    window.addEventListener("focus", refreshWhenVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+      window.removeEventListener("focus", refreshWhenVisible);
+    };
+  }, []);
   const load = useCallback(() => {
     void generation;
     return listProviderConnections({ cache: "no-store", credentials: "same-origin" });
@@ -158,6 +169,17 @@ function ProviderConnection({ connection, refresh }: Readonly<{
   async function connect() {
     if (session.status !== "authenticated") return;
     startController.current?.abort();
+    const authorizationTab = window.open("", "_blank");
+    if (authorizationTab !== null) authorizationTab.opener = null;
+    let authorizationStarted = false;
+    const openAuthorization = (authorizationUrl: string) => {
+      if (authorizationTab === null || authorizationTab.closed) {
+        window.location.assign(authorizationUrl);
+      } else {
+        authorizationTab.location.assign(authorizationUrl);
+      }
+      authorizationStarted = true;
+    };
     const controller = new AbortController();
     startController.current = controller;
     setAction("working");
@@ -167,7 +189,7 @@ function ProviderConnection({ connection, refresh }: Readonly<{
     try {
       const result = await startProviderConnection({ body: {}, cache: "no-store", credentials: "same-origin", headers: { "X-Steward-CSRF": session.value.csrf }, path: { provider }, signal: controller.signal });
       if (result.response?.status === 200 && result.data?.authorizationUrl) {
-        window.location.assign(result.data.authorizationUrl);
+        openAuthorization(result.data.authorizationUrl);
         return;
       }
       if (result.response?.status !== 202 || !result.data?.operationId || !result.data.pollDeadlineAt) {
@@ -194,7 +216,7 @@ function ProviderConnection({ connection, refresh }: Readonly<{
         const operation = await getProviderConnectionStartOperation({ cache: "no-store", credentials: "same-origin", path: { provider, operation_id: result.data.operationId }, signal: controller.signal });
         if (controller.signal.aborted) return;
         if (operation.data?.state === "succeeded" && operation.data.authorizationUrl) {
-          window.location.assign(operation.data.authorizationUrl);
+          openAuthorization(operation.data.authorizationUrl);
           return;
         }
         if (operation.data?.state === "failed") {
@@ -219,6 +241,7 @@ function ProviderConnection({ connection, refresh }: Readonly<{
       if (!controller.signal.aborted) setAction("error");
     } finally {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      if (!authorizationStarted && authorizationTab !== null && !authorizationTab.closed) authorizationTab.close();
       if (startController.current === controller) startController.current = null;
     }
   }
