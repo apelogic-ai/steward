@@ -3081,6 +3081,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -3109,7 +3110,11 @@ mod tests {
         listener
             .set_nonblocking(true)
             .map_err(|error| format!("bound provider-control fixture accept: {error}"))?;
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
         let server = thread::spawn(move || -> Result<(), String> {
+            ready_sender
+                .send(())
+                .map_err(|_| "signal provider-control fixture readiness".to_owned())?;
             for (expected_request, body) in exchanges {
                 let deadline = Instant::now() + Duration::from_secs(2);
                 let (mut stream, _) = loop {
@@ -3152,6 +3157,9 @@ mod tests {
             }
             Ok(())
         });
+        ready_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("await provider-control fixture readiness: {error}"))?;
         Ok((format!("http://{address}"), server))
     }
 
