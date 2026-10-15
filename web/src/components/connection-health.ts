@@ -1,6 +1,7 @@
 import type { ProviderConnectionStatus } from "@/api-client";
 
 export type ConnectionHealth = "healthy" | "expiring_soon" | "expired" | "reauth_required" | "other";
+export type ConnectionScopeStatus = "unavailable" | "missing" | "all_granted";
 
 const REAUTH_WARNING_MS = 24 * 60 * 60 * 1000;
 
@@ -14,4 +15,20 @@ export function connectionHealth(status: ProviderConnectionStatus, now = Date.no
   const remaining = Date.parse(deadline) - now;
   if (!Number.isFinite(remaining) || remaining <= 0) return "expired";
   return remaining <= REAUTH_WARNING_MS ? "expiring_soon" : "healthy";
+}
+
+export function connectionScopeStatus(status: ProviderConnectionStatus): ConnectionScopeStatus {
+  if (status.phase === "unavailable") {
+    return "unavailable";
+  }
+  if (status.scopesMissing.length > 0) {
+    return "missing";
+  }
+  if (
+    status.scopesGranted.length === 0 ||
+    status.scopesRequired.some((scope) => !status.scopesGranted.includes(scope))
+  ) {
+    return "unavailable";
+  }
+  return "all_granted";
 }
