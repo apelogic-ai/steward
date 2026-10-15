@@ -11,6 +11,7 @@ Feature: J2 - New user gets going
     And the optional integration "tool connections" is switched off
     And the template "standard" exists
     And I am signed in as a user with the role "member"
+    And the Get started guide is visible
 
   # All steps and "Done when".
   @smoke @needs-model
@@ -74,6 +75,15 @@ Feature: J2 - New user gets going
     When I open "Envelopes"
     # For example "0.02 USD / 10.00 USD".
     Then the Envelope from the template "standard" shows the same spend as used out of its monthly limit
+
+  @extended
+  Scenario: Hide and reopen Get started without losing progress
+    Then the Get started guide and sidebar entry are visible with the same progress
+    When I press "Hide Get started"
+    Then the Get started guide and sidebar entry are hidden
+    When I open "Settings"
+    And I press "Reopen Get started"
+    Then the Get started guide and sidebar entry are visible with the same progress
 
   # F1. The monthly limit of the template is 10.00 USD.
   Scenario Outline: A limit per run that is missing or too high cannot be submitted

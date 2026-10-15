@@ -5,9 +5,10 @@ Eleven journeys for the web UI (brand name in the UI: HyperShell), one file each
 The feature set comes from the user-journey specification (J1 to J10), plus the Jira acceptance
 journey J11. The runner loads all eleven
 files. `@smoke` executes the release-critical paths in J1 through J4; `@extended` executes the
-currently passing one-account paths in J6 through J8. J5's documented paths still carry product
-findings, J9 needs a second signed-in person, and J10 needs operator control of the installation,
-so those paths remain specifications until those prerequisites and expected outcomes are available.
+currently passing one-account paths in J2 and J6 through J8. J5's documented paths still carry
+product findings, J9 needs a second signed-in person, and J10 needs operator control of the
+installation, so those paths remain specifications until those prerequisites and expected outcomes
+are available.
 
 | File | Journey |
 |---|---|
@@ -85,7 +86,7 @@ Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test
 | Tag | Meaning |
 |---|---|
 | `@smoke` | Part of the smallest set that proves a release is usable: J1 (steps 1 to 9), J2, J3 (approve path), J4 (steps 1 to 6). Run in this order with one unique run prefix. |
-| `@extended` | One-account coverage beyond smoke: J6's accepted requirements, J7's terminal captured/no-capture logs, and J8's agent/model selection and Task persistence. Run after `@smoke` with the same prefix. |
+| `@extended` | One-account coverage beyond smoke: J2's onboarding dismissal preference, J6's accepted requirements, J7's terminal captured/no-capture logs, and J8's agent/model selection and Task persistence. Run after `@smoke` with the same prefix. |
 | `@needs-model` | Makes a real model call. Costs money. |
 | `@needs-github` | Needs an external repository that the installation allows. |
 | `@needs-jira` | Needs a connected Jira account and the `jira-read` template fixture created after `@smoke` with the same run prefix. |
@@ -183,7 +184,10 @@ file whose name contains `README`; the journey verifies the resolved commit agai
 head. The member role must be one held by the signed-in test account and replaces the `member`
 placeholder in journey text. The account must also have administrator access because J1 and J3
 use administrator APIs and screens. Tool-connection state is recorded but is not an account
-precondition: an existing personal connection does not change these journeys. A configured
+precondition: an existing personal connection does not change these journeys. The account must
+have incomplete onboarding progress so J2 can exercise the visible Get started guide; the runner
+temporarily reopens a dismissed guide and restores the account's original dismissal preference.
+A configured
 `STEWARD_JOURNEY_AGENT` or `STEWARD_JOURNEY_MODEL` must exist in the installation and be allowed by
 the selected Envelope. The deliberately narrowed `basic` Envelope is the only exception: it keeps
 the form's compatible default when the configured runtime is unavailable. Without either setting,

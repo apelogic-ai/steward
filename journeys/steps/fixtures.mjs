@@ -56,8 +56,10 @@ export const test = base.extend({
       initialCounts: new Map(),
       integrationStates: new Map(),
       knownIssue: testInfo.tags.find((tag) => tag.startsWith("@known-failing-")) ?? null,
+      onboardingProgressLabel: null,
       requests: new Map(),
       repository: null,
+      restoreOnboardingDismissal: null,
       run: null,
       initialRunIds: null,
       runRuntimeMinutes: null,
@@ -67,6 +69,7 @@ export const test = base.extend({
       transientSeen: new Set(),
     };
     await use(state);
+    if (state.restoreOnboardingDismissal) await state.restoreOnboardingDismissal();
     page.off("console", onConsole);
     page.off("pageerror", onPageError);
     page.off("response", onResponse);
