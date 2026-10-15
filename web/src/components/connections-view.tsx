@@ -15,7 +15,7 @@ import {
   type InferenceConnectionResponse,
   type ProviderConnectionView,
 } from "@/api-client";
-import { connectionHealth, connectionScopeStatus } from "@/components/connection-health";
+import { connectionHealth, connectionRenewsAutomatically, connectionScopeStatus } from "@/components/connection-health";
 import { classifyConnectionMutationFailure, type ConnectionMutationState } from "@/components/connection-mutation-state";
 import { boundedConnectionPollDeadline } from "@/components/connection-poll-deadline";
 import { ConfirmationDialog, SectionCard } from "@/components/hs";
@@ -145,12 +145,12 @@ function ProviderConnection({ connection, refresh }: Readonly<{
   const [action, setAction] = useState<"idle" | "working" | "poll-expired" | ConnectionMutationState>("idle");
   const [startFailure, setStartFailure] = useState<ConnectionOperationErrorResponse | null>(null);
   const status = connection.status;
-  const providerName = connection.displayName.trim() || connection.provider;
+  const providerName = providerDisplayName(connection);
   const health = connectionHealth(status);
   const scopeStatus = connectionScopeStatus(status);
   const canStart = connection.actions.includes("start");
   const canDisconnect = connection.actions.includes("disconnect");
-  const reauthorizationRecommended = health === "expiring_soon" || health === "expired";
+  const needsReauthorization = scopeStatus === "missing" || health === "expiring_soon" || health === "expired" || health === "reauth_required";
   const badge = health === "expiring_soon" ? "Expiring soon" : health === "expired" ? "Credential expired" : status.phase;
 
   useEffect(() => () => startController.current?.abort(), []);
@@ -285,36 +285,105 @@ function ProviderConnection({ connection, refresh }: Readonly<{
   }
 
   const disconnectDescription = `This removes ${providerName} access from every current and future run using your account.${connection.provider === "jira" ? " Also remove the app under Atlassian Connected Apps." : ""}`;
-  const footer = status.phase === "connected" && canDisconnect ? (
-    <div className="flex flex-wrap items-center justify-between gap-4">
-      <div className="max-w-2xl space-y-1 text-[13px] text-muted-ink">
-        <p>Disconnecting removes {providerName} access from every current and future run using your account.</p>
-        {connection.provider === "jira" ? <p>Also remove the app under Atlassian Connected Apps.</p> : null}
-      </div>
-      <div className="flex gap-2">
-        {canStart ? <button className="h-9 rounded-control border bg-panel px-3 text-sm font-semibold disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">Reconnect</button> : null}
-        <button className="h-9 rounded-control border border-err px-3 text-sm font-semibold text-err hover:bg-err-soft" onClick={() => setDisconnectOpen(true)} type="button">Disconnect…</button>
-      </div>
-      <ConfirmationDialog cancelLabel="Keep connection" confirmLabel={`Disconnect ${providerName}`} description={disconnectDescription} onConfirm={() => void disconnect()} onOpenChange={setDisconnectOpen} open={disconnectOpen} pending={action === "working"} title={`Disconnect ${providerName}?`} />
-    </div>
-  ) : null;
+  const footer = canStart || canDisconnect ? <ProviderConnectionFooter
+    canDisconnect={canDisconnect}
+    canStart={canStart}
+    connected={status.phase === "connected" || status.phase === "reauth_required"}
+    disconnectDescription={disconnectDescription}
+    disconnectOpen={disconnectOpen}
+    needsReauthorization={needsReauthorization}
+    onConnect={() => void connect()}
+    onDisconnect={() => void disconnect()}
+    onDisconnectOpenChange={setDisconnectOpen}
+    providerId={connection.provider}
+    providerName={providerName}
+    working={action === "working"}
+  /> : null;
 
   const accountIdentity = status?.accountId
     ? `${status.accountLogin ? `@${status.accountLogin} · ` : ""}${connection.provider === "github" ? "GitHub ID" : "Account ID"} ${status.accountId}`
     : status?.accountEmail ?? "Account not reported";
 
   return (
-    <SectionCard actions={<StatusBadge value={badge} />} footer={footer} title={<span className="flex items-center gap-3"><span aria-hidden="true" className="flex size-10 items-center justify-center rounded-[10px] bg-ink text-sm font-bold text-canvas">{providerInitials(providerName)}</span><span><span className="block text-[17px]">{providerName}</span><span className="block text-xs font-normal text-muted-ink">{accountIdentity}{status?.renewalCredentialExpiresAt ? ` · expires ${new Date(status.renewalCredentialExpiresAt).toLocaleDateString()}` : ""}</span></span></span>}>
+    <SectionCard actions={<StatusBadge value={badge} />} footer={footer} title={<span className="flex items-center gap-3"><span aria-hidden="true" className="flex size-10 items-center justify-center rounded-[10px] bg-ink text-sm font-bold text-canvas">{providerInitials(providerName)}</span><span><span className="block text-[17px]">{providerName}</span><span className="block text-xs font-normal text-muted-ink">{accountIdentity}{status?.renewalCredentialExpiresAt ? ` · expires ${formatCredentialDate(status.renewalCredentialExpiresAt)}` : ""}</span></span></span>}>
       <div className="space-y-4">
         {connection.provider === "github" && status.githubActionsIdentityLinked === true ? <p className="text-sm text-ok">GitHub Actions runs as you: linked.</p> : connection.provider === "github" && status.githubActionsIdentityLinked === false ? <p className="text-sm text-err">GitHub Actions identity is not linked to this Steward user.</p> : null}
         <div><p className="mb-2 text-xs font-semibold text-muted-ink">Scopes</p>{status.scopesGranted.length ? <ul className="flex flex-wrap gap-2">{status.scopesGranted.map((scope) => <li className="rounded-full bg-ok-soft px-3 py-1 font-mono text-xs" key={scope}>{scope} <span className="font-sans font-semibold text-ok">✓ granted</span></li>)}</ul> : <p className="text-sm text-muted-ink">No granted scopes reported.</p>}</div>
         {scopeStatus === "unavailable" ? <p className="text-sm text-muted-ink">{providerName} status couldn&apos;t be read right now.</p> : scopeStatus === "missing" ? <p className="text-sm text-err">Missing required scopes: {status.scopesMissing.join(", ")}.</p> : <p className="text-sm text-ok">All required scopes granted.</p>}
-        <dl className="grid gap-3 text-sm sm:grid-cols-2"><div><dt className="text-xs font-semibold text-muted-ink">Active credential expires</dt><dd className="mt-1">{status.activeCredentialExpiresAt ?? "Not reported"}</dd></div><div><dt className="text-xs font-semibold text-muted-ink">Renewal credential expires</dt><dd className="mt-1">{status.renewalCredentialExpiresAt ?? "Not reported"}</dd></div></dl>
-        {canStart && (status.phase !== "connected" || reauthorizationRecommended) ? <button className="min-h-10 rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-50" disabled={action === "working"} onClick={() => void connect()} type="button">{status.phase === "disconnected" ? `Connect ${providerName}` : `Re-authorize ${providerName}`}</button> : null}
+        <dl className="grid gap-3 text-sm sm:grid-cols-2"><div><dt className="text-xs font-semibold text-muted-ink">Active credential expires</dt><dd className="mt-1">{formatCredentialDate(status.activeCredentialExpiresAt)}</dd></div><div><dt className="text-xs font-semibold text-muted-ink">Renewal credential expires</dt><dd className="mt-1">{status.renewalCredentialExpiresAt ? formatCredentialDate(status.renewalCredentialExpiresAt) : connectionRenewsAutomatically(status) ? "Renews automatically" : "Not reported"}</dd></div></dl>
         {action !== "idle" && action !== "working" ? <div className="text-sm text-err" role="alert"><p>{action !== "orchestration-not-active" && startFailure ? connectionFailureMessage(startFailure, providerName) : { "orchestration-not-active": "Connections are disabled until task runs are enabled for this installation.", "oauth-pending": `Finish or wait for the pending ${providerName} authorization before disconnecting.`, "poll-expired": "The connection operation did not finish in time. Retry it; if it continues, contact an administrator.", conflict: "The connection changed before the action completed. Reload before retrying.", rejected: "The connection action was rejected.", forbidden: "You are not allowed to manage this connection.", unavailable: "Connections are unavailable. Try again.", error: "The connection action could not be completed." }[action]}</p>{action !== "orchestration-not-active" && startFailure ? <details className="mt-1 text-xs"><summary className="cursor-pointer">Details</summary><dl className="mt-1 grid grid-cols-[auto_1fr] gap-x-2"><dt>Category</dt><dd><code>{startFailure.error}</code></dd>{startFailure.code ? <><dt>Code</dt><dd><code>{startFailure.code}</code></dd></> : null}{startFailure.detail ? <><dt>Reason</dt><dd><code>{startFailure.detail}</code></dd></> : null}</dl></details> : null}</div> : null}
       </div>
     </SectionCard>
   );
+}
+
+function ProviderConnectionFooter({
+  canDisconnect,
+  canStart,
+  connected,
+  disconnectDescription,
+  disconnectOpen,
+  needsReauthorization,
+  onConnect,
+  onDisconnect,
+  onDisconnectOpenChange,
+  providerId,
+  providerName,
+  working,
+}: Readonly<{
+  canDisconnect: boolean;
+  canStart: boolean;
+  connected: boolean;
+  disconnectDescription: string;
+  disconnectOpen: boolean;
+  needsReauthorization: boolean;
+  onConnect: () => void;
+  onDisconnect: () => void;
+  onDisconnectOpenChange: (open: boolean) => void;
+  providerId: string;
+  providerName: string;
+  working: boolean;
+}>) {
+  const emphasizeConnect = !connected || needsReauthorization;
+  const explanation = canDisconnect
+    ? `Disconnecting removes ${providerName} access from every current and future run using your account.`
+    : needsReauthorization
+      ? `Reconnect ${providerName} to restore access for approved tasks.`
+      : connected
+        ? `Reconnect ${providerName} to refresh access for approved tasks.`
+        : `Connect ${providerName} to let approved tasks use your account.`;
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-4" data-provider-action-footer={providerId}>
+      <div className="max-w-2xl space-y-1 text-[13px] text-muted-ink">
+        <p>{explanation}</p>
+        {providerId === "jira" && canDisconnect ? <p>Also remove the app under Atlassian Connected Apps.</p> : null}
+      </div>
+      <div className="flex gap-2">
+        {canStart ? <button className={emphasizeConnect ? "h-9 rounded-control bg-brand px-3 text-sm font-semibold text-on-brand disabled:opacity-50" : "h-9 rounded-control border bg-panel px-3 text-sm font-semibold disabled:opacity-50"} disabled={working} onClick={onConnect} type="button">{connected ? "Reconnect" : "Connect"}</button> : null}
+        {canDisconnect ? <button className="h-9 rounded-control border border-err px-3 text-sm font-semibold text-err hover:bg-err-soft disabled:opacity-50" disabled={working} onClick={() => onDisconnectOpenChange(true)} type="button">Disconnect…</button> : null}
+      </div>
+      {canDisconnect ? <ConfirmationDialog cancelLabel="Keep connection" confirmLabel={`Disconnect ${providerName}`} description={disconnectDescription} onConfirm={onDisconnect} onOpenChange={onDisconnectOpenChange} open={disconnectOpen} pending={working} title={`Disconnect ${providerName}?`} /> : null}
+    </div>
+  );
+}
+
+function providerDisplayName(connection: ProviderConnectionView): string {
+  const displayName = connection.displayName.trim();
+  if (displayName) return displayName;
+  const fallback = connection.provider
+    .trim()
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((word) => `${word[0]?.toUpperCase() ?? ""}${word.slice(1)}`)
+    .join(" ");
+  return fallback || "Provider";
+}
+
+function formatCredentialDate(value: string | null | undefined): string {
+  if (!value) return "Not reported";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? "Not reported" : parsed.toLocaleString();
 }
 
 function providerInitials(displayName: string): string {
