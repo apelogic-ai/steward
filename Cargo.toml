@@ -31,7 +31,7 @@ edition = "2024"
 license = "MIT"
 publish = false
 rust-version = "1.95"
-version = "0.0.0"
+version = "0.3.18"
 
 [workspace.dependencies]
 async-stream = "0.3.6"

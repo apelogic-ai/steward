@@ -10,7 +10,7 @@
     },
     "web": {
       "name": "steward-web",
-      "version": "0.0.0",
+      "version": "0.3.18",
       "dependencies": {
         "@hey-api/client-fetch": "0.13.1",
         "class-variance-authority": "0.7.1",

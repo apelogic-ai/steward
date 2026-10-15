@@ -2,7 +2,7 @@
 
 Status: active browser and API boundary.
 
-Applies to Steward 0.3.17.
+Applies to Steward 0.3.18.
 
 ## Presentation ownership
 
@@ -199,15 +199,17 @@ failure is recorded, the status is `unknown`: authentication or policy failures
 before Task reservation leave no AgentRun record and therefore cannot truthfully
 be reported as ready.
 
-`GET /app/api/v1/connections` returns connected providers and the available
-provider catalog. GitHub is enabled; unavailable providers remain explicit and
-disabled. Provider `start` and `disconnect` mutations are browser-session and
-CSRF scoped. A successful `POST /app/api/v1/connections/{provider}/start`
-returns HTTP 202 with an opaque operation identifier, the server-owned
-`pollDeadlineAt`, and no provider URL. The browser polls
-`POST /app/api/v1/connections/{provider}/disconnect` likewise returns HTTP 202
-with an operation identifier and polling deadline. The browser polls
-`GET /app/api/v1/connections/{provider}/operations/{operation_id}`: pending
+`GET /app/api/v1/connections` returns one row for each enabled provider in the
+deployment catalog, using the catalog display name and only the actions the
+server reports. Disabled providers remain in availability metadata but are not
+returned as connection rows. GitHub rows report `start` and `disconnect`;
+enabled non-GitHub rows such as Jira report `start`.
+
+Provider mutations are browser-session and CSRF scoped. GitHub `start` and
+`disconnect` use the governed bridge: each POST returns HTTP 202 with an opaque
+operation identifier and server-owned `pollDeadlineAt`, and no provider URL.
+The browser polls
+`GET /app/api/v1/connections/github/operations/{operation_id}`: pending
 operations return HTTP 202, while a completed operation returns HTTP 200 with
 the one-time authorization URL, successful disconnect, or a bounded terminal
 failure. Operation reads are exact-owner scoped and use HTTP 404 for absent,
@@ -218,8 +220,12 @@ expiry so a retry can retrieve the still-valid URL. The browser aborts the poll
 when its view is replaced or unmounted. It observes a short, locally bounded
 grace after the advertised execution deadline so Steward can publish the
 durable deadline result, and always permits an immediate read of a reused
-terminal operation. An unobserved deadline leaves an actionable retry state. It
-never persists the authorization URL. The Connections UI renders distinct
+terminal operation. An unobserved deadline leaves an actionable retry state.
+
+Non-GitHub `start` calls such as Jira use the direct provider route and return
+HTTP 200 with `authorizationUrl`. The browser opens that one-time URL in a new
+tab. It never persists an authorization URL from either flow. The Connections
+UI renders distinct
 recovery guidance for runtime authentication, token grant, provider-response,
 gateway transport/status/body/unavailable, runtime creation, runtime start, and
 deadline failures. These bounded categories come from the durable operation

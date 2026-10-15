@@ -46,10 +46,13 @@ The existing Kubernetes TokenReview administrator routes remain unchanged. Brows
 parallel, route-specific frontend boundary and cannot inject a bearer assertion into that operator
 path.
 
-The optional browser Connections path performs provider-control calls only through governed,
-short-lived `steward-connections` runtimes. Identity continues to authenticate the browser, but it
-does not issue MCP authority for provider-control calls. Steward never places a bearer, provider
-credential, browser session value, or role claim in browser JavaScript.
+The optional browser Connections path keeps GitHub mutations in governed,
+short-lived `steward-connections` runtimes. Provider status calls and
+non-GitHub starts such as Jira use a short-lived Mint token limited to one exact
+provider action and call that provider's gateway route directly from the
+apiserver. Identity authenticates the browser but does not issue authority to
+browser JavaScript. Steward never places a bearer, provider credential, browser
+session value, or role claim in browser JavaScript.
 
 Production browser configuration parses and canonicalizes one real HTTPS origin. Userinfo,
 non-root paths, query strings, fragments, malformed ports, whitespace, scheme-like strings, and

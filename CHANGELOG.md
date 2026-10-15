@@ -7,12 +7,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.18] - 2026-10-15
+
+Steward v0.3.18 adds catalog-defined provider tools and provider-specific Connections, including
+Jira sign-in and read-only Jira tools. It also makes governed repository Tasks find their
+checkouts reliably, strengthens per-run inference-limit accounting, and improves browser
+explanations for failed or refused Runs.
+
 ### Fixed
 
 - Provider sign-in now opens in a new tab and refreshes connection status when users return, while
   retaining a same-tab fallback when the browser blocks the new tab.
 - Provider display names in the deployment capability catalog no longer prevent the token service
   from starting; unsupported provider fields are still refused.
+- Provider connection cards now use the catalog display name and available actions consistently.
+  Active and renewal credential expiry values show a local date and time, invalid values are
+  reported as unavailable, and a connected account without a reported renewal deadline says that
+  it renews automatically.
 - Jira sign-in now accepts the gateway's one-time state alongside its consent URL while still
   refusing incomplete or unexpected responses.
 - Coding agents now receive the exact path of every repository workspace in their prompt, so a
@@ -63,8 +74,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Changed
 
-- Connections can now route each catalog provider's status and sign-in start calls to its own
-  configured MCP-GW wrapper while preserving the existing default for providers without a mapping.
+- Connections can now route direct status calls and non-GitHub sign-in starts such as Jira to a
+  provider-specific MCP-GW wrapper, while preserving the existing default for providers without a
+  mapping. GitHub start and disconnect keep their governed bridge flow.
 - Connections can now start sign-in for enabled catalog providers such as Jira. Steward returns
   the provider's one-time consent URL and grants the gateway only the selected provider's start
   action for that request; GitHub keeps its existing governed connection flow.
@@ -87,8 +99,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Running Tasks show stdout and stderr together while in progress, and the displayed run duration
   now advances until the run finishes.
 
+### Security
+
+- Updated `rustls` to 0.23.46 to remediate RUSTSEC-2026-0349.
+
 ### Upgrade and rollback
 
+- Apply additive migration 0071 before starting v0.3.18. It adds an optional preferred-Envelope
+  digest to immutable browser Task versions; existing rows remain unchanged with no preference.
+  Retain the added column and its historical rows during rollback.
+- Jira Connections require MCP-GW v0.6.0 with its read-only Jira REST preset. Configure the exact
+  Jira wrapper under `connectionsBridge.providerOrigins` before enabling Jira in the capability
+  catalog. During a rolling upgrade, replace every old Mint pod before adding catalog
+  `displayName` fields. Before rolling back to v0.3.17, remove every catalog `displayName`, disable
+  Jira and remove its tool and catalog entries, and remove provider-specific origins from the older
+  chart's values.
 - Task evidence gains the optional `taskRuntimeMinutesLimit` field. After a Task with an explicit
   per-run cap stores this evidence, v0.3.17 and earlier binaries cannot read that row. Before such
   a rollback, stop Task submission and prove that no stored Task evidence carries the field.
@@ -1329,7 +1354,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.17...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.18...HEAD
+[0.3.18]: https://github.com/apelogic-ai/steward/compare/v0.3.17...v0.3.18
 [0.3.17]: https://github.com/apelogic-ai/steward/compare/v0.3.16...v0.3.17
 [0.3.16]: https://github.com/apelogic-ai/steward/compare/v0.3.15...v0.3.16
 [0.3.15]: https://github.com/apelogic-ai/steward/compare/v0.3.14...v0.3.15

@@ -1,6 +1,6 @@
 # Steward Helm chart
 
-Current release contract: chart `0.3.17` and application `0.3.17`.
+Current release contract: chart `0.3.18` and application `0.3.18`.
 
 This chart installs the Steward apiserver, controller/webhook, and
 `AgentRuntime` CRD. Mint and governed execution are opt-in; the web
@@ -182,13 +182,15 @@ reports `BackendTLSPolicy` support are required. Envoy Gateway `v1.9.1` is the
 currently supported, tested controller line for this chart. The chart does not
 install Gateway API CRDs or a controller.
 
-Connection start and disconnect are asynchronous: each POST returns HTTP 202
-with an operation identifier and server-owned polling deadline. The browser
+GitHub connection start and disconnect are asynchronous: each POST returns HTTP
+202 with an operation identifier and server-owned polling deadline. The browser
 polls an owner-scoped resource until authorization can continue or disconnect
 finishes. It uses a short, locally bounded observation grace after the execution
 deadline so the durable deadline result can be read, then stops with a retry
-action. Neither mutation requires a long-lived edge request while its governed
-runtime starts.
+action. Neither GitHub mutation requires a long-lived edge request while its
+governed runtime starts. A non-GitHub start such as Jira is synchronous and
+returns HTTP 200 with the provider consent URL for the browser to open in a new
+tab.
 Rerun may
 still spend up to 40 seconds waiting for the governed operation, so an edge
 that exposes rerun should allow at least 60 seconds (60–90 seconds is the
@@ -338,7 +340,7 @@ the exact MCP-GW origin, and a dedicated runtime namespace. Authority v1 also
 requires the named `connectionsBridge.mcpGatewayAuthorityContract` selector:
 `steward.connections.github/v1` for the legacy status route or
 `steward.connections.github/v2` for the lifecycle status contract used by
-MCP-GW 0.4.9 through 0.5.5. The deprecated `mcpGatewayVersion` input remains
+MCP-GW 0.4.9 through the tested v0.6.0 release. The deprecated `mcpGatewayVersion` input remains
 available for an existing values file and must not be set together with the
 named selector. Another configured contract fails closed. The apiserver records
 the frozen internal authority snapshot on each operation; the controller
@@ -349,7 +351,8 @@ verifies the same snapshot before creating or executing the short-lived
 to the MCP-GW wrapper that serves its connection status and sign-in start
 routes. Providers without an entry use `connectionsBridge.mcpGatewayOrigin`.
 The map is read only by the apiserver's direct provider-control clients; bridge
-operations continue to use the default origin.
+operations continue to use the default origin. Jira status and sign-in require
+MCP-GW v0.6.0 and its read-only Jira REST preset at the mapped Jira origin.
 
 Steward automatically selects internal authority v4 for browser GitHub repository
 automation. It adds only the operation-specific grants needed to list repositories,
@@ -395,13 +398,15 @@ the apiserver mints a short-lived `connections_status` control-plane token and
 the token carries one exact `<provider>/provider-control/status` grant. Mint
 accepts only providers present in `config.apiserver.capabilityCatalog.catalogs`,
 preventing a caller from creating status authority for an unconfigured provider.
-Configure apiserver egress and MCP-GW routing for the private status call. Connect, reauthorize,
-disconnect, and rerun mutations still execute through the one-shot governed
-OpenShell bridge runtime. The bridge has no inference provider, uses one fixed
-provider-control grant, and is finalized through the normal controller
-lifecycle. Changing a configured trust mode, image, endpoint, MCP-GW authority
-contract, namespace, or runtime class does not reinterpret an existing
-operation; it fails closed.
+Configure apiserver egress and MCP-GW routing for private status calls and
+non-GitHub starts. GitHub connect, reauthorize, disconnect, and rerun mutations
+continue through the one-shot governed OpenShell bridge runtime. The bridge has
+no inference provider, uses one fixed provider-control grant, and is finalized
+through the normal controller lifecycle. A non-GitHub start such as Jira uses
+the direct gateway route with a short-lived Mint token limited to that
+provider's start action. Changing a configured trust mode, image, endpoint,
+MCP-GW authority contract, namespace, or runtime class does not reinterpret an
+existing operation; it fails closed.
 
 Since Steward v0.3.14, for every MCP operation (repository search, workflow
 detection, publication, dispatch, run status and rerun) under the lifecycle
@@ -554,9 +559,9 @@ Steward release namespace also creates `steward-workflows`.
   display metadata. Each distinct available provider under `catalogs` gets one connection-status
   read through the gateway's version-2 provider route; failures are isolated to that provider.
   Disabled providers stay in the availability metadata but are not read or returned as connection
-  rows. A GitHub connection row supports `start` and `disconnect`; other provider rows carry no
-  actions until their browser flow is installed. Authority, budget, TTL, template, and user fields
-  are intentionally not part of this catalog.
+  rows. A GitHub connection row supports `start` and `disconnect`; enabled non-GitHub rows such as
+  Jira support `start`. Authority, budget, TTL, template, and user fields are intentionally not
+  part of this catalog.
 
   An upgrade that needs the existing GitHub connection card must list an available `github`
   provider entry and should set `displayName: GitHub`. An empty `catalogs` list returns no tool
