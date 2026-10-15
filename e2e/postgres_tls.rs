@@ -1885,6 +1885,7 @@ async fn direct_connection_status(
         DirectConnectionStatusConfig {
             control_plane_credential_file: credential_path,
             mint_origin,
+            provider_origins: std::collections::BTreeMap::new(),
             federated_subject_issuer: issuer.map(str::to_owned),
         },
         &gateway_origin,

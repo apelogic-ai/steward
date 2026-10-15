@@ -268,6 +268,9 @@ connectionsBridge:
   sourceRepository: ""
   sourceCommit: ""
   mcpGatewayOrigin: ""
+  # Optional exact provider-to-wrapper origins for direct status and sign-in start calls.
+  # Providers without an entry use mcpGatewayOrigin.
+  providerOrigins: {}
   # Preferred public selector. v2 covers the additive MCP-GW lifecycle-status releases.
   mcpGatewayAuthorityContract: ""
   # Deprecated compatibility selector. Leave empty when authorityContract is set.

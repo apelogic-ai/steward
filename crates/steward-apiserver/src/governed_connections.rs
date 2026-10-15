@@ -1,6 +1,6 @@
 //! Server-owned planning and orchestration for governed provider-control runtimes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::path::PathBuf;
@@ -269,6 +269,7 @@ pub struct GovernedConnectionsConfig {
 pub struct DirectConnectionStatusConfig {
     pub control_plane_credential_file: PathBuf,
     pub mint_origin: String,
+    pub provider_origins: BTreeMap<String, String>,
     pub federated_subject_issuer: Option<String>,
 }
 
@@ -402,10 +403,18 @@ impl DirectConnectionStatusReader {
             .timeout(DIRECT_PROVIDER_CONTROL_DEADLINE)
             .build()
             .map_err(|_| GovernedConnectionPlanError::Unavailable)?;
-        let gateway = ProviderStatusReader::new(mcp_gw_origin, mcp_gw_version)
-            .map_err(|_| GovernedConnectionPlanError::InvalidBindings)?;
-        let starter = ProviderAuthorizationStarter::new(mcp_gw_origin, mcp_gw_version)
-            .map_err(|_| GovernedConnectionPlanError::InvalidBindings)?;
+        let gateway = ProviderStatusReader::new_with_provider_origins(
+            mcp_gw_origin,
+            &config.provider_origins,
+            mcp_gw_version,
+        )
+        .map_err(|_| GovernedConnectionPlanError::InvalidBindings)?;
+        let starter = ProviderAuthorizationStarter::new_with_provider_origins(
+            mcp_gw_origin,
+            &config.provider_origins,
+            mcp_gw_version,
+        )
+        .map_err(|_| GovernedConnectionPlanError::InvalidBindings)?;
         Ok(Self {
             client,
             control_plane_credential_file: config.control_plane_credential_file,

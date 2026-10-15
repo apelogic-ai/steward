@@ -1003,6 +1003,7 @@ fn governed_connections_configuration(
                 "STEWARD_CONNECTIONS_CONTROL_PLANE_CREDENTIAL_FILE",
             )?),
             mint_origin: required("STEWARD_CONNECTIONS_MINT_ORIGIN")?,
+            provider_origins: connections_provider_origins()?,
             federated_subject_issuer: connection_auto_association_issuer,
         },
         &bindings.mcp_gw_origin,
@@ -1017,6 +1018,21 @@ fn governed_connections_configuration(
     Ok(Some(governed_connections::SplitConnectionsBroker::new(
         mutations, status,
     )))
+}
+
+fn connections_provider_origins() -> Result<BTreeMap<String, String>, io::Error> {
+    let value = match env::var("STEWARD_CONNECTIONS_MCP_GW_PROVIDER_ORIGINS") {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return Ok(BTreeMap::new()),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::other(
+                "STEWARD_CONNECTIONS_MCP_GW_PROVIDER_ORIGINS must be Unicode",
+            ));
+        }
+    };
+    serde_json::from_str(&value).map_err(|_| {
+        io::Error::other("STEWARD_CONNECTIONS_MCP_GW_PROVIDER_ORIGINS must be a JSON object")
+    })
 }
 
 fn task_orchestration_mode() -> Result<TaskOrchestrationMode, io::Error> {
