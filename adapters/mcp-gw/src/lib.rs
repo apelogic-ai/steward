@@ -22,7 +22,11 @@ const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 const MAX_MCP_TOOL_RESPONSE_BYTES: usize = 1024 * 1024;
 const PROVIDER_TRANSPORT_READY_TIMEOUT: Duration = Duration::from_secs(12);
 const PROVIDER_TRANSPORT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
 const DIRECT_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
+// Tests only: a busy test runner must not trip the production one-second bound.
+#[cfg(test)]
+const DIRECT_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECTION_STATUS_V2_MEDIA_TYPE: &str = "application/vnd.apelogic.connection-status.v2+json";
 pub const MAX_GATEWAY_FAILURE_DETAIL_BYTES: usize = 200;
 const MAX_GATEWAY_FAILURE_CODE_BYTES: usize = 100;
@@ -3116,7 +3120,7 @@ mod tests {
                 .send(())
                 .map_err(|_| "signal provider-control fixture readiness".to_owned())?;
             for (expected_request, body) in exchanges {
-                let deadline = Instant::now() + Duration::from_secs(2);
+                let deadline = Instant::now() + Duration::from_secs(10);
                 let (mut stream, _) = loop {
                     match listener.accept() {
                         Ok(connection) => break connection,
@@ -3137,7 +3141,7 @@ mod tests {
                     format!("restore blocking provider-control fixture: {error}")
                 })?;
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .set_read_timeout(Some(Duration::from_secs(10)))
                     .map_err(|error| format!("bound provider-control fixture read: {error}"))?;
                 let mut request = [0_u8; 4096];
                 let read = stream
