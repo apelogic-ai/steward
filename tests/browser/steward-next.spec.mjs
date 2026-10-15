@@ -5263,13 +5263,18 @@ test("the deployed admin template contract is accepted during the rolling Next c
   }
 });
 
-test("connection OAuth starts through a same-origin Rust mutation", async ({ browser }) => {
+test("connection OAuth polling opens provider sign-in in a new tab", async ({ browser }) => {
   const developer = await guardedPage(browser, { connectionPhase: "disconnected" });
   try {
     await developer.page.goto(`${origin}/connections`);
     const github = developer.page.getByRole("heading", { name: "GitHub" }).locator("xpath=ancestor::section[1]");
+    const popupPromise = developer.page.waitForEvent("popup");
     await github.getByRole("button", { name: "Connect", exact: true }).click();
-    await expect(developer.page).toHaveURL(`${origin}/connections?oauth=started`);
+    const popup = await popupPromise;
+    await expect(popup).toHaveURL(`${origin}/connections?oauth=started`);
+    await expect(developer.page).toHaveURL(`${origin}/connections`);
+    expect(await popup.evaluate(() => window.opener)).toBeNull();
+    await popup.close();
     expectMutationProof(developer.mutations.find((mutation) => mutation.path.endsWith("/start")));
   } finally {
     await closeGuardedPage(developer);
@@ -5298,8 +5303,13 @@ test("Connections starts Jira sign-in through Jira's provider route", async ({ b
     await expect(developer.page.getByRole("heading", { name: "GitHub" })).toBeVisible();
     await expect(developer.page.getByRole("heading", { name: "Jira" })).toBeVisible();
     const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
+    const popupPromise = developer.page.waitForEvent("popup");
     await jira.getByRole("button", { name: "Connect", exact: true }).click();
-    await expect(developer.page).toHaveURL(`${origin}/connections?oauth=started`);
+    const popup = await popupPromise;
+    await expect(popup).toHaveURL(`${origin}/connections?oauth=started`);
+    await expect(developer.page).toHaveURL(`${origin}/connections`);
+    expect(await popup.evaluate(() => window.opener)).toBeNull();
+    await popup.close();
     const start = developer.mutations.find((mutation) => mutation.path === "/app/api/v1/connections/jira/start");
     expectMutationProof(start);
   } finally {
@@ -5322,9 +5332,45 @@ test("Connections rejects a synchronous Jira start without an authorization URL"
   try {
     await developer.page.goto(`${origin}/connections`);
     const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
+    const popupPromise = developer.page.waitForEvent("popup");
     await jira.getByRole("button", { name: "Connect", exact: true }).click();
+    const popup = await popupPromise;
     await expect(developer.page.getByText("The connection action could not be completed.", { exact: true })).toBeVisible();
+    await expect.poll(() => popup.isClosed()).toBe(true);
     expectMutationProof(developer.mutations.find((mutation) => mutation.path === startPath));
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Connections falls back to same-tab sign-in when the new tab is blocked", async ({ browser }) => {
+  const developer = await guardedPage(browser, {
+    providerConnections: [{
+      provider: "jira",
+      displayName: "Jira",
+      actions: ["start"],
+      status: { phase: "disconnected", accountEmail: null, scopesRequired: ["read:jira-work"], scopesGranted: [], scopesMissing: ["read:jira-work"], activeCredentialExpiresAt: null, renewalCredentialExpiresAt: null },
+    }],
+  });
+  try {
+    await developer.page.goto(`${origin}/connections`);
+    await developer.page.evaluate(() => { window.open = () => null; });
+    const jira = developer.page.getByRole("heading", { name: "Jira" }).locator("xpath=ancestor::section[1]");
+    await jira.getByRole("button", { name: "Connect", exact: true }).click();
+    await expect(developer.page).toHaveURL(`${origin}/connections?oauth=started`);
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("Connections refreshes provider status when the page regains focus", async ({ browser }) => {
+  const developer = await guardedPage(browser);
+  try {
+    await developer.page.goto(`${origin}/connections`);
+    await expect(developer.page.getByRole("heading", { name: "GitHub" })).toBeVisible();
+    const refreshed = developer.page.waitForRequest((request) => new URL(request.url()).pathname === "/app/api/v1/connections");
+    await developer.page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await refreshed;
   } finally {
     await closeGuardedPage(developer);
   }
