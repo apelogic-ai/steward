@@ -30,17 +30,15 @@ describe("provider credential health", () => {
     expect(connectionHealth({ ...connected, phase: "reauth_required" }, now)).toBe("reauth_required");
   });
 
-  test("an expired active credential remains healthy when renewal capability is reported", () => {
-    const renewable = {
+  test("an expired active credential remains healthy when renewal happens on next use", () => {
+    const renewalOnUse = {
       ...connected,
-      scopesGranted: ["repo", "offline_access"],
       activeCredentialExpiresAt: "2026-09-14T11:00:00.000Z",
       renewalCredentialExpiresAt: null,
     };
 
-    expect(connectionHealth(renewable, now)).toBe("healthy");
-    expect(connectionHealth({ ...renewable, scopesGranted: ["repo"] }, now)).toBe("expired");
-    expect(connectionHealth({ ...renewable, renewalCredentialExpiresAt: "2026-09-14T11:00:00.000Z" }, now)).toBe("expired");
+    expect(connectionHealth(renewalOnUse, now)).toBe("healthy");
+    expect(connectionHealth({ ...renewalOnUse, renewalCredentialExpiresAt: "2026-09-14T11:00:00.000Z" }, now)).toBe("expired");
   });
 });
 

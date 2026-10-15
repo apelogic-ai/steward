@@ -10,16 +10,11 @@ export function connectionHealth(status: ProviderConnectionStatus, now = Date.no
   if (status.phase !== "connected") return "other";
   // An active credential may renew automatically. The renewal deadline, when reported,
   // is the date at which interactive authorization can actually become necessary.
-  const deadline = status.renewalCredentialExpiresAt
-    ?? (connectionRenewsAutomatically(status) ? null : status.activeCredentialExpiresAt);
+  const deadline = status.renewalCredentialExpiresAt;
   if (!deadline) return "healthy";
   const remaining = Date.parse(deadline) - now;
   if (!Number.isFinite(remaining) || remaining <= 0) return "expired";
   return remaining <= REAUTH_WARNING_MS ? "expiring_soon" : "healthy";
-}
-
-export function connectionRenewsAutomatically(status: ProviderConnectionStatus): boolean {
-  return status.scopesGranted.includes("offline_access");
 }
 
 export function connectionScopeStatus(status: ProviderConnectionStatus): ConnectionScopeStatus {

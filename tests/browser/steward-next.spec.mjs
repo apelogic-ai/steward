@@ -5364,7 +5364,7 @@ test("GitHub and Jira cards share action footers across disconnected, connected,
     {
       name: "connected",
       actions: ["start", "disconnect"],
-      status: { phase: "connected", accountEmail: "alice@example.com", scopesRequired: ["read"], scopesGranted: ["read", "offline_access"], scopesMissing: [], activeCredentialExpiresAt: "2026-09-14T11:00:00.000Z", renewalCredentialExpiresAt: null },
+      status: { phase: "connected", accountEmail: "alice@example.com", scopesRequired: ["read"], scopesGranted: ["read"], scopesMissing: [], activeCredentialExpiresAt: "2026-09-14T11:00:00.000Z", renewalCredentialExpiresAt: null },
       buttons: ["Reconnect", "Disconnect…"],
       primary: false,
     },
