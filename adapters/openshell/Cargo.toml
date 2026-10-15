@@ -18,8 +18,8 @@ reqwest = { workspace = true, features = ["stream"], optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2.workspace = true
-steward-ports = { path = "../../crates/steward-ports", version = "=0.0.0" }
-steward-types = { path = "../../crates/steward-types", version = "=0.0.0" }
+steward-ports = { path = "../../crates/steward-ports", version = "=0.3.18" }
+steward-types = { path = "../../crates/steward-types", version = "=0.3.18" }
 tokio = { workspace = true, features = ["sync"], optional = true }
 tonic = { workspace = true, features = ["tls-ring"], optional = true }
 
