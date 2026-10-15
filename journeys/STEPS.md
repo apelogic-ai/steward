@@ -1,6 +1,6 @@
 # Step vocabulary
 
-Every sentence used in the eleven `.feature` files follows one of the **63 patterns** below.
+Every sentence used in the eleven `.feature` files follows one of the **66 patterns** below.
 A new scenario should be written with these patterns. Add a pattern only when a person does or sees something that no pattern here can say.
 
 ## How to read a pattern
@@ -12,9 +12,9 @@ A new scenario should be written with these patterns. Add a pattern only when a 
 - `a/b` means one of the two words, for example `off/on`.
 - A pattern that ends with `:` is followed by a table.
 - A sentence without an actor ("the field ... shows ...", "the message ...") is about the screen of the person who acted last.
-- "Files" is the number of feature files (of 10) that use the pattern. "Uses" counts every use; a row of an Examples table counts once.
+- "Files" is the number of feature files (of 11) that use the pattern. "Uses" counts every use; a row of an Examples table counts once.
 
-## Setup (5)
+## Setup (6)
 
 What must be true before the person starts.
 
@@ -25,6 +25,7 @@ What must be true before the person starts.
 | `the repository {string} is allowed/unavailable in this installation` | repository placeholder | The installation allows (or does not allow) this repository. | 1 | 11 | J4 |
 | `the installation keeps execution logs` | none | Captured logs are stored. | 1 | 5 | J7 |
 | `{actor} has/have a run that ended as {string} with/without a captured execution log` | who; how the run ended: "succeeded", "failed", "cancelled" | A finished run of that person exists. | 3 | 9 | J4, J7, J9 |
+| `the Get started guide is visible` | none | The signed-in account has incomplete onboarding progress. If the guide was dismissed, the runner reopens it for the scenario and restores the original preference afterward. | 1 | 1 | J2 |
 
 ## Sign-in (3)
 
@@ -36,7 +37,7 @@ Who is at the screen.
 | `I am signed in as a user who is also an administrator` | none | One account that holds the member role and the administrator role. The default for journeys that need both. | 2 | 17 | J1, J3 |
 | `{actor} is signed in on a separate account` | who: "a user" (no administrator role), "an administrator" | A second person at a second browser. | 3 | 10 | J3, J9, J10 |
 
-## Any screen (23)
+## Any screen (25)
 
 Actions and sights that are the same on every screen.
 
@@ -65,6 +66,8 @@ Actions and sights that are the same on every screen.
 | `every amount of money on the page has 2 decimals and the unit "USD"` | none | For example "0.02 USD". | 3 | 3 | J2, J7, J9 |
 | `the message names {string}` | text | The message shown after the last action contains that field, name or limit. | 5 | 9 | J1, J3, J4, J6, J9 |
 | `the message says what to do next` | none | The message shown after the last action ends with an action the person can take. No exact text exists yet. | 4 | 12 | J3, J4, J6, J7 |
+| `the Get started guide and sidebar entry are hidden` | none | Both onboarding entry points disappear after the person hides the guide. | 1 | 1 | J2 |
+| `the Get started guide and sidebar entry are visible with the same progress` | none | Both onboarding entry points are visible, and hiding then reopening the guide does not reset its progress. | 1 | 2 | J2 |
 
 ## Templates (3)
 
@@ -132,7 +135,7 @@ Done by the operator, outside the web UI.
 
 ## Totals
 
-- Patterns: **63** (Setup 5, Sign-in 3, Any screen 23, Templates 3, Envelope requests 5, Tasks and runs 12, Logs 3, Administration 4, Configuration 5).
-- Used in 2 or more files: 42. Used in 1 file only: 21.
+- Patterns: **66** (Setup 6, Sign-in 3, Any screen 25, Templates 3, Envelope requests 5, Tasks and runs 12, Logs 3, Administration 4, Configuration 5).
+- Used in 2 or more files: 42. Used in 1 file only: 24.
 - The patterns whose meaning says "no exact text exists yet" or "the Markdown does not say" are placeholders. Each should be replaced by `{actor} see(s) {string}` with the real UI text, or by a concrete action, once that text is confirmed. That would lower the count.
 - One piece of supporting code is needed besides the sentences: the `{actor}` parameter (a list of the five names above).

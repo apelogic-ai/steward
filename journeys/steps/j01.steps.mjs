@@ -287,8 +287,7 @@ async function recordInitialRuns(journey, page) {
   journey.initialRunIds = new Set((await userRuns(page)).map((run) => run.taskUid));
 }
 
-async function provisionExtendedEnvelope(journey, page, name) {
-  const template = await ensureExtendedTemplate(page, name);
+async function provisionEnvelope(journey, page, template) {
   const requestedEnvelope = structuredClone(template.ceiling);
   requestedEnvelope.spec.runtimeMinutesLimit = journey.runRuntimeMinutes;
   const response = await mutationJson(page, "/app/api/v1/envelope-requests", "POST", {
@@ -299,6 +298,10 @@ async function provisionExtendedEnvelope(journey, page, name) {
   });
   expect(response?.request?.status, `${template.id} should auto-provision within its template limits`).toBe("provisioned");
   return response.request;
+}
+
+async function provisionExtendedEnvelope(journey, page, name) {
+  return provisionEnvelope(journey, page, await ensureExtendedTemplate(page, name));
 }
 
 async function chooseUnusedRuntimeMinutes(page) {
@@ -998,6 +1001,46 @@ Given("I am signed in as a user with the role {string}", async ({ journey, page 
   await recordInitialRuns(journey, page);
 });
 
+Given("the Get started guide is visible", async ({ journey, page }) => {
+  const preferences = await apiJson(page, "/app/api/v1/preferences");
+  expect(typeof preferences.onboardingDismissed, "the onboarding dismissal preference should be a boolean").toBe("boolean");
+  const originalOnboardingDismissed = preferences.onboardingDismissed;
+  journey.restoreOnboardingDismissal = async () => {
+    const current = await apiJson(page, "/app/api/v1/preferences");
+    if (current.onboardingDismissed !== originalOnboardingDismissed) {
+      await mutationJson(page, "/app/api/v1/preferences", "PUT", { onboardingDismissed: originalOnboardingDismissed });
+    }
+    const restored = await apiJson(page, "/app/api/v1/preferences");
+    expect(restored.onboardingDismissed, "the onboarding dismissal preference should be restored after the scenario").toBe(originalOnboardingDismissed);
+  };
+  if (preferences.onboardingDismissed) {
+    await mutationJson(page, "/app/api/v1/preferences", "PUT", { onboardingDismissed: false });
+    await page.reload();
+  }
+  const guide = page.locator('section[aria-label="Get started"]');
+  await expect(guide, "the signed-in account should have an incomplete Get started guide").toBeVisible();
+  journey.onboardingProgressLabel = await guide.getByRole("progressbar").getAttribute("aria-label");
+  expect(journey.onboardingProgressLabel, "the Get started guide should expose its current progress").toBeTruthy();
+});
+
+Then("the Get started guide and sidebar entry are hidden", async ({ page }) => {
+  await expect.poll(async () => (await apiJson(page, "/app/api/v1/preferences")).onboardingDismissed, {
+    message: "hiding Get started should persist the dismissal preference",
+  }).toBe(true);
+  await expect(page.locator('section[aria-label="Get started"]')).toHaveCount(0);
+  await expect(page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: /^Get started/ })).toHaveCount(0);
+});
+
+Then("the Get started guide and sidebar entry are visible with the same progress", async ({ journey, page }) => {
+  await expect.poll(async () => (await apiJson(page, "/app/api/v1/preferences")).onboardingDismissed, {
+    message: "reopening Get started should persist the visible preference",
+  }).toBe(false);
+  const guide = page.locator('section[aria-label="Get started"]');
+  await expect(guide).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: /^Get started/ })).toBeVisible();
+  await expect(guide.getByRole("progressbar")).toHaveAttribute("aria-label", journey.onboardingProgressLabel);
+});
+
 Given("I hold no Envelope", async ({ journey, page }) => {
   const count = (await userRequests(page)).filter((request) => request.templateId?.startsWith(`${runPrefix}-`)).length;
   expect(count, `run prefix ${runPrefix} should not already have an Envelope request`).toBe(0);
@@ -1007,6 +1050,11 @@ Given("I hold no Envelope", async ({ journey, page }) => {
 Given("I hold an Envelope from the template {string}", async ({ journey, page }, name) => {
   if (journey.jira && name === "jira-read") await ensureExtendedTemplate(page, name);
   let request = await requestForTemplate(page, name, "provisioned");
+  if (!request && name === "standard") {
+    const template = (await userTemplates(page)).find((candidate) => candidate.id === templateId(name));
+    expect(template, `template ${templateId(name)} should exist in the installation`).toBeDefined();
+    request = await provisionEnvelope(journey, page, template);
+  }
   if (!request && (journey.extended || journey.jira)) request = await provisionExtendedEnvelope(journey, page, name);
   expect(request, `a provisioned Envelope from ${templateId(name)} should exist`).toBeTruthy();
   journey.currentTemplate = name;
