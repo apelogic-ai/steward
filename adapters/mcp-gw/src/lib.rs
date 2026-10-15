@@ -782,7 +782,7 @@ impl ProviderAuthorizationStarter {
             read_bounded(response, MAX_RESPONSE_BYTES).await?,
         )?;
         let object = json_object(&body, "provider authorization response")?;
-        let authorization_url = exact_string_field(&object, "authorizationUrl")?;
+        let authorization_url = provider_authorization_url(&object)?;
         validate_authorization_url(&authorization_url)?;
         Ok(authorization_url)
     }
@@ -2937,6 +2937,28 @@ fn exact_string_field(object: &Map<String, Value>, expected: &str) -> Result<Str
         .ok_or_else(|| rejected("Connections bridge request is missing its exact string field"))
 }
 
+fn provider_authorization_url(object: &Map<String, Value>) -> Result<String, PortError> {
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "authorizationUrl" | "state"))
+    {
+        return Err(rejected(
+            "provider authorization response has unexpected fields",
+        ));
+    }
+    if object.get("state").is_some_and(|state| !state.is_string()) {
+        return Err(rejected(
+            "provider authorization response has an invalid state",
+        ));
+    }
+    object
+        .get("authorizationUrl")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| rejected("provider authorization response is missing its consent URL"))
+}
+
 fn valid_repository_component(value: &str, maximum: usize) -> bool {
     !value.is_empty()
         && value.len() <= maximum
@@ -3106,6 +3128,9 @@ mod tests {
                         }
                     }
                 };
+                stream.set_nonblocking(false).map_err(|error| {
+                    format!("restore blocking provider-control fixture: {error}")
+                })?;
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .map_err(|error| format!("bound provider-control fixture read: {error}"))?;
@@ -6111,7 +6136,9 @@ mod tests {
                     .contains("\r\nauthorization: bearer aaa.bbb.ccc\r\n")
             );
             assert!(request.ends_with("\r\n\r\n{}"));
-            let body = r#"{"authorizationUrl":"https://atlassian.test/authorize?state=one-time"}"#;
+            // MCP-GW owns this response contract. ProviderAuthorizationStarter is the reader;
+            // copying the real shape prevents a one-field fixture from hiding response drift.
+            let body = r#"{"authorizationUrl":"https://atlassian.test/authorize?state=one-time","state":"one-time"}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -6141,8 +6168,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_start_refuses_a_provider_mismatch_in_the_gateway_response() -> Result<(), String>
-    {
+    async fn direct_start_refuses_an_unknown_gateway_response_field() -> Result<(), String> {
         let listener = TcpListener::bind("127.0.0.1:0")
             .map_err(|error| format!("bind mismatched start fixture: {error}"))?;
         let address = listener
@@ -6161,7 +6187,7 @@ mod tests {
                     .starts_with("POST /connections/jira/authorize HTTP/1.1\r\n")
             );
             let body =
-                r#"{"provider":"github","authorizationUrl":"https://atlassian.test/authorize"}"#;
+                r#"{"authorizationUrl":"https://atlassian.test/authorize","unexpected":"value"}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -6182,7 +6208,30 @@ mod tests {
             .map_err(|_| "mismatched start fixture panicked".to_owned())??;
         assert!(
             result.is_err(),
-            "a response that names another provider must fail closed"
+            "an unknown response field must fail closed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_start_refuses_a_missing_authorization_url() -> Result<(), String> {
+        let (origin, server) = provider_control_fixture(vec![(
+            "POST /connections/jira/authorize HTTP/1.1\r\n",
+            r#"{"state":"one-time"}"#,
+        )])?;
+        let starter = ProviderAuthorizationStarter::new(&origin, "0.4.9")
+            .map_err(|error| format!("build direct start client: {error:?}"))?;
+        let credential = ProviderStartCredential::new("aaa.bbb.ccc".to_owned())
+            .map_err(|error| format!("build direct start credential: {error:?}"))?;
+
+        let result = starter.start(&credential, "jira").await;
+
+        server
+            .join()
+            .map_err(|_| "missing authorization URL fixture panicked".to_owned())??;
+        assert!(
+            result.is_err(),
+            "a response without authorizationUrl must fail closed"
         );
         Ok(())
     }

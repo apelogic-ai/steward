@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Jira sign-in now accepts the gateway's one-time state alongside its consent URL while still
+  refusing incomplete or unexpected responses.
 - Coding agents now receive the exact path of every repository workspace in their prompt, so a
   plain request about a repository can find its files while staged caller input and declared
   outputs keep their existing relative paths. A run that creates no regular file beneath `out/`
