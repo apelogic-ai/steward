@@ -47,7 +47,7 @@ bounded stream endpoint.
 | Workspace repositories and checkout paths | immutable direct or browser Task evidence | Submission snapshot | Available when the Task requested a workspace. Each entry preserves the exact repository, revision, destination, history request, and resolved evidence used for the Run. |
 | Stages | append-only lifecycle stage events plus current Task binding/state | Transactional/current | Admission, runtime binding, execution, and finalization are available. |
 | Execution step | bounded run presentation | Current | One agent-execution step names its stdout/stderr streams. Fine-grained agent steps are not claimed. |
-| Failure | `task_submissions.failure_reason` | Terminal Task snapshot | A bounded category is always derived when possible. `failureReason` is returned only for allowlisted actionable cases such as invalid coding-agent settings, missing required output, runtime or spending limits, and rejected inference requests; other stored text is withheld. |
+| Failure | `task_submissions.failure_reason` | Terminal Task snapshot | A bounded category is always derived when possible. `failureReason` is returned only for allowlisted actionable cases such as an agent that could not start, an approved tool that could not complete a request, invalid coding-agent settings, missing required output, runtime or spending limits, and rejected inference requests; other stored text is withheld. |
 
 `runtime_events` is not used for this API. It is not populated by the Task
 controller and current runtime phase remains a CRD-status concern. Treating it
@@ -93,6 +93,13 @@ events such as `admitted`, `runtimeBound`, `executionStarted`, and
 Envelope revision and digest, runtime binding carries runtime UID and ownership,
 and execution end carries a terminal exit category. Consumers must not invent
 missing transitions.
+
+An accepted coding-agent launch records `executionStarted` even when execution
+logs are disabled and the process reaches a terminal state before the next
+observation. `agent-start` means the launcher refused the process before that
+acceptance. `tool-failed` means an approved tool could not complete the request;
+it takes precedence over `output-missing` when the tool failure prevented the
+required output.
 
 `GET /app/api/v1/runs/{taskUid}/events` is the owner-scoped live-refresh
 boundary. It holds one `text/event-stream` response open, emits a complete

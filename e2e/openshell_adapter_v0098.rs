@@ -13,8 +13,8 @@ use steward_adapter_openshell::{
 };
 use steward_ports::{
     PortError, SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
-    SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
-    TaskExecutionAdapter, TaskExecutionPlanRequest,
+    SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TASK_AGENT_START_FAILURE,
+    TASK_TOOL_FAILURE, TaskAttemptId, TaskExecutionAdapter, TaskExecutionPlanRequest,
 };
 use steward_types::direct_package::{
     ContentDigest, DiagnosticsRequest, ExactGitCommit, ExecutionLogMode,
@@ -694,8 +694,80 @@ async fn verify_attempt_failure_semantics(
         }
     }
 
-    let synchronous_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000006".to_owned());
-    let synchronous_task = SandboxTaskRequest {
+    let tool_failure_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000008".to_owned());
+    let tool_failure_task = SandboxTaskRequest {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "printf '%s\n' 'Error: MCP: example_search failed: bounded_request_required' >&2; exit 1"
+                .to_owned(),
+        ],
+        diagnostics: DiagnosticsRequest {
+            execution_log: ExecutionLogMode::Off,
+        },
+        ..task.clone()
+    };
+    match runtime
+        .start_task(&tool_failure_attempt, &tool_failure_task, caller_archive)
+        .await
+        .map_err(|error| format!("tool-refusal task could not be observed: {error:?}"))?
+    {
+        SandboxTaskObservation::Failed { reason, .. } if reason == TASK_TOOL_FAILURE => {}
+        other => {
+            return Err(format!(
+                "real tool refusal did not retain its bounded category: {other:?}"
+            ));
+        }
+    }
+
+    let no_stderr_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000009".to_owned());
+    let no_stderr_task = SandboxTaskRequest {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "test ! -e /sandbox/.steward-attempts/{}/.steward/diagnostics/stderr.log; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; printf clean > \"$STEWARD_OUTPUT_DIR/out/result.txt\"",
+                tool_failure_attempt.0
+            ),
+        ],
+        diagnostics: DiagnosticsRequest {
+            execution_log: ExecutionLogMode::Off,
+        },
+        ..task.clone()
+    };
+    if !matches!(
+        runtime
+            .start_task(&no_stderr_attempt, &no_stderr_task, caller_archive)
+            .await
+            .map_err(|error| format!("diagnostics-off disk check failed: {error:?}"))?,
+        SandboxTaskObservation::Succeeded { .. }
+    ) {
+        return Err("executionLog=off left a stderr transcript in the sandbox".to_owned());
+    }
+
+    let agent_start_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000010".to_owned());
+    let agent_start_task = SandboxTaskRequest {
+        command: vec!["/sandbox/does-not-exist".to_owned()],
+        diagnostics: DiagnosticsRequest {
+            execution_log: ExecutionLogMode::Off,
+        },
+        ..task.clone()
+    };
+    match runtime
+        .start_task(&agent_start_attempt, &agent_start_task, caller_archive)
+        .await
+        .map_err(|error| format!("agent-start refusal could not be observed: {error:?}"))?
+    {
+        SandboxTaskObservation::Failed { reason, .. } if reason == TASK_AGENT_START_FAILURE => {}
+        other => {
+            return Err(format!(
+                "real agent-start refusal had the wrong category: {other:?}"
+            ));
+        }
+    }
+
+    let diagnostics_off_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000006".to_owned());
+    let diagnostics_off_task = SandboxTaskRequest {
         command: vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
@@ -709,9 +781,14 @@ async fn verify_attempt_failure_semantics(
     };
     if !matches!(
         runtime
-            .start_task(&synchronous_attempt, &synchronous_task, caller_archive)
-            .await,
-        Ok(SandboxTaskObservation::Succeeded { .. })
+            .start_task(
+                &diagnostics_off_attempt,
+                &diagnostics_off_task,
+                caller_archive,
+            )
+            .await
+            .map_err(|error| format!("diagnostics-off task could not start: {error:?}"))?,
+        SandboxTaskObservation::Succeeded { .. }
     ) {
         return Err(
             "executionLog=off did not retain synchronous terminal start behavior".to_owned(),

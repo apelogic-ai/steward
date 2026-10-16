@@ -9647,11 +9647,23 @@ impl PgStore {
             TaskExecutionObservation::Failed {
                 adapter_observation_id,
                 reason,
+                execution_started,
                 output_archive,
                 output_archive_contract,
                 execution_stdout,
                 execution_stderr,
             } => {
+                if execution_started {
+                    sqlx::query(
+                        "UPDATE task_submissions SET phase = 'running', updated_at = now() \
+                         WHERE task_uid = $1 AND phase = 'queued' AND NOT finalize_requested \
+                           AND NOT cancel_requested",
+                    )
+                    .bind(current.task_uid)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(database_error)?;
+                }
                 sqlx::query(
                     "UPDATE task_execution_attempts \
                      SET state = 'failed', generation = generation + 1, \
@@ -12640,6 +12652,7 @@ pub enum TaskExecutionObservation<'a> {
     Failed {
         adapter_observation_id: &'a str,
         reason: &'a str,
+        execution_started: bool,
         output_archive: Option<&'a [u8]>,
         output_archive_contract: Option<&'a str>,
         execution_stdout: Option<&'a [u8]>,
@@ -12683,6 +12696,7 @@ impl TaskExecutionObservation<'_> {
             Self::Failed {
                 adapter_observation_id,
                 reason,
+                execution_started: _,
                 output_archive,
                 output_archive_contract,
                 execution_stdout,
@@ -12734,6 +12748,7 @@ mod execution_log_tests {
         let without_contract = TaskExecutionObservation::Failed {
             adapter_observation_id: "attempt-a",
             reason: "agent",
+            execution_started: false,
             output_archive: Some(b"archive"),
             output_archive_contract: None,
             execution_stdout: None,
@@ -12742,6 +12757,7 @@ mod execution_log_tests {
         let without_archive = TaskExecutionObservation::Failed {
             adapter_observation_id: "attempt-b",
             reason: "agent",
+            execution_started: false,
             output_archive: None,
             output_archive_contract: Some(TASK_OUTPUT_ARCHIVE_CONTRACT),
             execution_stdout: None,

@@ -47,7 +47,8 @@ use steward_ports::{
     REQUIRED_OUTPUT_MISSING_FAILURE, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
     SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
     SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
-    SandboxTaskTranscript, TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
+    SandboxTaskTranscript, TASK_AGENT_START_FAILURE, TASK_TOOL_FAILURE, TaskAttemptId,
+    WORKSPACE_PREPARATION_FAILURE,
 };
 #[cfg(feature = "runtime")]
 use steward_types::direct_package::{
@@ -649,6 +650,30 @@ fn task_agent_failure_category(stderr: &[u8]) -> &'static str {
 }
 
 #[cfg(feature = "runtime")]
+fn has_tool_failure_line(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr).lines().any(|line| {
+        let line = line.trim();
+        let Some(failure) = line.strip_prefix("Error: MCP: ") else {
+            return false;
+        };
+        let Some((tool, reason)) = failure.split_once(" failed: ") else {
+            return false;
+        };
+        !tool.trim().is_empty() && !reason.trim().is_empty()
+    })
+}
+
+#[cfg(feature = "runtime")]
+fn is_agent_start_failure(exit_code: i32, stderr: &[u8]) -> bool {
+    matches!(exit_code, 126 | 127)
+        && String::from_utf8_lossy(stderr).lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("/bin/sh: ")
+                && (line.ends_with(": not found") || line.ends_with(": Permission denied"))
+        })
+}
+
+#[cfg(feature = "runtime")]
 fn managed_inference_failure_category(
     stderr: &[u8],
     model_providers: &[String],
@@ -695,10 +720,30 @@ fn task_failure_category(
     model_providers: &[String],
 ) -> &'static str {
     let existing = task_agent_failure_category(stderr);
-    if managed_inference && matches!(existing, "agent" | "authentication") {
-        managed_inference_failure_category(stderr, model_providers).unwrap_or(existing)
+    if managed_inference
+        && matches!(existing, "agent" | "authentication")
+        && let Some(category) = managed_inference_failure_category(stderr, model_providers)
+    {
+        return category;
+    }
+    if has_tool_failure_line(stderr) {
+        return TASK_TOOL_FAILURE;
+    }
+    existing
+}
+
+#[cfg(feature = "runtime")]
+fn required_output_failure_reason(
+    stderr: Option<&[u8]>,
+    managed_inference: bool,
+    model_providers: &[String],
+) -> String {
+    if stderr.is_some_and(|stderr| {
+        task_failure_category(stderr, managed_inference, model_providers) == TASK_TOOL_FAILURE
+    }) {
+        TASK_TOOL_FAILURE.to_owned()
     } else {
-        existing
+        REQUIRED_OUTPUT_MISSING_FAILURE.to_owned()
     }
 }
 
@@ -730,6 +775,7 @@ fn request_model_providers(request: &SandboxTaskRequest) -> Vec<String> {
 #[cfg(feature = "runtime")]
 fn attach_task_agent_failure_category(
     observation: SandboxTaskObservation,
+    exit_code: i32,
     stdout: &[u8],
     stderr: &[u8],
     retain_transcript: bool,
@@ -742,11 +788,17 @@ fn attach_task_agent_failure_category(
             reason,
             output,
         } => {
-            let reason = if reason == REQUIRED_OUTPUT_MISSING_FAILURE {
-                reason
+            let category = if is_agent_start_failure(exit_code, stderr) {
+                TASK_AGENT_START_FAILURE
             } else {
-                task_failure_category(stderr, managed_inference, model_providers).to_owned()
+                task_failure_category(stderr, managed_inference, model_providers)
             };
+            let reason =
+                if reason == REQUIRED_OUTPUT_MISSING_FAILURE && category != TASK_TOOL_FAILURE {
+                    reason
+                } else {
+                    category.to_owned()
+                };
             if retain_transcript {
                 SandboxTaskObservation::FailedWithTranscript {
                     adapter_observation_id,
@@ -2769,12 +2821,14 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             request.execution_binding.as_ref(),
         );
         let failed_output_archive_command = failed_output_archive_command(request.execution_class);
+        let retain_transcript =
+            task_transcript_requested(request.execution_class, request.diagnostics.execution_log);
         let wrapped_command = task_attempt_execution_command(
             &attempt_directory,
             &request.command,
             &output_archive_command,
             failed_output_archive_command.as_deref(),
-            task_transcript_requested(request.execution_class, request.diagnostics.execution_log),
+            retain_transcript,
         );
         let launch_mode =
             task_process_launch_mode(request.execution_class, request.diagnostics.execution_log);
@@ -2804,11 +2858,11 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                 }
                 Ok(_) => {
                     eprintln!(
-                        "openshell_task_launch_failed runtime_uid=\"{}\" category=launcher_rejected",
+                        "openshell_task_launch_failed runtime_uid=\"{}\" category=launcher_unconfirmed",
                         escaped_task_log_value(request.runtime.0.as_bytes())
                     );
                     Err(PortError::Failed {
-                        reason: "OpenShell task launch was not accepted".to_owned(),
+                        reason: "OpenShell task launch could not be confirmed".to_owned(),
                     })
                 }
                 Err(error) => {
@@ -2829,6 +2883,7 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                     .map(|observation| {
                         attach_task_agent_failure_category(
                             observation,
+                            executed.exit_code,
                             &executed.stdout,
                             &executed.stderr,
                             task_transcript_requested(
@@ -2978,7 +3033,14 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                         MAX_EXECUTION_STREAM_BYTES / (1024 * 1024)
                     )
                 } else if payload == REQUIRED_OUTPUT_MISSING_REASON.as_bytes() {
-                    REQUIRED_OUTPUT_MISSING_FAILURE.to_owned()
+                    let category_stderr = transcript
+                        .as_ref()
+                        .map(|transcript| transcript.stderr.as_slice());
+                    required_output_failure_reason(
+                        category_stderr,
+                        request_uses_managed_inference(request),
+                        &model_providers,
+                    )
                 } else {
                     transcript.as_ref().map_or_else(
                         || {
@@ -3568,7 +3630,8 @@ mod tests {
     #[cfg(feature = "runtime")]
     use steward_ports::{
         PortError, SandboxExecutionClass, SandboxRequest, SandboxTaskObservation,
-        SandboxTaskOutput, SandboxTaskRequest, SandboxTaskTranscript, TaskAttemptId,
+        SandboxTaskOutput, SandboxTaskRequest, SandboxTaskTranscript, TASK_TOOL_FAILURE,
+        TaskAttemptId,
     };
     #[cfg(feature = "runtime")]
     use steward_types::direct_package::{
@@ -3597,9 +3660,9 @@ mod tests {
         failed_output_archive_command, load_source_credential, output_archive_command,
         project_request, provider_reconciliation, provider_reconciliation_plan,
         provider_reconciliation_targets, repository_prompt_context, request_model_providers,
-        sandbox_spec, sanitized_provider_control_transcript, staging_append_command,
-        staging_archive_chunks, staging_extract_command, staging_prepare_command,
-        task_agent_failure_category, task_attempt_cancel_command,
+        required_output_failure_reason, sandbox_spec, sanitized_provider_control_transcript,
+        staging_append_command, staging_archive_chunks, staging_extract_command,
+        staging_prepare_command, task_agent_failure_category, task_attempt_cancel_command,
         task_attempt_detached_launch_command, task_attempt_directory,
         task_attempt_execution_command, task_attempt_failed_output_command,
         task_attempt_observation_command, task_attempt_transcript_stream_command,
@@ -4150,7 +4213,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn full_diagnostics_agent_launch_is_sandbox_detached_and_cancellable() {
+    fn only_full_diagnostics_agent_launch_is_sandbox_detached_and_cancellable() {
         assert_eq!(
             task_process_launch_mode(SandboxExecutionClass::Agent, ExecutionLogMode::Full),
             TaskProcessLaunchMode::SandboxDetached
@@ -5954,7 +6017,37 @@ mod tests {
             task_agent_failure_category(b"provider returned unauthorized status 401"),
             "authentication"
         );
+        assert_eq!(
+            task_failure_category(
+                b"Error: MCP: example_search ({\"query\":\"status = open\"}) failed: bounded_request_required",
+                false,
+                &[],
+            ),
+            TASK_TOOL_FAILURE
+        );
+        assert_eq!(
+            task_failure_category(b"MCP: request queued\nunrelated step failed", false, &[]),
+            "agent",
+            "separate MCP and failure text must not manufacture a tool refusal"
+        );
+        assert_eq!(
+            task_failure_category(
+                b"Error: MCP: example_search failed: bounded_request_required\nexample-provider error: incorrect api key provided",
+                true,
+                &model_providers,
+            ),
+            "inference_key_rejected",
+            "an admitted inference failure must take precedence over a tool-shaped line"
+        );
         assert_eq!(task_agent_failure_category(b"opaque failure"), "agent");
+        assert!(super::is_agent_start_failure(
+            127,
+            b"/bin/sh: 1: /sandbox/does-not-exist: not found\n"
+        ));
+        assert!(!super::is_agent_start_failure(
+            1,
+            b"/bin/sh: 1: /sandbox/does-not-exist: not found\n"
+        ));
         assert_eq!(
             task_failure_category(
                 b"example-provider error: incorrect api key provided",
@@ -6079,6 +6172,7 @@ mod tests {
                     output: None,
                     transcript: transcript.clone(),
                 },
+                1,
                 b"ignored stdout",
                 b"steward-connections-bridge: bridge MCP-GW rejected runtime authorization",
                 false,
@@ -6101,6 +6195,7 @@ mod tests {
                     output: None,
                     transcript: transcript.clone(),
                 },
+                1,
                 b"ignored stdout",
                 b"opaque stderr",
                 true,
@@ -6125,6 +6220,7 @@ mod tests {
                     },
                     transcript: transcript.clone(),
                 },
+                0,
                 b"ignored stdout",
                 b"opaque stderr",
                 false,
@@ -6148,6 +6244,7 @@ mod tests {
                     reason: super::REQUIRED_OUTPUT_MISSING_FAILURE.to_owned(),
                     output: None,
                 },
+                0,
                 b"stdout",
                 b"",
                 true,
@@ -6164,6 +6261,63 @@ mod tests {
                 },
             },
             "a missing-output failure must retain its reason and bounded process transcript"
+        );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn tool_failure_takes_precedence_over_the_missing_output_fallback() {
+        assert_eq!(
+            required_output_failure_reason(
+                Some(b"Error: MCP: example_search failed: bounded_request_required"),
+                false,
+                &[],
+            ),
+            TASK_TOOL_FAILURE
+        );
+        assert_eq!(
+            required_output_failure_reason(Some(b"ordinary agent output"), false, &[]),
+            super::REQUIRED_OUTPUT_MISSING_FAILURE
+        );
+        assert_eq!(
+            attach_task_agent_failure_category(
+                SandboxTaskObservation::Failed {
+                    adapter_observation_id: "attempt-tool".to_owned(),
+                    reason: super::REQUIRED_OUTPUT_MISSING_FAILURE.to_owned(),
+                    output: None,
+                },
+                1,
+                b"",
+                b"Error: MCP: example_search failed: bounded_request_required",
+                false,
+                false,
+                &[],
+            ),
+            SandboxTaskObservation::Failed {
+                adapter_observation_id: "attempt-tool".to_owned(),
+                reason: TASK_TOOL_FAILURE.to_owned(),
+                output: None,
+            }
+        );
+        assert_eq!(
+            attach_task_agent_failure_category(
+                SandboxTaskObservation::Failed {
+                    adapter_observation_id: "attempt-start".to_owned(),
+                    reason: "raw failure".to_owned(),
+                    output: None,
+                },
+                127,
+                b"",
+                b"/bin/sh: 1: /sandbox/does-not-exist: not found\n",
+                false,
+                false,
+                &[],
+            ),
+            SandboxTaskObservation::Failed {
+                adapter_observation_id: "attempt-start".to_owned(),
+                reason: super::TASK_AGENT_START_FAILURE.to_owned(),
+                output: None,
+            }
         );
     }
 

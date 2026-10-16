@@ -19,7 +19,8 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_ports::{
     INFERENCE_REQUEST_REJECTED_FAILURE, REQUIRED_OUTPUT_MISSING_FAILURE,
-    SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, WORKSPACE_PREPARATION_FAILURE,
+    SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, TASK_AGENT_START_FAILURE, TASK_TOOL_FAILURE,
+    WORKSPACE_PREPARATION_FAILURE,
 };
 use steward_store::{
     AgentRunExecutionLog, AgentRunLogStream, AgentRunOutputArchive, AgentRunPage, AgentRunQuery,
@@ -2869,6 +2870,8 @@ pub(crate) fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
         reason,
         REQUIRED_OUTPUT_MISSING_FAILURE
             | SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE
+            | TASK_AGENT_START_FAILURE
+            | TASK_TOOL_FAILURE
             | WORKSPACE_PREPARATION_FAILURE
     ) {
         return Some(reason);
@@ -3111,6 +3114,28 @@ mod tests {
 
     type FakeExecutionLogs = Arc<Mutex<HashMap<(Uuid, AgentRunLogStream), Vec<u8>>>>;
     type GithubRerunQuery = (String, String, String, u32);
+
+    #[test]
+    fn start_and_tool_failures_have_bounded_public_presentations() {
+        let start_reason = "This run could not start its coding agent. Try again or ask an administrator to check the installation.";
+        assert_eq!(
+            public_run_failure_reason(Some(start_reason)),
+            Some(start_reason)
+        );
+        assert_eq!(
+            bounded_task_error_category(Some(start_reason)),
+            Some("agent-start")
+        );
+
+        assert_eq!(
+            public_run_failure_reason(Some(steward_ports::TASK_TOOL_FAILURE)),
+            Some("This run stopped because an approved tool could not complete the request.")
+        );
+        assert_eq!(
+            bounded_task_error_category(Some(steward_ports::TASK_TOOL_FAILURE)),
+            Some("tool-failed")
+        );
+    }
 
     #[derive(Clone, Default)]
     struct FakeLedger {
