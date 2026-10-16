@@ -2231,8 +2231,19 @@ where
     let execution_log = record
         .direct_task_evidence
         .as_ref()
-        .map(|evidence| evidence.diagnostics.execution_log);
-    let archive = if failed || execution_log == Some(ExecutionLogMode::Full) {
+        .map(|evidence| evidence.diagnostics.execution_log)
+        .or_else(|| {
+            record
+                .browser_task_evidence
+                .as_ref()
+                .map(|evidence| evidence.diagnostics.execution_log)
+        });
+    let archive = if failed && execution_log != Some(ExecutionLogMode::Full) {
+        let Some(archive) = archive else {
+            return StatusCode::NO_CONTENT.into_response();
+        };
+        archive
+    } else if execution_log == Some(ExecutionLogMode::Full) {
         let transcript = match state
             .application
             .ledger
@@ -2244,6 +2255,7 @@ where
             .await
         {
             Ok(Some(transcript)) => transcript,
+            Ok(None) if failed => return StatusCode::NO_CONTENT.into_response(),
             Ok(None) => return ApiError::TaskOutputNotReady.into_response(),
             Err(error) => return ApiError::Store(error).into_response(),
         };

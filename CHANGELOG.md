@@ -11,9 +11,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - Tasks submitted through the API without browser or GitHub source evidence now report their Run
   origin as `api`, while existing browser, GitHub Actions, and Connections origins are unchanged.
-- Authenticated Task callers can now download bounded stdout and stderr after an agent process
-  fails, together with any validated partial `out/` files. Successful Task downloads and browser
-  output behavior are unchanged.
+- Authenticated Task callers can now download validated partial `out/` files after an agent
+  process fails. Failed Tasks also include bounded stdout and stderr when they requested full
+  diagnostics; missing or disabled diagnostics remain private, and browser output behavior is
+  unchanged. A terminal failure with nothing to download returns `204 No Content`.
 
 ### Fixed
 

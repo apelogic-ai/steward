@@ -290,8 +290,7 @@ pub struct SandboxTaskOutput {
 }
 
 /// Bounded process output captured for an Agent Task when full execution diagnostics were
-/// selected, when an Agent Task fails, or for a provider-control bridge whose output contract
-/// is itself sanitized.
+/// selected, or for a provider-control bridge whose output contract is itself sanitized.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxTaskTranscript {
     pub stdout: Vec<u8>,

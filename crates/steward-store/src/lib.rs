@@ -5512,7 +5512,7 @@ impl PgStore {
             "INSERT INTO envelope_request_decision_filing_claims \
              (request_id, token, claimed_by) \
              SELECT requests.id, $2, $3 FROM envelope_requests requests \
-             LEFT JOIN LATERAL ( \
+             JOIN LATERAL ( \
                  SELECT events.status FROM envelope_request_events events \
                  WHERE events.request_id = requests.id \
                  ORDER BY events.id DESC LIMIT 1 \
@@ -5781,7 +5781,7 @@ impl PgStore {
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at \
              FROM envelope_requests requests \
              JOIN canonical_users users ON users.user_id = requests.owner_user_id \
-             JOIN LATERAL ( \
+             LEFT JOIN LATERAL ( \
                  SELECT revisions.revision, revisions.spec \
                  FROM envelope_template_revisions revisions \
                  WHERE revisions.template_id = requests.template_id \
@@ -12715,7 +12715,7 @@ fn execution_logs_are_valid(stdout: Option<&[u8]>, stderr: Option<&[u8]>) -> boo
 mod execution_log_tests {
     use steward_types::direct_package::MAX_EXECUTION_STREAM_BYTES;
 
-    use super::execution_logs_are_valid;
+    use super::{TASK_OUTPUT_ARCHIVE_CONTRACT, TaskExecutionObservation, execution_logs_are_valid};
 
     #[test]
     fn logs_must_be_paired_and_individually_bounded() {
@@ -12727,6 +12727,28 @@ mod execution_log_tests {
         let oversized = vec![0; MAX_EXECUTION_STREAM_BYTES as usize + 1];
         assert!(!execution_logs_are_valid(Some(&oversized), Some(b"stderr")));
         assert!(!execution_logs_are_valid(Some(b"stdout"), Some(&oversized)));
+    }
+
+    #[test]
+    fn failed_output_archive_and_contract_must_be_present_together() {
+        let without_contract = TaskExecutionObservation::Failed {
+            adapter_observation_id: "attempt-a",
+            reason: "agent",
+            output_archive: Some(b"archive"),
+            output_archive_contract: None,
+            execution_stdout: None,
+            execution_stderr: None,
+        };
+        let without_archive = TaskExecutionObservation::Failed {
+            adapter_observation_id: "attempt-b",
+            reason: "agent",
+            output_archive: None,
+            output_archive_contract: Some(TASK_OUTPUT_ARCHIVE_CONTRACT),
+            execution_stdout: None,
+            execution_stderr: None,
+        };
+        assert!(!without_contract.is_valid());
+        assert!(!without_archive.is_valid());
     }
 }
 

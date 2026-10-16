@@ -726,11 +726,12 @@ pub async fn task_status_contract() {}
     params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
     security(("taskBearer" = [])),
     responses(
-        (status = 200, description = "Opaque workspace-relative output tar archive for a succeeded or failed Task. A failed Task whose agent process started carries the reserved .steward/diagnostics/stdout.log and stderr.log transcript plus any validated partial out/ content. A succeeded Task carries those entries only when its snapshotted diagnostics.executionLog is full. Stored output is at most 64 MiB and each transcript stream is at most 4 MiB, so the download is at most 64 MiB plus 8 MiB plus tar headers", body = TaskArchive, content_type = "application/x-tar"),
+        (status = 200, description = "Opaque workspace-relative output tar archive for a succeeded or failed Task. A failed Task carries validated partial out/ content and includes the reserved .steward/diagnostics/stdout.log and stderr.log transcript only when its snapshotted diagnostics.executionLog is full. A succeeded Task also carries those entries only for full diagnostics. Stored output is at most 64 MiB and each transcript stream is at most 4 MiB, so the download is at most 64 MiB plus 8 MiB plus tar headers", body = TaskArchive, content_type = "application/x-tar"),
+        (status = 204, description = "The Task failed terminally without partial output or a requested bounded execution transcript"),
         (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
         (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
         (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
-        (status = 409, description = "Task is not finished or no bounded output or execution log is available", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 409, description = "Task is not finished", body = TaskErrorResponse, content_type = "application/json"),
         (status = 500, description = "task_output_delivery_failed: the output cannot be delivered within its contract (failureReason execution_transcript_unavailable, execution_transcript_too_large, or output_archive_contract_violation); not retryable", body = TaskErrorResponse, content_type = "application/json"),
         (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
     )
@@ -14145,7 +14146,9 @@ mod tests {
         let app = direct_test_app(ledger.clone(), same_repository_direct_git_fixture()?)?;
         let stored =
             stored_output_archive(&[("out/", b"", b'5'), ("out/partial.txt", b"partial\n", b'0')]);
-        let task_uid = submit_package_path_task(&app, "failed-runner-outputs", None).await?;
+        let full = Some(serde_json::json!({ "executionLog": "full" }));
+        let task_uid =
+            submit_package_path_task(&app, "failed-runner-outputs", full.clone()).await?;
         fail_fake_task(
             &ledger,
             task_uid,
@@ -14165,6 +14168,30 @@ mod tests {
             .map_err(|error| format!("expected failed runner archive: {error:?}"))?;
         assert_eq!(body, expected);
 
+        let off = submit_package_path_task(&app, "failed-runner-outputs-off", None).await?;
+        fail_fake_task(
+            &ledger,
+            off,
+            Some(&stored_output_archive(&[
+                ("out/", b"", b'5'),
+                ("out/partial.txt", b"partial\n", b'0'),
+            ])),
+            Some(strict_transcript(b"must not leak", b"must not leak")),
+        )?;
+        let (status, content_type, body) = runner_outputs(&app, off).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("application/x-tar"));
+        assert_eq!(
+            body,
+            stored_output_archive(&[("out/", b"", b'5'), ("out/partial.txt", b"partial\n", b'0'),]),
+            "execution-log: off returns only validated partial output"
+        );
+        assert!(
+            !body
+                .windows("must not leak".len())
+                .any(|window| window == b"must not leak")
+        );
+
         let (status, _, body) = runner_outputs_as(&app, task_uid, "github-bob-assertion").await?;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(
@@ -14175,7 +14202,7 @@ mod tests {
         );
 
         let diagnostics_only =
-            submit_package_path_task(&app, "failed-runner-diagnostics-only", None).await?;
+            submit_package_path_task(&app, "failed-runner-diagnostics-only", full).await?;
         fail_fake_task(
             &ledger,
             diagnostics_only,
@@ -14201,10 +14228,8 @@ mod tests {
             submit_package_path_task(&app, "failed-runner-before-execution", None).await?;
         fail_fake_task(&ledger, before_execution, None, None)?;
         let (status, _, body) = runner_outputs(&app, before_execution).await?;
-        assert_eq!(status, StatusCode::CONFLICT);
-        let body: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|error| format!("decode failed-run pending response: {error}"))?;
-        assert_eq!(body, serde_json::json!({ "error": "TaskOutputNotReady" }));
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(body.is_empty());
         Ok(())
     }
 
@@ -14243,9 +14268,12 @@ mod tests {
             ),
         ];
         for (name, archive, transcript, failure_reason) in cases {
-            let task_uid =
-                submit_package_path_task(&app, &format!("failed-runner-refusal-{name}"), None)
-                    .await?;
+            let task_uid = submit_package_path_task(
+                &app,
+                &format!("failed-runner-refusal-{name}"),
+                Some(serde_json::json!({ "executionLog": "full" })),
+            )
+            .await?;
             fail_fake_task(&ledger, task_uid, archive, Some(transcript))?;
             let (status, _, body) = runner_outputs(&app, task_uid).await?;
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{name}");

@@ -65,7 +65,8 @@ not an Envelope UUID. Product configuration should omit it; internal Envelope UI
 revision, and digest remain mandatory immutable evidence.
 
 Missing diagnostics, `{}`, or `executionLog: off` means no caller-visible execution
-transcript. A v2 create/status representation always returns the server-snapshotted
+transcript, including when the agent process fails. A v2 create/status representation always
+returns the server-snapshotted
 effective diagnostics object and the immutable source-authority evidence. The status
 and evidence Task UID and diagnostics must match. A runner requires that authenticated
 `full` signal as well as the reserved files before replay; file presence alone grants
@@ -258,13 +259,14 @@ runner, so no difference between tar parsers can expose an entry Steward did not
 validate. The stored archive is at most 64 MiB, so this download is at most 64 MiB plus
 the 8 MiB transcript plus Steward's tar headers.
 
-Starting in Steward 0.3.20, when an agent process fails, the same authenticated outputs route returns the two bounded
-transcript entries regardless of whether the snapshotted diagnostic mode is `full` or `off`.
-If the failed process left one or more regular files beneath `out/`, Steward validates and
-rewrites that partial tree before adding the transcript. If it left no declared output, the tar
-contains only the two transcript entries. A failure before the process starts has no process
-transcript and therefore no downloadable archive; the Task status carries its safe failure
-reason. Submitter and owner scoping is identical for succeeded and failed downloads.
+Starting in Steward 0.3.20, when an agent process fails, the same authenticated outputs route
+returns any validated partial `out/` tree. With `executionLog: full`, Steward rewrites that tree
+and adds the two bounded transcript entries; if no partial output exists, the tar contains only
+the transcript. With missing diagnostics or `executionLog: off`, the route returns only the
+partial `out/` archive and never exposes a transcript. A terminal failure with neither partial
+output nor a requested bounded transcript returns `204 No Content`, distinct from the `409`
+returned while a Task is unfinished. The Task status carries its safe failure reason. Submitter
+and owner scoping is identical for succeeded and failed downloads.
 
 If a required transcript is missing or out of bounds, or a stored archive violates its
 contract, the download fails with a non-retryable `500` and
@@ -277,7 +279,8 @@ validation, and a sensitive-output warning.
 The streams may reproduce prompts, model output, repository data, and tool results.
 Injected credentials, bearer tokens, private keys, provider-control material, and
 hidden model reasoning must never enter them. Durable stdout and stderr for started execution
-attempts, including failed attempts, are stored outside the output archive and exposed to the
+attempts whose snapshotted diagnostic mode is `full`, including failed attempts, are stored
+outside the output archive and exposed to the
 authenticated owner at `/app/api/v1/runs/{taskUid}/logs/stdout` and
 `/app/api/v1/runs/{taskUid}/logs/stderr`. Rejected Tasks have no process attempt and therefore no
 process logs.

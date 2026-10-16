@@ -747,14 +747,12 @@ fn attach_task_agent_failure_category(
             } else {
                 task_failure_category(stderr, managed_inference, model_providers).to_owned()
             };
-            if retain_transcript
-                && let Some(transcript) = bounded_task_process_transcript(stdout, stderr)
-            {
+            if retain_transcript {
                 SandboxTaskObservation::FailedWithTranscript {
                     adapter_observation_id,
                     reason,
                     output,
-                    transcript,
+                    transcript: bounded_task_process_transcript(stdout, stderr),
                 }
             } else {
                 SandboxTaskObservation::Failed {
@@ -769,31 +767,50 @@ fn attach_task_agent_failure_category(
             reason,
             output,
             transcript,
-        } => SandboxTaskObservation::FailedWithTranscript {
-            adapter_observation_id,
-            reason: if reason == REQUIRED_OUTPUT_MISSING_FAILURE {
+        } => {
+            let reason = if reason == REQUIRED_OUTPUT_MISSING_FAILURE {
                 reason
             } else {
                 task_failure_category(stderr, managed_inference, model_providers).to_owned()
-            },
-            output,
-            transcript,
-        },
+            };
+            if retain_transcript {
+                SandboxTaskObservation::FailedWithTranscript {
+                    adapter_observation_id,
+                    reason,
+                    output,
+                    transcript,
+                }
+            } else {
+                SandboxTaskObservation::Failed {
+                    adapter_observation_id,
+                    reason,
+                    output,
+                }
+            }
+        }
         observation => observation,
     }
 }
 
 #[cfg(feature = "runtime")]
-fn bounded_task_process_transcript(stdout: &[u8], stderr: &[u8]) -> Option<SandboxTaskTranscript> {
-    let stdout_bytes = u64::try_from(stdout.len()).ok()?;
-    let stderr_bytes = u64::try_from(stderr.len()).ok()?;
-    (stdout_bytes <= MAX_EXECUTION_STREAM_BYTES
-        && stderr_bytes <= MAX_EXECUTION_STREAM_BYTES
-        && stdout_bytes.saturating_add(stderr_bytes) <= MAX_EXECUTION_TRANSCRIPT_BYTES)
-        .then(|| SandboxTaskTranscript {
-            stdout: stdout.to_vec(),
-            stderr: stderr.to_vec(),
-        })
+fn bounded_task_process_transcript(stdout: &[u8], stderr: &[u8]) -> SandboxTaskTranscript {
+    SandboxTaskTranscript {
+        stdout: bounded_task_process_stream(stdout),
+        stderr: bounded_task_process_stream(stderr),
+    }
+}
+
+#[cfg(feature = "runtime")]
+fn bounded_task_process_stream(stream: &[u8]) -> Vec<u8> {
+    let limit = usize::try_from(MAX_EXECUTION_STREAM_BYTES).unwrap_or(usize::MAX);
+    if stream.len() <= limit {
+        return stream.to_vec();
+    }
+    let retained = limit.saturating_sub(EXECUTION_TRANSCRIPT_TRUNCATION_MARKER.len());
+    let mut bounded = Vec::with_capacity(limit);
+    bounded.extend_from_slice(EXECUTION_TRANSCRIPT_TRUNCATION_MARKER.as_bytes());
+    bounded.extend_from_slice(&stream[stream.len().saturating_sub(retained)..]);
+    bounded
 }
 
 #[cfg(feature = "runtime")]
@@ -2057,35 +2074,31 @@ impl OpenShellRuntime {
         sandbox: &str,
         directory: &str,
     ) -> Result<Option<SandboxTaskOutput>, PortError> {
-        let output = self
-            .authenticated_client()
-            .await?
-            .workspace(workspace)
-            .exec(
-                sandbox,
-                &[
-                    "/bin/sh".to_owned(),
-                    "-c".to_owned(),
-                    task_attempt_failed_output_command(directory),
-                ],
-                ExecOptions {
-                    timeout: Some(StdDuration::from_secs(120)),
-                    ..ExecOptions::default()
-                },
-            )
-            .await
-            .map_err(port_failure)?;
-        if output.exit_code == 44 {
+        let output = match self.authenticated_client().await {
+            Ok(client) => {
+                client
+                    .workspace(workspace)
+                    .exec(
+                        sandbox,
+                        &[
+                            "/bin/sh".to_owned(),
+                            "-c".to_owned(),
+                            task_attempt_failed_output_command(directory),
+                        ],
+                        ExecOptions {
+                            timeout: Some(StdDuration::from_secs(120)),
+                            ..ExecOptions::default()
+                        },
+                    )
+                    .await
+            }
+            Err(_) => return Ok(None),
+        };
+        let Ok(output) = output else {
             return Ok(None);
-        }
-        if output.stdout.len() > MAX_TASK_OUTPUT_ARCHIVE_BYTES {
+        };
+        if output.exit_code != 0 || output.stdout.len() > MAX_TASK_OUTPUT_ARCHIVE_BYTES {
             return Ok(None);
-        }
-        if output.exit_code != 0 {
-            return Err(PortError::Failed {
-                reason: "Failed Task output is unavailable or outside its bounded contract"
-                    .to_owned(),
-            });
         }
         Ok(Some(SandboxTaskOutput {
             archive: output.stdout,
@@ -2818,7 +2831,10 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                             observation,
                             &executed.stdout,
                             &executed.stderr,
-                            request.execution_class == SandboxExecutionClass::Agent,
+                            task_transcript_requested(
+                                request.execution_class,
+                                request.diagnostics.execution_log,
+                            ),
                             request_uses_managed_inference(request),
                             &model_providers,
                         )
@@ -3252,7 +3268,8 @@ fn task_attempt_execution_command(
          if [ \"$status\" -ne 0 ]; then {failed_output} printf '%s' \"$status\" > {directory}/exit-code; \
            printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
          ({output_archive_command}) > {directory}/output.tar; status=$?; \
-         if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
+         if [ \"$status\" -ne 0 ]; then rm -f {directory}/output.tar; \
+           printf '%s' \"$status\" > {directory}/exit-code; \
            if [ \"$status\" -eq {REQUIRED_OUTPUT_MISSING_EXIT_CODE} ]; then \
              printf '%s' {REQUIRED_OUTPUT_MISSING_REASON} > {failure_reason_path}; fi; \
            printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
@@ -3286,7 +3303,13 @@ fn task_attempt_observation_command(directory: &str) -> String {
 #[cfg(feature = "runtime")]
 fn task_attempt_failed_output_command(directory: &str) -> String {
     let directory = shell_quote(directory);
-    format!("set -eu; test -f {directory}/output.tar || exit 44; cat {directory}/output.tar")
+    format!(
+        "set -eu; test -s {directory}/output.tar || exit 44; \
+         bytes=$(wc -c < {directory}/output.tar) || exit 45; \
+         case \"$bytes\" in ''|*[!0-9]*) exit 45 ;; esac; \
+         [ \"$bytes\" -le {MAX_TASK_OUTPUT_ARCHIVE_BYTES} ] || exit 45; \
+         cat {directory}/output.tar"
+    )
 }
 
 #[cfg(feature = "runtime")]
@@ -5379,6 +5402,9 @@ mod tests {
         );
         assert!(execution.contains("required_output_missing"));
         assert!(execution.contains("output.tar.tmp 2>/dev/null"));
+        assert!(execution.contains(
+            "rm -f '/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef'/output.tar"
+        ));
         assert_eq!(
             execution
                 .matches("tar -cf - -C /sandbox/steward-output out")
@@ -5419,7 +5445,9 @@ mod tests {
         let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
         let command = task_attempt_failed_output_command(directory);
         assert!(command.contains(directory));
-        assert_eq!(command.matches("output.tar").count(), 2);
+        assert_eq!(command.matches("output.tar").count(), 3);
+        assert!(command.contains("test -s"));
+        assert!(command.contains(&super::MAX_TASK_OUTPUT_ARCHIVE_BYTES.to_string()));
         assert!(!command.contains("steward-output"));
         assert!(
             Command::new("/bin/sh")
@@ -5428,6 +5456,23 @@ mod tests {
                 .is_ok_and(|status| status.success()),
             "the failed-output reader must be valid POSIX shell"
         );
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn synchronous_process_transcript_uses_the_shared_truncation_marker() {
+        let oversized = vec![b'x'; super::MAX_EXECUTION_STREAM_BYTES as usize + 1];
+        let transcript = super::bounded_task_process_transcript(&oversized, b"stderr");
+        assert_eq!(
+            transcript.stdout.len(),
+            super::MAX_EXECUTION_STREAM_BYTES as usize
+        );
+        assert!(
+            transcript
+                .stdout
+                .starts_with(super::EXECUTION_TRANSCRIPT_TRUNCATION_MARKER.as_bytes())
+        );
+        assert_eq!(transcript.stderr, b"stderr");
     }
 
     #[cfg(feature = "runtime")]
@@ -6040,13 +6085,35 @@ mod tests {
                 false,
                 &[],
             ),
-            SandboxTaskObservation::FailedWithTranscript {
+            SandboxTaskObservation::Failed {
                 adapter_observation_id: "attempt-a".to_owned(),
                 reason: "bridge-runtime-authorization".to_owned(),
                 output: None,
+            },
+            "disabled diagnostics must discard a failure transcript"
+        );
+
+        assert_eq!(
+            attach_task_agent_failure_category(
+                SandboxTaskObservation::FailedWithTranscript {
+                    adapter_observation_id: "attempt-full".to_owned(),
+                    reason: "raw failure".to_owned(),
+                    output: None,
+                    transcript: transcript.clone(),
+                },
+                b"ignored stdout",
+                b"opaque stderr",
+                true,
+                false,
+                &[],
+            ),
+            SandboxTaskObservation::FailedWithTranscript {
+                adapter_observation_id: "attempt-full".to_owned(),
+                reason: "agent".to_owned(),
+                output: None,
                 transcript: transcript.clone(),
             },
-            "failure classification must preserve the bounded execution transcript"
+            "full diagnostics must preserve the bounded execution transcript"
         );
 
         assert_eq!(

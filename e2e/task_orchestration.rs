@@ -70,7 +70,6 @@ use steward_types::direct_package::{
 use steward_types::task_output_archive::{
     TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputArchiveCompatibility, task_output_archive_entries,
     task_output_archive_with_execution_transcript,
-    task_output_archive_with_optional_output_and_execution_transcript,
 };
 use steward_types::{
     AgentRuntime, AgentRuntimeSpec, AgentRuntimeStatus, AgentType, Budget,
@@ -901,24 +900,32 @@ async fn pure_service_identity_runs_a_published_workflow_and_refuses_invalid_aut
         .ok_or(StoreError::TaskNotFound)?;
     assert_eq!(failed_task.phase, TaskPhase::Failed);
     assert!(failed_task.output_archive.is_some());
-    let failed_transcript = store
-        .task_output_transcript_for_submitter(failed_task_uid, &service, owner.user_id.as_str())
-        .await?
-        .ok_or_else(|| io::Error::other("failed-run transcript is absent"))?;
-    assert_eq!(
-        failed_transcript.output_archive_contract.as_deref(),
-        Some(TASK_OUTPUT_ARCHIVE_CONTRACT)
-    );
-    assert_eq!(
-        failed_transcript.execution_stdout.as_deref(),
-        Some(b"failed task stdout".as_slice())
-    );
     assert!(
         store
-            .task_output_transcript_for_submitter(failed_task_uid, &service, "another-owner")
+            .task_output_transcript_for_submitter(failed_task_uid, &service, owner.user_id.as_str())
             .await?
             .is_none(),
-        "a failed-run transcript must remain scoped to its exact owner"
+        "execution-log: off must not persist a failed-run transcript"
+    );
+    let owner_log = store
+        .agent_run_execution_log(
+            failed_task_uid,
+            Some(owner.user_id.as_str()),
+            AgentRunLogStream::Stdout,
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("owner log status is absent"))?;
+    assert!(
+        owner_log.content.is_empty(),
+        "the owner log route must not expose a transcript when diagnostics are off"
+    );
+    let admin_log = store
+        .agent_run_execution_log(failed_task_uid, None, AgentRunLogStream::Stderr)
+        .await?
+        .ok_or_else(|| io::Error::other("administrator log status is absent"))?;
+    assert!(
+        admin_log.content.is_empty(),
+        "the administrator log route must not expose a transcript when diagnostics are off"
     );
     let failed_outputs = task_api_request(
         &app,
@@ -932,15 +939,8 @@ async fn pure_service_identity_runs_a_published_workflow_and_refuses_invalid_aut
     .await?;
     assert_eq!(failed_outputs.status(), StatusCode::OK);
     let failed_output_archive = to_bytes(failed_outputs.into_body(), 72 * 1024 * 1024).await?;
-    let expected_failed_output = task_output_archive_with_optional_output_and_execution_transcript(
-        Some(task_output_archive(&[(
-            "out/partial.txt",
-            b"partial task output",
-        )])),
-        b"failed task stdout",
-        b"failed task stderr",
-    )
-    .map_err(|error| io::Error::other(format!("failed output was not rebuilt: {error:?}")))?;
+    let expected_failed_output =
+        task_output_archive(&[("out/partial.txt", b"partial task output")]);
     assert_eq!(
         failed_output_archive.as_ref(),
         expected_failed_output.as_slice()
@@ -2275,16 +2275,24 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
             .fail_next_start_with_diagnostics
             .swap(false, Ordering::SeqCst)
         {
-            return Ok(SandboxTaskObservation::FailedWithTranscript {
+            let output = Some(SandboxTaskOutput {
+                archive: task_output_archive(&[("out/partial.txt", b"partial task output")]),
+            });
+            if request.diagnostics.execution_log == ExecutionLogMode::Full {
+                return Ok(SandboxTaskObservation::FailedWithTranscript {
+                    adapter_observation_id: attempt_id.0.clone(),
+                    reason: "The coding agent stopped before completing the run.".to_owned(),
+                    output,
+                    transcript: SandboxTaskTranscript {
+                        stdout: b"failed task stdout".to_vec(),
+                        stderr: b"failed task stderr".to_vec(),
+                    },
+                });
+            }
+            return Ok(SandboxTaskObservation::Failed {
                 adapter_observation_id: attempt_id.0.clone(),
                 reason: "The coding agent stopped before completing the run.".to_owned(),
-                output: Some(SandboxTaskOutput {
-                    archive: task_output_archive(&[("out/partial.txt", b"partial task output")]),
-                }),
-                transcript: SandboxTaskTranscript {
-                    stdout: b"failed task stdout".to_vec(),
-                    stderr: b"failed task stderr".to_vec(),
-                },
+                output,
             });
         }
         if self.succeed_next_start.swap(false, Ordering::SeqCst) {
@@ -5067,12 +5075,8 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     .await?;
     assert_eq!(
         failed_start_outputs.status(),
-        StatusCode::CONFLICT,
-        "a failure before execution has no transcript to download"
-    );
-    assert_eq!(
-        response_json(failed_start_outputs).await?,
-        json!({ "error": "TaskOutputNotReady" })
+        StatusCode::NO_CONTENT,
+        "a terminal failure before execution is distinct from unfinished output"
     );
 
     let historical_success_uid = Uuid::new_v4();
