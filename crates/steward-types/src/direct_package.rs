@@ -590,6 +590,7 @@ pub enum TaskOrigin {
     Browser,
     GithubActions,
     Connections,
+    Api,
     Unknown,
 }
 
@@ -599,6 +600,7 @@ impl TaskOrigin {
             Self::Browser => "browser",
             Self::GithubActions => "github-actions",
             Self::Connections => "connections",
+            Self::Api => "api",
             Self::Unknown => "unknown",
         }
     }
@@ -608,6 +610,7 @@ impl TaskOrigin {
             "browser" => Ok(Self::Browser),
             "github-actions" => Ok(Self::GithubActions),
             "connections" => Ok(Self::Connections),
+            "api" => Ok(Self::Api),
             "unknown" => Ok(Self::Unknown),
             _ => Err("Task origin is invalid".to_owned()),
         }

@@ -359,12 +359,38 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
             ))
         })?;
     seed_browser_task_preferred_envelope_upgrade_fixture(&store).await?;
-    migration_set(None).run(store.pool()).await.map_err(|error| {
-        io::Error::other(format!(
-            "Steward preferred-Envelope migration must complete over the required TLS session: {error}"
-        ))
-    })?;
+    migration_set(Some(71))
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward preferred-Envelope migration must complete over the required TLS session: {error}"
+            ))
+        })?;
     assert_browser_task_preferred_envelope_upgrade_result(&store).await?;
+    let historical_before_api_origin = historical_task_identity_snapshot(&store).await?;
+    let historical_task_count =
+        sqlx::query_scalar::<_, i64>("SELECT count(*)::bigint FROM task_submissions")
+            .fetch_one(store.pool())
+            .await?;
+    assert!(
+        historical_task_count > 0,
+        "the API-origin upgrade must run over seeded historical Task rows"
+    );
+    migration_set(None)
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward API-origin migration must complete over the required TLS session: {error}"
+            ))
+        })?;
+    assert_eq!(
+        historical_task_identity_snapshot(&store).await?,
+        historical_before_api_origin,
+        "migration 0072 must not update historical Tasks, runs, or canonical identities"
+    );
+    assert_api_origin_upgrade_result(&store).await?;
     verify_browser_task_library_upgrade(&store).await?;
     assert_eq!(
         historical_task_identity_snapshot(&store).await?,
@@ -725,6 +751,46 @@ async fn assert_browser_task_preferred_envelope_upgrade_result(
     assert!(
         mutation.is_err(),
         "migration 0071 must keep historical Task versions immutable after adding the column"
+    );
+    Ok(())
+}
+
+async fn assert_api_origin_upgrade_result(store: &PgStore) -> Result<(), Box<dyn Error>> {
+    let constraint = sqlx::query_scalar::<_, String>(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conrelid = 'task_submissions'::regclass \
+           AND conname = 'task_submissions_task_origin_valid'",
+    )
+    .fetch_one(store.pool())
+    .await?;
+    assert!(
+        constraint.contains("'api'::text"),
+        "migration 0072 must add api to the persisted Task-origin contract: {constraint}"
+    );
+    for trigger in [
+        "task_browser_provenance_is_immutable",
+        "task_commands_are_monotonic",
+    ] {
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT tgenabled = 'O' FROM pg_trigger \
+                 WHERE tgrelid = 'task_submissions'::regclass AND tgname = $1",
+            )
+            .bind(trigger)
+            .fetch_one(store.pool())
+            .await?,
+            "migration 0072 must leave {trigger} enabled"
+        );
+    }
+    let mutation = sqlx::query(
+        "UPDATE task_submissions SET task_origin = 'api' \
+         WHERE task_uid = (SELECT task_uid FROM task_submissions ORDER BY task_uid LIMIT 1)",
+    )
+    .execute(store.pool())
+    .await;
+    assert!(
+        mutation.is_err(),
+        "migration 0072 must not let historical rows bypass origin immutability"
     );
     Ok(())
 }

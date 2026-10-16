@@ -6688,8 +6688,10 @@ where
             direct_task_evidence: None,
             task_origin: if browser_task_evidence.is_some() {
                 TaskOrigin::Browser
-            } else {
+            } else if identity.source_provenance.is_some() {
                 TaskOrigin::GithubActions
+            } else {
+                TaskOrigin::Api
             },
             browser_task_evidence,
             user_envelope_snapshot: Some(user_envelope),

@@ -40,6 +40,11 @@ test("browser hello world progress accepts only an inline browser run under a pr
   const envelopes = new Set(["sample-envelope"]);
   expect(browserHelloWorldRun([], envelopes)).toBeUndefined();
   expect(browserHelloWorldRun([run({
+    origin: "api",
+    package: { source: "inline", revision: "steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", path: "task-definition.json", promptSource: "inline" },
+    userEnvelopeInstanceId: "sample-envelope",
+  })], envelopes)).toBeUndefined();
+  expect(browserHelloWorldRun([run({
     origin: "browser",
     package: { source: "https://github.com/example-org/example-repo.git", revision: "git:sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", path: "task-definition.json", promptSource: "path" },
     userEnvelopeInstanceId: "sample-envelope",

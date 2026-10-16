@@ -926,6 +926,7 @@ async function guardedPage(browser, {
     { status: 201, body: { apiVersion: "steward.browser-runs/v1", taskUid: rerunTaskUid } },
   ],
   runFailureReason = undefined,
+  runOrigin = run.origin,
   runPhase = "succeeded",
   runSpend = run.observedSpend,
   capabilityCatalogModels = capabilityCatalog.models,
@@ -991,7 +992,7 @@ async function guardedPage(browser, {
       contentDigest: browserTaskDigest,
       promptSource: "inline",
     },
-  } : { ...run, observedSpend: runSpend };
+  } : { ...run, observedSpend: runSpend, origin: runOrigin };
   await context.addInitScript(() => {
     const BrowserAbortController = AbortController;
     Object.defineProperty(window, "__stewardAbortCount", { configurable: true, value: 0, writable: true });
@@ -2217,6 +2218,19 @@ test("the Pending envelope tab excludes stale requests", async ({ browser }) => 
     for (const request of requests.filter((request) => request.status === "stale")) {
       await expect(envelopes).not.toContainText(request.id);
     }
+  } finally {
+    await closeGuardedPage(developer);
+  }
+});
+
+test("API-origin runs render on the runs list and detail page", async ({ browser }) => {
+  const developer = await guardedPage(browser, { runOrigin: "api" });
+  try {
+    await developer.page.goto(`${origin}/runs`);
+    await expect(developer.page.getByText("api", { exact: true })).toBeVisible();
+
+    await developer.page.goto(`${origin}/runs/${taskUid}`);
+    await expect(developer.page.getByText("Origin: api", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
