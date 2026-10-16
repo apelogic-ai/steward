@@ -1,4 +1,4 @@
-# Source: user journey J3. UI text exercised against the 0.3.18 release candidate.
+# Source: user journey J3. UI text exercised against the 0.3.19 release candidate.
 # "I" is one person who is both a user and an administrator: I ask as a user,
 # switch to the administrator area of the same UI, and decide my own request.
 # Only the scenario about separation of roles uses a second account.

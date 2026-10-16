@@ -7,7 +7,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-steward-ports = { path = "../../crates/steward-ports", version = "=0.3.18" }
+steward-ports = { path = "../../crates/steward-ports", version = "=0.3.19" }
 
 [lints]
 workspace = true

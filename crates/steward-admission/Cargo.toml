@@ -8,8 +8,8 @@ version.workspace = true
 
 [dependencies]
 serde.workspace = true
-steward-ports = { path = "../steward-ports", version = "=0.3.18" }
-steward-types = { path = "../steward-types", version = "=0.3.18" }
+steward-ports = { path = "../steward-ports", version = "=0.3.19" }
+steward-types = { path = "../steward-types", version = "=0.3.19" }
 
 [lints]
 workspace = true

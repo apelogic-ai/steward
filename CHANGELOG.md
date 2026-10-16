@@ -7,12 +7,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.19] - 2026-10-15
+
+Steward v0.3.19 gives Run clients safe explanations for bounded-workspace preparation failures and
+keeps expected runtime-deletion progress out of error logs without hiding stalled cleanup.
+
 ### Fixed
 
 - Run APIs now return the bounded workspace-preparation explanation stored for a failed Run, so
   clients can show why the coding agent did not start without exposing internal diagnostics.
 - Runtime cleanup now retries quietly while sandbox deletion is making progress, while a deletion
   that remains incomplete past the cleanup deadline still produces a controller error.
+
+### Upgrade and rollback
+
+- This release adds no database migration and requires no configuration change. Deploy the v0.3.19
+  chart and all component images as one release unit.
+- Rolling back to v0.3.18 hides the two bounded workspace-preparation explanations from Run API
+  responses and restores error logging during expected sandbox-deletion progress. The cleanup
+  deadline and stalled-deletion error remain unchanged.
 
 ## [0.3.18] - 2026-10-15
 
@@ -1361,7 +1374,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.18...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.19...HEAD
+[0.3.19]: https://github.com/apelogic-ai/steward/compare/v0.3.18...v0.3.19
 [0.3.18]: https://github.com/apelogic-ai/steward/compare/v0.3.17...v0.3.18
 [0.3.17]: https://github.com/apelogic-ai/steward/compare/v0.3.16...v0.3.17
 [0.3.16]: https://github.com/apelogic-ai/steward/compare/v0.3.15...v0.3.16
