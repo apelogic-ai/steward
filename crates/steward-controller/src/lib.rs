@@ -17,8 +17,8 @@ use futures::stream::FuturesUnordered;
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::core::admission::{AdmissionRequest, AdmissionResponse, Operation};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
-use kube::runtime::controller::{Action, Controller};
-use kube::runtime::finalizer::{Event, finalizer};
+use kube::runtime::controller::{Action, Controller, Error as RuntimeControllerError};
+use kube::runtime::finalizer::{Error as FinalizerError, Event, finalizer};
 use kube::runtime::watcher;
 use kube::{Client, Resource, ResourceExt};
 use sha2::{Digest, Sha256};
@@ -376,6 +376,7 @@ pub enum ReconcileError {
     Runtime(PortError),
     Authority(String),
     DeletionPending,
+    DeletionTimedOut,
     InferenceRevocationTimedOut,
     ManagedModeStockCredentialPresent,
 }
@@ -422,7 +423,7 @@ const FINAL_SPEND_SETTLEMENT_DELAY: StdDuration = StdDuration::from_secs(12);
 const FINAL_SPEND_SETTLEMENT_CEILING: StdDuration = StdDuration::from_secs(20);
 const FINAL_SPEND_SETTLEMENT_POLL_INTERVAL: StdDuration = StdDuration::from_secs(1);
 const FINAL_SPEND_CAPTURE_TIMEOUT: StdDuration = StdDuration::from_secs(25);
-const INFERENCE_CLEANUP_DEADLINE: StdDuration = StdDuration::from_secs(30);
+const RUNTIME_CLEANUP_DEADLINE: StdDuration = StdDuration::from_secs(30);
 const MAX_INFERENCE_OBSERVATION_INTERVAL: StdDuration = StdDuration::from_secs(60);
 
 fn ensure_termination_started_condition(status: &mut AgentRuntimeStatus) {
@@ -455,7 +456,7 @@ fn reset_termination_started_condition_for_phase(
     }
 }
 
-fn inference_cleanup_deadline_elapsed_at(runtime: &AgentRuntime, now_epoch_seconds: i64) -> bool {
+fn runtime_cleanup_deadline_elapsed_at(runtime: &AgentRuntime, now_epoch_seconds: i64) -> bool {
     if !runtime
         .status
         .as_ref()
@@ -476,10 +477,10 @@ fn inference_cleanup_deadline_elapsed_at(runtime: &AgentRuntime, now_epoch_secon
         return false;
     };
     now_epoch_seconds.saturating_sub(started_at)
-        >= i64::try_from(INFERENCE_CLEANUP_DEADLINE.as_secs()).unwrap_or(i64::MAX)
+        >= i64::try_from(RUNTIME_CLEANUP_DEADLINE.as_secs()).unwrap_or(i64::MAX)
 }
 
-fn inference_cleanup_deadline_elapsed(runtime: &AgentRuntime) -> Result<bool, ReconcileError> {
+fn runtime_cleanup_deadline_elapsed(runtime: &AgentRuntime) -> Result<bool, ReconcileError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ReconcileError::InvalidSpec {
@@ -489,7 +490,15 @@ fn inference_cleanup_deadline_elapsed(runtime: &AgentRuntime) -> Result<bool, Re
     let now = i64::try_from(now).map_err(|_| ReconcileError::InvalidSpec {
         reason: "system clock exceeds the supported deadline range".to_owned(),
     })?;
-    Ok(inference_cleanup_deadline_elapsed_at(runtime, now))
+    Ok(runtime_cleanup_deadline_elapsed_at(runtime, now))
+}
+
+fn runtime_cleanup_wait_error(runtime: &AgentRuntime) -> Result<ReconcileError, ReconcileError> {
+    Ok(if runtime_cleanup_deadline_elapsed(runtime)? {
+        ReconcileError::DeletionTimedOut
+    } else {
+        ReconcileError::DeletionPending
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3888,10 +3897,36 @@ async fn run_controller_inner<R: SandboxRuntime, I: InferencePlane>(
         .for_each(|result| async move {
             match result {
                 Ok(reference) => eprintln!("reconciled {reference:?}"),
-                Err(error) => eprintln!("reconcile error: {error}"),
+                Err(error) => {
+                    let should_log = match &error {
+                        RuntimeControllerError::ReconcilerFailed(error, _) => {
+                            should_log_controller_error(error)
+                        }
+                        _ => true,
+                    };
+                    if should_log {
+                        eprintln!("reconcile error: {error}");
+                    }
+                }
             }
         })
         .await;
+}
+
+fn should_log_controller_error(error: &ControllerError) -> bool {
+    !matches!(
+        error,
+        ControllerError::Reconcile(ReconcileError::DeletionPending)
+    )
+}
+
+fn map_finalizer_error(error: FinalizerError<ControllerError>) -> ControllerError {
+    match error {
+        FinalizerError::CleanupFailed(
+            error @ ControllerError::Reconcile(ReconcileError::DeletionPending),
+        ) => error,
+        error => ControllerError::Finalizer(error.to_string()),
+    }
 }
 
 enum InferenceReconcile {
@@ -5045,14 +5080,16 @@ async fn reconcile<R: SandboxRuntime, I: InferencePlane>(
                         api.patch_status(&name, &PatchParams::default(), &Patch::Merge(&patch))
                             .await
                             .map_err(ControllerError::Kubernetes)?;
-                        Err(ControllerError::Reconcile(ReconcileError::DeletionPending))
+                        let deletion_error = runtime_cleanup_wait_error(&runtime)
+                            .map_err(ControllerError::Reconcile)?;
+                        Err(ControllerError::Reconcile(deletion_error))
                     }
                 }
             }
         }
     })
     .await
-    .map_err(|error| ControllerError::Finalizer(error.to_string()))
+    .map_err(map_finalizer_error)
 }
 
 async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
@@ -5097,7 +5134,7 @@ async fn cleanup_runtime<R: SandboxRuntime, I: InferencePlane>(
     };
     if let ReconcileDecision::Status(status) = &mut decision {
         ensure_termination_started_condition(status);
-        if inference_cleanup_deadline_elapsed(runtime).map_err(ControllerError::Reconcile)? {
+        if runtime_cleanup_deadline_elapsed(runtime).map_err(ControllerError::Reconcile)? {
             let final_spend = finalize_inference_and_delete_credential(
                 runtime,
                 inference,
@@ -5380,7 +5417,7 @@ async fn suspend_runtime_with_inference_cleanup<R: SandboxRuntime, I: InferenceP
         }
     };
     if !sandbox_stopped {
-        if inference_cleanup_deadline_elapsed(runtime).map_err(ControllerError::Reconcile)? {
+        if runtime_cleanup_deadline_elapsed(runtime).map_err(ControllerError::Reconcile)? {
             let final_spend = finalize_inference_and_delete_credential(
                 runtime, inference, &request, authority, client,
             )
@@ -6333,14 +6370,64 @@ mod tests {
         cleanup_runtime, connection_operation_authority_action,
         connection_operation_failure_log_line, create_task_runtime_inner,
         ensure_managed_mode_has_no_stock_credential, exhausted_spend_to_preserve,
-        failed_runtime_status, inference_action, provider_control_bindings_match, reconcile_once,
-        replace_as_controller, runtime_authority_action, runtime_start_failed, runtime_ttl_action,
-        runtime_with_remaining_spend_budget, sandbox_execution_class, sandbox_task_diagnostics,
-        server_task_runtime_manifest, status_merge_patch, suspend_runtime,
-        suspend_runtime_with_inference_cleanup, task_output_archive_failure,
-        task_output_archive_size_failure, task_runtime, task_runtime_action,
-        task_runtime_observation_is_failed, task_start_observation, ttl_action,
+        failed_runtime_status, inference_action, map_finalizer_error,
+        provider_control_bindings_match, reconcile_once, replace_as_controller,
+        runtime_authority_action, runtime_cleanup_wait_error, runtime_start_failed,
+        runtime_ttl_action, runtime_with_remaining_spend_budget, sandbox_execution_class,
+        sandbox_task_diagnostics, server_task_runtime_manifest, should_log_controller_error,
+        status_merge_patch, suspend_runtime, suspend_runtime_with_inference_cleanup,
+        task_output_archive_failure, task_output_archive_size_failure, task_runtime,
+        task_runtime_action, task_runtime_observation_is_failed, task_start_observation,
+        ttl_action,
     };
+
+    #[test]
+    fn pending_finalizer_cleanup_is_not_logged_as_a_reconcile_error() {
+        let error = map_finalizer_error(kube::runtime::finalizer::Error::CleanupFailed(
+            super::ControllerError::Reconcile(super::ReconcileError::DeletionPending),
+        ));
+
+        assert!(
+            !should_log_controller_error(&error),
+            "waiting for sandbox deletion must requeue without producing the controller error line"
+        );
+    }
+
+    #[test]
+    fn timed_out_finalizer_cleanup_remains_a_reconcile_error() {
+        let error = map_finalizer_error(kube::runtime::finalizer::Error::CleanupFailed(
+            super::ControllerError::Reconcile(super::ReconcileError::DeletionTimedOut),
+        ));
+
+        assert!(
+            should_log_controller_error(&error),
+            "a sandbox deletion that exceeded the cleanup deadline must remain visible"
+        );
+    }
+
+    #[test]
+    fn runtime_cleanup_becomes_an_error_after_the_existing_deadline() -> Result<(), String> {
+        let mut runtime = fixture();
+        let mut termination_started = steward_types::runtime_termination_started_condition(3);
+        termination_started.last_transition_time.0 = "1970-01-01T00:00:00Z"
+            .parse()
+            .map_err(|error| format!("termination timestamp fixture is invalid: {error}"))?;
+        runtime.status = Some(AgentRuntimeStatus {
+            phase: Phase::Terminating,
+            observed_generation: 3,
+            spec_digest: "fixture-digest".to_owned(),
+            refs: RuntimeRefs::default(),
+            conditions: vec![termination_started],
+            spend: None,
+        });
+
+        assert_eq!(
+            runtime_cleanup_wait_error(&runtime)
+                .map_err(|error| format!("cleanup deadline must be readable: {error}"))?,
+            super::ReconcileError::DeletionTimedOut
+        );
+        Ok(())
+    }
 
     #[test]
     fn task_runtime_cap_has_a_plain_terminal_reason() {

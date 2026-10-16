@@ -11,6 +11,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - Run APIs now return the bounded workspace-preparation explanation stored for a failed Run, so
   clients can show why the coding agent did not start without exposing internal diagnostics.
+- Runtime cleanup now retries quietly while sandbox deletion is making progress, while a deletion
+  that remains incomplete past the cleanup deadline still produces a controller error.
 
 ## [0.3.18] - 2026-10-15
 
