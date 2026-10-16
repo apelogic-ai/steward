@@ -12,6 +12,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Tasks submitted through the API without browser or GitHub source evidence now report their Run
   origin as `api`, while existing browser, GitHub Actions, and Connections origins are unchanged.
 
+### Fixed
+
+- Task authentication now refuses credentials that combine a GitHub Actions identity with a
+  pure-service caller, while delegated GitHub callers continue to work.
+
 ## [0.3.19] - 2026-10-15
 
 Steward v0.3.19 gives Run clients safe explanations for bounded-workspace preparation failures and

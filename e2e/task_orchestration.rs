@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,9 +14,16 @@ use axum::extract::{Request, State};
 use axum::http::{Method, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::any;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use kube::api::PostParams;
 use kube::core::Request as KubeRequest;
 use kube::{Client, ResourceExt};
+use p256::SecretKey;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::pkcs8::EncodePrivateKey;
+use rand_core::OsRng;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, types::Json as SqlJson, types::Uuid};
@@ -30,8 +38,8 @@ use steward_apiserver::governed_connections::{
     GovernedConnectionsConfig,
 };
 use steward_apiserver::{
-    AuthenticatedCaller, AuthenticationError, BoxFuture, KubeRuntimeRepository,
-    RequestAuthenticator, operator_admin,
+    AuthenticatedCaller, AuthenticationError, BoxFuture, ConfiguredTaskIdentityResolver,
+    KubeRuntimeRepository, RequestAuthenticator, TaskApiConfig, operator_admin, task_router,
 };
 use steward_controller::{
     ManagedInferencePlane, TaskControllerError, reconcile_agent_runtime_work_item,
@@ -43,7 +51,8 @@ use steward_ports::{
     ProviderControlExecutionBindings, ProvisionedInference,
     SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxObservation, SandboxRequest, SandboxRuntime,
     SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
-    SandboxTaskTranscript, TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
+    SandboxTaskTranscript, TaskAttemptId, TaskExecutionAdapter, TaskExecutionPlan,
+    TaskExecutionPlanRequest, WORKSPACE_PREPARATION_FAILURE,
 };
 use steward_store::{
     AgentRunLogStream, AgentRunTimelineKind, BrowserMemberStateAction, BrowserMemberStateChange,
@@ -76,9 +85,15 @@ use tower::ServiceExt;
 
 const RUNTIME_PATH_PREFIX: &str =
     "/apis/agents.apelogic.ai/v1alpha1/namespaces/steward-test/agentruntimes";
+const WORKFLOW_RUNTIME_PATH_PREFIX: &str =
+    "/apis/agents.apelogic.ai/v1alpha1/namespaces/steward-workflows/agentruntimes";
 const SECRET_PATH_PREFIX: &str = "/api/v1/namespaces/steward-test/secrets";
+const WORKFLOW_SECRET_PATH_PREFIX: &str = "/api/v1/namespaces/steward-workflows/secrets";
 const CONTROLLER_USERNAME: &str = "system:serviceaccount:steward-system:steward-controller";
 const OPERATOR_USERNAME: &str = "system:serviceaccount:steward-test:operator";
+const TASK_IDENTITY_ISSUER: &str = "https://identity.example.test";
+const TASK_IDENTITY_AUDIENCE: &str = "steward-task-api";
+const TASK_IDENTITY_KID: &str = "task-e2e-current";
 
 #[derive(Clone)]
 struct OperatorTestAuthenticator;
@@ -171,6 +186,625 @@ fn task_output_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
     }
     archive.resize(archive.len() + 1024, 0);
     archive
+}
+
+#[derive(Clone)]
+struct PublishedWorkflowExecutionAdapter;
+
+impl TaskExecutionAdapter for PublishedWorkflowExecutionAdapter {
+    fn contract(&self) -> &'static str {
+        "task-e2e-v1"
+    }
+
+    fn render(
+        &self,
+        request: TaskExecutionPlanRequest<'_>,
+    ) -> Result<TaskExecutionPlan, PortError> {
+        Ok(TaskExecutionPlan {
+            command: vec![
+                "example-agent".to_owned(),
+                request.workflow_prompt.to_owned(),
+                format!("{}/{}", request.model.provider, request.model.model),
+            ],
+        })
+    }
+}
+
+fn published_workflow_task_config(model_provider: &str) -> Result<TaskApiConfig, io::Error> {
+    let catalog = json!({
+        "apiVersion": "steward.execution-bindings/v2",
+        "bindings": [{
+            "agentRef": "example-agent@1",
+            "displayName": "Example agent",
+            "adapter": "task-e2e-v1",
+            "image": format!("registry.example.test/steward/agent@sha256:{}", "a".repeat(64)),
+            "executable": "/opt/steward/example-agent",
+            "versionProbe": {
+                "arguments": ["--version"],
+                "expectedStdout": "example-agent 1"
+            },
+            "models": {"providers": [model_provider]},
+            "providerProfiles": {
+                "inference": {
+                    "id": "example-inference-profile-v1",
+                    "digest": format!("sha256:{}", "b".repeat(64))
+                }
+            }
+        }]
+    })
+    .to_string();
+    TaskApiConfig::new(None)
+        .and_then(|config| {
+            config.with_execution_adapter(Arc::new(PublishedWorkflowExecutionAdapter))
+        })
+        .and_then(|config| config.with_execution_bindings_json(Some(&catalog)))
+        .and_then(|config| config.with_execution_bindings_active(true))
+        .map(|config| config.with_task_orchestration_mode(TaskOrchestrationMode::Active))
+        .map_err(io::Error::other)
+}
+
+fn task_identity_signer(
+    store: PgStore,
+) -> Result<(EncodingKey, ConfiguredTaskIdentityResolver), Box<dyn Error>> {
+    let private = SecretKey::random(&mut OsRng);
+    let der = private.to_pkcs8_der()?;
+    let point = private.public_key().to_encoded_point(false);
+    let x = point
+        .x()
+        .ok_or_else(|| io::Error::other("P-256 public key is missing x"))?;
+    let y = point
+        .y()
+        .ok_or_else(|| io::Error::other("P-256 public key is missing y"))?;
+    let jwks = json!({
+        "keys": [{
+            "kty": "EC",
+            "use": "sig",
+            "alg": "ES256",
+            "kid": TASK_IDENTITY_KID,
+            "crv": "P-256",
+            "x": URL_SAFE_NO_PAD.encode(x),
+            "y": URL_SAFE_NO_PAD.encode(y)
+        }]
+    });
+    let jwks_path = env::temp_dir().join(format!(
+        "steward-task-e2e-jwks-{}.json",
+        Uuid::new_v4().simple()
+    ));
+    fs::write(&jwks_path, serde_json::to_vec(&jwks)?)?;
+    let resolver = ConfiguredTaskIdentityResolver::identity_from_jwks_file(
+        TASK_IDENTITY_ISSUER.to_owned(),
+        TASK_IDENTITY_AUDIENCE.to_owned(),
+        &jwks_path,
+        store,
+        false,
+    );
+    fs::remove_file(&jwks_path)?;
+    Ok((
+        EncodingKey::from_ec_der(der.as_bytes()),
+        resolver.map_err(|error| io::Error::other(format!("load task JWKS: {error:?}")))?,
+    ))
+}
+
+fn pure_service_task_token(
+    key: &EncodingKey,
+    subject: &str,
+    owner_email: &str,
+    owner_user_id: &str,
+    service: &str,
+    extra_groups: &[String],
+) -> Result<String, Box<dyn Error>> {
+    let now = jsonwebtoken::get_current_timestamp();
+    let mut groups = vec![
+        format!("agents.apelogic.ai/service-principal:{service}"),
+        format!("agents.apelogic.ai/task-owner:{owner_email}"),
+        format!("agents.apelogic.ai/canonical-user:{owner_user_id}"),
+    ];
+    groups.extend_from_slice(extra_groups);
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some(TASK_IDENTITY_KID.to_owned());
+    Ok(encode(
+        &header,
+        &json!({
+            "iss": TASK_IDENTITY_ISSUER,
+            "sub": subject,
+            "aud": [TASK_IDENTITY_AUDIENCE],
+            "exp": now + 60,
+            "iat": now,
+            "nbf": now.saturating_sub(1),
+            "jti": Uuid::new_v4().to_string(),
+            "email": owner_email,
+            "email_verified": true,
+            "groups": groups,
+            "identity_contract": "steward-task-v2"
+        }),
+        key,
+    )?)
+}
+
+async fn task_api_request(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    token: &str,
+    idempotency_key: Option<&str>,
+    content_type: Option<&str>,
+    body: Vec<u8>,
+) -> Result<Response<Body>, Box<dyn Error>> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+    if let Some(idempotency_key) = idempotency_key {
+        request = request.header("idempotency-key", idempotency_key);
+    }
+    if let Some(content_type) = content_type {
+        request = request.header(header::CONTENT_TYPE, content_type);
+    }
+    Ok(app.clone().oneshot(request.body(Body::from(body))?).await?)
+}
+
+async fn publish_task_workflow(
+    store: &PgStore,
+    owner_user_id: &steward_types::CanonicalUserId,
+    suffix: &str,
+) -> Result<String, Box<dyn Error>> {
+    let envelope = Envelope {
+        revision: 1,
+        spec: EnvelopeSpec {
+            llms: vec![ModelRef {
+                provider: "example".to_owned(),
+                model: "model-a".to_owned(),
+            }],
+            tools: Vec::new(),
+            budget: Budget {
+                monthly_limit: "10.00".to_owned(),
+                single_run_limit: Some("1.00".to_owned()),
+                currency: "USD".to_owned(),
+            },
+            runtime_minutes_limit: Some("10".to_owned()),
+            workspace: None,
+            ttl: Duration("30m".to_owned()),
+            runner: RunnerRequirements::default(),
+        },
+    };
+    let workflow_name = format!("service-event-{suffix}");
+    store
+        .insert_envelope_template_revision(EnvelopeTemplatePublication {
+            template_id: &workflow_name,
+            display_name: "Service event",
+            member_roles: std::slice::from_ref(&workflow_name),
+            ceiling: &envelope,
+            auto_provision_threshold: None,
+            allow_inline_browser_tasks: false,
+            authored_by: "test-bootstrap",
+        })
+        .await?;
+    let request = store
+        .reserve_envelope_request(EnvelopeRequestReservationRequest {
+            owner_user_id,
+            template_id: Some(&workflow_name),
+            template_revision: Some(envelope.revision),
+            requested_envelope: &envelope,
+            idempotency_key: &format!("service-envelope-{suffix}"),
+            justification: None,
+            ceiling_exceedances: &[],
+            actor: "test-bootstrap",
+        })
+        .await?
+        .record;
+    let envelope_instance_id = format!("env_{}", request.id.simple());
+    let envelope_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&envelope)?)
+    );
+    store
+        .append_envelope_request_status(
+            request.id,
+            EnvelopeRequestStatusUpdate {
+                from: EnvelopeRequestStatus::Pending,
+                to: EnvelopeRequestStatus::Provisioned,
+                approval_id: Some(Uuid::new_v4()),
+                envelope_instance_id: Some(&envelope_instance_id),
+                envelope_digest: Some(&envelope_digest),
+                reason: None,
+                rationale: Some("pure-service Task test"),
+                evidence_url: None,
+                expires_at: None,
+                approved_envelope: Some(&envelope),
+                actor: "test-bootstrap",
+            },
+        )
+        .await?;
+    let workflow_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(format!("pure-service-workflow-{suffix}"))
+    );
+    store
+        .publish_initial_workflow(WorkflowPublication {
+            name: &workflow_name,
+            display_name: "Service event",
+            agent: "example-agent@1",
+            prompt: "Process the event file and write the result.",
+            content_digest: &workflow_digest,
+            published_by: "test-bootstrap",
+        })
+        .await?;
+    Ok(workflow_name)
+}
+
+#[tokio::test]
+async fn pure_service_identity_runs_a_published_workflow_and_refuses_invalid_authority()
+-> Result<(), Box<dyn Error>> {
+    install_rustls_crypto_provider()?;
+    let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
+    let store = PgStore::new(
+        PgPoolOptions::new()
+            .max_connections(8)
+            .connect(&database_url)
+            .await?,
+    );
+    store.migrate().await?;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let organization_id = OrganizationId::parse("org_example")?;
+    let policy = OrganizationIdentityPolicy::new(
+        "https://accounts.google.com",
+        "example.com",
+        organization_id,
+    )?;
+    let owner = store
+        .register_canonical_identity(
+            &policy.validate(
+                "https://accounts.google.com",
+                &format!("service-owner-{suffix}"),
+                "example.com",
+                &format!("alice-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let owner_without_envelope = store
+        .register_canonical_identity(
+            &policy.validate(
+                "https://accounts.google.com",
+                &format!("owner-without-envelope-{suffix}"),
+                "example.com",
+                &format!("bob-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    let inactive_owner = store
+        .register_canonical_identity(
+            &policy.validate(
+                "https://accounts.google.com",
+                &format!("inactive-owner-{suffix}"),
+                "example.com",
+                &format!("carol-{suffix}@example.com"),
+                true,
+            )?,
+            "test-bootstrap",
+        )
+        .await?;
+    store
+        .change_browser_member_state(BrowserMemberStateChange {
+            user_id: &inactive_owner.user_id,
+            action: BrowserMemberStateAction::Disable,
+            actor: &owner.user_id,
+        })
+        .await?;
+    let workflow_name = publish_task_workflow(&store, &owner.user_id, &suffix).await?;
+    let workflow_reference = format!("{workflow_name}@1");
+    let service = format!("event-worker-{suffix}");
+    let service_subject = format!("service:{service}");
+    let (signing_key, identities) = task_identity_signer(store.clone())?;
+    let token = pure_service_task_token(
+        &signing_key,
+        &service_subject,
+        owner.display_email.as_str(),
+        owner.user_id.as_str(),
+        &service,
+        &[],
+    )?;
+    let app = task_router(
+        store.clone(),
+        identities.clone(),
+        published_workflow_task_config("example")?,
+    );
+
+    let inactive_token = pure_service_task_token(
+        &signing_key,
+        &service_subject,
+        inactive_owner.display_email.as_str(),
+        inactive_owner.user_id.as_str(),
+        &service,
+        &[],
+    )?;
+    let inactive = task_api_request(
+        &app,
+        Method::POST,
+        "/v1/tasks",
+        &inactive_token,
+        Some(&format!("inactive-owner-{suffix}")),
+        Some("application/json"),
+        serde_json::to_vec(&json!({"workflow": workflow_reference}))?,
+    )
+    .await?;
+    assert_eq!(inactive.status(), StatusCode::UNAUTHORIZED);
+
+    let no_envelope_token = pure_service_task_token(
+        &signing_key,
+        &service_subject,
+        owner_without_envelope.display_email.as_str(),
+        owner_without_envelope.user_id.as_str(),
+        &service,
+        &[],
+    )?;
+    let no_envelope = task_api_request(
+        &app,
+        Method::POST,
+        "/v1/tasks",
+        &no_envelope_token,
+        Some(&format!("no-envelope-{suffix}")),
+        Some("application/json"),
+        serde_json::to_vec(&json!({"workflow": workflow_reference}))?,
+    )
+    .await?;
+    assert_eq!(no_envelope.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let outside_envelope_app = task_router(
+        store.clone(),
+        identities.clone(),
+        published_workflow_task_config("other-provider")?,
+    );
+    let outside_envelope = task_api_request(
+        &outside_envelope_app,
+        Method::POST,
+        "/v1/tasks",
+        &token,
+        Some(&format!("outside-envelope-{suffix}")),
+        Some("application/json"),
+        serde_json::to_vec(&json!({"workflow": workflow_reference}))?,
+    )
+    .await?;
+    assert_eq!(outside_envelope.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let github_subject_token = pure_service_task_token(
+        &signing_key,
+        "github-actions:actor:16106037",
+        owner.display_email.as_str(),
+        owner.user_id.as_str(),
+        &service,
+        &[],
+    )?;
+    let github_subject = task_api_request(
+        &app,
+        Method::POST,
+        "/v1/tasks",
+        &github_subject_token,
+        Some(&format!("github-subject-{suffix}")),
+        Some("application/json"),
+        serde_json::to_vec(&json!({"workflow": workflow_reference}))?,
+    )
+    .await?;
+    assert_eq!(github_subject.status(), StatusCode::UNAUTHORIZED);
+
+    for (case, extra_group) in [
+        (
+            "contradictory",
+            format!(
+                "agents.apelogic.ai/acting-user:{}",
+                owner.display_email.as_str()
+            ),
+        ),
+        (
+            "duplicate",
+            format!("agents.apelogic.ai/service-principal:{service}"),
+        ),
+    ] {
+        let invalid_token = pure_service_task_token(
+            &signing_key,
+            &service_subject,
+            owner.display_email.as_str(),
+            owner.user_id.as_str(),
+            &service,
+            &[extra_group],
+        )?;
+        let response = task_api_request(
+            &app,
+            Method::POST,
+            "/v1/tasks",
+            &invalid_token,
+            Some(&format!("{case}-groups-{suffix}")),
+            Some("application/json"),
+            serde_json::to_vec(&json!({"workflow": workflow_reference}))?,
+        )
+        .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{case} identity groups must fail closed"
+        );
+    }
+
+    let created = task_api_request(
+        &app,
+        Method::POST,
+        "/v1/tasks",
+        &token,
+        Some(&format!("service-run-{suffix}")),
+        Some("application/json"),
+        serde_json::to_vec(&json!({"workflow": workflow_reference}))?,
+    )
+    .await?;
+    let created_status = created.status();
+    let created = response_json(created).await?;
+    assert_eq!(
+        created_status,
+        StatusCode::ACCEPTED,
+        "pure-service Task creation failed: {created}"
+    );
+    let task_uid = created["taskUid"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("Task response omitted taskUid"))?
+        .parse::<Uuid>()?;
+    assert_eq!(
+        store
+            .task(task_uid)
+            .await?
+            .ok_or(StoreError::TaskNotFound)?
+            .task_origin,
+        TaskOrigin::Api
+    );
+    let input_archive = task_output_archive(&[(
+        "in/event.json",
+        br#"{"event":"PROJ-123","action":"updated"}"#,
+    )]);
+    let inputs = task_api_request(
+        &app,
+        Method::PUT,
+        &format!("/v1/tasks/{task_uid}/inputs"),
+        &token,
+        None,
+        Some("application/x-tar"),
+        input_archive,
+    )
+    .await?;
+    assert_eq!(inputs.status(), StatusCode::NO_CONTENT);
+    let execute = task_api_request(
+        &app,
+        Method::POST,
+        &format!("/v1/tasks/{task_uid}/execute"),
+        &token,
+        None,
+        None,
+        Vec::new(),
+    )
+    .await?;
+    assert_eq!(execute.status(), StatusCode::ACCEPTED);
+
+    let kubernetes = AmbiguousKubernetes::default();
+    *kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("runtime UID fixture was poisoned"))? =
+        Some(format!("runtime-uid-{suffix}"));
+    let (client, _server) = kubernetes_client(kubernetes.clone()).await?;
+    let task_runtime = AmbiguousTaskRuntime::default();
+    task_runtime
+        .accept_default_diagnostics
+        .store(true, Ordering::SeqCst);
+    let inference = ActiveInference::default();
+    for _ in 0..5 {
+        reconcile_current(&client, &task_runtime, &store, task_uid).await?;
+    }
+    assert_eq!(
+        operation(&store, task_uid).await?.state,
+        TaskOrchestrationState::ActivationPending
+    );
+    for _ in 0..2 {
+        let runtime = kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("runtime fixture was poisoned"))?
+            .clone()
+            .ok_or_else(|| io::Error::other("published Workflow runtime is absent"))?;
+        reconcile_agent_runtime_work_item(
+            &client,
+            task_runtime.clone(),
+            inference.clone(),
+            store.clone(),
+            runtime,
+        )
+        .await?;
+    }
+    for _ in 0..8 {
+        reconcile_current(&client, &task_runtime, &store, task_uid).await?;
+        if operation(&store, task_uid).await?.state == TaskOrchestrationState::Active {
+            break;
+        }
+    }
+    assert_eq!(
+        operation(&store, task_uid).await?.state,
+        TaskOrchestrationState::Active
+    );
+
+    let starts_before = task_runtime.starts.load(Ordering::SeqCst);
+    task_runtime
+        .succeed_next_start
+        .store(true, Ordering::SeqCst);
+    for _ in 0..8 {
+        reconcile_current(&client, &task_runtime, &store, task_uid).await?;
+        if task_runtime.starts.load(Ordering::SeqCst) > starts_before {
+            break;
+        }
+    }
+    assert_eq!(
+        task_runtime.starts.load(Ordering::SeqCst),
+        starts_before + 1,
+        "the published Workflow must cross the Task adapter exactly once"
+    );
+    for _ in 0..8 {
+        reconcile_current(&client, &task_runtime, &store, task_uid).await?;
+        if store
+            .task(task_uid)
+            .await?
+            .is_some_and(|task| task.phase == TaskPhase::Succeeded)
+        {
+            break;
+        }
+    }
+    let completed_task = store
+        .task(task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(
+        completed_task.phase,
+        TaskPhase::Succeeded,
+        "published Workflow Task failed: {:?}",
+        completed_task.failure_reason
+    );
+    assert_eq!(
+        operation(&store, task_uid).await?.state,
+        TaskOrchestrationState::CleanupPending
+    );
+    let observed_inputs = task_runtime
+        .input_archives
+        .lock()
+        .map_err(|_| io::Error::other("Task input fixture was poisoned"))?;
+    assert!(
+        observed_inputs.iter().any(|archive| archive
+            .windows(b"in/event.json".len())
+            .any(|window| window == b"in/event.json")),
+        "the runtime must receive the caller's event file"
+    );
+    drop(observed_inputs);
+
+    let outputs = task_api_request(
+        &app,
+        Method::GET,
+        &format!("/v1/tasks/{task_uid}/outputs"),
+        &token,
+        None,
+        None,
+        Vec::new(),
+    )
+    .await?;
+    assert_eq!(outputs.status(), StatusCode::OK);
+    let output_archive = to_bytes(outputs.into_body(), 1024 * 1024).await?;
+    let output_entries =
+        task_output_archive_entries(&output_archive, TaskOutputArchiveCompatibility::Strict)
+            .map_err(|error| io::Error::other(format!("invalid Task output archive: {error:?}")))?;
+    let result = output_entries
+        .iter()
+        .find(|entry| entry.path == "result.txt")
+        .ok_or_else(|| io::Error::other("Task output omitted result.txt"))?;
+    assert_eq!(
+        &output_archive[result.offset..result.offset + result.size],
+        b"successful task output"
+    );
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1337,10 +1971,12 @@ async fn browser_task_rows_persist_and_concurrency_is_bounded_without_breaking_e
 #[derive(Clone, Default)]
 struct AmbiguousTaskRuntime {
     starts: Arc<AtomicUsize>,
+    input_archives: Arc<Mutex<Vec<Vec<u8>>>>,
     ensures: Arc<AtomicUsize>,
     deletes: Arc<AtomicUsize>,
     fail_next_ensure: Arc<AtomicBool>,
     succeed_next_start: Arc<AtomicBool>,
+    accept_default_diagnostics: Arc<AtomicBool>,
     progressive_success_stage: Arc<AtomicUsize>,
     terminal_observed: Arc<AtomicBool>,
     fail_next_observation: Arc<AtomicBool>,
@@ -1484,11 +2120,19 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
         &self,
         attempt_id: &TaskAttemptId,
         request: &SandboxTaskRequest,
-        _input_archive: &[u8],
+        input_archive: &[u8],
     ) -> Result<SandboxTaskObservation, PortError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
+        self.input_archives
+            .lock()
+            .map_err(|_| PortError::Failed {
+                reason: "fixture input archive lock was poisoned".to_owned(),
+            })?
+            .push(input_archive.to_vec());
         if self.succeed_next_start.swap(false, Ordering::SeqCst) {
-            if request.diagnostics.execution_log != ExecutionLogMode::Full {
+            if !self.accept_default_diagnostics.load(Ordering::SeqCst)
+                && request.diagnostics.execution_log != ExecutionLogMode::Full
+            {
                 return Err(PortError::Failed {
                     reason: "successful fixture did not request full execution diagnostics"
                         .to_owned(),
@@ -1519,7 +2163,9 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
             if stage == 0 {
                 break;
             }
-            if request.diagnostics.execution_log != ExecutionLogMode::Full {
+            if !self.accept_default_diagnostics.load(Ordering::SeqCst)
+                && request.diagnostics.execution_log != ExecutionLogMode::Full
+            {
                 return Err(PortError::Failed {
                     reason: "progressive fixture did not retain full execution diagnostics"
                         .to_owned(),
@@ -6537,7 +7183,7 @@ async fn kubernetes_request(
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     let response = match method {
-        Method::POST if path == RUNTIME_PATH_PREFIX => {
+        Method::POST if path == RUNTIME_PATH_PREFIX || path == WORKFLOW_RUNTIME_PATH_PREFIX => {
             state.create_calls.fetch_add(1, Ordering::SeqCst);
             if state
                 .reject_create_with_unprocessable_entity
@@ -6645,14 +7291,22 @@ async fn kubernetes_request(
                 }
             }
         }
-        Method::GET if path.starts_with(RUNTIME_PATH_PREFIX) => match state.runtime.lock() {
-            Ok(runtime) => runtime.as_ref().map_or_else(
-                || status_response(StatusCode::NOT_FOUND, "NotFound"),
-                |runtime| json_response(StatusCode::OK, serde_json::to_value(runtime)),
-            ),
-            Err(_) => status_response(StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
-        },
-        Method::PUT if path.starts_with(RUNTIME_PATH_PREFIX) => {
+        Method::GET
+            if path.starts_with(RUNTIME_PATH_PREFIX)
+                || path.starts_with(WORKFLOW_RUNTIME_PATH_PREFIX) =>
+        {
+            match state.runtime.lock() {
+                Ok(runtime) => runtime.as_ref().map_or_else(
+                    || status_response(StatusCode::NOT_FOUND, "NotFound"),
+                    |runtime| json_response(StatusCode::OK, serde_json::to_value(runtime)),
+                ),
+                Err(_) => status_response(StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+            }
+        }
+        Method::PUT
+            if path.starts_with(RUNTIME_PATH_PREFIX)
+                || path.starts_with(WORKFLOW_RUNTIME_PATH_PREFIX) =>
+        {
             state.replace_calls.fetch_add(1, Ordering::SeqCst);
             let bytes = match to_bytes(request.into_body(), 1024 * 1024).await {
                 Ok(bytes) => bytes,
@@ -6732,7 +7386,10 @@ async fn kubernetes_request(
                 json_response(StatusCode::OK, serde_json::to_value(&desired))
             }
         }
-        Method::PATCH if path.starts_with(RUNTIME_PATH_PREFIX) => {
+        Method::PATCH
+            if path.starts_with(RUNTIME_PATH_PREFIX)
+                || path.starts_with(WORKFLOW_RUNTIME_PATH_PREFIX) =>
+        {
             let bytes = match to_bytes(request.into_body(), 1024 * 1024).await {
                 Ok(bytes) => bytes,
                 Err(_) => return Ok(status_response(StatusCode::BAD_REQUEST, "BadRequest")),
@@ -6841,7 +7498,10 @@ async fn kubernetes_request(
             );
             json_response(StatusCode::OK, serde_json::to_value(runtime))
         }
-        Method::GET if path.starts_with(SECRET_PATH_PREFIX) => {
+        Method::GET
+            if path.starts_with(SECRET_PATH_PREFIX)
+                || path.starts_with(WORKFLOW_SECRET_PATH_PREFIX) =>
+        {
             match state.credential_secret.lock() {
                 Ok(secret) => secret.as_ref().map_or_else(
                     || status_response(StatusCode::NOT_FOUND, "NotFound"),
@@ -6850,7 +7510,7 @@ async fn kubernetes_request(
                 Err(_) => status_response(StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
             }
         }
-        Method::POST if path == SECRET_PATH_PREFIX => {
+        Method::POST if path == SECRET_PATH_PREFIX || path == WORKFLOW_SECRET_PATH_PREFIX => {
             let bytes = match to_bytes(request.into_body(), 1024 * 1024).await {
                 Ok(bytes) => bytes,
                 Err(_) => return Ok(status_response(StatusCode::BAD_REQUEST, "BadRequest")),
@@ -6879,7 +7539,10 @@ async fn kubernetes_request(
                 Err(_) => status_response(StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
             }
         }
-        Method::DELETE if path.starts_with(SECRET_PATH_PREFIX) => {
+        Method::DELETE
+            if path.starts_with(SECRET_PATH_PREFIX)
+                || path.starts_with(WORKFLOW_SECRET_PATH_PREFIX) =>
+        {
             match state.credential_secret.lock() {
                 Ok(mut stored) => {
                     *stored = None;
@@ -6888,7 +7551,10 @@ async fn kubernetes_request(
                 Err(_) => status_response(StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
             }
         }
-        Method::DELETE if path.starts_with(RUNTIME_PATH_PREFIX) => {
+        Method::DELETE
+            if path.starts_with(RUNTIME_PATH_PREFIX)
+                || path.starts_with(WORKFLOW_RUNTIME_PATH_PREFIX) =>
+        {
             let bytes = match to_bytes(request.into_body(), 1024 * 1024).await {
                 Ok(bytes) => bytes,
                 Err(_) => return Ok(status_response(StatusCode::BAD_REQUEST, "BadRequest")),

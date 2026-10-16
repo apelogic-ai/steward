@@ -3758,7 +3758,11 @@ name = "steward-e2e"
 version = "0.3.19"
 dependencies = [
  "axum",
+ "base64",
+ "jsonwebtoken",
  "kube",
+ "p256",
+ "rand_core 0.6.4",
  "serde_json",
  "sha2",
  "sqlx",
