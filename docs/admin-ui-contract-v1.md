@@ -2,7 +2,7 @@
 
 Status: active browser and API boundary.
 
-Applies to Steward 0.3.18.
+Applies to Steward 0.3.19.
 
 ## Presentation ownership
 

@@ -9,10 +9,10 @@ version.workspace = true
 [dependencies]
 reqwest.workspace = true # Validates governed endpoints without performing I/O.
 serde_json.workspace = true # Renders the isolated MCP configuration without shell interpolation.
-steward-ports = { path = "../../crates/steward-ports", version = "=0.3.18" }
+steward-ports = { path = "../../crates/steward-ports", version = "=0.3.19" }
 
 [dev-dependencies]
-steward-types = { path = "../../crates/steward-types", version = "=0.3.18" }
+steward-types = { path = "../../crates/steward-types", version = "=0.3.19" }
 
 [lints]
 workspace = true

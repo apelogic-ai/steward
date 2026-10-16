@@ -628,7 +628,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          test "$version" = "0.3.18"
+          test "$version" = "0.3.19"
           repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward"
           codex_repository="ghcr.io/$GITHUB_REPOSITORY_OWNER/steward-codex-runtime"
           chart="ghcr.io/$GITHUB_REPOSITORY_OWNER/charts/steward"
@@ -757,15 +757,14 @@ jobs:
             printf '# Steward release %s\n\n' "$version"
             printf 'Release commit: %s\n\n' "$GITHUB_SHA"
             printf '## Highlights\n\n'
-            printf 'Steward v0.3.18 adds catalog-defined provider tools and provider-specific Connections. Jira users can see connection status and start or restart consent in a new browser tab, and governed Tasks can use only the read-only Jira tools selected by their Envelope and Task.\n\n'
-            printf 'Direct connection-status requests and non-GitHub sign-in starts such as Jira use the provider-specific connectionsBridge.providerOrigins entry when configured, with the default gateway origin as fallback. GitHub start and disconnect retain the governed bridge flow. Catalog display names are accepted by Mint and shown on unified provider cards; the cards expose only reported actions and present active and renewal credential expiry consistently.\n\n'
-            printf 'Governed repository Tasks now tell coding agents where every checkout is located and fail clearly when no output is produced. Per-run inference limits reject zero, account for prior spend by the same Envelope instance, retain final spend, and expose a stable spending-limit reason.\n\n'
-            printf 'This release retains everything shipped in v0.3.17, including administrator-controlled custom Envelope approvals, stable Run refusal codes, reliable browser mutations, and bounded Git workspace preparation.\n\n'
+            printf 'Steward v0.3.19 lets Run clients show the existing safe explanation when bounded workspace preparation fails, while arbitrary internal diagnostics remain private.\n\n'
+            printf 'Runtime cleanup now retries quietly while sandbox deletion is making progress. Cleanup that remains incomplete past the existing deadline still produces an error.\n\n'
+            printf 'This release retains everything shipped in v0.3.18, including catalog-defined provider tools, provider-specific Connections, governed Jira access, reliable repository checkout discovery, and per-run inference limits.\n\n'
             printf 'The release retains immutable chart, component-image, reference-runtime, provider-bundle, platform-preflight, mirror, SBOM, provenance, scan, and product-compatibility artifacts.\n\n'
             printf '## Upgrade prerequisites and rollback\n\n'
-            printf 'Apply additive migration 0071 before starting v0.3.18. It adds an optional preferred-Envelope digest to immutable browser Task versions and leaves historical rows unchanged. Retain the column and rows on rollback.\n\n'
-            printf 'Jira Connections require MCP-GW v0.6.0 with its read-only Jira REST preset. Configure the exact Jira wrapper under connectionsBridge.providerOrigins before enabling Jira in the capability catalog. Replace every old Mint pod before adding catalog displayName fields.\n\n'
-            printf 'Deploy the v0.3.18 chart and all component images as one release unit. Before rollback to v0.3.17, remove every catalog displayName, disable Jira and remove its tool and catalog entries, and remove provider-specific origins. Tasks that recorded taskRuntimeMinutesLimit cannot be read by v0.3.17 or earlier; stop submission and prove that no stored Task evidence carries that field before rollback.\n\n'
+            printf 'This release adds no database migration and requires no configuration change. Deploy the v0.3.19 chart and all component images as one release unit.\n\n'
+            printf 'Jira Connections retain the v0.3.18 prerequisite: MCP-GW v0.6.0 with its read-only Jira REST preset and the exact Jira wrapper under connectionsBridge.providerOrigins.\n\n'
+            printf 'Rolling back to v0.3.18 hides the two bounded workspace-preparation explanations from Run API responses and restores error logging during expected sandbox-deletion progress. The cleanup deadline and stalled-deletion error remain unchanged.\n\n'
             printf 'The provider-profile bundle remains 1.2.2. Its MCP-GW profile permits the session DELETE used by the bridge.\n\n'
             printf 'Run-refusal clients must read the stable code from error and the user-facing sentence from failureReason. Do not parse prior internal error formatting.\n\n'
             printf '## Required action\n\n'
@@ -839,7 +838,7 @@ jobs:
         id: attest-product-compatibility
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:
-          subject-path: dist/steward-product-compatibility-0.3.18.json
+          subject-path: dist/steward-product-compatibility-0.3.19.json
 
       - name: Archive product compatibility verification material
         env:
@@ -849,7 +848,7 @@ jobs:
           set -euo pipefail
           test -s "$BUNDLE_PATH"
           cp "$BUNDLE_PATH" dist/steward-product-compatibility-attestation.jsonl
-          gh attestation verify dist/steward-product-compatibility-0.3.18.json \
+          gh attestation verify dist/steward-product-compatibility-0.3.19.json \
             --repo "$GITHUB_REPOSITORY" \
             --cert-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/release.yml@refs/tags/$GITHUB_REF_NAME"
 
