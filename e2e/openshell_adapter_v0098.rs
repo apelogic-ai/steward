@@ -13,8 +13,8 @@ use steward_adapter_openshell::{
 };
 use steward_ports::{
     PortError, SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
-    SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
-    TaskExecutionAdapter, TaskExecutionPlanRequest,
+    SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TASK_AGENT_START_FAILURE,
+    TASK_TOOL_FAILURE, TaskAttemptId, TaskExecutionAdapter, TaskExecutionPlanRequest,
 };
 use steward_types::direct_package::{
     ContentDigest, DiagnosticsRequest, ExactGitCommit, ExecutionLogMode,
@@ -477,31 +477,6 @@ async fn delete_sandbox(
     }
 }
 
-async fn observe_task_until_terminal(
-    runtime: &OpenShellRuntime,
-    attempt: &TaskAttemptId,
-    task: &SandboxTaskRequest,
-    mut observation: SandboxTaskObservation,
-) -> Result<SandboxTaskObservation, String> {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        match observation {
-            SandboxTaskObservation::Accepted { .. }
-            | SandboxTaskObservation::Running { .. }
-            | SandboxTaskObservation::RunningWithTranscript { .. } => {}
-            observation => return Ok(observation),
-        }
-        if Instant::now() >= deadline {
-            return Err("Task did not reach a terminal observation within 120 seconds".to_owned());
-        }
-        sleep(Duration::from_secs(1)).await;
-        observation = runtime
-            .observe_task(attempt, task)
-            .await
-            .map_err(|error| format!("Task observation failed: {error:?}"))?;
-    }
-}
-
 async fn verify_attempt_failure_semantics(
     runtime: &OpenShellRuntime,
     sandbox: &SandboxRequest,
@@ -698,29 +673,14 @@ async fn verify_attempt_failure_semantics(
         workspace: Some(workspace.clone()),
         ..task.clone()
     };
-    let empty_output_started = runtime
+    match runtime
         .start_task(
             &empty_output_attempt,
             &empty_output_task,
             workspace_input_archive,
         )
         .await
-        .map_err(|error| format!("empty-output task could not start: {error:?}"))?;
-    if !matches!(
-        empty_output_started,
-        SandboxTaskObservation::Accepted { .. }
-    ) {
-        return Err(format!(
-            "diagnostics-off task did not record its accepted start: {empty_output_started:?}"
-        ));
-    }
-    match observe_task_until_terminal(
-        runtime,
-        &empty_output_attempt,
-        &empty_output_task,
-        empty_output_started,
-    )
-    .await?
+        .map_err(|error| format!("empty-output task could not be observed: {error:?}"))?
     {
         SandboxTaskObservation::Failed {
             reason,
@@ -730,6 +690,78 @@ async fn verify_attempt_failure_semantics(
         other => {
             return Err(format!(
                 "empty-output task did not fail with the expected reason: {other:?}"
+            ));
+        }
+    }
+
+    let tool_failure_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000008".to_owned());
+    let tool_failure_task = SandboxTaskRequest {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "printf '%s\n' 'Error: MCP: example_search failed: bounded_request_required' >&2; exit 1"
+                .to_owned(),
+        ],
+        diagnostics: DiagnosticsRequest {
+            execution_log: ExecutionLogMode::Off,
+        },
+        ..task.clone()
+    };
+    match runtime
+        .start_task(&tool_failure_attempt, &tool_failure_task, caller_archive)
+        .await
+        .map_err(|error| format!("tool-refusal task could not be observed: {error:?}"))?
+    {
+        SandboxTaskObservation::Failed { reason, .. } if reason == TASK_TOOL_FAILURE => {}
+        other => {
+            return Err(format!(
+                "real tool refusal did not retain its bounded category: {other:?}"
+            ));
+        }
+    }
+
+    let no_stderr_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000009".to_owned());
+    let no_stderr_task = SandboxTaskRequest {
+        command: vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "test ! -e /sandbox/.steward-attempts/{}/.steward/diagnostics/stderr.log; mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; printf clean > \"$STEWARD_OUTPUT_DIR/out/result.txt\"",
+                tool_failure_attempt.0
+            ),
+        ],
+        diagnostics: DiagnosticsRequest {
+            execution_log: ExecutionLogMode::Off,
+        },
+        ..task.clone()
+    };
+    if !matches!(
+        runtime
+            .start_task(&no_stderr_attempt, &no_stderr_task, caller_archive)
+            .await
+            .map_err(|error| format!("diagnostics-off disk check failed: {error:?}"))?,
+        SandboxTaskObservation::Succeeded { .. }
+    ) {
+        return Err("executionLog=off left a stderr transcript in the sandbox".to_owned());
+    }
+
+    let agent_start_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000010".to_owned());
+    let agent_start_task = SandboxTaskRequest {
+        command: vec!["/sandbox/does-not-exist".to_owned()],
+        diagnostics: DiagnosticsRequest {
+            execution_log: ExecutionLogMode::Off,
+        },
+        ..task.clone()
+    };
+    match runtime
+        .start_task(&agent_start_attempt, &agent_start_task, caller_archive)
+        .await
+        .map_err(|error| format!("agent-start refusal could not be observed: {error:?}"))?
+    {
+        SandboxTaskObservation::Failed { reason, .. } if reason == TASK_AGENT_START_FAILURE => {}
+        other => {
+            return Err(format!(
+                "real agent-start refusal had the wrong category: {other:?}"
             ));
         }
     }
@@ -747,31 +779,20 @@ async fn verify_attempt_failure_semantics(
         },
         ..task
     };
-    let diagnostics_off_started = runtime
-        .start_task(
-            &diagnostics_off_attempt,
-            &diagnostics_off_task,
-            caller_archive,
-        )
-        .await
-        .map_err(|error| format!("diagnostics-off task could not start: {error:?}"))?;
     if !matches!(
-        diagnostics_off_started,
-        SandboxTaskObservation::Accepted { .. }
-    ) {
-        return Err("executionLog=off did not return an accepted start observation".to_owned());
-    }
-    if !matches!(
-        observe_task_until_terminal(
-            runtime,
-            &diagnostics_off_attempt,
-            &diagnostics_off_task,
-            diagnostics_off_started,
-        )
-        .await?,
+        runtime
+            .start_task(
+                &diagnostics_off_attempt,
+                &diagnostics_off_task,
+                caller_archive,
+            )
+            .await
+            .map_err(|error| format!("diagnostics-off task could not start: {error:?}"))?,
         SandboxTaskObservation::Succeeded { .. }
     ) {
-        return Err("executionLog=off did not reach a successful terminal observation".to_owned());
+        return Err(
+            "executionLog=off did not retain synchronous terminal start behavior".to_owned(),
+        );
     }
     Ok(())
 }

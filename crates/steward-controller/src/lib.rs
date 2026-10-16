@@ -32,7 +32,7 @@ use steward_ports::{
     InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest,
     MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SandboxExecutionClass,
     SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
-    TaskAttemptId,
+    TASK_AGENT_START_FAILURE, TaskAttemptId,
 };
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{
@@ -1360,6 +1360,7 @@ async fn reconcile_quarantined_execution<R: SandboxTaskRuntime>(
             attempt.generation,
             request.execution_class,
             observation,
+            false,
         )
         .await?;
     }
@@ -1610,6 +1611,18 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
             task.task_uid,
         );
     }
+    let execution_started = request.execution_class == SandboxExecutionClass::Agent
+        && match &result {
+            Ok(
+                SandboxTaskObservation::Succeeded { .. }
+                | SandboxTaskObservation::SucceededWithTranscript { .. },
+            ) => true,
+            Ok(
+                SandboxTaskObservation::Failed { reason, .. }
+                | SandboxTaskObservation::FailedWithTranscript { reason, .. },
+            ) => reason != TASK_AGENT_START_FAILURE,
+            _ => false,
+        };
     let observation = task_start_observation(&attempt_id, result);
     persist_execution_observation(
         authority,
@@ -1617,6 +1630,7 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
         attempt.generation,
         request.execution_class,
         observation,
+        execution_started,
     )
     .await
 }
@@ -1828,6 +1842,7 @@ async fn reconcile_task_cancellation<R: SandboxTaskRuntime>(
             attempt.generation,
             sandbox_execution_class(&task.runtime_spec),
             observation,
+            false,
         )
         .await;
     };
@@ -1883,6 +1898,7 @@ async fn reconcile_task_cancellation<R: SandboxTaskRuntime>(
                 attempt.generation,
                 execution_class,
                 observation,
+                false,
             )
             .await
         }
@@ -2513,6 +2529,7 @@ async fn observe_execution_attempt<R: SandboxTaskRuntime>(
         attempt.generation,
         request.execution_class,
         observation,
+        false,
     )
     .await
 }
@@ -2551,6 +2568,7 @@ async fn persist_execution_observation(
     generation: i64,
     execution_class: SandboxExecutionClass,
     observation: SandboxTaskObservation,
+    execution_started: bool,
 ) -> Result<(), TaskControllerError> {
     let transition = match observation {
         SandboxTaskObservation::Absent => return Ok(()),
@@ -2613,6 +2631,7 @@ async fn persist_execution_observation(
                         TaskExecutionObservation::Failed {
                             adapter_observation_id: &adapter_observation_id,
                             reason,
+                            execution_started,
                             output_archive: None,
                             output_archive_contract: None,
                             execution_stdout: None,
@@ -2655,6 +2674,7 @@ async fn persist_execution_observation(
                         TaskExecutionObservation::Failed {
                             adapter_observation_id: &adapter_observation_id,
                             reason,
+                            execution_started,
                             output_archive: None,
                             output_archive_contract: None,
                             execution_stdout: Some(&transcript.stdout),
@@ -2697,6 +2717,7 @@ async fn persist_execution_observation(
                     TaskExecutionObservation::Failed {
                         adapter_observation_id: &adapter_observation_id,
                         reason: &reason,
+                        execution_started,
                         output_archive: output.as_ref().map(|output| output.archive.as_slice()),
                         output_archive_contract: output
                             .as_ref()
@@ -2722,6 +2743,7 @@ async fn persist_execution_observation(
                     TaskExecutionObservation::Failed {
                         adapter_observation_id: &adapter_observation_id,
                         reason: &reason,
+                        execution_started,
                         output_archive: output.as_ref().map(|output| output.archive.as_slice()),
                         output_archive_contract: output
                             .as_ref()
@@ -6758,22 +6780,16 @@ mod tests {
     }
 
     #[test]
-    fn launcher_rejection_is_a_specific_terminal_failure() {
-        let reason = steward_ports::TASK_AGENT_START_FAILURE;
+    fn unconfirmed_launcher_result_is_quarantined() {
         assert_eq!(
             task_start_observation(
                 &TaskAttemptId("attempt-a".to_owned()),
-                Err(PortError::TaskPreparationFailed {
-                    reason: reason.to_owned(),
-                    step: "launch",
-                    category: "launcher_rejected",
-                    exit_code: Some(70),
+                Err(PortError::Failed {
+                    reason: "OpenShell task launch could not be confirmed".to_owned(),
                 }),
             ),
-            SandboxTaskObservation::Failed {
-                adapter_observation_id: "attempt-a".to_owned(),
-                reason: reason.to_owned(),
-                output: None,
+            SandboxTaskObservation::OutcomeUnknown {
+                reason: "OpenShell task launch could not be confirmed".to_owned(),
             }
         );
     }

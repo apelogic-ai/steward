@@ -900,6 +900,34 @@ async fn pure_service_identity_runs_a_published_workflow_and_refuses_invalid_aut
         .ok_or(StoreError::TaskNotFound)?;
     assert_eq!(failed_task.phase, TaskPhase::Failed);
     assert!(failed_task.output_archive.is_some());
+    let failed_timeline = store
+        .agent_run_timeline(failed_task_uid)
+        .await?
+        .ok_or_else(|| io::Error::other("failed-run timeline is absent"))?;
+    let started_index = failed_timeline
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                AgentRunTimelineKind::Stage { event_kind, .. }
+                    if event_kind == "execution_started"
+            )
+        })
+        .ok_or_else(|| io::Error::other("terminal start result omitted executionStarted"))?;
+    let ended_index = failed_timeline
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                AgentRunTimelineKind::Stage { event_kind, .. }
+                    if event_kind == "execution_ended"
+            )
+        })
+        .ok_or_else(|| io::Error::other("failed run omitted executionEnded"))?;
+    assert!(
+        started_index < ended_index,
+        "a synchronous terminal result must record executionStarted before executionEnded"
+    );
     assert!(
         store
             .task_output_transcript_for_submitter(failed_task_uid, &service, owner.user_id.as_str())
@@ -4085,6 +4113,7 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 TaskExecutionObservation::Failed {
                     adapter_observation_id: &adapter_observation_id,
                     reason: failure_reason,
+                    execution_started: false,
                     output_archive: None,
                     output_archive_contract: None,
                     execution_stdout: None,

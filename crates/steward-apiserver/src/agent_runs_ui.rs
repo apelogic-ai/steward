@@ -2866,14 +2866,12 @@ pub(crate) fn public_run_failure_reason(reason: Option<&str>) -> Option<&str> {
     if reason == INFERENCE_REQUEST_REJECTED_FAILURE {
         return Some(reason);
     }
-    if reason == "tool" {
-        return Some(TASK_TOOL_FAILURE);
-    }
     if matches!(
         reason,
         REQUIRED_OUTPUT_MISSING_FAILURE
             | SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE
             | TASK_AGENT_START_FAILURE
+            | TASK_TOOL_FAILURE
             | WORKSPACE_PREPARATION_FAILURE
     ) {
         return Some(reason);
@@ -3130,11 +3128,11 @@ mod tests {
         );
 
         assert_eq!(
-            public_run_failure_reason(Some("tool")),
+            public_run_failure_reason(Some(steward_ports::TASK_TOOL_FAILURE)),
             Some("This run stopped because an approved tool could not complete the request.")
         );
         assert_eq!(
-            bounded_task_error_category(Some("tool")),
+            bounded_task_error_category(Some(steward_ports::TASK_TOOL_FAILURE)),
             Some("tool-failed")
         );
     }
