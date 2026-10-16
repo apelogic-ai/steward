@@ -28,6 +28,7 @@ use steward_types::task_output_archive::{
 use steward_types::{
     AgentType, DisposableExecutionBinding, ExecutionModelCompatibility, ExecutionProviderProfile,
     ExecutionProviderProfiles, ExecutionVersionProbe, ModelRef, RuntimeId, RuntimeRefs,
+    TASK_EXECUTION_BINDING_DIGEST_DOMAIN, TASK_EXECUTION_BINDING_SCHEMA_VERSION,
 };
 use tokio::time::sleep;
 
@@ -430,6 +431,45 @@ fn assert_default_runtime_class(workspace: &str, sandbox: &str) -> Result<(), St
     Ok(())
 }
 
+fn sandbox_agent_image(workspace: &str, sandbox: &str) -> Result<String, String> {
+    let kubeconfig = required("STEWARD_TEST_KUBECONFIG")?;
+    let context = required("STEWARD_TEST_KUBE_CONTEXT")?;
+    let pod = format!("{workspace}--{sandbox}");
+    let output = Command::new("kubectl")
+        .args([
+            "--kubeconfig",
+            &kubeconfig,
+            "--context",
+            &context,
+            "-n",
+            "openshell",
+            "get",
+            "pod",
+            &pod,
+            "-o",
+            "jsonpath={.status.containerStatuses[?(@.name==\"agent\")].imageID}",
+        ])
+        .output()
+        .map_err(|error| format!("failed to inspect sandbox agent image: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "sandbox agent image lookup failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let image = String::from_utf8(output.stdout)
+        .map_err(|_| "sandbox agent image ID was not UTF-8".to_owned())?;
+    let image = image.trim();
+    let image = image
+        .strip_prefix("docker-pullable://")
+        .or_else(|| image.strip_prefix("docker://"))
+        .unwrap_or(image);
+    if !image.contains("@sha256:") {
+        return Err(format!("sandbox agent image was not immutable: {image:?}"));
+    }
+    Ok(image.to_owned())
+}
+
 async fn wait_running(
     runtime: &OpenShellRuntime,
     request: &SandboxRequest,
@@ -475,6 +515,143 @@ async fn delete_sandbox(
         }
         sleep(Duration::from_secs(2)).await;
     }
+}
+
+fn bound_agent_execution_binding(image: String) -> Result<DisposableExecutionBinding, String> {
+    let placeholder = format!("sha256:{}", "0".repeat(64));
+    let mut binding = DisposableExecutionBinding {
+        schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
+        binding_id: placeholder.clone(),
+        binding_digest: placeholder,
+        agent_ref: "example-agent@1.0.0".to_owned(),
+        display_name: Some("Example Agent".to_owned()),
+        adapter: CODEX_V1_ADAPTER.to_owned(),
+        image,
+        executable: "/bin/sh".to_owned(),
+        version_probe: ExecutionVersionProbe {
+            arguments: vec!["--version".to_owned()],
+            expected_stdout: "example-agent 1.0.0".to_owned(),
+        },
+        models: None,
+        provider_profiles: ExecutionProviderProfiles::default(),
+    };
+    let mut digest = Sha256::new();
+    digest.update(TASK_EXECUTION_BINDING_DIGEST_DOMAIN);
+    digest.update(binding.canonical_content()?);
+    let digest = format!("sha256:{:x}", digest.finalize());
+    binding.binding_id = digest.clone();
+    binding.binding_digest = digest;
+    binding.validate()?;
+    Ok(binding)
+}
+
+async fn verify_bound_agent_declared_output_contract(
+    runtime: &OpenShellRuntime,
+    caller_archive: &[u8],
+    image: String,
+) -> Result<(), String> {
+    let binding = bound_agent_execution_binding(image)?;
+    let mut sandbox = SandboxRequest {
+        runtime: RuntimeId("runtime-bound-empty-result".to_owned()),
+        workspace_key: "team-a".to_owned(),
+        execution_class: SandboxExecutionClass::Agent,
+        agent_type: AgentType {
+            name: binding.agent_ref.clone(),
+        },
+        models: Vec::new(),
+        tools: Vec::new(),
+        refs: RuntimeRefs::default(),
+        execution_binding: Some(binding.clone()),
+    };
+
+    let verification = async {
+        sandbox.refs = wait_running(runtime, &sandbox).await?;
+        let base = SandboxTaskRequest {
+            runtime: sandbox.runtime.clone(),
+            refs: sandbox.refs.clone(),
+            execution_class: SandboxExecutionClass::Agent,
+            agent_type: sandbox.agent_type.clone(),
+            models: Vec::new(),
+            command: Vec::new(),
+            diagnostics: DiagnosticsRequest {
+                execution_log: ExecutionLogMode::Off,
+            },
+            workspace: None,
+            execution_binding: Some(binding),
+        };
+        let empty_result = SandboxTaskRequest {
+            command: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "mkdir -p \"$STEWARD_OUTPUT_DIR/out\"; printf complete > \"$STEWARD_OUTPUT_DIR/out/result.txt\"; : > \"$STEWARD_OUTPUT_DIR/result.txt\""
+                    .to_owned(),
+            ],
+            ..base.clone()
+        };
+        let observation = runtime
+            .start_task(
+                &TaskAttemptId("00000000-0000-4000-8000-000000000011".to_owned()),
+                &empty_result,
+                caller_archive,
+            )
+            .await
+            .map_err(|error| format!("empty-final-message Task could not run: {error:?}"))?;
+        let output = match observation {
+            SandboxTaskObservation::Succeeded { output, .. } => output,
+            other => {
+                return Err(format!(
+                    "a bound Agent with declared output and an empty final message did not succeed: {other:?}"
+                ));
+            }
+        };
+        let entries = task_output_archive_entries(
+            &output.archive,
+            TaskOutputArchiveCompatibility::Strict,
+        )
+        .map_err(|_| "empty-final-message Task returned an invalid output archive".to_owned())?;
+        let [entry] = entries.as_slice() else {
+            return Err(format!(
+                "empty-final-message Task returned unexpected entries: {entries:?}"
+            ));
+        };
+        if entry.path != "result.txt"
+            || output.archive.get(entry.offset..entry.offset + entry.size) != Some(b"complete")
+        {
+            return Err("empty-final-message Task did not return its declared output".to_owned());
+        }
+
+        let missing_output = SandboxTaskRequest {
+            command: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "rm -rf \"$STEWARD_OUTPUT_DIR/out\"; : > \"$STEWARD_OUTPUT_DIR/result.txt\""
+                    .to_owned(),
+            ],
+            ..base
+        };
+        match runtime
+            .start_task(
+                &TaskAttemptId("00000000-0000-4000-8000-000000000012".to_owned()),
+                &missing_output,
+                caller_archive,
+            )
+            .await
+            .map_err(|error| format!("missing-output Task could not run: {error:?}"))?
+        {
+            SandboxTaskObservation::Failed { reason, .. }
+                if reason == "This run finished without creating an output file." =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "a bound Agent without declared output did not retain output-missing: {other:?}"
+            )),
+        }
+    }
+    .await;
+    let cleanup = delete_sandbox(runtime, &sandbox).await;
+    verification?;
+    cleanup
 }
 
 async fn verify_attempt_failure_semantics(
@@ -864,6 +1041,7 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
         .as_deref()
         .ok_or_else(|| "running sandbox has no sandbox reference".to_owned())?;
     assert_default_runtime_class(workspace, sandbox)?;
+    let bound_agent_image = sandbox_agent_image(workspace, sandbox)?;
     request.refs = refs.clone();
 
     let run_dir = PathBuf::from(required("STEWARD_RUN_DIR")?);
@@ -955,6 +1133,8 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
     let actual_payload = task_result?;
     failure_semantics?;
     cleanup_result?;
+    verify_bound_agent_declared_output_contract(&runtime, &caller_archive, bound_agent_image)
+        .await?;
     assert_eq!(
         Sha256::digest(&actual_payload),
         Sha256::digest(&expected_payload),

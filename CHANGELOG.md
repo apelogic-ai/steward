@@ -18,6 +18,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Bound Agent Tasks now succeed when the agent exits successfully and writes every declared
+  output but leaves its conversational final message empty. Missing declared output still fails
+  with the output-missing reason.
 - Task authentication now refuses credentials that combine a GitHub Actions identity with a
   pure-service caller, while delegated GitHub callers continue to work.
 - Coding-agent launches now record that execution started before any terminal result, including

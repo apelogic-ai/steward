@@ -487,14 +487,9 @@ fn validate_disposable_execution_binding(
 fn output_archive_command(
     execution_class: SandboxExecutionClass,
     agent_type: &AgentType,
-    execution_binding: Option<&steward_types::DisposableExecutionBinding>,
 ) -> String {
     if agent_type.name == CONNECTIONS_BRIDGE_AGENT_TYPE {
         "set -eu; test -f /sandbox/steward-output/response.json; tar -cf - -C /sandbox/steward-output response.json".to_owned()
-    } else if execution_class == SandboxExecutionClass::Agent && execution_binding.is_some() {
-        format!(
-            "set -eu; test -s /sandbox/steward-output/result.txt; if ! test -d /sandbox/steward-output/out || test -z \"$(find /sandbox/steward-output/out -type f -print -quit)\"; then exit {REQUIRED_OUTPUT_MISSING_EXIT_CODE}; fi; tar -cf - -C /sandbox/steward-output out"
-        )
     } else if execution_class == SandboxExecutionClass::Agent {
         format!(
             "set -eu; if ! test -d /sandbox/steward-output/out || test -z \"$(find /sandbox/steward-output/out -type f -print -quit)\"; then exit {REQUIRED_OUTPUT_MISSING_EXIT_CODE}; fi; tar -cf - -C /sandbox/steward-output out"
@@ -2815,11 +2810,8 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                     })?;
             environment.insert("STEWARD_MCP_GW_VERSION".to_owned(), version.to_owned());
         }
-        let output_archive_command = output_archive_command(
-            request.execution_class,
-            &request.agent_type,
-            request.execution_binding.as_ref(),
-        );
+        let output_archive_command =
+            output_archive_command(request.execution_class, &request.agent_type);
         let failed_output_archive_command = failed_output_archive_command(request.execution_class);
         let retain_transcript =
             task_transcript_requested(request.execution_class, request.diagnostics.execution_log);
@@ -5399,7 +5391,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn bound_workflow_validates_the_standard_result_and_archives_declared_outputs() {
+    fn bound_workflow_uses_declared_output_as_its_success_contract() {
         let binding = DisposableExecutionBinding {
             schema_version: TASK_EXECUTION_BINDING_SCHEMA_VERSION.to_owned(),
             binding_id: format!("sha256:{}", "a".repeat(64)),
@@ -5424,11 +5416,10 @@ mod tests {
             &AgentType {
                 name: binding.agent_ref.clone(),
             },
-            Some(&binding),
         );
         assert!(
-            command.contains("test -s /sandbox/steward-output/result.txt"),
-            "the runtime must reject a missing or empty standard result"
+            !command.contains("/sandbox/steward-output/result.txt"),
+            "a conversational result must not gate a bound Task's declared output"
         );
         assert!(
             command.contains("test -d /sandbox/steward-output/out"),
@@ -5448,7 +5439,6 @@ mod tests {
             &AgentType {
                 name: "base".to_owned(),
             },
-            None,
         );
         assert!(command.contains("test -d /sandbox/steward-output/out"));
         assert!(
@@ -5496,7 +5486,6 @@ mod tests {
             &AgentType {
                 name: "example-control@1".to_owned(),
             },
-            None,
         );
         assert!(provider_control.ends_with(" ."));
         Ok(())
