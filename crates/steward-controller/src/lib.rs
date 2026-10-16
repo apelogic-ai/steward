@@ -1606,7 +1606,7 @@ async fn reconcile_task_execution<R: SandboxTaskRuntime>(
     {
         let exit_code = exit_code.map_or_else(|| "none".to_owned(), |code| code.to_string());
         eprintln!(
-            "task workspace preparation failed: task_uid={} step={step} category={category} exit_code={exit_code}",
+            "task preparation failed: task_uid={} step={step} category={category} exit_code={exit_code}",
             task.task_uid,
         );
     }
@@ -6747,6 +6747,27 @@ mod tests {
                     step: "materialize",
                     category: "scratch_volume_size_not_enforced",
                     exit_code: Some(42),
+                }),
+            ),
+            SandboxTaskObservation::Failed {
+                adapter_observation_id: "attempt-a".to_owned(),
+                reason: reason.to_owned(),
+                output: None,
+            }
+        );
+    }
+
+    #[test]
+    fn launcher_rejection_is_a_specific_terminal_failure() {
+        let reason = steward_ports::TASK_AGENT_START_FAILURE;
+        assert_eq!(
+            task_start_observation(
+                &TaskAttemptId("attempt-a".to_owned()),
+                Err(PortError::TaskPreparationFailed {
+                    reason: reason.to_owned(),
+                    step: "launch",
+                    category: "launcher_rejected",
+                    exit_code: Some(70),
                 }),
             ),
             SandboxTaskObservation::Failed {

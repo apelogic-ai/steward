@@ -20,6 +20,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - Task authentication now refuses credentials that combine a GitHub Actions identity with a
   pure-service caller, while delegated GitHub callers continue to work.
+- Coding-agent launches now record that execution started before any terminal result, including
+  when execution logs are disabled. A launcher refusal is reported as `agent-start`, while an
+  approved tool refusal that prevents required output is reported as `tool-failed` instead of
+  `output-missing`; disabled execution logs remain unavailable.
 
 ## [0.3.19] - 2026-10-15
 

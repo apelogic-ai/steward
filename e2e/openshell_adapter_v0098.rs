@@ -477,6 +477,31 @@ async fn delete_sandbox(
     }
 }
 
+async fn observe_task_until_terminal(
+    runtime: &OpenShellRuntime,
+    attempt: &TaskAttemptId,
+    task: &SandboxTaskRequest,
+    mut observation: SandboxTaskObservation,
+) -> Result<SandboxTaskObservation, String> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match observation {
+            SandboxTaskObservation::Accepted { .. }
+            | SandboxTaskObservation::Running { .. }
+            | SandboxTaskObservation::RunningWithTranscript { .. } => {}
+            observation => return Ok(observation),
+        }
+        if Instant::now() >= deadline {
+            return Err("Task did not reach a terminal observation within 120 seconds".to_owned());
+        }
+        sleep(Duration::from_secs(1)).await;
+        observation = runtime
+            .observe_task(attempt, task)
+            .await
+            .map_err(|error| format!("Task observation failed: {error:?}"))?;
+    }
+}
+
 async fn verify_attempt_failure_semantics(
     runtime: &OpenShellRuntime,
     sandbox: &SandboxRequest,
@@ -673,14 +698,29 @@ async fn verify_attempt_failure_semantics(
         workspace: Some(workspace.clone()),
         ..task.clone()
     };
-    match runtime
+    let empty_output_started = runtime
         .start_task(
             &empty_output_attempt,
             &empty_output_task,
             workspace_input_archive,
         )
         .await
-        .map_err(|error| format!("empty-output task could not be observed: {error:?}"))?
+        .map_err(|error| format!("empty-output task could not start: {error:?}"))?;
+    if !matches!(
+        empty_output_started,
+        SandboxTaskObservation::Accepted { .. }
+    ) {
+        return Err(format!(
+            "diagnostics-off task did not record its accepted start: {empty_output_started:?}"
+        ));
+    }
+    match observe_task_until_terminal(
+        runtime,
+        &empty_output_attempt,
+        &empty_output_task,
+        empty_output_started,
+    )
+    .await?
     {
         SandboxTaskObservation::Failed {
             reason,
@@ -694,8 +734,8 @@ async fn verify_attempt_failure_semantics(
         }
     }
 
-    let synchronous_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000006".to_owned());
-    let synchronous_task = SandboxTaskRequest {
+    let diagnostics_off_attempt = TaskAttemptId("00000000-0000-4000-8000-000000000006".to_owned());
+    let diagnostics_off_task = SandboxTaskRequest {
         command: vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
@@ -707,15 +747,31 @@ async fn verify_attempt_failure_semantics(
         },
         ..task
     };
+    let diagnostics_off_started = runtime
+        .start_task(
+            &diagnostics_off_attempt,
+            &diagnostics_off_task,
+            caller_archive,
+        )
+        .await
+        .map_err(|error| format!("diagnostics-off task could not start: {error:?}"))?;
     if !matches!(
-        runtime
-            .start_task(&synchronous_attempt, &synchronous_task, caller_archive)
-            .await,
-        Ok(SandboxTaskObservation::Succeeded { .. })
+        diagnostics_off_started,
+        SandboxTaskObservation::Accepted { .. }
     ) {
-        return Err(
-            "executionLog=off did not retain synchronous terminal start behavior".to_owned(),
-        );
+        return Err("executionLog=off did not return an accepted start observation".to_owned());
+    }
+    if !matches!(
+        observe_task_until_terminal(
+            runtime,
+            &diagnostics_off_attempt,
+            &diagnostics_off_task,
+            diagnostics_off_started,
+        )
+        .await?,
+        SandboxTaskObservation::Succeeded { .. }
+    ) {
+        return Err("executionLog=off did not reach a successful terminal observation".to_owned());
     }
     Ok(())
 }

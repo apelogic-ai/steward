@@ -75,10 +75,10 @@ use steward_admission::{
     AdmissionDecision, AdmissionDelta, Envelope, EnvelopeScopeKind, add_budget_amount,
     evaluate_with_grants, validate_user_envelope,
 };
-use steward_ports::REQUIRED_OUTPUT_MISSING_FAILURE;
 pub use steward_ports::{
     DecisionChannel, DecisionReference, DecisionRequest, DecisionResolution, PortError,
 };
+use steward_ports::{REQUIRED_OUTPUT_MISSING_FAILURE, TASK_AGENT_START_FAILURE};
 use steward_store::{
     AdminApprovalRecord, AdminEnvelopeProvisionRequest, AdminEnvelopeRequestRecord,
     AgentRunExecutionLog, AgentRunPage, AgentRunQuery, AgentRunRecord, AgentRunTimelineEvent,
@@ -2419,6 +2419,10 @@ pub(crate) fn bounded_task_error_category(reason: Option<&str>) -> Option<&'stat
     reason.map(|reason| {
         if reason == REQUIRED_OUTPUT_MISSING_FAILURE {
             "output-missing"
+        } else if reason == TASK_AGENT_START_FAILURE {
+            "agent-start"
+        } else if reason == "tool" {
+            "tool-failed"
         } else if reason.starts_with("task output archive exceeds") {
             "output-limit"
         } else if reason.starts_with("sandbox does not support task operation") {
