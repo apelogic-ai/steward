@@ -1493,16 +1493,19 @@ fn task_identity_from_identity_claims(
     if claims.identity_contract != IDENTITY_TASK_CONTRACT {
         return Err(TaskAuthenticationError::InvalidCredentials);
     }
+    let github_actions_subject = valid_github_actions_subject(&claims.sub);
     let source_provenance = claims.source_provenance;
     let user = UserInfo {
         username: claims.email,
         groups: claims.groups,
         ..UserInfo::default()
     };
-    task_identity_from_kubernetes_user(&user).map(|mut identity| {
-        identity.source_provenance = source_provenance;
-        identity
-    })
+    let mut identity = task_identity_from_kubernetes_user(&user)?;
+    if github_actions_subject && identity.acting_user.is_none() {
+        return Err(TaskAuthenticationError::InvalidCredentials);
+    }
+    identity.source_provenance = source_provenance;
+    Ok(identity)
 }
 
 fn compatibility_task_identity_from_claims(
@@ -9598,8 +9601,7 @@ mod identity_task_authentication_tests {
     }
 
     #[test]
-    fn identity_task_token_verifies_exact_claims_and_maps_existing_group_contract()
-    -> Result<(), String> {
+    fn identity_task_token_preserves_the_delegated_github_v2_contract() -> Result<(), String> {
         let (key, jwks) = key_material()?;
         validate_identity_task_jwks(&jwks)
             .map_err(|error| format!("valid JWKS rejected: {error:?}"))?;
@@ -9610,6 +9612,10 @@ mod identity_task_authentication_tests {
         let identity = task_identity_from_identity_claims(claims)
             .map_err(|error| format!("valid ratified Identity groups rejected: {error:?}"))?;
         assert_eq!(identity.service, "steward-run");
+        assert_eq!(
+            identity.acting_user,
+            Some(Email("alice@example.com".to_owned()))
+        );
         assert_eq!(identity.owner.0, "alice@example.com");
         assert_eq!(
             identity.canonical_user_id.as_str(),
