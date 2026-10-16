@@ -290,7 +290,8 @@ pub struct SandboxTaskOutput {
 }
 
 /// Bounded process output captured for an Agent Task when full execution diagnostics were
-/// selected, or for a provider-control bridge whose output contract is itself sanitized.
+/// selected, when an Agent Task fails, or for a provider-control bridge whose output contract
+/// is itself sanitized.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxTaskTranscript {
     pub stdout: Vec<u8>,
@@ -326,10 +327,12 @@ pub enum SandboxTaskObservation {
     Failed {
         adapter_observation_id: String,
         reason: String,
+        output: Option<SandboxTaskOutput>,
     },
     FailedWithTranscript {
         adapter_observation_id: String,
         reason: String,
+        output: Option<SandboxTaskOutput>,
         transcript: SandboxTaskTranscript,
     },
     OutcomeUnknown {

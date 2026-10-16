@@ -43,10 +43,11 @@ use sha2::{Digest, Sha256};
 use steward_ports::PortError;
 #[cfg(feature = "runtime")]
 use steward_ports::{
-    ProviderControlExecutionBindings, REQUIRED_OUTPUT_MISSING_FAILURE,
-    SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxExecutionClass, SandboxObservation,
-    SandboxRequest, SandboxRuntime, SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest,
-    SandboxTaskRuntime, SandboxTaskTranscript, TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
+    MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProviderControlExecutionBindings,
+    REQUIRED_OUTPUT_MISSING_FAILURE, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE,
+    SandboxExecutionClass, SandboxObservation, SandboxRequest, SandboxRuntime,
+    SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
+    SandboxTaskTranscript, TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
 };
 #[cfg(feature = "runtime")]
 use steward_types::direct_package::{
@@ -503,6 +504,15 @@ fn output_archive_command(
 }
 
 #[cfg(feature = "runtime")]
+fn failed_output_archive_command(execution_class: SandboxExecutionClass) -> Option<String> {
+    (execution_class == SandboxExecutionClass::Agent).then(|| {
+        format!(
+            "set -eu; if ! test -d /sandbox/steward-output/out || test -z \"$(find /sandbox/steward-output/out -type f -print -quit)\"; then exit {REQUIRED_OUTPUT_MISSING_EXIT_CODE}; fi; tar -cf - -C /sandbox/steward-output out"
+        )
+    })
+}
+
+#[cfg(feature = "runtime")]
 fn repository_prompt_context(workspace: Option<&WorkspaceEvidence>) -> String {
     workspace
         .into_iter()
@@ -720,7 +730,9 @@ fn request_model_providers(request: &SandboxTaskRequest) -> Vec<String> {
 #[cfg(feature = "runtime")]
 fn attach_task_agent_failure_category(
     observation: SandboxTaskObservation,
+    stdout: &[u8],
     stderr: &[u8],
+    retain_transcript: bool,
     managed_inference: bool,
     model_providers: &[String],
 ) -> SandboxTaskObservation {
@@ -728,17 +740,34 @@ fn attach_task_agent_failure_category(
         SandboxTaskObservation::Failed {
             adapter_observation_id,
             reason,
-        } => SandboxTaskObservation::Failed {
-            adapter_observation_id,
-            reason: if reason == REQUIRED_OUTPUT_MISSING_FAILURE {
+            output,
+        } => {
+            let reason = if reason == REQUIRED_OUTPUT_MISSING_FAILURE {
                 reason
             } else {
                 task_failure_category(stderr, managed_inference, model_providers).to_owned()
-            },
-        },
+            };
+            if retain_transcript
+                && let Some(transcript) = bounded_task_process_transcript(stdout, stderr)
+            {
+                SandboxTaskObservation::FailedWithTranscript {
+                    adapter_observation_id,
+                    reason,
+                    output,
+                    transcript,
+                }
+            } else {
+                SandboxTaskObservation::Failed {
+                    adapter_observation_id,
+                    reason,
+                    output,
+                }
+            }
+        }
         SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
             reason,
+            output,
             transcript,
         } => SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
@@ -747,10 +776,24 @@ fn attach_task_agent_failure_category(
             } else {
                 task_failure_category(stderr, managed_inference, model_providers).to_owned()
             },
+            output,
             transcript,
         },
         observation => observation,
     }
+}
+
+#[cfg(feature = "runtime")]
+fn bounded_task_process_transcript(stdout: &[u8], stderr: &[u8]) -> Option<SandboxTaskTranscript> {
+    let stdout_bytes = u64::try_from(stdout.len()).ok()?;
+    let stderr_bytes = u64::try_from(stderr.len()).ok()?;
+    (stdout_bytes <= MAX_EXECUTION_STREAM_BYTES
+        && stderr_bytes <= MAX_EXECUTION_STREAM_BYTES
+        && stdout_bytes.saturating_add(stderr_bytes) <= MAX_EXECUTION_TRANSCRIPT_BYTES)
+        .then(|| SandboxTaskTranscript {
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        })
 }
 
 #[cfg(feature = "runtime")]
@@ -2008,6 +2051,47 @@ impl OpenShellRuntime {
         })
     }
 
+    async fn failed_task_output(
+        &self,
+        workspace: &str,
+        sandbox: &str,
+        directory: &str,
+    ) -> Result<Option<SandboxTaskOutput>, PortError> {
+        let output = self
+            .authenticated_client()
+            .await?
+            .workspace(workspace)
+            .exec(
+                sandbox,
+                &[
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    task_attempt_failed_output_command(directory),
+                ],
+                ExecOptions {
+                    timeout: Some(StdDuration::from_secs(120)),
+                    ..ExecOptions::default()
+                },
+            )
+            .await
+            .map_err(port_failure)?;
+        if output.exit_code == 44 {
+            return Ok(None);
+        }
+        if output.stdout.len() > MAX_TASK_OUTPUT_ARCHIVE_BYTES {
+            return Ok(None);
+        }
+        if output.exit_code != 0 {
+            return Err(PortError::Failed {
+                reason: "Failed Task output is unavailable or outside its bounded contract"
+                    .to_owned(),
+            });
+        }
+        Ok(Some(SandboxTaskOutput {
+            archive: output.stdout,
+        }))
+    }
+
     async fn resolve_raw_sandbox_binding(
         &self,
         workspace: &str,
@@ -2671,10 +2755,12 @@ impl SandboxTaskRuntime for OpenShellRuntime {
             &request.agent_type,
             request.execution_binding.as_ref(),
         );
+        let failed_output_archive_command = failed_output_archive_command(request.execution_class);
         let wrapped_command = task_attempt_execution_command(
             &attempt_directory,
             &request.command,
             &output_archive_command,
+            failed_output_archive_command.as_deref(),
             task_transcript_requested(request.execution_class, request.diagnostics.execution_log),
         );
         let launch_mode =
@@ -2730,7 +2816,9 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                     .map(|observation| {
                         attach_task_agent_failure_category(
                             observation,
+                            &executed.stdout,
                             &executed.stderr,
+                            request.execution_class == SandboxExecutionClass::Agent,
                             request_uses_managed_inference(request),
                             &model_providers,
                         )
@@ -2825,6 +2913,13 @@ impl SandboxTaskRuntime for OpenShellRuntime {
         } else {
             None
         };
+        let failed_output =
+            if state == "failed" && request.execution_class == SandboxExecutionClass::Agent {
+                self.failed_task_output(workspace, sandbox, &attempt_directory)
+                    .await?
+            } else {
+                None
+            };
         match state {
             "claimed" => Ok(SandboxTaskObservation::Accepted {
                 adapter_observation_id: correlation,
@@ -2888,12 +2983,14 @@ impl SandboxTaskRuntime for OpenShellRuntime {
                     SandboxTaskObservation::FailedWithTranscript {
                         adapter_observation_id: correlation,
                         reason,
+                        output: failed_output,
                         transcript,
                     }
                 } else {
                     SandboxTaskObservation::Failed {
                         adapter_observation_id: correlation,
                         reason,
+                        output: failed_output,
                     }
                 })
             }
@@ -3088,6 +3185,7 @@ fn task_attempt_execution_command(
     directory: &str,
     command: &[String],
     output_archive_command: &str,
+    failed_output_archive_command: Option<&str>,
     capture_transcript: bool,
 ) -> String {
     let diagnostics_directory = format!("{directory}/.steward/diagnostics");
@@ -3104,6 +3202,13 @@ fn task_attempt_execution_command(
         .map(|argument| shell_quote(argument))
         .collect::<Vec<_>>()
         .join(" ");
+    let failed_output = failed_output_archive_command.map_or_else(String::new, |command| {
+        format!(
+            "command_status=$status; if ({command}) > {directory}/output.tar.tmp 2>/dev/null; then \
+             mv {directory}/output.tar.tmp {directory}/output.tar; \
+             else rm -f {directory}/output.tar.tmp {directory}/output.tar; fi; status=$command_status;"
+        )
+    });
     let diagnostics_setup = if capture_transcript {
         format!("mkdir -p {diagnostics_directory}; : > {stdout_path}; : > {stderr_path};")
     } else {
@@ -3144,7 +3249,7 @@ fn task_attempt_execution_command(
          {diagnostics_setup} \
          printf running > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; \
          {execution}; \
-         if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
+         if [ \"$status\" -ne 0 ]; then {failed_output} printf '%s' \"$status\" > {directory}/exit-code; \
            printf failed > {directory}/state.tmp; mv {directory}/state.tmp {directory}/state; exit \"$status\"; fi; \
          ({output_archive_command}) > {directory}/output.tar; status=$?; \
          if [ \"$status\" -ne 0 ]; then printf '%s' \"$status\" > {directory}/exit-code; \
@@ -3176,6 +3281,12 @@ fn task_attempt_observation_command(directory: &str) -> String {
          elif [ \"$state\" = failed ] && [ -f {directory}/failure-reason ]; then \
            cat {directory}/failure-reason; fi"
     )
+}
+
+#[cfg(feature = "runtime")]
+fn task_attempt_failed_output_command(directory: &str) -> String {
+    let directory = shell_quote(directory);
+    format!("set -eu; test -f {directory}/output.tar || exit 44; cat {directory}/output.tar")
 }
 
 #[cfg(feature = "runtime")]
@@ -3459,16 +3570,18 @@ mod tests {
         SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream, TaskProcessLaunchMode,
         TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
         WorkloadExchangeTokenProvider, attach_task_agent_failure_category,
-        collect_task_process_stream, delete_owned_sandbox, deletion_names, load_source_credential,
-        output_archive_command, project_request, provider_reconciliation,
-        provider_reconciliation_plan, provider_reconciliation_targets, repository_prompt_context,
-        request_model_providers, sandbox_spec, sanitized_provider_control_transcript,
-        staging_append_command, staging_archive_chunks, staging_extract_command,
-        staging_prepare_command, task_agent_failure_category, task_attempt_cancel_command,
+        collect_task_process_stream, delete_owned_sandbox, deletion_names,
+        failed_output_archive_command, load_source_credential, output_archive_command,
+        project_request, provider_reconciliation, provider_reconciliation_plan,
+        provider_reconciliation_targets, repository_prompt_context, request_model_providers,
+        sandbox_spec, sanitized_provider_control_transcript, staging_append_command,
+        staging_archive_chunks, staging_extract_command, staging_prepare_command,
+        task_agent_failure_category, task_attempt_cancel_command,
         task_attempt_detached_launch_command, task_attempt_directory,
-        task_attempt_execution_command, task_attempt_observation_command,
-        task_attempt_transcript_stream_command, task_failure_category, task_process_launch_mode,
-        task_process_log_record, task_transcript_requested, validate_raw_sandbox_binding,
+        task_attempt_execution_command, task_attempt_failed_output_command,
+        task_attempt_observation_command, task_attempt_transcript_stream_command,
+        task_failure_category, task_process_launch_mode, task_process_log_record,
+        task_transcript_requested, validate_raw_sandbox_binding,
         validate_workload_exchange_endpoint, workspace_materialization_command,
         workspace_preparation_failed,
     };
@@ -4036,6 +4149,7 @@ mod tests {
             directory,
             &["/bin/sleep".to_owned(), "30".to_owned()],
             "true",
+            Some("true"),
             true,
         );
         let launcher = task_attempt_detached_launch_command(directory, &execution);
@@ -4333,8 +4447,13 @@ mod tests {
     #[test]
     fn task_attempt_marker_uses_a_cross_exec_liveness_lease() {
         let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
-        let execution =
-            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true", false);
+        let execution = task_attempt_execution_command(
+            directory,
+            &["/bin/true".to_owned()],
+            "true",
+            None,
+            false,
+        );
         assert!(execution.contains("pid=$$"));
         assert!(execution.contains("/proc/$$/stat"));
         assert!(execution.contains("heartbeat"));
@@ -4351,8 +4470,13 @@ mod tests {
     #[test]
     fn successful_task_execution_keeps_transcripts_out_of_the_output_archive() {
         let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
-        let execution =
-            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true", true);
+        let execution = task_attempt_execution_command(
+            directory,
+            &["/bin/true".to_owned()],
+            "true",
+            Some("true"),
+            true,
+        );
 
         assert!(execution.contains(steward_types::direct_package::EXECUTION_STDOUT_ARCHIVE_PATH));
         assert!(execution.contains(steward_types::direct_package::EXECUTION_STDERR_ARCHIVE_PATH));
@@ -4377,8 +4501,13 @@ mod tests {
             "the bounded transcript wrapper must be valid POSIX shell"
         );
 
-        let disabled =
-            task_attempt_execution_command(directory, &["/bin/true".to_owned()], "true", false);
+        let disabled = task_attempt_execution_command(
+            directory,
+            &["/bin/true".to_owned()],
+            "true",
+            Some("true"),
+            false,
+        );
         assert!(!disabled.contains(steward_types::direct_package::EXECUTION_STDOUT_ARCHIVE_PATH));
         assert!(!disabled.contains(steward_types::direct_package::EXECUTION_STDERR_ARCHIVE_PATH));
     }
@@ -4391,6 +4520,7 @@ mod tests {
             directory,
             &["/bin/true".to_owned()],
             "tar -cf - response.json",
+            None,
             task_transcript_requested(
                 SandboxExecutionClass::ProviderControl,
                 ExecutionLogMode::Off,
@@ -5226,7 +5356,7 @@ mod tests {
 
     #[cfg(feature = "runtime")]
     #[test]
-    fn unbound_agent_archives_only_the_declared_output_root() {
+    fn unbound_agent_archives_only_the_declared_output_root() -> Result<(), String> {
         let command = output_archive_command(
             SandboxExecutionClass::Agent,
             &AgentType {
@@ -5244,9 +5374,26 @@ mod tests {
             "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef",
             &["/bin/true".to_owned()],
             &command,
+            failed_output_archive_command(SandboxExecutionClass::Agent).as_deref(),
             false,
         );
         assert!(execution.contains("required_output_missing"));
+        assert!(execution.contains("output.tar.tmp 2>/dev/null"));
+        assert_eq!(
+            execution
+                .matches("tar -cf - -C /sandbox/steward-output out")
+                .count(),
+            2,
+            "a failed agent command must retain a valid partial out/ archive before publishing its terminal marker"
+        );
+        let failed_command = failed_output_archive_command(SandboxExecutionClass::Agent)
+            .ok_or_else(|| "Agent failures did not retain validated partial output".to_owned())?;
+        assert!(!failed_command.contains("result.txt"));
+        assert_eq!(
+            failed_output_archive_command(SandboxExecutionClass::ProviderControl),
+            None,
+            "provider-control failures must not expose partial bridge responses"
+        );
         assert!(
             Command::new("/bin/sh")
                 .args(["-n", "-c", &execution])
@@ -5263,6 +5410,24 @@ mod tests {
             None,
         );
         assert!(provider_control.ends_with(" ."));
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn failed_task_output_reader_is_attempt_scoped() {
+        let directory = "/sandbox/.steward-attempts/01234567-89ab-cdef-0123-456789abcdef";
+        let command = task_attempt_failed_output_command(directory);
+        assert!(command.contains(directory));
+        assert_eq!(command.matches("output.tar").count(), 2);
+        assert!(!command.contains("steward-output"));
+        assert!(
+            Command::new("/bin/sh")
+                .args(["-n", "-c", &command])
+                .status()
+                .is_ok_and(|status| status.success()),
+            "the failed-output reader must be valid POSIX shell"
+        );
     }
 
     #[cfg(feature = "runtime")]
@@ -5866,15 +6031,19 @@ mod tests {
                 SandboxTaskObservation::FailedWithTranscript {
                     adapter_observation_id: "attempt-a".to_owned(),
                     reason: "raw failure".to_owned(),
+                    output: None,
                     transcript: transcript.clone(),
                 },
+                b"ignored stdout",
                 b"steward-connections-bridge: bridge MCP-GW rejected runtime authorization",
+                false,
                 false,
                 &[],
             ),
             SandboxTaskObservation::FailedWithTranscript {
                 adapter_observation_id: "attempt-a".to_owned(),
                 reason: "bridge-runtime-authorization".to_owned(),
+                output: None,
                 transcript: transcript.clone(),
             },
             "failure classification must preserve the bounded execution transcript"
@@ -5889,7 +6058,9 @@ mod tests {
                     },
                     transcript: transcript.clone(),
                 },
+                b"ignored stdout",
                 b"opaque stderr",
+                false,
                 false,
                 &[],
             ),
@@ -5908,16 +6079,24 @@ mod tests {
                 SandboxTaskObservation::Failed {
                     adapter_observation_id: "attempt-c".to_owned(),
                     reason: super::REQUIRED_OUTPUT_MISSING_FAILURE.to_owned(),
+                    output: None,
                 },
+                b"stdout",
                 b"",
+                true,
                 false,
                 &[],
             ),
-            SandboxTaskObservation::Failed {
+            SandboxTaskObservation::FailedWithTranscript {
                 adapter_observation_id: "attempt-c".to_owned(),
                 reason: super::REQUIRED_OUTPUT_MISSING_FAILURE.to_owned(),
+                output: None,
+                transcript: SandboxTaskTranscript {
+                    stdout: b"stdout".to_vec(),
+                    stderr: Vec::new(),
+                },
             },
-            "a missing-output failure must not be replaced by a generic agent category"
+            "a missing-output failure must retain its reason and bounded process transcript"
         );
     }
 

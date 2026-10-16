@@ -24,7 +24,7 @@ submitter-scoped `Idempotency-Key`.
 | `PUT` | `/v1/tasks/{taskUid}/inputs` | `204`; body is `application/x-tar` |
 | `POST` | `/v1/tasks/{taskUid}/execute` | `202`; desired execution is recorded durably |
 | `GET` | `/v1/tasks/{taskUid}` | `200`; returns `TaskStatusResponse` |
-| `GET` | `/v1/tasks/{taskUid}/outputs` | `200`; body is `application/x-tar` after success |
+| `GET` | `/v1/tasks/{taskUid}/outputs` | `200`; body is `application/x-tar` after success or a started agent process fails |
 | `DELETE` | `/v1/tasks/{taskUid}` | `202`; desired cleanup is recorded durably |
 
 `TaskStatusResponse.phase` is one of `submitted`, `queued`, `running`,
@@ -85,6 +85,12 @@ The tar body is a workspace snapshot, not a second naming scheme:
 The maximum raw HTTP input archive is **64 MiB (67,108,864 bytes)**. The maximum raw output
 archive accepted from the sandbox is also **64 MiB (67,108,864 bytes)**. An oversized input is
 `413 Payload Too Large`; oversized sandbox output fails the Task before output persistence.
+
+After an agent process fails, the authenticated submitter can download its bounded stdout and
+stderr from the outputs route even when `diagnostics.executionLog` was omitted or `off`. The tar
+also contains validated files left beneath `out/`, when any exist. A failure before the agent
+process starts has no process log; its safe explanation remains in `failureReason`. Another owner
+receives the same `404` as for any Task outside their submitter scope.
 
 ## Production identity boundary
 

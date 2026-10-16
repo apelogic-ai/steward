@@ -5779,7 +5779,7 @@ export type TaskOutputsContractErrors = {
      */
     404: TaskErrorResponse;
     /**
-     * Task has not succeeded or output is not available
+     * Task is not finished or no bounded output or execution log is available
      */
     409: TaskErrorResponse;
     /**
@@ -5796,7 +5796,7 @@ export type TaskOutputsContractError = TaskOutputsContractErrors[keyof TaskOutpu
 
 export type TaskOutputsContractResponses = {
     /**
-     * Opaque workspace-relative output tar archive. The stored archive is at most 64 MiB. When the Task's snapshotted diagnostics.executionLog is full, the archive is rebuilt with Steward-written headers and also carries the reserved .steward/diagnostics/stdout.log and stderr.log transcript (at most 4 MiB each), so the download is at most 64 MiB plus 8 MiB plus tar headers
+     * Opaque workspace-relative output tar archive for a succeeded or failed Task. A failed Task whose agent process started carries the reserved .steward/diagnostics/stdout.log and stderr.log transcript plus any validated partial out/ content. A succeeded Task carries those entries only when its snapshotted diagnostics.executionLog is full. Stored output is at most 64 MiB and each transcript stream is at most 4 MiB, so the download is at most 64 MiB plus 8 MiB plus tar headers
      */
     200: TaskArchive;
 };

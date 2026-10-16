@@ -2612,6 +2612,8 @@ async fn persist_execution_observation(
                         TaskExecutionObservation::Failed {
                             adapter_observation_id: &adapter_observation_id,
                             reason,
+                            output_archive: None,
+                            output_archive_contract: None,
                             execution_stdout: None,
                             execution_stderr: None,
                         },
@@ -2652,6 +2654,8 @@ async fn persist_execution_observation(
                         TaskExecutionObservation::Failed {
                             adapter_observation_id: &adapter_observation_id,
                             reason,
+                            output_archive: None,
+                            output_archive_contract: None,
                             execution_stdout: Some(&transcript.stdout),
                             execution_stderr: Some(&transcript.stderr),
                         },
@@ -2682,7 +2686,11 @@ async fn persist_execution_observation(
         SandboxTaskObservation::Failed {
             adapter_observation_id,
             reason,
+            output,
         } => {
+            let output = output.filter(|output| {
+                task_output_archive_failure(execution_class, &output.archive).is_none()
+            });
             authority
                 .record_task_execution_observation(
                     attempt.attempt_id,
@@ -2690,6 +2698,10 @@ async fn persist_execution_observation(
                     TaskExecutionObservation::Failed {
                         adapter_observation_id: &adapter_observation_id,
                         reason: &reason,
+                        output_archive: output.as_ref().map(|output| output.archive.as_slice()),
+                        output_archive_contract: output
+                            .as_ref()
+                            .and(task_output_archive_contract(execution_class)),
                         execution_stdout: None,
                         execution_stderr: None,
                     },
@@ -2700,8 +2712,12 @@ async fn persist_execution_observation(
         SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
             reason,
+            output,
             transcript,
         } => {
+            let output = output.filter(|output| {
+                task_output_archive_failure(execution_class, &output.archive).is_none()
+            });
             authority
                 .record_task_execution_observation(
                     attempt.attempt_id,
@@ -2709,6 +2725,10 @@ async fn persist_execution_observation(
                     TaskExecutionObservation::Failed {
                         adapter_observation_id: &adapter_observation_id,
                         reason: &reason,
+                        output_archive: output.as_ref().map(|output| output.archive.as_slice()),
+                        output_archive_contract: output
+                            .as_ref()
+                            .and(task_output_archive_contract(execution_class)),
                         execution_stdout: Some(&transcript.stdout),
                         execution_stderr: Some(&transcript.stderr),
                     },
@@ -3789,6 +3809,7 @@ fn task_start_observation(
         Err(PortError::TaskPreparationFailed { reason, .. }) => SandboxTaskObservation::Failed {
             adapter_observation_id: attempt_id.0.clone(),
             reason,
+            output: None,
         },
         Err(error) => SandboxTaskObservation::OutcomeUnknown {
             reason: task_failure_reason(&error),
@@ -6727,6 +6748,7 @@ mod tests {
             SandboxTaskObservation::Failed {
                 adapter_observation_id: "attempt-a".to_owned(),
                 reason: reason.to_owned(),
+                output: None,
             }
         );
     }
@@ -6748,6 +6770,7 @@ mod tests {
             SandboxTaskObservation::Failed {
                 adapter_observation_id: "attempt-a".to_owned(),
                 reason: reason.to_owned(),
+                output: None,
             }
         );
     }

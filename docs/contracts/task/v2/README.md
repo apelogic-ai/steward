@@ -224,7 +224,7 @@ fragment for a direct Task. It records:
 The caller cannot supply this shape. Retries must match it exactly and cannot switch
 source bytes, authority, provenance, or diagnostics.
 
-## Successful execution transcript
+## Execution transcript delivery
 
 A successful agent Task must create at least one regular file beneath `out/`. A missing or
 empty `out/` tree fails the run with `This run finished without creating an output file.`
@@ -258,7 +258,15 @@ runner, so no difference between tar parsers can expose an entry Steward did not
 validate. The stored archive is at most 64 MiB, so this download is at most 64 MiB plus
 the 8 MiB transcript plus Steward's tar headers.
 
-If the transcript is missing or out of bounds, or the stored archive violates its
+Starting in Steward 0.3.20, when an agent process fails, the same authenticated outputs route returns the two bounded
+transcript entries regardless of whether the snapshotted diagnostic mode is `full` or `off`.
+If the failed process left one or more regular files beneath `out/`, Steward validates and
+rewrites that partial tree before adding the transcript. If it left no declared output, the tar
+contains only the two transcript entries. A failure before the process starts has no process
+transcript and therefore no downloadable archive; the Task status carries its safe failure
+reason. Submitter and owner scoping is identical for succeeded and failed downloads.
+
+If a required transcript is missing or out of bounds, or a stored archive violates its
 contract, the download fails with a non-retryable `500` and
 `{"error": "task_output_delivery_failed", "failureReason": ...}`, where the reason is
 `execution_transcript_unavailable`, `execution_transcript_too_large`, or
