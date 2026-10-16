@@ -37,7 +37,7 @@ test("run event snapshots retain their monotonic resume identifier", () => {
 describe("run table", () => {
   test("renders newest-first in an internally scrollable table with conventional outcome colors", () => {
     const html = renderToStaticMarkup(<RunCards runs={[
-      run({ taskUid: "task-older", runtimeUid: "oldruntime-0000-0000-0000-000000000000", updatedAt: "2026-08-25T20:00:00Z", phase: "failed" }),
+      run({ taskUid: "task-older", runtimeUid: "oldruntime-0000-0000-0000-000000000000", updatedAt: "2026-08-25T20:00:00Z", phase: "failed", origin: "api" }),
       run({
         taskUid: "task-newer",
         runtimeUid: "newruntime-0000-0000-0000-000000000000",
@@ -62,6 +62,7 @@ describe("run table", () => {
     expect(html).toContain("oldruntime-0000-0000-0000-000000000000");
     expect(html).toContain("Origin / package");
     expect(html).toContain("browser");
+    expect(html).toContain("api");
     expect(html).toContain("steward:sha256:");
     expect(html).toContain("rev 7");
     expect(html).not.toContain("uppercase");

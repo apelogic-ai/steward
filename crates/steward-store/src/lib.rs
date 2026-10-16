@@ -12174,7 +12174,7 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
         TaskOrigin::GithubActions => {
             request.browser_task_evidence.is_none() && request.source_provenance.is_some()
         }
-        TaskOrigin::Connections | TaskOrigin::Unknown => {
+        TaskOrigin::Connections | TaskOrigin::Api | TaskOrigin::Unknown => {
             request.browser_task_evidence.is_none() && request.source_provenance.is_none()
         }
     };

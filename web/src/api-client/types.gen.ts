@@ -1815,7 +1815,7 @@ export type TaskErrorResponse = {
 
 export type TaskIdentityErrorResponse = UnknownTaskIdentityErrorResponse | FederatedTaskIdentityErrorResponse;
 
-export type TaskOrigin = 'browser' | 'github-actions' | 'connections' | 'unknown';
+export type TaskOrigin = 'browser' | 'github-actions' | 'connections' | 'api' | 'unknown';
 
 /**
  * Durable lifecycle state for one single-shot governed task.

@@ -4589,6 +4589,16 @@ mod tests {
                         .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
                         source_provenance: None,
                     }),
+                    "service-assertion" => Ok(TaskIdentity {
+                        service: "event-worker".to_owned(),
+                        acting_user: None,
+                        owner: Email("alice@example.com".to_owned()),
+                        canonical_user_id: CanonicalUserId::parse(
+                            "usr_0123456789abcdef0123456789abcdef",
+                        )
+                        .map_err(|_| TaskAuthenticationError::InvalidCredentials)?,
+                        source_provenance: None,
+                    }),
                     "unassociated-federated-assertion" => {
                         Err(TaskAuthenticationError::Unassociated {
                             issuer: "https://identity.example.test".to_owned(),
@@ -7599,6 +7609,17 @@ mod tests {
                 "failed",
                 "cancelled"
             ]))
+        );
+        assert_eq!(
+            document.pointer("/components/schemas/TaskOrigin/enum"),
+            Some(&serde_json::json!([
+                "browser",
+                "github-actions",
+                "connections",
+                "api",
+                "unknown"
+            ])),
+            "every Task-origin reader must receive the API origin in the wire schema"
         );
         assert!(
             document
@@ -17150,6 +17171,7 @@ mod tests {
         );
 
         let submitted = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -17164,12 +17186,28 @@ mod tests {
             .map_err(|error| format!("submit versioned Workflow request: {error}"))?;
         assert_eq!(submitted.status(), StatusCode::ACCEPTED);
 
+        let api_submitted = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer service-assertion")
+                    .header("idempotency-key", "repository-review-api-run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"workflow":"repository-review@1"}"#))
+                    .map_err(|error| format!("build API Workflow request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit API Workflow request: {error}"))?;
+        assert_eq!(api_submitted.status(), StatusCode::ACCEPTED);
+
         let rows = task_rows
             .lock()
             .map_err(|_| "fake task ledger lock was poisoned")?;
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
         let task = &rows[0];
         assert_eq!(task.workflow, "repository-review@1");
+        assert_eq!(task.task_origin, TaskOrigin::GithubActions);
         let provenance = task.source_provenance.as_ref().ok_or_else(|| {
             "versioned GitHub submission did not persist identity-ratified provenance".to_owned()
         })?;
@@ -17211,6 +17249,10 @@ mod tests {
             task.agent_command.get(2).map(String::as_str),
             Some("openai/gpt-5.4")
         );
+        let api_task = &rows[1];
+        assert_eq!(api_task.task_origin, TaskOrigin::Api);
+        assert_eq!(api_task.submitter_service, "event-worker");
+        assert!(api_task.source_provenance.is_none());
         Ok(())
     }
 

@@ -3905,12 +3905,14 @@ mod tests {
         let owner = "usr_0123456789abcdef0123456789abcdef";
         let other_owner = "usr_abcdefabcdefabcdefabcdefabcdefab";
         let ledger = FakeLedger::default();
+        let mut api_run = run(
+            Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+                .map_err(|error| error.to_string())?,
+            owner,
+        );
+        api_run.task_origin = TaskOrigin::Api;
         ledger.records.lock().map_err(|_| "lock records")?.extend([
-            run(
-                Uuid::parse_str("11111111-1111-4111-8111-111111111111")
-                    .map_err(|error| error.to_string())?,
-                owner,
-            ),
+            api_run,
             run(
                 Uuid::parse_str("22222222-2222-4222-8222-222222222222")
                     .map_err(|error| error.to_string())?,
@@ -3960,6 +3962,7 @@ mod tests {
             "11111111-1111-4111-8111-111111111111"
         );
         assert_eq!(value["runs"][0]["workflowName"], "repository-review");
+        assert_eq!(value["runs"][0]["origin"], "api");
         assert_eq!(value["runs"][0]["workflowVersion"], 1);
         assert_eq!(
             value["runs"][0]["workflowDigest"],

@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Changed
+
+- Tasks submitted through the API without browser or GitHub source evidence now report their Run
+  origin as `api`, while existing browser, GitHub Actions, and Connections origins are unchanged.
+
 ## [0.3.19] - 2026-10-15
 
 Steward v0.3.19 gives Run clients safe explanations for bounded-workspace preparation failures and
