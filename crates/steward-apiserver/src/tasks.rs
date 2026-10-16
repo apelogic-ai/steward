@@ -55,6 +55,7 @@ use steward_types::task_input_archive::{frame_task_input_archive, split_task_inp
 use steward_types::task_output_archive::{
     TASK_OUTPUT_ARCHIVE_CONTRACT, TaskOutputTranscriptError,
     task_output_archive_with_execution_transcript,
+    task_output_archive_with_optional_output_and_execution_transcript,
 };
 use steward_types::{
     AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId,
@@ -2219,17 +2220,30 @@ where
         Ok(None) => return ApiError::Store(StoreError::TaskNotFound).into_response(),
         Err(error) => return ApiError::Store(error).into_response(),
     };
-    if record.phase != TaskPhase::Succeeded {
+    if !matches!(record.phase, TaskPhase::Succeeded | TaskPhase::Failed) {
         return ApiError::TaskOutputNotReady.into_response();
     }
-    let Some(archive) = record.output_archive else {
+    let failed = record.phase == TaskPhase::Failed;
+    let archive = record.output_archive;
+    if !failed && archive.is_none() {
         return ApiError::TaskOutputNotReady.into_response();
-    };
+    }
     let execution_log = record
         .direct_task_evidence
         .as_ref()
-        .map(|evidence| evidence.diagnostics.execution_log);
-    let archive = if execution_log == Some(ExecutionLogMode::Full) {
+        .map(|evidence| evidence.diagnostics.execution_log)
+        .or_else(|| {
+            record
+                .browser_task_evidence
+                .as_ref()
+                .map(|evidence| evidence.diagnostics.execution_log)
+        });
+    let archive = if failed && execution_log != Some(ExecutionLogMode::Full) {
+        let Some(archive) = archive else {
+            return StatusCode::NO_CONTENT.into_response();
+        };
+        archive
+    } else if execution_log == Some(ExecutionLogMode::Full) {
         let transcript = match state
             .application
             .ledger
@@ -2241,15 +2255,21 @@ where
             .await
         {
             Ok(Some(transcript)) => transcript,
+            Ok(None) if failed => return StatusCode::NO_CONTENT.into_response(),
             Ok(None) => return ApiError::TaskOutputNotReady.into_response(),
             Err(error) => return ApiError::Store(error).into_response(),
         };
-        match runner_output_archive_with_transcript(archive, transcript) {
+        let delivered = if failed {
+            runner_failed_output_archive_with_transcript(archive, transcript)
+        } else {
+            runner_output_archive_with_transcript(archive.unwrap_or_default(), transcript)
+        };
+        match delivered {
             Ok(archive) => archive,
             Err(error) => return error.into_response(),
         }
     } else {
-        archive
+        archive.unwrap_or_default()
     };
     (
         StatusCode::OK,
@@ -2289,6 +2309,34 @@ fn runner_output_archive_with_transcript(
             TaskOutputTranscriptError::Archive(_) => "output_archive_contract_violation",
         })
     })
+}
+
+fn runner_failed_output_archive_with_transcript(
+    archive: Option<Vec<u8>>,
+    transcript: TaskOutputTranscript,
+) -> Result<Vec<u8>, ApiError> {
+    let contract_matches_output = matches!(
+        (&archive, transcript.output_archive_contract.as_deref()),
+        (Some(_), Some(TASK_OUTPUT_ARCHIVE_CONTRACT)) | (None, None)
+    );
+    if !contract_matches_output {
+        return Err(ApiError::TaskOutputDeliveryFailed(
+            "output_archive_contract_violation",
+        ));
+    }
+    let (Some(stdout), Some(stderr)) = (transcript.execution_stdout, transcript.execution_stderr)
+    else {
+        return Err(ApiError::TaskOutputDeliveryFailed(
+            "execution_transcript_unavailable",
+        ));
+    };
+    task_output_archive_with_optional_output_and_execution_transcript(archive, &stdout, &stderr)
+        .map_err(|error| {
+            ApiError::TaskOutputDeliveryFailed(match error {
+                TaskOutputTranscriptError::TranscriptTooLarge => "execution_transcript_too_large",
+                TaskOutputTranscriptError::Archive(_) => "output_archive_contract_violation",
+            })
+        })
 }
 
 async fn delete_task<L, I>(

@@ -326,10 +326,12 @@ pub enum SandboxTaskObservation {
     Failed {
         adapter_observation_id: String,
         reason: String,
+        output: Option<SandboxTaskOutput>,
     },
     FailedWithTranscript {
         adapter_observation_id: String,
         reason: String,
+        output: Option<SandboxTaskOutput>,
         transcript: SandboxTaskTranscript,
     },
     OutcomeUnknown {

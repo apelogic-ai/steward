@@ -227,8 +227,10 @@ transcript may reproduce prompts, repository data, model output, and MCP results
 must never include injected credentials, bearer tokens, private keys, or provider
 authorization material. Provider-control executions remain structurally excluded.
 
-Missing diagnostics or `executionLog: off` captures no caller-visible transcript.
-The diagnostic selection is snapshotted with the Task.
+Missing diagnostics or `executionLog: off` captures no caller-visible transcript, including
+when execution fails. A failed Task can still return validated partial `out/` files; with no
+partial output it returns `204 No Content`. The diagnostic selection is snapshotted with the
+Task.
 
 Beginning with Steward 0.3.16, for a started OpenShell Agent attempt with full
 diagnostics, Steward retains bounded live stdout and stderr snapshots while the

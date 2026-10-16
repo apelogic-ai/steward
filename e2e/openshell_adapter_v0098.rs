@@ -682,8 +682,11 @@ async fn verify_attempt_failure_semantics(
         .await
         .map_err(|error| format!("empty-output task could not be observed: {error:?}"))?
     {
-        SandboxTaskObservation::Failed { reason, .. }
-            if reason == "This run finished without creating an output file." => {}
+        SandboxTaskObservation::Failed {
+            reason,
+            output: None,
+            ..
+        } if reason == "This run finished without creating an output file." => {}
         other => {
             return Err(format!(
                 "empty-output task did not fail with the expected reason: {other:?}"

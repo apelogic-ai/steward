@@ -24,7 +24,7 @@ submitter-scoped `Idempotency-Key`.
 | `PUT` | `/v1/tasks/{taskUid}/inputs` | `204`; body is `application/x-tar` |
 | `POST` | `/v1/tasks/{taskUid}/execute` | `202`; desired execution is recorded durably |
 | `GET` | `/v1/tasks/{taskUid}` | `200`; returns `TaskStatusResponse` |
-| `GET` | `/v1/tasks/{taskUid}/outputs` | `200`; body is `application/x-tar` after success |
+| `GET` | `/v1/tasks/{taskUid}/outputs` | `200` with `application/x-tar` after success or when a failed run has partial output or requested diagnostics; `204` when a failed run has neither |
 | `DELETE` | `/v1/tasks/{taskUid}` | `202`; desired cleanup is recorded durably |
 
 `TaskStatusResponse.phase` is one of `submitted`, `queued`, `running`,
@@ -85,6 +85,13 @@ The tar body is a workspace snapshot, not a second naming scheme:
 The maximum raw HTTP input archive is **64 MiB (67,108,864 bytes)**. The maximum raw output
 archive accepted from the sandbox is also **64 MiB (67,108,864 bytes)**. An oversized input is
 `413 Payload Too Large`; oversized sandbox output fails the Task before output persistence.
+
+After an agent process fails, the authenticated submitter can download validated files left
+beneath `out/`, when any exist. The archive also includes bounded stdout and stderr only when the
+Task requested `diagnostics.executionLog: full`. A terminal failure with neither partial output
+nor requested diagnostics returns `204 No Content`; a failure before the process starts likewise
+has no process log, and its safe explanation remains in `failureReason`. Another owner receives
+the same `404` as for any Task outside their submitter scope.
 
 ## Production identity boundary
 

@@ -31,7 +31,8 @@ use steward_ports::{
     DecisionChannel, DecisionRequest, INFERENCE_REQUEST_REJECTED_FAILURE, InferenceCapabilities,
     InferenceCredential, InferenceObservation, InferencePlane, InferenceRequest,
     MAX_TASK_OUTPUT_ARCHIVE_BYTES, ProvisionedInference, SandboxExecutionClass,
-    SandboxTaskObservation, SandboxTaskRequest, SandboxTaskRuntime, TaskAttemptId,
+    SandboxTaskObservation, SandboxTaskOutput, SandboxTaskRequest, SandboxTaskRuntime,
+    TaskAttemptId,
 };
 pub use steward_ports::{PortError, SandboxObservation, SandboxRequest, SandboxRuntime};
 use steward_store::{
@@ -2612,6 +2613,8 @@ async fn persist_execution_observation(
                         TaskExecutionObservation::Failed {
                             adapter_observation_id: &adapter_observation_id,
                             reason,
+                            output_archive: None,
+                            output_archive_contract: None,
                             execution_stdout: None,
                             execution_stderr: None,
                         },
@@ -2652,6 +2655,8 @@ async fn persist_execution_observation(
                         TaskExecutionObservation::Failed {
                             adapter_observation_id: &adapter_observation_id,
                             reason,
+                            output_archive: None,
+                            output_archive_contract: None,
                             execution_stdout: Some(&transcript.stdout),
                             execution_stderr: Some(&transcript.stderr),
                         },
@@ -2682,7 +2687,9 @@ async fn persist_execution_observation(
         SandboxTaskObservation::Failed {
             adapter_observation_id,
             reason,
+            output,
         } => {
+            let output = validated_failed_task_output(execution_class, output);
             authority
                 .record_task_execution_observation(
                     attempt.attempt_id,
@@ -2690,6 +2697,10 @@ async fn persist_execution_observation(
                     TaskExecutionObservation::Failed {
                         adapter_observation_id: &adapter_observation_id,
                         reason: &reason,
+                        output_archive: output.as_ref().map(|output| output.archive.as_slice()),
+                        output_archive_contract: output
+                            .as_ref()
+                            .and(task_output_archive_contract(execution_class)),
                         execution_stdout: None,
                         execution_stderr: None,
                     },
@@ -2700,8 +2711,10 @@ async fn persist_execution_observation(
         SandboxTaskObservation::FailedWithTranscript {
             adapter_observation_id,
             reason,
+            output,
             transcript,
         } => {
+            let output = validated_failed_task_output(execution_class, output);
             authority
                 .record_task_execution_observation(
                     attempt.attempt_id,
@@ -2709,6 +2722,10 @@ async fn persist_execution_observation(
                     TaskExecutionObservation::Failed {
                         adapter_observation_id: &adapter_observation_id,
                         reason: &reason,
+                        output_archive: output.as_ref().map(|output| output.archive.as_slice()),
+                        output_archive_contract: output
+                            .as_ref()
+                            .and(task_output_archive_contract(execution_class)),
                         execution_stdout: Some(&transcript.stdout),
                         execution_stderr: Some(&transcript.stderr),
                     },
@@ -3760,6 +3777,13 @@ fn task_output_archive_failure(
     None
 }
 
+fn validated_failed_task_output(
+    execution_class: SandboxExecutionClass,
+    output: Option<SandboxTaskOutput>,
+) -> Option<SandboxTaskOutput> {
+    output.filter(|output| task_output_archive_failure(execution_class, &output.archive).is_none())
+}
+
 fn task_output_archive_size_failure(archive_bytes: usize) -> Option<&'static str> {
     (archive_bytes > MAX_TASK_OUTPUT_ARCHIVE_BYTES)
         .then_some("Task output archive exceeds the 64 MiB limit")
@@ -3789,6 +3813,7 @@ fn task_start_observation(
         Err(PortError::TaskPreparationFailed { reason, .. }) => SandboxTaskObservation::Failed {
             adapter_observation_id: attempt_id.0.clone(),
             reason,
+            output: None,
         },
         Err(error) => SandboxTaskObservation::OutcomeUnknown {
             reason: task_failure_reason(&error),
@@ -6341,8 +6366,8 @@ mod tests {
         InferenceCapabilities, InferenceObservation, InferencePlane, InferenceRequest,
         MAX_TASK_OUTPUT_ARCHIVE_BYTES, PortError, ProviderControlExecutionBindings,
         ProvisionedInference, SCRATCH_VOLUME_SIZE_NOT_ENFORCED_FAILURE, SandboxExecutionClass,
-        SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskObservation, TaskAttemptId,
-        WORKSPACE_PREPARATION_FAILURE,
+        SandboxObservation, SandboxRequest, SandboxRuntime, SandboxTaskObservation,
+        SandboxTaskOutput, TaskAttemptId, WORKSPACE_PREPARATION_FAILURE,
     };
     use steward_store::{
         ConnectionExecutionBindingSnapshot, ConnectionOAuthPhase, ConnectionOperationKind,
@@ -6378,7 +6403,7 @@ mod tests {
         status_merge_patch, suspend_runtime, suspend_runtime_with_inference_cleanup,
         task_output_archive_failure, task_output_archive_size_failure, task_runtime,
         task_runtime_action, task_runtime_observation_is_failed, task_start_observation,
-        ttl_action,
+        ttl_action, validated_failed_task_output,
     };
 
     #[test]
@@ -6727,6 +6752,7 @@ mod tests {
             SandboxTaskObservation::Failed {
                 adapter_observation_id: "attempt-a".to_owned(),
                 reason: reason.to_owned(),
+                output: None,
             }
         );
     }
@@ -6748,6 +6774,7 @@ mod tests {
             SandboxTaskObservation::Failed {
                 adapter_observation_id: "attempt-a".to_owned(),
                 reason: reason.to_owned(),
+                output: None,
             }
         );
     }
@@ -8034,6 +8061,47 @@ mod tests {
             Some("Task output archive contains unsupported link entries"),
             "links must fail with a distinct operator-visible category"
         );
+    }
+
+    #[test]
+    fn invalid_failed_agent_output_is_dropped_before_storage() {
+        fn archive_with_entry(path: &str, kind: u8) -> Vec<u8> {
+            let mut archive = vec![0_u8; 512 * 3];
+            archive[..path.len()].copy_from_slice(path.as_bytes());
+            archive[100..108].copy_from_slice(b"0000644\0");
+            archive[108..116].copy_from_slice(b"0000000\0");
+            archive[116..124].copy_from_slice(b"0000000\0");
+            archive[124..136].copy_from_slice(b"00000000000\0");
+            archive[136..148].copy_from_slice(b"00000000000\0");
+            archive[148..156].fill(b' ');
+            archive[156] = kind;
+            archive[257..263].copy_from_slice(b"ustar\0");
+            archive[263..265].copy_from_slice(b"00");
+            let checksum = archive[..512]
+                .iter()
+                .map(|byte| usize::from(*byte))
+                .sum::<usize>();
+            archive[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            archive
+        }
+
+        let invalid = [
+            ("symlink", archive_with_entry("out/link", b'2')),
+            ("hardlink", archive_with_entry("out/link", b'1')),
+            ("traversal", archive_with_entry("out/../escape", b'0')),
+            ("outside-output", archive_with_entry("result.txt", b'0')),
+            ("oversized", vec![0_u8; MAX_TASK_OUTPUT_ARCHIVE_BYTES + 1]),
+        ];
+        for (case, archive) in invalid {
+            let output = validated_failed_task_output(
+                SandboxExecutionClass::Agent,
+                Some(SandboxTaskOutput { archive }),
+            );
+            assert!(
+                output.is_none(),
+                "{case} output must be dropped while the Failed observation and its reason remain"
+            );
+        }
     }
 
     #[derive(Default)]

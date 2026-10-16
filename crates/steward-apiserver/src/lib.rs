@@ -726,11 +726,12 @@ pub async fn task_status_contract() {}
     params(("taskUid" = String, Path, format = "uuid", description = "Task lifecycle identity")),
     security(("taskBearer" = [])),
     responses(
-        (status = 200, description = "Opaque workspace-relative output tar archive. The stored archive is at most 64 MiB. When the Task's snapshotted diagnostics.executionLog is full, the archive is rebuilt with Steward-written headers and also carries the reserved .steward/diagnostics/stdout.log and stderr.log transcript (at most 4 MiB each), so the download is at most 64 MiB plus 8 MiB plus tar headers", body = TaskArchive, content_type = "application/x-tar"),
+        (status = 200, description = "Opaque workspace-relative output tar archive for a succeeded or failed Task. A failed Task carries validated partial out/ content and includes the reserved .steward/diagnostics/stdout.log and stderr.log transcript only when its snapshotted diagnostics.executionLog is full. A succeeded Task also carries those entries only for full diagnostics. Stored output is at most 64 MiB and each transcript stream is at most 4 MiB, so the download is at most 64 MiB plus 8 MiB plus tar headers", body = TaskArchive, content_type = "application/x-tar"),
+        (status = 204, description = "The Task failed terminally without partial output or a requested bounded execution transcript"),
         (status = 400, description = "taskUid is not a UUID", body = String, content_type = "text/plain"),
         (status = 401, description = "Identity assertion is invalid", body = TaskErrorResponse, content_type = "application/json"),
         (status = 404, description = "Task is not owned by the resolved submitter", body = TaskErrorResponse, content_type = "application/json"),
-        (status = 409, description = "Task has not succeeded or output is not available", body = TaskErrorResponse, content_type = "application/json"),
+        (status = 409, description = "Task is not finished", body = TaskErrorResponse, content_type = "application/json"),
         (status = 500, description = "task_output_delivery_failed: the output cannot be delivered within its contract (failureReason execution_transcript_unavailable, execution_transcript_too_large, or output_archive_contract_violation); not retryable", body = TaskErrorResponse, content_type = "application/json"),
         (status = 503, description = "Identity or persistence dependency unavailable", body = TaskErrorResponse, content_type = "application/json")
     )
@@ -1005,7 +1006,7 @@ pub enum ApiError {
     TaskPersistenceFailed,
     DirectPackageSourceDisabled,
     TaskRuntimeContractUnavailable(String),
-    /// A succeeded Task's output cannot be delivered within its contract; the bounded reason
+    /// A terminal Task's output cannot be delivered within its contract; the bounded reason
     /// is permanent, so the status is deliberately not retryable.
     TaskOutputDeliveryFailed(&'static str),
 }
@@ -10226,8 +10227,10 @@ mod tests {
                     owner_user_id,
                 )
                 .await?
-                .is_some_and(|task| {
-                    task.phase == TaskPhase::Succeeded && task.output_archive.is_some()
+                .is_some_and(|task| match task.phase {
+                    TaskPhase::Succeeded => task.output_archive.is_some(),
+                    TaskPhase::Failed => true,
+                    _ => false,
                 });
                 if !in_scope {
                     return Ok(None);
@@ -13990,9 +13993,45 @@ mod tests {
         Ok(())
     }
 
+    fn fail_fake_task(
+        ledger: &FakeLedger,
+        task_uid: Uuid,
+        archive: Option<&[u8]>,
+        transcript: Option<steward_store::TaskOutputTranscript>,
+    ) -> Result<(), String> {
+        let mut tasks = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake Task ledger lock was poisoned")?;
+        let task = tasks
+            .iter_mut()
+            .find(|task| task.task_uid == task_uid)
+            .ok_or_else(|| "fake Task is absent".to_owned())?;
+        task.phase = TaskPhase::Failed;
+        task.failure_reason = Some("agent".to_owned());
+        task.output_archive = archive.map(<[u8]>::to_vec);
+        drop(tasks);
+        if let Some(transcript) = transcript {
+            ledger
+                .task_output_transcripts
+                .lock()
+                .map_err(|_| "fake Task transcript ledger lock was poisoned")?
+                .push((task_uid, transcript));
+        }
+        Ok(())
+    }
+
     async fn runner_outputs(
         app: &axum::Router,
         task_uid: Uuid,
+    ) -> Result<(StatusCode, Option<String>, Vec<u8>), String> {
+        runner_outputs_as(app, task_uid, "github-assertion").await
+    }
+
+    async fn runner_outputs_as(
+        app: &axum::Router,
+        task_uid: Uuid,
+        assertion: &str,
     ) -> Result<(StatusCode, Option<String>, Vec<u8>), String> {
         let response = app
             .clone()
@@ -14000,7 +14039,7 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri(format!("/v1/tasks/{task_uid}/outputs"))
-                    .header("authorization", "Bearer github-assertion")
+                    .header("authorization", format!("Bearer {assertion}"))
                     .header("accept", "application/x-tar")
                     .body(Body::empty())
                     .map_err(|error| format!("build outputs request: {error}"))?,
@@ -14047,8 +14086,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_execution_log_runner_outputs_carry_the_reserved_transcript() -> Result<(), String>
-    {
+    async fn succeeded_runner_outputs_preserve_the_existing_archive_and_diagnostics_contract()
+    -> Result<(), String> {
         let ledger = versioned_task_ledger_with_runtime_minutes()?;
         let app = direct_test_app(ledger.clone(), same_repository_direct_git_fixture()?)?;
         let stored =
@@ -14095,6 +14134,158 @@ mod tests {
             assert!(
                 body == stored,
                 "every other run keeps the out/-only archive"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_runner_outputs_carry_bounded_diagnostics_and_partial_output_only_to_the_owner()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        let app = direct_test_app(ledger.clone(), same_repository_direct_git_fixture()?)?;
+        let stored =
+            stored_output_archive(&[("out/", b"", b'5'), ("out/partial.txt", b"partial\n", b'0')]);
+        let full = Some(serde_json::json!({ "executionLog": "full" }));
+        let task_uid =
+            submit_package_path_task(&app, "failed-runner-outputs", full.clone()).await?;
+        fail_fake_task(
+            &ledger,
+            task_uid,
+            Some(&stored),
+            Some(strict_transcript(b"agent stdout\n", b"agent stderr\n")),
+        )?;
+
+        let (status, content_type, body) = runner_outputs(&app, task_uid).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("application/x-tar"));
+        let expected =
+            steward_types::task_output_archive::task_output_archive_with_execution_transcript(
+                stored,
+                b"agent stdout\n",
+                b"agent stderr\n",
+            )
+            .map_err(|error| format!("expected failed runner archive: {error:?}"))?;
+        assert_eq!(body, expected);
+
+        let off = submit_package_path_task(&app, "failed-runner-outputs-off", None).await?;
+        fail_fake_task(
+            &ledger,
+            off,
+            Some(&stored_output_archive(&[
+                ("out/", b"", b'5'),
+                ("out/partial.txt", b"partial\n", b'0'),
+            ])),
+            Some(strict_transcript(b"must not leak", b"must not leak")),
+        )?;
+        let (status, content_type, body) = runner_outputs(&app, off).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("application/x-tar"));
+        assert_eq!(
+            body,
+            stored_output_archive(&[("out/", b"", b'5'), ("out/partial.txt", b"partial\n", b'0'),]),
+            "execution-log: off returns only validated partial output"
+        );
+        assert!(
+            !body
+                .windows("must not leak".len())
+                .any(|window| window == b"must not leak")
+        );
+
+        let (status, _, body) = runner_outputs_as(&app, task_uid, "github-bob-assertion").await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            !body
+                .windows("agent stderr".len())
+                .any(|window| window == b"agent stderr"),
+            "another owner must not receive failed-run diagnostics"
+        );
+
+        let diagnostics_only =
+            submit_package_path_task(&app, "failed-runner-diagnostics-only", full).await?;
+        fail_fake_task(
+            &ledger,
+            diagnostics_only,
+            None,
+            Some(steward_store::TaskOutputTranscript {
+                output_archive_contract: None,
+                execution_stdout: Some(b"stdout only\n".to_vec()),
+                execution_stderr: Some(b"stderr only\n".to_vec()),
+            }),
+        )?;
+        let (status, content_type, body) = runner_outputs(&app, diagnostics_only).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("application/x-tar"));
+        let expected = steward_types::task_output_archive::task_output_archive_with_optional_output_and_execution_transcript(
+            None,
+            b"stdout only\n",
+            b"stderr only\n",
+        )
+        .map_err(|error| format!("expected diagnostics-only archive: {error:?}"))?;
+        assert_eq!(body, expected);
+
+        let before_execution =
+            submit_package_path_task(&app, "failed-runner-before-execution", None).await?;
+        fail_fake_task(&ledger, before_execution, None, None)?;
+        let (status, _, body) = runner_outputs(&app, before_execution).await?;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(body.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_runner_outputs_refuse_unbounded_or_agent_authored_diagnostics()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger_with_runtime_minutes()?;
+        let app = direct_test_app(ledger.clone(), same_repository_direct_git_fixture()?)?;
+        let oversized = vec![b'x'; 4 * 1024 * 1024 + 1];
+        let forged = stored_output_archive(&[
+            ("out/result.txt", b"partial\n", b'0'),
+            (".steward/diagnostics/stdout.log", b"agent-authored", b'0'),
+        ]);
+        let cases = [
+            (
+                "malformed",
+                Some(b"not a tar archive".as_slice()),
+                strict_transcript(b"stdout", b"stderr"),
+                "output_archive_contract_violation",
+            ),
+            (
+                "agent-authored",
+                Some(forged.as_slice()),
+                strict_transcript(b"stdout", b"stderr"),
+                "output_archive_contract_violation",
+            ),
+            (
+                "oversized",
+                None,
+                steward_store::TaskOutputTranscript {
+                    output_archive_contract: None,
+                    execution_stdout: Some(oversized),
+                    execution_stderr: Some(Vec::new()),
+                },
+                "execution_transcript_too_large",
+            ),
+        ];
+        for (name, archive, transcript, failure_reason) in cases {
+            let task_uid = submit_package_path_task(
+                &app,
+                &format!("failed-runner-refusal-{name}"),
+                Some(serde_json::json!({ "executionLog": "full" })),
+            )
+            .await?;
+            fail_fake_task(&ledger, task_uid, archive, Some(transcript))?;
+            let (status, _, body) = runner_outputs(&app, task_uid).await?;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{name}");
+            let body: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|error| format!("decode {name} delivery refusal: {error}"))?;
+            assert_eq!(
+                body,
+                serde_json::json!({
+                    "error": "task_output_delivery_failed",
+                    "failureReason": failure_reason,
+                }),
+                "{name} failed-run content must not be returned"
             );
         }
         Ok(())

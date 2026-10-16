@@ -9647,6 +9647,8 @@ impl PgStore {
             TaskExecutionObservation::Failed {
                 adapter_observation_id,
                 reason,
+                output_archive,
+                output_archive_contract,
                 execution_stdout,
                 execution_stderr,
             } => {
@@ -9705,12 +9707,16 @@ impl PgStore {
                          failure_reason = CASE \
                              WHEN $3 THEN failure_reason \
                              ELSE COALESCE(failure_reason, $2) END, \
+                         output_archive = CASE WHEN $3 THEN NULL ELSE $4 END, \
+                         output_archive_contract = CASE WHEN $3 THEN NULL ELSE $5 END, \
                          finalize_requested = true, updated_at = now() \
                      WHERE task_uid = $1 AND phase IN ('queued', 'running')",
                 )
                 .bind(current.task_uid)
                 .bind(reason)
                 .bind(task.cancel_requested)
+                .bind(output_archive)
+                .bind(output_archive_contract)
                 .execute(&mut *transaction)
                 .await
                 .map_err(database_error)?;
@@ -10847,9 +10853,9 @@ impl PgStore {
         row.map(task_record).transpose()
     }
 
-    /// Return the output-archive contract marker and the successful attempt's final
-    /// transcript for one succeeded Task, in exactly the submitter scope of
-    /// [`Self::task_for_submitter`]. Live transcripts are never returned.
+    /// Return the output-archive contract marker and terminal attempt's final transcript for one
+    /// succeeded or failed Task, in exactly the submitter scope of [`Self::task_for_submitter`].
+    /// Live transcripts are never returned.
     pub async fn task_output_transcript_for_submitter(
         &self,
         task_uid: Uuid,
@@ -10860,11 +10866,22 @@ impl PgStore {
             "SELECT tasks.output_archive_contract, \
                     attempts.execution_stdout, attempts.execution_stderr \
              FROM task_submissions tasks \
-             LEFT JOIN task_execution_attempts attempts \
-               ON attempts.task_uid = tasks.task_uid AND attempts.state = 'succeeded' \
+             LEFT JOIN LATERAL ( \
+                 SELECT candidate.execution_stdout, candidate.execution_stderr \
+                 FROM task_execution_attempts candidate \
+                 WHERE candidate.task_uid = tasks.task_uid \
+                   AND candidate.state = tasks.phase \
+                   AND candidate.execution_stdout IS NOT NULL \
+                   AND candidate.execution_stderr IS NOT NULL \
+                 ORDER BY candidate.finished_at DESC NULLS LAST, candidate.attempt_id DESC \
+                 LIMIT 1 \
+             ) attempts ON true \
              WHERE tasks.task_uid = $1 AND tasks.submitter_service = $2 \
                AND tasks.owner_user_id = $3 AND tasks.identity_binding_state = 'bound' \
-               AND tasks.phase = 'succeeded' AND tasks.output_archive IS NOT NULL \
+               AND ((tasks.phase = 'succeeded' AND tasks.output_archive IS NOT NULL) \
+                    OR (tasks.phase = 'failed' \
+                        AND attempts.execution_stdout IS NOT NULL \
+                        AND attempts.execution_stderr IS NOT NULL)) \
                AND NOT EXISTS (SELECT 1 FROM connection_operations operations \
                    WHERE operations.task_uid = tasks.task_uid)",
         )
@@ -12623,6 +12640,8 @@ pub enum TaskExecutionObservation<'a> {
     Failed {
         adapter_observation_id: &'a str,
         reason: &'a str,
+        output_archive: Option<&'a [u8]>,
+        output_archive_contract: Option<&'a str>,
         execution_stdout: Option<&'a [u8]>,
         execution_stderr: Option<&'a [u8]>,
     },
@@ -12664,11 +12683,16 @@ impl TaskExecutionObservation<'_> {
             Self::Failed {
                 adapter_observation_id,
                 reason,
+                output_archive,
+                output_archive_contract,
                 execution_stdout,
                 execution_stderr,
             } => {
                 !adapter_observation_id.is_empty()
                     && !reason.is_empty()
+                    && output_archive_contract
+                        .is_none_or(|contract| contract == TASK_OUTPUT_ARCHIVE_CONTRACT)
+                    && output_archive_contract.is_some() == output_archive.is_some()
                     && execution_logs_are_valid(execution_stdout, execution_stderr)
             }
             Self::OutcomeUnknown { reason } => !reason.is_empty(),
@@ -12691,7 +12715,7 @@ fn execution_logs_are_valid(stdout: Option<&[u8]>, stderr: Option<&[u8]>) -> boo
 mod execution_log_tests {
     use steward_types::direct_package::MAX_EXECUTION_STREAM_BYTES;
 
-    use super::execution_logs_are_valid;
+    use super::{TASK_OUTPUT_ARCHIVE_CONTRACT, TaskExecutionObservation, execution_logs_are_valid};
 
     #[test]
     fn logs_must_be_paired_and_individually_bounded() {
@@ -12703,6 +12727,28 @@ mod execution_log_tests {
         let oversized = vec![0; MAX_EXECUTION_STREAM_BYTES as usize + 1];
         assert!(!execution_logs_are_valid(Some(&oversized), Some(b"stderr")));
         assert!(!execution_logs_are_valid(Some(b"stdout"), Some(&oversized)));
+    }
+
+    #[test]
+    fn failed_output_archive_and_contract_must_be_present_together() {
+        let without_contract = TaskExecutionObservation::Failed {
+            adapter_observation_id: "attempt-a",
+            reason: "agent",
+            output_archive: Some(b"archive"),
+            output_archive_contract: None,
+            execution_stdout: None,
+            execution_stderr: None,
+        };
+        let without_archive = TaskExecutionObservation::Failed {
+            adapter_observation_id: "attempt-b",
+            reason: "agent",
+            output_archive: None,
+            output_archive_contract: Some(TASK_OUTPUT_ARCHIVE_CONTRACT),
+            execution_stdout: None,
+            execution_stderr: None,
+        };
+        assert!(!without_contract.is_valid());
+        assert!(!without_archive.is_valid());
     }
 }
 

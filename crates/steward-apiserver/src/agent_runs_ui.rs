@@ -5757,6 +5757,51 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn failed_runs_without_captured_diagnostics_expose_no_owner_or_admin_log()
+    -> Result<(), String> {
+        let owner = "usr_0123456789abcdef0123456789abcdef";
+        let task_uid = Uuid::parse_str("33333333-3333-4333-8333-333333333333")
+            .map_err(|error| error.to_string())?;
+        let ledger = FakeLedger::default();
+        let mut failed = run(task_uid, owner);
+        failed.phase = TaskPhase::Failed;
+        ledger
+            .records
+            .lock()
+            .map_err(|_| "lock records")?
+            .push(failed);
+
+        let (user_service, user_cookie) = signed_in_cookie(LocalFakeIdentity::User).await?;
+        let owner_response = protected_router(ledger.clone(), user_service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/app/api/v1/runs/{task_uid}/logs/stdout?after=0"))
+                    .header(header::COOKIE, user_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build owner log request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute owner log request: {error}"))?;
+        assert_eq!(owner_response.status(), StatusCode::NOT_FOUND);
+
+        let (admin_service, admin_cookie) = signed_in_cookie(LocalFakeIdentity::Admin).await?;
+        let admin_response = protected_router(ledger, admin_service)
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/admin/api/v1/all-runs/{task_uid}/logs/stderr?after=0"
+                    ))
+                    .header(header::COOKIE, admin_cookie)
+                    .body(Body::empty())
+                    .map_err(|error| format!("build admin log request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute admin log request: {error}"))?;
+        assert_eq!(admin_response.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
     fn output_tar_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut archive = Vec::new();
         for (path, content) in entries {

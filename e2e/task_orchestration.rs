@@ -804,6 +804,147 @@ async fn pure_service_identity_runs_a_published_workflow_and_refuses_invalid_aut
         &output_archive[result.offset..result.offset + result.size],
         b"successful task output"
     );
+
+    let failed_created = task_api_request(
+        &app,
+        Method::POST,
+        "/v1/tasks",
+        &token,
+        Some(&format!("failed-service-run-{suffix}")),
+        Some("application/json"),
+        serde_json::to_vec(&json!({"workflow": workflow_reference}))?,
+    )
+    .await?;
+    let failed_status = failed_created.status();
+    let failed_created = response_json(failed_created).await?;
+    assert_eq!(
+        failed_status,
+        StatusCode::ACCEPTED,
+        "failed-run fixture creation failed: {failed_created}"
+    );
+    let failed_task_uid = failed_created["taskUid"]
+        .as_str()
+        .ok_or_else(|| io::Error::other("failed-run response omitted taskUid"))?
+        .parse::<Uuid>()?;
+    let failed_inputs = task_api_request(
+        &app,
+        Method::PUT,
+        &format!("/v1/tasks/{failed_task_uid}/inputs"),
+        &token,
+        None,
+        Some("application/x-tar"),
+        task_output_archive(&[("in/event.json", br#"{"event":"PROJ-123"}"#)]),
+    )
+    .await?;
+    assert_eq!(failed_inputs.status(), StatusCode::NO_CONTENT);
+    let failed_execute = task_api_request(
+        &app,
+        Method::POST,
+        &format!("/v1/tasks/{failed_task_uid}/execute"),
+        &token,
+        None,
+        None,
+        Vec::new(),
+    )
+    .await?;
+    assert_eq!(failed_execute.status(), StatusCode::ACCEPTED);
+
+    let failed_kubernetes = AmbiguousKubernetes::default();
+    *failed_kubernetes
+        .next_runtime_uid
+        .lock()
+        .map_err(|_| io::Error::other("failed-run runtime UID fixture was poisoned"))? =
+        Some(format!("runtime-uid-failed-{suffix}"));
+    let (failed_client, _failed_server) = kubernetes_client(failed_kubernetes.clone()).await?;
+    let failed_runtime = AmbiguousTaskRuntime::default();
+    failed_runtime
+        .fail_next_start_with_diagnostics
+        .store(true, Ordering::SeqCst);
+    let failed_inference = ActiveInference::default();
+    for _ in 0..5 {
+        reconcile_current(&failed_client, &failed_runtime, &store, failed_task_uid).await?;
+    }
+    assert_eq!(
+        operation(&store, failed_task_uid).await?.state,
+        TaskOrchestrationState::ActivationPending
+    );
+    for _ in 0..2 {
+        let runtime = failed_kubernetes
+            .runtime
+            .lock()
+            .map_err(|_| io::Error::other("failed-run runtime fixture was poisoned"))?
+            .clone()
+            .ok_or_else(|| io::Error::other("failed-run runtime is absent"))?;
+        reconcile_agent_runtime_work_item(
+            &failed_client,
+            failed_runtime.clone(),
+            failed_inference.clone(),
+            store.clone(),
+            runtime,
+        )
+        .await?;
+    }
+    for _ in 0..8 {
+        reconcile_current(&failed_client, &failed_runtime, &store, failed_task_uid).await?;
+        if store
+            .task(failed_task_uid)
+            .await?
+            .is_some_and(|task| task.phase == TaskPhase::Failed)
+        {
+            break;
+        }
+    }
+    let failed_task = store
+        .task(failed_task_uid)
+        .await?
+        .ok_or(StoreError::TaskNotFound)?;
+    assert_eq!(failed_task.phase, TaskPhase::Failed);
+    assert!(failed_task.output_archive.is_some());
+    assert!(
+        store
+            .task_output_transcript_for_submitter(failed_task_uid, &service, owner.user_id.as_str())
+            .await?
+            .is_none(),
+        "execution-log: off must not persist a failed-run transcript"
+    );
+    let owner_log = store
+        .agent_run_execution_log(
+            failed_task_uid,
+            Some(owner.user_id.as_str()),
+            AgentRunLogStream::Stdout,
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("owner log status is absent"))?;
+    assert!(
+        owner_log.content.is_empty(),
+        "the owner log route must not expose a transcript when diagnostics are off"
+    );
+    let admin_log = store
+        .agent_run_execution_log(failed_task_uid, None, AgentRunLogStream::Stderr)
+        .await?
+        .ok_or_else(|| io::Error::other("administrator log status is absent"))?;
+    assert!(
+        admin_log.content.is_empty(),
+        "the administrator log route must not expose a transcript when diagnostics are off"
+    );
+    let failed_outputs = task_api_request(
+        &app,
+        Method::GET,
+        &format!("/v1/tasks/{failed_task_uid}/outputs"),
+        &token,
+        None,
+        None,
+        Vec::new(),
+    )
+    .await?;
+    assert_eq!(failed_outputs.status(), StatusCode::OK);
+    let failed_output_archive = to_bytes(failed_outputs.into_body(), 72 * 1024 * 1024).await?;
+    let expected_failed_output =
+        task_output_archive(&[("out/partial.txt", b"partial task output")]);
+    assert_eq!(
+        failed_output_archive.as_ref(),
+        expected_failed_output.as_slice()
+    );
     Ok(())
 }
 
@@ -1976,6 +2117,7 @@ struct AmbiguousTaskRuntime {
     deletes: Arc<AtomicUsize>,
     fail_next_ensure: Arc<AtomicBool>,
     succeed_next_start: Arc<AtomicBool>,
+    fail_next_start_with_diagnostics: Arc<AtomicBool>,
     accept_default_diagnostics: Arc<AtomicBool>,
     progressive_success_stage: Arc<AtomicUsize>,
     terminal_observed: Arc<AtomicBool>,
@@ -2129,6 +2271,30 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
                 reason: "fixture input archive lock was poisoned".to_owned(),
             })?
             .push(input_archive.to_vec());
+        if self
+            .fail_next_start_with_diagnostics
+            .swap(false, Ordering::SeqCst)
+        {
+            let output = Some(SandboxTaskOutput {
+                archive: task_output_archive(&[("out/partial.txt", b"partial task output")]),
+            });
+            if request.diagnostics.execution_log == ExecutionLogMode::Full {
+                return Ok(SandboxTaskObservation::FailedWithTranscript {
+                    adapter_observation_id: attempt_id.0.clone(),
+                    reason: "The coding agent stopped before completing the run.".to_owned(),
+                    output,
+                    transcript: SandboxTaskTranscript {
+                        stdout: b"failed task stdout".to_vec(),
+                        stderr: b"failed task stderr".to_vec(),
+                    },
+                });
+            }
+            return Ok(SandboxTaskObservation::Failed {
+                adapter_observation_id: attempt_id.0.clone(),
+                reason: "The coding agent stopped before completing the run.".to_owned(),
+                output,
+            });
+        }
         if self.succeed_next_start.swap(false, Ordering::SeqCst) {
             if !self.accept_default_diagnostics.load(Ordering::SeqCst)
                 && request.diagnostics.execution_log != ExecutionLogMode::Full
@@ -2220,6 +2386,7 @@ impl SandboxTaskRuntime for AmbiguousTaskRuntime {
             Ok(SandboxTaskObservation::Failed {
                 adapter_observation_id: attempt_id.0.clone(),
                 reason: "late durable process exit".to_owned(),
+                output: None,
             })
         } else {
             Ok(SandboxTaskObservation::Absent)
@@ -3804,6 +3971,9 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 inert_manifest_digest: &inert_digest,
                 active_manifest_digest: &active_digest,
                 direct_task_evidence: None,
+                phase: "submitted",
+                output_archive: None,
+                output_archive_contract: None,
             },
         )
         .await?;
@@ -3915,6 +4085,8 @@ async fn cumulative_spend_top_up_is_append_only_instance_scoped_and_idempotent()
                 TaskExecutionObservation::Failed {
                     adapter_observation_id: &adapter_observation_id,
                     reason: failure_reason,
+                    output_archive: None,
+                    output_archive_contract: None,
                     execution_stdout: None,
                     execution_stderr: None,
                 },
@@ -4680,6 +4852,9 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             inert_manifest_digest: &replacement_inert_digest,
             active_manifest_digest: &replacement_active_digest,
             direct_task_evidence: None,
+            phase: "submitted",
+            output_archive: None,
+            output_archive_contract: None,
         },
     )
     .await?;
@@ -4790,6 +4965,9 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             inert_manifest_digest: &failed_start_inert_digest,
             active_manifest_digest: &failed_start_active_digest,
             direct_task_evidence: None,
+            phase: "submitted",
+            output_archive: None,
+            output_archive_contract: None,
         },
     )
     .await?;
@@ -4870,6 +5048,96 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
     assert_eq!(
         failed_start_task.failure_reason.as_deref(),
         Some("runtime_start_failed")
+    );
+    let (failed_start_signing_key, failed_start_identities) = task_identity_signer(store.clone())?;
+    let failed_start_token = pure_service_task_token(
+        &failed_start_signing_key,
+        &format!("service:{service}"),
+        identity.display_email.as_str(),
+        identity.user_id.as_str(),
+        &service,
+        &[],
+    )?;
+    let failed_start_app = task_router(
+        store.clone(),
+        failed_start_identities,
+        published_workflow_task_config("example")?,
+    );
+    let failed_start_outputs = task_api_request(
+        &failed_start_app,
+        Method::GET,
+        &format!("/v1/tasks/{failed_start_task_uid}/outputs"),
+        &failed_start_token,
+        None,
+        None,
+        Vec::new(),
+    )
+    .await?;
+    assert_eq!(
+        failed_start_outputs.status(),
+        StatusCode::NO_CONTENT,
+        "a terminal failure before execution is distinct from unfinished output"
+    );
+
+    let historical_success_uid = Uuid::new_v4();
+    let historical_success_operation_id = Uuid::new_v4();
+    let historical_success_runtime_name =
+        format!("task-{}", historical_success_operation_id.simple());
+    let historical_success_evidence = direct_task_evidence_fixture(
+        historical_success_uid,
+        1,
+        "900001",
+        envelope.revision,
+        &envelope_digest,
+    )?;
+    let historical_success_archive = task_output_archive(&[
+        ("out/result.txt", b"historical task output"),
+        (".steward/diagnostics/stdout.log", b"historical task stdout"),
+        (".steward/diagnostics/stderr.log", b"historical task stderr"),
+    ]);
+    insert_task_projection_fixture(
+        &pool,
+        TaskProjectionFixture {
+            source_task_uid: task_uid,
+            task_uid: historical_success_uid,
+            operation_id: historical_success_operation_id,
+            idempotency_key: &format!("historical-success-{suffix}"),
+            task_runtime_name: &historical_success_runtime_name,
+            operation_runtime_name: &historical_success_runtime_name,
+            inert_manifest_digest: &failed_start_inert_digest,
+            active_manifest_digest: &failed_start_active_digest,
+            direct_task_evidence: Some(&historical_success_evidence),
+            phase: "succeeded",
+            output_archive: Some(&historical_success_archive),
+            output_archive_contract: None,
+        },
+    )
+    .await?;
+    let historical_success_transcript = store
+        .task_output_transcript_for_submitter(
+            historical_success_uid,
+            &service,
+            identity.user_id.as_str(),
+        )
+        .await?
+        .ok_or_else(|| io::Error::other("historical successful output became unavailable"))?;
+    assert_eq!(historical_success_transcript.output_archive_contract, None);
+    assert_eq!(historical_success_transcript.execution_stdout, None);
+    assert_eq!(historical_success_transcript.execution_stderr, None);
+    let historical_success_outputs = task_api_request(
+        &failed_start_app,
+        Method::GET,
+        &format!("/v1/tasks/{historical_success_uid}/outputs"),
+        &failed_start_token,
+        None,
+        None,
+        Vec::new(),
+    )
+    .await?;
+    assert_eq!(historical_success_outputs.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(historical_success_outputs.into_body(), 1024 * 1024).await?,
+        historical_success_archive
     );
 
     let successful_task_uid = Uuid::new_v4();
@@ -5231,14 +5499,21 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
         ["result.txt"],
         "the reserved transcript is never listed as a Task output"
     );
-    for (task_uid, submitter, owner) in [
+    for (case, task_uid, submitter, owner) in [
         (
+            "other submitter",
             successful_task_uid,
             "another-service",
             identity.user_id.as_str(),
         ),
-        (successful_task_uid, service.as_str(), "another-owner"),
         (
+            "other owner",
+            successful_task_uid,
+            service.as_str(),
+            "another-owner",
+        ),
+        (
+            "failure before execution",
             failed_start_task_uid,
             service.as_str(),
             identity.user_id.as_str(),
@@ -5249,7 +5524,7 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
                 .task_output_transcript_for_submitter(task_uid, submitter, owner)
                 .await?
                 .is_none(),
-            "runner transcripts stay in the exact submitter scope of a succeeded Task"
+            "{case}: runner transcripts require an exact owner and a matching terminal execution transcript"
         );
     }
     assert!(
@@ -6162,6 +6437,9 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             inert_manifest_digest: &duplicate_inert_digest,
             active_manifest_digest: &duplicate_active_digest,
             direct_task_evidence: None,
+            phase: "submitted",
+            output_archive: None,
+            output_archive_contract: None,
         },
     )
     .await?;
@@ -6197,6 +6475,9 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
             inert_manifest_digest: &rejected_inert_digest,
             active_manifest_digest: &rejected_active_digest,
             direct_task_evidence: None,
+            phase: "submitted",
+            output_archive: None,
+            output_archive_contract: None,
         },
     )
     .await?;
@@ -6250,6 +6531,9 @@ async fn two_reconcilers_recover_ambiguous_effects_without_rebinding_or_replay()
                 inert_manifest_digest: &candidate_inert_digest,
                 active_manifest_digest: &candidate_active_digest,
                 direct_task_evidence: Some(&evidence),
+                phase: "submitted",
+                output_archive: None,
+                output_archive_contract: None,
             },
         )
         .await?;
@@ -6986,6 +7270,9 @@ struct TaskProjectionFixture<'a> {
     inert_manifest_digest: &'a str,
     active_manifest_digest: &'a str,
     direct_task_evidence: Option<&'a serde_json::Value>,
+    phase: &'a str,
+    output_archive: Option<&'a [u8]>,
+    output_archive_contract: Option<&'a str>,
 }
 
 async fn insert_task_projection_fixture(
@@ -6999,7 +7286,8 @@ async fn insert_task_projection_fixture(
           owner, owner_user_id, identity_binding_state, workflow, workflow_name, workflow_version, \
           workflow_digest, user_envelope_instance_id, user_envelope_revision, \
           user_envelope_digest, authority_kind, user_envelope_snapshot, coding_agent_runtime, \
-          runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, runtime_spec, \
+          runtime_uid, runtime_namespace, runtime_name, runtime_ownership, phase, output_archive, \
+          output_archive_contract, runtime_spec, \
           agent_command, execution_binding, source_provenance, direct_task_evidence, envelope_revision, \
           orchestration_version, orchestration_operation_id, candidate_digest, \
           service_envelope_digest, original_admission_decision, original_admission_deltas) \
@@ -7010,7 +7298,7 @@ async fn insert_task_projection_fixture(
                 CASE WHEN $6::jsonb IS NULL THEN workflow_digest ELSE NULL END, \
                 user_envelope_instance_id, user_envelope_revision, user_envelope_digest, \
                 authority_kind, user_envelope_snapshot, coding_agent_runtime, NULL, \
-                runtime_namespace, $3, runtime_ownership, 'submitted', runtime_spec, agent_command, \
+                runtime_namespace, $3, runtime_ownership, $7, $8, $9, runtime_spec, agent_command, \
                 execution_binding, \
                 CASE WHEN $6::jsonb IS NULL \
                      THEN source_provenance ELSE $6::jsonb -> 'sourceProvenance' END, \
@@ -7025,6 +7313,9 @@ async fn insert_task_projection_fixture(
     .bind(fixture.operation_id)
     .bind(fixture.source_task_uid)
     .bind(fixture.direct_task_evidence)
+    .bind(fixture.phase)
+    .bind(fixture.output_archive)
+    .bind(fixture.output_archive_contract)
     .execute(&mut *transaction)
     .await?
     .rows_affected();

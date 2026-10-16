@@ -213,16 +213,35 @@ pub fn task_output_archive_with_execution_transcript(
     stdout: &[u8],
     stderr: &[u8],
 ) -> Result<Vec<u8>, TaskOutputTranscriptError> {
+    task_output_archive_with_optional_output_and_execution_transcript(Some(archive), stdout, stderr)
+}
+
+/// Build a failed Task's runner-facing diagnostics archive, retaining a validated partial
+/// `out/` archive when the failed process produced one.
+///
+/// A failure before any declared output exists still returns the two bounded, server-owned
+/// transcript entries. When output is present it is validated and rewritten with the same
+/// strict rules as successful Task output before the reserved diagnostics are appended.
+pub fn task_output_archive_with_optional_output_and_execution_transcript(
+    archive: Option<Vec<u8>>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<Vec<u8>, TaskOutputTranscriptError> {
     let within_bound = |stream: &[u8]| {
         u64::try_from(stream.len()).is_ok_and(|len| len <= MAX_EXECUTION_STREAM_BYTES)
     };
     if !within_bound(stdout) || !within_bound(stderr) {
         return Err(TaskOutputTranscriptError::TranscriptTooLarge);
     }
-    let walked = walk_task_output_archive(&archive, TaskOutputArchiveCompatibility::Strict)
-        .map_err(TaskOutputTranscriptError::Archive)?;
+    let archive_bytes = archive.as_deref().unwrap_or_default();
+    let walked = archive
+        .as_ref()
+        .map(|_| walk_task_output_archive(archive_bytes, TaskOutputArchiveCompatibility::Strict))
+        .transpose()
+        .map_err(TaskOutputTranscriptError::Archive)?
+        .unwrap_or_default();
     let mut delivered = Vec::with_capacity(
-        archive.len()
+        archive_bytes.len()
             + 4 * TAR_BLOCK_BYTES
             + padded_tar_bytes(stdout.len())
             + padded_tar_bytes(stderr.len()),
@@ -250,12 +269,11 @@ pub fn task_output_archive_with_execution_transcript(
                     &mut delivered,
                     &format!("out/{}", entry.path),
                     kind,
-                    &archive[entry.offset..entry.offset + entry.size],
+                    &archive_bytes[entry.offset..entry.offset + entry.size],
                 );
             }
         }
     }
-    drop(archive);
     append_tar_entry(
         &mut delivered,
         EXECUTION_STDOUT_ARCHIVE_PATH,
@@ -502,6 +520,7 @@ mod tests {
         InvalidTaskOutputArchive, TarEntryKind, TaskOutputArchiveCompatibility,
         TaskOutputTranscriptError, append_tar_entry, finish_tar_archive,
         task_output_archive_entries, task_output_archive_with_execution_transcript,
+        task_output_archive_with_optional_output_and_execution_transcript,
     };
 
     fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -752,6 +771,47 @@ mod tests {
             ),
             Err(TaskOutputTranscriptError::TranscriptTooLarge)
         );
+
+        let forged = archive(&[(".steward/diagnostics/stdout.log", b"agent-authored")]);
+        assert!(matches!(
+            task_output_archive_with_optional_output_and_execution_transcript(
+                Some(forged),
+                b"stdout",
+                b"stderr",
+            ),
+            Err(TaskOutputTranscriptError::Archive(_))
+        ));
+        assert_eq!(
+            task_output_archive_with_optional_output_and_execution_transcript(
+                None, &oversized, b"",
+            ),
+            Err(TaskOutputTranscriptError::TranscriptTooLarge)
+        );
+    }
+
+    #[test]
+    fn failed_runner_delivery_can_contain_only_server_owned_diagnostics() -> Result<(), String> {
+        let delivered = task_output_archive_with_optional_output_and_execution_transcript(
+            None, b"stdout", b"stderr",
+        )
+        .map_err(|error| format!("diagnostics-only archive was not produced: {error:?}"))?;
+
+        let mut expected = Vec::new();
+        append_tar_entry(
+            &mut expected,
+            ".steward/diagnostics/stdout.log",
+            TarEntryKind::File,
+            b"stdout",
+        );
+        append_tar_entry(
+            &mut expected,
+            ".steward/diagnostics/stderr.log",
+            TarEntryKind::File,
+            b"stderr",
+        );
+        finish_tar_archive(&mut expected);
+        assert_eq!(delivered, expected);
+        Ok(())
     }
 
     #[test]
