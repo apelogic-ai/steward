@@ -8,15 +8,25 @@ version.workspace = true
 
 [dependencies]
 axum.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+reqwest.workspace = true
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+steward-adapter-openshell = { path = "../../adapters/openshell", version = "=0.3.19", features = ["workload-exchange"] }
 steward-apiserver = { path = "../../crates/steward-apiserver", version = "=0.3.19" }
+steward-admission = { path = "../../crates/steward-admission", version = "=0.3.19" }
+steward-ports = { path = "../../crates/steward-ports", version = "=0.3.19" }
+steward-store = { path = "../../crates/steward-store", version = "=0.3.19" }
 steward-types = { path = "../../crates/steward-types", version = "=0.3.19" }
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
+rcgen = "0.13.2"
+tokio-rustls.workspace = true
 tower.workspace = true
 
 [lints]
