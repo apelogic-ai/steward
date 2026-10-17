@@ -9,6 +9,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Added prepared `@callers` journeys for Jenkins and Temporal Run API callers, Jira receiver
+  delivery and replay, unbound-caller refusal, and write-capable Envelope refusal. Receiver paths
+  remain tagged pending until their deployment changes land, and the live Jira path requires an
+  explicit owner opt-in.
 - Added validation and routing for signed, bounded Jira webhook Triggers. This change is not usable
   on its own; starting governed runs and enabling deployment follow separately.
 - Published the generated Run API OpenAPI contract and added Jenkins and Temporal Go examples for
