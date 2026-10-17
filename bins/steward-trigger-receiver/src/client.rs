@@ -419,7 +419,8 @@ struct TaskRequest<'a> {
     #[serde(rename = "envelopeDigest")]
     envelope_digest: &'a str,
     #[serde(rename = "callerReference")]
-    caller_reference: &'a steward_types::CallerReference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller_reference: Option<&'a steward_types::CallerReference>,
 }
 
 impl WorkloadExchangeClient {
@@ -560,7 +561,7 @@ impl TaskLifecycle for WorkloadExchangeClient {
                         .json(&TaskRequest {
                             workflow: &invocation.workflow,
                             envelope_digest: &invocation.envelope_digest,
-                            caller_reference: &invocation.caller_reference,
+                            caller_reference: invocation.caller_reference.as_ref(),
                         })
                 })
                 .await?;
@@ -1802,10 +1803,10 @@ mod tests {
             workflow: "triage@1".to_owned(),
             envelope_digest: format!("steward:sha256:{}", "a".repeat(64)),
             idempotency_key: format!("jira-sha256:{}", "b".repeat(64)),
-            caller_reference: steward_types::CallerReference::new(
+            caller_reference: Some(steward_types::CallerReference::new(
                 "Jira trigger jira-read · PROJ-123",
                 Some("https://jira.example.com/browse/PROJ-123".to_owned()),
-            )?,
+            )?),
             input_archive: crate::JiraEvent::parse(
                 br#"{"webhookEvent":"jira:issue_updated","issue":{"key":"PROJ-123","fields":{"project":{"key":"PROJ"},"issuetype":{"id":"10001"}}},"user":{"accountId":"alice"}}"#,
                 128,
@@ -1854,6 +1855,36 @@ mod tests {
         let requests = state.requests.lock().map_err(|_| "poisoned")?;
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].0, Method::DELETE);
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_omits_an_unavailable_caller_reference() -> Result<(), String> {
+        let (client, state, handle) =
+            client_fixture(StatusCode::OK, "succeeded", 0, Duration::from_secs(1), None).await?;
+        let mut invocation = invocation()?;
+        invocation.caller_reference = None;
+        let result = client
+            .start(&trigger()?, invocation)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert!(matches!(result, TaskStart::Duplicate));
+        let create_body = state
+            .create_bodies
+            .lock()
+            .map_err(|_| "poisoned")?
+            .first()
+            .cloned()
+            .ok_or("create body missing")?;
+        let create: serde_json::Value =
+            serde_json::from_str(&create_body).map_err(|error| error.to_string())?;
+        assert!(
+            !create
+                .as_object()
+                .ok_or("create body is not an object")?
+                .contains_key("callerReference")
+        );
         handle.abort();
         Ok(())
     }

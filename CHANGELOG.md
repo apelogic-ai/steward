@@ -53,11 +53,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Upgrade and rollback
 
 - Migration 0073 adds nullable immutable caller-reference context to Tasks without rewriting
-  historical rows. When the Jira Trigger receiver is enabled, set
-  `config.apiserver.jiraBaseUrl` to the exact configured Jira HTTPS site so issue links are not
-  taken from webhook payloads. Deploy the chart, API, web, and receiver images together.
+  historical rows. The Jira Trigger receiver uses `config.apiserver.jiraBaseUrl`, when set, as
+  the validated HTTPS site and optional context path for issue links; without it, runs retain a
+  label without a link. Issue display metadata never determines whether a delivery is accepted.
+  Deploy the chart, API, web, and receiver images together.
 - Rolling back leaves the nullable column and its values in place; older API and web versions
-  ignore them. An older Jira receiver continues to start Tasks without display references.
+  ignore them. A full chart rollback removes the new receiver configuration field. Image-only
+  rollback of the receiver requires leaving `config.apiserver.jiraBaseUrl` unset; otherwise the
+  older strict config parser rejects that unknown field.
 
 ## [0.3.19] - 2026-10-15
 

@@ -23,7 +23,10 @@ ALTER TABLE task_submissions
                 )
             )
         )
-    );
+    ) NOT VALID;
+
+ALTER TABLE task_submissions
+    VALIDATE CONSTRAINT task_submissions_caller_reference_shape;
 
 CREATE FUNCTION steward_reject_task_caller_reference_mutation()
 RETURNS trigger

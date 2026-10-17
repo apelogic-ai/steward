@@ -48,22 +48,32 @@ function dateTime(value: string): string {
 }
 
 export function runOriginLabel(origin: BrowserRunView["origin"]): string {
-  return {
+  return ({
     api: "External caller",
     browser: "HyperShell",
     connections: "Connections",
     "github-actions": "GitHub Actions",
     unknown: "Earlier run",
-  }[origin];
+  } as Record<string, string>)[origin] ?? origin;
 }
 
 export function runCallerLabel(run: BrowserRunView): string | null {
   return run.caller ? `Triggered by ${run.caller.service} · ${run.caller.label}` : null;
 }
 
+function safeCallerUrl(value: string | null | undefined): string | null {
+  if (!value) return null;
+  try {
+    return new URL(value).protocol === "https:" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 export function RunAttribution({ run }: Readonly<{ run: BrowserRunView }>) {
+  const callerUrl = safeCallerUrl(run.caller?.url);
   return <>
-    {run.trigger ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.trigger.actor}</strong> via {run.trigger.event} · <a href={run.trigger.runUrl} rel="noreferrer" target="_blank">{run.trigger.repository}@{run.trigger.ref} ({run.trigger.sha.slice(0, 7)})</a> · <RunDuration createdAt={run.createdAt} phase={run.phase} updatedAt={run.updatedAt} /></div> : run.caller ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.caller.service}</strong> · {run.caller.url ? <a href={run.caller.url} rel="noreferrer" target="_blank">{run.caller.label}</a> : run.caller.label} · <RunDuration createdAt={run.createdAt} phase={run.phase} updatedAt={run.updatedAt} /></div> : <div className="mt-2 text-sm text-muted-ink">Started {dateTime(run.createdAt)} · <RunDuration createdAt={run.createdAt} phase={run.phase} updatedAt={run.updatedAt} /></div>}
+    {run.trigger ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.trigger.actor}</strong> via {run.trigger.event} · <a href={run.trigger.runUrl} rel="noreferrer" target="_blank">{run.trigger.repository}@{run.trigger.ref} ({run.trigger.sha.slice(0, 7)})</a> · <RunDuration createdAt={run.createdAt} phase={run.phase} updatedAt={run.updatedAt} /></div> : run.caller ? <div className="mt-2 text-sm text-muted-ink">Triggered by <strong className="font-medium text-ink">{run.caller.service}</strong> · {callerUrl ? <a href={callerUrl} rel="noreferrer" target="_blank">{run.caller.label}</a> : run.caller.label} · <RunDuration createdAt={run.createdAt} phase={run.phase} updatedAt={run.updatedAt} /></div> : <div className="mt-2 text-sm text-muted-ink">Started {dateTime(run.createdAt)} · <RunDuration createdAt={run.createdAt} phase={run.phase} updatedAt={run.updatedAt} /></div>}
     <div className="mt-1 text-sm text-muted-ink">Origin: {runOriginLabel(run.origin)}{run.package ? ` · Package: ${run.package.source} @ ${run.package.revision} · ${run.package.path} · Prompt: ${run.package.promptSource}` : ""}</div>
   </>;
 }
@@ -510,7 +520,7 @@ export function RunCards({ admin = false, runs }: Readonly<{ admin?: boolean; ru
   const columns = [
     { key: "workflow", label: "Workflow", className: "font-semibold", render: (run: BrowserRunView) => <span><span className="block truncate">{run.workflow}</span><span className="mt-0.5 block truncate font-mono text-xs font-normal text-muted-ink">{run.taskUid}</span></span> },
     ...(admin ? [{ key: "owner", label: "Owner", render: (run: BrowserRunView) => <span className="block truncate text-muted-ink">{"ownerDisplayEmail" in run ? String(run.ownerDisplayEmail ?? "Not reported") : "Not reported"}</span> }] : []),
-    { key: "source", label: "Origin / package", render: (run: BrowserRunView) => <span><span className="block">{runOriginLabel(run.origin)}</span><span className="mt-0.5 block max-w-64 truncate text-xs text-muted-ink">{runCallerLabel(run) ?? (run.package ? `${run.package.source} @ ${run.package.revision}` : "No package details")}</span></span> },
+    { key: "source", label: "Origin / package", render: (run: BrowserRunView) => <span><span className="block">{runOriginLabel(run.origin)}</span><span className={`mt-0.5 block max-w-64 truncate text-xs text-muted-ink${run.caller ? "" : " font-mono"}`}>{runCallerLabel(run) ?? (run.package ? `${run.package.source} @ ${run.package.revision}` : "No package details")}</span></span> },
     { key: "envelope", label: "Envelope", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => run.userEnvelopeRevision ? `rev ${run.userEnvelopeRevision}` : "—" },
     { key: "status", label: "Status", render: (run: BrowserRunView) => <StatusBadge value={run.phase} /> },
     { key: "runtime", label: "Runtime", className: "font-mono text-xs text-muted-ink", render: (run: BrowserRunView) => <span className={run.runtimeUid ? "text-ink" : "text-faint-ink"}>{runtimeLabel(run.runtimeUid)}</span> },

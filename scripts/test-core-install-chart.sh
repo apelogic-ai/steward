@@ -132,8 +132,25 @@ STEWARD_CHART_EXCHANGE_SERVER_NAME="$(inline_env_value STEWARD_WORKLOAD_EXCHANGE
   cargo test --quiet --package steward-trigger-receiver \
     client::tests::chart_render_contract_from_environment -- --exact
 
+helm_template "${receiver_inputs[@]}" \
+  --set-string config.apiserver.jiraBaseUrl= > "${rendered}"
+receiver_config_without_site="$(
+  awk '/^metadata: \{ name: steward-trigger-receiver-config/ { found = 1 } found && /^  config.json: / { sub(/^  config.json: /, ""); print; exit }' "${rendered}" |
+    jq -r .
+)"
+if jq -e 'has("jiraSiteUrl")' <<< "${receiver_config_without_site}" > /dev/null; then
+  echo 'receiver configuration must omit the optional Jira site when it is unset' >&2
+  exit 1
+fi
+STEWARD_CHART_RECEIVER_CONFIG="${receiver_config_without_site}" \
+STEWARD_CHART_API_ORIGIN="$(inline_env_value STEWARD_API_ORIGIN)" \
+STEWARD_CHART_API_SERVER_NAME="$(inline_env_value STEWARD_API_SERVER_NAME)" \
+STEWARD_CHART_EXCHANGE_ENDPOINT="$(inline_env_value STEWARD_WORKLOAD_EXCHANGE_ENDPOINT)" \
+STEWARD_CHART_EXCHANGE_SERVER_NAME="$(inline_env_value STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME)" \
+  cargo test --quiet --package steward-trigger-receiver \
+    client::tests::chart_render_contract_from_environment -- --exact
+
 for missing in \
-  config.apiserver.jiraBaseUrl \
   triggerReceiver.databaseSecret.name \
   triggerReceiver.workloadExchange.endpoint \
   triggerReceiver.workloadExchange.serverName \

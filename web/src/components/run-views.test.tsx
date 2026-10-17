@@ -108,6 +108,29 @@ describe("run table", () => {
     expect(historicalHtml).not.toContain("Triggered by");
   });
 
+  test("renders only safe caller links and escapes caller labels", () => {
+    for (const url of ["javascript:alert(1)", "http://jira.example.com/browse/PROJ-123"]) {
+      const html = renderToStaticMarkup(<RunAttribution run={run({
+        origin: "api",
+        caller: { service: "event-worker", label: "<script>alert(1)</script>", url },
+      })} />);
+      expect(html).not.toContain("href=");
+      expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+      expect(html).not.toContain("<script>");
+    }
+
+    const safe = renderToStaticMarkup(<RunAttribution run={run({
+      origin: "api",
+      caller: {
+        service: "event-worker",
+        label: "PROJ-123",
+        url: "https://jira.example.com/browse/PROJ-123",
+      },
+    })} />);
+    expect(safe).toContain('href="https://jira.example.com/browse/PROJ-123"');
+    expect(safe).toContain('rel="noreferrer"');
+  });
+
   test("maps every persisted origin to a readable label", () => {
     expect([
       runOriginLabel("api"),

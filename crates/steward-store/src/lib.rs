@@ -15135,10 +15135,7 @@ fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreE
     Ok(AgentRunRecord {
         task_uid: row.try_get("task_uid").map_err(database_error)?,
         submitter_service: row.try_get("submitter_service").map_err(database_error)?,
-        caller_reference: row
-            .try_get::<Option<Json<CallerReference>>, _>("caller_reference")
-            .map_err(database_error)?
-            .map(|reference| reference.0),
+        caller_reference: lenient_caller_reference_from_row(&row)?,
         acting_user: row.try_get("acting_user").map_err(database_error)?,
         owner: row.try_get("owner").map_err(database_error)?,
         owner_user_id: row.try_get("owner_user_id").map_err(database_error)?,
@@ -15195,6 +15192,23 @@ fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreE
             .map_err(database_error)?
             .map(|value| value.0),
     })
+}
+
+fn lenient_caller_reference_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<CallerReference>, StoreError> {
+    let reference = row
+        .try_get::<Option<Json<serde_json::Value>>, _>("caller_reference")
+        .map_err(database_error)?;
+    Ok(
+        reference.and_then(|Json(value)| match serde_json::from_value(value) {
+            Ok(reference) => Some(reference),
+            Err(_) => {
+                eprintln!("ignored invalid persisted Task caller reference");
+                None
+            }
+        }),
+    )
 }
 
 fn agent_run_timeline_event(
