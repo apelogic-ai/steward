@@ -30,12 +30,34 @@ const SOURCE_TOKEN_REFRESH_DIVISOR: u32 = 10;
 
 #[derive(Clone)]
 pub struct PgEnvelopeAuthority {
-    store: PgStore,
+    store: Arc<dyn EnvelopeStore>,
 }
 
 impl PgEnvelopeAuthority {
     pub fn new(store: PgStore) -> Self {
-        Self { store }
+        Self {
+            store: Arc::new(store),
+        }
+    }
+}
+
+trait EnvelopeStore: Send + Sync {
+    fn active_provisioned_user_envelopes_by_digest<'a>(
+        &'a self,
+        owner: &'a CanonicalUserId,
+        digest: &'a str,
+    ) -> ReceiverFuture<'a, Result<Vec<EnvelopeRequestRecord>, StoreError>>;
+}
+
+impl EnvelopeStore for PgStore {
+    fn active_provisioned_user_envelopes_by_digest<'a>(
+        &'a self,
+        owner: &'a CanonicalUserId,
+        digest: &'a str,
+    ) -> ReceiverFuture<'a, Result<Vec<EnvelopeRequestRecord>, StoreError>> {
+        Box::pin(async move {
+            PgStore::active_provisioned_user_envelopes_by_digest(self, owner, digest).await
+        })
     }
 }
 
@@ -200,17 +222,28 @@ impl KubernetesTokenRequester {
         let status = response.status.ok_or(TaskLifecycleError::Final)?;
         let token = OpaqueToken::new(status.token).map_err(|_| TaskLifecycleError::Final)?;
         let expires_at: SystemTime = status.expiration_timestamp.0.into();
-        let remaining = expires_at
-            .duration_since(SystemTime::now())
-            .map_err(|_| TaskLifecycleError::Final)?;
-        let refresh_margin = remaining.max(Duration::from_secs(MIN_SOURCE_TOKEN_SECONDS))
-            / SOURCE_TOKEN_REFRESH_DIVISOR;
-        let refresh_at = expires_at
-            .checked_sub(refresh_margin)
-            .filter(|refresh_at| *refresh_at > SystemTime::now())
-            .ok_or(TaskLifecycleError::Final)?;
+        let refresh_at = source_token_refresh_at(expires_at, SystemTime::now())?;
         Ok(CachedSourceToken { token, refresh_at })
     }
+
+    async fn invalidate(&self) {
+        *self.cache.lock().await = None;
+    }
+}
+
+fn source_token_refresh_at(
+    expires_at: SystemTime,
+    now: SystemTime,
+) -> Result<SystemTime, TaskLifecycleError> {
+    let remaining = expires_at
+        .duration_since(now)
+        .map_err(|_| TaskLifecycleError::Retriable)?;
+    let refresh_margin =
+        remaining.max(Duration::from_secs(MIN_SOURCE_TOKEN_SECONDS)) / SOURCE_TOKEN_REFRESH_DIVISOR;
+    expires_at
+        .checked_sub(refresh_margin)
+        .filter(|refresh_at| *refresh_at > now)
+        .ok_or(TaskLifecycleError::Retriable)
 }
 
 fn transient_status_code(code: u16) -> bool {
@@ -308,14 +341,28 @@ impl TaskTokenProvider for KubernetesWorkloadTokenProvider {
                 Arc::new(self.source.clone()),
             )
             .map_err(exchange_error)?;
-            Ok(Arc::new(provider) as Arc<dyn TaskAccessTokenProvider>)
+            Ok(Arc::new(KubernetesAccessTokenProvider {
+                exchange: provider,
+                source: self.source.clone(),
+            }) as Arc<dyn TaskAccessTokenProvider>)
         })
     }
 }
 
-impl TaskAccessTokenProvider for WorkloadExchangeTokenProvider {
+struct KubernetesAccessTokenProvider {
+    exchange: WorkloadExchangeTokenProvider,
+    source: KubernetesTokenRequester,
+}
+
+impl TaskAccessTokenProvider for KubernetesAccessTokenProvider {
     fn token(&self) -> ReceiverFuture<'_, Result<OpaqueToken, TaskLifecycleError>> {
-        Box::pin(async move { self.access_token().await.map_err(exchange_error) })
+        Box::pin(async move {
+            let result = self.exchange.access_token().await;
+            if matches!(result, Err(steward_ports::PortError::Rejected { .. })) {
+                self.source.invalidate().await;
+            }
+            result.map_err(exchange_error)
+        })
     }
 }
 
@@ -848,7 +895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workload_provider_refreshes_the_source_token_during_a_long_lifecycle()
+    async fn workload_provider_reuses_the_source_token_during_access_token_refresh()
     -> Result<(), String> {
         let source_calls = Arc::new(Mutex::new(0_usize));
         let counted = source_calls.clone();
@@ -921,6 +968,83 @@ mod tests {
         assert!(requests[0].contains("Bearer obviously-fake-source-token-1"));
         assert!(requests[1].contains("Bearer obviously-fake-source-token-1"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_token_refreshes_after_its_refresh_point() -> Result<(), String> {
+        let source_calls = Arc::new(Mutex::new(0_usize));
+        let counted = source_calls.clone();
+        let kube = KubeClient::new(
+            service_fn(move |_request: Request<KubeBody>| {
+                let counted = counted.clone();
+                async move {
+                    let call = {
+                        let mut count = counted
+                            .lock()
+                            .map_err(|_| std::io::Error::other("poisoned"))?;
+                        *count += 1;
+                        *count
+                    };
+                    let mut response = HttpResponse::new(Body::from(format!(
+                        r#"{{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","metadata":{{}},"spec":{{"audiences":["steward-task"],"expirationSeconds":600}},"status":{{"expirationTimestamp":"2030-01-01T00:00:00Z","token":"obviously-fake-source-token-{call}"}}}}"#
+                    )));
+                    response.headers_mut().insert(
+                        "content-type",
+                        "application/json".parse().map_err(std::io::Error::other)?,
+                    );
+                    Ok::<_, std::io::Error>(response)
+                }
+            }),
+            "default",
+        );
+        let requester = KubernetesTokenRequester::new(
+            kube,
+            "steward-test".to_owned(),
+            "receiver".to_owned(),
+            "steward-task".to_owned(),
+            600,
+        )?;
+        assert_eq!(
+            requester
+                .source_token()
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .expose_secret(),
+            "obviously-fake-source-token-1"
+        );
+        requester
+            .cache
+            .lock()
+            .await
+            .as_mut()
+            .ok_or("source token was not cached")?
+            .refresh_at = SystemTime::UNIX_EPOCH;
+        assert_eq!(
+            requester
+                .source_token()
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .expose_secret(),
+            "obviously-fake-source-token-2"
+        );
+        assert_eq!(*source_calls.lock().map_err(|_| "poisoned")?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn source_token_clock_skew_is_retriable() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        for expires_at in [
+            now - Duration::from_secs(1),
+            now + Duration::from_secs(
+                MIN_SOURCE_TOKEN_SECONDS / u64::from(SOURCE_TOKEN_REFRESH_DIVISOR) - 1,
+            ),
+        ] {
+            assert_eq!(
+                source_token_refresh_at(expires_at, now),
+                Err(TaskLifecycleError::Retriable)
+            );
+        }
     }
 
     #[tokio::test]
@@ -1081,6 +1205,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refused_source_token_is_evicted_before_the_next_delivery() -> Result<(), String> {
+        let source_calls = Arc::new(Mutex::new(0_usize));
+        let counted = source_calls.clone();
+        let kube = KubeClient::new(
+            service_fn(move |_request: Request<KubeBody>| {
+                let counted = counted.clone();
+                async move {
+                    let call = {
+                        let mut count = counted
+                            .lock()
+                            .map_err(|_| std::io::Error::other("poisoned"))?;
+                        *count += 1;
+                        *count
+                    };
+                    let mut response = HttpResponse::new(Body::from(format!(
+                        r#"{{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","metadata":{{}},"spec":{{"audiences":["steward-task"],"expirationSeconds":600}},"status":{{"expirationTimestamp":"2030-01-01T00:00:00Z","token":"obviously-fake-source-token-{call}"}}}}"#
+                    )));
+                    response.headers_mut().insert(
+                        "content-type",
+                        "application/json".parse().map_err(std::io::Error::other)?,
+                    );
+                    Ok::<_, std::io::Error>(response)
+                }
+            }),
+            "default",
+        );
+        let access =
+            r#"{"access_token":"obviously-fake-access","token_type":"Bearer","expires_in":120}"#;
+        let exchange = tls_fixture(vec![
+            test_response(401, "", ""),
+            test_response(200, "Cache-Control: no-store\r\n", access),
+        ])
+        .await?;
+        let provider = KubernetesWorkloadTokenProvider::new(
+            KubernetesTokenRequester::new(
+                kube,
+                "steward-test".to_owned(),
+                "receiver".to_owned(),
+                "steward-task".to_owned(),
+                600,
+            )?,
+            format!("{}v1/workload/exchange", exchange.origin),
+            "localhost".to_owned(),
+            exchange.ca_certificate_pem.clone(),
+            exchange_transport(),
+        )?;
+        let first = provider
+            .lifecycle()
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(first.token().await.err(), Some(TaskLifecycleError::Final));
+        let second = provider
+            .lifecycle()
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(
+            second
+                .token()
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .expose_secret(),
+            "obviously-fake-access"
+        );
+        exchange.handle.await.map_err(|error| error.to_string())?;
+        assert_eq!(*source_calls.lock().map_err(|_| "poisoned")?, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn workload_exchange_rejects_a_malformed_ca_at_startup() -> Result<(), String> {
         let kube = KubeClient::new(
             service_fn(|_request: Request<KubeBody>| async move {
@@ -1139,16 +1332,46 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn envelope_lookup_fails_closed_when_database_is_unreachable() -> Result<(), String> {
-        let owner = CanonicalUserId::parse(OWNER)?;
-        let digest = format!("sha256:{}", "a".repeat(64));
-        assert_eq!(
-            active_tools_from_store_result(
-                &owner,
-                &digest,
-                Err(StoreError::Database("database unavailable".to_owned())),
+    #[tokio::test]
+    async fn envelope_lookup_fails_closed_when_database_is_unreachable() -> Result<(), String> {
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            PgStore::connect_with_acquire_timeout(
+                "postgres://steward@127.0.0.1:9/steward",
+                Duration::from_millis(25),
             ),
+        )
+        .await
+        .map_err(|_| "database refusal exceeded the receiver deadline")?;
+        assert!(result.is_err(), "an unavailable database must fail closed");
+        Ok(())
+    }
+
+    struct UnavailableEnvelopeStore;
+
+    impl EnvelopeStore for UnavailableEnvelopeStore {
+        fn active_provisioned_user_envelopes_by_digest<'a>(
+            &'a self,
+            _owner: &'a CanonicalUserId,
+            _digest: &'a str,
+        ) -> ReceiverFuture<'a, Result<Vec<EnvelopeRequestRecord>, StoreError>> {
+            Box::pin(async { Err(StoreError::Database("database unavailable".to_owned())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn envelope_authority_maps_database_failure_to_unavailable() -> Result<(), String> {
+        let owner = CanonicalUserId::parse(OWNER)?;
+        let authority = PgEnvelopeAuthority {
+            store: Arc::new(UnavailableEnvelopeStore),
+        };
+        assert_eq!(
+            crate::EnvelopeAuthority::active_tools(
+                &authority,
+                &owner,
+                &format!("steward:sha256:{}", "a".repeat(64)),
+            )
+            .await,
             Err(crate::EnvelopeError::Unavailable)
         );
         Ok(())
@@ -1474,20 +1697,24 @@ mod tests {
             HttpResponse::new(Body::empty())
         };
         let injected_failure = match state.failure {
-            Some("upload") => method == Method::PUT,
-            Some("execute") => method == Method::POST && path.ends_with("/execute"),
-            Some("poll") => method == Method::GET,
-            Some("poll_once") => {
-                method == Method::GET
-                    && state.polls.lock().map(|polls| *polls == 1).unwrap_or(false)
+            Some("upload") if method == Method::PUT => Some(StatusCode::SERVICE_UNAVAILABLE),
+            Some("execute") if method == Method::POST && path.ends_with("/execute") => {
+                Some(StatusCode::SERVICE_UNAVAILABLE)
             }
-            Some("finalize") => method == Method::DELETE,
-            _ => false,
+            Some("poll") if method == Method::GET => Some(StatusCode::SERVICE_UNAVAILABLE),
+            Some("poll_once") => (method == Method::GET
+                && state.polls.lock().map(|polls| *polls == 1).unwrap_or(false))
+            .then_some(StatusCode::SERVICE_UNAVAILABLE),
+            Some("poll_408_once") => (method == Method::GET
+                && state.polls.lock().map(|polls| *polls == 1).unwrap_or(false))
+            .then_some(StatusCode::REQUEST_TIMEOUT),
+            Some("finalize") if method == Method::DELETE => Some(StatusCode::SERVICE_UNAVAILABLE),
+            _ => None,
         };
         *response.status_mut() = if method == Method::POST && path == "/v1/tasks" {
             state.create_status
-        } else if injected_failure {
-            StatusCode::SERVICE_UNAVAILABLE
+        } else if let Some(status) = injected_failure {
+            status
         } else if method == Method::PUT {
             StatusCode::NO_CONTENT
         } else if method == Method::GET {
@@ -1775,6 +2002,40 @@ mod tests {
             0,
             Duration::from_secs(1),
             Some("poll_once"),
+        )
+        .await?;
+        let TaskStart::Started(completion) = client
+            .start(&trigger()?, invocation()?)
+            .await
+            .map_err(|error| format!("{error:?}"))?
+        else {
+            return Err("expected started".to_owned());
+        };
+        completion.await.map_err(|error| format!("{error:?}"))?;
+        let requests = state.requests.lock().map_err(|_| "poisoned")?;
+        let poll_positions = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (method, _, _))| (*method == Method::GET).then_some(index))
+            .collect::<Vec<_>>();
+        let finalize_position = requests
+            .iter()
+            .position(|(method, _, _)| *method == Method::DELETE)
+            .ok_or("finalize was not attempted")?;
+        assert_eq!(poll_positions.len(), 2);
+        assert!(poll_positions[1] < finalize_position);
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_request_timeout_retries_before_finalization() -> Result<(), String> {
+        let (client, state, handle) = client_fixture(
+            StatusCode::ACCEPTED,
+            "submitted",
+            0,
+            Duration::from_secs(1),
+            Some("poll_408_once"),
         )
         .await?;
         let TaskStart::Started(completion) = client

@@ -353,6 +353,10 @@ impl PendingDelivery {
 impl Drop for PendingDelivery {
     fn drop(&mut self) {
         if self.armed {
+            if let Ok(mut state) = self.live.state.try_lock() {
+                rollback_pending_state(&mut state, &self.replay_key, &self.issue_key);
+                return;
+            }
             let live = self.live.clone();
             let replay_key = self.replay_key.clone();
             let issue_key = self.issue_key.clone();
@@ -365,15 +369,19 @@ impl Drop for PendingDelivery {
 
 async fn rollback_pending(live: Arc<LiveTrigger>, replay_key: String, issue_key: String) {
     let mut state = live.state.lock().await;
-    if state.deliveries.get(&replay_key) == Some(&DeliveryState::Pending) {
-        state.deliveries.remove(&replay_key);
+    rollback_pending_state(&mut state, &replay_key, &issue_key);
+}
+
+fn rollback_pending_state(state: &mut TriggerState, replay_key: &str, issue_key: &str) {
+    if state.deliveries.get(replay_key) == Some(&DeliveryState::Pending) {
+        state.deliveries.remove(replay_key);
     }
     if state
         .issue_cooldowns
-        .get(&issue_key)
+        .get(issue_key)
         .is_some_and(|reservation| reservation.delivery_id == replay_key)
     {
-        state.issue_cooldowns.remove(&issue_key);
+        state.issue_cooldowns.remove(issue_key);
     }
 }
 
@@ -446,7 +454,6 @@ impl Receiver {
         &self,
         trigger_id: &str,
         signature: Option<&str>,
-        _delivery_id: Option<&str>,
         body: &[u8],
     ) -> Result<WebhookResult, WebhookError> {
         let live = self
@@ -628,13 +635,7 @@ async fn receive_route(
     let signature = headers
         .get("x-hub-signature")
         .and_then(|value| value.to_str().ok());
-    let delivery = headers
-        .get("x-atlassian-webhook-identifier")
-        .and_then(|value| value.to_str().ok());
-    let (status, message) = match receiver
-        .receive(&trigger, signature, delivery, body.as_ref())
-        .await
-    {
+    let (status, message) = match receiver.receive(&trigger, signature, body.as_ref()).await {
         Ok(WebhookResult::Accepted) => (StatusCode::ACCEPTED, "The event was accepted."),
         Ok(WebhookResult::Noop) => (StatusCode::OK, "No run was needed."),
         Err(WebhookError::NotFound) => (StatusCode::NOT_FOUND, "This Trigger is unavailable."),
@@ -790,7 +791,7 @@ fn idempotency_key(trigger: &str, body: &[u8]) -> Result<String, WebhookError> {
         .map_err(|_| WebhookError::Invalid("The Jira event is invalid."))?;
     let canonical = serde_json::to_vec(&value).map_err(|_| WebhookError::Failed)?;
     let mut digest = Sha256::new();
-    digest.update(b"steward-jira-trigger-delivery/v1\0");
+    digest.update(b"steward-jira-trigger-delivery/v2\0");
     digest.update(trigger.as_bytes());
     digest.update(b"\0");
     digest.update(canonical);
@@ -1053,7 +1054,7 @@ mod tests {
 
     async fn send_issue(
         receiver: &Receiver,
-        delivery: &str,
+        _delivery: &str,
         author: &str,
         issue: &str,
     ) -> Result<W, E> {
@@ -1062,7 +1063,6 @@ mod tests {
             .receive(
                 "jira-read",
                 Some(&signature(b"test-signing-secret", &event)),
-                Some(delivery),
                 &event,
             )
             .await
@@ -1116,43 +1116,34 @@ mod tests {
         let event = body("alice");
         let signed = signature(b"test-signing-secret", &event);
         assert_eq!(
-            r.receive("missing", Some(&signed), Some("x"), &event).await,
+            r.receive("missing", Some(&signed), &event).await,
             Err(E::NotFound)
         );
         assert_eq!(
-            r.receive("jira-read", None, Some("x"), &event).await,
+            r.receive("jira-read", None, &event).await,
             Err(E::Unauthorized)
         );
         assert_eq!(
-            r.receive("jira-read", Some("sha256=bad"), Some("x"), &event)
-                .await,
+            r.receive("jira-read", Some("sha256=bad"), &event).await,
             Err(E::Unauthorized)
         );
         for signature in [None, Some("sha256=bad")] {
             assert_eq!(
-                r.receive("jira-read", signature, Some("malformed"), b"not-json")
-                    .await,
+                r.receive("jira-read", signature, b"not-json").await,
                 Err(E::Unauthorized)
             );
         }
-        let long_id = "x".repeat(limits().max_identifier_bytes + 1);
         assert_eq!(
-            r.receive("jira-read", Some(&signed), Some(&long_id), &event)
-                .await,
+            r.receive("jira-read", Some(&signed), &event).await,
             Ok(W::Accepted)
         );
         assert!(matches!(
-            r.receive(
-                "jira-read",
-                None,
-                Some("x"),
-                &vec![b'x'; limits().max_body_bytes + 1]
-            )
-            .await,
+            r.receive("jira-read", None, &vec![b'x'; limits().max_body_bytes + 1])
+                .await,
             Err(E::Invalid(_))
         ));
         assert_eq!(
-            r.receive("jira-read", Some(&signed), None, &event).await,
+            r.receive("jira-read", Some(&signed), &event).await,
             Ok(W::Noop)
         );
         let malformed = b"{}";
@@ -1160,7 +1151,6 @@ mod tests {
             r.receive(
                 "jira-read",
                 Some(&signature(b"test-signing-secret", malformed)),
-                Some("malformed"),
                 malformed
             )
             .await,
@@ -1169,8 +1159,7 @@ mod tests {
         let mut changed = event.clone();
         changed.push(b' ');
         assert_eq!(
-            r.receive("jira-read", Some(&signed), Some("changed"), &changed)
-                .await,
+            r.receive("jira-read", Some(&signed), &changed).await,
             Err(E::Unauthorized)
         );
         let disabled = valid.replace("\"enabled\":true", "\"enabled\":false");
@@ -1195,7 +1184,6 @@ mod tests {
             r.receive(
                 "jira-read",
                 Some(&signature(b"test-signing-secret", &underscore)),
-                Some("underscore-project"),
                 &underscore,
             )
             .await,
@@ -1234,7 +1222,6 @@ mod tests {
                 r.receive(
                     "jira-read",
                     Some(&signature(b"test-signing-secret", &event)),
-                    Some("invalid-field"),
                     &event,
                 )
                 .await,
@@ -1392,13 +1379,11 @@ mod tests {
         let event = body("alice");
         let signed = signature(b"test-signing-secret", &event);
         assert_eq!(
-            r.receive("jira-read", Some(&signed), Some("shared"), &event)
-                .await,
+            r.receive("jira-read", Some(&signed), &event).await,
             Ok(W::Accepted)
         );
         assert_eq!(
-            r.receive("jira-two", Some(&signed), Some("shared"), &event)
-                .await,
+            r.receive("jira-two", Some(&signed), &event).await,
             Ok(W::Accepted)
         );
         Ok(())
@@ -1476,7 +1461,6 @@ mod tests {
                 .receive(
                     "jira-read",
                     Some(&signature(b"test-signing-secret", &first)),
-                    None,
                     &first,
                 )
                 .await,
@@ -1487,7 +1471,6 @@ mod tests {
                 .receive(
                     "jira-read",
                     Some(&signature(b"test-signing-secret", second)),
-                    None,
                     second,
                 )
                 .await,
@@ -1501,7 +1484,6 @@ mod tests {
                 .receive(
                     "jira-read",
                     Some(&signature(b"test-signing-secret", different.as_bytes())),
-                    None,
                     different.as_bytes(),
                 )
                 .await,
@@ -1510,6 +1492,15 @@ mod tests {
         assert_eq!(
             tasks.calls.lock().map_err(|_| "calls lock failed")?.len(),
             2
+        );
+        // Pin the numeric range represented exactly by serde_json's default Number model.
+        assert_ne!(
+            idempotency_key("jira-read", br#"{"value":18446744073709551615}"#),
+            idempotency_key("jira-read", br#"{"value":18446744073709551614}"#)
+        );
+        assert_ne!(
+            idempotency_key("jira-read", br#"{"value":0.1234567890123456}"#),
+            idempotency_key("jira-read", br#"{"value":0.1234567890123457}"#)
         );
         Ok(())
     }
