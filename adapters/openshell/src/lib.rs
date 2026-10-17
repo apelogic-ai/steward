@@ -1673,7 +1673,7 @@ pub struct WorkloadExchangeTransport {
 
 #[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 impl WorkloadExchangeTransport {
-    fn validate(self) -> Result<Self, PortError> {
+    pub fn validate(self) -> Result<Self, PortError> {
         if self.connect_timeout.is_zero()
             || self.request_timeout < self.connect_timeout
             || self.max_response_bytes == 0

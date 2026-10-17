@@ -6,8 +6,9 @@ use std::net::SocketAddr;
 use steward_adapter_openshell::WorkloadExchangeTransport;
 use steward_store::PgStore;
 use steward_trigger_receiver::client::{
-    FileCatalog, KubernetesTokenRequester, KubernetesWorkloadTokenProvider, PgEnvelopeAuthority,
-    TaskClientTiming, WorkloadExchangeClient,
+    FileCatalog, KubernetesTokenRequester, KubernetesWorkloadTokenProvider,
+    MAX_SOURCE_TOKEN_SECONDS, MIN_SOURCE_TOKEN_SECONDS, PgEnvelopeAuthority, TaskClientTiming,
+    WorkloadExchangeClient,
 };
 use steward_trigger_receiver::{Receiver, ReceiverConfig, ReceiverLimits};
 
@@ -26,8 +27,6 @@ const MAX_CONNECT_TIMEOUT_MILLISECONDS: u64 = 60_000;
 const MAX_REQUEST_TIMEOUT_MILLISECONDS: u64 = 300_000;
 const MAX_REPLY_BYTES: usize = 1024 * 1024;
 const MAX_EXCHANGE_REPLY_BYTES: usize = 64 * 1024;
-const MIN_SOURCE_TOKEN_SECONDS: u64 = 600;
-const MAX_SOURCE_TOKEN_SECONDS: u64 = 86_400;
 
 fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     env::var(name).map_err(|_| format!("{name} is required").into())
@@ -56,7 +55,7 @@ fn bounded_usize(name: &str, value: String, max: usize) -> Result<usize, String>
 struct RuntimeSettings {
     limits: ReceiverLimits,
     database_acquire_timeout: std::time::Duration,
-    source_token_seconds: i64,
+    source_token_seconds: u64,
     exchange_transport: WorkloadExchangeTransport,
     task_timing: TaskClientTiming,
 }
@@ -126,7 +125,7 @@ fn runtime_settings_from(
         MIN_SOURCE_TOKEN_SECONDS,
         MAX_SOURCE_TOKEN_SECONDS,
         &mut get,
-    )? as i64;
+    )?;
     let exchange_transport = WorkloadExchangeTransport {
         connect_timeout: duration(
             "STEWARD_WORKLOAD_EXCHANGE_CONNECT_TIMEOUT_MILLISECONDS",
@@ -177,9 +176,6 @@ fn runtime_settings_from(
         )?,
     }
     .validate()?;
-    if exchange_transport.request_timeout < exchange_transport.connect_timeout {
-        return Err("workload exchange timeouts are inconsistent".to_owned());
-    }
     Ok(RuntimeSettings {
         limits,
         database_acquire_timeout,
@@ -281,7 +277,7 @@ mod tests {
         assert_eq!(settings.source_token_seconds, 601);
         assert!(
             settings.task_timing.deadline
-                > std::time::Duration::from_secs(settings.source_token_seconds as u64)
+                > std::time::Duration::from_secs(settings.source_token_seconds)
         );
         assert_eq!(settings.task_timing.max_reply_bytes, 1000);
         assert_eq!(settings.exchange_transport.max_response_bytes, 1000);
@@ -299,6 +295,9 @@ mod tests {
                 "1000".to_owned()
             })
         });
-        assert!(result.is_err());
+        assert_eq!(
+            result.err().as_deref(),
+            Some("STEWARD_TRIGGER_MAX_CONCURRENCY is outside its supported range")
+        );
     }
 }

@@ -11,7 +11,7 @@ use steward_apiserver::WorkflowReference;
 use steward_apiserver::browser_admin::{CapabilityCatalog, ToolAccessClass};
 use steward_types::task_output_archive::{TarEntryKind, append_tar_entry, finish_tar_archive};
 use steward_types::{CanonicalUserId, ToolGrant};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -353,25 +353,35 @@ impl PendingDelivery {
 impl Drop for PendingDelivery {
     fn drop(&mut self) {
         if self.armed {
+            if let Ok(mut state) = self.live.state.try_lock() {
+                rollback_pending_state(&mut state, &self.replay_key, &self.issue_key);
+                return;
+            }
             let live = self.live.clone();
             let replay_key = self.replay_key.clone();
             let issue_key = self.issue_key.clone();
-            tokio::spawn(async move { rollback_pending(live, replay_key, issue_key).await });
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move { rollback_pending(live, replay_key, issue_key).await });
+            }
         }
     }
 }
 
 async fn rollback_pending(live: Arc<LiveTrigger>, replay_key: String, issue_key: String) {
     let mut state = live.state.lock().await;
-    if state.deliveries.get(&replay_key) == Some(&DeliveryState::Pending) {
-        state.deliveries.remove(&replay_key);
+    rollback_pending_state(&mut state, &replay_key, &issue_key);
+}
+
+fn rollback_pending_state(state: &mut TriggerState, replay_key: &str, issue_key: &str) {
+    if state.deliveries.get(replay_key) == Some(&DeliveryState::Pending) {
+        state.deliveries.remove(replay_key);
     }
     if state
         .issue_cooldowns
-        .get(&issue_key)
+        .get(issue_key)
         .is_some_and(|reservation| reservation.delivery_id == replay_key)
     {
-        state.issue_cooldowns.remove(&issue_key);
+        state.issue_cooldowns.remove(issue_key);
     }
 }
 
@@ -444,7 +454,6 @@ impl Receiver {
         &self,
         trigger_id: &str,
         signature: Option<&str>,
-        delivery_id: Option<&str>,
         body: &[u8],
     ) -> Result<WebhookResult, WebhookError> {
         let live = self
@@ -462,11 +471,6 @@ impl Receiver {
         if !verify_jira_signature_with_key(&live.signing_key, signature, body) {
             return Err(WebhookError::Unauthorized);
         }
-        delivery_id
-            .filter(|value| valid_exact(value, self.limits.max_identifier_bytes))
-            .ok_or(WebhookError::Invalid(
-                "The delivery identifier is missing or invalid.",
-            ))?;
         let event = JiraEvent::parse(body, self.limits.max_identifier_bytes)?;
         if !trigger.filters.matches(&event)
             || trigger
@@ -475,7 +479,7 @@ impl Receiver {
         {
             return Ok(WebhookResult::Noop);
         }
-        let replay_key = idempotency_key(&trigger.id, body);
+        let replay_key = idempotency_key(&trigger.id, body)?;
         let (invocation, issue_key, permit) = {
             let input_archive = event.archive()?;
             let mut state = live.state.lock().await;
@@ -525,18 +529,17 @@ impl Receiver {
             )
         };
         let worker = self.clone();
-        let (result_tx, result_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let result = worker
+        let result = tokio::spawn(async move {
+            worker
                 .start(
                     PendingDelivery::new(live, replay_key, issue_key),
                     invocation,
                     permit,
                 )
-                .await;
-            _ = result_tx.send(result);
-        });
-        match result_rx.await {
+                .await
+        })
+        .await;
+        match result {
             Ok(result) => result,
             Err(_) => Err(WebhookError::Failed),
         }
@@ -632,13 +635,7 @@ async fn receive_route(
     let signature = headers
         .get("x-hub-signature")
         .and_then(|value| value.to_str().ok());
-    let delivery = headers
-        .get("x-atlassian-webhook-identifier")
-        .and_then(|value| value.to_str().ok());
-    let (status, message) = match receiver
-        .receive(&trigger, signature, delivery, body.as_ref())
-        .await
-    {
+    let (status, message) = match receiver.receive(&trigger, signature, body.as_ref()).await {
         Ok(WebhookResult::Accepted) => (StatusCode::ACCEPTED, "The event was accepted."),
         Ok(WebhookResult::Noop) => (StatusCode::OK, "No run was needed."),
         Err(WebhookError::NotFound) => (StatusCode::NOT_FOUND, "This Trigger is unavailable."),
@@ -789,13 +786,16 @@ fn hex_digit(value: u8) -> Option<u8> {
     }
 }
 
-fn idempotency_key(trigger: &str, body: &[u8]) -> String {
+fn idempotency_key(trigger: &str, body: &[u8]) -> Result<String, WebhookError> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| WebhookError::Invalid("The Jira event is invalid."))?;
+    let canonical = serde_json::to_vec(&value).map_err(|_| WebhookError::Failed)?;
     let mut digest = Sha256::new();
-    digest.update(b"steward-jira-trigger-delivery/v1\0");
+    digest.update(b"steward-jira-trigger-delivery/v2\0");
     digest.update(trigger.as_bytes());
     digest.update(b"\0");
-    digest.update(body);
-    format!("jira-sha256:{:x}", digest.finalize())
+    digest.update(canonical);
+    Ok(format!("jira-sha256:{:x}", digest.finalize()))
 }
 
 #[cfg(test)]
@@ -860,6 +860,7 @@ mod tests {
         recorded: Option<Arc<Notify>>,
         response_gate: Option<Arc<Notify>>,
         fail_start: Arc<AtomicBool>,
+        panic_start: Arc<AtomicBool>,
     }
 
     impl TaskLifecycle for Tasks {
@@ -881,6 +882,9 @@ mod tests {
                 }
                 if fail {
                     return Err(TaskLifecycleError::Retriable);
+                }
+                if self.panic_start.load(Ordering::SeqCst) {
+                    std::panic::resume_unwind(Box::new("task lifecycle fixture panicked"));
                 }
                 self.calls
                     .lock()
@@ -1050,7 +1054,7 @@ mod tests {
 
     async fn send_issue(
         receiver: &Receiver,
-        delivery: &str,
+        _delivery: &str,
         author: &str,
         issue: &str,
     ) -> Result<W, E> {
@@ -1059,7 +1063,6 @@ mod tests {
             .receive(
                 "jira-read",
                 Some(&signature(b"test-signing-secret", &event)),
-                Some(delivery),
                 &event,
             )
             .await
@@ -1113,51 +1116,41 @@ mod tests {
         let event = body("alice");
         let signed = signature(b"test-signing-secret", &event);
         assert_eq!(
-            r.receive("missing", Some(&signed), Some("x"), &event).await,
+            r.receive("missing", Some(&signed), &event).await,
             Err(E::NotFound)
         );
         assert_eq!(
-            r.receive("jira-read", None, Some("x"), &event).await,
+            r.receive("jira-read", None, &event).await,
             Err(E::Unauthorized)
         );
         assert_eq!(
-            r.receive("jira-read", Some("sha256=bad"), Some("x"), &event)
-                .await,
+            r.receive("jira-read", Some("sha256=bad"), &event).await,
             Err(E::Unauthorized)
         );
         for signature in [None, Some("sha256=bad")] {
             assert_eq!(
-                r.receive("jira-read", signature, Some("malformed"), b"not-json")
-                    .await,
+                r.receive("jira-read", signature, b"not-json").await,
                 Err(E::Unauthorized)
             );
         }
-        let long_id = "x".repeat(limits().max_identifier_bytes + 1);
+        assert_eq!(
+            r.receive("jira-read", Some(&signed), &event).await,
+            Ok(W::Accepted)
+        );
         assert!(matches!(
-            r.receive("jira-read", Some(&signed), Some(&long_id), &event)
+            r.receive("jira-read", None, &vec![b'x'; limits().max_body_bytes + 1])
                 .await,
             Err(E::Invalid(_))
         ));
-        assert!(matches!(
-            r.receive(
-                "jira-read",
-                None,
-                Some("x"),
-                &vec![b'x'; limits().max_body_bytes + 1]
-            )
-            .await,
-            Err(E::Invalid(_))
-        ));
-        assert!(matches!(
-            r.receive("jira-read", Some(&signed), None, &event).await,
-            Err(E::Invalid(_))
-        ));
+        assert_eq!(
+            r.receive("jira-read", Some(&signed), &event).await,
+            Ok(W::Noop)
+        );
         let malformed = b"{}";
         assert!(matches!(
             r.receive(
                 "jira-read",
                 Some(&signature(b"test-signing-secret", malformed)),
-                Some("malformed"),
                 malformed
             )
             .await,
@@ -1166,8 +1159,7 @@ mod tests {
         let mut changed = event.clone();
         changed.push(b' ');
         assert_eq!(
-            r.receive("jira-read", Some(&signed), Some("changed"), &changed)
-                .await,
+            r.receive("jira-read", Some(&signed), &changed).await,
             Err(E::Unauthorized)
         );
         let disabled = valid.replace("\"enabled\":true", "\"enabled\":false");
@@ -1192,7 +1184,6 @@ mod tests {
             r.receive(
                 "jira-read",
                 Some(&signature(b"test-signing-secret", &underscore)),
-                Some("underscore-project"),
                 &underscore,
             )
             .await,
@@ -1231,7 +1222,6 @@ mod tests {
                 r.receive(
                     "jira-read",
                     Some(&signature(b"test-signing-secret", &event)),
-                    Some("invalid-field"),
                     &event,
                 )
                 .await,
@@ -1339,8 +1329,8 @@ mod tests {
             Err(TaskLifecycleError::Final)
         ));
         assert_ne!(
-            idempotency_key("one", b"same"),
-            idempotency_key("two", b"same")
+            idempotency_key("one", br#"{"value":"same"}"#).map_err(|_| "key failed")?,
+            idempotency_key("two", br#"{"value":"same"}"#).map_err(|_| "key failed")?
         );
 
         let trigger = ReceiverConfig::from_json(&config_json("[]", 1, 0), &limits())?
@@ -1389,14 +1379,128 @@ mod tests {
         let event = body("alice");
         let signed = signature(b"test-signing-secret", &event);
         assert_eq!(
-            r.receive("jira-read", Some(&signed), Some("shared"), &event)
+            r.receive("jira-read", Some(&signed), &event).await,
+            Ok(W::Accepted)
+        );
+        assert_eq!(
+            r.receive("jira-two", Some(&signed), &event).await,
+            Ok(W::Accepted)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pending_delivery_drop_without_runtime_does_not_panic() -> Result<(), String> {
+        let config = ReceiverConfig::from_json(&config_json("[]", 1, 0), &limits())?
+            .triggers
+            .into_iter()
+            .next()
+            .ok_or("Trigger fixture is unavailable")?;
+        let live = Arc::new(LiveTrigger {
+            signing_key: hmac::Key::new(hmac::HMAC_SHA256, b"test-signing-secret"),
+            concurrency: Arc::new(Semaphore::new(1)),
+            config,
+            state: Mutex::new(TriggerState::default()),
+        });
+        drop(PendingDelivery::new(
+            live,
+            format!("jira-sha256:{}", "a".repeat(64)),
+            "PROJ-123".to_owned(),
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn panicking_task_start_releases_pending_delivery_and_cooldown() -> Result<(), String> {
+        let tasks = Tasks {
+            panic_start: Arc::new(AtomicBool::new(true)),
+            ..Tasks::default()
+        };
+        let receiver = make_receiver(config_json("[]", 1, 60), envelopes(), tasks.clone()).await?;
+        assert_eq!(send(&receiver, "first", "alice").await, Err(E::Failed));
+        let live = receiver
+            .triggers
+            .get("jira-read")
+            .ok_or("Trigger fixture is unavailable")?;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let state = live.state.lock().await;
+                if state.deliveries.is_empty() && state.issue_cooldowns.is_empty() {
+                    break;
+                }
+                drop(state);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "panicking Task start did not release receiver state")?;
+        tasks.panic_start.store(false, Ordering::SeqCst);
+        assert_eq!(send(&receiver, "retry", "alice").await, Ok(W::Accepted));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replay_identity_uses_the_parsed_json_value() -> Result<(), String> {
+        let tasks = Tasks::default();
+        let receiver = make_receiver(config_json("[]", 2, 0), envelopes(), tasks.clone()).await?;
+        let first = body("alice");
+        let second = br#"{
+          "ignored": "event text",
+          "user": { "accountId": "alice" },
+          "issue": {
+            "fields": {
+              "issuetype": { "name": "free text", "id": "10001" },
+              "project": { "key": "PROJ" }
+            },
+            "key": "PROJ-123"
+          },
+          "webhookEvent": "jira:issue_updated"
+        }"#;
+        assert_eq!(
+            receiver
+                .receive(
+                    "jira-read",
+                    Some(&signature(b"test-signing-secret", &first)),
+                    &first,
+                )
                 .await,
             Ok(W::Accepted)
         );
         assert_eq!(
-            r.receive("jira-two", Some(&signed), Some("shared"), &event)
+            receiver
+                .receive(
+                    "jira-read",
+                    Some(&signature(b"test-signing-secret", second)),
+                    second,
+                )
+                .await,
+            Ok(W::Noop)
+        );
+        let different = std::str::from_utf8(second)
+            .map_err(|_| "event fixture is not UTF-8")?
+            .replace("event text", "different event text");
+        assert_eq!(
+            receiver
+                .receive(
+                    "jira-read",
+                    Some(&signature(b"test-signing-secret", different.as_bytes())),
+                    different.as_bytes(),
+                )
                 .await,
             Ok(W::Accepted)
+        );
+        assert_eq!(
+            tasks.calls.lock().map_err(|_| "calls lock failed")?.len(),
+            2
+        );
+        // Pin the numeric range represented exactly by serde_json's default Number model.
+        assert_ne!(
+            idempotency_key("jira-read", br#"{"value":18446744073709551615}"#),
+            idempotency_key("jira-read", br#"{"value":18446744073709551614}"#)
+        );
+        assert_ne!(
+            idempotency_key("jira-read", br#"{"value":0.1234567890123456}"#),
+            idempotency_key("jira-read", br#"{"value":0.1234567890123457}"#)
         );
         Ok(())
     }
@@ -1538,6 +1642,8 @@ mod tests {
             second.await.map_err(|_| "second request task failed")?,
             Ok(W::Accepted)
         );
+        let expected = idempotency_key("jira-read", &body_for("bob", "PROJ-1"))
+            .map_err(|_| "idempotency key fixture is invalid")?;
         assert_eq!(
             live.state
                 .lock()
@@ -1545,7 +1651,7 @@ mod tests {
                 .issue_cooldowns
                 .get("PROJ-1")
                 .map(|reservation| reservation.delivery_id.as_str()),
-            Some(idempotency_key("jira-read", &body_for("bob", "PROJ-1")).as_str())
+            Some(expected.as_str())
         );
         Ok(())
     }
