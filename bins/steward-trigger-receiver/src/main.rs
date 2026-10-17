@@ -3,15 +3,22 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
-use steward_apiserver::browser_admin::CapabilityCatalog;
 use steward_store::PgStore;
 use steward_trigger_receiver::client::{
-    PgEnvelopeAuthority, StaticCatalog, WorkloadExchangeClient,
+    FileCatalog, KubernetesTokenRequester, KubernetesWorkloadTokenProvider, PgEnvelopeAuthority,
+    TaskClientTiming, WorkloadExchangeClient,
 };
 use steward_trigger_receiver::{Receiver, ReceiverConfig, ReceiverLimits};
 
 fn required(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     env::var(name).map_err(|_| format!("{name} is required").into())
+}
+
+fn required_duration_ms(name: &str) -> Result<std::time::Duration, Box<dyn std::error::Error>> {
+    let value = required(name)?
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be milliseconds"))?;
+    Ok(std::time::Duration::from_millis(value))
 }
 
 fn limits() -> ReceiverLimits {
@@ -41,31 +48,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             secrets.insert(trigger.id.clone(), fs::read(&trigger.signing_secret_file)?);
         }
     }
-    let catalog = CapabilityCatalog::from_json(&fs::read_to_string(required(
-        "STEWARD_CAPABILITY_CATALOG_FILE",
-    )?)?)?;
+    let catalog = FileCatalog::new(required("STEWARD_CAPABILITY_CATALOG_FILE")?.into())?;
     let store = PgStore::connect(&required("STEWARD_DATABASE_URL")?).await?;
     let kube = KubeClient::try_default().await?;
     let namespace = required("STEWARD_TRIGGER_NAMESPACE")?;
     let service_account = required("STEWARD_TRIGGER_SERVICE_ACCOUNT")?;
-    let audience = required("STEWARD_TASK_AUDIENCE")?;
-    let token_requester = steward_trigger_receiver::client::KubernetesTokenRequester::new(
+    let token_requester = KubernetesTokenRequester::new(
         kube,
         namespace,
         service_account,
-        audience.clone(),
+        required("STEWARD_WORKLOAD_SOURCE_AUDIENCE")?,
     )?;
-    let source_token = token_requester.request().await?;
-    let tasks = WorkloadExchangeClient::new(
+    let tokens = KubernetesWorkloadTokenProvider::new(
+        token_requester,
         required("STEWARD_WORKLOAD_EXCHANGE_ENDPOINT")?,
+        required("STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME")?,
+        fs::read(required("STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE")?)?,
+    )?;
+    let tasks = WorkloadExchangeClient::new(
         required("STEWARD_API_ORIGIN")?,
-        audience,
-        source_token,
+        required("STEWARD_API_SERVER_NAME")?,
+        fs::read(required("STEWARD_API_CA_CERTIFICATE_FILE")?)?,
+        tokens,
+        TaskClientTiming {
+            deadline: required_duration_ms("STEWARD_TRIGGER_TASK_DEADLINE_MILLISECONDS")?,
+            initial_poll_delay: required_duration_ms("STEWARD_TRIGGER_POLL_INITIAL_MILLISECONDS")?,
+            max_poll_delay: required_duration_ms("STEWARD_TRIGGER_POLL_MAX_MILLISECONDS")?,
+        },
     )?;
     let receiver = Receiver::new(
         config,
         secrets,
-        StaticCatalog(catalog),
+        catalog,
         PgEnvelopeAuthority::new(store),
         tasks,
         limits(),

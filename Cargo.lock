@@ -4162,12 +4162,15 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "steward-adapter-openshell",
  "steward-admission",
  "steward-apiserver",
+ "steward-ports",
  "steward-store",
  "steward-types",
  "tokio",
  "tower",
+ "uuid",
 ]
 
 [[package]]

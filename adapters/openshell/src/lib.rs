@@ -6,9 +6,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 #[cfg(feature = "runtime")]
 use std::path::{Path, PathBuf};
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 use std::sync::Arc;
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 use std::time::{Duration as StdDuration, Instant};
 
 #[cfg(feature = "identity")]
@@ -32,14 +32,14 @@ use openshell_sdk::raw::proto::{
 use openshell_sdk::{
     EdgeAuthInterceptor, ExecOptions, OpenShellClient, SandboxPhase, SandboxSpec, SdkError,
 };
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 use reqwest::header::CACHE_CONTROL;
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 use reqwest::{Certificate as HttpCertificate, Client as HttpClient, StatusCode, Url};
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 use steward_ports::PortError;
 #[cfg(feature = "runtime")]
 use steward_ports::{
@@ -60,7 +60,7 @@ use steward_types::direct_package::{
 use steward_types::task_input_archive::split_task_input_archive;
 #[cfg(feature = "runtime")]
 use steward_types::{AgentType, MANAGED_INFERENCE_REFERENCE, RuntimeRefs};
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 use tokio::sync::Mutex;
 #[cfg(feature = "runtime")]
 use tonic::Streaming;
@@ -103,13 +103,13 @@ const INFERENCE_PROVIDER: &str = "steward-litellm";
 const GRPC_NOT_FOUND: i32 = 5;
 #[cfg(feature = "runtime")]
 const GRPC_ALREADY_EXISTS: i32 = 6;
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 const WORKLOAD_EXCHANGE_PATH: &str = "/v1/workload/exchange";
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 const WORKLOAD_ACCESS_TOKEN_MAX_TTL: StdDuration = StdDuration::from_secs(120);
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 const WORKLOAD_ACCESS_TOKEN_REFRESH_SKEW: StdDuration = StdDuration::from_secs(30);
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 const WORKLOAD_EXCHANGE_MAX_RESPONSE_BYTES: u64 = 16 * 1024;
 #[cfg(feature = "runtime")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1573,8 +1573,8 @@ fn load_source_credential(path: &Path) -> Result<OpaqueToken, PortError> {
     Ok(OpaqueToken(token.to_owned()))
 }
 
-#[cfg(feature = "runtime")]
-fn validate_workload_exchange_endpoint(
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
+pub fn validate_workload_exchange_endpoint(
     endpoint: &str,
     server_name: &str,
 ) -> Result<Url, PortError> {
@@ -1602,30 +1602,39 @@ fn validate_workload_exchange_endpoint(
     Ok(url)
 }
 
-#[cfg(feature = "runtime")]
-struct OpaqueToken(String);
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
+pub struct OpaqueToken(String);
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 impl OpaqueToken {
-    fn expose_secret(&self) -> &str {
+    pub fn new(value: String) -> Result<Self, PortError> {
+        if value.trim().is_empty() || value.trim() != value {
+            return Err(PortError::Rejected {
+                reason: "workload credential is invalid".to_owned(),
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn expose_secret(&self) -> &str {
         &self.0
     }
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 impl Clone for OpaqueToken {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 struct CachedAccessToken {
     token: OpaqueToken,
     refresh_at: Instant,
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkloadExchangeResponse {
@@ -1634,27 +1643,61 @@ struct WorkloadExchangeResponse {
     expires_in: u64,
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 #[derive(Clone)]
-struct WorkloadExchangeTokenProvider {
+enum WorkloadSourceCredential {
+    #[cfg(feature = "runtime")]
+    File(PathBuf),
+    Token(OpaqueToken),
+}
+
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
+#[derive(Clone)]
+pub struct WorkloadExchangeTokenProvider {
     cache: Arc<Mutex<Option<CachedAccessToken>>>,
     client: HttpClient,
     endpoint: Url,
-    source_credential_file: PathBuf,
+    source_credential: WorkloadSourceCredential,
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 impl WorkloadExchangeTokenProvider {
-    fn new(config: &OpenShellConnectionConfig) -> Result<Self, PortError> {
-        let endpoint = validate_workload_exchange_endpoint(
+    pub fn new(
+        endpoint: &str,
+        server_name: &str,
+        ca_certificate_pem: &[u8],
+        source_token: String,
+    ) -> Result<Self, PortError> {
+        Self::build(
+            endpoint,
+            server_name,
+            ca_certificate_pem,
+            WorkloadSourceCredential::Token(OpaqueToken::new(source_token)?),
+        )
+    }
+
+    #[cfg(feature = "runtime")]
+    fn from_connection_config(config: &OpenShellConnectionConfig) -> Result<Self, PortError> {
+        Self::build(
             &config.workload_exchange_endpoint,
             &config.workload_exchange_server_name,
-        )?;
-        let certificates =
-            HttpCertificate::from_pem_bundle(&config.workload_exchange_ca_certificate_pem)
-                .map_err(|_| PortError::Rejected {
-                    reason: "workload exchange CA certificate is invalid".to_owned(),
-                })?;
+            &config.workload_exchange_ca_certificate_pem,
+            WorkloadSourceCredential::File(config.workload_source_credential_file.clone()),
+        )
+    }
+
+    fn build(
+        endpoint: &str,
+        server_name: &str,
+        ca_certificate_pem: &[u8],
+        source_credential: WorkloadSourceCredential,
+    ) -> Result<Self, PortError> {
+        let endpoint = validate_workload_exchange_endpoint(endpoint, server_name)?;
+        let certificates = HttpCertificate::from_pem_bundle(ca_certificate_pem).map_err(|_| {
+            PortError::Rejected {
+                reason: "workload exchange CA certificate is invalid".to_owned(),
+            }
+        })?;
         if certificates.is_empty() {
             return Err(PortError::Rejected {
                 reason: "workload exchange CA certificate is empty".to_owned(),
@@ -1676,22 +1719,28 @@ impl WorkloadExchangeTokenProvider {
             cache: Arc::new(Mutex::new(None)),
             client,
             endpoint,
-            source_credential_file: config.workload_source_credential_file.clone(),
+            source_credential,
         })
     }
 
-    async fn access_token(&self) -> Result<OpaqueToken, PortError> {
+    pub async fn access_token(&self) -> Result<OpaqueToken, PortError> {
         let mut cache = self.cache.lock().await;
         let now = Instant::now();
         if let Some(cached) = cache.as_ref().filter(|cached| now < cached.refresh_at) {
             return Ok(cached.token.clone());
         }
-        let source_file = self.source_credential_file.clone();
-        let source = tokio::task::spawn_blocking(move || load_source_credential(&source_file))
-            .await
-            .map_err(|_| PortError::Failed {
-                reason: "workload source credential could not be loaded".to_owned(),
-            })??;
+        let source = match &self.source_credential {
+            #[cfg(feature = "runtime")]
+            WorkloadSourceCredential::File(source_file) => {
+                let source_file = source_file.clone();
+                tokio::task::spawn_blocking(move || load_source_credential(&source_file))
+                    .await
+                    .map_err(|_| PortError::Failed {
+                        reason: "workload source credential could not be loaded".to_owned(),
+                    })??
+            }
+            WorkloadSourceCredential::Token(source) => source.clone(),
+        };
         let mut response = self
             .client
             .post(self.endpoint.clone())
@@ -1762,7 +1811,7 @@ impl WorkloadExchangeTokenProvider {
                 reason: "workload exchange access token contract is invalid".to_owned(),
             });
         }
-        let token = OpaqueToken(exchanged.access_token);
+        let token = OpaqueToken::new(exchanged.access_token)?;
         let ttl = StdDuration::from_secs(exchanged.expires_in);
         let refresh_at = now + ttl.saturating_sub(WORKLOAD_ACCESS_TOKEN_REFRESH_SKEW);
         *cache = Some(CachedAccessToken {
@@ -1773,7 +1822,7 @@ impl WorkloadExchangeTokenProvider {
     }
 }
 
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 fn workload_exchange_unavailable(_: reqwest::Error) -> PortError {
     PortError::Failed {
         reason: "workload exchange is unavailable".to_owned(),
@@ -1814,7 +1863,7 @@ fn provider_control_execution_bindings(
 impl OpenShellRuntime {
     pub async fn connect(config: OpenShellConnectionConfig) -> Result<Self, PortError> {
         config.validate()?;
-        let token_provider = WorkloadExchangeTokenProvider::new(&config)?;
+        let token_provider = WorkloadExchangeTokenProvider::from_connection_config(&config)?;
         let tls = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(config.ca_certificate_pem))
             .identity(Identity::from_pem(
@@ -3643,19 +3692,19 @@ mod tests {
     use super::validate_connections_bridge_archive;
     #[cfg(feature = "runtime")]
     use super::{
-        CONNECTIONS_BRIDGE_AGENT_TYPE, INFERENCE_PROVIDER, OpenShellConnectionConfig,
+        CONNECTIONS_BRIDGE_AGENT_TYPE, INFERENCE_PROVIDER, OpaqueToken, OpenShellConnectionConfig,
         OpenShellTaskLogMode, ProviderReconciliation, STAGING_EXEC_STDIN_CHUNK_BYTES,
         SandboxDeleteClient, TOOL_PROVIDER, TaskProcessEventStream, TaskProcessLaunchMode,
         TaskProcessLogContext, TaskProcessLogSink, TaskProcessStream,
-        WorkloadExchangeTokenProvider, attach_task_agent_failure_category,
-        collect_task_process_stream, delete_owned_sandbox, deletion_names,
-        failed_output_archive_command, load_source_credential, output_archive_command,
-        project_request, provider_reconciliation, provider_reconciliation_plan,
-        provider_reconciliation_targets, repository_prompt_context, request_model_providers,
-        required_output_failure_reason, sandbox_spec, sanitized_provider_control_transcript,
-        staging_append_command, staging_archive_chunks, staging_extract_command,
-        staging_prepare_command, task_agent_failure_category, task_attempt_cancel_command,
-        task_attempt_detached_launch_command, task_attempt_directory,
+        WorkloadExchangeTokenProvider, WorkloadSourceCredential,
+        attach_task_agent_failure_category, collect_task_process_stream, delete_owned_sandbox,
+        deletion_names, failed_output_archive_command, load_source_credential,
+        output_archive_command, project_request, provider_reconciliation,
+        provider_reconciliation_plan, provider_reconciliation_targets, repository_prompt_context,
+        request_model_providers, required_output_failure_reason, sandbox_spec,
+        sanitized_provider_control_transcript, staging_append_command, staging_archive_chunks,
+        staging_extract_command, staging_prepare_command, task_agent_failure_category,
+        task_attempt_cancel_command, task_attempt_detached_launch_command, task_attempt_directory,
         task_attempt_execution_command, task_attempt_failed_output_command,
         task_attempt_observation_command, task_attempt_transcript_stream_command,
         task_failure_category, task_process_launch_mode, task_process_log_record,
@@ -3899,7 +3948,7 @@ mod tests {
                 .build()
                 .map_err(|error| format!("failed to build test exchange client: {error}"))?,
             endpoint,
-            source_credential_file,
+            source_credential: WorkloadSourceCredential::File(source_credential_file),
         })
     }
 
@@ -4670,8 +4719,11 @@ mod tests {
     -> Result<(), String> {
         let body = r#"{"access_token":"obviously-fake-access-token","token_type":"Bearer","expires_in":120}"#;
         let exchange = mock_exchange(response(200, Some("private, no-store"), body))?;
-        let source_file = source_credential_fixture()?;
-        let provider = test_token_provider(exchange.endpoint.clone(), source_file.clone())?;
+        let mut provider = test_token_provider(exchange.endpoint.clone(), PathBuf::new())?;
+        provider.source_credential = WorkloadSourceCredential::Token(
+            OpaqueToken::new("obviously-fake-source-credential".to_owned())
+                .map_err(|error| format!("source fixture is invalid: {error:?}"))?,
+        );
 
         let (first, second, third) = tokio::join!(
             provider.access_token(),
@@ -4690,8 +4742,6 @@ mod tests {
             .finish(1)?
             .try_into()
             .map_err(|_| "mock exchange request count changed".to_owned())?;
-        std::fs::remove_file(source_file)
-            .map_err(|error| format!("failed to remove source credential fixture: {error}"))?;
         let (headers, body) = request
             .split_once("\r\n\r\n")
             .ok_or_else(|| "mock exchange request had no header terminator".to_owned())?;
