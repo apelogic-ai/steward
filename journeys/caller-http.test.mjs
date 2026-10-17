@@ -6,7 +6,9 @@ import {
   downloadCallerOutput,
   exactHttpUrl,
   exchangeTaskToken,
+  invalidJiraSignature,
   jiraPayload,
+  jiraReceiverConfiguration,
   jiraSignature,
   outputArchiveContains,
   requireLiveJiraAuthorization,
@@ -198,5 +200,61 @@ describe("caller HTTP journey helpers", () => {
     expect(request.url).toBe("https://receiver.example.com/hooks/jira/jira-read");
     expect(request.options.headers["x-hub-signature"]).toBe(signature);
     expect(Buffer.from(request.options.body)).toEqual(body);
+  });
+
+  test("Jira receiver configuration preserves every signing key byte", () => {
+    const secret = Buffer.from([0xff, 0x61, 0x20, 0x0a]);
+    const environment = {
+      STEWARD_JOURNEY_JIRA_COOLDOWN_SECONDS: "60",
+      STEWARD_JOURNEY_JIRA_MAX_ISSUE_COOLDOWNS: "4",
+      STEWARD_JOURNEY_JIRA_RECEIVER_ORIGIN: "https://receiver.example.com",
+      STEWARD_JOURNEY_JIRA_SIGNING_SECRET_FILE: "/example/jira-signing-secret",
+      STEWARD_JOURNEY_JIRA_TRIGGER_ID: "local-read",
+    };
+    const dependencies = { readFile: () => secret };
+    const config = jiraReceiverConfiguration("read", environment, dependencies);
+
+    expect(config.secret).toEqual(secret);
+    expect(config.secret).not.toBe(secret);
+    expect(() => jiraReceiverConfiguration("read", {
+      ...environment,
+      STEWARD_JOURNEY_JIRA_COOLDOWN_SECONDS: "59",
+    }, dependencies)).toThrow("at least 60");
+    expect(() => jiraReceiverConfiguration("read", {
+      ...environment,
+      STEWARD_JOURNEY_JIRA_MAX_ISSUE_COOLDOWNS: "3",
+    }, dependencies)).toThrow("at least 4");
+  });
+
+  test("Jira refusal probes can send an invalid or missing signature without changing the body", async () => {
+    const body = jiraPayload("PROJ-126", "journey-001", "delivery-invalid-signature");
+    const requests = [];
+    const fetchImpl = async (url, options) => {
+      requests.push({ url: url.toString(), options });
+      return new Response("The request signature is invalid.", { status: 401 });
+    };
+    const config = {
+      origin: "https://receiver.example.com",
+      secret: Buffer.from("obviously-fake-signing-secret"),
+      trigger: "local-read",
+    };
+    const validSignature = jiraSignature(config.secret, body);
+    const invalidSignature = invalidJiraSignature(config.secret, body);
+
+    await sendJiraDelivery(config, "delivery-invalid-signature", body, {
+      fetchImpl,
+      signature: invalidSignature,
+    });
+    await sendJiraDelivery(config, "delivery-missing-signature", body, {
+      fetchImpl,
+      signature: null,
+    });
+
+    expect(requests[0].url).toBe("https://receiver.example.com/hooks/jira/local-read");
+    expect(invalidSignature).not.toBe(validSignature);
+    expect(invalidSignature.slice(0, -1)).toBe(validSignature.slice(0, -1));
+    expect(requests[0].options.headers["x-hub-signature"]).toBe(invalidSignature);
+    expect(requests[1].options.headers["x-hub-signature"]).toBeUndefined();
+    for (const request of requests) expect(Buffer.from(request.options.body)).toEqual(body);
   });
 });

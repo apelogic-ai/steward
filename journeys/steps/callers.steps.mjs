@@ -7,6 +7,7 @@ import {
   downloadCallerOutput,
   exactHttpUrl,
   exchangeTaskToken,
+  invalidJiraSignature,
   jiraPayload,
   jiraReceiverConfiguration,
   outputArchiveContains,
@@ -80,9 +81,9 @@ async function expectNewRunCount(journey, page, expected) {
   }).toBe(expected);
 }
 
-async function sendConfiguredJiraDelivery(journey, deliveryId, issueKey) {
+async function sendConfiguredJiraDelivery(journey, deliveryId, issueKey, dependencies = {}) {
   const body = jiraPayload(issueKey, requiredEnvironment("STEWARD_JOURNEY_RUN_PREFIX"), deliveryId);
-  const response = await sendJiraDelivery(journey.receiverConfig, deliveryId, body);
+  const response = await sendJiraDelivery(journey.receiverConfig, deliveryId, body, dependencies);
   journey.receiverDeliveryId = deliveryId;
   journey.receiverPayload = body;
   journey.receiverResponse = { body: await response.text(), status: response.status };
@@ -175,6 +176,19 @@ When("Jira sends the signed delivery {string} for issue {string}", async ({ jour
   await sendConfiguredJiraDelivery(journey, deliveryId, issueKey);
 });
 
+When("Jira sends the delivery {string} for issue {string} with an invalid signature", async ({ journey }, deliveryId, issueKey) => {
+  const body = jiraPayload(issueKey, requiredEnvironment("STEWARD_JOURNEY_RUN_PREFIX"), deliveryId);
+  const signature = invalidJiraSignature(journey.receiverConfig.secret, body);
+  const response = await sendJiraDelivery(journey.receiverConfig, deliveryId, body, { signature });
+  journey.receiverDeliveryId = deliveryId;
+  journey.receiverPayload = body;
+  journey.receiverResponse = { body: await response.text(), status: response.status };
+});
+
+When("Jira sends the delivery {string} for issue {string} without a signature", async ({ journey }, deliveryId, issueKey) => {
+  await sendConfiguredJiraDelivery(journey, deliveryId, issueKey, { signature: null });
+});
+
 When("Jira replays that signed delivery", async ({ journey }) => {
   expect(journey.receiverPayload, "the first signed Jira delivery must be sent before replaying it").toBeTruthy();
   const response = await sendJiraDelivery(
@@ -198,8 +212,19 @@ Then("the receiver refuses the delivery because the Envelope is not read-only", 
   expect(journey.receiverResponse).toEqual({ body: "This Trigger is not read-only.", status: 400 });
 });
 
+Then("the receiver refuses the delivery because its signature is invalid", async ({ journey }) => {
+  expect(journey.receiverResponse).toEqual({ body: "The request signature is invalid.", status: 401 });
+});
+
 Then("the receiver reports that no run was needed", async ({ journey }) => {
   expect(journey.receiverResponse).toEqual({ body: "No run was needed.", status: 200 });
+});
+
+Then("the receiver reports that it cannot start another run yet", async ({ journey }) => {
+  expect(journey.receiverResponse).toEqual({
+    body: "This Trigger cannot start another run yet.",
+    status: 429,
+  });
 });
 
 Then(/^the receiver creates (\d+) new Tasks?$/, async ({ journey, page }, expectedText) => {
