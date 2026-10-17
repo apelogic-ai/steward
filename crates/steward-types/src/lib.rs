@@ -17,6 +17,140 @@ pub const TASK_EXECUTION_BINDING_ANNOTATION: &str = "agents.apelogic.ai/task-exe
 pub const TASK_EXECUTION_BINDING_SCHEMA_VERSION: &str = "steward/task-execution-binding/v1";
 pub const TASK_EXECUTION_BINDING_DIGEST_DOMAIN: &[u8] = b"steward.execution-bindings/v1\0";
 pub const MANAGED_INFERENCE_REFERENCE: &str = "managed-user-credential";
+pub const MAX_CALLER_REFERENCE_LABEL_BYTES: usize = 128;
+pub const MAX_CALLER_REFERENCE_URL_BYTES: usize = 2048;
+
+/// Display-only context supplied by an authenticated external Task caller.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CallerReference {
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+}
+
+impl CallerReference {
+    pub fn new(label: impl Into<String>, url: Option<String>) -> Result<Self, String> {
+        let reference = Self {
+            label: label.into(),
+            url,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let label_is_valid = !self.label.is_empty()
+            && self.label.len() <= MAX_CALLER_REFERENCE_LABEL_BYTES
+            && self.label.trim() == self.label
+            && self.label.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || character == '·'
+                    || matches!(
+                        character,
+                        ' ' | '.' | '_' | '-' | '#' | '/' | ':' | '@' | '+' | '(' | ')'
+                    )
+            });
+        if !label_is_valid
+            || self
+                .url
+                .as_deref()
+                .is_some_and(|url| !valid_caller_url(url))
+        {
+            return Err(
+                "caller reference must contain a short label and an optional HTTPS URL".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for CallerReference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct WireCallerReference {
+            label: String,
+            #[serde(default)]
+            url: Option<String>,
+        }
+
+        let value = WireCallerReference::deserialize(deserializer)?;
+        Self::new(value.label, value.url).map_err(serde::de::Error::custom)
+    }
+}
+
+fn valid_caller_url(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !rest.is_empty()
+        && value.len() <= MAX_CALLER_REFERENCE_URL_BYTES
+        && value.bytes().all(|byte| byte.is_ascii_graphic())
+        && !value.contains('\\')
+        && valid_caller_authority(authority)
+}
+
+fn valid_caller_authority(value: &str) -> bool {
+    if value.is_empty() || value.contains('@') {
+        return false;
+    }
+    if let Some(bracketed) = value.strip_prefix('[') {
+        let Some((host, port)) = bracketed.split_once(']') else {
+            return false;
+        };
+        return host.parse::<std::net::Ipv6Addr>().is_ok() && valid_caller_port(port);
+    }
+    let (host, port) = match value.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (value, None),
+    };
+    if host.contains(':')
+        || port.is_some_and(|port| port.is_empty() || port.parse::<u16>().is_err())
+    {
+        return false;
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+}
+
+fn valid_caller_port(value: &str) -> bool {
+    value.is_empty()
+        || value
+            .strip_prefix(':')
+            .is_some_and(|port| !port.is_empty() && port.parse::<u16>().is_ok())
+}
 
 #[derive(
     Clone, Copy, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize, utoipa::ToSchema,
@@ -1243,15 +1377,38 @@ mod tests {
 
     use super::{
         CANONICAL_AUTHORITY_BINDING_SCHEMA_VERSION, CANONICAL_PRINCIPAL_SCHEMA_VERSION,
-        CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId, DisposableExecutionBinding,
-        Email, ModelRef, OrganizationId, OrganizationIdentityPolicy, Principal,
-        ResidentExecutionBinding, ResidentExecutionContext, RuntimeId,
+        CallerReference, CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId,
+        DisposableExecutionBinding, Email, ModelRef, OrganizationId, OrganizationIdentityPolicy,
+        Principal, ResidentExecutionBinding, ResidentExecutionContext, RuntimeId,
         TASK_EXECUTION_BINDING_SCHEMA_VERSION, TaskExecutionBinding, agent_runtime_crd,
         valid_digest_pinned_image,
     };
 
     fn digest(byte: char) -> String {
         format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    #[test]
+    fn caller_reference_requires_a_parseable_https_authority() {
+        for url in [
+            "https://example.com/builds/142",
+            "https://localhost:8443/builds/142",
+            "https://[2001:db8::1]/builds/142",
+        ] {
+            assert!(CallerReference::new("build 142", Some(url.to_owned())).is_ok());
+        }
+        for url in [
+            "https://:",
+            "https://.",
+            "https://-bad.example.com/builds/142",
+            "https://example.com:many/builds/142",
+            "https://alice@example.com/builds/142",
+        ] {
+            assert!(
+                CallerReference::new("build 142", Some(url.to_owned())).is_err(),
+                "accepted malformed caller URL {url}"
+            );
+        }
     }
 
     fn resident_binding() -> Result<ResidentExecutionBinding, String> {

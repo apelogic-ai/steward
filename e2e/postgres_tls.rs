@@ -377,7 +377,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         historical_task_count > 0,
         "the API-origin upgrade must run over seeded historical Task rows"
     );
-    migration_set(None)
+    migration_set(Some(72))
         .run(store.pool())
         .await
         .map_err(|error| {
@@ -391,6 +391,21 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         "migration 0072 must not update historical Tasks, runs, or canonical identities"
     );
     assert_api_origin_upgrade_result(&store).await?;
+    let historical_before_caller_reference = historical_task_identity_snapshot(&store).await?;
+    migration_set(None)
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward caller-reference migration must complete over the required TLS session: {error}"
+            ))
+        })?;
+    assert_eq!(
+        historical_task_identity_snapshot(&store).await?,
+        historical_before_caller_reference,
+        "migration 0073 must not update historical Tasks, runs, or canonical identities"
+    );
+    assert_task_caller_reference_upgrade_result(&store, historical_task_count).await?;
     verify_browser_task_library_upgrade(&store).await?;
     assert_eq!(
         historical_task_identity_snapshot(&store).await?,
@@ -791,6 +806,51 @@ async fn assert_api_origin_upgrade_result(store: &PgStore) -> Result<(), Box<dyn
     assert!(
         mutation.is_err(),
         "migration 0072 must not let historical rows bypass origin immutability"
+    );
+    Ok(())
+}
+
+async fn assert_task_caller_reference_upgrade_result(
+    store: &PgStore,
+    historical_task_count: i64,
+) -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)::bigint FROM task_submissions WHERE caller_reference IS NULL",
+        )
+        .fetch_one(store.pool())
+        .await?,
+        historical_task_count,
+        "migration 0073 must leave every historical Task without invented caller context"
+    );
+    for trigger in [
+        "durable_task_intent_is_immutable",
+        "task_commands_are_monotonic",
+        "task_caller_reference_is_immutable",
+    ] {
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT tgenabled = 'O' FROM pg_trigger \
+                 WHERE tgrelid = 'task_submissions'::regclass AND tgname = $1",
+            )
+            .bind(trigger)
+            .fetch_one(store.pool())
+            .await?,
+            "migration 0073 must leave {trigger} enabled"
+        );
+    }
+    let mutation = sqlx::query(
+        "UPDATE task_submissions \
+         SET caller_reference = '{\"label\":\"PROJ-123\"}'::jsonb \
+         WHERE task_uid = (SELECT task_uid FROM task_submissions ORDER BY task_uid LIMIT 1)",
+    )
+    .execute(store.pool())
+    .await;
+    assert!(
+        mutation.is_err_and(|error| error
+            .to_string()
+            .contains("Task caller reference is immutable")),
+        "migration 0073 must keep caller context immutable under the existing Task triggers"
     );
     Ok(())
 }
@@ -2070,7 +2130,7 @@ async fn historical_task_identity_snapshot(
     Ok(sqlx::query_scalar(
         "SELECT jsonb_build_object(\
              'tasks', (\
-                 SELECT jsonb_agg(to_jsonb(task_row) ORDER BY task_row.task_uid) \
+                 SELECT jsonb_agg(to_jsonb(task_row) - 'caller_reference' ORDER BY task_row.task_uid) \
                  FROM task_submissions task_row\
              ), \
              'runs', (\

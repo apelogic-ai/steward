@@ -292,6 +292,9 @@ triggerReceiver:
       concurrencyLimit: 2
       cooldownSeconds: 60
       signingSecret: { name: steward-jira-webhook, key: secret }
+config:
+  apiserver:
+    jiraBaseUrl: https://jira.example.com
 networkPolicy:
   ingressNamespace: edge-system
   kubeApiCidrs: [192.0.2.1/32]

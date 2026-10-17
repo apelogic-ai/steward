@@ -418,6 +418,8 @@ struct TaskRequest<'a> {
     workflow: &'a str,
     #[serde(rename = "envelopeDigest")]
     envelope_digest: &'a str,
+    #[serde(rename = "callerReference")]
+    caller_reference: &'a steward_types::CallerReference,
 }
 
 impl WorkloadExchangeClient {
@@ -558,6 +560,7 @@ impl TaskLifecycle for WorkloadExchangeClient {
                         .json(&TaskRequest {
                             workflow: &invocation.workflow,
                             envelope_digest: &invocation.envelope_digest,
+                            caller_reference: &invocation.caller_reference,
                         })
                 })
                 .await?;
@@ -687,7 +690,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use axum::body::Body;
+    use axum::body::{Body, to_bytes};
     use axum::http::{Request, Response as HttpResponse};
     use kube::client::Body as KubeBody;
     use rcgen::generate_simple_self_signed;
@@ -1480,7 +1483,7 @@ mod tests {
     #[test]
     fn chart_render_contract_from_environment() -> Result<(), String> {
         let config_json = std::env::var("STEWARD_CHART_RECEIVER_CONFIG").unwrap_or_else(|_| {
-            r#"{"triggers":[{"id":"Jira_read","enabled":true,"source":"jira","workflow":"triage@1","service":"event-worker","ownerUserId":"usr_11111111111111111111111111111111","envelopeDigest":"steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filters":{"event":"jira:issue_updated","project":"PROJ","issueType":"10001"},"ignoredAccountIds":["acct-1"],"concurrencyLimit":2,"cooldownSeconds":60,"signingSecretFile":"/run/trigger-signing/Jira_read"}]}"#.to_owned()
+            r#"{"jiraSiteUrl":"https://jira.example.com/","triggers":[{"id":"Jira_read","enabled":true,"source":"jira","workflow":"triage@1","service":"event-worker","ownerUserId":"usr_11111111111111111111111111111111","envelopeDigest":"steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filters":{"event":"jira:issue_updated","project":"PROJ","issueType":"10001"},"ignoredAccountIds":["acct-1"],"concurrencyLimit":2,"cooldownSeconds":60,"signingSecretFile":"/run/trigger-signing/Jira_read"}]}"#.to_owned()
         });
         let limits = crate::ReceiverLimits {
             max_config_bytes: 4 * 1024 * 1024,
@@ -1649,6 +1652,7 @@ mod tests {
         polls_before_done: usize,
         failure: Option<&'static str>,
         requests: Arc<Mutex<Vec<(Method, String, String)>>>,
+        create_bodies: Arc<Mutex<Vec<String>>>,
         polls: Arc<Mutex<usize>>,
     }
 
@@ -1664,6 +1668,18 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_owned();
+        let body = to_bytes(request.into_body(), 64 * 1024)
+            .await
+            .unwrap_or_default();
+        if method == Method::POST && path == "/v1/tasks" {
+            let Ok(mut bodies) = state.create_bodies.lock() else {
+                return HttpResponse::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| HttpResponse::new(Body::empty()));
+            };
+            bodies.push(String::from_utf8_lossy(&body).into_owned());
+        }
         let Ok(mut requests) = state.requests.lock() else {
             return HttpResponse::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -1745,6 +1761,7 @@ mod tests {
             polls_before_done,
             failure,
             requests: Arc::new(Mutex::new(Vec::new())),
+            create_bodies: Arc::new(Mutex::new(Vec::new())),
             polls: Arc::new(Mutex::new(0)),
         };
         let app = axum::Router::new()
@@ -1785,6 +1802,10 @@ mod tests {
             workflow: "triage@1".to_owned(),
             envelope_digest: format!("steward:sha256:{}", "a".repeat(64)),
             idempotency_key: format!("jira-sha256:{}", "b".repeat(64)),
+            caller_reference: steward_types::CallerReference::new(
+                "Jira trigger jira-read · PROJ-123",
+                Some("https://jira.example.com/browse/PROJ-123".to_owned()),
+            )?,
             input_archive: crate::JiraEvent::parse(
                 br#"{"webhookEvent":"jira:issue_updated","issue":{"key":"PROJ-123","fields":{"project":{"key":"PROJ"},"issuetype":{"id":"10001"}}},"user":{"accountId":"alice"}}"#,
                 128,
@@ -1815,6 +1836,21 @@ mod tests {
             .await
             .map_err(|error| format!("{error:?}"))?;
         assert!(matches!(result, TaskStart::Duplicate));
+        let create_body = state
+            .create_bodies
+            .lock()
+            .map_err(|_| "poisoned")?
+            .first()
+            .cloned()
+            .ok_or("create body missing")?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&create_body)
+                .map_err(|error| error.to_string())?["callerReference"],
+            serde_json::json!({
+                "label": "Jira trigger jira-read · PROJ-123",
+                "url": "https://jira.example.com/browse/PROJ-123"
+            })
+        );
         let requests = state.requests.lock().map_err(|_| "poisoned")?;
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1].0, Method::DELETE);

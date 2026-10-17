@@ -53,6 +53,15 @@ Envelope exists and returns `409` when several are active. Steward never selects
 by recency, template order, or another heuristic. The persisted Task binding still
 contains owner ID, Envelope instance ID, digest, and approved snapshot.
 
+Versioned-Workflow submissions may also include an optional display-only
+`callerReference` object with a `label` of 1–128 UTF-8 bytes and an optional
+HTTPS `url` of at most 2,048 bytes. Labels accept ASCII letters, numbers, spaces,
+the middle dot, and the bounded punctuation used by build, workflow, Trigger, and issue references;
+control characters are refused. URLs with another scheme, credentials,
+whitespace, or control characters are refused. The authenticated Task token
+supplies the service name shown beside this reference. A request cannot set the
+service name, and neither the label nor URL contributes authority.
+
 A direct-package submission requires `githubSource.enabled=true`. When exact Git
 source retrieval is disabled, `POST /v1/tasks` returns `503` before reserving a
 Task, with stable code `task.direct_package_source_disabled` and an actionable

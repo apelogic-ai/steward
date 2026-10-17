@@ -12,7 +12,7 @@
 {{- $_ := set $runtimeTrigger "signingSecretFile" (printf "/run/trigger-signing/%s" .id) }}
 {{- $triggerReceiverTriggers = append $triggerReceiverTriggers $runtimeTrigger }}
 {{- end }}
-{{- $triggerReceiverConfigJson := toJson (dict "triggers" $triggerReceiverTriggers) }}
+{{- $triggerReceiverConfigJson := toJson (dict "jiraSiteUrl" .Values.config.apiserver.jiraBaseUrl "triggers" $triggerReceiverTriggers) }}
 {{- $triggerReceiverConfigHash := $triggerReceiverConfigJson | sha256sum }}
 {{- $triggerReceiverConfigMapName := printf "steward-trigger-receiver-config-%s" ($triggerReceiverConfigHash | trunc 12) }}
 {{- $sourceRepositoryBindingsJson := toJson .Values.githubSource.bindings }}
@@ -41,6 +41,9 @@
 {{- end }}
 {{- if and .Values.triggerReceiver.enabled (gt (len .Values.triggerReceiver.triggers) (int .Values.triggerReceiver.limits.maxTriggers)) }}
 {{- fail "triggerReceiver.triggers exceeds triggerReceiver.limits.maxTriggers" }}
+{{- end }}
+{{- if and .Values.triggerReceiver.enabled (not .Values.config.apiserver.jiraBaseUrl) }}
+{{- fail "triggerReceiver.enabled requires config.apiserver.jiraBaseUrl for issue links" }}
 {{- end }}
 {{- if and .Values.triggerReceiver.enabled (gt (len $triggerReceiverConfigJson) (int .Values.triggerReceiver.limits.maxConfigBytes)) }}
 {{- fail "triggerReceiver configuration exceeds triggerReceiver.limits.maxConfigBytes" }}

@@ -10007,6 +10007,7 @@ mod tests {
                     task_uid: request.task_uid,
                     idempotency_key: request.idempotency_key.to_owned(),
                     submitter_service: request.submitter_service.to_owned(),
+                    caller_reference: request.caller_reference.cloned(),
                     acting_user: request.acting_user.map(str::to_owned),
                     acting_user_id: request.acting_user_id.map(str::to_owned),
                     owner: request.owner.to_owned(),
@@ -17659,6 +17660,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_task_caller_reference_is_bounded_and_cannot_select_the_service()
+    -> Result<(), String> {
+        let ledger = versioned_task_ledger()?;
+        let app = task_router(ledger.clone(), FakeTaskIdentityResolver, task_api_config()?);
+        let request = |idempotency_key: &'static str, body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("authorization", "Bearer service-assertion")
+                .header("idempotency-key", idempotency_key)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .map_err(|error| format!("build caller-reference request: {error}"))
+        };
+
+        let accepted = app
+            .clone()
+            .oneshot(request(
+                "caller-reference-valid",
+                r#"{"workflow":"repository-review@1","callerReference":{"label":"Jira trigger jira_read · PROJ-123","url":"https://jira.example.com/browse/PROJ-123"}}"#,
+            )?)
+            .await
+            .map_err(|error| format!("submit valid caller reference: {error}"))?;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let stored = ledger
+            .tasks
+            .lock()
+            .map_err(|_| "fake task ledger lock was poisoned")?
+            .first()
+            .cloned()
+            .ok_or_else(|| "accepted caller reference was not persisted".to_owned())?;
+        assert_eq!(stored.submitter_service, "event-worker");
+        assert_eq!(
+            stored
+                .caller_reference
+                .as_ref()
+                .map(steward_types::CallerReference::label),
+            Some("Jira trigger jira_read · PROJ-123")
+        );
+        let changed_retry = app
+            .clone()
+            .oneshot(request(
+                "caller-reference-valid",
+                r#"{"workflow":"repository-review@1","callerReference":{"label":"Jira trigger jira_read · PROJ-124","url":"https://jira.example.com/browse/PROJ-124"}}"#,
+            )?)
+            .await
+            .map_err(|error| format!("retry with changed caller reference: {error}"))?;
+        assert_eq!(changed_retry.status(), StatusCode::CONFLICT);
+
+        for (idempotency_key, body) in [
+            (
+                "caller-reference-control",
+                r#"{"workflow":"repository-review@1","callerReference":{"label":"build\u000a142"}}"#,
+            ),
+            (
+                "caller-reference-http",
+                r#"{"workflow":"repository-review@1","callerReference":{"label":"build 142","url":"http://ci.example.com/build/142"}}"#,
+            ),
+            (
+                "caller-reference-empty-host",
+                r#"{"workflow":"repository-review@1","callerReference":{"label":"build 142","url":"https://:"}}"#,
+            ),
+            (
+                "caller-reference-invalid-host",
+                r#"{"workflow":"repository-review@1","callerReference":{"label":"build 142","url":"https://."}}"#,
+            ),
+        ] {
+            let refused = app
+                .clone()
+                .oneshot(request(idempotency_key, body)?)
+                .await
+                .map_err(|error| format!("submit invalid caller reference: {error}"))?;
+            assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        let overlong = format!(
+            r#"{{"workflow":"repository-review@1","callerReference":{{"label":"{}"}}}}"#,
+            "a".repeat(129)
+        );
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("authorization", "Bearer service-assertion")
+                    .header("idempotency-key", "caller-reference-overlong")
+                    .header("content-type", "application/json")
+                    .body(Body::from(overlong))
+                    .map_err(|error| format!("build overlong caller-reference request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("submit overlong caller reference: {error}"))?;
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let injected_service = app
+            .oneshot(request(
+                "caller-reference-service-injection",
+                r#"{"workflow":"repository-review@1","service":"other-service","callerReference":{"label":"build 142"}}"#,
+            )?)
+            .await
+            .map_err(|error| format!("submit caller-selected service: {error}"))?;
+        assert_eq!(injected_service.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn versioned_task_retry_uses_persisted_plan_across_runtime_contract_changes()
     -> Result<(), String> {
         let ledger = versioned_task_ledger()?;
@@ -17903,6 +18011,7 @@ mod tests {
                 operation_id: Uuid::new_v4(),
                 idempotency_key: "runtime-bind-race",
                 submitter_service: "steward-run",
+                caller_reference: None,
                 acting_user: Some("alice@example.com"),
                 acting_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
                 owner: "alice@example.com",
@@ -18449,6 +18558,7 @@ mod tests {
         AgentRunRecord {
             task_uid,
             submitter_service: "steward-run".to_owned(),
+            caller_reference: None,
             acting_user: Some("alice@example.com".to_owned()),
             owner: "alice@example.com".to_owned(),
             owner_user_id: Some("usr_0123456789abcdef0123456789abcdef".to_owned()),

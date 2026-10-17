@@ -9,6 +9,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- External Run API callers may attach a bounded display label and optional HTTPS link. My runs,
+  All runs, and run details show that context with the service name from the verified Task token;
+  the Jira receiver supplies its Trigger id, issue key, and configured-site issue link.
 - Added prepared `@callers` journeys for Jenkins and Temporal Run API callers, Jira receiver
   delivery and replay, unbound-caller refusal, and write-capable Envelope refusal. Receiver paths
   remain tagged pending until their deployment changes land, and the live Jira path requires an
@@ -46,6 +49,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   when execution logs are disabled. A launcher refusal is reported as `agent-start`, while an
   approved tool refusal that prevents required output is reported as `tool-failed` instead of
   `output-missing`; disabled execution logs remain unavailable.
+
+### Upgrade and rollback
+
+- Migration 0073 adds nullable immutable caller-reference context to Tasks without rewriting
+  historical rows. When the Jira Trigger receiver is enabled, set
+  `config.apiserver.jiraBaseUrl` to the exact configured Jira HTTPS site so issue links are not
+  taken from webhook payloads. Deploy the chart, API, web, and receiver images together.
+- Rolling back leaves the nullable column and its values in place; older API and web versions
+  ignore them. An older Jira receiver continues to start Tasks without display references.
 
 ## [0.3.19] - 2026-10-15
 

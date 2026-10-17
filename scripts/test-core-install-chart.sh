@@ -77,6 +77,7 @@ receiver_inputs=(
   --set-string images.triggerReceiver.tag=test-trigger-receiver
   --set-string images.triggerReceiver.digest=sha256:3333333333333333333333333333333333333333333333333333333333333333
   --set-json "triggerReceiver.triggers=${receiver_trigger}"
+  --set-string config.apiserver.jiraBaseUrl=https://jira.example.com
   --set-string triggerReceiver.databaseSecret.name=steward-trigger-database
   --set-string triggerReceiver.databaseSecret.key=url
   --set-string triggerReceiver.workloadExchange.endpoint=https://identity.identity-exchange.svc.cluster.local:8443/v1/workload/exchange
@@ -132,6 +133,7 @@ STEWARD_CHART_EXCHANGE_SERVER_NAME="$(inline_env_value STEWARD_WORKLOAD_EXCHANGE
     client::tests::chart_render_contract_from_environment -- --exact
 
 for missing in \
+  config.apiserver.jiraBaseUrl \
   triggerReceiver.databaseSecret.name \
   triggerReceiver.workloadExchange.endpoint \
   triggerReceiver.workloadExchange.serverName \

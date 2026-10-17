@@ -66,7 +66,11 @@ Use this sequence for every run:
 1. Exchange the caller credential for a Steward Task token.
 2. `POST /v1/tasks` with `Content-Type: application/json`, the bearer token,
    and a stable `Idempotency-Key`. For a published Workflow, the request is
-   `{"workflow":"name@N"}`. A new Task returns `202`; an exact retry returns
+   `{"workflow":"name@N"}`. To identify the run in HyperShell, add
+   `"callerReference":{"label":"build #142","url":"https://ci.example.com/builds/142"}`.
+   The label is limited to 128 UTF-8 bytes and the optional URL must be HTTPS
+   and at most 2,048 bytes. Do not put credentials or secret values in either
+   display field. A new Task returns `202`; an exact retry returns
    `200` and the existing `taskUid`. A changed request with the same key returns
    `409`.
 3. Create a tar archive for the inputs. When there are no input files, upload a
@@ -141,6 +145,9 @@ Temporal history.
   assertion must fail at exchange; do not retry it as an API key.
 - A Task token bound to another service or owner must not be rewritten or
   supplemented by request fields.
+- A caller reference is display text only. Steward derives the displayed
+  service name from the verified token and refuses a request field that tries
+  to select it.
 - `404` on a Task read or output request does not reveal whether another owner
   has that Task UID.
 - `409` on outputs means the Task is not finished; it is not an empty result.

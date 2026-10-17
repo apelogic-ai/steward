@@ -2236,6 +2236,7 @@ mod tests {
         Ok(AgentRunRecord {
             task_uid,
             submitter_service: "browser".to_owned(),
+            caller_reference: None,
             acting_user: Some("alice@example.com".to_owned()),
             owner: "alice@example.com".to_owned(),
             owner_user_id: Some(owner_user_id.to_owned()),
