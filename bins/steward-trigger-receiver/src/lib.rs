@@ -177,8 +177,7 @@ fn valid_jira_event(value: &str, max_bytes: usize) -> bool {
 fn valid_project_key(value: &str, max_bytes: usize) -> bool {
     let mut bytes = value.bytes();
     bytes.next().is_some_and(|byte| byte.is_ascii_uppercase())
-        && bytes.clone().next().is_some()
-        && bytes.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        && bytes.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
         && valid_exact(value, max_bytes)
 }
 
@@ -656,6 +655,18 @@ struct JiraEvent {
 }
 
 impl JiraEvent {
+    fn validate(&self, max_identifier_bytes: usize) -> bool {
+        valid_jira_event(&self.event, max_identifier_bytes)
+            && valid_issue_key(&self.issue_key, max_identifier_bytes)
+            && valid_project_key(&self.project_key, max_identifier_bytes)
+            && valid_numeric_id(&self.issue_type, max_identifier_bytes)
+            && valid_account_id(&self.author_account_id, max_identifier_bytes)
+            && self
+                .issue_key
+                .rsplit_once('-')
+                .is_some_and(|(project, _)| project == self.project_key)
+    }
+
     fn parse(body: &[u8], max_identifier_bytes: usize) -> Result<Self, WebhookError> {
         let value: serde_json::Value = serde_json::from_slice(body)
             .map_err(|_| WebhookError::Invalid("The Jira event is invalid."))?;
@@ -717,6 +728,7 @@ fn valid_event_archive(archive: &[u8]) -> bool {
     archive
         .get(512..512_usize.saturating_add(size))
         .and_then(|bytes| serde_json::from_slice::<JiraEvent>(bytes).ok())
+        .filter(|event| event.validate(usize::MAX))
         .and_then(|event| event.archive().ok())
         .is_some_and(|expected| expected == archive)
 }
@@ -1058,12 +1070,17 @@ mod tests {
             ),
             valid.replace(
                 "\"signingSecretFile\"",
-                "\"filters\":{\"project\":\"PROJ_KEY\"},\"signingSecretFile\"",
+                "\"filters\":{\"project\":\"PROJ/KEY\"},\"signingSecretFile\"",
             ),
             valid.replace("[\"ignored\"]", "[\"alice_user\"]"),
         ] {
             assert!(ReceiverConfig::from_json(&bad, &limits()).is_err());
         }
+        let underscore_filter = valid.replace(
+            "\"signingSecretFile\"",
+            "\"filters\":{\"project\":\"PROJ_KEY\"},\"signingSecretFile\"",
+        );
+        assert!(ReceiverConfig::from_json(&underscore_filter, &limits()).is_ok());
         let tools = envelopes();
         let tasks = Tasks::default();
         let r = make_receiver(valid.clone(), tools.clone(), tasks.clone()).await?;
@@ -1137,6 +1154,25 @@ mod tests {
         let r = make_receiver(filtered, envelopes(), Tasks::default()).await?;
         expect(&r, "x", "alice", Ok(W::Noop)).await;
 
+        let underscore = body_fields(
+            "jira:issue_updated",
+            "alice",
+            "PROJ_KEY-123",
+            "PROJ_KEY",
+            "10001",
+        );
+        let r = make_receiver(config_json("[]", 1, 0), envelopes(), Tasks::default()).await?;
+        assert_eq!(
+            r.receive(
+                "jira-read",
+                Some(&signature(b"test-signing-secret", &underscore)),
+                Some("underscore-project"),
+                &underscore,
+            )
+            .await,
+            Ok(W::Accepted)
+        );
+
         for event in [
             body_fields("Jira event", "alice", "PROJ-123", "PROJ", "10001"),
             body_fields("jira:issue_updated", "alice", "proj-123", "PROJ", "10001"),
@@ -1145,8 +1181,8 @@ mod tests {
             body_fields(
                 "jira:issue_updated",
                 "alice",
-                "PROJ_KEY-123",
-                "PROJ_KEY",
+                "PROJ/KEY-123",
+                "PROJ/KEY",
                 "10001",
             ),
             body_fields("jira:issue_updated", "alice", "PROJ-123", "PROJ", "Task"),
@@ -1280,6 +1316,32 @@ mod tests {
             idempotency_key("one", b"same"),
             idempotency_key("two", b"same")
         );
+
+        let trigger = ReceiverConfig::from_json(&config_json("[]", 1, 0), &limits())?
+            .triggers
+            .into_iter()
+            .next()
+            .ok_or("Trigger fixture is unavailable")?;
+        for (event, issue_type) in [("Jira event", "10001"), ("jira:issue_updated", "Task")] {
+            let input_archive = JiraEvent {
+                event: event.to_owned(),
+                issue_key: "PROJ-123".to_owned(),
+                project_key: "PROJ".to_owned(),
+                issue_type: issue_type.to_owned(),
+                author_account_id: "alice".to_owned(),
+            }
+            .archive()
+            .map_err(|_| "Jira archive fixture is invalid")?;
+            assert!(
+                !TaskInvocation {
+                    workflow: trigger.workflow.clone(),
+                    envelope_digest: trigger.envelope_digest.clone(),
+                    idempotency_key: format!("jira-sha256:{}", "a".repeat(64)),
+                    input_archive,
+                }
+                .validate_for(&trigger)
+            );
+        }
 
         let config = ReceiverConfig::from_json(&config_json("[]", 2, 0), &limits())?;
         let mut second = config.triggers[0].clone();
