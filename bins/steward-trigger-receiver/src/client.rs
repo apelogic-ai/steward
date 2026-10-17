@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use k8s_openapi::api::authentication::v1::{TokenRequest, TokenRequestSpec};
 use k8s_openapi::api::core::v1::ServiceAccount;
@@ -14,17 +14,19 @@ use steward_adapter_openshell::{
     WorkloadSourceTokenFuture, WorkloadSourceTokenProvider,
 };
 use steward_apiserver::browser_admin::CapabilityCatalog;
-use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, PgStore};
+use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, PgStore, StoreError};
 use steward_types::CanonicalUserId;
 use steward_types::direct_package::{EnvelopeDigest, Uuid};
+use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
 use crate::{
     ReceiverFuture, TaskInvocation, TaskLifecycle, TaskLifecycleError, TaskStart, TriggerConfig,
 };
 
-const TOKEN_REQUEST_MIN_SECONDS: i64 = 600;
-const TOKEN_REQUEST_MAX_SECONDS: i64 = 86_400;
+pub const MIN_SOURCE_TOKEN_SECONDS: u64 = 600;
+pub const MAX_SOURCE_TOKEN_SECONDS: u64 = 86_400;
+const SOURCE_TOKEN_REFRESH_DIVISOR: u32 = 10;
 
 #[derive(Clone)]
 pub struct PgEnvelopeAuthority {
@@ -53,11 +55,22 @@ impl crate::EnvelopeAuthority for PgEnvelopeAuthority {
             let rows = self
                 .store
                 .active_provisioned_user_envelopes_by_digest(owner, store_digest)
-                .await
-                .map_err(|_| crate::EnvelopeError::Unavailable)?;
-            active_tools_from_rows(owner, store_digest, rows)
+                .await;
+            active_tools_from_store_result(owner, store_digest, rows)
         })
     }
+}
+
+fn active_tools_from_store_result(
+    owner: &CanonicalUserId,
+    digest: &str,
+    rows: Result<Vec<EnvelopeRequestRecord>, StoreError>,
+) -> Result<Vec<steward_types::ToolGrant>, crate::EnvelopeError> {
+    active_tools_from_rows(
+        owner,
+        digest,
+        rows.map_err(|_| crate::EnvelopeError::Unavailable)?,
+    )
 }
 
 fn active_tools_from_rows(
@@ -123,7 +136,14 @@ pub struct KubernetesTokenRequester {
     namespace: String,
     service_account: String,
     audience: String,
-    expiration_seconds: i64,
+    expiration_seconds: u64,
+    cache: Arc<Mutex<Option<CachedSourceToken>>>,
+}
+
+#[derive(Clone)]
+struct CachedSourceToken {
+    token: OpaqueToken,
+    refresh_at: SystemTime,
 }
 
 impl KubernetesTokenRequester {
@@ -132,7 +152,7 @@ impl KubernetesTokenRequester {
         namespace: String,
         service_account: String,
         audience: String,
-        expiration_seconds: i64,
+        expiration_seconds: u64,
     ) -> Result<Self, String> {
         if [
             namespace.as_str(),
@@ -141,8 +161,7 @@ impl KubernetesTokenRequester {
         ]
         .iter()
         .any(|value| value.trim().is_empty() || value.trim() != *value)
-            || !(TOKEN_REQUEST_MIN_SECONDS..=TOKEN_REQUEST_MAX_SECONDS)
-                .contains(&expiration_seconds)
+            || !(MIN_SOURCE_TOKEN_SECONDS..=MAX_SOURCE_TOKEN_SECONDS).contains(&expiration_seconds)
         {
             return Err("TokenRequest settings are incomplete".to_owned());
         }
@@ -152,16 +171,19 @@ impl KubernetesTokenRequester {
             service_account,
             audience,
             expiration_seconds,
+            cache: Arc::new(Mutex::new(None)),
         })
     }
 
-    async fn request(&self) -> Result<String, TaskLifecycleError> {
+    async fn request(&self) -> Result<CachedSourceToken, TaskLifecycleError> {
+        let expiration_seconds =
+            i64::try_from(self.expiration_seconds).map_err(|_| TaskLifecycleError::Final)?;
         let api: Api<ServiceAccount> = Api::namespaced(self.client.clone(), &self.namespace);
         let request = TokenRequest {
             metadata: Default::default(),
             spec: TokenRequestSpec {
                 audiences: vec![self.audience.clone()],
-                expiration_seconds: Some(self.expiration_seconds),
+                expiration_seconds: Some(expiration_seconds),
                 bound_object_ref: None,
             },
             status: None,
@@ -175,11 +197,19 @@ impl KubernetesTokenRequester {
                 }
                 _ => TaskLifecycleError::Retriable,
             })?;
-        response
-            .status
-            .map(|status| status.token)
-            .filter(|token| !token.trim().is_empty() && token.trim() == token)
-            .ok_or(TaskLifecycleError::Final)
+        let status = response.status.ok_or(TaskLifecycleError::Final)?;
+        let token = OpaqueToken::new(status.token).map_err(|_| TaskLifecycleError::Final)?;
+        let expires_at: SystemTime = status.expiration_timestamp.0.into();
+        let remaining = expires_at
+            .duration_since(SystemTime::now())
+            .map_err(|_| TaskLifecycleError::Final)?;
+        let refresh_margin = remaining.max(Duration::from_secs(MIN_SOURCE_TOKEN_SECONDS))
+            / SOURCE_TOKEN_REFRESH_DIVISOR;
+        let refresh_at = expires_at
+            .checked_sub(refresh_margin)
+            .filter(|refresh_at| *refresh_at > SystemTime::now())
+            .ok_or(TaskLifecycleError::Final)?;
+        Ok(CachedSourceToken { token, refresh_at })
     }
 }
 
@@ -196,6 +226,13 @@ fn transient_status_code(code: u16) -> bool {
 impl WorkloadSourceTokenProvider for KubernetesTokenRequester {
     fn source_token(&self) -> WorkloadSourceTokenFuture<'_> {
         Box::pin(async move {
+            let mut cache = self.cache.lock().await;
+            if let Some(cached) = cache
+                .as_ref()
+                .filter(|cached| SystemTime::now() < cached.refresh_at)
+            {
+                return Ok(cached.token.clone());
+            }
             let source = self.request().await.map_err(|error| match error {
                 TaskLifecycleError::Final => steward_ports::PortError::Rejected {
                     reason: "workload source credential was refused".to_owned(),
@@ -204,7 +241,9 @@ impl WorkloadSourceTokenProvider for KubernetesTokenRequester {
                     reason: "workload source credential is unavailable".to_owned(),
                 },
             })?;
-            OpaqueToken::new(source)
+            let token = source.token.clone();
+            *cache = Some(source);
+            Ok(token)
         })
     }
 }
@@ -236,6 +275,9 @@ impl KubernetesWorkloadTokenProvider {
         ca_certificate_pem: Vec<u8>,
         transport: WorkloadExchangeTransport,
     ) -> Result<Self, String> {
+        let transport = transport
+            .validate()
+            .map_err(|_| "workload exchange transport settings are invalid".to_owned())?;
         steward_adapter_openshell::validate_workload_exchange_endpoint(&endpoint, &server_name)
             .map_err(|_| "workload exchange endpoint is invalid".to_owned())?;
         let certificates = Certificate::from_pem_bundle(&ca_certificate_pem)
@@ -549,7 +591,12 @@ fn validate_task_origin(origin: &str, server_name: &str) -> Result<Url, String> 
 }
 
 fn classify_status(status: StatusCode) -> TaskLifecycleError {
-    if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+    if status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+        )
+    {
         TaskLifecycleError::Retriable
     } else {
         TaskLifecycleError::Final
@@ -739,7 +786,12 @@ mod tests {
             600,
         )?;
         assert_eq!(
-            requester.request().await.map_err(|_| "request failed")?,
+            requester
+                .request()
+                .await
+                .map_err(|_| "request failed")?
+                .token
+                .expose_secret(),
             "obviously-fake-source-token"
         );
         let body = captured
@@ -864,10 +916,10 @@ mod tests {
             "obviously-fake-second-access"
         );
         exchange.handle.await.map_err(|error| error.to_string())?;
-        assert_eq!(*source_calls.lock().map_err(|_| "poisoned")?, 2);
+        assert_eq!(*source_calls.lock().map_err(|_| "poisoned")?, 1);
         let requests = exchange.requests.lock().map_err(|_| "poisoned")?;
         assert!(requests[0].contains("Bearer obviously-fake-source-token-1"));
-        assert!(requests[1].contains("Bearer obviously-fake-source-token-2"));
+        assert!(requests[1].contains("Bearer obviously-fake-source-token-1"));
         Ok(())
     }
 
@@ -1056,17 +1108,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn envelope_lookup_fails_closed_when_database_is_unreachable() -> Result<(), String> {
-        let result = tokio::time::timeout(
-            Duration::from_millis(300),
-            PgStore::connect_with_acquire_timeout(
-                "postgres://steward@127.0.0.1:9/steward",
-                Duration::from_millis(25),
+    async fn workload_exchange_rejects_invalid_transport_at_startup() -> Result<(), String> {
+        let exchange = tls_fixture(Vec::new()).await?;
+        let kube = KubeClient::new(
+            service_fn(|_request: Request<KubeBody>| async move {
+                Ok::<_, std::io::Error>(HttpResponse::new(Body::empty()))
+            }),
+            "default",
+        );
+        assert!(
+            KubernetesWorkloadTokenProvider::new(
+                KubernetesTokenRequester::new(
+                    kube,
+                    "steward-test".to_owned(),
+                    "receiver".to_owned(),
+                    "steward-task".to_owned(),
+                    600,
+                )?,
+                format!("{}v1/workload/exchange", exchange.origin),
+                "localhost".to_owned(),
+                exchange.ca_certificate_pem,
+                WorkloadExchangeTransport {
+                    max_response_bytes: 0,
+                    ..exchange_transport()
+                },
+            )
+            .is_err()
+        );
+        exchange.handle.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_lookup_fails_closed_when_database_is_unreachable() -> Result<(), String> {
+        let owner = CanonicalUserId::parse(OWNER)?;
+        let digest = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            active_tools_from_store_result(
+                &owner,
+                &digest,
+                Err(StoreError::Database("database unavailable".to_owned())),
             ),
-        )
-        .await
-        .map_err(|_| "database refusal exceeded the receiver deadline")?;
-        assert!(result.is_err(), "an unavailable database must fail closed");
+            Err(crate::EnvelopeError::Unavailable)
+        );
         Ok(())
     }
 
@@ -1512,6 +1596,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_duplicate_reports_finalize_failure() -> Result<(), String> {
+        let (client, state, handle) = client_fixture(
+            StatusCode::OK,
+            "succeeded",
+            0,
+            Duration::from_secs(1),
+            Some("finalize"),
+        )
+        .await?;
+        assert_eq!(
+            client.start(&trigger()?, invocation()?).await.err(),
+            Some(TaskLifecycleError::Retriable)
+        );
+        assert!(
+            state
+                .requests
+                .lock()
+                .map_err(|_| "poisoned")?
+                .iter()
+                .any(|(method, _, _)| *method == Method::DELETE)
+        );
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn accepted_task_polls_with_fresh_tokens_and_finalizes() -> Result<(), String> {
         let (client, state, handle) = client_fixture(
             StatusCode::ACCEPTED,
@@ -1610,6 +1720,7 @@ mod tests {
     #[tokio::test]
     async fn create_failures_are_classified_before_started() -> Result<(), String> {
         for (status, expected) in [
+            (StatusCode::REQUEST_TIMEOUT, TaskLifecycleError::Retriable),
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 TaskLifecycleError::Retriable,

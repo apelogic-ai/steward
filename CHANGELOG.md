@@ -33,6 +33,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Jira webhook delivery now recovers its concurrency and cooldown state if Task startup stops
+  unexpectedly, treats semantically identical JSON retries as one delivery, reuses bounded
+  Kubernetes source credentials until their safe refresh point, and retries temporary Task API
+  timeouts. The optional delivery identifier is no longer required.
 - Bound Agent Tasks now succeed when the agent exits successfully and writes every declared
   output but leaves its conversational final message empty. Missing declared output still fails
   with the output-missing reason.
