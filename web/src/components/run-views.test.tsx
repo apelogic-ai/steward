@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BrowserRunView, WorkspaceEvidence } from "@/api-client";
 
-import { cancelFailureMessage, inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunCards, runtimeMinutesSummary, visibleRunFailureReason, WorkspaceEvidencePanel } from "./run-views";
+import { cancelFailureMessage, inferenceFailureGuidance, packagePrompt, parseRunEventSnapshot, pollRerun, rerunFailureMessage, RunAttribution, RunCards, runCallerLabel, runOriginLabel, runtimeMinutesSummary, visibleRunFailureReason, WorkspaceEvidencePanel } from "./run-views";
 
 function run(overrides: Partial<BrowserRunView>): BrowserRunView {
   return {
@@ -61,11 +61,84 @@ describe("run table", () => {
     expect(html).toContain("newruntime-0000-0000-0000-000000000000");
     expect(html).toContain("oldruntime-0000-0000-0000-000000000000");
     expect(html).toContain("Origin / package");
-    expect(html).toContain("browser");
-    expect(html).toContain("api");
+    expect(html).toContain("HyperShell");
+    expect(html).toContain("External caller");
     expect(html).toContain("steward:sha256:");
     expect(html).toContain("rev 7");
     expect(html).not.toContain("uppercase");
+  });
+
+  test("shows external caller context in plain language", () => {
+    const external = run({
+      origin: "api",
+      caller: {
+        service: "event-worker",
+        label: "Jira trigger jira_read · PROJ-123",
+        url: "https://jira.example.com/browse/PROJ-123",
+      },
+    });
+    const html = renderToStaticMarkup(<RunCards runs={[external]} />);
+
+    expect(runOriginLabel(external.origin)).toBe("External caller");
+    expect(runCallerLabel(external)).toBe("Triggered by event-worker · Jira trigger jira_read · PROJ-123");
+    expect(html).toContain("External caller");
+    expect(html).toContain("Triggered by event-worker · Jira trigger jira_read · PROJ-123");
+    expect(html).not.toContain(">api<");
+  });
+
+  test("shows external caller context in run detail and preserves historical API runs", () => {
+    const external = run({
+      origin: "api",
+      caller: {
+        service: "event-worker",
+        label: "Jira trigger jira_read · PROJ-123",
+        url: "https://jira.example.com/browse/PROJ-123",
+      },
+    });
+    const externalHtml = renderToStaticMarkup(<RunAttribution run={external} />);
+    expect(externalHtml).toContain("Triggered by");
+    expect(externalHtml).toContain("event-worker");
+    expect(externalHtml).toContain("Jira trigger jira_read · PROJ-123");
+    expect(externalHtml).toContain('href="https://jira.example.com/browse/PROJ-123"');
+    expect(externalHtml).toContain("Origin: External caller");
+
+    const historicalHtml = renderToStaticMarkup(<RunAttribution run={run({ origin: "api" })} />);
+    expect(historicalHtml).toContain("Started");
+    expect(historicalHtml).toContain("Origin: External caller");
+    expect(historicalHtml).not.toContain("Triggered by");
+  });
+
+  test("renders only safe caller links and escapes caller labels", () => {
+    for (const url of ["javascript:alert(1)", "http://jira.example.com/browse/PROJ-123"]) {
+      const html = renderToStaticMarkup(<RunAttribution run={run({
+        origin: "api",
+        caller: { service: "event-worker", label: "<script>alert(1)</script>", url },
+      })} />);
+      expect(html).not.toContain("href=");
+      expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+      expect(html).not.toContain("<script>");
+    }
+
+    const safe = renderToStaticMarkup(<RunAttribution run={run({
+      origin: "api",
+      caller: {
+        service: "event-worker",
+        label: "PROJ-123",
+        url: "https://jira.example.com/browse/PROJ-123",
+      },
+    })} />);
+    expect(safe).toContain('href="https://jira.example.com/browse/PROJ-123"');
+    expect(safe).toContain('rel="noreferrer"');
+  });
+
+  test("maps every persisted origin to a readable label", () => {
+    expect([
+      runOriginLabel("api"),
+      runOriginLabel("browser"),
+      runOriginLabel("connections"),
+      runOriginLabel("github-actions"),
+      runOriginLabel("unknown"),
+    ]).toEqual(["External caller", "HyperShell", "Connections", "GitHub Actions", "Earlier run"]);
   });
 });
 

@@ -267,7 +267,10 @@ read-only file path into the receiver configuration. The database user in
 Use a separate database role from the apiserver and controller roles. Configure all
 receiver size, concurrency, lifetime, polling, and timeout limits under
 `triggerReceiver.limits`; the chart rejects values outside the receiver's supported
-ranges.
+ranges. `config.apiserver.jiraBaseUrl` is optional for the receiver. When set, it
+must be an HTTPS Jira site URL, including an optional context path, and run views
+link the bounded issue key beneath that site. When it is unset, run views still show
+the Trigger label without a link.
 
 ```yaml
 triggerReceiver:
@@ -292,6 +295,9 @@ triggerReceiver:
       concurrencyLimit: 2
       cooldownSeconds: 60
       signingSecret: { name: steward-jira-webhook, key: secret }
+config:
+  apiserver:
+    jiraBaseUrl: https://jira.example.com
 networkPolicy:
   ingressNamespace: edge-system
   kubeApiCidrs: [192.0.2.1/32]

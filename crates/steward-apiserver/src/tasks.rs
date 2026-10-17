@@ -58,9 +58,9 @@ use steward_types::task_output_archive::{
     task_output_archive_with_optional_output_and_execution_transcript,
 };
 use steward_types::{
-    AgentRuntimeSpec, CanonicalAuthorityBinding, CanonicalPrincipal, CanonicalUserId,
-    DisposableExecutionBinding, Email, InferenceMode, ModelRef, Principal, RuntimeOwnership,
-    TaskExecutionBinding, TaskPhase, ToolGrant,
+    AgentRuntimeSpec, CallerReference, CanonicalAuthorityBinding, CanonicalPrincipal,
+    CanonicalUserId, DisposableExecutionBinding, Email, InferenceMode, ModelRef, Principal,
+    RuntimeOwnership, TaskExecutionBinding, TaskPhase, ToolGrant,
 };
 use uuid::Uuid;
 
@@ -1907,6 +1907,10 @@ impl TaskSubmissionLedger for PgStore {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskSubmissionRequest {
     pub workflow: String,
+    /// Optional display-only context. The authenticated token, never this object, supplies the
+    /// service identity shown with the reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_reference: Option<CallerReference>,
     /// Optional exact active User Envelope selector. The digest is content identity scoped to
     /// the authenticated canonical owner; it is not bearer authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2725,6 +2729,7 @@ where
         evidence.validate().map_err(ApiError::Admission)?;
         let task_request = TaskSubmissionRequest {
             workflow: format!("{name}@{version}"),
+            caller_reference: None,
             envelope_digest: request.envelope_digest.clone(),
             coding_agent_runtime: None,
             agent_runtime_uid: None,
@@ -2828,6 +2833,7 @@ where
                 operation_id,
                 idempotency_key,
                 submitter_service: &identity.service,
+                caller_reference: None,
                 acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
                 acting_user_id: identity
                     .acting_user
@@ -2979,6 +2985,7 @@ where
                 operation_id,
                 idempotency_key,
                 submitter_service: &identity.service,
+                caller_reference: None,
                 acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
                 acting_user_id: identity
                     .acting_user
@@ -3043,6 +3050,15 @@ where
         identity: TaskIdentity,
         request: &TaskSubmissionRequest,
     ) -> Result<(StatusCode, TaskStatusResponse), ApiError> {
+        if request
+            .caller_reference
+            .as_ref()
+            .is_some_and(|reference| reference.validate().is_err())
+        {
+            return Err(ApiError::Admission(
+                "caller reference must contain a short label and an optional HTTPS URL".to_owned(),
+            ));
+        }
         let reference = versioned_workflow_reference(
             &request.workflow,
             request.coding_agent_runtime.as_deref(),
@@ -5657,6 +5673,7 @@ fn validate_direct_task_retry(
         || record.acting_user_id.as_deref() != acting_user_id
         || record.owner != identity.owner.0
         || record.owner_user_id.as_deref() != Some(identity.canonical_user_id.as_str())
+        || record.caller_reference.is_some()
         || record.runtime_ownership != RuntimeOwnership::Provisioned
         || record.workflow_name.is_some()
         || record.workflow_version.is_some()
@@ -5709,6 +5726,7 @@ fn validate_direct_task_retry_request(
         || record.acting_user_id.as_deref() != acting_user_id
         || record.owner != identity.owner.0
         || record.owner_user_id.as_deref() != Some(identity.canonical_user_id.as_str())
+        || record.caller_reference.is_some()
         || record.runtime_ownership != RuntimeOwnership::Provisioned
         || record.workflow_name.is_some()
         || record.workflow_version.is_some()
@@ -6713,6 +6731,7 @@ where
             operation_id,
             idempotency_key,
             submitter_service: &identity.service,
+            caller_reference: request.caller_reference.as_ref(),
             acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
             acting_user_id: identity
                 .acting_user
@@ -6783,6 +6802,7 @@ fn validate_task_retry(
         || record.acting_user_id.as_deref() != acting_user_id
         || record.owner != identity.owner.0
         || record.owner_user_id.as_deref() != Some(identity.canonical_user_id.as_str())
+        || record.caller_reference.as_ref() != request.caller_reference.as_ref()
     {
         return Err(ApiError::Store(StoreError::TaskIdempotencyConflict));
     }

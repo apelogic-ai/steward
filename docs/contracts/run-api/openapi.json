@@ -8324,6 +8324,27 @@
           "admin"
         ]
       },
+      "BrowserRunCaller": {
+        "type": "object",
+        "required": [
+          "service",
+          "label"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "BrowserRunEventSnapshot": {
         "type": "object",
         "required": [
@@ -8870,6 +8891,16 @@
           "stages"
         ],
         "properties": {
+          "caller": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BrowserRunCaller"
+              }
+            ]
+          },
           "codingAgentRuntime": {
             "type": "string"
           },
@@ -9480,6 +9511,24 @@
           }
         },
         "additionalProperties": false
+      },
+      "CallerReference": {
+        "type": "object",
+        "description": "Display-only context supplied by an authenticated external Task caller.",
+        "required": [
+          "label"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
       },
       "CanonicalAuthorityBinding": {
         "type": "object",
@@ -13391,6 +13440,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "callerReference": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CallerReference",
+                "description": "Optional display-only context. The authenticated token, never this object, supplies the\nservice identity shown with the reference."
+              }
             ]
           },
           "codingAgentRuntime": {

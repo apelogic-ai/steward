@@ -1,5 +1,5 @@
 # Source: caller acceptance for the upcoming 0.3.20 release.
-# The receiver scenarios stay marked pending until the Jira receiver A2/B changes land.
+# The direct receiver scenarios use the deployed Trigger contract. The live path remains owner-only.
 @callers
 Feature: J12 - Service callers run governed work
   As an automation owner
@@ -31,7 +31,6 @@ Feature: J12 - Service callers run governed work
     Then the token exchange is refused
     And the caller creates 0 new Tasks
 
-  @pending-jira-receiver
   Scenario: A signed Jira webhook starts one governed Task
     Given the Jira receiver uses a read-only Envelope
     When Jira sends the signed delivery "delivery-123" for issue "PROJ-123"
@@ -39,14 +38,12 @@ Feature: J12 - Service callers run governed work
     And the receiver creates 1 new Task
     And the receiver Task ends as "succeeded" within 4 min
 
-  @pending-jira-receiver
   Scenario: A write-capable Envelope is refused by the Jira receiver
     Given the Jira receiver uses a write-capable Envelope
     When Jira sends the signed delivery "delivery-456" for issue "PROJ-124"
     Then the receiver refuses the delivery because the Envelope is not read-only
     And the receiver creates 0 new Tasks
 
-  @pending-jira-receiver
   Scenario: Replaying a signed Jira delivery creates no second Task
     Given the Jira receiver uses a read-only Envelope
     When Jira sends the signed delivery "delivery-789" for issue "PROJ-125"
@@ -55,10 +52,30 @@ Feature: J12 - Service callers run governed work
     And the receiver creates 1 new Task
     And the receiver Task ends as "succeeded" within 4 min
 
-  @pending-jira-receiver @live-jira-webhook @needs-public-ingress @owner-only
+  Scenario: A Jira webhook with an invalid signature is refused
+    Given the Jira receiver uses a read-only Envelope
+    When Jira sends the delivery "delivery-invalid-signature" for issue "PROJ-126" with an invalid signature
+    Then the receiver refuses the delivery because its signature is invalid
+    And the receiver creates 0 new Tasks
+
+  Scenario: A Jira webhook without a signature is refused
+    Given the Jira receiver uses a read-only Envelope
+    When Jira sends the delivery "delivery-missing-signature" for issue "PROJ-127" without a signature
+    Then the receiver refuses the delivery because its signature is invalid
+    And the receiver creates 0 new Tasks
+
+  Scenario: A Jira Trigger enforces its per-issue cooldown
+    Given the Jira receiver uses a read-only Envelope
+    When Jira sends the signed delivery "delivery-cooldown-first" for issue "PROJ-128"
+    And Jira sends the signed delivery "delivery-cooldown-second" for issue "PROJ-128"
+    Then the receiver reports that it cannot start another run yet
+    And the receiver creates 1 new Task
+    And the receiver Task ends as "succeeded" within 4 min
+
+  @live-jira-webhook @needs-public-ingress @owner-only
   Scenario: A live Jira webhook reaches the public receiver
     Given the owner explicitly allowed a live Jira webhook test
     And the Jira receiver uses a read-only Envelope
-    When the live Jira helper updates issue "PROJ-126"
+    When the live Jira helper updates issue "PROJ-129"
     Then the receiver creates 1 new Task
     And the receiver Task ends as "succeeded" within 4 min

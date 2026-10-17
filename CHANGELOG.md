@@ -12,10 +12,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Added a Jira webhook Trigger operator guide covering exact-path exposure, signing Secrets,
   read-only Envelope checks, filters, run limits, cooldowns, response meanings, optional issue
   links, and the pending deployment acceptance evidence.
+- External Run API callers may attach a bounded display label and optional HTTPS link. My runs,
+  All runs, and run details show that context with the service name from the verified Task token;
+  the Jira receiver supplies its Trigger id, issue key, and configured-site issue link.
 - Added prepared `@callers` journeys for Jenkins and Temporal Run API callers, Jira receiver
-  delivery and replay, unbound-caller refusal, and write-capable Envelope refusal. Receiver paths
-  remain tagged pending until their deployment changes land, and the live Jira path requires an
-  explicit owner opt-in.
+  delivery and replay, unbound-caller refusal, write-capable Envelope refusal, missing or invalid
+  Jira signatures, and Trigger cooldown. Direct receiver paths now follow the deployed response
+  contract; the live Jira path still requires an explicit owner opt-in.
 - Added validation, routing, and the ability to start and clean up governed Tasks for signed,
   bounded Jira webhook Triggers. The Helm chart can now deploy that receiver with isolated
   identity, exact Secret and CA projections, bounded runtime settings, and deny-by-default
@@ -36,6 +39,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- The Codex reference runtime now pins the latest reviewed Ubuntu kernel headers and limits its
+  vulnerability exception to three named, unfixed kernel-code findings with a dated review.
 - Jira webhook delivery now recovers its concurrency and cooldown state if Task startup stops
   unexpectedly, treats semantically identical JSON retries as one delivery, reuses bounded
   Kubernetes source credentials until their safe refresh point, and retries temporary Task API
@@ -49,6 +54,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   when execution logs are disabled. A launcher refusal is reported as `agent-start`, while an
   approved tool refusal that prevents required output is reported as `tool-failed` instead of
   `output-missing`; disabled execution logs remain unavailable.
+
+### Upgrade and rollback
+
+- Migration 0073 adds nullable immutable caller-reference context to Tasks without rewriting
+  historical rows. The Jira Trigger receiver uses `config.apiserver.jiraBaseUrl`, when set, as
+  the validated HTTPS site and optional context path for issue links; without it, runs retain a
+  label without a link. Issue display metadata never determines whether a delivery is accepted.
+  Deploy the chart, API, web, and receiver images together.
+- Rolling back leaves the nullable column and its values in place; older API and web versions
+  ignore them. A full chart rollback removes the new receiver configuration field. Image-only
+  rollback of the receiver requires leaving `config.apiserver.jiraBaseUrl` unset; otherwise the
+  older strict config parser rejects that unknown field.
 
 ## [0.3.19] - 2026-10-15
 

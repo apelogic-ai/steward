@@ -549,6 +549,12 @@ export type BrowserResolvedPackage = {
 
 export type BrowserRole = 'user' | 'admin';
 
+export type BrowserRunCaller = {
+    label: string;
+    service: string;
+    url?: string | null;
+};
+
 export type BrowserRunEventSnapshot = {
     apiVersion: string;
     eventId: number;
@@ -678,6 +684,7 @@ export type BrowserRunTrigger = {
 };
 
 export type BrowserRunView = {
+    caller?: null | BrowserRunCaller;
     codingAgentRuntime: string;
     createdAt: string;
     envelopeRuntimeMinutesLimit?: string | null;
@@ -808,6 +815,14 @@ export type BudgetRequirement = {
     currency: Currency;
     monthlyLimit: Decimal;
     singleRunLimit?: null | Decimal;
+};
+
+/**
+ * Display-only context supplied by an authenticated external Task caller.
+ */
+export type CallerReference = {
+    label: string;
+    url?: string | null;
 };
 
 /**
@@ -1826,6 +1841,7 @@ export type TaskStatusResponse = LegacyTaskStatusResponse | DirectTaskStatusResp
 
 export type TaskSubmissionRequest = {
     agentRuntimeUid?: string | null;
+    callerReference?: null | CallerReference;
     /**
      * Optional compatibility assertion for an unversioned legacy Workflow.
      * Steward selects the runtime from its own Workflow catalog when this is

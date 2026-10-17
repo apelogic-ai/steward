@@ -829,6 +829,7 @@ impl<B> GovernedConnectionsBroker<B> {
             operation_id,
             idempotency_key: &operation_key,
             submitter_service: CONNECTIONS_SERVICE,
+            caller_reference: None,
             acting_user: Some(email.as_str()),
             acting_user_id: Some(acting_user_id),
             owner: email.as_str(),

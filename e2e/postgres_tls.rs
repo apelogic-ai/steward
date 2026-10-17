@@ -22,12 +22,13 @@ use steward_apiserver::governed_connections::{
     DirectConnectionStatusConfig, DirectConnectionStatusReader, SplitConnectionsBroker,
 };
 use steward_store::{
-    BrowserMemberInvitation, BrowserMemberInvitationOutcome, BrowserMemberStateAction,
-    BrowserMemberStateChange, BrowserRbacAssignment, BrowserRbacAssignmentAction,
-    BrowserRbacAssignmentChange, BrowserTaskVersionPublication, EnvelopeRequestStatus,
-    EnvelopeRequestStatusUpdate, FederatedSubjectAssociation, FederatedSubjectAssociationMethod,
-    FederatedSubjectAuditAction, FederatedSubjectDisable, FederatedSubjectObservation,
-    FederatedSubjectState, FederatedSubjectUnlink, ManagedInferenceKeyCipher, PgStore, StoreError,
+    AgentRunQuery, BrowserMemberInvitation, BrowserMemberInvitationOutcome,
+    BrowserMemberStateAction, BrowserMemberStateChange, BrowserRbacAssignment,
+    BrowserRbacAssignmentAction, BrowserRbacAssignmentChange, BrowserTaskVersionPublication,
+    EnvelopeRequestStatus, EnvelopeRequestStatusUpdate, FederatedSubjectAssociation,
+    FederatedSubjectAssociationMethod, FederatedSubjectAuditAction, FederatedSubjectDisable,
+    FederatedSubjectObservation, FederatedSubjectState, FederatedSubjectUnlink,
+    ManagedInferenceKeyCipher, PgStore, StoreError,
 };
 use steward_types::direct_package::SourceProvenance;
 use steward_types::{
@@ -377,7 +378,7 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         historical_task_count > 0,
         "the API-origin upgrade must run over seeded historical Task rows"
     );
-    migration_set(None)
+    migration_set(Some(72))
         .run(store.pool())
         .await
         .map_err(|error| {
@@ -391,6 +392,21 @@ async fn tls_required_postgres_accepts_store_migrations() -> Result<(), Box<dyn 
         "migration 0072 must not update historical Tasks, runs, or canonical identities"
     );
     assert_api_origin_upgrade_result(&store).await?;
+    let historical_before_caller_reference = historical_task_identity_snapshot(&store).await?;
+    migration_set(None)
+        .run(store.pool())
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "Steward caller-reference migration must complete over the required TLS session: {error}"
+            ))
+        })?;
+    assert_eq!(
+        historical_task_identity_snapshot(&store).await?,
+        historical_before_caller_reference,
+        "migration 0073 must not update historical Tasks, runs, or canonical identities"
+    );
+    assert_task_caller_reference_upgrade_result(&store, historical_task_count).await?;
     verify_browser_task_library_upgrade(&store).await?;
     assert_eq!(
         historical_task_identity_snapshot(&store).await?,
@@ -791,6 +807,259 @@ async fn assert_api_origin_upgrade_result(store: &PgStore) -> Result<(), Box<dyn
     assert!(
         mutation.is_err(),
         "migration 0072 must not let historical rows bypass origin immutability"
+    );
+    Ok(())
+}
+
+async fn assert_task_caller_reference_upgrade_result(
+    store: &PgStore,
+    historical_task_count: i64,
+) -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*)::bigint FROM task_submissions WHERE caller_reference IS NULL",
+        )
+        .fetch_one(store.pool())
+        .await?,
+        historical_task_count,
+        "migration 0073 must leave every historical Task without invented caller context"
+    );
+    for trigger in [
+        "durable_task_intent_is_immutable",
+        "task_commands_are_monotonic",
+        "task_caller_reference_is_immutable",
+    ] {
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT tgenabled = 'O' FROM pg_trigger \
+                 WHERE tgrelid = 'task_submissions'::regclass AND tgname = $1",
+            )
+            .bind(trigger)
+            .fetch_one(store.pool())
+            .await?,
+            "migration 0073 must leave {trigger} enabled"
+        );
+    }
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT convalidated FROM pg_constraint \
+             WHERE conrelid = 'task_submissions'::regclass \
+               AND conname = 'task_submissions_caller_reference_shape'",
+        )
+        .fetch_one(store.pool())
+        .await?,
+        "migration 0073 must validate its caller-reference constraint"
+    );
+
+    let valid_task_uid = "00000000-0000-0000-0000-000000000073";
+    let valid_reference = serde_json::json!({
+        "label": "Jira trigger jira-read · PROJ-123",
+        "url": "https://jira.example.com/browse/PROJ-123",
+    });
+    let inserted = sqlx::query(
+        "INSERT INTO task_submissions \
+         SELECT (jsonb_populate_record( \
+             NULL::task_submissions, \
+             to_jsonb(source_row) || jsonb_build_object( \
+                 'task_uid', $1, \
+                 'idempotency_key', 'migration-0073-valid-reference', \
+                 'task_origin', 'api', \
+                 'caller_reference', $2::jsonb \
+             ) \
+         )).* \
+         FROM task_submissions source_row \
+         WHERE idempotency_key = 'user-unfinished'",
+    )
+    .bind(valid_task_uid)
+    .bind(&valid_reference)
+    .execute(store.pool())
+    .await?
+    .rows_affected();
+    assert_eq!(
+        inserted, 1,
+        "migration 0073 must accept a new API caller reference"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT caller_reference FROM task_submissions WHERE task_uid = $1::text::uuid",
+        )
+        .bind(valid_task_uid)
+        .fetch_one(store.pool())
+        .await?,
+        valid_reference
+    );
+
+    let non_api = sqlx::query(
+        "INSERT INTO task_submissions \
+         SELECT (jsonb_populate_record( \
+             NULL::task_submissions, \
+             to_jsonb(source_row) || jsonb_build_object( \
+                 'task_uid', '00000000-0000-0000-0000-000000000074', \
+                 'idempotency_key', 'migration-0073-non-api-reference', \
+                 'task_origin', 'unknown', \
+                 'caller_reference', $1::jsonb \
+             ) \
+         )).* \
+         FROM task_submissions source_row \
+         WHERE idempotency_key = 'user-unfinished'",
+    )
+    .bind(&valid_reference)
+    .execute(store.pool())
+    .await;
+    assert!(
+        non_api.is_err(),
+        "migration 0073 must refuse caller context on a non-API Task"
+    );
+
+    let invalid_task_uid = "00000000-0000-0000-0000-000000000075";
+    sqlx::query(
+        "INSERT INTO task_submissions \
+         SELECT (jsonb_populate_record( \
+             NULL::task_submissions, \
+             to_jsonb(source_row) || jsonb_build_object( \
+                 'task_uid', $1, \
+                 'idempotency_key', 'migration-0073-invalid-reference', \
+                 'task_origin', 'api', \
+                 'runtime_spec', jsonb_build_object( \
+                     'principal', jsonb_build_object( \
+                         'kind', 'user', 'actingUser', 'alice@example.com' \
+                     ), \
+                     'owner', 'alice@example.com', \
+                     'agentType', jsonb_build_object('name', 'agent@1'), \
+                     'llms', '[]'::jsonb, \
+                     'tools', '[]'::jsonb, \
+                     'budget', jsonb_build_object( \
+                         'monthlyLimit', '1.00', 'currency', 'USD' \
+                     ), \
+                     'ttl', '1h', \
+                     'runner', '{}'::jsonb \
+                 ), \
+                 'caller_reference', jsonb_build_object( \
+                     'label', 'PROJ-123', \
+                     'url', 'https://jira.example.com:many/browse/PROJ-123' \
+                 ) \
+             ) \
+         )).* \
+         FROM task_submissions source_row \
+         WHERE idempotency_key = 'user-unfinished'",
+    )
+    .bind(invalid_task_uid)
+    .execute(store.pool())
+    .await?;
+    let page = store
+        .agent_runs(&AgentRunQuery {
+            limit: 1,
+            cursor: None,
+            phase: None,
+            workflow: None,
+            owner_user_id: None,
+            runtime_uid: None,
+            user_envelope_instance_id: None,
+            task_uid: Some(Uuid::parse_str(invalid_task_uid)?),
+            package_digest: None,
+        })
+        .await?;
+    assert_eq!(page.records.len(), 1);
+    assert!(
+        page.records[0].caller_reference.is_none(),
+        "a persisted reference rejected by the Rust validator must not break run listing"
+    );
+    let task_error = store
+        .task(Uuid::parse_str(invalid_task_uid)?)
+        .await
+        .err()
+        .ok_or("an invalid persisted reference was accepted by the Task identity reader")?;
+    assert!(
+        matches!(
+            &task_error,
+            StoreError::Database(message) if message.contains("caller_reference")
+        ),
+        "an invalid persisted reference must fail the Task identity read before retry comparison: {task_error:?}"
+    );
+
+    let mut historical_update = store.pool().begin().await?;
+    let updated = sqlx::query(
+        "UPDATE task_submissions \
+         SET phase = 'failed', finalize_requested = true, finalized = true, \
+             failure_reason = 'caller_reference_upgrade_probe' \
+         WHERE idempotency_key = 'internal-unfinished'",
+    )
+    .execute(&mut *historical_update)
+    .await?
+    .rows_affected();
+    assert_eq!(
+        updated, 1,
+        "migration 0073 must preserve allowed lifecycle updates for historical Tasks"
+    );
+    historical_update.rollback().await?;
+    let mut cleanup = store.pool().begin().await?;
+    sqlx::query(
+        "ALTER TABLE task_lifecycle_events \
+         DISABLE TRIGGER task_lifecycle_events_are_append_only",
+    )
+    .execute(&mut *cleanup)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE task_stage_events \
+         DISABLE TRIGGER task_stage_events_are_append_only",
+    )
+    .execute(&mut *cleanup)
+    .await?;
+    sqlx::query(
+        "DELETE FROM task_lifecycle_events \
+         WHERE task_uid IN ($1::text::uuid, $2::text::uuid)",
+    )
+    .bind(valid_task_uid)
+    .bind(invalid_task_uid)
+    .execute(&mut *cleanup)
+    .await?;
+    sqlx::query(
+        "DELETE FROM task_stage_events \
+         WHERE task_uid IN ($1::text::uuid, $2::text::uuid)",
+    )
+    .bind(valid_task_uid)
+    .bind(invalid_task_uid)
+    .execute(&mut *cleanup)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE task_lifecycle_events \
+         ENABLE TRIGGER task_lifecycle_events_are_append_only",
+    )
+    .execute(&mut *cleanup)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE task_stage_events \
+         ENABLE TRIGGER task_stage_events_are_append_only",
+    )
+    .execute(&mut *cleanup)
+    .await?;
+    assert_eq!(
+        sqlx::query(
+            "DELETE FROM task_submissions \
+             WHERE task_uid IN ($1::text::uuid, $2::text::uuid)",
+        )
+        .bind(valid_task_uid)
+        .bind(invalid_task_uid)
+        .execute(&mut *cleanup)
+        .await?
+        .rows_affected(),
+        2,
+        "caller-reference migration probes must clean up their inserted Task rows"
+    );
+    cleanup.commit().await?;
+
+    let mutation = sqlx::query(
+        "UPDATE task_submissions \
+         SET caller_reference = '{\"label\":\"PROJ-123\"}'::jsonb \
+         WHERE task_uid = (SELECT task_uid FROM task_submissions ORDER BY task_uid LIMIT 1)",
+    )
+    .execute(store.pool())
+    .await;
+    assert!(
+        mutation.is_err_and(|error| error
+            .to_string()
+            .contains("Task caller reference is immutable")),
+        "migration 0073 must keep caller context immutable under the existing Task triggers"
     );
     Ok(())
 }
@@ -2070,7 +2339,12 @@ async fn historical_task_identity_snapshot(
     Ok(sqlx::query_scalar(
         "SELECT jsonb_build_object(\
              'tasks', (\
-                 SELECT jsonb_agg(to_jsonb(task_row) ORDER BY task_row.task_uid) \
+                 SELECT jsonb_agg( \
+                     to_jsonb(task_row) || jsonb_build_object( \
+                         'caller_reference', to_jsonb(task_row) -> 'caller_reference' \
+                     ) \
+                     ORDER BY task_row.task_uid \
+                 ) \
                  FROM task_submissions task_row\
              ), \
              'runs', (\
