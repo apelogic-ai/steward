@@ -53,6 +53,7 @@ records the limits of this tested matrix.
 | Post-M1 contracts that remain unresolved | [Deferred-contract register](docs/v2/deferred-implementation-contracts.md) |
 | Current Task lifecycle, identity, and Envelope-selection contract | [Task submission API](docs/task-submission-api.md) |
 | Call the Run API from Jenkins or Temporal | [Jenkins and Temporal caller guide](docs/calling-steward-from-jenkins-and-temporal.md) |
+| Start governed runs from signed Jira webhooks | [Jira webhook Trigger guide](docs/calling-steward-from-jira.md) |
 | Generate or consume the Run API schema | [Run API OpenAPI contract](docs/contracts/run-api/README.md) |
 | Upgrade from v0.2.6 and understand the rollback boundary | [v0.3 upgrade guide](docs/installation/upgrade-v0.3.0.md) |
 | Enable or roll back federated Task identity | [Federated Task identity upgrade](docs/installation/federated-task-identity-upgrade.md) |
@@ -120,6 +121,8 @@ docs/
   task-submission-api.md      lifecycle REST, tar paths, limits, identity boundary
   calling-steward-from-jenkins-and-temporal.md
                               Jenkins and Temporal Run API caller guide
+  calling-steward-from-jira.md
+                              Jira webhook Trigger operator guide
   contracts/run-api/         generated OpenAPI contract for /v1/tasks
   canonical-user-identity-v1.md
                               immutable user ID, Google OIDC mapping, reconnect contract

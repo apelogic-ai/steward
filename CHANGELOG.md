@@ -9,6 +9,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Added a Jira webhook Trigger operator guide covering exact-path exposure, signing Secrets,
+  read-only Envelope checks, filters, run limits, cooldowns, response meanings, optional issue
+  links, and the pending deployment acceptance evidence.
 - External Run API callers may attach a bounded display label and optional HTTPS link. My runs,
   All runs, and run details show that context with the service name from the verified Task token;
   the Jira receiver supplies its Trigger id, issue key, and configured-site issue link.
