@@ -20,6 +20,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 
+pub mod client;
+
 const SIGNATURE_PREFIX: &str = "sha256=";
 
 #[derive(Clone, Copy, Debug)]
@@ -257,11 +259,17 @@ pub trait TaskLifecycle: Send + Sync + 'static {
         &'a self,
         trigger: &'a TriggerConfig,
         invocation: TaskInvocation,
-    ) -> ReceiverFuture<'a, Result<TaskStart, String>>;
+    ) -> ReceiverFuture<'a, Result<TaskStart, TaskLifecycleError>>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskLifecycleError {
+    Retriable,
+    Final,
 }
 
 pub enum TaskStart {
-    Started(ReceiverFuture<'static, ()>),
+    Started(ReceiverFuture<'static, Result<(), TaskLifecycleError>>),
     Duplicate,
 }
 
@@ -546,7 +554,12 @@ impl Receiver {
             self.tasks
                 .start(trigger, invocation)
                 .await
-                .map_err(|_| WebhookError::Failed)
+                .map_err(|error| match error {
+                    TaskLifecycleError::Retriable => WebhookError::Failed,
+                    TaskLifecycleError::Final => {
+                        WebhookError::Invalid("The Task request was refused.")
+                    }
+                })
         }
         .await;
         let start = match started {
@@ -562,7 +575,9 @@ impl Receiver {
             TaskStart::Started(completion) => {
                 tokio::spawn(async move {
                     let _permit = permit;
-                    completion.await;
+                    if let Err(error) = completion.await {
+                        eprintln!("accepted Task lifecycle ended with a {error:?} failure");
+                    }
                 });
                 Ok(WebhookResult::Accepted)
             }
@@ -852,10 +867,10 @@ mod tests {
             &'a self,
             trigger: &'a super::TriggerConfig,
             invocation: TaskInvocation,
-        ) -> ReceiverFuture<'a, Result<TaskStart, String>> {
+        ) -> ReceiverFuture<'a, Result<TaskStart, TaskLifecycleError>> {
             Box::pin(async move {
                 if !invocation.validate_for(trigger) {
-                    return Err("Task invocation is invalid".to_owned());
+                    return Err(TaskLifecycleError::Final);
                 }
                 let fail = self.fail_start.load(Ordering::SeqCst);
                 if let Some(entered) = &self.entered {
@@ -865,20 +880,20 @@ mod tests {
                     gate.notified().await;
                 }
                 if fail {
-                    return Err("Task service is unavailable".to_owned());
+                    return Err(TaskLifecycleError::Retriable);
                 }
                 self.calls
                     .lock()
-                    .map_err(|_| "Task fixture is unavailable".to_owned())?
+                    .map_err(|_| TaskLifecycleError::Retriable)?
                     .push(invocation.clone());
                 let duplicate = {
                     let mut seen = self
                         .seen
                         .lock()
-                        .map_err(|_| "Task fixture is unavailable".to_owned())?;
+                        .map_err(|_| TaskLifecycleError::Retriable)?;
                     match seen.entry(invocation.idempotency_key.clone()) {
                         Entry::Occupied(entry) if entry.get() == &invocation => true,
-                        Entry::Occupied(_) => return Err("idempotency conflict".to_owned()),
+                        Entry::Occupied(_) => return Err(TaskLifecycleError::Final),
                         Entry::Vacant(entry) => {
                             _ = entry.insert(invocation);
                             false
@@ -899,6 +914,7 @@ mod tests {
                     if blocks {
                         std::future::pending::<()>().await;
                     }
+                    Ok(())
                 })))
             })
         }
@@ -1051,6 +1067,16 @@ mod tests {
 
     async fn expect(receiver: &Receiver, delivery: &str, author: &str, value: Result<W, E>) {
         assert_eq!(send(receiver, delivery, author).await, value);
+    }
+
+    #[test]
+    fn deployment_limit_unknown_to_the_code_controls_trigger_validation() {
+        let mut configured = limits();
+        configured.max_concurrency = 7;
+        configured.max_cooldown_seconds = 137;
+        assert!(ReceiverConfig::from_json(&config_json("[]", 7, 137), &configured).is_ok());
+        assert!(ReceiverConfig::from_json(&config_json("[]", 8, 137), &configured).is_err());
+        assert!(ReceiverConfig::from_json(&config_json("[]", 7, 138), &configured).is_err());
     }
 
     #[tokio::test]
@@ -1310,7 +1336,7 @@ mod tests {
             .map_err(|_| "Jira archive fixture is invalid")?;
         assert!(matches!(
             exact.start(&config.triggers[0], conflict).await,
-            Err(error) if error == "idempotency conflict"
+            Err(TaskLifecycleError::Final)
         ));
         assert_ne!(
             idempotency_key("one", b"same"),
