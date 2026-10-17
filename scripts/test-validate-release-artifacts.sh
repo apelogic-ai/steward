@@ -66,6 +66,7 @@ checks:chart
 image:apiserver
 image:controller
 image:mint
+image:trigger-receiver
 image:bridge
 image:web
 smoke:web
@@ -165,7 +166,7 @@ done
 # ends the run between the table and the dispatch loop's last step.
 while IFS= read -r step; do
   case "${step}" in
-    image:apiserver|image:controller|image:mint)
+    image:apiserver|image:controller|image:mint|image:trigger-receiver)
       # shellcheck disable=SC2016 # a literal line of the script under test
       arm='build_packaged_image "${image_step#image:}"'
       ;;
@@ -176,12 +177,14 @@ while IFS= read -r step; do
   [[ "$(grep -Fc -- "${arm}" "${script}")" == 1 ]] ||
     fail "${step} is not dispatched to exactly one implementation"
   case "${step}" in
-    image:apiserver|image:controller|image:mint)
-      grep -Fq "image:apiserver|image:controller|image:mint)" "${script}" ||
+    image:apiserver|image:controller|image:mint|image:trigger-receiver)
+      grep -Fq "image:apiserver|image:controller|image:mint|image:trigger-receiver)" "${script}" ||
         fail "${step} has no dispatch arm"
       ;;
   esac
 done <<<"${full_plan}"
+grep -Fq 'trigger-receiver) binary=steward-trigger-receiver ;;' "${script}" ||
+  fail "the trigger receiver image must select the exact Cargo binary name"
 for implementation in build_packaged_image build_bridge_image build_web_image \
   smoke_web_image smoke_bridge_image smoke_mint_image
 do

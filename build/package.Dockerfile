@@ -4,7 +4,8 @@ COPY . .
 RUN cargo build --locked --release \
     --bin steward-apiserver-bin \
     --bin steward-controller-bin \
-    --bin steward-mint-bin
+    --bin steward-mint-bin \
+    --bin steward-trigger-receiver
 
 FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e
 ARG BINARY

@@ -24,6 +24,8 @@ for required in \
   "helm_pull=(pull \"\${chart_repository}@\${chart_digest}\"" \
   'kind create cluster' \
   '--set-string spire.className=spire-spire' \
+  'images.triggerReceiver.tag' \
+  "\${release_version}-trigger-receiver@\${trigger_receiver_digest}" \
   "upgrade --install steward \"\${chart_archive}\"" \
   '_sqlx_migrations' \
   'complete-rendered.yaml'
@@ -47,7 +49,8 @@ fi
 for required in \
   'STEWARD_RELEASE_IMAGE_PULL_REPOSITORY' \
   'STEWARD_RELEASE_REGISTRY_MIRROR' \
-  'STEWARD_RELEASE_PLAIN_HTTP'
+  'STEWARD_RELEASE_PLAIN_HTTP' \
+  'STEWARD_RELEASE_TRIGGER_RECEIVER_DIGEST'
 do
   grep -Fq "${required}" "${harness}" || {
     echo "released-artifact acceptance omitted candidate-registry input ${required}" >&2
@@ -55,8 +58,27 @@ do
   }
 done
 
+missing_receiver_status=0
+missing_receiver_output="$({
+  STEWARD_RELEASE_VERSION=0.3.20 \
+    STEWARD_RELEASE_IMAGE_REPOSITORY=registry.example.test/steward \
+    STEWARD_RELEASE_CHART_REPOSITORY=oci://registry.example.test/charts/steward \
+    STEWARD_RELEASE_CHART_DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    STEWARD_RELEASE_APISERVER_DIGEST=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    STEWARD_RELEASE_CONTROLLER_DIGEST=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+    STEWARD_RELEASE_MINT_DIGEST=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd \
+    bash "${harness}" 2>&1
+})" || missing_receiver_status="$?"
+if [[ "${missing_receiver_status}" == 0 ]] \
+  || ! grep -Fq 'STEWARD_RELEASE_TRIGGER_RECEIVER_DIGEST is required' <<<"${missing_receiver_output}"
+then
+  echo 'released-artifact acceptance must refuse a missing trigger receiver digest' >&2
+  exit 1
+fi
+
 for required in \
   'registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373' \
+  'steward-trigger-receiver:release-validation' \
   'docker push' \
   'helm push' \
   '--plain-http 2>&1' \
@@ -71,6 +93,7 @@ done
 for required in \
   'bash scripts/customer-core-install-e2e.sh --lint-source-chart charts/steward' \
   'bash scripts/release-candidate-acceptance.sh' \
+  'Enforce critical trigger receiver image policy' \
   'Enforce critical web image policy' \
   'Enforce critical chart policy'
 do

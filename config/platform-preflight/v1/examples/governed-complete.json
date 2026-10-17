@@ -11,6 +11,7 @@
       "images.apiserver": {"target": {"reference": "registry.example.test/team-a/steward:0.2.2-apiserver", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"}},
       "images.controller": {"target": {"reference": "registry.example.test/team-a/steward:0.2.2-controller", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"}},
       "images.mint": {"target": {"reference": "registry.example.test/team-a/steward:0.2.2-mint", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"}},
+      "images.triggerReceiver": {"target": {"reference": "registry.example.test/team-a/steward:0.2.2-trigger-receiver", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"}},
       "images.web": {"target": {"reference": "registry.example.test/team-a/steward:0.2.2-web", "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"}},
       "images.bridge": {"target": {"reference": "registry.example.test/team-a/steward:0.2.2-bridge", "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"}},
       "referenceRuntimes.codex": {"target": {"reference": "registry.example.test/team-a/codex:0.140.0", "digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666"}}
@@ -21,6 +22,7 @@
         "apiserver": {"tag": "0.2.2-apiserver", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
         "controller": {"tag": "0.2.2-controller", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
         "mint": {"tag": "0.2.2-mint", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+        "triggerReceiver": {"tag": "0.2.2-trigger-receiver", "digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"},
         "web": {"tag": "0.2.2-web", "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"}
       },
       "connectionsBridge": {"image": "registry.example.test/team-a/steward@sha256:5555555555555555555555555555555555555555555555555555555555555555"}
