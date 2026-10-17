@@ -20,6 +20,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 
+pub mod client;
+
 const SIGNATURE_PREFIX: &str = "sha256=";
 
 #[derive(Clone, Copy, Debug)]
