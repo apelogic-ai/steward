@@ -14,6 +14,7 @@
 {{- end }}
 {{- $triggerReceiverConfigJson := toJson (dict "triggers" $triggerReceiverTriggers) }}
 {{- $triggerReceiverConfigHash := $triggerReceiverConfigJson | sha256sum }}
+{{- $triggerReceiverConfigMapName := printf "steward-trigger-receiver-config-%s" ($triggerReceiverConfigHash | trunc 12) }}
 {{- $sourceRepositoryBindingsJson := toJson .Values.githubSource.bindings }}
 {{- $sourceRepositoryBindingsHash := $sourceRepositoryBindingsJson | sha256sum }}
 {{- $sourceRepositoryBindingsConfigMapName := printf "steward-source-repository-bindings-%s" ($sourceRepositoryBindingsHash | trunc 12) }}
@@ -45,8 +46,19 @@
 {{- fail "triggerReceiver configuration exceeds triggerReceiver.limits.maxConfigBytes" }}
 {{- end }}
 {{- range .Values.triggerReceiver.triggers }}
-{{- if and $.Values.triggerReceiver.enabled (or (gt (int .concurrencyLimit) (int $.Values.triggerReceiver.limits.maxConcurrency)) (gt (int .cooldownSeconds) (int $.Values.triggerReceiver.limits.maxCooldownSeconds)) (gt (len .ignoredAccountIds) (int $.Values.triggerReceiver.limits.maxIgnoredAccounts))) }}
+{{- if and $.Values.triggerReceiver.enabled (or (gt (int .concurrencyLimit) (int $.Values.triggerReceiver.limits.maxConcurrency)) (gt (int .cooldownSeconds) (int $.Values.triggerReceiver.limits.maxCooldownSeconds)) (gt (len .ignoredAccountIds) (int $.Values.triggerReceiver.limits.maxIgnoredAccounts)) (gt (len .id) (int $.Values.triggerReceiver.limits.maxIdentifierBytes)) (gt (len .workflow) (int $.Values.triggerReceiver.limits.maxIdentifierBytes)) (gt (len .service) (int $.Values.triggerReceiver.limits.maxIdentifierBytes)) (gt (len (printf "/run/trigger-signing/%s" .id)) (int $.Values.triggerReceiver.limits.maxIdentifierBytes))) }}
 {{- fail (printf "triggerReceiver Trigger %s exceeds its configured limit" .id) }}
+{{- end }}
+{{- end }}
+{{- if .Values.triggerReceiver.enabled }}
+{{- $seenTriggerIds := dict }}
+{{- range .Values.triggerReceiver.triggers }}
+{{- if hasKey $seenTriggerIds .id }}{{ fail (printf "triggerReceiver Trigger id %s is duplicated" .id) }}{{ end }}
+{{- $_ := set $seenTriggerIds .id true }}
+{{- end }}
+{{- $exchangeHost := trimPrefix "https://" (regexFind "^https://[^/:?#]+" .Values.triggerReceiver.workloadExchange.endpoint) }}
+{{- if ne $exchangeHost .Values.triggerReceiver.workloadExchange.serverName }}
+{{- fail "triggerReceiver workload exchange endpoint and server name must match" }}
 {{- end }}
 {{- end }}
 {{- if and .Values.triggerReceiver.enabled (gt (int .Values.triggerReceiver.limits.pollInitialMilliseconds) (int .Values.triggerReceiver.limits.pollMaxMilliseconds)) }}
@@ -315,7 +327,7 @@ data:
 ---
 apiVersion: v1
 kind: ConfigMap
-metadata: { name: steward-trigger-receiver-config }
+metadata: { name: {{ $triggerReceiverConfigMapName }} }
 immutable: true
 data:
   config.json: {{ $triggerReceiverConfigJson | quote }}
@@ -803,7 +815,7 @@ spec:
             - { name: STEWARD_WORKLOAD_EXCHANGE_ENDPOINT, value: {{ .Values.triggerReceiver.workloadExchange.endpoint | quote }} }
             - { name: STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME, value: {{ .Values.triggerReceiver.workloadExchange.serverName | quote }} }
             - { name: STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE, value: /run/workload-exchange/ca.crt }
-            - { name: STEWARD_API_ORIGIN, value: {{ printf "https://steward-apiserver:%v" .Values.services.apiserverPort | quote }} }
+            - { name: STEWARD_API_ORIGIN, value: {{ printf "https://steward-apiserver.%s.svc.%s:%v" .Release.Namespace .Values.services.clusterDomain .Values.services.apiserverPort | quote }} }
             - { name: STEWARD_API_SERVER_NAME, value: {{ printf "steward-apiserver.%s.svc.%s" .Release.Namespace .Values.services.clusterDomain | quote }} }
             - { name: STEWARD_API_CA_CERTIFICATE_FILE, value: /run/task-api/ca.crt }
             - { name: STEWARD_TRIGGER_MAX_CONFIG_BYTES, value: {{ .Values.triggerReceiver.limits.maxConfigBytes | quote }} }
@@ -840,7 +852,7 @@ spec:
       volumes:
         - name: trigger-config
           configMap:
-            name: steward-trigger-receiver-config
+            name: {{ $triggerReceiverConfigMapName }}
             items: [{ key: config.json, path: config.json }]
         - name: trigger-signing
           projected:
@@ -848,6 +860,9 @@ spec:
 {{- range .Values.triggerReceiver.triggers }}
               - secret:
                   name: {{ .signingSecret.name }}
+{{- if not .enabled }}
+                  optional: true
+{{- end }}
                   items: [{ key: {{ .signingSecret.key }}, path: {{ .id }} }]
 {{- end }}
         - name: capability-catalog
@@ -1164,8 +1179,13 @@ metadata: { name: steward-apiserver-ingress }
 spec:
   podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
   policyTypes: [Ingress]
-{{- if or .Values.networkPolicy.apiserverIngressNamespaces .Values.networkPolicy.burbleNamespace .Values.networkPolicy.arcNamespace (and .Values.web.enabled .Values.networkPolicy.ingressNamespace) }}
+{{- if or .Values.triggerReceiver.enabled .Values.networkPolicy.apiserverIngressNamespaces .Values.networkPolicy.burbleNamespace .Values.networkPolicy.arcNamespace (and .Values.web.enabled .Values.networkPolicy.ingressNamespace) }}
   ingress:
+{{- if .Values.triggerReceiver.enabled }}
+    - from:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: trigger-receiver } }
+      ports: [{ protocol: TCP, port: 8443 }]
+{{- end }}
 {{- if .Values.networkPolicy.apiserverIngressNamespaces }}
     - from:
 {{- range .Values.networkPolicy.apiserverIngressNamespaces }}

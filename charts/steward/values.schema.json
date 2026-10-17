@@ -163,23 +163,23 @@
             "additionalProperties": false,
             "required": ["id", "enabled", "source", "workflow", "service", "ownerUserId", "envelopeDigest", "signingSecret", "concurrencyLimit", "cooldownSeconds"],
             "properties": {
-              "id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$", "maxLength": 1024},
+              "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 1024},
               "enabled": {"type": "boolean"},
               "source": {"const": "jira"},
-              "workflow": {"type": "string", "minLength": 1, "maxLength": 1024},
+              "workflow": {"type": "string", "pattern": "^[a-z](?:[a-z0-9-]*[a-z0-9])?@[1-9][0-9]*$", "maxLength": 1024},
               "service": {"type": "string", "minLength": 1, "maxLength": 1024},
               "ownerUserId": {"type": "string", "pattern": "^usr_[a-f0-9]{32}$"},
-              "envelopeDigest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+              "envelopeDigest": {"type": "string", "pattern": "^steward:sha256:[a-f0-9]{64}$"},
               "filters": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                  "event": {"type": "string", "minLength": 1, "maxLength": 1024},
-                  "project": {"type": "string", "minLength": 1, "maxLength": 1024},
-                  "issueType": {"type": "string", "minLength": 1, "maxLength": 1024}
+                  "event": {"type": "string", "pattern": "^[a-z0-9:_]+$", "maxLength": 1024},
+                  "project": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$", "maxLength": 1024},
+                  "issueType": {"type": "string", "pattern": "^[0-9]+$", "maxLength": 1024}
                 }
               },
-              "ignoredAccountIds": {"type": "array", "maxItems": 4096, "items": {"type": "string", "minLength": 1, "maxLength": 1024}, "uniqueItems": true},
+              "ignoredAccountIds": {"type": "array", "maxItems": 4096, "items": {"type": "string", "pattern": "^[A-Za-z0-9:-]+$", "maxLength": 1024}, "uniqueItems": true},
               "signingSecret": {
                 "type": "object",
                 "additionalProperties": false,

@@ -280,14 +280,14 @@ triggerReceiver:
   taskApi:
     ca: { kind: ConfigMap, name: steward-apiserver-ca, key: ca.crt }
   triggers:
-    - id: jira-read
+    - id: jira_read
       enabled: true
       source: jira
       workflow: triage@1
       service: event-worker
       ownerUserId: usr_11111111111111111111111111111111
-      envelopeDigest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      filters: { project: PROJ }
+      envelopeDigest: steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      filters: { event: jira:issue_updated, project: PROJ, issueType: "10001" }
       ignoredAccountIds: []
       concurrencyLimit: 2
       cooldownSeconds: 60
@@ -298,11 +298,12 @@ networkPolicy:
   postgresCidrs: [192.0.2.2/32]
 ```
 
-Jira Cloud must reach the receiver through HTTPS. Create the public Gateway or
-Ingress in the platform layer and forward **only the exact path `/hooks/jira`** to
-the `steward-trigger-receiver` Service. Do not publish a path prefix, the Service
-root, or any other receiver path. The chart intentionally does not create that edge
-route, public hostname, certificate, or controller-specific timeout policy. Set
+Jira Cloud must reach the receiver through HTTPS. For each enabled Trigger, create
+the public Gateway or Ingress in the platform layer and forward **only its exact
+`/hooks/jira/<id>` path** to the `steward-trigger-receiver` Service (for the example,
+`/hooks/jira/jira_read`). Do not publish `/hooks/jira` as a prefix, the Service root,
+or any other receiver path. The chart intentionally does not create that edge route,
+public hostname, certificate, or controller-specific timeout policy. Set
 `networkPolicy.ingressNamespace` to the edge data-plane namespace and keep the
 Kubernetes API and PostgreSQL CIDRs limited to the exact deployment endpoints.
 

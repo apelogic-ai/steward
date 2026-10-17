@@ -70,7 +70,7 @@ do
   fi
 done
 
-receiver_trigger='[{"id":"jira-read","enabled":true,"source":"jira","workflow":"triage@1","service":"event-worker","ownerUserId":"usr_11111111111111111111111111111111","envelopeDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filters":{"project":"PROJ"},"ignoredAccountIds":[],"concurrencyLimit":2,"cooldownSeconds":60,"signingSecret":{"name":"steward-jira-webhook","key":"secret"}}]'
+receiver_trigger='[{"id":"Jira_read","enabled":true,"source":"jira","workflow":"triage@1","service":"event-worker","ownerUserId":"usr_11111111111111111111111111111111","envelopeDigest":"steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filters":{"event":"jira:issue_updated","project":"PROJ","issueType":"10001"},"ignoredAccountIds":["acct-1"],"concurrencyLimit":2,"cooldownSeconds":60,"signingSecret":{"name":"steward-jira-webhook","key":"secret"}}]'
 receiver_inputs=(
   --set-string tls.webhook.caBundlePem=public-test-ca
   --set triggerReceiver.enabled=true
@@ -110,9 +110,26 @@ do
     exit 1
   }
 done
-grep -qF 'https://steward-apiserver:443' "${rendered}"
+grep -qF 'https://steward-apiserver.steward.svc.cluster.local:443' "${rendered}"
 grep -qF 'steward-apiserver.steward.svc.cluster.local' "${rendered}"
-grep -qF '/run/trigger-signing/jira-read' "${rendered}"
+grep -qF '/run/trigger-signing/Jira_read' "${rendered}"
+apiserver_ingress="$(awk '/^metadata: \{ name: steward-apiserver-ingress \}/ { found = 1 } found { print } found && /^---$/ { exit }' "${rendered}")"
+grep -qF 'app.kubernetes.io/component: trigger-receiver' <<< "${apiserver_ingress}"
+
+receiver_config="$(
+  awk '/^metadata: \{ name: steward-trigger-receiver-config/ { found = 1 } found && /^  config.json: / { sub(/^  config.json: /, ""); print; exit }' "${rendered}" |
+    jq -r .
+)"
+inline_env_value() {
+  sed -n "/name: ${1},/s/.*value: \"\([^\"]*\)\".*/\1/p" "${rendered}" | head -1
+}
+STEWARD_CHART_RECEIVER_CONFIG="${receiver_config}" \
+STEWARD_CHART_API_ORIGIN="$(inline_env_value STEWARD_API_ORIGIN)" \
+STEWARD_CHART_API_SERVER_NAME="$(inline_env_value STEWARD_API_SERVER_NAME)" \
+STEWARD_CHART_EXCHANGE_ENDPOINT="$(inline_env_value STEWARD_WORKLOAD_EXCHANGE_ENDPOINT)" \
+STEWARD_CHART_EXCHANGE_SERVER_NAME="$(inline_env_value STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME)" \
+  cargo test --quiet --package steward-trigger-receiver \
+    client::tests::chart_render_contract_from_environment -- --exact
 
 for missing in \
   triggerReceiver.databaseSecret.name \
@@ -130,11 +147,56 @@ do
   fi
 done
 
+duplicate_triggers="$(printf '%s' "${receiver_trigger}" | jq -c '. + [(.[] | .cooldownSeconds = 61)]')"
+if helm_template "${receiver_inputs[@]}" \
+  --set-json "triggerReceiver.triggers=${duplicate_triggers}" > /dev/null 2>&1; then
+  echo 'Jira Trigger receiver must reject duplicate Trigger ids' >&2
+  exit 1
+fi
+
+if helm_template "${receiver_inputs[@]}" \
+  --set-string triggerReceiver.workloadExchange.serverName=other.example.test > /dev/null 2>&1; then
+  echo 'Jira Trigger receiver must reject a workload exchange server-name mismatch' >&2
+  exit 1
+fi
+
+if helm_template "${receiver_inputs[@]}" \
+  --set triggerReceiver.limits.maxIdentifierBytes=20 > /dev/null 2>&1; then
+  echo 'Jira Trigger receiver must count the generated signing-secret path against the identifier limit' >&2
+  exit 1
+fi
+
 if helm_template "${receiver_inputs[@]}" \
   --set triggerReceiver.limits.maxConcurrency=1025 > /dev/null 2>&1; then
   echo 'Jira Trigger receiver must reject concurrency above the binary ceiling' >&2
   exit 1
 fi
+
+for invalid_trigger in \
+  'triggerReceiver.triggers[0].envelopeDigest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+  'triggerReceiver.triggers[0].filters.project=proj lower' \
+  'triggerReceiver.triggers[0].filters.issueType=not-numeric'
+do
+  if helm_template "${receiver_inputs[@]}" --set-string "${invalid_trigger}" > /dev/null 2>&1; then
+    echo "Jira Trigger receiver must reject invalid ${invalid_trigger%%=*}" >&2
+    exit 1
+  fi
+done
+
+first_config_name="$(awk '/^metadata: \{ name: steward-trigger-receiver-config/ { print $4; exit }' "${rendered}" | tr -d '}')"
+helm_template "${receiver_inputs[@]}" \
+  --set triggerReceiver.triggers[0].cooldownSeconds=61 > "${rendered}"
+second_config_name="$(awk '/^metadata: \{ name: steward-trigger-receiver-config/ { print $4; exit }' "${rendered}" | tr -d '}')"
+if [[ -z "${first_config_name}" || "${first_config_name}" == "${second_config_name}" ]]; then
+  echo 'Jira Trigger receiver config changes must select a new immutable ConfigMap' >&2
+  exit 1
+fi
+helm_template "${receiver_inputs[@]}" \
+  --set triggerReceiver.triggers[0].enabled=false > "${rendered}"
+grep -qF 'optional: true' "${rendered}" || {
+  echo 'a disabled Trigger must not require its signing Secret to exist' >&2
+  exit 1
+}
 
 if helm_template "${receiver_inputs[@]}" \
   --set triggerReceiver.limits.sourceTokenSeconds=599 > /dev/null 2>&1; then
