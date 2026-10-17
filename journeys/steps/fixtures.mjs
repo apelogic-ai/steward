@@ -65,10 +65,19 @@ export const test = base.extend({
       runRuntimeMinutes: null,
       statedSingleRunLimit: null,
       selectedModels: [],
+      cleanups: [],
       shared,
       transientSeen: new Set(),
     };
     await use(state);
+    const cleanupErrors = [];
+    for (const cleanup of state.cleanups.reverse()) {
+      try {
+        await cleanup();
+      } catch {
+        cleanupErrors.push("cleanup failed");
+      }
+    }
     if (state.restoreOnboardingDismissal) await state.restoreOnboardingDismissal();
     page.off("console", onConsole);
     page.off("pageerror", onPageError);
@@ -81,6 +90,7 @@ export const test = base.extend({
       throw new Error("[steward-known-failure:#478] the Task page emitted one unavailable workflow-publication request");
     }
     if (state.statedSingleRunLimit === "0" && onlyZeroBudgetTaskSaveRejected(consoleErrors, taskSaveRejections, page.url())) return;
+    expect(cleanupErrors, "the journey must clean up every caller Task it starts").toEqual([]);
     expect(consoleErrors, "the journey must not emit browser console errors").toEqual([]);
   },
 });

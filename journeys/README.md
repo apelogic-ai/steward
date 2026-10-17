@@ -1,9 +1,11 @@
 # User journeys as feature files
 
-Eleven journeys for the web UI (brand name in the UI: HyperShell), one file each. A journey is one person, one goal, from start to finish. The files are plain text that a person can read and a test runner can run.
+Twelve journeys cover the web UI (brand name in the UI: HyperShell) and service callers, one file
+each. A journey is one person or caller, one goal, from start to finish. The files are plain text
+that a person can read and a test runner can run.
 
 The feature set comes from the user-journey specification (J1 to J10), plus the Jira acceptance
-journey J11. The runner loads all eleven
+journey J11 and the service-caller acceptance journey J12. The runner loads all twelve
 files. `@smoke` executes the release-critical paths in J1 through J4; `@extended` executes the
 currently passing one-account paths in J2 and J6 through J8. J5's documented paths still carry
 product findings, J9 needs a second signed-in person, and J10 needs operator control of the
@@ -23,6 +25,7 @@ are available.
 | `J09-…` | Administrator oversight |
 | `J10-…` | Operator changes configuration |
 | `J11-…` | User runs a Task with Jira |
+| `J12-…` | Jenkins, Temporal and Jira callers run governed work |
 
 `STEPS.md` lists every sentence pattern the files use.
 
@@ -43,16 +46,16 @@ are available.
 
 ## To add a scenario or a journey
 
-1. A new feature first goes into the journey whose goal it serves, as a new scenario. Start a new file only for a new goal. Name it `J11-short-name.feature`.
+1. A new feature first goes into the journey whose goal it serves, as a new scenario. Start a new file only for a new goal. Name it `J13-short-name.feature`.
 2. Write each line with a pattern from `STEPS.md`.
 3. If no pattern fits, write the sentence the way a person would say it, and add it to `STEPS.md` in the same change. See "A sentence with no code behind it" below.
 4. Add the tags that apply.
 
 ## Writing rules
 
-- **One person, one goal.** "I" is the person of the journey. A second person is named by role: "an administrator", "a user", "the operator".
+- **One person or caller, one goal.** "I" is the person of a UI journey. A second person is named by role: "an administrator", "a user", "the operator". A caller journey names the external system that acts.
 - **One account by default.** A journey uses one universal account: a user who is also an administrator (`Given I am signed in as a user who is also an administrator`), or a user with one role. That person asks as a user, switches to the administrator area of the same UI, and decides. Use a second account only when the scenario is about separation of roles (what a person without a role must not see or do) or about another person's data, and tag it `@two-accounts`.
-- **Only what a person does and sees.** No page addresses, no element names, no server answers, no stored records, no internal words.
+- **Only observable behavior.** UI journeys say what a person does and sees. Caller journeys say what the caller sends and receives. Neither exposes implementation details or stored secrets.
 - **Exact UI text in quotes.** If the text is not known yet, write a plain sentence without quotes and mark it with a note `# UI text to confirm`.
 - **State the expected text.** Where the product today shows something else, the file still holds the text a person should see. Tag the scenario `@known-failing-<version>`.
 - **A unit on every number.** "15 min", "10.00 USD", "2 GiB", "0 new entries". A value typed into a field is written exactly as typed; the unit is in a note above the line or in the column name.
@@ -77,6 +80,7 @@ are available.
 | `<provider-a>/<new-model>` | A model added in configuration only (J10). |
 | `<provider-c>/<model-c>` | A model no configured agent can use (J10). |
 | `<run-runtime-minutes>` | A within-template runtime allowance derived from the unique smoke run prefix. |
+| `<run-prefix>` | The unique `STEWARD_JOURNEY_RUN_PREFIX`, also used in caller idempotency identities and Jira payloads. |
 | "member" | The role a template is meant for. |
 
 Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test installation.
@@ -90,6 +94,11 @@ Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test
 | `@needs-model` | Makes a real model call. Costs money. |
 | `@needs-github` | Needs an external repository that the installation allows. |
 | `@needs-jira` | Needs a connected Jira account and the `jira-read` template fixture created after `@smoke` with the same run prefix. |
+| `@callers` | Exercises external caller exchange, Run API and receiver paths in J12. |
+| `@pending-jira-receiver` | Prepared receiver coverage that is not run until the Jira receiver A2/B changes land. This is not a known-failure waiver. |
+| `@live-jira-webhook` | Causes a real Jira event to reach a public receiver. It also requires `@owner-only`. |
+| `@needs-public-ingress` | Requires the target receiver to be reachable from the external service. |
+| `@owner-only` | Runs only after the owner explicitly authorizes that live external action for the current run. |
 | `@two-accounts` | Needs a second signed-in person. |
 | `@operator` | Needs a change to the installation outside the UI. |
 | `@nightly` | Long. Not for every build. |
@@ -111,7 +120,7 @@ When a file holds a sentence that has no code:
 
 So a maintainer can write a new sentence at any time. The cost is one request to a test engineer, and the scenario stays unproven until it is answered. Reusing a pattern from `STEPS.md` costs nothing.
 
-The runner includes all eleven files, but tags select only the intended scenarios. Feature
+The runner includes all twelve files, but tags select only the intended scenarios. Feature
 specifications without step code do not look tested: selecting one fails generation before a
 browser starts.
 
@@ -159,6 +168,54 @@ After the owner connects Jira, run its acceptance journey with the same prefix t
 
 ```console
 cargo xtask journeys --tags @needs-jira
+```
+
+### Service callers
+
+J12 calls the exchange, Run API and receiver endpoints directly. It still uses the signed-in
+administrator storage state to prove that a refusal or replay created no extra Task. Configure
+these non-secret values for the target installation:
+
+| Variable | Value |
+|---|---|
+| `STEWARD_JOURNEY_JENKINS_EXCHANGE_URL` | Exact generic OIDC exchange URL ending in `/v1/oidc/exchange`. |
+| `STEWARD_JOURNEY_JENKINS_WORKFLOW` | Versioned Workflow bound to the Jenkins service, such as `release-summary@1`. |
+| `STEWARD_JOURNEY_TEMPORAL_EXCHANGE_URL` | Exact workload exchange URL ending in `/v1/workload/exchange`. |
+| `STEWARD_JOURNEY_TEMPORAL_WORKFLOW` | Versioned Workflow bound to the Temporal service. |
+| `STEWARD_JOURNEY_UNBOUND_EXCHANGE_URL` | Exchange URL that will receive the deliberately unbound assertion. |
+| `STEWARD_JOURNEY_JIRA_RECEIVER_ORIGIN` | Origin of the receiver whose Trigger uses a read-only Envelope. |
+| `STEWARD_JOURNEY_JIRA_TRIGGER_ID` | That read-only Trigger's configured ID. |
+| `STEWARD_JOURNEY_JIRA_WRITE_RECEIVER_ORIGIN` | Origin of an already-running receiver whose Trigger Envelope was changed to include write access. |
+| `STEWARD_JOURNEY_JIRA_WRITE_TRIGGER_ID` | That Trigger's configured ID. |
+
+Credential helpers are absolute executable paths outside the repository. Each helper receives no
+arguments and must write only one fresh source assertion to standard output. The runner invokes it
+again for every exchange and never reports its output. Configure
+`STEWARD_JOURNEY_JENKINS_SOURCE_HELPER`, `STEWARD_JOURNEY_TEMPORAL_SOURCE_HELPER`, and
+`STEWARD_JOURNEY_UNBOUND_SOURCE_HELPER`. Put the Jira signing secrets in credential files outside
+the repository and set `STEWARD_JOURNEY_JIRA_SIGNING_SECRET_FILE` and
+`STEWARD_JOURNEY_JIRA_WRITE_SIGNING_SECRET_FILE` to their absolute paths.
+
+While the receiver work is pending, the prepared non-receiver paths have one selector:
+
+```console
+cargo xtask journeys --tags '@callers and not @pending-jira-receiver'
+```
+
+After the receiver changes land, all direct signed-payload paths run with one command:
+
+```console
+cargo xtask journeys --tags '@callers and not @live-jira-webhook'
+```
+
+The live Jira path additionally requires a public receiver, an owner instruction for the current
+run, `STEWARD_JOURNEY_ALLOW_LIVE_JIRA_WEBHOOK=$STEWARD_JOURNEY_RUN_PREFIX`, the exact neutral issue key in
+`STEWARD_JOURNEY_LIVE_JIRA_ISSUE_KEY`, and an absolute no-argument
+`STEWARD_JOURNEY_LIVE_JIRA_HELPER`. The helper performs the already-configured Jira action and its
+output is discarded. With those safeguards in place, the complete caller set remains one command:
+
+```console
+cargo xtask journeys --tags @callers
 ```
 
 The extended fixture authors run-prefixed `basic` and `broad` templates through the real admin API

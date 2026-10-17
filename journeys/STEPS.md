@@ -1,6 +1,6 @@
 # Step vocabulary
 
-Every sentence used in the eleven `.feature` files follows one of the **66 patterns** below.
+Every sentence used in the twelve `.feature` files follows one of the **88 patterns** below.
 A new scenario should be written with these patterns. Add a pattern only when a person does or sees something that no pattern here can say.
 
 ## How to read a pattern
@@ -133,9 +133,39 @@ Done by the operator, outside the web UI.
 | `I apply a configuration that is not valid for this version` | none | - | 1 | 1 | J10 |
 | `the services refuse to start with a message that names the setting` | none | - | 1 | 1 | J10 |
 
+## Service callers (22)
+
+Used by J12 to exercise the exchange, Run API and Jira receiver contracts without putting a
+credential in a feature file or report.
+
+| Pattern | Parameters | Meaning | Files | Uses | Used in |
+|---|---|---|---|---|---|
+| `the caller journey target is configured` | none | Checks the target origin and unique run prefix. | 1 | 7 | J12 |
+| `the {string} caller is bound to a versioned Workflow` | caller name | Loads that caller's exchange helper and versioned Workflow. | 1 | 2 | J12 |
+| `a Jenkins job exchanges its source assertion` | none | Obtains a fresh Jenkins assertion from its helper and exchanges it without logging either token. | 1 | 1 | J12 |
+| `a Temporal activity exchanges its workload assertion` | none | Obtains and exchanges a fresh workload assertion without logging either token. | 1 | 1 | J12 |
+| `it runs the bound Workflow with the stable identity {string}` | idempotency identity | Replaces `<run-prefix>`, then creates, uploads and executes one Task. Each request uses a fresh exchange. | 1 | 2 | J12 |
+| `the caller Task ends as {string} within {int} min` | phase; minutes | Polls with a fresh exchange until the caller's Task is terminal. | 1 | 2 | J12 |
+| `the caller downloads output containing {string}` | expected text | Downloads the output tar and checks for the expected result. | 1 | 2 | J12 |
+| `an unbound caller assertion is available` | none | Loads the deliberately unbound assertion helper and records the starting Task set. | 1 | 1 | J12 |
+| `the unbound caller requests a Task token` | none | Calls exchange with the unbound assertion. | 1 | 1 | J12 |
+| `the token exchange is refused` | none | Requires a client refusal without exposing the response body. | 1 | 1 | J12 |
+| `the caller creates {int} new Tasks` | count | Compares the administrator Task set with the scenario's starting set. | 1 | 1 | J12 |
+| `the Jira receiver uses a read-only Envelope` | none | Loads the read-only receiver origin, Trigger and signing secret, then records the starting Task set. | 1 | 3 | J12 |
+| `the Jira receiver uses a write-capable Envelope` | none | Loads the separate receiver whose active Trigger Envelope now includes write access. | 1 | 1 | J12 |
+| `the owner explicitly allowed a live Jira webhook test` | none | Requires the exact opt-in for a live external Jira action. | 1 | 1 | J12 |
+| `Jira sends the signed delivery {string} for issue {string}` | delivery ID; issue key | Signs and sends one neutral Jira payload directly to the receiver. | 1 | 3 | J12 |
+| `Jira replays that signed delivery` | none | Re-sends the exact body, signature and delivery identity. | 1 | 1 | J12 |
+| `the live Jira helper updates issue {string}` | issue key | Runs the owner-provided no-argument helper with all output discarded. | 1 | 1 | J12 |
+| `the receiver accepts the delivery` | none | Requires the receiver's accepted response. | 1 | 1 | J12 |
+| `the receiver refuses the delivery because the Envelope is not read-only` | none | Requires the read-only refusal and no internal diagnostic. | 1 | 1 | J12 |
+| `the receiver reports that no run was needed` | none | Requires the replay response. | 1 | 1 | J12 |
+| `the receiver creates {int} new Task/Tasks` | count | Compares the administrator Task set with the scenario's starting set. | 1 | 4 | J12 |
+| `the receiver Task ends as {string} within {int} min` | phase; minutes | Waits for the receiver-created Task to reach its terminal phase and finish cleanup in the administrator view. | 1 | 3 | J12 |
+
 ## Totals
 
-- Patterns: **66** (Setup 6, Sign-in 3, Any screen 25, Templates 3, Envelope requests 5, Tasks and runs 12, Logs 3, Administration 4, Configuration 5).
-- Used in 2 or more files: 42. Used in 1 file only: 24.
+- Patterns: **88** (Setup 6, Sign-in 3, Any screen 25, Templates 3, Envelope requests 5, Tasks and runs 12, Logs 3, Administration 4, Configuration 5, Service callers 22).
+- Used in 2 or more files: 42. Used in 1 file only: 46.
 - The patterns whose meaning says "no exact text exists yet" or "the Markdown does not say" are placeholders. Each should be replaced by `{actor} see(s) {string}` with the real UI text, or by a concrete action, once that text is confirmed. That would lower the count.
 - One piece of supporting code is needed besides the sentences: the `{actor}` parameter (a list of the five names above).

@@ -19,6 +19,7 @@ const testDir = defineBddConfig({
     "J09-administrator-oversight.feature",
     "J10-operator-changes-configuration.feature",
     "J11-user-runs-a-task-with-jira.feature",
+    "J12-service-callers-run-governed-work.feature",
   ],
   steps: "steps/*.mjs",
   outputDir: `.generated/${execution}`,
