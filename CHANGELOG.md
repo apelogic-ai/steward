@@ -10,9 +10,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Added
 
 - Added prepared `@callers` journeys for Jenkins and Temporal Run API callers, Jira receiver
-  delivery and replay, unbound-caller refusal, and write-capable Envelope refusal. Receiver paths
-  remain tagged pending until their deployment changes land, and the live Jira path requires an
-  explicit owner opt-in.
+  delivery and replay, unbound-caller refusal, write-capable Envelope refusal, missing or invalid
+  Jira signatures, and Trigger cooldown. Direct receiver paths now follow the deployed response
+  contract; the live Jira path still requires an explicit owner opt-in.
 - Added validation, routing, and the ability to start and clean up governed Tasks for signed,
   bounded Jira webhook Triggers. The Helm chart can now deploy that receiver with isolated
   identity, exact Secret and CA projections, bounded runtime settings, and deny-by-default

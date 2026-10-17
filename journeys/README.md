@@ -95,7 +95,6 @@ Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test
 | `@needs-github` | Needs an external repository that the installation allows. |
 | `@needs-jira` | Needs a connected Jira account and the `jira-read` template fixture created after `@smoke` with the same run prefix. |
 | `@callers` | Exercises external caller exchange, Run API and receiver paths in J12. |
-| `@pending-jira-receiver` | Prepared receiver coverage that is not run until the Jira receiver A2/B changes land. This is not a known-failure waiver. |
 | `@live-jira-webhook` | Causes a real Jira event to reach a public receiver. It also requires `@owner-only`. |
 | `@needs-public-ingress` | Requires the target receiver to be reachable from the external service. |
 | `@owner-only` | Runs only after the owner explicitly authorizes that live external action for the current run. |
@@ -184,7 +183,9 @@ these non-secret values for the target installation:
 | `STEWARD_JOURNEY_TEMPORAL_WORKFLOW` | Versioned Workflow bound to the Temporal service. |
 | `STEWARD_JOURNEY_UNBOUND_EXCHANGE_URL` | Exchange URL that will receive the deliberately unbound assertion. |
 | `STEWARD_JOURNEY_JIRA_RECEIVER_ORIGIN` | Origin of the receiver whose Trigger uses a read-only Envelope. |
-| `STEWARD_JOURNEY_JIRA_TRIGGER_ID` | That read-only Trigger's configured ID. |
+| `STEWARD_JOURNEY_JIRA_TRIGGER_ID` | That read-only Trigger's configured ID. The local-main acceptance configuration uses `local-read`. |
+| `STEWARD_JOURNEY_JIRA_COOLDOWN_SECONDS` | The read-only Trigger's configured per-issue cooldown in seconds; J12 requires at least `60`. |
+| `STEWARD_JOURNEY_JIRA_MAX_ISSUE_COOLDOWNS` | The receiver's configured issue-reservation capacity; J12 requires at least `4`. |
 | `STEWARD_JOURNEY_JIRA_WRITE_RECEIVER_ORIGIN` | Origin of an already-running receiver whose Trigger Envelope was changed to include write access. |
 | `STEWARD_JOURNEY_JIRA_WRITE_TRIGGER_ID` | That Trigger's configured ID. |
 
@@ -196,17 +197,30 @@ again for every exchange and never reports its output. Configure
 the repository and set `STEWARD_JOURNEY_JIRA_SIGNING_SECRET_FILE` and
 `STEWARD_JOURNEY_JIRA_WRITE_SIGNING_SECRET_FILE` to their absolute paths.
 
-While the receiver work is pending, the prepared non-receiver paths have one selector:
+The read-only Trigger must have a per-issue cooldown of at least 60 seconds and the receiver must
+retain at least four issue reservations. Those bounds keep the second same-issue delivery inside
+the cooldown while leaving room for both earlier accepted deliveries and the optional live case.
 
-```console
-cargo xtask journeys --tags '@callers and not @pending-jira-receiver'
-```
+The write-capable refusal uses a separate receiver so its deliberately unsafe state cannot affect
+`local-read`. Start that receiver and its Trigger against a read-only Envelope, wait for readiness,
+then change only its isolated capability-catalog copy so one of that Envelope's grants is classified
+as write-capable. Keep the receiver running: it rechecks the Envelope and current catalog on the
+request and must return the read-only refusal. Restore or remove this acceptance-only fixture during
+teardown. A receiver configured with unsafe authority at startup is not a valid fixture because it
+must fail closed before serving.
 
-After the receiver changes land, all direct signed-payload paths run with one command:
+Once apelogic-ai/gitops#272 lands, local-main uses the `local-read` Trigger and its exact edge route
+for `STEWARD_JOURNEY_JIRA_RECEIVER_ORIGIN`, plus the isolated runtime-revalidation fixture above.
+All direct signed-payload and refusal paths run with one command:
 
 ```console
 cargo xtask journeys --tags '@callers and not @live-jira-webhook'
 ```
+
+The direct receiver assertions follow its public response contract: `202` means one Task was
+accepted, `200` means a replay or filtered event needed no run, `401` means the signature was
+missing or invalid, and `429` means the Trigger's concurrency or cooldown limit refused the
+delivery. The write-capable Envelope probe expects the receiver's `400` read-only refusal.
 
 The live Jira path additionally requires a public receiver, an owner instruction for the current
 run, `STEWARD_JOURNEY_ALLOW_LIVE_JIRA_WEBHOOK=$STEWARD_JOURNEY_RUN_PREFIX`, the exact neutral issue key in

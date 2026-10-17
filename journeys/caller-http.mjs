@@ -269,34 +269,62 @@ export function jiraSignature(secret, body) {
   return `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
 }
 
-export function jiraReceiverConfiguration(mode, environment = process.env) {
+export function invalidJiraSignature(secret, body) {
+  const valid = jiraSignature(secret, body);
+  const replacement = valid.endsWith("0") ? "1" : "0";
+  return `${valid.slice(0, -1)}${replacement}`;
+}
+
+function requiredInteger(name, environment) {
+  const value = required(name, environment);
+  if (!/^[1-9][0-9]*$/.test(value)) throw new Error(`${name} must be a positive integer.`);
+  return Number(value);
+}
+
+export function jiraReceiverConfiguration(mode, environment = process.env, dependencies = {}) {
   const write = mode === "write";
   if (!write && mode !== "read") throw new Error(`Unsupported Jira receiver mode ${mode}.`);
   const prefix = write ? "STEWARD_JOURNEY_JIRA_WRITE" : "STEWARD_JOURNEY_JIRA";
   const secretFile = required(`${prefix}_SIGNING_SECRET_FILE`, environment);
   if (!isAbsolute(secretFile)) throw new Error(`${prefix}_SIGNING_SECRET_FILE must use an absolute path outside the repository.`);
-  const secret = readFileSync(secretFile);
+  const secret = (dependencies.readFile ?? readFileSync)(secretFile);
   if (!secret.length || secret.length > MAX_EXCHANGE_BYTES) throw new Error("The Jira signing secret file is empty or too large.");
-  const trimmedSecret = Buffer.from(secret.toString("utf8").trimEnd());
-  if (!trimmedSecret.length) throw new Error("The Jira signing secret file is empty or too large.");
-  return {
+  const config = {
     origin: exactHttpUrl(
       `${prefix}_RECEIVER_ORIGIN`,
       required(`${prefix}_RECEIVER_ORIGIN`, environment),
     ).origin,
-    secret: trimmedSecret,
+    secret: Buffer.from(secret),
     trigger: required(`${prefix}_TRIGGER_ID`, environment),
   };
+  if (!write) {
+    config.cooldownSeconds = requiredInteger("STEWARD_JOURNEY_JIRA_COOLDOWN_SECONDS", environment);
+    config.maxIssueCooldowns = requiredInteger("STEWARD_JOURNEY_JIRA_MAX_ISSUE_COOLDOWNS", environment);
+    if (config.cooldownSeconds < 60) {
+      throw new Error("STEWARD_JOURNEY_JIRA_COOLDOWN_SECONDS must be at least 60 for @callers journeys.");
+    }
+    if (config.maxIssueCooldowns < 4) {
+      throw new Error("STEWARD_JOURNEY_JIRA_MAX_ISSUE_COOLDOWNS must be at least 4 for @callers journeys.");
+    }
+  }
+  return config;
 }
 
 export async function sendJiraDelivery(config, deliveryId, body, dependencies = {}) {
+  const headers = {
+    "content-type": "application/json",
+    "x-atlassian-webhook-identifier": deliveryId,
+  };
+  const signature = Object.hasOwn(dependencies, "signature")
+    ? dependencies.signature
+    : jiraSignature(config.secret, body);
+  if (signature !== null && (typeof signature !== "string" || !/^sha256=[0-9a-f]{64}$/.test(signature))) {
+    throw new Error("The Jira signature probe must be a SHA-256 signature or null.");
+  }
+  if (signature !== null) headers["x-hub-signature"] = signature;
   return request(dependencies.fetchImpl ?? fetch, new URL(`/hooks/jira/${encodeURIComponent(config.trigger)}`, `${config.origin}/`), {
     body,
-    headers: {
-      "content-type": "application/json",
-      "x-atlassian-webhook-identifier": deliveryId,
-      "x-hub-signature": jiraSignature(config.secret, body),
-    },
+    headers,
     method: "POST",
   });
 }
