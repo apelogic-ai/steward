@@ -4151,6 +4151,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "steward-trigger-receiver"
+version = "0.3.19"
+dependencies = [
+ "axum",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "steward-apiserver",
+ "steward-types",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "steward-types"
 version = "0.3.19"
 dependencies = [

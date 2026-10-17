@@ -1,0 +1,23 @@
+[package]
+name = "steward-trigger-receiver"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+axum.workspace = true
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+steward-apiserver = { path = "../../crates/steward-apiserver", version = "=0.3.19" }
+steward-types = { path = "../../crates/steward-types", version = "=0.3.19" }
+tokio.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+
+[lints]
+workspace = true

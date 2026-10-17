@@ -7,6 +7,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Added validation and routing for signed, bounded Jira webhook Triggers. This change is not usable
+  on its own; starting governed runs and enabling deployment follow separately.
+
 ### Changed
 
 - Tasks submitted through the API without browser or GitHub source evidence now report their Run
