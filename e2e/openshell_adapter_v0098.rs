@@ -33,6 +33,8 @@ use steward_types::{
 use tokio::time::sleep;
 
 const EXPECTED_RELEASE: &str = "v0.0.98";
+const SANDBOX_AGENT_IMAGE_TIMEOUT: Duration = Duration::from_secs(120);
+const SANDBOX_AGENT_IMAGE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 fn required(name: &str) -> Result<String, String> {
     env::var(name).map_err(|_| format!("{name} is required from the ephemeral OpenShell harness"))
@@ -431,16 +433,23 @@ fn assert_default_runtime_class(workspace: &str, sandbox: &str) -> Result<(), St
     Ok(())
 }
 
-fn sandbox_agent_image(workspace: &str, sandbox: &str) -> Result<String, String> {
+fn sandbox_agent_image_observation(
+    workspace: &str,
+    sandbox: &str,
+    request_timeout: Duration,
+) -> Result<Option<String>, String> {
     let kubeconfig = required("STEWARD_TEST_KUBECONFIG")?;
     let context = required("STEWARD_TEST_KUBE_CONTEXT")?;
     let pod = format!("{workspace}--{sandbox}");
+    let request_timeout = format!("{}ms", request_timeout.as_millis().max(1));
     let output = Command::new("kubectl")
         .args([
             "--kubeconfig",
             &kubeconfig,
             "--context",
             &context,
+            "--request-timeout",
+            &request_timeout,
             "-n",
             "openshell",
             "get",
@@ -459,7 +468,14 @@ fn sandbox_agent_image(workspace: &str, sandbox: &str) -> Result<String, String>
     }
     let image = String::from_utf8(output.stdout)
         .map_err(|_| "sandbox agent image ID was not UTF-8".to_owned())?;
+    parse_sandbox_agent_image(&image)
+}
+
+fn parse_sandbox_agent_image(image: &str) -> Result<Option<String>, String> {
     let image = image.trim();
+    if image.is_empty() {
+        return Ok(None);
+    }
     let image = image
         .strip_prefix("docker-pullable://")
         .or_else(|| image.strip_prefix("docker://"))
@@ -467,7 +483,145 @@ fn sandbox_agent_image(workspace: &str, sandbox: &str) -> Result<String, String>
     if !image.contains("@sha256:") {
         return Err(format!("sandbox agent image was not immutable: {image:?}"));
     }
-    Ok(image.to_owned())
+    Ok(Some(image.to_owned()))
+}
+
+async fn wait_for_sandbox_agent_image<F>(
+    mut inspect: F,
+    deadline: Instant,
+    poll_interval: Duration,
+) -> Result<String, String>
+where
+    F: FnMut(Duration) -> Result<Option<String>, String>,
+{
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(
+                "sandbox agent image was not reported before the inspection deadline".to_owned(),
+            );
+        }
+        let observation = inspect(remaining)?;
+        if Instant::now() >= deadline {
+            return Err(
+                "sandbox agent image was not reported before the inspection deadline".to_owned(),
+            );
+        }
+        if let Some(image) = observation {
+            return Ok(image);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        sleep(poll_interval.min(remaining)).await;
+    }
+}
+
+async fn sandbox_agent_image(workspace: &str, sandbox: &str) -> Result<String, String> {
+    wait_for_sandbox_agent_image(
+        |request_timeout| sandbox_agent_image_observation(workspace, sandbox, request_timeout),
+        Instant::now() + SANDBOX_AGENT_IMAGE_TIMEOUT,
+        SANDBOX_AGENT_IMAGE_POLL_INTERVAL,
+    )
+    .await
+}
+
+#[test]
+fn empty_sandbox_agent_image_is_pending() {
+    assert_eq!(parse_sandbox_agent_image(""), Ok(None));
+}
+
+#[test]
+fn sandbox_agent_image_normalizes_an_immutable_runtime_reference() {
+    let digest = "a".repeat(64);
+    let image = format!("docker-pullable://registry.example.test/agent@sha256:{digest}");
+
+    assert_eq!(
+        parse_sandbox_agent_image(&image),
+        Ok(Some(format!("registry.example.test/agent@sha256:{digest}")))
+    );
+}
+
+#[test]
+fn mutable_sandbox_agent_image_is_refused() {
+    for image in [
+        "registry.example.test/agent:latest",
+        "docker://",
+        "docker-pullable://",
+    ] {
+        let error = parse_sandbox_agent_image(image)
+            .expect_err("a non-empty image without a digest must fail closed");
+
+        assert!(error.starts_with("sandbox agent image was not immutable:"));
+    }
+}
+
+#[tokio::test]
+async fn sandbox_agent_image_waits_for_the_runtime_digest() {
+    let digest = "a".repeat(64);
+    let immutable = format!("registry.example.test/agent@sha256:{digest}");
+    let mut observations = [Ok(None), Ok(Some(immutable.clone()))].into_iter();
+
+    let image = wait_for_sandbox_agent_image(
+        |_request_timeout| observations.next().unwrap_or(Ok(None)),
+        Instant::now() + Duration::from_secs(1),
+        Duration::ZERO,
+    )
+    .await
+    .expect("a later immutable image must complete the wait");
+
+    assert_eq!(image, immutable);
+}
+
+#[tokio::test]
+async fn sandbox_agent_image_wait_is_bounded() {
+    let error =
+        wait_for_sandbox_agent_image(|_request_timeout| Ok(None), Instant::now(), Duration::ZERO)
+            .await
+            .expect_err("an image that stays absent must time out");
+
+    assert_eq!(
+        error,
+        "sandbox agent image was not reported before the inspection deadline"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_agent_image_is_not_accepted_after_the_deadline() {
+    let immutable = format!("registry.example.test/agent@sha256:{}", "a".repeat(64));
+    let mut observations = [Ok(None), Ok(Some(immutable))].into_iter();
+
+    let error = wait_for_sandbox_agent_image(
+        |_request_timeout| observations.next().unwrap_or(Ok(None)),
+        Instant::now() + Duration::from_millis(100),
+        Duration::from_millis(200),
+    )
+    .await
+    .expect_err("an image first observed after the deadline must be refused");
+
+    assert_eq!(
+        error,
+        "sandbox agent image was not reported before the inspection deadline"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_agent_image_probe_must_finish_before_the_deadline() {
+    let immutable = format!("registry.example.test/agent@sha256:{}", "a".repeat(64));
+
+    let error = wait_for_sandbox_agent_image(
+        |_request_timeout| {
+            std::thread::sleep(Duration::from_millis(40));
+            Ok(Some(immutable.clone()))
+        },
+        Instant::now() + Duration::from_millis(20),
+        Duration::ZERO,
+    )
+    .await
+    .expect_err("an image probe that finishes after the deadline must be refused");
+
+    assert_eq!(
+        error,
+        "sandbox agent image was not reported before the inspection deadline"
+    );
 }
 
 async fn wait_running(
@@ -1041,7 +1195,7 @@ async fn adapter_round_trip_is_authenticated_with_default_runtime_and_cleanup() 
         .as_deref()
         .ok_or_else(|| "running sandbox has no sandbox reference".to_owned())?;
     assert_default_runtime_class(workspace, sandbox)?;
-    let bound_agent_image = sandbox_agent_image(workspace, sandbox)?;
+    let bound_agent_image = sandbox_agent_image(workspace, sandbox).await?;
     request.refs = refs.clone();
 
     let run_dir = PathBuf::from(required("STEWARD_RUN_DIR")?);
