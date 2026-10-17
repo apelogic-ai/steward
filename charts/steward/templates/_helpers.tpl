@@ -2,6 +2,7 @@
 {{- define "steward.controllerName" -}}steward-controller{{- end -}}
 {{- define "steward.mintName" -}}steward-mint{{- end -}}
 {{- define "steward.webName" -}}steward-web{{- end -}}
+{{- define "steward.triggerReceiverName" -}}steward-trigger-receiver{{- end -}}
 {{- define "steward.image" -}}{{ .root.Values.images.repository }}:{{ .image.tag }}@{{ .image.digest }}{{- end -}}
 {{- define "steward.mcpGwInternalVersion" -}}
 {{- if eq .Values.connectionsBridge.mcpGatewayAuthorityContract "steward.connections.github/v1" -}}

@@ -30,6 +30,9 @@ images:
   web:
     tag: "" # set tag and digest when web.enabled=true
     digest: ""
+  triggerReceiver:
+    tag: "" # set tag and digest when triggerReceiver.enabled=true
+    digest: ""
 ```
 
 Never set a tag without the matching digest or use a mutable image reference.
@@ -239,12 +242,70 @@ The chart references existing objects and never creates secret values:
 | `steward-mint` Secret | `signing-key`, `introspection-credential` | `execution.enabled=true`; mint |
 | browser-auth Secret | configured client-secret key | `browserAuth.enabled=true`; apiserver |
 | GitHub source App Secret | configured PEM private-key key | `githubSource.enabled=true`; apiserver |
+| Trigger receiver database Secret | configured `url` key | `triggerReceiver.enabled=true`; read-only Envelope lookup |
+| Jira webhook signing Secrets | configured key per Trigger | `triggerReceiver.enabled=true`; receiver only |
+| Task API public CA | configured key in a ConfigMap or Secret | `triggerReceiver.enabled=true`; receiver only |
 
 In governed mode the controller also requires the public workload-exchange CA bundle selected
 by `workloadExchangeTrust.kind`, `workloadExchangeTrust.name`, and
 `workloadExchangeTrust.caCertificate`. `ConfigMap` is the default; `Secret`
 supports cert-manager-managed local trust bundles while projecting only the
 named CA key into the workload.
+
+## Jira Trigger receiver
+
+The Jira Trigger receiver is disabled by default. Enabling it creates a dedicated
+Deployment, Service, service account, and narrowly scoped Role that can request a
+fresh token only for that service account. It mounts the current capability catalog,
+the public workload-exchange and Task API CAs, a read-only database URL, and only the
+named webhook signing keys. It does not receive permission to read Kubernetes
+Secrets.
+
+Each Trigger names its signing Secret directly; the chart writes the corresponding
+read-only file path into the receiver configuration. The database user in
+`triggerReceiver.databaseSecret` needs read access to Envelope request records only.
+Use a separate database role from the apiserver and controller roles. Configure all
+receiver size, concurrency, lifetime, polling, and timeout limits under
+`triggerReceiver.limits`; the chart rejects values outside the receiver's supported
+ranges.
+
+```yaml
+triggerReceiver:
+  enabled: true
+  databaseSecret: { name: steward-trigger-database, key: url }
+  workloadExchange:
+    endpoint: https://identity.identity-exchange.svc.cluster.local:8443/v1/workload/exchange
+    serverName: identity.identity-exchange.svc.cluster.local
+    audience: apelogic-workload-exchange
+  taskApi:
+    ca: { kind: ConfigMap, name: steward-apiserver-ca, key: ca.crt }
+  triggers:
+    - id: jira_read
+      enabled: true
+      source: jira
+      workflow: triage@1
+      service: event-worker
+      ownerUserId: usr_11111111111111111111111111111111
+      envelopeDigest: steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      filters: { event: jira:issue_updated, project: PROJ, issueType: "10001" }
+      ignoredAccountIds: []
+      concurrencyLimit: 2
+      cooldownSeconds: 60
+      signingSecret: { name: steward-jira-webhook, key: secret }
+networkPolicy:
+  ingressNamespace: edge-system
+  kubeApiCidrs: [192.0.2.1/32]
+  postgresCidrs: [192.0.2.2/32]
+```
+
+Jira Cloud must reach the receiver through HTTPS. For each enabled Trigger, create
+the public Gateway or Ingress in the platform layer and forward **only its exact
+`/hooks/jira/<id>` path** to the `steward-trigger-receiver` Service (for the example,
+`/hooks/jira/jira_read`). Do not publish `/hooks/jira` as a prefix, the Service root,
+or any other receiver path. The chart intentionally does not create that edge route,
+public hostname, certificate, or controller-specific timeout policy. Set
+`networkPolicy.ingressNamespace` to the edge data-plane namespace and keep the
+Kubernetes API and PostgreSQL CIDRs limited to the exact deployment endpoints.
 
 The mint Secret is not referenced by either the apiserver or controller
 Deployment. TLS mode `customerSecret` consumes existing TLS Secrets and a

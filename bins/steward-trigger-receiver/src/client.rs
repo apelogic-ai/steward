@@ -1170,6 +1170,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chart_render_contract_from_environment() -> Result<(), String> {
+        let config_json = std::env::var("STEWARD_CHART_RECEIVER_CONFIG").unwrap_or_else(|_| {
+            r#"{"triggers":[{"id":"Jira_read","enabled":true,"source":"jira","workflow":"triage@1","service":"event-worker","ownerUserId":"usr_11111111111111111111111111111111","envelopeDigest":"steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filters":{"event":"jira:issue_updated","project":"PROJ","issueType":"10001"},"ignoredAccountIds":["acct-1"],"concurrencyLimit":2,"cooldownSeconds":60,"signingSecretFile":"/run/trigger-signing/Jira_read"}]}"#.to_owned()
+        });
+        let limits = crate::ReceiverLimits {
+            max_config_bytes: 4 * 1024 * 1024,
+            max_body_bytes: 1024 * 1024,
+            max_identifier_bytes: 1024,
+            max_triggers: 4096,
+            max_ignored_accounts: 4096,
+            max_concurrency: 1024,
+            max_cooldown_seconds: 31_536_000,
+            max_recent_deliveries: 1_000_000,
+            max_issue_cooldowns: 1_000_000,
+            max_signing_secret_bytes: 64 * 1024,
+        };
+        crate::ReceiverConfig::from_json(&config_json, &limits)?;
+        let api_server_name = std::env::var("STEWARD_CHART_API_SERVER_NAME")
+            .unwrap_or_else(|_| "steward-apiserver.steward.svc.cluster.local".to_owned());
+        let api_origin = std::env::var("STEWARD_CHART_API_ORIGIN")
+            .unwrap_or_else(|_| format!("https://{api_server_name}:443"));
+        validate_task_origin(&api_origin, &api_server_name)?;
+        let exchange_server_name = std::env::var("STEWARD_CHART_EXCHANGE_SERVER_NAME")
+            .unwrap_or_else(|_| "identity.identity-exchange.svc.cluster.local".to_owned());
+        let exchange_endpoint =
+            std::env::var("STEWARD_CHART_EXCHANGE_ENDPOINT").unwrap_or_else(|_| {
+                format!("https://{exchange_server_name}:8443/v1/workload/exchange")
+            });
+        steward_adapter_openshell::validate_workload_exchange_endpoint(
+            &exchange_endpoint,
+            &exchange_server_name,
+        )
+        .map_err(|_| "rendered workload exchange endpoint is invalid".to_owned())?;
+
+        for (pointer, invalid) in [
+            (
+                "/triggers/0/envelopeDigest",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            ("/triggers/0/filters/project", "proj lower"),
+            ("/triggers/0/filters/issueType", "not-numeric"),
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&config_json).map_err(|error| error.to_string())?;
+            *value
+                .pointer_mut(pointer)
+                .ok_or_else(|| "rendered Trigger field is missing".to_owned())? =
+                serde_json::Value::String(invalid.to_owned());
+            assert!(
+                crate::ReceiverConfig::from_json(&value.to_string(), &limits).is_err(),
+                "receiver accepted invalid chart field {pointer}"
+            );
+        }
+        Ok(())
+    }
+
     fn test_timing() -> TaskClientTiming {
         TaskClientTiming {
             deadline: Duration::from_millis(250),
