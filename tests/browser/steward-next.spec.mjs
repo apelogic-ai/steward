@@ -2227,10 +2227,10 @@ test("API-origin runs render on the runs list and detail page", async ({ browser
   const developer = await guardedPage(browser, { runOrigin: "api" });
   try {
     await developer.page.goto(`${origin}/runs`);
-    await expect(developer.page.getByText("api", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("External caller", { exact: true })).toBeVisible();
 
     await developer.page.goto(`${origin}/runs/${taskUid}`);
-    await expect(developer.page.getByText("Origin: api", { exact: true })).toBeVisible();
+    await expect(developer.page.getByText("Origin: External caller", { exact: true })).toBeVisible();
   } finally {
     await closeGuardedPage(developer);
   }
