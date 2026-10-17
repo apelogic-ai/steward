@@ -9,6 +9,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Added a Jira webhook Trigger operator guide covering exact-path exposure, signing Secrets,
+  read-only Envelope checks, filters, run limits, cooldowns, response meanings, optional issue
+  links, and the pending deployment acceptance evidence.
 - Added prepared `@callers` journeys for Jenkins and Temporal Run API callers, Jira receiver
   delivery and replay, unbound-caller refusal, and write-capable Envelope refusal. Receiver paths
   remain tagged pending until their deployment changes land, and the live Jira path requires an
