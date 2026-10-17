@@ -15,6 +15,9 @@ images:
   web:
     tag: ""
     digest: ""
+  triggerReceiver:
+    tag: ""
+    digest: ""
 imagePullSecrets: []
 execution:
   # Core API/webhook mode. Governed execution requires an explicit switch
@@ -35,11 +38,14 @@ serviceAccounts:
     annotations: {}
   web:
     annotations: {}
+  triggerReceiver:
+    annotations: {}
 podAnnotations:
   apiserver: {}
   controller: {}
   mint: {}
   web: {}
+  triggerReceiver: {}
 web:
   enabled: false
   host: ""
@@ -66,6 +72,45 @@ web:
       caConfigMap:
         name: ""
         key: ca.crt
+triggerReceiver:
+  # Opt in only after the receiver image, read-only database role, trust bundles,
+  # and every referenced Jira webhook signing Secret are available.
+  enabled: false
+  triggers: []
+  databaseSecret:
+    name: ""
+    key: ""
+  workloadExchange:
+    endpoint: ""
+    serverName: ""
+    audience: ""
+  taskApi:
+    ca:
+      kind: ConfigMap
+      name: ""
+      key: ""
+  limits:
+    maxConfigBytes: 4194304
+    maxBodyBytes: 1048576
+    maxIdentifierBytes: 1024
+    maxTriggers: 4096
+    maxIgnoredAccounts: 4096
+    maxConcurrency: 1024
+    maxCooldownSeconds: 31536000
+    maxRecentDeliveries: 1000000
+    maxIssueCooldowns: 1000000
+    maxSigningSecretBytes: 65536
+    databaseAcquireTimeoutMilliseconds: 60000
+    sourceTokenSeconds: 600
+    exchangeConnectTimeoutMilliseconds: 5000
+    exchangeRequestTimeoutMilliseconds: 30000
+    exchangeMaxReplyBytes: 65536
+    taskDeadlineMilliseconds: 600000
+    pollInitialMilliseconds: 500
+    pollMaxMilliseconds: 5000
+    apiConnectTimeoutMilliseconds: 5000
+    apiRequestTimeoutMilliseconds: 30000
+    maxTaskReplyBytes: 1048576
 secrets:
   database:
     name: steward-database
@@ -325,11 +370,13 @@ services:
   webhookPort: 443
   mintPort: 8080
   webPort: 3000
+  triggerReceiverPort: 8080
 replicaCount:
   apiserver: 1
   controller: 1
   mint: 1
   web: 1
+  triggerReceiver: 1
 resources:
   apiserver:
     requests: { cpu: 100m, memory: 256Mi }
@@ -343,6 +390,9 @@ resources:
   web:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: 500m, memory: 256Mi }
+  triggerReceiver:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
 probes:
   apiserver:
     readiness: { initialDelaySeconds: 2, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 3 }
@@ -354,6 +404,9 @@ probes:
     readiness: { initialDelaySeconds: 2, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 3 }
     liveness: { initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3 }
   web:
+    readiness: { initialDelaySeconds: 2, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 3 }
+    liveness: { initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3 }
+  triggerReceiver:
     readiness: { initialDelaySeconds: 2, periodSeconds: 5, timeoutSeconds: 3, failureThreshold: 3 }
     liveness: { initialDelaySeconds: 10, periodSeconds: 10, timeoutSeconds: 3, failureThreshold: 3 }
 persistence:

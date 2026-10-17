@@ -6,6 +6,14 @@
 {{- $capabilityCatalogJson := toJson .Values.config.apiserver.capabilityCatalog }}
 {{- $capabilityCatalogHash := $capabilityCatalogJson | sha256sum }}
 {{- $capabilityCatalogConfigMapName := printf "steward-capability-catalog-%s" ($capabilityCatalogHash | trunc 12) }}
+{{- $triggerReceiverTriggers := list }}
+{{- range .Values.triggerReceiver.triggers }}
+{{- $runtimeTrigger := deepCopy (omit . "signingSecret") }}
+{{- $_ := set $runtimeTrigger "signingSecretFile" (printf "/run/trigger-signing/%s" .id) }}
+{{- $triggerReceiverTriggers = append $triggerReceiverTriggers $runtimeTrigger }}
+{{- end }}
+{{- $triggerReceiverConfigJson := toJson (dict "triggers" $triggerReceiverTriggers) }}
+{{- $triggerReceiverConfigHash := $triggerReceiverConfigJson | sha256sum }}
 {{- $sourceRepositoryBindingsJson := toJson .Values.githubSource.bindings }}
 {{- $sourceRepositoryBindingsHash := $sourceRepositoryBindingsJson | sha256sum }}
 {{- $sourceRepositoryBindingsConfigMapName := printf "steward-source-repository-bindings-%s" ($sourceRepositoryBindingsHash | trunc 12) }}
@@ -29,6 +37,23 @@
 {{- end }}
 {{- if and .Values.web.ingress.enabled .Values.web.httpRoute.enabled }}
 {{- fail "choose exactly one edge route interface: web.ingress or web.httpRoute" }}
+{{- end }}
+{{- if and .Values.triggerReceiver.enabled (gt (len .Values.triggerReceiver.triggers) (int .Values.triggerReceiver.limits.maxTriggers)) }}
+{{- fail "triggerReceiver.triggers exceeds triggerReceiver.limits.maxTriggers" }}
+{{- end }}
+{{- if and .Values.triggerReceiver.enabled (gt (len $triggerReceiverConfigJson) (int .Values.triggerReceiver.limits.maxConfigBytes)) }}
+{{- fail "triggerReceiver configuration exceeds triggerReceiver.limits.maxConfigBytes" }}
+{{- end }}
+{{- range .Values.triggerReceiver.triggers }}
+{{- if and $.Values.triggerReceiver.enabled (or (gt (int .concurrencyLimit) (int $.Values.triggerReceiver.limits.maxConcurrency)) (gt (int .cooldownSeconds) (int $.Values.triggerReceiver.limits.maxCooldownSeconds)) (gt (len .ignoredAccountIds) (int $.Values.triggerReceiver.limits.maxIgnoredAccounts))) }}
+{{- fail (printf "triggerReceiver Trigger %s exceeds its configured limit" .id) }}
+{{- end }}
+{{- end }}
+{{- if and .Values.triggerReceiver.enabled (gt (int .Values.triggerReceiver.limits.pollInitialMilliseconds) (int .Values.triggerReceiver.limits.pollMaxMilliseconds)) }}
+{{- fail "triggerReceiver poll time settings are inconsistent" }}
+{{- end }}
+{{- if and .Values.triggerReceiver.enabled (or (gt (int .Values.triggerReceiver.limits.exchangeConnectTimeoutMilliseconds) (int .Values.triggerReceiver.limits.exchangeRequestTimeoutMilliseconds)) (gt (int .Values.triggerReceiver.limits.apiConnectTimeoutMilliseconds) (int .Values.triggerReceiver.limits.apiRequestTimeoutMilliseconds))) }}
+{{- fail "triggerReceiver connection and request time settings are inconsistent" }}
 {{- end }}
 {{- if and .Values.execution.enabled (not (has "steward-workflows" .Values.runtimeNamespaces)) }}
 {{- fail "execution.enabled requires steward-workflows in runtimeNamespaces" }}
@@ -70,6 +95,35 @@ metadata:
 {{ toYaml . | nindent 4 }}
 {{- end }}
 automountServiceAccountToken: false
+{{- end }}
+{{- if .Values.triggerReceiver.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "steward.triggerReceiverName" . }}
+  labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: trigger-receiver }
+{{- with .Values.serviceAccounts.triggerReceiver.annotations }}
+  annotations:
+{{ toYaml . | nindent 4 }}
+{{- end }}
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: steward-trigger-receiver-token-request }
+rules:
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    resourceNames: ["steward-trigger-receiver"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: steward-trigger-receiver-token-request }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: steward-trigger-receiver-token-request }
+subjects:
+  - { kind: ServiceAccount, name: steward-trigger-receiver, namespace: {{ .Release.Namespace }} }
 {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -257,6 +311,15 @@ metadata: { name: {{ $capabilityCatalogConfigMapName }} }
 immutable: true
 data:
   capability-catalog.json: {{ $capabilityCatalogJson | quote }}
+{{- if .Values.triggerReceiver.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: steward-trigger-receiver-config }
+immutable: true
+data:
+  config.json: {{ $triggerReceiverConfigJson | quote }}
+{{- end }}
 {{- if .Values.githubSource.enabled }}
 ---
 apiVersion: v1
@@ -311,6 +374,15 @@ metadata: { name: steward-web }
 spec:
   selector: { app.kubernetes.io/name: steward, app.kubernetes.io/component: web }
   ports: [{ name: http, appProtocol: http, port: {{ .Values.services.webPort }}, targetPort: http }]
+{{- end }}
+{{- if .Values.triggerReceiver.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata: { name: steward-trigger-receiver }
+spec:
+  selector: { app.kubernetes.io/name: steward, app.kubernetes.io/component: trigger-receiver }
+  ports: [{ name: http, appProtocol: http, port: {{ .Values.services.triggerReceiverPort }}, targetPort: http }]
 {{- end }}
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -682,6 +754,135 @@ spec:
           configMap:
             name: {{ $connectionsBridgeBundleName }}
             items: [{ key: bundle.jsonl, path: bundle.jsonl }]
+{{- end }}
+{{- if .Values.triggerReceiver.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: steward-trigger-receiver }
+spec:
+  replicas: {{ .Values.replicaCount.triggerReceiver }}
+  selector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: trigger-receiver } }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: trigger-receiver }
+      annotations:
+        checksum/trigger-config: {{ $triggerReceiverConfigHash | quote }}
+        checksum/capability-catalog: {{ $capabilityCatalogHash | quote }}
+{{- with .Values.podAnnotations.triggerReceiver }}
+{{ toYaml . | nindent 8 }}
+{{- end }}
+    spec:
+      serviceAccountName: steward-trigger-receiver
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+{{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+{{- end }}
+      containers:
+        - name: trigger-receiver
+          image: {{ include "steward.image" (dict "root" . "image" .Values.images.triggerReceiver) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          ports: [{ name: http, containerPort: {{ .Values.services.triggerReceiverPort }} }]
+          readinessProbe:
+            tcpSocket: { port: http }
+{{ toYaml .Values.probes.triggerReceiver.readiness | nindent 12 }}
+          livenessProbe:
+            tcpSocket: { port: http }
+{{ toYaml .Values.probes.triggerReceiver.liveness | nindent 12 }}
+          env:
+            - { name: STEWARD_TRIGGER_BIND, value: {{ printf "0.0.0.0:%v" .Values.services.triggerReceiverPort | quote }} }
+            - { name: STEWARD_TRIGGER_CONFIG_FILE, value: /run/trigger-config/config.json }
+            - { name: STEWARD_CAPABILITY_CATALOG_FILE, value: /run/capability-catalog/capability-catalog.json }
+            - { name: STEWARD_DATABASE_URL, valueFrom: { secretKeyRef: { name: {{ .Values.triggerReceiver.databaseSecret.name }}, key: {{ .Values.triggerReceiver.databaseSecret.key }} } } }
+            - { name: STEWARD_TRIGGER_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+            - { name: STEWARD_TRIGGER_SERVICE_ACCOUNT, value: steward-trigger-receiver }
+            - { name: STEWARD_WORKLOAD_SOURCE_AUDIENCE, value: {{ .Values.triggerReceiver.workloadExchange.audience | quote }} }
+            - { name: STEWARD_WORKLOAD_SOURCE_TOKEN_SECONDS, value: {{ .Values.triggerReceiver.limits.sourceTokenSeconds | quote }} }
+            - { name: STEWARD_WORKLOAD_EXCHANGE_ENDPOINT, value: {{ .Values.triggerReceiver.workloadExchange.endpoint | quote }} }
+            - { name: STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME, value: {{ .Values.triggerReceiver.workloadExchange.serverName | quote }} }
+            - { name: STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE, value: /run/workload-exchange/ca.crt }
+            - { name: STEWARD_API_ORIGIN, value: {{ printf "https://steward-apiserver:%v" .Values.services.apiserverPort | quote }} }
+            - { name: STEWARD_API_SERVER_NAME, value: {{ printf "steward-apiserver.%s.svc.%s" .Release.Namespace .Values.services.clusterDomain | quote }} }
+            - { name: STEWARD_API_CA_CERTIFICATE_FILE, value: /run/task-api/ca.crt }
+            - { name: STEWARD_TRIGGER_MAX_CONFIG_BYTES, value: {{ .Values.triggerReceiver.limits.maxConfigBytes | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_BODY_BYTES, value: {{ .Values.triggerReceiver.limits.maxBodyBytes | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_IDENTIFIER_BYTES, value: {{ .Values.triggerReceiver.limits.maxIdentifierBytes | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_TRIGGERS, value: {{ .Values.triggerReceiver.limits.maxTriggers | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_IGNORED_ACCOUNTS, value: {{ .Values.triggerReceiver.limits.maxIgnoredAccounts | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_CONCURRENCY, value: {{ .Values.triggerReceiver.limits.maxConcurrency | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_COOLDOWN_SECONDS, value: {{ .Values.triggerReceiver.limits.maxCooldownSeconds | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_RECENT_DELIVERIES, value: {{ .Values.triggerReceiver.limits.maxRecentDeliveries | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_ISSUE_COOLDOWNS, value: {{ .Values.triggerReceiver.limits.maxIssueCooldowns | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_SIGNING_SECRET_BYTES, value: {{ .Values.triggerReceiver.limits.maxSigningSecretBytes | quote }} }
+            - { name: STEWARD_TRIGGER_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.databaseAcquireTimeoutMilliseconds | quote }} }
+            - { name: STEWARD_WORKLOAD_EXCHANGE_CONNECT_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.exchangeConnectTimeoutMilliseconds | quote }} }
+            - { name: STEWARD_WORKLOAD_EXCHANGE_REQUEST_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.exchangeRequestTimeoutMilliseconds | quote }} }
+            - { name: STEWARD_WORKLOAD_EXCHANGE_MAX_REPLY_BYTES, value: {{ .Values.triggerReceiver.limits.exchangeMaxReplyBytes | quote }} }
+            - { name: STEWARD_TRIGGER_TASK_DEADLINE_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.taskDeadlineMilliseconds | quote }} }
+            - { name: STEWARD_TRIGGER_POLL_INITIAL_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.pollInitialMilliseconds | quote }} }
+            - { name: STEWARD_TRIGGER_POLL_MAX_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.pollMaxMilliseconds | quote }} }
+            - { name: STEWARD_TRIGGER_API_CONNECT_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.apiConnectTimeoutMilliseconds | quote }} }
+            - { name: STEWARD_TRIGGER_API_REQUEST_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.apiRequestTimeoutMilliseconds | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_TASK_REPLY_BYTES, value: {{ .Values.triggerReceiver.limits.maxTaskReplyBytes | quote }} }
+          volumeMounts:
+            - { name: trigger-config, mountPath: /run/trigger-config, readOnly: true }
+            - { name: trigger-signing, mountPath: /run/trigger-signing, readOnly: true }
+            - { name: capability-catalog, mountPath: /run/capability-catalog, readOnly: true }
+            - { name: workload-exchange-ca, mountPath: /run/workload-exchange, readOnly: true }
+            - { name: task-api-ca, mountPath: /run/task-api, readOnly: true }
+{{- if eq .Values.databaseTls.mode "verify-full" }}
+            - { name: database-tls-ca, mountPath: /run/database-tls, readOnly: true }
+{{- end }}
+          resources:
+{{ toYaml .Values.resources.triggerReceiver | nindent 12 }}
+      volumes:
+        - name: trigger-config
+          configMap:
+            name: steward-trigger-receiver-config
+            items: [{ key: config.json, path: config.json }]
+        - name: trigger-signing
+          projected:
+            sources:
+{{- range .Values.triggerReceiver.triggers }}
+              - secret:
+                  name: {{ .signingSecret.name }}
+                  items: [{ key: {{ .signingSecret.key }}, path: {{ .id }} }]
+{{- end }}
+        - name: capability-catalog
+          configMap:
+            name: {{ $capabilityCatalogConfigMapName }}
+            items: [{ key: capability-catalog.json, path: capability-catalog.json }]
+        - name: workload-exchange-ca
+{{- if eq .Values.workloadExchangeTrust.kind "Secret" }}
+          secret:
+            secretName: {{ .Values.workloadExchangeTrust.name }}
+{{- else }}
+          configMap:
+            name: {{ .Values.workloadExchangeTrust.name }}
+{{- end }}
+            items: [{ key: {{ .Values.workloadExchangeTrust.caCertificate }}, path: ca.crt }]
+        - name: task-api-ca
+{{- if eq .Values.triggerReceiver.taskApi.ca.kind "Secret" }}
+          secret:
+            secretName: {{ .Values.triggerReceiver.taskApi.ca.name }}
+{{- else }}
+          configMap:
+            name: {{ .Values.triggerReceiver.taskApi.ca.name }}
+{{- end }}
+            items: [{ key: {{ .Values.triggerReceiver.taskApi.ca.key }}, path: ca.crt }]
+{{- if eq .Values.databaseTls.mode "verify-full" }}
+        - name: database-tls-ca
+{{- if eq .Values.databaseTls.ca.kind "Secret" }}
+          secret:
+            secretName: {{ .Values.databaseTls.ca.name }}
+{{- else }}
+          configMap:
+            name: {{ .Values.databaseTls.ca.name }}
+{{- end }}
+            items: [{ key: {{ .Values.databaseTls.ca.key }}, path: ca.crt }]
+{{- end }}
 {{- end }}
 {{- if .Values.execution.enabled }}
 ---
@@ -1145,6 +1346,42 @@ spec:
 {{- else }}
   egress: []
 {{- end }}
+{{- end }}
+{{- if .Values.triggerReceiver.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: steward-trigger-receiver-ingress }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: trigger-receiver } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace }} } }
+      ports: [{ protocol: TCP, port: {{ .Values.services.triggerReceiverPort }} }]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: steward-trigger-receiver-egress }
+spec:
+  podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: trigger-receiver } }
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector: { matchLabels: { app.kubernetes.io/name: steward, app.kubernetes.io/component: apiserver } }
+      ports: [{ protocol: TCP, port: 8443 }]
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .Values.networkPolicy.identityExchangeNamespace }} } } }]
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.identityExchange }} }]
+    - to:
+{{- range .Values.networkPolicy.postgresCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+{{- end }}
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.postgres }} }]
+    - to:
+{{- range .Values.networkPolicy.kubeApiCidrs }}
+        - ipBlock: { cidr: {{ . }} }
+{{- end }}
+      ports: [{ protocol: TCP, port: {{ .Values.networkPolicy.ports.kubernetesApi }} }]
 {{- end }}
 {{- if .Values.web.enabled }}
 ---

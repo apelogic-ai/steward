@@ -26,6 +26,10 @@ fi
 
 helm_template \
   --set-string tls.webhook.caBundlePem=public-test-ca > "${rendered}"
+if grep -qF 'steward-trigger-receiver' "${rendered}"; then
+  echo 'core install must not render the Jira Trigger receiver by default' >&2
+  exit 1
+fi
 if grep -qF 'STEWARD_STARTER_TASK_JSON' "${rendered}"; then
   echo 'unset starter task must use the apiserver built-in without an environment override' >&2
   exit 1
@@ -65,6 +69,91 @@ do
     exit 1
   fi
 done
+
+receiver_trigger='[{"id":"jira-read","enabled":true,"source":"jira","workflow":"triage@1","service":"event-worker","ownerUserId":"usr_11111111111111111111111111111111","envelopeDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filters":{"project":"PROJ"},"ignoredAccountIds":[],"concurrencyLimit":2,"cooldownSeconds":60,"signingSecret":{"name":"steward-jira-webhook","key":"secret"}}]'
+receiver_inputs=(
+  --set-string tls.webhook.caBundlePem=public-test-ca
+  --set triggerReceiver.enabled=true
+  --set-string images.triggerReceiver.tag=test-trigger-receiver
+  --set-string images.triggerReceiver.digest=sha256:3333333333333333333333333333333333333333333333333333333333333333
+  --set-json "triggerReceiver.triggers=${receiver_trigger}"
+  --set-string triggerReceiver.databaseSecret.name=steward-trigger-database
+  --set-string triggerReceiver.databaseSecret.key=url
+  --set-string triggerReceiver.workloadExchange.endpoint=https://identity.identity-exchange.svc.cluster.local:8443/v1/workload/exchange
+  --set-string triggerReceiver.workloadExchange.serverName=identity.identity-exchange.svc.cluster.local
+  --set-string triggerReceiver.workloadExchange.audience=apelogic-workload-exchange
+  --set-string triggerReceiver.taskApi.ca.kind=ConfigMap
+  --set-string triggerReceiver.taskApi.ca.name=steward-apiserver-ca
+  --set-string triggerReceiver.taskApi.ca.key=ca.crt
+  --set-string networkPolicy.ingressNamespace=edge-system
+  --set-string 'networkPolicy.kubeApiCidrs[0]=192.0.2.1/32'
+  --set-string 'networkPolicy.postgresCidrs[0]=192.0.2.2/32'
+)
+helm_template "${receiver_inputs[@]}" > "${rendered}"
+for required in \
+  'name: steward-trigger-receiver' \
+  'resourceNames: ["steward-trigger-receiver"]' \
+  'resources: ["serviceaccounts/token"]' \
+  'checksum/trigger-config:' \
+  'STEWARD_TRIGGER_CONFIG_FILE' \
+  'STEWARD_CAPABILITY_CATALOG_FILE' \
+  'STEWARD_WORKLOAD_EXCHANGE_ENDPOINT' \
+  'STEWARD_API_CA_CERTIFICATE_FILE' \
+  'STEWARD_TRIGGER_MAX_CONCURRENCY' \
+  'name: steward-trigger-database' \
+  'name: steward-jira-webhook' \
+  'name: steward-trigger-receiver-ingress' \
+  'name: steward-trigger-receiver-egress'
+do
+  grep -qF "${required}" "${rendered}" || {
+    echo "enabled Jira Trigger receiver omitted: ${required}" >&2
+    exit 1
+  }
+done
+grep -qF 'https://steward-apiserver:443' "${rendered}"
+grep -qF 'steward-apiserver.steward.svc.cluster.local' "${rendered}"
+grep -qF '/run/trigger-signing/jira-read' "${rendered}"
+
+for missing in \
+  triggerReceiver.databaseSecret.name \
+  triggerReceiver.workloadExchange.endpoint \
+  triggerReceiver.workloadExchange.serverName \
+  triggerReceiver.workloadExchange.audience \
+  triggerReceiver.taskApi.ca.name \
+  triggerReceiver.taskApi.ca.key \
+  'triggerReceiver.triggers[0].signingSecret.name' \
+  'triggerReceiver.triggers[0].signingSecret.key'
+do
+  if helm_template "${receiver_inputs[@]}" --set-string "${missing}=" > /dev/null 2>&1; then
+    echo "enabled Jira Trigger receiver must reject missing ${missing}" >&2
+    exit 1
+  fi
+done
+
+if helm_template "${receiver_inputs[@]}" \
+  --set triggerReceiver.limits.maxConcurrency=1025 > /dev/null 2>&1; then
+  echo 'Jira Trigger receiver must reject concurrency above the binary ceiling' >&2
+  exit 1
+fi
+
+if helm_template "${receiver_inputs[@]}" \
+  --set triggerReceiver.limits.sourceTokenSeconds=599 > /dev/null 2>&1; then
+  echo 'Jira Trigger receiver must reject a source token lifetime below 600 seconds' >&2
+  exit 1
+fi
+
+if helm_template "${receiver_inputs[@]}" \
+  --set triggerReceiver.limits.maxConcurrency=1 > /dev/null 2>&1; then
+  echo 'Jira Trigger receiver must reject a Trigger above its configured concurrency limit' >&2
+  exit 1
+fi
+
+if helm_template "${receiver_inputs[@]}" \
+  --set triggerReceiver.limits.apiConnectTimeoutMilliseconds=5001 \
+  --set triggerReceiver.limits.apiRequestTimeoutMilliseconds=5000 > /dev/null 2>&1; then
+  echo 'Jira Trigger receiver must reject inconsistent Task API time settings' >&2
+  exit 1
+fi
 
 if helm_template \
   --set-string tls.webhook.caBundlePem=public-test-ca \

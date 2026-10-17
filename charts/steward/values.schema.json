@@ -7,6 +7,7 @@
     "execution",
     "inference",
     "web",
+    "triggerReceiver",
     "secrets",
     "databaseTls",
     "jira",
@@ -48,14 +49,15 @@
     "images": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["repository", "pullPolicy", "apiserver", "controller", "mint", "web"],
+      "required": ["repository", "pullPolicy", "apiserver", "controller", "mint", "web", "triggerReceiver"],
       "properties": {
         "repository": {"type": "string", "minLength": 1},
         "pullPolicy": {"enum": ["IfNotPresent", "Always", "Never"]},
         "apiserver": {"$ref": "#/definitions/image"},
         "controller": {"$ref": "#/definitions/image"},
         "mint": {"$ref": "#/definitions/optionalImage"},
-        "web": {"$ref": "#/definitions/optionalImage"}
+        "web": {"$ref": "#/definitions/optionalImage"},
+        "triggerReceiver": {"$ref": "#/definitions/optionalImage"}
       }
     },
     "imagePullSecrets": {
@@ -71,23 +73,25 @@
     "serviceAccounts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["apiserver", "controller", "mint", "web"],
+      "required": ["apiserver", "controller", "mint", "web", "triggerReceiver"],
       "properties": {
         "apiserver": {"$ref": "#/definitions/serviceAccount"},
         "controller": {"$ref": "#/definitions/serviceAccount"},
         "mint": {"$ref": "#/definitions/serviceAccount"},
-        "web": {"$ref": "#/definitions/serviceAccount"}
+        "web": {"$ref": "#/definitions/serviceAccount"},
+        "triggerReceiver": {"$ref": "#/definitions/serviceAccount"}
       }
     },
     "podAnnotations": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["apiserver", "controller", "mint", "web"],
+      "required": ["apiserver", "controller", "mint", "web", "triggerReceiver"],
       "properties": {
         "apiserver": {"$ref": "#/definitions/annotations"},
         "controller": {"$ref": "#/definitions/annotations"},
         "mint": {"$ref": "#/definitions/annotations"},
-        "web": {"$ref": "#/definitions/annotations"}
+        "web": {"$ref": "#/definitions/annotations"},
+        "triggerReceiver": {"$ref": "#/definitions/annotations"}
       }
     },
     "web": {
@@ -140,6 +144,112 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "triggerReceiver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "triggers", "databaseSecret", "workloadExchange", "taskApi", "limits"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "triggers": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "enabled", "source", "workflow", "service", "ownerUserId", "envelopeDigest", "signingSecret", "concurrencyLimit", "cooldownSeconds"],
+            "properties": {
+              "id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$", "maxLength": 1024},
+              "enabled": {"type": "boolean"},
+              "source": {"const": "jira"},
+              "workflow": {"type": "string", "minLength": 1, "maxLength": 1024},
+              "service": {"type": "string", "minLength": 1, "maxLength": 1024},
+              "ownerUserId": {"type": "string", "pattern": "^usr_[a-f0-9]{32}$"},
+              "envelopeDigest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+              "filters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "event": {"type": "string", "minLength": 1, "maxLength": 1024},
+                  "project": {"type": "string", "minLength": 1, "maxLength": 1024},
+                  "issueType": {"type": "string", "minLength": 1, "maxLength": 1024}
+                }
+              },
+              "ignoredAccountIds": {"type": "array", "maxItems": 4096, "items": {"type": "string", "minLength": 1, "maxLength": 1024}, "uniqueItems": true},
+              "signingSecret": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "key"],
+                "properties": {"name": {"type": "string"}, "key": {"type": "string"}}
+              },
+              "concurrencyLimit": {"type": "integer", "minimum": 1, "maximum": 1024},
+              "cooldownSeconds": {"type": "integer", "minimum": 0, "maximum": 31536000}
+            }
+          }
+        },
+        "databaseSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "key"],
+          "properties": {"name": {"type": "string"}, "key": {"type": "string"}}
+        },
+        "workloadExchange": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["endpoint", "serverName", "audience"],
+          "properties": {
+            "endpoint": {"type": "string"},
+            "serverName": {"type": "string"},
+            "audience": {"type": "string"}
+          }
+        },
+        "taskApi": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ca"],
+          "properties": {
+            "ca": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "name", "key"],
+              "properties": {
+                "kind": {"enum": ["Secret", "ConfigMap"]},
+                "name": {"type": "string"},
+                "key": {"type": "string"}
+              }
+            }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["maxConfigBytes", "maxBodyBytes", "maxIdentifierBytes", "maxTriggers", "maxIgnoredAccounts", "maxConcurrency", "maxCooldownSeconds", "maxRecentDeliveries", "maxIssueCooldowns", "maxSigningSecretBytes", "databaseAcquireTimeoutMilliseconds", "sourceTokenSeconds", "exchangeConnectTimeoutMilliseconds", "exchangeRequestTimeoutMilliseconds", "exchangeMaxReplyBytes", "taskDeadlineMilliseconds", "pollInitialMilliseconds", "pollMaxMilliseconds", "apiConnectTimeoutMilliseconds", "apiRequestTimeoutMilliseconds", "maxTaskReplyBytes"],
+          "properties": {
+            "maxConfigBytes": {"type": "integer", "minimum": 1, "maximum": 4194304},
+            "maxBodyBytes": {"type": "integer", "minimum": 1, "maximum": 1048576},
+            "maxIdentifierBytes": {"type": "integer", "minimum": 1, "maximum": 1024},
+            "maxTriggers": {"type": "integer", "minimum": 1, "maximum": 4096},
+            "maxIgnoredAccounts": {"type": "integer", "minimum": 1, "maximum": 4096},
+            "maxConcurrency": {"type": "integer", "minimum": 1, "maximum": 1024},
+            "maxCooldownSeconds": {"type": "integer", "minimum": 1, "maximum": 31536000},
+            "maxRecentDeliveries": {"type": "integer", "minimum": 1, "maximum": 1000000},
+            "maxIssueCooldowns": {"type": "integer", "minimum": 1, "maximum": 1000000},
+            "maxSigningSecretBytes": {"type": "integer", "minimum": 1, "maximum": 65536},
+            "databaseAcquireTimeoutMilliseconds": {"type": "integer", "minimum": 1, "maximum": 60000},
+            "sourceTokenSeconds": {"type": "integer", "minimum": 600, "maximum": 86400},
+            "exchangeConnectTimeoutMilliseconds": {"type": "integer", "minimum": 1, "maximum": 60000},
+            "exchangeRequestTimeoutMilliseconds": {"type": "integer", "minimum": 1, "maximum": 300000},
+            "exchangeMaxReplyBytes": {"type": "integer", "minimum": 1, "maximum": 65536},
+            "taskDeadlineMilliseconds": {"type": "integer", "minimum": 1, "maximum": 86400000},
+            "pollInitialMilliseconds": {"type": "integer", "minimum": 1, "maximum": 60000},
+            "pollMaxMilliseconds": {"type": "integer", "minimum": 1, "maximum": 60000},
+            "apiConnectTimeoutMilliseconds": {"type": "integer", "minimum": 1, "maximum": 60000},
+            "apiRequestTimeoutMilliseconds": {"type": "integer", "minimum": 1, "maximum": 300000},
+            "maxTaskReplyBytes": {"type": "integer", "minimum": 1, "maximum": 1048576}
           }
         }
       }
@@ -1217,46 +1327,50 @@
     "services": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["clusterDomain", "apiserverPort", "webhookPort", "mintPort", "webPort"],
+      "required": ["clusterDomain", "apiserverPort", "webhookPort", "mintPort", "webPort", "triggerReceiverPort"],
       "properties": {
         "clusterDomain": {"$ref": "#/definitions/nonempty"},
         "apiserverPort": {"$ref": "#/definitions/port"},
         "webhookPort": {"$ref": "#/definitions/port"},
         "mintPort": {"$ref": "#/definitions/port"},
-        "webPort": {"$ref": "#/definitions/port"}
+        "webPort": {"$ref": "#/definitions/port"},
+        "triggerReceiverPort": {"$ref": "#/definitions/port"}
       }
     },
     "replicaCount": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["apiserver", "controller", "mint", "web"],
+      "required": ["apiserver", "controller", "mint", "web", "triggerReceiver"],
       "properties": {
         "apiserver": {"type": "integer", "minimum": 1},
         "controller": {"type": "integer", "minimum": 1},
         "mint": {"type": "integer", "minimum": 1},
-        "web": {"type": "integer", "minimum": 1}
+        "web": {"type": "integer", "minimum": 1},
+        "triggerReceiver": {"type": "integer", "minimum": 1}
       }
     },
     "resources": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["apiserver", "controller", "mint", "web"],
+      "required": ["apiserver", "controller", "mint", "web", "triggerReceiver"],
       "properties": {
         "apiserver": {"type": "object"},
         "controller": {"type": "object"},
         "mint": {"type": "object"},
-        "web": {"type": "object"}
+        "web": {"type": "object"},
+        "triggerReceiver": {"type": "object"}
       }
     },
     "probes": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["apiserver", "controller", "mint", "web"],
+      "required": ["apiserver", "controller", "mint", "web", "triggerReceiver"],
       "properties": {
         "apiserver": {"$ref": "#/definitions/componentProbes"},
         "controller": {"$ref": "#/definitions/componentProbes"},
         "mint": {"$ref": "#/definitions/componentProbes"},
-        "web": {"$ref": "#/definitions/componentProbes"}
+        "web": {"$ref": "#/definitions/componentProbes"},
+        "triggerReceiver": {"$ref": "#/definitions/componentProbes"}
       }
     },
     "persistence": {
@@ -1267,6 +1381,62 @@
     }
   },
   "allOf": [
+    {
+      "if": {"properties": {"triggerReceiver": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]}}},
+      "then": {
+        "properties": {
+          "images": {"properties": {"triggerReceiver": {"$ref": "#/definitions/image"}}},
+          "triggerReceiver": {
+            "properties": {
+              "triggers": {
+                "minItems": 1,
+                "items": {
+                  "properties": {
+                    "signingSecret": {
+                      "properties": {
+                        "name": {"$ref": "#/definitions/nonempty"},
+                        "key": {"$ref": "#/definitions/nonempty"}
+                      }
+                    }
+                  }
+                }
+              },
+              "databaseSecret": {
+                "properties": {
+                  "name": {"$ref": "#/definitions/nonempty"},
+                  "key": {"$ref": "#/definitions/nonempty"}
+                }
+              },
+              "workloadExchange": {
+                "properties": {
+                  "endpoint": {"type": "string", "pattern": "^https://[^/?#]+(?::[0-9]+)?/v1/workload/exchange$", "minLength": 38},
+                  "serverName": {"$ref": "#/definitions/nonempty"},
+                  "audience": {"$ref": "#/definitions/nonempty"}
+                }
+              },
+              "taskApi": {
+                "properties": {
+                  "ca": {
+                    "properties": {
+                      "name": {"$ref": "#/definitions/nonempty"},
+                      "key": {"$ref": "#/definitions/nonempty"}
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "networkPolicy": {
+            "properties": {
+              "enabled": {"const": true},
+              "ingressNamespace": {"$ref": "#/definitions/nonempty"},
+              "kubeApiCidrs": {"minItems": 1},
+              "postgresCidrs": {"minItems": 1}
+            }
+          }
+        }
+      }
+    },
     {
       "if": {"properties": {"browserAuth": {"properties": {"enabled": {"const": true}}}}},
       "then": {

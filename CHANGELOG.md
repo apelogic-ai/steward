@@ -10,8 +10,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ### Added
 
 - Added validation, routing, and the ability to start and clean up governed Tasks for signed,
-  bounded Jira webhook Triggers. This change is not usable on its own; deployment enablement
-  follows separately.
+  bounded Jira webhook Triggers. The Helm chart can now deploy that receiver with isolated
+  identity, exact Secret and CA projections, bounded runtime settings, and deny-by-default
+  network access; operators must expose only the exact `/hooks/jira` path through their edge.
 - Published the generated Run API OpenAPI contract and added Jenkins and Temporal Go examples for
   token exchange, idempotent submission, empty input archives, non-blocking polling, failed-run
   diagnostics, output download, and cleanup. Jenkins support requires the next
