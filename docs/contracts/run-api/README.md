@@ -4,9 +4,10 @@ Status: **Generated current implementation for the upcoming Steward v0.3.20 rele
 
 The machine-readable contract is [`openapi.json`](openapi.json). The Steward
 server generates that document from `steward_apiserver::ApiDoc`; the Run API is
-the set of `/v1/tasks` paths in the document. The same generated document also
-contains the server's browser and administrator routes because Steward exports
-one OpenAPI document.
+the set of `/v1/tasks` paths in the document. Only that subset is the stable
+caller contract. The same generated document also contains browser and
+administrator routes because Steward exports one OpenAPI document; treat those
+routes as internal unless their own documentation says otherwise.
 
 The generated `info.version` follows the repository package version. During
 Unreleased development it therefore names the last release; the release PR
@@ -38,4 +39,7 @@ git diff --exit-code -- docs/contracts/run-api/openapi.json
 ```
 
 Do not edit `openapi.json` by hand. Change the server annotations or response
-types, regenerate the document, and review the resulting contract diff.
+types, regenerate the document, and review the resulting contract diff. The
+`committed_openapi_document_matches_generator` apiserver test runs in
+`cargo xtask ci` and fails when the committed document differs from the
+generator output.
