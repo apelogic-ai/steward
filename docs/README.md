@@ -69,6 +69,8 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`installation/upgrade-v0.2.0.md`](installation/upgrade-v0.2.0.md) | **Current release contract** | v0.1.23 preconditions, migration result, and rollback boundary. |
 | [`installation/upgrade-v0.3.0.md`](installation/upgrade-v0.3.0.md) | **Current release contract** | v0.2.6 catalog, request, RBAC, identity, and rollback transition to v0.3.0. |
 | [`task-submission-api.md`](task-submission-api.md) | **Current implementation** | Current `steward.task/v2` API, User-Envelope-only authority, and digest-qualified Envelope selection. |
+| [`contracts/run-api/README.md`](contracts/run-api/README.md) | **Generated current implementation** | Generated OpenAPI contract for the `/v1/tasks` Run API lifecycle. |
+| [`calling-steward-from-jenkins-and-temporal.md`](calling-steward-from-jenkins-and-temporal.md) | **Current implementation** | Token exchange, idempotency, polling, and output handling for Jenkins and Temporal callers. |
 
 ### Accepted implementation architecture
 
@@ -105,4 +107,5 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`upstream/pr-1970-review-comment.md`](upstream/pr-1970-review-comment.md) | **Historical, superseded** | Withdrawn upstream review draft. |
 | [`upstream/rfc-0011-review-comment.md`](upstream/rfc-0011-review-comment.md) | **Historical reference** | Retained upstream review text. |
 | [`examples/github-file-read-v1.yaml`](examples/github-file-read-v1.yaml) | **Example** | Example generated workflow; its owning contract states its authority. |
+| [`examples/callers/`](examples/callers/) | **Examples** | Minimal Jenkins and Temporal Go Run API callers. |
 | [`diagrams/`](diagrams/) | **Historical illustrations** | Images associated with the earlier architecture documents; not contracts. |

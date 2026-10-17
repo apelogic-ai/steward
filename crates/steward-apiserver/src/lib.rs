@@ -7431,6 +7431,21 @@ mod tests {
     }
 
     #[test]
+    fn committed_openapi_document_matches_generator() -> Result<(), String> {
+        let mut generated = serde_json::to_string_pretty(&ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        generated.push('\n');
+        let committed = include_str!("../../../docs/contracts/run-api/openapi.json");
+        if committed != generated {
+            return Err(
+                "docs/contracts/run-api/openapi.json is stale; run the documented export-openapi command and commit the result"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn task_lifecycle_is_fully_published_in_the_openapi_contract() -> Result<(), String> {
         let document = serde_json::to_value(ApiDoc::openapi())
             .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;

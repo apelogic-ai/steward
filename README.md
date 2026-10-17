@@ -52,6 +52,8 @@ records the limits of this tested matrix.
 | Accepted post-M1 Agent, Task, session, and runtime semantics | [Post-M1 architecture baseline](docs/v2/README.md) |
 | Post-M1 contracts that remain unresolved | [Deferred-contract register](docs/v2/deferred-implementation-contracts.md) |
 | Current Task lifecycle, identity, and Envelope-selection contract | [Task submission API](docs/task-submission-api.md) |
+| Call the Run API from Jenkins or Temporal | [Jenkins and Temporal caller guide](docs/calling-steward-from-jenkins-and-temporal.md) |
+| Generate or consume the Run API schema | [Run API OpenAPI contract](docs/contracts/run-api/README.md) |
 | Upgrade from v0.2.6 and understand the rollback boundary | [v0.3 upgrade guide](docs/installation/upgrade-v0.3.0.md) |
 | Enable or roll back federated Task identity | [Federated Task identity upgrade](docs/installation/federated-task-identity-upgrade.md) |
 | Release history and security-relevant changes | [Changelog](CHANGELOG.md) |
@@ -116,6 +118,9 @@ docs/
   task-runtime-orchestration.md
                               accepted durable Task runtime state-machine architecture
   task-submission-api.md      lifecycle REST, tar paths, limits, identity boundary
+  calling-steward-from-jenkins-and-temporal.md
+                              Jenkins and Temporal Run API caller guide
+  contracts/run-api/         generated OpenAPI contract for /v1/tasks
   canonical-user-identity-v1.md
                               immutable user ID, Google OIDC mapping, reconnect contract
   installation/installation-guide.md
