@@ -46,6 +46,11 @@ missing and extra entries are rejected.
 }
 ```
 
+The v0.3.1 handoff above predates the Jira trigger receiver image. When a
+verified handoff contains `images.triggerReceiver`, the mapping must also
+contain an exact target such as
+`"images.triggerReceiver": "registry.example.test/team-a/steward:<version>-trigger-receiver"`.
+
 ## Plan, then mirror
 
 The first command is a no-write plan. It resolves and validates every source

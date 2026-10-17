@@ -75,6 +75,9 @@ jobs:
           - component: mint
             binary: steward-mint-bin
             dockerfile: build/package.Dockerfile
+          - component: trigger-receiver
+            binary: steward-trigger-receiver
+            dockerfile: build/package.Dockerfile
           - component: bridge
             binary: steward-connections-bridge
             dockerfile: build/connections-bridge.Dockerfile
@@ -555,11 +558,13 @@ jobs:
           STEWARD_RELEASE_APISERVER_DIGEST="$(cat dist/apiserver.digest)"
           STEWARD_RELEASE_CONTROLLER_DIGEST="$(cat dist/controller.digest)"
           STEWARD_RELEASE_MINT_DIGEST="$(cat dist/mint.digest)"
+          STEWARD_RELEASE_TRIGGER_RECEIVER_DIGEST="$(cat dist/trigger-receiver.digest)"
           STEWARD_RELEASE_BRIDGE_DIGEST="$(cat dist/bridge.digest)"
           STEWARD_RELEASE_WEB_DIGEST="$(cat dist/web.digest)"
           export STEWARD_RELEASE_VERSION STEWARD_RELEASE_CHART_DIGEST
           export STEWARD_RELEASE_APISERVER_DIGEST STEWARD_RELEASE_CONTROLLER_DIGEST
-          export STEWARD_RELEASE_MINT_DIGEST STEWARD_RELEASE_BRIDGE_DIGEST
+          export STEWARD_RELEASE_MINT_DIGEST STEWARD_RELEASE_TRIGGER_RECEIVER_DIGEST
+          export STEWARD_RELEASE_BRIDGE_DIGEST
           export STEWARD_RELEASE_WEB_DIGEST
           bash scripts/customer-core-install-e2e.sh
 
@@ -659,6 +664,7 @@ jobs:
             --arg apiserver_digest "$(cat dist/apiserver.digest)" \
             --arg controller_digest "$(cat dist/controller.digest)" \
             --arg mint_digest "$(cat dist/mint.digest)" \
+            --arg trigger_receiver_digest "$(cat dist/trigger-receiver.digest)" \
             --arg bridge_digest "$bridge_digest" \
             --arg web_digest "$(cat dist/web.digest)" \
             --arg provider_digest "$provider_profile_bundle_digest" \
@@ -681,6 +687,7 @@ jobs:
                 apiserver: {reference: ($image_repository + ":" + $version + "-apiserver"), digest: $apiserver_digest},
                 controller: {reference: ($image_repository + ":" + $version + "-controller"), digest: $controller_digest},
                 mint: {reference: ($image_repository + ":" + $version + "-mint"), digest: $mint_digest},
+                triggerReceiver: {reference: ($image_repository + ":" + $version + "-trigger-receiver"), digest: $trigger_receiver_digest},
                 bridge: {reference: ($image_repository + ":" + $version + "-bridge"), digest: $bridge_digest},
                 web: {reference: ($image_repository + ":" + $version + "-web"), digest: $web_digest}
               },
@@ -772,7 +779,7 @@ jobs:
             printf '## Acceptance\n\n'
             printf 'Repository validation, migration rehearsal, image/chart publication, OpenShell conformance, released-artifact installation, scans, SBOMs, and provenance completed successfully before this handoff job.\n\n'
             printf '| Artifact | Tag | Digest |\n|---|---|---|\n'
-            for component in apiserver controller mint bridge web; do
+            for component in apiserver controller mint trigger-receiver bridge web; do
               printf '| %s | %s:%s-%s | %s |\n' \
                 "$component" "$repository" "$version" "$component" "$(cat "dist/$component.digest")"
             done
@@ -861,7 +868,7 @@ jobs:
           mkdir -p "$DOCKER_CONFIG"
           test ! -e "$DOCKER_CONFIG/config.json"
           test ! -e "$HELM_REGISTRY_CONFIG"
-          for component in apiserver controller mint bridge web; do
+          for component in apiserver controller mint trigger-receiver bridge web; do
             docker buildx imagetools inspect \
               "ghcr.io/$GITHUB_REPOSITORY_OWNER/steward@$(cat "dist/$component.digest")"
           done

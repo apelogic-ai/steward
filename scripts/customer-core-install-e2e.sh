@@ -3,6 +3,7 @@
 set -euo pipefail
 
 build_release_value_sets() {
+  local receiver_trigger='[{"id":"Jira_read","enabled":true,"source":"jira","workflow":"triage@1","service":"event-worker","ownerUserId":"usr_11111111111111111111111111111111","envelopeDigest":"steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","filters":{"event":"jira:issue_updated","project":"PROJ","issueType":"10001"},"ignoredAccountIds":["acct-1"],"concurrencyLimit":2,"cooldownSeconds":60,"signingSecret":{"name":"steward-jira-webhook","key":"secret"}}]'
   values=(
     --set-string spire.className=spire-spire
     --set-string "images.repository=${image_repository}"
@@ -22,9 +23,23 @@ build_release_value_sets() {
     --set browserAuth.enabled=true
     --set-string images.mint.tag="${release_version}-mint"
     --set-string images.mint.digest="${mint_digest}"
+    --set triggerReceiver.enabled=true
+    --set-string images.triggerReceiver.tag="${release_version}-trigger-receiver"
+    --set-string images.triggerReceiver.digest="${trigger_receiver_digest}"
+    --set-json "triggerReceiver.triggers=${receiver_trigger}"
+    --set-string triggerReceiver.databaseSecret.name=steward-trigger-database
+    --set-string triggerReceiver.databaseSecret.key=url
+    --set-string triggerReceiver.workloadExchange.endpoint=https://identity.example.test/v1/workload/exchange
+    --set-string triggerReceiver.workloadExchange.serverName=identity.example.test
+    --set-string triggerReceiver.workloadExchange.audience=apelogic-workload-exchange
+    --set-string triggerReceiver.taskApi.ca.kind=ConfigMap
+    --set-string triggerReceiver.taskApi.ca.name=steward-apiserver-ca
+    --set-string triggerReceiver.taskApi.ca.key=ca.crt
+    --set-string networkPolicy.ingressNamespace=edge-system
     --set-string images.web.tag="${release_version}-web"
     --set-string images.web.digest="${web_digest}"
     --set-string config.apiserver.inferenceEndpoint=https://inference.example.test/v1/responses
+    --set-string config.apiserver.jiraBaseUrl=https://jira.example.com
     --set-string config.controller.openshellEndpoint=https://openshell.example.test
     --set-string config.controller.openshellServerName=openshell.example.test
     --set-string config.controller.workloadExchangeEndpoint=https://identity.example.test/v1/workload/exchange
@@ -66,8 +81,9 @@ if [[ "${1:-}" == --lint-source-chart ]]; then
   api_digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   controller_digest=sha256:1111111111111111111111111111111111111111111111111111111111111111
   mint_digest=sha256:2222222222222222222222222222222222222222222222222222222222222222
-  bridge_digest=sha256:3333333333333333333333333333333333333333333333333333333333333333
-  web_digest=sha256:4444444444444444444444444444444444444444444444444444444444444444
+  trigger_receiver_digest=sha256:3333333333333333333333333333333333333333333333333333333333333333
+  bridge_digest=sha256:4444444444444444444444444444444444444444444444444444444444444444
+  web_digest=sha256:5555555555555555555555555555555555555555555555555555555555555555
   api_ip=192.0.2.10
   postgres_ip=192.0.2.11
   build_release_value_sets
@@ -92,6 +108,7 @@ chart_digest="${STEWARD_RELEASE_CHART_DIGEST:?STEWARD_RELEASE_CHART_DIGEST is re
 api_digest="${STEWARD_RELEASE_APISERVER_DIGEST:?STEWARD_RELEASE_APISERVER_DIGEST is required}"
 controller_digest="${STEWARD_RELEASE_CONTROLLER_DIGEST:?STEWARD_RELEASE_CONTROLLER_DIGEST is required}"
 mint_digest="${STEWARD_RELEASE_MINT_DIGEST:?STEWARD_RELEASE_MINT_DIGEST is required}"
+trigger_receiver_digest="${STEWARD_RELEASE_TRIGGER_RECEIVER_DIGEST:?STEWARD_RELEASE_TRIGGER_RECEIVER_DIGEST is required}"
 bridge_digest="${STEWARD_RELEASE_BRIDGE_DIGEST:?STEWARD_RELEASE_BRIDGE_DIGEST is required}"
 web_digest="${STEWARD_RELEASE_WEB_DIGEST:?STEWARD_RELEASE_WEB_DIGEST is required}"
 run_id="core-$(date -u +%Y%m%d%H%M%S)-$$"
@@ -143,7 +160,7 @@ for tool in docker helm kind kubectl openssl jq curl tar; do
   command -v "${tool}" >/dev/null || { echo "missing ${tool}" >&2; exit 2; }
 done
 docker info >/dev/null
-for digest in "${chart_digest}" "${api_digest}" "${controller_digest}" "${mint_digest}" "${bridge_digest}" "${web_digest}"; do
+for digest in "${chart_digest}" "${api_digest}" "${controller_digest}" "${mint_digest}" "${trigger_receiver_digest}" "${bridge_digest}" "${web_digest}"; do
   if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
     echo "release artifact has invalid digest: ${digest}" >&2
     exit 2
@@ -163,7 +180,7 @@ printf 'release_version=%s\ncluster=%s\ncontext=%s\nkubeconfig=%s\nrun_dir=%s\n'
 echo "core install release ${release_version}; owned cluster ${cluster}"
 
 stage=release-artifacts
-for digest in "${api_digest}" "${controller_digest}" "${mint_digest}" "${bridge_digest}" "${web_digest}"; do
+for digest in "${api_digest}" "${controller_digest}" "${mint_digest}" "${trigger_receiver_digest}" "${bridge_digest}" "${web_digest}"; do
   docker pull "${image_pull_repository}@${digest}" >/dev/null
 done
 helm_pull=(pull "${chart_repository}@${chart_digest}" --destination "${run_dir}")
@@ -297,6 +314,7 @@ for image in \
   "${image_repository}:${release_version}-apiserver@${api_digest}" \
   "${image_repository}:${release_version}-controller@${controller_digest}" \
   "${image_repository}:${release_version}-mint@${mint_digest}" \
+  "${image_repository}:${release_version}-trigger-receiver@${trigger_receiver_digest}" \
   "${image_repository}:${release_version}-web@${web_digest}" \
   "${image_repository}@${bridge_digest}"
 do
