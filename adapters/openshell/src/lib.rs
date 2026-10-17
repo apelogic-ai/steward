@@ -1749,15 +1749,19 @@ impl WorkloadExchangeTokenProvider {
             .await
             .map_err(workload_exchange_unavailable)?;
         if response.status() != StatusCode::OK {
-            return Err(if response.status().is_client_error() {
-                PortError::Rejected {
-                    reason: "workload exchange rejected the source credential".to_owned(),
-                }
-            } else {
-                PortError::Failed {
-                    reason: "workload exchange is unavailable".to_owned(),
-                }
-            });
+            return Err(
+                if response.status().is_client_error()
+                    && response.status() != StatusCode::TOO_MANY_REQUESTS
+                {
+                    PortError::Rejected {
+                        reason: "workload exchange rejected the source credential".to_owned(),
+                    }
+                } else {
+                    PortError::Failed {
+                        reason: "workload exchange is unavailable".to_owned(),
+                    }
+                },
+            );
         }
         let cache_control = response
             .headers()
@@ -4849,6 +4853,25 @@ mod tests {
         let _ = exchange.finish(1)?;
         std::fs::remove_file(source_file)
             .map_err(|error| format!("failed to remove source credential fixture: {error}"))?;
+        Ok(())
+    }
+
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn workload_exchange_rate_limits_and_server_failures_are_retriable() -> Result<(), String>
+    {
+        for status in [429, 503] {
+            let exchange = mock_exchange(response(status, None, ""))?;
+            let source_file = source_credential_fixture()?;
+            let provider = test_token_provider(exchange.endpoint.clone(), source_file.clone())?;
+            assert!(
+                matches!(provider.access_token().await, Err(PortError::Failed { .. })),
+                "HTTP {status} must allow the caller to retry"
+            );
+            let _ = exchange.finish(1)?;
+            std::fs::remove_file(source_file)
+                .map_err(|error| format!("failed to remove source credential fixture: {error}"))?;
+        }
         Ok(())
     }
 

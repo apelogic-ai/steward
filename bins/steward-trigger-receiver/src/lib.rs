@@ -1069,6 +1069,16 @@ mod tests {
         assert_eq!(send(receiver, delivery, author).await, value);
     }
 
+    #[test]
+    fn deployment_limit_unknown_to_the_code_controls_trigger_validation() {
+        let mut configured = limits();
+        configured.max_concurrency = 7;
+        configured.max_cooldown_seconds = 137;
+        assert!(ReceiverConfig::from_json(&config_json("[]", 7, 137), &configured).is_ok());
+        assert!(ReceiverConfig::from_json(&config_json("[]", 8, 137), &configured).is_err());
+        assert!(ReceiverConfig::from_json(&config_json("[]", 7, 138), &configured).is_err());
+    }
+
     #[tokio::test]
     async fn request_refusals_are_fail_closed() -> Result<(), String> {
         let valid = config_json("[\"ignored\"]", 2, 60);

@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::time::Duration;
 
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -964,12 +965,35 @@ impl PgStore {
             .map_err(database_error)
     }
 
+    pub async fn connect_with_acquire_timeout(
+        database_url: &str,
+        acquire_timeout: Duration,
+    ) -> Result<Self, StoreError> {
+        PgPoolOptions::new()
+            .acquire_timeout(acquire_timeout)
+            .connect(database_url)
+            .await
+            .map(Self::new)
+            .map_err(database_error)
+    }
+
     /// Creates a pool without opening a database connection.
     ///
     /// This is reserved for optional runtime dependencies whose outage must not prevent the
     /// surrounding service from starting or serving unrelated operations.
     pub fn connect_lazy(database_url: &str) -> Result<Self, StoreError> {
         PgPoolOptions::new()
+            .connect_lazy(database_url)
+            .map(Self::new)
+            .map_err(database_error)
+    }
+
+    pub fn connect_lazy_with_acquire_timeout(
+        database_url: &str,
+        acquire_timeout: Duration,
+    ) -> Result<Self, StoreError> {
+        PgPoolOptions::new()
+            .acquire_timeout(acquire_timeout)
             .connect_lazy(database_url)
             .map(Self::new)
             .map_err(database_error)

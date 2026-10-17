@@ -21,7 +21,6 @@ use crate::{
 };
 
 const TOKEN_REQUEST_SECONDS: i64 = 600;
-const MAX_TASK_REPLY_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone)]
 pub struct PgEnvelopeAuthority {
@@ -162,7 +161,12 @@ impl KubernetesTokenRequester {
             .create_token_request(&self.service_account, &PostParams::default(), &request)
             .await
             .map_err(|error| match error {
-                kube::Error::Api(response) if response.code < 500 => TaskLifecycleError::Final,
+                kube::Error::Api(response)
+                    if response.code < 500
+                        && response.code != u16::from(StatusCode::TOO_MANY_REQUESTS) =>
+                {
+                    TaskLifecycleError::Final
+                }
                 _ => TaskLifecycleError::Retriable,
             })?;
         response
@@ -174,6 +178,12 @@ impl KubernetesTokenRequester {
 }
 
 pub trait TaskTokenProvider: Send + Sync + 'static {
+    fn lifecycle(
+        &self,
+    ) -> ReceiverFuture<'_, Result<Arc<dyn TaskAccessTokenProvider>, TaskLifecycleError>>;
+}
+
+pub trait TaskAccessTokenProvider: Send + Sync + 'static {
     fn token(&self) -> ReceiverFuture<'_, Result<OpaqueToken, TaskLifecycleError>>;
 }
 
@@ -194,9 +204,13 @@ impl KubernetesWorkloadTokenProvider {
     ) -> Result<Self, String> {
         steward_adapter_openshell::validate_workload_exchange_endpoint(&endpoint, &server_name)
             .map_err(|_| "workload exchange endpoint is invalid".to_owned())?;
-        if ca_certificate_pem.is_empty() {
-            return Err("workload exchange CA certificate is required".to_owned());
-        }
+        WorkloadExchangeTokenProvider::new(
+            &endpoint,
+            &server_name,
+            &ca_certificate_pem,
+            "startup-validation-only".to_owned(),
+        )
+        .map_err(|_| "workload exchange CA certificate is invalid".to_owned())?;
         Ok(Self {
             source,
             endpoint,
@@ -207,7 +221,9 @@ impl KubernetesWorkloadTokenProvider {
 }
 
 impl TaskTokenProvider for KubernetesWorkloadTokenProvider {
-    fn token(&self) -> ReceiverFuture<'_, Result<OpaqueToken, TaskLifecycleError>> {
+    fn lifecycle(
+        &self,
+    ) -> ReceiverFuture<'_, Result<Arc<dyn TaskAccessTokenProvider>, TaskLifecycleError>> {
         Box::pin(async move {
             let source = self.source.request().await?;
             let provider = WorkloadExchangeTokenProvider::new(
@@ -217,8 +233,14 @@ impl TaskTokenProvider for KubernetesWorkloadTokenProvider {
                 source,
             )
             .map_err(exchange_error)?;
-            provider.access_token().await.map_err(exchange_error)
+            Ok(Arc::new(provider) as Arc<dyn TaskAccessTokenProvider>)
         })
+    }
+}
+
+impl TaskAccessTokenProvider for WorkloadExchangeTokenProvider {
+    fn token(&self) -> ReceiverFuture<'_, Result<OpaqueToken, TaskLifecycleError>> {
+        Box::pin(async move { self.access_token().await.map_err(exchange_error) })
     }
 }
 
@@ -234,6 +256,9 @@ pub struct TaskClientTiming {
     pub deadline: Duration,
     pub initial_poll_delay: Duration,
     pub max_poll_delay: Duration,
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub max_reply_bytes: usize,
 }
 
 impl TaskClientTiming {
@@ -241,6 +266,9 @@ impl TaskClientTiming {
         if self.deadline.is_zero()
             || self.initial_poll_delay.is_zero()
             || self.max_poll_delay < self.initial_poll_delay
+            || self.connect_timeout.is_zero()
+            || self.request_timeout < self.connect_timeout
+            || self.max_reply_bytes == 0
         {
             return Err("Task polling settings are invalid".to_owned());
         }
@@ -288,8 +316,8 @@ impl WorkloadExchangeClient {
             .https_only(true)
             .tls_built_in_root_certs(false)
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10));
+            .connect_timeout(timing.connect_timeout)
+            .timeout(timing.request_timeout);
         for certificate in certificates {
             builder = builder.add_root_certificate(certificate);
         }
@@ -305,11 +333,12 @@ impl WorkloadExchangeClient {
 
     async fn send(
         &self,
+        tokens: &dyn TaskAccessTokenProvider,
         method: Method,
         path: &str,
         configure: impl FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
     ) -> Result<Response, TaskLifecycleError> {
-        let token = self.tokens.token().await?;
+        let token = tokens.token().await?;
         let url = self
             .task_origin
             .join(path)
@@ -327,46 +356,49 @@ impl WorkloadExchangeClient {
     async fn continue_task(
         self,
         uid: String,
-        input_archive: Vec<u8>,
+        tokens: Arc<dyn TaskAccessTokenProvider>,
     ) -> Result<(), TaskLifecycleError> {
         let base = format!("v1/tasks/{uid}");
         let work = async {
-            require_status(
-                self.send(Method::PUT, &format!("{base}/inputs"), |request| {
-                    request
-                        .header(CONTENT_TYPE, "application/x-tar")
-                        .body(input_archive)
-                })
-                .await?,
-                StatusCode::NO_CONTENT,
-            )?;
-            require_status(
-                self.send(Method::POST, &format!("{base}/execute"), |request| request)
-                    .await?,
-                StatusCode::ACCEPTED,
-            )?;
             let mut delay = self.timing.initial_poll_delay;
             loop {
-                let response = self.send(Method::GET, &base, |request| request).await?;
-                if response.status() != StatusCode::OK {
-                    return Err(classify_status(response.status()));
-                }
-                match read_task_reply(response).await?.phase.as_str() {
-                    "succeeded" | "failed" | "cancelled" => return Ok(()),
-                    "submitted" | "parked" | "queued" | "running" => {
+                let reply = match self
+                    .send(tokens.as_ref(), Method::GET, &base, |request| request)
+                    .await
+                {
+                    Ok(response) if response.status() == StatusCode::OK => {
+                        read_task_reply(response, self.timing.max_reply_bytes).await
+                    }
+                    Ok(response) => Err(classify_status(response.status())),
+                    Err(error) => Err(error),
+                };
+                match reply {
+                    Err(TaskLifecycleError::Retriable) => {
                         sleep(delay).await;
                         delay = delay.saturating_mul(2).min(self.timing.max_poll_delay);
+                        continue;
                     }
-                    _ => return Err(TaskLifecycleError::Final),
+                    Err(TaskLifecycleError::Final) => return Err(TaskLifecycleError::Final),
+                    Ok(reply) => match reply.phase.as_str() {
+                        "succeeded" | "failed" | "cancelled" => return Ok(()),
+                        "submitted" | "parked" | "queued" | "running" => {
+                            sleep(delay).await;
+                            delay = delay.saturating_mul(2).min(self.timing.max_poll_delay);
+                        }
+                        _ => return Err(TaskLifecycleError::Final),
+                    },
                 }
             }
         };
         match timeout(self.timing.deadline, work).await {
-            Ok(result) => result.and(self.finalize(&base).await),
+            Ok(result) => {
+                let finalized = self.finalize(&base, tokens.as_ref()).await;
+                result.and(finalized)
+            }
             Err(_) => {
                 let cleanup = self.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = cleanup.finalize(&base).await {
+                    if let Err(error) = cleanup.finalize(&base, tokens.as_ref()).await {
                         eprintln!("timed-out Task finalization ended with a {error:?} failure");
                     }
                 });
@@ -375,8 +407,12 @@ impl WorkloadExchangeClient {
         }
     }
 
-    async fn finalize(&self, base: &str) -> Result<(), TaskLifecycleError> {
-        self.send(Method::DELETE, base, |request| request)
+    async fn finalize(
+        &self,
+        base: &str,
+        tokens: &dyn TaskAccessTokenProvider,
+    ) -> Result<(), TaskLifecycleError> {
+        self.send(tokens, Method::DELETE, base, |request| request)
             .await
             .and_then(|response| require_status(response, StatusCode::ACCEPTED))
     }
@@ -392,8 +428,9 @@ impl TaskLifecycle for WorkloadExchangeClient {
             if !invocation.validate_for(trigger) {
                 return Err(TaskLifecycleError::Final);
             }
+            let tokens = self.tokens.lifecycle().await?;
             let response = self
-                .send(Method::POST, "v1/tasks", |request| {
+                .send(tokens.as_ref(), Method::POST, "v1/tasks", |request| {
                     request
                         .header("Idempotency-Key", &invocation.idempotency_key)
                         .json(&TaskRequest {
@@ -406,14 +443,54 @@ impl TaskLifecycle for WorkloadExchangeClient {
             if !matches!(status, StatusCode::OK | StatusCode::ACCEPTED) {
                 return Err(classify_status(status));
             }
-            let reply = read_task_reply(response).await?;
-            if status == StatusCode::OK {
-                return Ok(TaskStart::Duplicate);
+            let reply = read_task_reply(response, self.timing.max_reply_bytes).await?;
+            let base = format!("v1/tasks/{}", reply.task_uid);
+            match reply.phase.as_str() {
+                "succeeded" | "failed" | "cancelled" => return Ok(TaskStart::Duplicate),
+                "submitted" | "parked" => {
+                    let prepared = async {
+                        require_status(
+                            self.send(
+                                tokens.as_ref(),
+                                Method::PUT,
+                                &format!("{base}/inputs"),
+                                |request| {
+                                    request
+                                        .header(CONTENT_TYPE, "application/x-tar")
+                                        .body(invocation.input_archive)
+                                },
+                            )
+                            .await?,
+                            StatusCode::NO_CONTENT,
+                        )?;
+                        require_status(
+                            self.send(
+                                tokens.as_ref(),
+                                Method::POST,
+                                &format!("{base}/execute"),
+                                |request| request,
+                            )
+                            .await?,
+                            StatusCode::ACCEPTED,
+                        )
+                    }
+                    .await;
+                    if let Err(error) = prepared {
+                        if error == TaskLifecycleError::Final {
+                            let _ = self.finalize(&base, tokens.as_ref()).await;
+                        }
+                        return Err(error);
+                    }
+                }
+                "queued" | "running" => {}
+                _ => {
+                    let _ = self.finalize(&base, tokens.as_ref()).await;
+                    return Err(TaskLifecycleError::Final);
+                }
             }
             let this = self.clone();
             Ok(TaskStart::Started(Box::pin(async move {
-                this.continue_task(reply.task_uid, invocation.input_archive)
-                    .await
+                this.continue_task(reply.task_uid, tokens).await
             })))
         })
     }
@@ -449,10 +526,13 @@ fn require_status(response: Response, expected: StatusCode) -> Result<(), TaskLi
         .ok_or_else(|| classify_status(response.status()))
 }
 
-async fn read_task_reply(mut response: Response) -> Result<TaskReply, TaskLifecycleError> {
+async fn read_task_reply(
+    mut response: Response,
+    max_reply_bytes: usize,
+) -> Result<TaskReply, TaskLifecycleError> {
     if response
         .content_length()
-        .is_some_and(|length| length > MAX_TASK_REPLY_BYTES)
+        .is_some_and(|length| length > max_reply_bytes as u64)
     {
         return Err(TaskLifecycleError::Final);
     }
@@ -462,7 +542,7 @@ async fn read_task_reply(mut response: Response) -> Result<TaskReply, TaskLifecy
         .await
         .map_err(|_| TaskLifecycleError::Retriable)?
     {
-        if body.len().saturating_add(chunk.len()) > MAX_TASK_REPLY_BYTES as usize {
+        if body.len().saturating_add(chunk.len()) > max_reply_bytes {
             return Err(TaskLifecycleError::Final);
         }
         body.extend_from_slice(&chunk);
@@ -475,17 +555,94 @@ async fn read_task_reply(mut response: Response) -> Result<TaskReply, TaskLifecy
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use axum::body::Body;
     use axum::http::{Request, Response as HttpResponse};
     use kube::client::Body as KubeBody;
+    use rcgen::generate_simple_self_signed;
     use steward_admission::{Envelope, EnvelopeSpec};
     use steward_types::{Budget, Duration as StewardDuration, RunnerRequirements};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::rustls::ServerConfig;
+    use tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer;
     use tower::service_fn;
 
     use super::*;
 
     const OWNER: &str = "usr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    struct TlsFixture {
+        origin: String,
+        ca_certificate_pem: Vec<u8>,
+        requests: Arc<Mutex<Vec<String>>>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    async fn tls_fixture(responses: Vec<String>) -> Result<TlsFixture, String> {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let certified = generate_simple_self_signed(vec!["localhost".to_owned()])
+            .map_err(|error| error.to_string())?;
+        let ca_certificate_pem = certified.cert.pem().into_bytes();
+        let key = PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certified.cert.der().clone()], key.into())
+            .map_err(|error| error.to_string())?;
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let handle = tokio::spawn(async move {
+            for response in responses {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    continue;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                if let Ok(request) = String::from_utf8(request)
+                    && let Ok(mut captured) = captured.lock()
+                {
+                    captured.push(request);
+                }
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(TlsFixture {
+            origin: format!("https://localhost:{}/", address.port()),
+            ca_certificate_pem,
+            requests,
+            handle,
+        })
+    }
+
+    fn test_response(status: u16, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
 
     #[tokio::test]
     async fn token_request_uses_supported_expiration_and_exact_audience() -> Result<(), String> {
@@ -542,18 +699,247 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_request_maps_rate_limits_and_server_failures_to_retry() -> Result<(), String> {
+        for (status, expected) in [
+            (StatusCode::FORBIDDEN, TaskLifecycleError::Final),
+            (StatusCode::TOO_MANY_REQUESTS, TaskLifecycleError::Retriable),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                TaskLifecycleError::Retriable,
+            ),
+        ] {
+            let client = KubeClient::new(
+                service_fn(move |_request: Request<KubeBody>| async move {
+                    let mut response = HttpResponse::new(Body::from(format!(
+                        r#"{{"apiVersion":"v1","kind":"Status","status":"Failure","message":"request refused","reason":"Failure","code":{}}}"#,
+                        status.as_u16()
+                    )));
+                    *response.status_mut() = status;
+                    response.headers_mut().insert(
+                        "content-type",
+                        "application/json".parse().map_err(std::io::Error::other)?,
+                    );
+                    Ok::<_, std::io::Error>(response)
+                }),
+                "default",
+            );
+            let requester = KubernetesTokenRequester::new(
+                client,
+                "steward-test".to_owned(),
+                "receiver".to_owned(),
+                "steward-task".to_owned(),
+            )?;
+            assert_eq!(requester.request().await.err(), Some(expected));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workload_provider_uses_one_source_token_and_exchange_per_lifecycle()
+    -> Result<(), String> {
+        let source_calls = Arc::new(Mutex::new(0_usize));
+        let counted = source_calls.clone();
+        let kube = KubeClient::new(
+            service_fn(move |_request: Request<KubeBody>| {
+                let counted = counted.clone();
+                async move {
+                    *counted
+                        .lock()
+                        .map_err(|_| std::io::Error::other("poisoned"))? += 1;
+                    let mut response = HttpResponse::new(Body::from(
+                        br#"{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","metadata":{},"spec":{"audiences":["steward-task"],"expirationSeconds":600},"status":{"expirationTimestamp":"2030-01-01T00:00:00Z","token":"obviously-fake-source-token"}}"#
+                            .to_vec(),
+                    ));
+                    response.headers_mut().insert(
+                        "content-type",
+                        "application/json".parse().map_err(std::io::Error::other)?,
+                    );
+                    Ok::<_, std::io::Error>(response)
+                }
+            }),
+            "default",
+        );
+        let exchange_body = r#"{"access_token":"obviously-fake-access-token","token_type":"Bearer","expires_in":120}"#;
+        let exchange = tls_fixture(vec![
+            test_response(200, "Cache-Control: no-store\r\n", exchange_body),
+            test_response(200, "Cache-Control: no-store\r\n", exchange_body),
+        ])
+        .await?;
+        let provider = KubernetesWorkloadTokenProvider::new(
+            KubernetesTokenRequester::new(
+                kube,
+                "steward-test".to_owned(),
+                "receiver".to_owned(),
+                "steward-task".to_owned(),
+            )?,
+            format!("{}v1/workload/exchange", exchange.origin),
+            "localhost".to_owned(),
+            exchange.ca_certificate_pem.clone(),
+        )?;
+        for _ in 0..2 {
+            let lifecycle = provider
+                .lifecycle()
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            for _ in 0..2 {
+                assert_eq!(
+                    lifecycle
+                        .token()
+                        .await
+                        .map_err(|error| format!("{error:?}"))?
+                        .expose_secret(),
+                    "obviously-fake-access-token"
+                );
+            }
+        }
+        exchange.handle.await.map_err(|error| error.to_string())?;
+        assert_eq!(*source_calls.lock().map_err(|_| "poisoned")?, 2);
+        assert_eq!(exchange.requests.lock().map_err(|_| "poisoned")?.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workload_exchange_refuses_a_source_token_with_the_wrong_audience() -> Result<(), String>
+    {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let request_bodies = captured.clone();
+        let kube = KubeClient::new(
+            service_fn(move |request: Request<KubeBody>| {
+                let request_bodies = request_bodies.clone();
+                async move {
+                    let body = request
+                        .into_body()
+                        .collect_bytes()
+                        .await
+                        .map_err(std::io::Error::other)?;
+                    request_bodies
+                        .lock()
+                        .map_err(|_| std::io::Error::other("poisoned"))?
+                        .push(body.to_vec());
+                    let mut response = HttpResponse::new(Body::from(
+                        br#"{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","metadata":{},"spec":{"audiences":["other-service"],"expirationSeconds":600},"status":{"expirationTimestamp":"2030-01-01T00:00:00Z","token":"obviously-fake-wrong-audience-token"}}"#
+                            .to_vec(),
+                    ));
+                    response.headers_mut().insert(
+                        "content-type",
+                        "application/json".parse().map_err(std::io::Error::other)?,
+                    );
+                    Ok::<_, std::io::Error>(response)
+                }
+            }),
+            "default",
+        );
+        let exchange = tls_fixture(vec![test_response(401, "", "")]).await?;
+        let provider = KubernetesWorkloadTokenProvider::new(
+            KubernetesTokenRequester::new(
+                kube,
+                "steward-test".to_owned(),
+                "receiver".to_owned(),
+                "other-service".to_owned(),
+            )?,
+            format!("{}v1/workload/exchange", exchange.origin),
+            "localhost".to_owned(),
+            exchange.ca_certificate_pem.clone(),
+        )?;
+        let lifecycle = provider
+            .lifecycle()
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(
+            lifecycle.token().await.err(),
+            Some(TaskLifecycleError::Final)
+        );
+        exchange.handle.await.map_err(|error| error.to_string())?;
+        let bodies = captured.lock().map_err(|_| "poisoned")?;
+        let request: serde_json::Value =
+            serde_json::from_slice(&bodies[0]).map_err(|error| error.to_string())?;
+        assert_eq!(
+            request["spec"]["audiences"],
+            serde_json::json!(["other-service"])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workload_exchange_maps_refusal_and_transient_statuses() -> Result<(), String> {
+        for (status, expected) in [
+            (401, TaskLifecycleError::Final),
+            (429, TaskLifecycleError::Retriable),
+            (503, TaskLifecycleError::Retriable),
+        ] {
+            let kube = KubeClient::new(
+                service_fn(|_request: Request<KubeBody>| async move {
+                    let mut response = HttpResponse::new(Body::from(
+                        br#"{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","metadata":{},"spec":{"audiences":["steward-task"],"expirationSeconds":600},"status":{"expirationTimestamp":"2030-01-01T00:00:00Z","token":"obviously-fake-source-token"}}"#
+                            .to_vec(),
+                    ));
+                    response.headers_mut().insert(
+                        "content-type",
+                        "application/json".parse().map_err(std::io::Error::other)?,
+                    );
+                    Ok::<_, std::io::Error>(response)
+                }),
+                "default",
+            );
+            let exchange = tls_fixture(vec![test_response(status, "", "")]).await?;
+            let provider = KubernetesWorkloadTokenProvider::new(
+                KubernetesTokenRequester::new(
+                    kube,
+                    "steward-test".to_owned(),
+                    "receiver".to_owned(),
+                    "steward-task".to_owned(),
+                )?,
+                format!("{}v1/workload/exchange", exchange.origin),
+                "localhost".to_owned(),
+                exchange.ca_certificate_pem.clone(),
+            )?;
+            let lifecycle = provider
+                .lifecycle()
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            assert_eq!(lifecycle.token().await.err(), Some(expected));
+            exchange.handle.await.map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workload_exchange_rejects_a_malformed_ca_at_startup() -> Result<(), String> {
+        let kube = KubeClient::new(
+            service_fn(|_request: Request<KubeBody>| async move {
+                Ok::<_, std::io::Error>(HttpResponse::new(Body::empty()))
+            }),
+            "default",
+        );
+        assert!(
+            KubernetesWorkloadTokenProvider::new(
+                KubernetesTokenRequester::new(
+                    kube,
+                    "steward-test".to_owned(),
+                    "receiver".to_owned(),
+                    "steward-task".to_owned(),
+                )?,
+                "https://identity.example.test/v1/workload/exchange".to_owned(),
+                "identity.example.test".to_owned(),
+                b"not a certificate".to_vec(),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn envelope_lookup_fails_closed_when_database_is_unreachable() -> Result<(), String> {
-        let store = PgStore::connect_lazy("postgres://steward@127.0.0.1:9/steward")
-            .map_err(|error| error.to_string())?;
+        let store = PgStore::connect_lazy_with_acquire_timeout(
+            "postgres://steward@127.0.0.1:9/steward",
+            Duration::from_millis(25),
+        )
+        .map_err(|error| error.to_string())?;
         let authority = PgEnvelopeAuthority::new(store);
         let owner = CanonicalUserId::parse(OWNER)?;
         let digest = format!("steward:sha256:{}", "a".repeat(64));
-        let result = tokio::time::timeout(
-            Duration::from_millis(100),
-            crate::EnvelopeAuthority::active_tools(&authority, &owner, &digest),
-        )
-        .await;
-        assert!(!matches!(result, Ok(Ok(_))));
+        let result = crate::EnvelopeAuthority::active_tools(&authority, &owner, &digest).await;
+        assert_eq!(result, Err(crate::EnvelopeError::Unavailable));
         Ok(())
     }
 
@@ -657,11 +1043,68 @@ mod tests {
         }
     }
 
+    fn test_timing() -> TaskClientTiming {
+        TaskClientTiming {
+            deadline: Duration::from_millis(250),
+            initial_poll_delay: Duration::from_millis(5),
+            max_poll_delay: Duration::from_millis(10),
+            connect_timeout: Duration::from_millis(50),
+            request_timeout: Duration::from_millis(100),
+            max_reply_bytes: 4093,
+        }
+    }
+
+    #[tokio::test]
+    async fn production_task_transport_refuses_redirects() -> Result<(), String> {
+        let fixture = tls_fixture(vec![test_response(
+            307,
+            "Location: https://other.example.test/v1/tasks\r\n",
+            "",
+        )])
+        .await?;
+        let client = WorkloadExchangeClient::new(
+            fixture.origin.clone(),
+            "localhost".to_owned(),
+            fixture.ca_certificate_pem.clone(),
+            Tokens(Arc::new(Mutex::new(0))),
+            test_timing(),
+        )?;
+        assert_eq!(
+            client.start(&trigger()?, invocation()?).await.err(),
+            Some(TaskLifecycleError::Final)
+        );
+        fixture.handle.await.map_err(|error| error.to_string())?;
+        assert_eq!(fixture.requests.lock().map_err(|_| "poisoned")?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn production_task_transport_refuses_an_untrusted_ca() -> Result<(), String> {
+        let trusted = tls_fixture(Vec::new()).await?;
+        let target = tls_fixture(vec![test_response(401, "", "")]).await?;
+        let client = WorkloadExchangeClient::new(
+            target.origin.clone(),
+            "localhost".to_owned(),
+            trusted.ca_certificate_pem.clone(),
+            Tokens(Arc::new(Mutex::new(0))),
+            test_timing(),
+        )?;
+        assert_eq!(
+            client.start(&trigger()?, invocation()?).await.err(),
+            Some(TaskLifecycleError::Retriable)
+        );
+        trusted.handle.abort();
+        target.handle.abort();
+        Ok(())
+    }
+
     #[tokio::test]
     async fn file_catalog_is_read_again_for_each_submit_check() -> Result<(), String> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "../../target/trigger-catalog-{}",
-            std::process::id()
+        static NEXT_CATALOG_ID: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "steward-trigger-catalog-{}-{}",
+            std::process::id(),
+            NEXT_CATALOG_ID.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::write(
             &path,
@@ -688,6 +1131,16 @@ mod tests {
     struct Tokens(Arc<Mutex<usize>>);
 
     impl TaskTokenProvider for Tokens {
+        fn lifecycle(
+            &self,
+        ) -> ReceiverFuture<'_, Result<Arc<dyn TaskAccessTokenProvider>, TaskLifecycleError>>
+        {
+            let tokens = self.clone();
+            Box::pin(async move { Ok(Arc::new(tokens) as Arc<dyn TaskAccessTokenProvider>) })
+        }
+    }
+
+    impl TaskAccessTokenProvider for Tokens {
         fn token(&self) -> ReceiverFuture<'_, Result<OpaqueToken, TaskLifecycleError>> {
             Box::pin(async move {
                 let mut count = self.0.lock().map_err(|_| TaskLifecycleError::Retriable)?;
@@ -701,6 +1154,7 @@ mod tests {
     #[derive(Clone)]
     struct ApiState {
         create_status: StatusCode,
+        create_phase: &'static str,
         polls_before_done: usize,
         failure: Option<&'static str>,
         requests: Arc<Mutex<Vec<(Method, String, String)>>>,
@@ -728,9 +1182,10 @@ mod tests {
         requests.push((method.clone(), path.clone(), auth));
         drop(requests);
         let mut response = if method == Method::POST && path == "/v1/tasks" {
-            HttpResponse::new(Body::from(
-                r#"{"taskUid":"00000000-0000-4000-8000-000000000001","phase":"submitted"}"#,
-            ))
+            HttpResponse::new(Body::from(format!(
+                r#"{{"taskUid":"00000000-0000-4000-8000-000000000001","phase":"{}"}}"#,
+                state.create_phase
+            )))
         } else if method == Method::GET {
             let Ok(mut polls) = state.polls.lock() else {
                 return HttpResponse::builder()
@@ -754,6 +1209,10 @@ mod tests {
             Some("upload") => method == Method::PUT,
             Some("execute") => method == Method::POST && path.ends_with("/execute"),
             Some("poll") => method == Method::GET,
+            Some("poll_once") => {
+                method == Method::GET
+                    && state.polls.lock().map(|polls| *polls == 1).unwrap_or(false)
+            }
             Some("finalize") => method == Method::DELETE,
             _ => false,
         };
@@ -773,6 +1232,7 @@ mod tests {
 
     async fn client_fixture(
         create_status: StatusCode,
+        create_phase: &'static str,
         polls_before_done: usize,
         deadline: Duration,
         failure: Option<&'static str>,
@@ -786,6 +1246,7 @@ mod tests {
     > {
         let state = ApiState {
             create_status,
+            create_phase,
             polls_before_done,
             failure,
             requests: Arc::new(Mutex::new(Vec::new())),
@@ -816,6 +1277,9 @@ mod tests {
                 deadline,
                 initial_poll_delay: Duration::from_millis(5),
                 max_poll_delay: Duration::from_millis(10),
+                connect_timeout: Duration::from_secs(1),
+                request_timeout: Duration::from_secs(2),
+                max_reply_bytes: 64 * 1024,
             },
         };
         Ok((client, state, handle))
@@ -850,7 +1314,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_create_is_a_noop() -> Result<(), String> {
         let (client, state, handle) =
-            client_fixture(StatusCode::OK, 0, Duration::from_secs(1), None).await?;
+            client_fixture(StatusCode::OK, "succeeded", 0, Duration::from_secs(1), None).await?;
         let result = client
             .start(&trigger()?, invocation()?)
             .await
@@ -863,8 +1327,14 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_task_polls_with_fresh_tokens_and_finalizes() -> Result<(), String> {
-        let (client, state, handle) =
-            client_fixture(StatusCode::ACCEPTED, 1, Duration::from_secs(1), None).await?;
+        let (client, state, handle) = client_fixture(
+            StatusCode::ACCEPTED,
+            "submitted",
+            1,
+            Duration::from_secs(1),
+            None,
+        )
+        .await?;
         let TaskStart::Started(completion) = client
             .start(&trigger()?, invocation()?)
             .await
@@ -872,6 +1342,21 @@ mod tests {
         else {
             return Err("expected started".to_owned());
         };
+        {
+            let requests = state.requests.lock().map_err(|_| "poisoned")?;
+            assert!(
+                requests.iter().any(|(method, path, _)| {
+                    *method == Method::PUT && path.ends_with("/inputs")
+                }),
+                "input upload must finish before Started is returned"
+            );
+            assert!(
+                requests.iter().any(|(method, path, _)| {
+                    *method == Method::POST && path.ends_with("/execute")
+                }),
+                "execute must finish before Started is returned"
+            );
+        }
         completion.await.map_err(|error| format!("{error:?}"))?;
         let requests = state.requests.lock().map_err(|_| "poisoned")?;
         assert_eq!(
@@ -899,6 +1384,7 @@ mod tests {
     async fn poll_deadline_still_finalizes() -> Result<(), String> {
         let (client, state, handle) = client_fixture(
             StatusCode::ACCEPTED,
+            "submitted",
             usize::MAX,
             Duration::from_millis(20),
             None,
@@ -945,7 +1431,7 @@ mod tests {
             (StatusCode::FORBIDDEN, TaskLifecycleError::Final),
         ] {
             let (client, _, handle) =
-                client_fixture(status, 0, Duration::from_secs(1), None).await?;
+                client_fixture(status, "submitted", 0, Duration::from_secs(1), None).await?;
             assert_eq!(
                 client.start(&trigger()?, invocation()?).await.err(),
                 Some(expected)
@@ -956,35 +1442,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_post_create_failure_is_returned_and_finalize_is_attempted() -> Result<(), String>
-    {
-        for failure in ["upload", "execute", "poll", "finalize"] {
+    async fn prepare_failure_is_returned_before_started_and_left_for_retry() -> Result<(), String> {
+        for failure in ["upload", "execute"] {
             let (client, state, handle) = client_fixture(
                 StatusCode::ACCEPTED,
+                "submitted",
                 0,
                 Duration::from_secs(1),
                 Some(failure),
             )
             .await?;
-            let TaskStart::Started(completion) = client
-                .start(&trigger()?, invocation()?)
-                .await
-                .map_err(|error| format!("{error:?}"))?
-            else {
-                return Err("expected started".to_owned());
-            };
-            assert_eq!(completion.await, Err(TaskLifecycleError::Retriable));
+            assert_eq!(
+                client.start(&trigger()?, invocation()?).await.err(),
+                Some(TaskLifecycleError::Retriable)
+            );
             assert!(
-                state
+                !state
                     .requests
                     .lock()
                     .map_err(|_| "poisoned")?
                     .iter()
                     .any(|(method, _, _)| *method == Method::DELETE),
-                "{failure} must still attempt finalization"
+                "{failure} must leave the Task resumable for webhook retry"
             );
             handle.abort();
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transient_poll_failure_retries_before_finalization() -> Result<(), String> {
+        let (client, state, handle) = client_fixture(
+            StatusCode::ACCEPTED,
+            "submitted",
+            0,
+            Duration::from_secs(1),
+            Some("poll_once"),
+        )
+        .await?;
+        let TaskStart::Started(completion) = client
+            .start(&trigger()?, invocation()?)
+            .await
+            .map_err(|error| format!("{error:?}"))?
+        else {
+            return Err("expected started".to_owned());
+        };
+        completion.await.map_err(|error| format!("{error:?}"))?;
+        let requests = state.requests.lock().map_err(|_| "poisoned")?;
+        let poll_positions = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (method, _, _))| (*method == Method::GET).then_some(index))
+            .collect::<Vec<_>>();
+        let finalize_position = requests
+            .iter()
+            .position(|(method, _, _)| *method == Method::DELETE)
+            .ok_or("finalize was not attempted")?;
+        assert_eq!(poll_positions.len(), 2);
+        assert!(poll_positions[1] < finalize_position);
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submitted_duplicate_resumes_upload_and_execute() -> Result<(), String> {
+        let (client, state, handle) =
+            client_fixture(StatusCode::OK, "submitted", 0, Duration::from_secs(1), None).await?;
+        let TaskStart::Started(completion) = client
+            .start(&trigger()?, invocation()?)
+            .await
+            .map_err(|error| format!("{error:?}"))?
+        else {
+            return Err("submitted duplicate must resume".to_owned());
+        };
+        completion.await.map_err(|error| format!("{error:?}"))?;
+        let requests = state.requests.lock().map_err(|_| "poisoned")?;
+        assert!(
+            requests
+                .iter()
+                .any(|(method, path, _)| *method == Method::PUT && path.ends_with("/inputs"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(method, path, _)| *method == Method::POST && path.ends_with("/execute"))
+        );
+        handle.abort();
         Ok(())
     }
 }

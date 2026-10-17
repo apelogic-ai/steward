@@ -25,6 +25,8 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+rcgen = "0.13.2"
+tokio-rustls.workspace = true
 tower.workspace = true
 
 [lints]
