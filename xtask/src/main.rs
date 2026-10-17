@@ -1605,8 +1605,8 @@ mod tests {
             "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:",
             "@openai/codex@0.140.0",
             "codex-cli 0.140.0",
-            "LINUX_LIBC_DEV_VERSION=6.8.0-142.142",
-            "LINUX_LIBC_DEV_SHA256=937db1a88a4fa2ea97fd4eab89f2cd9d077290f6a26bcd27b1a6d24fa3d706b6",
+            "LINUX_LIBC_DEV_VERSION=6.8.0-147.147",
+            "LINUX_LIBC_DEV_SHA256=fec8e4a308c03cd98dace67370a8d5a8031c36741796065c9f6e3f9548ab0cd2",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin dpkg --install",
             "tar@7.5.22",
             "/usr/lib/node_modules/npm/node_modules/tar/package.json",
@@ -1621,13 +1621,7 @@ mod tests {
         let statements = vulnerability_exceptions["statements"]
             .as_array()
             .ok_or_else(|| "Codex reference runtime VEX statements are required".to_string())?;
-        let expected_vulnerabilities = [
-            "CVE-2026-53398",
-            "CVE-2026-63940",
-            "CVE-2026-64535",
-            "CVE-2026-64564",
-            "CVE-2026-74394",
-        ];
+        let expected_vulnerabilities = ["CVE-2026-63825", "CVE-2026-64523", "CVE-2026-68426"];
         assert_eq!(
             statements.len(),
             expected_vulnerabilities.len(),
@@ -1639,9 +1633,20 @@ mod tests {
             assert_eq!(statement["justification"], "vulnerable_code_not_present");
             assert_eq!(
                 statement["products"][0]["@id"],
-                "pkg:deb/ubuntu/linux-libc-dev@6.8.0-142.142?arch=amd64&distro=ubuntu-24.04"
+                "pkg:deb/ubuntu/linux-libc-dev@6.8.0-147.147?arch=amd64&distro=ubuntu-24.04"
+            );
+            assert_eq!(statement["products"].as_array().map(Vec::len), Some(1));
+            assert!(
+                statement["impact_statement"]
+                    .as_str()
+                    .is_some_and(|impact| impact.contains("Review by 2026-11-17")),
+                "each exception must carry its explicit review date"
             );
         }
+        assert!(
+            !vulnerability_exceptions.to_string().contains('*'),
+            "Codex reference runtime VEX must not contain wildcard exceptions"
+        );
         for required in [
             "publish-codex-reference-runtime:",
             "build/codex-reference.Dockerfile",
