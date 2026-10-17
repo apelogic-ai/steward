@@ -16,6 +16,7 @@ members = [
     "bins/steward-controller",
     "bins/steward-apiserver",
     "bins/steward-mint",
+    "bins/steward-trigger-receiver",
     "crates/steward-admission",
     "crates/steward-apiserver",
     "crates/steward-controller",
