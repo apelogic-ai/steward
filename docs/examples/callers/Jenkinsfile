@@ -1,0 +1,180 @@
+import groovy.json.JsonSlurperClassic
+
+// Move these functions to vars/stewardRun.groovy in a Jenkins shared library
+// and rename stewardRun to call. The consuming Jenkinsfile then needs only the
+// final stewardRun(...) invocation.
+def withStewardToken(Map config, Closure useToken) {
+    withCredentials([string(credentialsId: config.oidcCredentialId, variable: 'JENKINS_OIDC_TOKEN')]) {
+        def exchange = httpRequest(
+            httpMode: 'POST',
+            url: "${config.identityUrl}/v1/oidc/exchange",
+            requestBody: '',
+            customHeaders: [[
+                name: 'Authorization',
+                value: "Bearer ${env.JENKINS_OIDC_TOKEN}",
+                maskValue: true,
+            ]],
+            validResponseCodes: '200',
+            followRedirects: false,
+            consoleLogResponseBody: false,
+            quiet: true,
+        )
+        def parsed = new JsonSlurperClassic().parseText(exchange.content)
+        if (parsed.token_type != 'Bearer' || !(parsed.access_token instanceof String)) {
+            error('Identity returned an invalid Task token response')
+        }
+        String token = parsed.access_token
+        try {
+            useToken(token)
+        } finally {
+            token = null
+            parsed = null
+            exchange = null
+        }
+    }
+}
+
+def stewardRun(Map config) {
+    String taskUid = null
+    String idempotencyKey = "jenkins:${env.JOB_NAME}:${env.BUILD_NUMBER}"
+    Map terminalStatus = null
+
+    try {
+        node(config.agentLabel ?: '') {
+            withEnv([
+                "IDENTITY_URL=${config.identityUrl}",
+                "STEWARD_URL=${config.stewardUrl}",
+                "STEWARD_WORKFLOW=${config.workflow}",
+                "STEWARD_IDEMPOTENCY_KEY=${idempotencyKey}",
+            ]) {
+                withCredentials([string(credentialsId: config.oidcCredentialId, variable: 'JENKINS_OIDC_TOKEN')]) {
+                    taskUid = sh(
+                        returnStdout: true,
+                        script: '''#!/bin/sh
+set -eu
+set +x
+umask 077
+
+work=.steward-caller
+rm -rf "$work"
+mkdir -p "$work"
+trap 'rm -rf "$work"' EXIT INT TERM
+
+curl -fsS -X POST \
+  -H "Authorization: Bearer $JENKINS_OIDC_TOKEN" \
+  --data-binary '' \
+  "$IDENTITY_URL/v1/oidc/exchange" >"$work/exchange.json"
+task_token=$(jq -er 'select(.token_type == "Bearer") | .access_token' "$work/exchange.json")
+rm -f "$work/exchange.json"
+
+jq -n --arg workflow "$STEWARD_WORKFLOW" '{workflow:$workflow}' >"$work/create-request.json"
+create_status=$(curl -sS -o "$work/create-response.json" -w '%{http_code}' \
+  -X POST \
+  -H "Authorization: Bearer $task_token" \
+  -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $STEWARD_IDEMPOTENCY_KEY" \
+  --data-binary @"$work/create-request.json" \
+  "$STEWARD_URL/v1/tasks")
+case "$create_status" in 200|202) ;; *) exit 1 ;; esac
+task_uid=$(jq -er .taskUid "$work/create-response.json")
+
+# Steward requires application/x-tar even when the run has no input files.
+tar -cf "$work/inputs.tar" --files-from /dev/null
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+  -X PUT \
+  -H "Authorization: Bearer $task_token" \
+  -H 'Content-Type: application/x-tar' \
+  --data-binary @"$work/inputs.tar" \
+  "$STEWARD_URL/v1/tasks/$task_uid/inputs")" = 204
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+  -X POST \
+  -H "Authorization: Bearer $task_token" \
+  --data-binary '' \
+  "$STEWARD_URL/v1/tasks/$task_uid/execute")" = 202
+
+unset task_token JENKINS_OIDC_TOKEN
+printf '%s' "$task_uid"
+''',
+                    ).trim()
+                }
+            }
+        }
+
+        // This block is intentionally outside node {}. A long Steward run does
+        // not hold a Jenkins executor, and each poll obtains a fresh assertion.
+        timeout(time: config.timeoutMinutes ?: 45, unit: 'MINUTES') {
+            waitUntil(initialRecurrencePeriod: 5000, quiet: true) {
+                withStewardToken(config) { token ->
+                    def response = httpRequest(
+                        httpMode: 'GET',
+                        url: "${config.stewardUrl}/v1/tasks/${taskUid}",
+                        customHeaders: [[
+                            name: 'Authorization',
+                            value: "Bearer ${token}",
+                            maskValue: true,
+                        ]],
+                        validResponseCodes: '200',
+                        followRedirects: false,
+                        consoleLogResponseBody: false,
+                        quiet: true,
+                    )
+                    terminalStatus = new JsonSlurperClassic().parseText(response.content)
+                }
+                return terminalStatus.phase in ['succeeded', 'failed', 'cancelled']
+            }
+        }
+
+        node(config.agentLabel ?: '') {
+            withStewardToken(config) { token ->
+                def output = httpRequest(
+                    httpMode: 'GET',
+                    url: "${config.stewardUrl}/v1/tasks/${taskUid}/outputs",
+                    outputFile: config.outputFile ?: 'steward-output.tar',
+                    customHeaders: [[
+                        name: 'Authorization',
+                        value: "Bearer ${token}",
+                        maskValue: true,
+                    ]],
+                    validResponseCodes: '200,204',
+                    followRedirects: false,
+                    consoleLogResponseBody: false,
+                    quiet: true,
+                )
+                if (output.status == 200) {
+                    archiveArtifacts artifacts: config.outputFile ?: 'steward-output.tar', fingerprint: true
+                }
+            }
+        }
+
+        if (terminalStatus.phase != 'succeeded') {
+            error(terminalStatus.failureReason ?: "Steward run ended ${terminalStatus.phase}")
+        }
+        return [taskUid: taskUid, phase: terminalStatus.phase]
+    } finally {
+        if (taskUid) {
+            withStewardToken(config) { token ->
+                httpRequest(
+                    httpMode: 'DELETE',
+                    url: "${config.stewardUrl}/v1/tasks/${taskUid}",
+                    customHeaders: [[
+                        name: 'Authorization',
+                        value: "Bearer ${token}",
+                        maskValue: true,
+                    ]],
+                    validResponseCodes: '202',
+                    followRedirects: false,
+                    consoleLogResponseBody: false,
+                    quiet: true,
+                )
+            }
+        }
+    }
+}
+
+stewardRun(
+    identityUrl: 'https://identity.example.com',
+    stewardUrl: 'https://steward.example.com',
+    oidcCredentialId: 'steward-oidc',
+    workflow: 'release-summary@1',
+    outputFile: 'steward-output.tar',
+)
