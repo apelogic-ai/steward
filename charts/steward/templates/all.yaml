@@ -12,7 +12,11 @@
 {{- $_ := set $runtimeTrigger "signingSecretFile" (printf "/run/trigger-signing/%s" .id) }}
 {{- $triggerReceiverTriggers = append $triggerReceiverTriggers $runtimeTrigger }}
 {{- end }}
-{{- $triggerReceiverConfigJson := toJson (dict "triggers" $triggerReceiverTriggers) }}
+{{- $triggerReceiverConfig := dict "triggers" $triggerReceiverTriggers }}
+{{- if .Values.config.apiserver.jiraBaseUrl }}
+{{- $_ := set $triggerReceiverConfig "jiraSiteUrl" .Values.config.apiserver.jiraBaseUrl }}
+{{- end }}
+{{- $triggerReceiverConfigJson := toJson $triggerReceiverConfig }}
 {{- $triggerReceiverConfigHash := $triggerReceiverConfigJson | sha256sum }}
 {{- $triggerReceiverConfigMapName := printf "steward-trigger-receiver-config-%s" ($triggerReceiverConfigHash | trunc 12) }}
 {{- $sourceRepositoryBindingsJson := toJson .Values.githubSource.bindings }}

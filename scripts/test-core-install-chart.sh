@@ -77,6 +77,7 @@ receiver_inputs=(
   --set-string images.triggerReceiver.tag=test-trigger-receiver
   --set-string images.triggerReceiver.digest=sha256:3333333333333333333333333333333333333333333333333333333333333333
   --set-json "triggerReceiver.triggers=${receiver_trigger}"
+  --set-string config.apiserver.jiraBaseUrl=https://jira.example.com
   --set-string triggerReceiver.databaseSecret.name=steward-trigger-database
   --set-string triggerReceiver.databaseSecret.key=url
   --set-string triggerReceiver.workloadExchange.endpoint=https://identity.identity-exchange.svc.cluster.local:8443/v1/workload/exchange
@@ -124,6 +125,24 @@ inline_env_value() {
   sed -n "/name: ${1},/s/.*value: \"\([^\"]*\)\".*/\1/p" "${rendered}" | head -1
 }
 STEWARD_CHART_RECEIVER_CONFIG="${receiver_config}" \
+STEWARD_CHART_API_ORIGIN="$(inline_env_value STEWARD_API_ORIGIN)" \
+STEWARD_CHART_API_SERVER_NAME="$(inline_env_value STEWARD_API_SERVER_NAME)" \
+STEWARD_CHART_EXCHANGE_ENDPOINT="$(inline_env_value STEWARD_WORKLOAD_EXCHANGE_ENDPOINT)" \
+STEWARD_CHART_EXCHANGE_SERVER_NAME="$(inline_env_value STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME)" \
+  cargo test --quiet --package steward-trigger-receiver \
+    client::tests::chart_render_contract_from_environment -- --exact
+
+helm_template "${receiver_inputs[@]}" \
+  --set-string config.apiserver.jiraBaseUrl= > "${rendered}"
+receiver_config_without_site="$(
+  awk '/^metadata: \{ name: steward-trigger-receiver-config/ { found = 1 } found && /^  config.json: / { sub(/^  config.json: /, ""); print; exit }' "${rendered}" |
+    jq -r .
+)"
+if jq -e 'has("jiraSiteUrl")' <<< "${receiver_config_without_site}" > /dev/null; then
+  echo 'receiver configuration must omit the optional Jira site when it is unset' >&2
+  exit 1
+fi
+STEWARD_CHART_RECEIVER_CONFIG="${receiver_config_without_site}" \
 STEWARD_CHART_API_ORIGIN="$(inline_env_value STEWARD_API_ORIGIN)" \
 STEWARD_CHART_API_SERVER_NAME="$(inline_env_value STEWARD_API_SERVER_NAME)" \
 STEWARD_CHART_EXCHANGE_ENDPOINT="$(inline_env_value STEWARD_WORKLOAD_EXCHANGE_ENDPOINT)" \

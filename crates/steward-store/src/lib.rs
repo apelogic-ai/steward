@@ -21,7 +21,7 @@ use steward_types::direct_package::{
 };
 use steward_types::task_output_archive::TASK_OUTPUT_ARCHIVE_CONTRACT;
 use steward_types::{
-    AgentRuntimeSpec, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
+    AgentRuntimeSpec, CallerReference, CanonicalPrincipal, CanonicalUserId, Email, OrganizationId,
     OrganizationIdentity, OrganizationIdentityMigration, TaskExecutionBinding,
     is_valid_opaque_bearer_token,
 };
@@ -866,6 +866,17 @@ mod migration_tests {
                         .contains("browser task preferred envelope")
             }),
             "migration 71 must add an optional immutable Envelope preference to browser Task versions"
+        );
+    }
+
+    #[test]
+    fn task_caller_reference_migration_is_embedded_additively() {
+        let migrations = sqlx::migrate!("../../migrations");
+        assert!(
+            migrations.migrations.iter().any(|migration| {
+                migration.version == 73 && migration.description.contains("task caller reference")
+            }),
+            "migration 73 must add immutable caller display context without rewriting historical Tasks"
         );
     }
 }
@@ -7677,10 +7688,10 @@ impl PgStore {
               task_origin, browser_task_evidence, envelope_revision, orchestration_version, \
               orchestration_operation_id, \
               candidate_digest, service_envelope_digest, original_admission_decision, \
-              original_admission_deltas) \
+              original_admission_deltas, caller_reference) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'bound', $8, $9, $10, $11, $12, $13, $14, \
                      'user-envelope', $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, \
-                     $27, $28, NULL, 3, $29, $30, NULL, $31, $32) \
+                     $27, $28, NULL, 3, $29, $30, NULL, $31, $32, $33) \
              ON CONFLICT DO NOTHING",
         )
         .bind(task_uid)
@@ -7715,6 +7726,7 @@ impl PgStore {
         .bind(request.candidate_digest)
         .bind(admission_text)
         .bind(Json(&deltas))
+        .bind(request.caller_reference.map(Json))
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?
@@ -11438,6 +11450,7 @@ pub struct TaskReservationRequest<'a> {
     pub operation_id: Uuid,
     pub idempotency_key: &'a str,
     pub submitter_service: &'a str,
+    pub caller_reference: Option<&'a CallerReference>,
     pub acting_user: Option<&'a str>,
     pub acting_user_id: Option<&'a str>,
     pub owner: &'a str,
@@ -11532,6 +11545,7 @@ pub struct AgentRunPage {
 pub struct AgentRunRecord {
     pub task_uid: Uuid,
     pub submitter_service: String,
+    pub caller_reference: Option<CallerReference>,
     pub acting_user: Option<String>,
     pub owner: String,
     pub owner_user_id: Option<String>,
@@ -11811,6 +11825,7 @@ fn task_reservation_matches(
             && operation.inert_manifest_digest == request.inert_manifest_digest
             && operation.active_manifest_digest == request.active_manifest_digest);
     record.submitter_service == request.submitter_service
+        && record.caller_reference.as_ref() == request.caller_reference
         && record.acting_user.as_deref() == request.acting_user
         && record.acting_user_id.as_deref() == request.acting_user_id
         && record.owner == request.owner
@@ -12212,11 +12227,20 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
         None => request.direct_task_evidence.is_none(),
     };
     let origin_valid = match request.task_origin {
-        TaskOrigin::Browser => request.browser_task_evidence.is_some(),
-        TaskOrigin::GithubActions => {
-            request.browser_task_evidence.is_none() && request.source_provenance.is_some()
+        TaskOrigin::Browser => {
+            request.browser_task_evidence.is_some() && request.caller_reference.is_none()
         }
-        TaskOrigin::Connections | TaskOrigin::Api | TaskOrigin::Unknown => {
+        TaskOrigin::GithubActions => {
+            request.browser_task_evidence.is_none()
+                && request.source_provenance.is_some()
+                && request.caller_reference.is_none()
+        }
+        TaskOrigin::Connections | TaskOrigin::Unknown => {
+            request.browser_task_evidence.is_none()
+                && request.source_provenance.is_none()
+                && request.caller_reference.is_none()
+        }
+        TaskOrigin::Api => {
             request.browser_task_evidence.is_none() && request.source_provenance.is_none()
         }
     };
@@ -12244,6 +12268,9 @@ fn validate_task_version_pins(request: &TaskReservationRequest<'_>) -> Result<()
         || !origin_valid
         || (request.browser_task_evidence.is_some() && request.source_provenance.is_some())
         || !source_provenance_valid
+        || request
+            .caller_reference
+            .is_some_and(|reference| reference.validate().is_err())
         || request.workflow_version.is_some_and(|version| version <= 0)
         || request
             .user_envelope_revision
@@ -12331,6 +12358,7 @@ mod task_execution_binding_tests {
             operation_id,
             idempotency_key: "resident-mismatch",
             submitter_service: "steward-run",
+            caller_reference: None,
             acting_user: Some("alice@example.com"),
             acting_user_id: Some("usr_0123456789abcdef0123456789abcdef"),
             owner: "alice@example.com",
@@ -12879,6 +12907,7 @@ pub struct TaskRecord {
     pub task_uid: Uuid,
     pub idempotency_key: String,
     pub submitter_service: String,
+    pub caller_reference: Option<CallerReference>,
     pub acting_user: Option<String>,
     pub acting_user_id: Option<String>,
     pub owner: String,
@@ -14073,6 +14102,10 @@ fn task_record(row: sqlx::postgres::PgRow) -> Result<TaskRecord, StoreError> {
         task_uid: row.try_get("task_uid").map_err(database_error)?,
         idempotency_key: row.try_get("idempotency_key").map_err(database_error)?,
         submitter_service: row.try_get("submitter_service").map_err(database_error)?,
+        caller_reference: row
+            .try_get::<Option<Json<CallerReference>>, _>("caller_reference")
+            .map_err(database_error)?
+            .map(|reference| reference.0),
         acting_user: row.try_get("acting_user").map_err(database_error)?,
         acting_user_id: row.try_get("acting_user_id").map_err(database_error)?,
         owner: row.try_get("owner").map_err(database_error)?,
@@ -14988,7 +15021,7 @@ fn canonical_user_query(suffix: &str) -> String {
     format!("{CANONICAL_USER_SELECT}{suffix}")
 }
 
-const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, tasks.acting_user, tasks.owner, tasks.owner_user_id, \
+const AGENT_RUN_SELECT: &str = "SELECT tasks.task_uid, tasks.submitter_service, tasks.caller_reference, tasks.acting_user, tasks.owner, tasks.owner_user_id, \
             users.display_email AS owner_display_email, \
             tasks.workflow, tasks.workflow_name, tasks.workflow_version, tasks.workflow_digest, \
             tasks.user_envelope_instance_id, tasks.user_envelope_revision, tasks.user_envelope_digest, \
@@ -15102,6 +15135,7 @@ fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreE
     Ok(AgentRunRecord {
         task_uid: row.try_get("task_uid").map_err(database_error)?,
         submitter_service: row.try_get("submitter_service").map_err(database_error)?,
+        caller_reference: lenient_caller_reference_from_row(&row)?,
         acting_user: row.try_get("acting_user").map_err(database_error)?,
         owner: row.try_get("owner").map_err(database_error)?,
         owner_user_id: row.try_get("owner_user_id").map_err(database_error)?,
@@ -15158,6 +15192,23 @@ fn agent_run_record(row: sqlx::postgres::PgRow) -> Result<AgentRunRecord, StoreE
             .map_err(database_error)?
             .map(|value| value.0),
     })
+}
+
+fn lenient_caller_reference_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<CallerReference>, StoreError> {
+    let reference = row
+        .try_get::<Option<Json<serde_json::Value>>, _>("caller_reference")
+        .map_err(database_error)?;
+    Ok(
+        reference.and_then(|Json(value)| match serde_json::from_value(value) {
+            Ok(reference) => Some(reference),
+            Err(_) => {
+                eprintln!("ignored invalid persisted Task caller reference");
+                None
+            }
+        }),
+    )
 }
 
 fn agent_run_timeline_event(

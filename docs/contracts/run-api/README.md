@@ -24,6 +24,24 @@ The Run API lifecycle is:
 5. `GET /v1/tasks/{taskUid}/outputs`; and
 6. `DELETE /v1/tasks/{taskUid}` to request cleanup.
 
+A versioned-Workflow submission may include display-only caller context:
+
+```json
+{
+  "workflow": "triage@1",
+  "callerReference": {
+    "label": "build #142",
+    "url": "https://ci.example.com/builds/142"
+  }
+}
+```
+
+The label is 1–128 UTF-8 bytes from the documented display character set. The
+optional URL is at most 2,048 bytes and must use HTTPS without credentials.
+Steward records the service name from the verified Task token; request JSON has
+no field that can select or replace it. The reference is display context only
+and grants no access.
+
 Every request requires a current Task bearer token. See
 [`calling-steward-from-jenkins-and-temporal.md`](../../calling-steward-from-jenkins-and-temporal.md)
 for token handling and complete caller examples.

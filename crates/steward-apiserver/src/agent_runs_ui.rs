@@ -458,6 +458,8 @@ pub(crate) struct BrowserRunView {
     error_category: Option<String>,
     failure_reason: Option<String>,
     trigger: Option<BrowserRunTrigger>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller: Option<BrowserRunCaller>,
     execution_log: ExecutionLogMode,
     rerun_supported: bool,
     rerun_unavailable_reason: Option<&'static str>,
@@ -593,6 +595,15 @@ pub(crate) struct BrowserRunTrigger {
     run_attempt: u32,
     run_url: String,
     caller_workflow: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BrowserRunCaller {
+    service: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, utoipa::ToSchema)]
@@ -2725,6 +2736,18 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
         .direct_task_evidence
         .as_ref()
         .map(|evidence| browser_run_trigger(&evidence.source_provenance));
+    let caller = (record.task_origin == TaskOrigin::Api)
+        .then(|| {
+            record
+                .caller_reference
+                .as_ref()
+                .map(|reference| BrowserRunCaller {
+                    service: record.submitter_service.clone(),
+                    label: reference.label().to_owned(),
+                    url: reference.url().map(str::to_owned),
+                })
+        })
+        .flatten();
     let execution_log = record
         .direct_task_evidence
         .as_ref()
@@ -2846,6 +2869,7 @@ fn browser_run_view(record: AgentRunRecord) -> BrowserRunView {
             .map(str::to_owned),
         failure_reason,
         trigger,
+        caller,
         execution_log,
         rerun_supported,
         rerun_unavailable_reason: (!rerun_supported)
@@ -3102,7 +3126,7 @@ mod tests {
         BrowserTaskEvidence, ContentDigest, PromptSourceKind, RelativePath, WorkspaceEvidence,
     };
     use steward_types::{
-        AgentRuntimeSpec, AgentType, Budget, Duration, Email, ModelRef, Principal,
+        AgentRuntimeSpec, AgentType, Budget, CallerReference, Duration, Email, ModelRef, Principal,
     };
     use tower::ServiceExt;
 
@@ -3637,6 +3661,7 @@ mod tests {
         AgentRunRecord {
             task_uid,
             submitter_service: "steward-run".to_owned(),
+            caller_reference: None,
             acting_user: Some("alice@example.com".to_owned()),
             owner: "alice@example.com".to_owned(),
             owner_user_id: Some(owner_user_id.to_owned()),
@@ -3718,6 +3743,7 @@ mod tests {
             task_uid,
             idempotency_key: format!("github-attempt-{attempt}"),
             submitter_service: view.submitter_service,
+            caller_reference: None,
             acting_user: view.acting_user,
             acting_user_id: Some(owner_user_id.to_owned()),
             owner: view.owner,
@@ -3930,12 +3956,30 @@ mod tests {
         let owner = "usr_0123456789abcdef0123456789abcdef";
         let other_owner = "usr_abcdefabcdefabcdefabcdefabcdefab";
         let ledger = FakeLedger::default();
+        let mut historical_api_run = run(
+            Uuid::parse_str("00000000-0000-4000-8000-000000000000")
+                .map_err(|error| error.to_string())?,
+            owner,
+        );
+        historical_api_run.task_origin = TaskOrigin::Api;
+        assert!(
+            serde_json::to_value(browser_run_view(historical_api_run))
+                .map_err(|error| error.to_string())?
+                .get("caller")
+                .is_none(),
+            "historical API runs must retain their response shape"
+        );
         let mut api_run = run(
             Uuid::parse_str("11111111-1111-4111-8111-111111111111")
                 .map_err(|error| error.to_string())?,
             owner,
         );
         api_run.task_origin = TaskOrigin::Api;
+        api_run.submitter_service = "event-worker".to_owned();
+        api_run.caller_reference = Some(CallerReference::new(
+            "Jira trigger jira_read · PROJ-123",
+            Some("https://jira.example.com/browse/PROJ-123".to_owned()),
+        )?);
         ledger.records.lock().map_err(|_| "lock records")?.extend([
             api_run,
             run(
@@ -3988,6 +4032,15 @@ mod tests {
         );
         assert_eq!(value["runs"][0]["workflowName"], "repository-review");
         assert_eq!(value["runs"][0]["origin"], "api");
+        assert_eq!(value["runs"][0]["caller"]["service"], "event-worker");
+        assert_eq!(
+            value["runs"][0]["caller"]["label"],
+            "Jira trigger jira_read · PROJ-123"
+        );
+        assert_eq!(
+            value["runs"][0]["caller"]["url"],
+            "https://jira.example.com/browse/PROJ-123"
+        );
         assert_eq!(value["runs"][0]["workflowVersion"], 1);
         assert_eq!(
             value["runs"][0]["workflowDigest"],

@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use steward_apiserver::WorkflowReference;
 use steward_apiserver::browser_admin::{CapabilityCatalog, ToolAccessClass};
 use steward_types::task_output_archive::{TarEntryKind, append_tar_entry, finish_tar_archive};
-use steward_types::{CanonicalUserId, ToolGrant};
+use steward_types::{CallerReference, CanonicalUserId, ToolGrant};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use axum::Router;
@@ -63,6 +63,8 @@ pub type ReceiverFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReceiverConfig {
+    #[serde(default)]
+    pub jira_site_url: Option<String>,
     pub triggers: Vec<TriggerConfig>,
 }
 
@@ -106,6 +108,13 @@ impl ReceiverConfig {
     }
 
     fn validate(&self, limits: &ReceiverLimits) -> Result<(), String> {
+        if self
+            .jira_site_url
+            .as_deref()
+            .is_some_and(|site| !valid_jira_site_url(site))
+        {
+            return Err("The Jira site URL is invalid".to_owned());
+        }
         if self.triggers.is_empty() || self.triggers.len() > limits.max_triggers {
             return Err("Trigger configuration has an invalid entry count".to_owned());
         }
@@ -155,6 +164,44 @@ impl ReceiverConfig {
     }
 }
 
+fn valid_jira_site_url(value: &str) -> bool {
+    CallerReference::new("Jira issue", Some(value.to_owned())).is_ok()
+        && reqwest::Url::parse(value).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+}
+
+fn jira_caller_label(trigger_id: &str, issue_key: &str) -> String {
+    format!("Jira trigger {trigger_id} · {issue_key}")
+}
+
+fn jira_caller_reference(
+    trigger_id: &str,
+    issue_key: &str,
+    project_key: &str,
+    jira_site_url: Option<&str>,
+    max_identifier_bytes: usize,
+) -> Option<CallerReference> {
+    let fallback = || CallerReference::new(format!("Jira trigger {trigger_id}"), None).ok();
+    if !valid_issue_key(issue_key, max_identifier_bytes)
+        || issue_key
+            .rsplit_once('-')
+            .is_none_or(|(project, _)| project != project_key)
+    {
+        return fallback();
+    }
+    let url =
+        jira_site_url.map(|site| format!("{}/browse/{issue_key}", site.trim_end_matches('/')));
+    CallerReference::new(jira_caller_label(trigger_id, issue_key), url)
+        .ok()
+        .or_else(fallback)
+}
+
 fn valid_exact(value: &str, max_bytes: usize) -> bool {
     !value.is_empty()
         && value.len() <= max_bytes
@@ -186,8 +233,11 @@ fn valid_project_key(value: &str, max_bytes: usize) -> bool {
 fn valid_issue_key(value: &str, max_bytes: usize) -> bool {
     value.rsplit_once('-').is_some_and(|(project, number)| {
         valid_project_key(project, max_bytes)
-            && !number.is_empty()
-            && number.bytes().all(|byte| byte.is_ascii_digit())
+            && number
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| matches!(byte, b'1'..=b'9'))
+            && number.bytes().skip(1).all(|byte| byte.is_ascii_digit())
             && valid_exact(value, max_bytes)
     })
 }
@@ -242,6 +292,7 @@ pub struct TaskInvocation {
     pub workflow: String,
     pub envelope_digest: String,
     pub idempotency_key: String,
+    pub caller_reference: Option<CallerReference>,
     pub input_archive: Vec<u8>,
 }
 
@@ -250,6 +301,10 @@ impl TaskInvocation {
         self.workflow == trigger.workflow
             && self.envelope_digest == trigger.envelope_digest
             && valid_hash(&self.idempotency_key, "jira-sha256:")
+            && self
+                .caller_reference
+                .as_ref()
+                .is_none_or(|reference| reference.validate().is_ok())
             && valid_event_archive(&self.input_archive)
     }
 }
@@ -391,6 +446,7 @@ pub struct Receiver {
     catalogs: Arc<dyn CapabilityCatalogReader>,
     envelopes: Arc<dyn EnvelopeAuthority>,
     tasks: Arc<dyn TaskLifecycle>,
+    jira_site_url: Arc<Option<String>>,
     limits: ReceiverLimits,
 }
 
@@ -405,6 +461,11 @@ impl Receiver {
     ) -> Result<Self, String> {
         limits.validate()?;
         config.validate(&limits)?;
+        let jira_site_url = Arc::new(
+            config
+                .jira_site_url
+                .map(|site| site.trim_end_matches('/').to_owned()),
+        );
         let triggers = config
             .triggers
             .into_iter()
@@ -435,6 +496,7 @@ impl Receiver {
             catalogs: Arc::new(catalogs),
             envelopes: Arc::new(envelopes),
             tasks: Arc::new(tasks),
+            jira_site_url,
             limits,
         };
         for live in receiver
@@ -482,6 +544,13 @@ impl Receiver {
         let replay_key = idempotency_key(&trigger.id, body)?;
         let (invocation, issue_key, permit) = {
             let input_archive = event.archive()?;
+            let caller_reference = jira_caller_reference(
+                &trigger.id,
+                &event.issue_key,
+                &event.project_key,
+                self.jira_site_url.as_deref(),
+                self.limits.max_identifier_bytes,
+            );
             let mut state = live.state.lock().await;
             match state.deliveries.get(&replay_key) {
                 Some(DeliveryState::Accepted) => return Ok(WebhookResult::Noop),
@@ -522,6 +591,7 @@ impl Receiver {
                     workflow: trigger.workflow.clone(),
                     envelope_digest: trigger.envelope_digest.clone(),
                     idempotency_key: replay_key.clone(),
+                    caller_reference,
                     input_archive,
                 },
                 event.issue_key,
@@ -669,14 +739,10 @@ struct JiraEvent {
 impl JiraEvent {
     fn validate(&self, max_identifier_bytes: usize) -> bool {
         valid_jira_event(&self.event, max_identifier_bytes)
-            && valid_issue_key(&self.issue_key, max_identifier_bytes)
+            && valid_exact(&self.issue_key, max_identifier_bytes)
             && valid_project_key(&self.project_key, max_identifier_bytes)
             && valid_numeric_id(&self.issue_type, max_identifier_bytes)
             && valid_account_id(&self.author_account_id, max_identifier_bytes)
-            && self
-                .issue_key
-                .rsplit_once('-')
-                .is_some_and(|(project, _)| project == self.project_key)
     }
 
     fn parse(body: &[u8], max_identifier_bytes: usize) -> Result<Self, WebhookError> {
@@ -692,7 +758,7 @@ impl JiraEvent {
         let event =
             field(&["webhookEvent"]).filter(|value| valid_jira_event(value, max_identifier_bytes));
         let issue_key =
-            field(&["issue", "key"]).filter(|value| valid_issue_key(value, max_identifier_bytes));
+            field(&["issue", "key"]).filter(|value| valid_exact(value, max_identifier_bytes));
         let project_key = field(&["issue", "fields", "project", "key"])
             .filter(|value| valid_project_key(value, max_identifier_bytes));
         let issue_type = field(&["issue", "fields", "issuetype", "id"])
@@ -702,12 +768,6 @@ impl JiraEvent {
         let incomplete = WebhookError::Invalid("The Jira event is incomplete or invalid.");
         let issue_key = issue_key.ok_or_else(|| incomplete.clone())?;
         let project_key = project_key.ok_or_else(|| incomplete.clone())?;
-        if issue_key
-            .rsplit_once('-')
-            .is_none_or(|(project, _)| project != project_key)
-        {
-            return Err(incomplete);
-        }
         Ok(Self {
             event: event.ok_or_else(|| incomplete.clone())?,
             issue_key,
@@ -935,7 +995,7 @@ mod tests {
 
     fn config_json(ignored: &str, concurrency: usize, cooldown: u64) -> String {
         format!(
-            r#"{{"triggers":[{{"id":"jira-read","enabled":true,"source":"jira","workflow":"triage@1","service":"event-worker","ownerUserId":"{OWNER}","envelopeDigest":"{DIGEST}","signingSecretFile":"/var/run/secrets/jira","concurrencyLimit":2,"cooldownSeconds":60}}]}}"#
+            r#"{{"jiraSiteUrl":"https://jira.example.com/","triggers":[{{"id":"jira-read","enabled":true,"source":"jira","workflow":"triage@1","service":"event-worker","ownerUserId":"{OWNER}","envelopeDigest":"{DIGEST}","signingSecretFile":"/var/run/secrets/jira","concurrencyLimit":2,"cooldownSeconds":60}}]}}"#
         )
         .replace("\"concurrencyLimit\":2", &format!("\"concurrencyLimit\":{concurrency}"))
         .replace("\"cooldownSeconds\":60", &format!("\"cooldownSeconds\":{cooldown}"))
@@ -1080,6 +1140,159 @@ mod tests {
         assert!(ReceiverConfig::from_json(&config_json("[]", 7, 137), &configured).is_ok());
         assert!(ReceiverConfig::from_json(&config_json("[]", 8, 137), &configured).is_err());
         assert!(ReceiverConfig::from_json(&config_json("[]", 7, 138), &configured).is_err());
+        for site in [
+            "http://jira.example.com/",
+            "https://alice@jira.example.com/",
+            "https://jira_internal.example.com/",
+            "https://jirá.example.com/",
+        ] {
+            let invalid = config_json("[]", 7, 137).replace("https://jira.example.com/", site);
+            assert!(matches!(
+                ReceiverConfig::from_json(&invalid, &configured),
+                Err(error) if error == "The Jira site URL is invalid"
+            ));
+        }
+        assert!(
+            ReceiverConfig::from_json(
+                &config_json("[]", 7, 137)
+                    .replace("\"jiraSiteUrl\":\"https://jira.example.com/\",", "",),
+                &configured,
+            )
+            .is_ok()
+        );
+        assert!(
+            ReceiverConfig::from_json(
+                &config_json("[]", 7, 137).replace(
+                    "https://jira.example.com/",
+                    "https://tools.example.com/jira/"
+                ),
+                &configured,
+            )
+            .is_ok()
+        );
+        for (length, accepted) in [(128, true), (129, false)] {
+            let boundary = config_json("[]", 7, 137).replace(
+                "\"id\":\"jira-read\"",
+                &format!("\"id\":\"{}\"", "a".repeat(length)),
+            );
+            assert_eq!(
+                ReceiverConfig::from_json(&boundary, &configured).is_ok(),
+                accepted,
+                "Trigger id length {length} did not respect the caller-label boundary"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn jira_display_context_is_optional_and_never_refuses_delivery() -> Result<(), String> {
+        let tasks = Tasks::default();
+        let context_path = make_receiver(
+            config_json("[]", 2, 0).replace(
+                "https://jira.example.com/",
+                "https://tools.example.com/jira/",
+            ),
+            envelopes(),
+            tasks.clone(),
+        )
+        .await?;
+        expect(&context_path, "context", "alice", Ok(W::Accepted)).await;
+        {
+            let calls = tasks.calls.lock().map_err(|_| "calls lock failed")?;
+            let reference = calls[0]
+                .caller_reference
+                .as_ref()
+                .ok_or("context-path issue reference is absent")?;
+            assert_eq!(reference.label(), "Jira trigger jira-read · PROJ-123");
+            assert_eq!(
+                reference.url(),
+                Some("https://tools.example.com/jira/browse/PROJ-123")
+            );
+        }
+
+        let tasks = Tasks::default();
+        let no_site = make_receiver(
+            config_json("[]", 2, 0).replace("\"jiraSiteUrl\":\"https://jira.example.com/\",", ""),
+            envelopes(),
+            tasks.clone(),
+        )
+        .await?;
+        expect(&no_site, "no-site", "alice", Ok(W::Accepted)).await;
+        {
+            let calls = tasks.calls.lock().map_err(|_| "calls lock failed")?;
+            let reference = calls[0]
+                .caller_reference
+                .as_ref()
+                .ok_or("label-only issue reference is absent")?;
+            assert_eq!(reference.label(), "Jira trigger jira-read · PROJ-123");
+            assert_eq!(reference.url(), None);
+        }
+
+        let tasks = Tasks::default();
+        let invalid_key =
+            make_receiver(config_json("[]", 2, 0), envelopes(), tasks.clone()).await?;
+        assert_eq!(
+            send_issue(&invalid_key, "padded", "alice", "PROJ-007").await,
+            Ok(W::Accepted)
+        );
+        {
+            let calls = tasks.calls.lock().map_err(|_| "calls lock failed")?;
+            let reference = calls[0]
+                .caller_reference
+                .as_ref()
+                .ok_or("fallback Trigger reference is absent")?;
+            assert_eq!(reference.label(), "Jira trigger jira-read");
+            assert_eq!(reference.url(), None);
+        }
+        for issue_key in ["PROJ007", "OTHER-1", "proj-123"] {
+            assert_eq!(
+                send_issue(&invalid_key, issue_key, "alice", issue_key).await,
+                Ok(W::Accepted),
+                "bounded display metadata must not refuse delivery"
+            );
+        }
+        {
+            let calls = tasks.calls.lock().map_err(|_| "calls lock failed")?;
+            for invocation in &calls[1..] {
+                let reference = invocation
+                    .caller_reference
+                    .as_ref()
+                    .ok_or("fallback Trigger reference is absent")?;
+                assert_eq!(reference.label(), "Jira trigger jira-read");
+                assert_eq!(reference.url(), None);
+            }
+        }
+
+        let long_id = "a".repeat(120);
+        let config = config_json("[]", 2, 0)
+            .replace("\"id\":\"jira-read\"", &format!("\"id\":\"{long_id}\""));
+        let tasks = Tasks::default();
+        let receiver = Receiver::new(
+            ReceiverConfig::from_json(&config, &limits())?,
+            BTreeMap::from([(long_id.clone(), b"test-signing-secret".to_vec())]),
+            catalogs(ToolAccessClass::Read),
+            envelopes(),
+            tasks.clone(),
+            limits(),
+        )
+        .await?;
+        let event = body("alice");
+        assert_eq!(
+            receiver
+                .receive(
+                    &long_id,
+                    Some(&signature(b"test-signing-secret", &event)),
+                    &event,
+                )
+                .await,
+            Ok(W::Accepted)
+        );
+        assert!(
+            tasks.calls.lock().map_err(|_| "calls lock failed")?[0]
+                .caller_reference
+                .is_none(),
+            "a display label outside the bound must be omitted without refusing delivery"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -1192,9 +1405,7 @@ mod tests {
 
         for event in [
             body_fields("Jira event", "alice", "PROJ-123", "PROJ", "10001"),
-            body_fields("jira:issue_updated", "alice", "proj-123", "PROJ", "10001"),
             body_fields("jira:issue_updated", "alice", "PROJ-123", "proj", "10001"),
-            body_fields("jira:issue_updated", "alice", "PROJ-123", "OTHER", "10001"),
             body_fields(
                 "jira:issue_updated",
                 "alice",
@@ -1252,6 +1463,22 @@ mod tests {
         );
         {
             let calls = tasks.calls.lock().map_err(|_| "calls lock failed")?;
+            assert_eq!(
+                calls[0]
+                    .caller_reference
+                    .as_ref()
+                    .ok_or("Jira caller reference is absent")?
+                    .label(),
+                "Jira trigger jira-read · PROJ-123"
+            );
+            assert_eq!(
+                calls[0]
+                    .caller_reference
+                    .as_ref()
+                    .ok_or("Jira caller reference is absent")?
+                    .url(),
+                Some("https://jira.example.com/browse/PROJ-123")
+            );
             for free_text in [b"event text".as_slice(), b"free text".as_slice()] {
                 assert!(
                     !calls[0]
@@ -1353,6 +1580,7 @@ mod tests {
                     workflow: trigger.workflow.clone(),
                     envelope_digest: trigger.envelope_digest.clone(),
                     idempotency_key: format!("jira-sha256:{}", "a".repeat(64)),
+                    caller_reference: Some(CallerReference::new("PROJ-123", None)?),
                     input_archive,
                 }
                 .validate_for(&trigger)
@@ -1364,6 +1592,7 @@ mod tests {
         second.id = "jira-two".to_owned();
         let r = Receiver::new(
             ReceiverConfig {
+                jira_site_url: config.jira_site_url,
                 triggers: vec![config.triggers[0].clone(), second],
             },
             BTreeMap::from([
