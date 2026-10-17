@@ -49,6 +49,7 @@ release artifacts.
 | API server | `build/package.Dockerfile`, `BINARY=steward-apiserver-bin` |
 | Controller | `build/package.Dockerfile`, `BINARY=steward-controller-bin` |
 | Mint | `build/package.Dockerfile`, `BINARY=steward-mint-bin` |
+| Jira trigger receiver | `build/package.Dockerfile`, `BINARY=steward-trigger-receiver` |
 | Connections bridge, when used | `build/connections-bridge.Dockerfile` |
 | Web, when used | `build/web.Dockerfile` |
 | Helm chart | `charts/steward` from the same source revision |

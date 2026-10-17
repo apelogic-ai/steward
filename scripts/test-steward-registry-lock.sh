@@ -48,6 +48,13 @@ case "${1:-} ${2:-}" in
           digest='sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
         fi
         ;;
+      ghcr.io/example-org/steward:0.3.1-trigger-receiver@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee)
+        if [[ -n "${platform}" ]]; then
+          digest='sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+        else
+          digest='sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+        fi
+        ;;
       ghcr.io/example-org/steward-codex:0.140.0@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd)
         if [[ -n "${platform}" ]]; then
           digest='sha256:2222222222222222222222222222222222222222222222222222222222222222'
@@ -90,6 +97,10 @@ cat >"${temporary_directory}/handoff.json" <<'JSON'
     "apiserver": {
       "reference": "ghcr.io/example-org/steward:0.3.1-apiserver",
       "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "triggerReceiver": {
+      "reference": "ghcr.io/example-org/steward:0.3.1-trigger-receiver",
+      "digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
     }
   },
   "referenceRuntimes": {
@@ -107,6 +118,7 @@ cat >"${temporary_directory}/mappings.json" <<'JSON'
   "artifacts": {
     "chart": "registry.example.test/team-a/charts/steward:0.3.1",
     "images.apiserver": "registry.example.test/team-a/steward:0.3.1-apiserver",
+    "images.triggerReceiver": "registry.example.test/team-a/steward:0.3.1-trigger-receiver",
     "referenceRuntimes.codex": "registry.example.test/team-a/steward-codex:0.140.0"
   }
 }
@@ -127,7 +139,7 @@ cmp "${temporary_directory}/plan-one.json" "${temporary_directory}/plan-two.json
 jq -e '
   .schemaVersion == "steward.registry-plan/v1" and
   .platform == null and
-  (.artifacts | keys) == ["chart", "images.apiserver", "referenceRuntimes.codex"] and
+  (.artifacts | keys) == ["chart", "images.apiserver", "images.triggerReceiver", "referenceRuntimes.codex"] and
   .artifacts.chart.target.reference == "registry.example.test/team-a/charts/steward:0.3.1"
 ' "${temporary_directory}/plan-one.json" >/dev/null
 if grep -Fq 'cp --recursive' "${command_log}"; then
@@ -143,8 +155,8 @@ PATH="${mock_directory}:${PATH}" "${root}/scripts/steward-registry-lock.sh" mirr
   --output "${temporary_directory}/lock-two.json" >"${temporary_directory}/result-two.jsonl"
 cmp "${temporary_directory}/lock-one.json" "${temporary_directory}/lock-two.json"
 
-jq -s -e 'length == 3 and all(.status == "copied")' "${temporary_directory}/result-one.jsonl" >/dev/null
-jq -s -e 'length == 3 and all(.status == "already-present")' "${temporary_directory}/result-two.jsonl" >/dev/null
+jq -s -e 'length == 4 and all(.status == "copied")' "${temporary_directory}/result-one.jsonl" >/dev/null
+jq -s -e 'length == 4 and all(.status == "already-present")' "${temporary_directory}/result-two.jsonl" >/dev/null
 jq -e '
   .schemaVersion == "steward.deployment-lock/v1" and
   .artifacts.chart.source.digest == .artifacts.chart.target.digest and
@@ -152,6 +164,7 @@ jq -e '
   .artifacts.chart.flux.ociRepository.ref.digest == "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" and
   .chartValues.images.repository == "registry.example.test/team-a/steward" and
   .chartValues.images.apiserver.tag == "0.3.1-apiserver" and
+  .chartValues.images.triggerReceiver.tag == "0.3.1-trigger-receiver" and
   .executionBindingImages.codex == "registry.example.test/team-a/steward-codex@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 ' "${temporary_directory}/lock-one.json" >/dev/null
 

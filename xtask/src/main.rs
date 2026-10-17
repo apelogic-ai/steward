@@ -1948,7 +1948,14 @@ mod tests {
             .and_then(|jobs| jobs.split("\n  pinned:").next())
             .ok_or_else(|| "release-candidate CI job is required".to_owned())?;
 
-        for component in ["apiserver", "controller", "mint", "bridge", "web"] {
+        for component in [
+            "apiserver",
+            "controller",
+            "mint",
+            "trigger-receiver",
+            "bridge",
+            "web",
+        ] {
             assert!(
                 release_candidate.contains(&format!(
                     "image-ref: steward-{component}:release-validation"
@@ -1970,17 +1977,17 @@ mod tests {
             release_candidate
                 .matches("aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8")
                 .count(),
-            6,
+            7,
             "release-candidate CI must use the pinned Trivy action for every Steward component image and the chart"
         );
         assert_eq!(
             release_candidate.matches("exit-code: \"1\"").count(),
-            6,
+            7,
             "every release-candidate image and chart scan must fail closed"
         );
         assert_eq!(
             release_candidate.matches("severity: CRITICAL").count(),
-            6,
+            7,
             "every release-candidate image and chart scan must enforce CRITICAL findings"
         );
         assert!(
@@ -3213,7 +3220,14 @@ mod tests {
                 "v0.3 release handoff is missing `{required}`"
             );
         }
-        for component in ["apiserver", "controller", "mint", "bridge", "web"] {
+        for component in [
+            "apiserver",
+            "controller",
+            "mint",
+            "triggerReceiver",
+            "bridge",
+            "web",
+        ] {
             assert!(
                 release.contains(&format!("{component}: {{reference:")),
                 "machine-readable handoff must include {component}"
@@ -4219,6 +4233,7 @@ mod tests {
         for (image, in_web) in &images {
             let label = match *image {
                 "bridge" => "connections bridge",
+                "trigger-receiver" => "trigger receiver",
                 other => other,
             };
             let mut scan = serde_json::json!({
@@ -4619,6 +4634,7 @@ mod tests {
             "apiserver.digest",
             "controller.digest",
             "mint.digest",
+            "trigger-receiver.digest",
             "bridge.digest",
             "bridge-attestation-bundle.jsonl",
             "gh attestation download",
@@ -4633,6 +4649,12 @@ mod tests {
                 "release workflow must record {artifact}"
             );
         }
+        assert!(
+            workflow.contains(
+                "triggerReceiver: {reference: ($image_repository + \":\" + $version + \"-trigger-receiver\"), digest: $trigger_receiver_digest}"
+            ),
+            "release handoff must map the trigger receiver digest to images.triggerReceiver"
+        );
         assert!(
             values.contains("connectionsBridge:")
                 && values.contains("artifactTrust:")
@@ -4692,6 +4714,10 @@ mod tests {
             container.contains("USER 65532:65532"),
             "production images must run as a numeric non-root user"
         );
+        assert!(
+            container.contains("--bin steward-trigger-receiver"),
+            "the production package must build the trigger receiver binary"
+        );
         for required in [
             "FROM ubuntu:24.04@sha256:",
             "apt-get install --yes --no-install-recommends iproute2",
@@ -4720,6 +4746,12 @@ mod tests {
         assert!(
             workflow.contains("${{ steps.version.outputs.version }}-${{ matrix.component }}"),
             "component tags must match the published chart contract"
+        );
+        assert!(
+            workflow.contains(
+                "          - component: trigger-receiver\n            binary: steward-trigger-receiver\n            dockerfile: build/package.Dockerfile"
+            ),
+            "release publication must build the exact trigger receiver binary with the shared package image"
         );
         assert!(
             workflow.contains("platforms: linux/amd64"),
@@ -4776,6 +4808,10 @@ mod tests {
                 "release validation must smoke-test the combined mint image startup: missing {required}"
             );
         }
+        assert!(
+            release_validation.contains("image:trigger-receiver"),
+            "release validation must expose the trigger receiver image build target"
+        );
         Ok(())
     }
 

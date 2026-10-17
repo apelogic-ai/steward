@@ -38,7 +38,14 @@ REQUIRED_NAMESPACES = (
     "dns",
 )
 OPTIONAL_NAMESPACES = ("arc",)
-IMAGE_COMPONENTS = ("apiserver", "controller", "mint", "web", "bridge")
+IMAGE_COMPONENTS = (
+    "apiserver",
+    "controller",
+    "mint",
+    "triggerReceiver",
+    "web",
+    "bridge",
+)
 
 
 class ValidationError(Exception):

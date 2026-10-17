@@ -472,6 +472,15 @@ jobs:
           exit-code: "1"
           severity: CRITICAL
 
+      - name: Enforce critical trigger receiver image policy
+        if: needs.changes.outputs.class != 'web'
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8
+        with:
+          image-ref: steward-trigger-receiver:release-validation
+          format: table
+          exit-code: "1"
+          severity: CRITICAL
+
       - name: Enforce critical connections bridge image policy
         if: needs.changes.outputs.class != 'web'
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8

@@ -301,6 +301,53 @@ class PlatformPreflightTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("all-zero placeholder", result.stderr)
 
+    def test_rejects_missing_trigger_receiver_image(self) -> None:
+        del self.input["deploymentLock"]["artifacts"]["images.triggerReceiver"]
+        result = self.run_validate(self.input)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "deploymentLock.artifacts.images.triggerReceiver must be an object",
+            result.stderr,
+        )
+
+    def test_rejects_trigger_receiver_digest_mismatch(self) -> None:
+        candidate = copy.deepcopy(self.input)
+        candidate["deploymentLock"]["artifacts"]["images.triggerReceiver"] = {
+            "target": {
+                "reference": "registry.example.test/team-a/steward:0.2.2-trigger-receiver",
+                "digest": "sha256:" + "7" * 64,
+            }
+        }
+        candidate["deploymentLock"]["chartValues"]["images"]["triggerReceiver"] = {
+            "tag": "0.2.2-trigger-receiver",
+            "digest": "sha256:" + "8" * 64,
+        }
+        result = self.run_validate(candidate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "chartValues digest for triggerReceiver does not match artifacts target",
+            result.stderr,
+        )
+
+    def test_rejects_trigger_receiver_reference_mismatch(self) -> None:
+        candidate = copy.deepcopy(self.input)
+        candidate["deploymentLock"]["artifacts"]["images.triggerReceiver"] = {
+            "target": {
+                "reference": "registry.example.test/team-a/steward:0.2.2-trigger-receiver",
+                "digest": "sha256:" + "7" * 64,
+            }
+        }
+        candidate["deploymentLock"]["chartValues"]["images"]["triggerReceiver"] = {
+            "tag": "other-trigger-receiver",
+            "digest": "sha256:" + "7" * 64,
+        }
+        result = self.run_validate(candidate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "chartValues reference for triggerReceiver does not match artifacts target",
+            result.stderr,
+        )
+
     def test_rejects_chart_coordinate_not_bound_to_mirrored_artifact(self) -> None:
         self.input["deploymentLock"]["artifacts"]["images.apiserver"]["target"]["reference"] = (
             "registry.example.test/team-a/different:wrong-tag"

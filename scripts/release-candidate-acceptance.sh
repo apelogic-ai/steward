@@ -40,6 +40,7 @@ for image in \
   steward-apiserver:release-validation \
   steward-controller:release-validation \
   steward-mint:release-validation \
+  steward-trigger-receiver:release-validation \
   steward-bridge:release-validation \
   steward-web:release-validation
 do
@@ -58,9 +59,9 @@ fi
 pull_repository="${registry_address}/steward"
 runtime_repository="${registry_name}:5000/steward"
 
-for component in apiserver controller mint bridge web; do
+for component in apiserver controller mint trigger-receiver bridge web; do
   case "${component}" in
-    apiserver|controller|mint) source_image="steward-${component}:release-validation" ;;
+    apiserver|controller|mint|trigger-receiver) source_image="steward-${component}:release-validation" ;;
     bridge) source_image=steward-bridge:release-validation ;;
     web) source_image=steward-web:release-validation ;;
   esac
@@ -73,6 +74,7 @@ for component in apiserver controller mint bridge web; do
     apiserver) api_digest="${digest}" ;;
     controller) controller_digest="${digest}" ;;
     mint) mint_digest="${digest}" ;;
+    trigger-receiver) trigger_receiver_digest="${digest}" ;;
     bridge) bridge_digest="${digest}" ;;
     web) web_digest="${digest}" ;;
   esac
@@ -98,6 +100,7 @@ export STEWARD_RELEASE_CHART_DIGEST="${chart_digest}"
 export STEWARD_RELEASE_APISERVER_DIGEST="${api_digest}"
 export STEWARD_RELEASE_CONTROLLER_DIGEST="${controller_digest}"
 export STEWARD_RELEASE_MINT_DIGEST="${mint_digest}"
+export STEWARD_RELEASE_TRIGGER_RECEIVER_DIGEST="${trigger_receiver_digest}"
 export STEWARD_RELEASE_BRIDGE_DIGEST="${bridge_digest}"
 export STEWARD_RELEASE_WEB_DIGEST="${web_digest}"
 bash "${root}/scripts/customer-core-install-e2e.sh"

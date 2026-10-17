@@ -35,6 +35,7 @@ IMAGE_STEPS='
 image:apiserver    run   skip
 image:controller   run   skip
 image:mint         run   skip
+image:trigger-receiver run skip
 image:bridge       run   skip
 image:web          run   run
 smoke:web          run   run
@@ -1510,9 +1511,13 @@ fi
 # The image steps. Each function is one row of IMAGE_STEPS, and both scopes
 # run the same function for a row they share.
 build_packaged_image() {
+  local binary="steward-$1-bin"
+  case "$1" in
+    trigger-receiver) binary=steward-trigger-receiver ;;
+  esac
   docker build \
     --file "${root}/build/package.Dockerfile" \
-    --build-arg "BINARY=steward-$1-bin" \
+    --build-arg "BINARY=${binary}" \
     --tag "steward-$1:release-validation" \
     "${root}"
 }
@@ -1625,7 +1630,7 @@ EOF
 
 for image_step in ${planned_image_steps}; do
   case "${image_step}" in
-    image:apiserver|image:controller|image:mint)
+    image:apiserver|image:controller|image:mint|image:trigger-receiver)
       build_packaged_image "${image_step#image:}"
       ;;
     image:bridge) build_bridge_image ;;
@@ -1641,7 +1646,7 @@ for image_step in ${planned_image_steps}; do
 done
 
 release_workflow="${root}/.github/workflows/release.yml"
-if [[ "$(grep -Fc 'for component in apiserver controller mint bridge web; do' "${release_workflow}")" -ne 2 ]]; then
-  echo "every release publication gate must include the Steward web image" >&2
+if [[ "$(grep -Fc 'for component in apiserver controller mint trigger-receiver bridge web; do' "${release_workflow}")" -ne 2 ]]; then
+  echo "every release publication gate must include every Steward component image" >&2
   exit 1
 fi
