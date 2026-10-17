@@ -988,17 +988,6 @@ impl PgStore {
             .map_err(database_error)
     }
 
-    pub fn connect_lazy_with_acquire_timeout(
-        database_url: &str,
-        acquire_timeout: Duration,
-    ) -> Result<Self, StoreError> {
-        PgPoolOptions::new()
-            .acquire_timeout(acquire_timeout)
-            .connect_lazy(database_url)
-            .map(Self::new)
-            .map_err(database_error)
-    }
-
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }

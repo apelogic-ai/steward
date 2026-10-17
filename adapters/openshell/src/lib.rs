@@ -2,10 +2,12 @@
 
 #[cfg(feature = "runtime")]
 use std::collections::{BTreeSet, HashMap};
-#[cfg(feature = "runtime")]
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 use std::future::Future;
 #[cfg(feature = "runtime")]
 use std::path::{Path, PathBuf};
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
+use std::pin::Pin;
 #[cfg(any(feature = "runtime", feature = "workload-exchange"))]
 use std::sync::Arc;
 #[cfg(any(feature = "runtime", feature = "workload-exchange"))]
@@ -1649,6 +1651,50 @@ enum WorkloadSourceCredential {
     #[cfg(feature = "runtime")]
     File(PathBuf),
     Token(OpaqueToken),
+    Provider(Arc<dyn WorkloadSourceTokenProvider>),
+}
+
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
+pub type WorkloadSourceTokenFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<OpaqueToken, PortError>> + Send + 'a>>;
+
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
+pub trait WorkloadSourceTokenProvider: Send + Sync + 'static {
+    fn source_token(&self) -> WorkloadSourceTokenFuture<'_>;
+}
+
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
+#[derive(Clone, Copy)]
+pub struct WorkloadExchangeTransport {
+    pub connect_timeout: StdDuration,
+    pub request_timeout: StdDuration,
+    pub max_response_bytes: usize,
+}
+
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
+impl WorkloadExchangeTransport {
+    fn validate(self) -> Result<Self, PortError> {
+        if self.connect_timeout.is_zero()
+            || self.request_timeout < self.connect_timeout
+            || self.max_response_bytes == 0
+        {
+            return Err(PortError::Rejected {
+                reason: "workload exchange transport settings are invalid".to_owned(),
+            });
+        }
+        Ok(self)
+    }
+}
+
+#[cfg(any(feature = "runtime", feature = "workload-exchange"))]
+impl Default for WorkloadExchangeTransport {
+    fn default() -> Self {
+        Self {
+            connect_timeout: StdDuration::from_secs(5),
+            request_timeout: StdDuration::from_secs(10),
+            max_response_bytes: WORKLOAD_EXCHANGE_MAX_RESPONSE_BYTES as usize,
+        }
+    }
 }
 
 #[cfg(any(feature = "runtime", feature = "workload-exchange"))]
@@ -1657,6 +1703,7 @@ pub struct WorkloadExchangeTokenProvider {
     cache: Arc<Mutex<Option<CachedAccessToken>>>,
     client: HttpClient,
     endpoint: Url,
+    max_response_bytes: usize,
     source_credential: WorkloadSourceCredential,
 }
 
@@ -1672,7 +1719,24 @@ impl WorkloadExchangeTokenProvider {
             endpoint,
             server_name,
             ca_certificate_pem,
+            WorkloadExchangeTransport::default(),
             WorkloadSourceCredential::Token(OpaqueToken::new(source_token)?),
+        )
+    }
+
+    pub fn new_with_source_provider(
+        endpoint: &str,
+        server_name: &str,
+        ca_certificate_pem: &[u8],
+        transport: WorkloadExchangeTransport,
+        source_provider: Arc<dyn WorkloadSourceTokenProvider>,
+    ) -> Result<Self, PortError> {
+        Self::build(
+            endpoint,
+            server_name,
+            ca_certificate_pem,
+            transport,
+            WorkloadSourceCredential::Provider(source_provider),
         )
     }
 
@@ -1682,6 +1746,7 @@ impl WorkloadExchangeTokenProvider {
             &config.workload_exchange_endpoint,
             &config.workload_exchange_server_name,
             &config.workload_exchange_ca_certificate_pem,
+            WorkloadExchangeTransport::default(),
             WorkloadSourceCredential::File(config.workload_source_credential_file.clone()),
         )
     }
@@ -1690,8 +1755,10 @@ impl WorkloadExchangeTokenProvider {
         endpoint: &str,
         server_name: &str,
         ca_certificate_pem: &[u8],
+        transport: WorkloadExchangeTransport,
         source_credential: WorkloadSourceCredential,
     ) -> Result<Self, PortError> {
+        let transport = transport.validate()?;
         let endpoint = validate_workload_exchange_endpoint(endpoint, server_name)?;
         let certificates = HttpCertificate::from_pem_bundle(ca_certificate_pem).map_err(|_| {
             PortError::Rejected {
@@ -1707,8 +1774,8 @@ impl WorkloadExchangeTokenProvider {
             .https_only(true)
             .tls_built_in_root_certs(false)
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(StdDuration::from_secs(5))
-            .timeout(StdDuration::from_secs(10));
+            .connect_timeout(transport.connect_timeout)
+            .timeout(transport.request_timeout);
         for certificate in certificates {
             builder = builder.add_root_certificate(certificate);
         }
@@ -1719,6 +1786,7 @@ impl WorkloadExchangeTokenProvider {
             cache: Arc::new(Mutex::new(None)),
             client,
             endpoint,
+            max_response_bytes: transport.max_response_bytes,
             source_credential,
         })
     }
@@ -1740,6 +1808,7 @@ impl WorkloadExchangeTokenProvider {
                     })??
             }
             WorkloadSourceCredential::Token(source) => source.clone(),
+            WorkloadSourceCredential::Provider(provider) => provider.source_token().await?,
         };
         let mut response = self
             .client
@@ -1751,7 +1820,12 @@ impl WorkloadExchangeTokenProvider {
         if response.status() != StatusCode::OK {
             return Err(
                 if response.status().is_client_error()
-                    && response.status() != StatusCode::TOO_MANY_REQUESTS
+                    && !matches!(
+                        response.status(),
+                        StatusCode::REQUEST_TIMEOUT
+                            | StatusCode::TOO_EARLY
+                            | StatusCode::TOO_MANY_REQUESTS
+                    )
                 {
                     PortError::Rejected {
                         reason: "workload exchange rejected the source credential".to_owned(),
@@ -1778,7 +1852,7 @@ impl WorkloadExchangeTokenProvider {
         }
         if response
             .content_length()
-            .is_some_and(|length| length > WORKLOAD_EXCHANGE_MAX_RESPONSE_BYTES)
+            .is_some_and(|length| length > self.max_response_bytes as u64)
         {
             return Err(PortError::Rejected {
                 reason: "workload exchange response is too large".to_owned(),
@@ -1791,8 +1865,7 @@ impl WorkloadExchangeTokenProvider {
             .map_err(workload_exchange_unavailable)?
         {
             let next_length = body.len().saturating_add(chunk.len());
-            if u64::try_from(next_length).unwrap_or(u64::MAX) > WORKLOAD_EXCHANGE_MAX_RESPONSE_BYTES
-            {
+            if next_length > self.max_response_bytes {
                 return Err(PortError::Rejected {
                     reason: "workload exchange response is too large".to_owned(),
                 });
@@ -3952,6 +4025,7 @@ mod tests {
                 .build()
                 .map_err(|error| format!("failed to build test exchange client: {error}"))?,
             endpoint,
+            max_response_bytes: super::WORKLOAD_EXCHANGE_MAX_RESPONSE_BYTES as usize,
             source_credential: WorkloadSourceCredential::File(source_credential_file),
         })
     }
@@ -4860,7 +4934,7 @@ mod tests {
     #[tokio::test]
     async fn workload_exchange_rate_limits_and_server_failures_are_retriable() -> Result<(), String>
     {
-        for status in [429, 503] {
+        for status in [408, 425, 429, 503] {
             let exchange = mock_exchange(response(status, None, ""))?;
             let source_file = source_credential_fixture()?;
             let provider = test_token_provider(exchange.endpoint.clone(), source_file.clone())?;

@@ -9,7 +9,10 @@ use kube::api::{Api, PostParams};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Certificate, Client, Method, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
-use steward_adapter_openshell::{OpaqueToken, WorkloadExchangeTokenProvider};
+use steward_adapter_openshell::{
+    OpaqueToken, WorkloadExchangeTokenProvider, WorkloadExchangeTransport,
+    WorkloadSourceTokenFuture, WorkloadSourceTokenProvider,
+};
 use steward_apiserver::browser_admin::CapabilityCatalog;
 use steward_store::{EnvelopeRequestRecord, EnvelopeRequestStatus, PgStore};
 use steward_types::CanonicalUserId;
@@ -20,7 +23,8 @@ use crate::{
     ReceiverFuture, TaskInvocation, TaskLifecycle, TaskLifecycleError, TaskStart, TriggerConfig,
 };
 
-const TOKEN_REQUEST_SECONDS: i64 = 600;
+const TOKEN_REQUEST_MIN_SECONDS: i64 = 600;
+const TOKEN_REQUEST_MAX_SECONDS: i64 = 86_400;
 
 #[derive(Clone)]
 pub struct PgEnvelopeAuthority {
@@ -119,6 +123,7 @@ pub struct KubernetesTokenRequester {
     namespace: String,
     service_account: String,
     audience: String,
+    expiration_seconds: i64,
 }
 
 impl KubernetesTokenRequester {
@@ -127,6 +132,7 @@ impl KubernetesTokenRequester {
         namespace: String,
         service_account: String,
         audience: String,
+        expiration_seconds: i64,
     ) -> Result<Self, String> {
         if [
             namespace.as_str(),
@@ -135,6 +141,8 @@ impl KubernetesTokenRequester {
         ]
         .iter()
         .any(|value| value.trim().is_empty() || value.trim() != *value)
+            || !(TOKEN_REQUEST_MIN_SECONDS..=TOKEN_REQUEST_MAX_SECONDS)
+                .contains(&expiration_seconds)
         {
             return Err("TokenRequest settings are incomplete".to_owned());
         }
@@ -143,6 +151,7 @@ impl KubernetesTokenRequester {
             namespace,
             service_account,
             audience,
+            expiration_seconds,
         })
     }
 
@@ -152,7 +161,7 @@ impl KubernetesTokenRequester {
             metadata: Default::default(),
             spec: TokenRequestSpec {
                 audiences: vec![self.audience.clone()],
-                expiration_seconds: Some(TOKEN_REQUEST_SECONDS),
+                expiration_seconds: Some(self.expiration_seconds),
                 bound_object_ref: None,
             },
             status: None,
@@ -161,10 +170,7 @@ impl KubernetesTokenRequester {
             .create_token_request(&self.service_account, &PostParams::default(), &request)
             .await
             .map_err(|error| match error {
-                kube::Error::Api(response)
-                    if response.code < 500
-                        && response.code != u16::from(StatusCode::TOO_MANY_REQUESTS) =>
-                {
+                kube::Error::Api(response) if !transient_status_code(response.code) => {
                     TaskLifecycleError::Final
                 }
                 _ => TaskLifecycleError::Retriable,
@@ -174,6 +180,32 @@ impl KubernetesTokenRequester {
             .map(|status| status.token)
             .filter(|token| !token.trim().is_empty() && token.trim() == token)
             .ok_or(TaskLifecycleError::Final)
+    }
+}
+
+fn transient_status_code(code: u16) -> bool {
+    code >= 500
+        || [
+            StatusCode::REQUEST_TIMEOUT.as_u16(),
+            StatusCode::TOO_EARLY.as_u16(),
+            StatusCode::TOO_MANY_REQUESTS.as_u16(),
+        ]
+        .contains(&code)
+}
+
+impl WorkloadSourceTokenProvider for KubernetesTokenRequester {
+    fn source_token(&self) -> WorkloadSourceTokenFuture<'_> {
+        Box::pin(async move {
+            let source = self.request().await.map_err(|error| match error {
+                TaskLifecycleError::Final => steward_ports::PortError::Rejected {
+                    reason: "workload source credential was refused".to_owned(),
+                },
+                TaskLifecycleError::Retriable => steward_ports::PortError::Failed {
+                    reason: "workload source credential is unavailable".to_owned(),
+                },
+            })?;
+            OpaqueToken::new(source)
+        })
     }
 }
 
@@ -193,6 +225,7 @@ pub struct KubernetesWorkloadTokenProvider {
     endpoint: String,
     server_name: String,
     ca_certificate_pem: Arc<Vec<u8>>,
+    transport: WorkloadExchangeTransport,
 }
 
 impl KubernetesWorkloadTokenProvider {
@@ -201,21 +234,21 @@ impl KubernetesWorkloadTokenProvider {
         endpoint: String,
         server_name: String,
         ca_certificate_pem: Vec<u8>,
+        transport: WorkloadExchangeTransport,
     ) -> Result<Self, String> {
         steward_adapter_openshell::validate_workload_exchange_endpoint(&endpoint, &server_name)
             .map_err(|_| "workload exchange endpoint is invalid".to_owned())?;
-        WorkloadExchangeTokenProvider::new(
-            &endpoint,
-            &server_name,
-            &ca_certificate_pem,
-            "startup-validation-only".to_owned(),
-        )
-        .map_err(|_| "workload exchange CA certificate is invalid".to_owned())?;
+        let certificates = Certificate::from_pem_bundle(&ca_certificate_pem)
+            .map_err(|_| "workload exchange CA certificate is invalid".to_owned())?;
+        if certificates.is_empty() {
+            return Err("workload exchange CA certificate is empty".to_owned());
+        }
         Ok(Self {
             source,
             endpoint,
             server_name,
             ca_certificate_pem: Arc::new(ca_certificate_pem),
+            transport,
         })
     }
 }
@@ -225,12 +258,12 @@ impl TaskTokenProvider for KubernetesWorkloadTokenProvider {
         &self,
     ) -> ReceiverFuture<'_, Result<Arc<dyn TaskAccessTokenProvider>, TaskLifecycleError>> {
         Box::pin(async move {
-            let source = self.source.request().await?;
-            let provider = WorkloadExchangeTokenProvider::new(
+            let provider = WorkloadExchangeTokenProvider::new_with_source_provider(
                 &self.endpoint,
                 &self.server_name,
                 &self.ca_certificate_pem,
-                source,
+                self.transport,
+                Arc::new(self.source.clone()),
             )
             .map_err(exchange_error)?;
             Ok(Arc::new(provider) as Arc<dyn TaskAccessTokenProvider>)
@@ -446,7 +479,10 @@ impl TaskLifecycle for WorkloadExchangeClient {
             let reply = read_task_reply(response, self.timing.max_reply_bytes).await?;
             let base = format!("v1/tasks/{}", reply.task_uid);
             match reply.phase.as_str() {
-                "succeeded" | "failed" | "cancelled" => return Ok(TaskStart::Duplicate),
+                "succeeded" | "failed" | "cancelled" => {
+                    self.finalize(&base, tokens.as_ref()).await?;
+                    return Ok(TaskStart::Duplicate);
+                }
                 "submitted" | "parked" => {
                     let prepared = async {
                         require_status(
@@ -581,6 +617,18 @@ mod tests {
     }
 
     async fn tls_fixture(responses: Vec<String>) -> Result<TlsFixture, String> {
+        let expected_requests = responses.len();
+        let mut responses = responses.into_iter();
+        tls_fixture_with_responder(expected_requests, move |_| {
+            responses.next().unwrap_or_default()
+        })
+        .await
+    }
+
+    async fn tls_fixture_with_responder(
+        expected_requests: usize,
+        mut respond: impl FnMut(&str) -> String + Send + 'static,
+    ) -> Result<TlsFixture, String> {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         let certified = generate_simple_self_signed(vec!["localhost".to_owned()])
             .map_err(|error| error.to_string())?;
@@ -598,7 +646,7 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = requests.clone();
         let handle = tokio::spawn(async move {
-            for response in responses {
+            for _ in 0..expected_requests {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
@@ -619,9 +667,11 @@ mod tests {
                         break;
                     }
                 }
-                if let Ok(request) = String::from_utf8(request)
-                    && let Ok(mut captured) = captured.lock()
-                {
+                let Ok(request) = String::from_utf8(request) else {
+                    return;
+                };
+                let response = respond(&request);
+                if let Ok(mut captured) = captured.lock() {
                     captured.push(request);
                 }
                 if stream.write_all(response.as_bytes()).await.is_err() {
@@ -642,6 +692,14 @@ mod tests {
             "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    fn exchange_transport() -> WorkloadExchangeTransport {
+        WorkloadExchangeTransport {
+            connect_timeout: Duration::from_millis(50),
+            request_timeout: Duration::from_millis(250),
+            max_response_bytes: 4091,
+        }
     }
 
     #[tokio::test]
@@ -678,6 +736,7 @@ mod tests {
             "steward-test".to_owned(),
             "receiver".to_owned(),
             "steward-task".to_owned(),
+            600,
         )?;
         assert_eq!(
             requester.request().await.map_err(|_| "request failed")?,
@@ -702,6 +761,7 @@ mod tests {
     async fn token_request_maps_rate_limits_and_server_failures_to_retry() -> Result<(), String> {
         for (status, expected) in [
             (StatusCode::FORBIDDEN, TaskLifecycleError::Final),
+            (StatusCode::REQUEST_TIMEOUT, TaskLifecycleError::Retriable),
             (StatusCode::TOO_MANY_REQUESTS, TaskLifecycleError::Retriable),
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -728,6 +788,7 @@ mod tests {
                 "steward-test".to_owned(),
                 "receiver".to_owned(),
                 "steward-task".to_owned(),
+                600,
             )?;
             assert_eq!(requester.request().await.err(), Some(expected));
         }
@@ -735,7 +796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workload_provider_uses_one_source_token_and_exchange_per_lifecycle()
+    async fn workload_provider_refreshes_the_source_token_during_a_long_lifecycle()
     -> Result<(), String> {
         let source_calls = Arc::new(Mutex::new(0_usize));
         let counted = source_calls.clone();
@@ -743,13 +804,16 @@ mod tests {
             service_fn(move |_request: Request<KubeBody>| {
                 let counted = counted.clone();
                 async move {
-                    *counted
-                        .lock()
-                        .map_err(|_| std::io::Error::other("poisoned"))? += 1;
-                    let mut response = HttpResponse::new(Body::from(
-                        br#"{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","metadata":{},"spec":{"audiences":["steward-task"],"expirationSeconds":600},"status":{"expirationTimestamp":"2030-01-01T00:00:00Z","token":"obviously-fake-source-token"}}"#
-                            .to_vec(),
-                    ));
+                    let call = {
+                        let mut count = counted
+                            .lock()
+                            .map_err(|_| std::io::Error::other("poisoned"))?;
+                        *count += 1;
+                        *count
+                    };
+                    let mut response = HttpResponse::new(Body::from(format!(
+                        r#"{{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","metadata":{{}},"spec":{{"audiences":["steward-task"],"expirationSeconds":600}},"status":{{"expirationTimestamp":"2030-01-01T00:00:00Z","token":"obviously-fake-source-token-{call}"}}}}"#
+                    )));
                     response.headers_mut().insert(
                         "content-type",
                         "application/json".parse().map_err(std::io::Error::other)?,
@@ -759,10 +823,11 @@ mod tests {
             }),
             "default",
         );
-        let exchange_body = r#"{"access_token":"obviously-fake-access-token","token_type":"Bearer","expires_in":120}"#;
+        let first_exchange = r#"{"access_token":"obviously-fake-first-access","token_type":"Bearer","expires_in":1}"#;
+        let second_exchange = r#"{"access_token":"obviously-fake-second-access","token_type":"Bearer","expires_in":120}"#;
         let exchange = tls_fixture(vec![
-            test_response(200, "Cache-Control: no-store\r\n", exchange_body),
-            test_response(200, "Cache-Control: no-store\r\n", exchange_body),
+            test_response(200, "Cache-Control: no-store\r\n", first_exchange),
+            test_response(200, "Cache-Control: no-store\r\n", second_exchange),
         ])
         .await?;
         let provider = KubernetesWorkloadTokenProvider::new(
@@ -771,30 +836,38 @@ mod tests {
                 "steward-test".to_owned(),
                 "receiver".to_owned(),
                 "steward-task".to_owned(),
+                600,
             )?,
             format!("{}v1/workload/exchange", exchange.origin),
             "localhost".to_owned(),
             exchange.ca_certificate_pem.clone(),
+            exchange_transport(),
         )?;
-        for _ in 0..2 {
-            let lifecycle = provider
-                .lifecycle()
+        let lifecycle = provider
+            .lifecycle()
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(
+            lifecycle
+                .token()
                 .await
-                .map_err(|error| format!("{error:?}"))?;
-            for _ in 0..2 {
-                assert_eq!(
-                    lifecycle
-                        .token()
-                        .await
-                        .map_err(|error| format!("{error:?}"))?
-                        .expose_secret(),
-                    "obviously-fake-access-token"
-                );
-            }
-        }
+                .map_err(|error| format!("{error:?}"))?
+                .expose_secret(),
+            "obviously-fake-first-access"
+        );
+        assert_eq!(
+            lifecycle
+                .token()
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .expose_secret(),
+            "obviously-fake-second-access"
+        );
         exchange.handle.await.map_err(|error| error.to_string())?;
         assert_eq!(*source_calls.lock().map_err(|_| "poisoned")?, 2);
-        assert_eq!(exchange.requests.lock().map_err(|_| "poisoned")?.len(), 2);
+        let requests = exchange.requests.lock().map_err(|_| "poisoned")?;
+        assert!(requests[0].contains("Bearer obviously-fake-source-token-1"));
+        assert!(requests[1].contains("Bearer obviously-fake-source-token-2"));
         Ok(())
     }
 
@@ -816,10 +889,17 @@ mod tests {
                         .lock()
                         .map_err(|_| std::io::Error::other("poisoned"))?
                         .push(body.to_vec());
-                    let mut response = HttpResponse::new(Body::from(
-                        br#"{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","metadata":{},"spec":{"audiences":["other-service"],"expirationSeconds":600},"status":{"expirationTimestamp":"2030-01-01T00:00:00Z","token":"obviously-fake-wrong-audience-token"}}"#
-                            .to_vec(),
-                    ));
+                    let wrong = body
+                        .windows(b"other-service".len())
+                        .any(|window| window == b"other-service");
+                    let (audience, token) = if wrong {
+                        ("other-service", "obviously-fake-wrong-audience-token")
+                    } else {
+                        ("steward-task", "obviously-fake-source-token")
+                    };
+                    let mut response = HttpResponse::new(Body::from(format!(
+                        r#"{{"apiVersion":"authentication.k8s.io/v1","kind":"TokenRequest","metadata":{{}},"spec":{{"audiences":["{audience}"],"expirationSeconds":600}},"status":{{"expirationTimestamp":"2030-01-01T00:00:00Z","token":"{token}"}}}}"#
+                    )));
                     response.headers_mut().insert(
                         "content-type",
                         "application/json".parse().map_err(std::io::Error::other)?,
@@ -829,19 +909,32 @@ mod tests {
             }),
             "default",
         );
-        let exchange = tls_fixture(vec![test_response(401, "", "")]).await?;
-        let provider = KubernetesWorkloadTokenProvider::new(
+        let exchange = tls_fixture_with_responder(2, |request| {
+            if request.contains("Bearer obviously-fake-wrong-audience-token") {
+                test_response(401, "", "")
+            } else {
+                test_response(
+                    200,
+                    "Cache-Control: no-store\r\n",
+                    r#"{"access_token":"obviously-fake-access-token","token_type":"Bearer","expires_in":120}"#,
+                )
+            }
+        })
+        .await?;
+        let wrong = KubernetesWorkloadTokenProvider::new(
             KubernetesTokenRequester::new(
-                kube,
+                kube.clone(),
                 "steward-test".to_owned(),
                 "receiver".to_owned(),
                 "other-service".to_owned(),
+                600,
             )?,
             format!("{}v1/workload/exchange", exchange.origin),
             "localhost".to_owned(),
             exchange.ca_certificate_pem.clone(),
+            exchange_transport(),
         )?;
-        let lifecycle = provider
+        let lifecycle = wrong
             .lifecycle()
             .await
             .map_err(|error| format!("{error:?}"))?;
@@ -849,13 +942,42 @@ mod tests {
             lifecycle.token().await.err(),
             Some(TaskLifecycleError::Final)
         );
+        let good = KubernetesWorkloadTokenProvider::new(
+            KubernetesTokenRequester::new(
+                kube,
+                "steward-test".to_owned(),
+                "receiver".to_owned(),
+                "steward-task".to_owned(),
+                600,
+            )?,
+            format!("{}v1/workload/exchange", exchange.origin),
+            "localhost".to_owned(),
+            exchange.ca_certificate_pem.clone(),
+            exchange_transport(),
+        )?;
+        assert_eq!(
+            good.lifecycle()
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .token()
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .expose_secret(),
+            "obviously-fake-access-token"
+        );
         exchange.handle.await.map_err(|error| error.to_string())?;
         let bodies = captured.lock().map_err(|_| "poisoned")?;
-        let request: serde_json::Value =
+        let wrong_request: serde_json::Value =
             serde_json::from_slice(&bodies[0]).map_err(|error| error.to_string())?;
+        let good_request: serde_json::Value =
+            serde_json::from_slice(&bodies[1]).map_err(|error| error.to_string())?;
         assert_eq!(
-            request["spec"]["audiences"],
+            wrong_request["spec"]["audiences"],
             serde_json::json!(["other-service"])
+        );
+        assert_eq!(
+            good_request["spec"]["audiences"],
+            serde_json::json!(["steward-task"])
         );
         Ok(())
     }
@@ -864,6 +986,7 @@ mod tests {
     async fn workload_exchange_maps_refusal_and_transient_statuses() -> Result<(), String> {
         for (status, expected) in [
             (401, TaskLifecycleError::Final),
+            (408, TaskLifecycleError::Retriable),
             (429, TaskLifecycleError::Retriable),
             (503, TaskLifecycleError::Retriable),
         ] {
@@ -888,10 +1011,12 @@ mod tests {
                     "steward-test".to_owned(),
                     "receiver".to_owned(),
                     "steward-task".to_owned(),
+                    600,
                 )?,
                 format!("{}v1/workload/exchange", exchange.origin),
                 "localhost".to_owned(),
                 exchange.ca_certificate_pem.clone(),
+                exchange_transport(),
             )?;
             let lifecycle = provider
                 .lifecycle()
@@ -918,10 +1043,12 @@ mod tests {
                     "steward-test".to_owned(),
                     "receiver".to_owned(),
                     "steward-task".to_owned(),
+                    600,
                 )?,
                 "https://identity.example.test/v1/workload/exchange".to_owned(),
                 "identity.example.test".to_owned(),
                 b"not a certificate".to_vec(),
+                exchange_transport(),
             )
             .is_err()
         );
@@ -930,16 +1057,16 @@ mod tests {
 
     #[tokio::test]
     async fn envelope_lookup_fails_closed_when_database_is_unreachable() -> Result<(), String> {
-        let store = PgStore::connect_lazy_with_acquire_timeout(
-            "postgres://steward@127.0.0.1:9/steward",
-            Duration::from_millis(25),
+        let result = tokio::time::timeout(
+            Duration::from_millis(300),
+            PgStore::connect_with_acquire_timeout(
+                "postgres://steward@127.0.0.1:9/steward",
+                Duration::from_millis(25),
+            ),
         )
-        .map_err(|error| error.to_string())?;
-        let authority = PgEnvelopeAuthority::new(store);
-        let owner = CanonicalUserId::parse(OWNER)?;
-        let digest = format!("steward:sha256:{}", "a".repeat(64));
-        let result = crate::EnvelopeAuthority::active_tools(&authority, &owner, &digest).await;
-        assert_eq!(result, Err(crate::EnvelopeError::Unavailable));
+        .await
+        .map_err(|_| "database refusal exceeded the receiver deadline")?;
+        assert!(result.is_err(), "an unavailable database must fail closed");
         Ok(())
     }
 
@@ -1312,7 +1439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_create_is_a_noop() -> Result<(), String> {
+    async fn terminal_duplicate_is_finalized_before_noop() -> Result<(), String> {
         let (client, state, handle) =
             client_fixture(StatusCode::OK, "succeeded", 0, Duration::from_secs(1), None).await?;
         let result = client
@@ -1320,7 +1447,9 @@ mod tests {
             .await
             .map_err(|error| format!("{error:?}"))?;
         assert!(matches!(result, TaskStart::Duplicate));
-        assert_eq!(state.requests.lock().map_err(|_| "poisoned")?.len(), 1);
+        let requests = state.requests.lock().map_err(|_| "poisoned")?;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].0, Method::DELETE);
         handle.abort();
         Ok(())
     }
