@@ -27,7 +27,16 @@ uuid.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13.2"
+sqlx.workspace = true
 tower.workspace = true
+
+[[test]]
+name = "write_catalog_process"
+path = "tests/write_catalog_process.rs"
+required-features = ["postgres-e2e"]
+
+[features]
+postgres-e2e = []
 
 [lints]
 workspace = true
