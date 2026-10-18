@@ -597,7 +597,7 @@ async fn spawn_kubernetes_api() -> Result<TestServer, Box<dyn Error>> {
         (
             StatusCode::CREATED,
             Json(json!({
-                "apiVersion": ["authentication", "k8s", "io"].join(".") + "/v1",
+                "apiVersion": (["authentication", "k8s", "io"].join(".") + "/v1"),
                 "kind": "TokenRequest",
                 "metadata": {},
                 "spec": {
