@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs
 import { spawnSync } from "node:child_process";
 
 import { expectedKnownFailures as reportHasExpectedKnownFailures } from "./known-failing-report.mjs";
+import { browserInputsRequired } from "./run-environment.mjs";
 
 const config = "journeys/playwright.config.mjs";
 const knownFailingReport = "target/journeys/known-failing-report.json";
@@ -21,6 +22,7 @@ function requiredEnvironment(name) {
 }
 
 function validateEnvironment() {
+  const selectedTags = requiredEnvironment("STEWARD_JOURNEY_TAGS");
   const baseUrl = requiredEnvironment("STEWARD_JOURNEY_BASE_URL");
   let parsedBaseUrl;
   try {
@@ -32,21 +34,23 @@ function validateEnvironment() {
     throw new Error("STEWARD_JOURNEY_BASE_URL must be a valid HTTP or HTTPS URL.");
   }
 
-  const storageState = requiredEnvironment("STEWARD_JOURNEY_STORAGE_STATE");
-  try {
-    if (!statSync(storageState).isFile()) throw new Error("not a file");
-    const parsed = JSON.parse(readFileSync(storageState, "utf8"));
-    if (!Array.isArray(parsed.cookies) || !Array.isArray(parsed.origins)) throw new Error("invalid shape");
-  } catch (error) {
-    throw new Error(`STEWARD_JOURNEY_STORAGE_STATE must name a readable Playwright storage-state JSON file: ${error.message}`);
-  }
+  if (browserInputsRequired(selectedTags)) {
+    const storageState = requiredEnvironment("STEWARD_JOURNEY_STORAGE_STATE");
+    try {
+      if (!statSync(storageState).isFile()) throw new Error("not a file");
+      const parsed = JSON.parse(readFileSync(storageState, "utf8"));
+      if (!Array.isArray(parsed.cookies) || !Array.isArray(parsed.origins)) throw new Error("invalid shape");
+    } catch (error) {
+      throw new Error(`STEWARD_JOURNEY_STORAGE_STATE must name a readable Playwright storage-state JSON file: ${error.message}`);
+    }
 
-  const repository = requiredEnvironment("STEWARD_JOURNEY_REPOSITORY");
-  if (!/^[^/\s]+\/[^/\s]+$/.test(repository)) {
-    throw new Error("STEWARD_JOURNEY_REPOSITORY must use owner/repository form.");
-  }
+    const repository = requiredEnvironment("STEWARD_JOURNEY_REPOSITORY");
+    if (!/^[^/\s]+\/[^/\s]+$/.test(repository)) {
+      throw new Error("STEWARD_JOURNEY_REPOSITORY must use owner/repository form.");
+    }
 
-  requiredEnvironment("STEWARD_JOURNEY_MEMBER_ROLE");
+    requiredEnvironment("STEWARD_JOURNEY_MEMBER_ROLE");
+  }
 
   const runPrefix = requiredEnvironment("STEWARD_JOURNEY_RUN_PREFIX");
   if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(runPrefix)) {
@@ -58,7 +62,7 @@ function validateEnvironment() {
     throw new Error("STEWARD_JOURNEY_IGNORE_HTTPS_ERRORS must be true or false when set.");
   }
 
-  return requiredEnvironment("STEWARD_JOURNEY_TAGS");
+  return selectedTags;
 }
 
 function run(command, arguments_, environment) {

@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  adminConfiguration,
+  adminRequest,
   ExchangeRefusedError,
   deleteCallerTask,
   downloadCallerOutput,
@@ -37,6 +39,116 @@ function config() {
 }
 
 describe("caller HTTP journey helpers", () => {
+  test("administrator requests read a protected token file without exposing it", async () => {
+    const requests = [];
+    let reads = 0;
+    const environment = {
+      STEWARD_JOURNEY_ADMIN_TOKEN_FILE: "/example/admin-token",
+      STEWARD_JOURNEY_BASE_URL: "https://steward.example.com",
+    };
+    const dependencies = {
+      fetchImpl: async (url, options) => {
+        requests.push({ url: url.toString(), options });
+        return jsonResponse({ apiVersion: "steward.admin/runs/v1", runs: [] });
+      },
+      readFile: () => {
+        reads += 1;
+        return Buffer.from("obviously-fake-admin-token\n");
+      },
+      realpathFile: (path) => path,
+      checkoutRoot: "/example/repository",
+      statFile: () => ({ isFile: () => true, mode: 0o100600 }),
+    };
+    const admin = adminConfiguration(environment);
+
+    await adminRequest(admin, "/admin/api/v1/runs?limit=100", dependencies);
+    await adminRequest(admin, "/admin/api/v1/runs/11111111-1111-4111-8111-111111111111", dependencies);
+
+    expect(reads).toBe(2);
+    expect(requests.map((entry) => entry.url)).toEqual([
+      "https://steward.example.com/admin/api/v1/runs?limit=100",
+      "https://steward.example.com/admin/api/v1/runs/11111111-1111-4111-8111-111111111111",
+    ]);
+    for (const request of requests) {
+      expect(request.options.redirect).toBe("manual");
+      expect(request.options.headers.authorization).toBe("Bearer obviously-fake-admin-token");
+    }
+  });
+
+  test("administrator requests refuse unsafe token files and paths", async () => {
+    const environment = {
+      STEWARD_JOURNEY_ADMIN_TOKEN_FILE: "/example/admin-token",
+      STEWARD_JOURNEY_BASE_URL: "https://steward.example.com",
+    };
+    expect(() => adminConfiguration({
+      ...environment,
+      STEWARD_JOURNEY_ADMIN_TOKEN_FILE: "relative/admin-token",
+    })).toThrow("absolute path");
+
+    let reads = 0;
+    for (const dependencies of [
+      {
+        readFile: () => {
+          reads += 1;
+          return Buffer.from("obviously-fake-admin-token");
+        },
+        statFile: () => ({ isFile: () => true, mode: 0o100640 }),
+      },
+      {
+        readFile: () => {
+          reads += 1;
+          return Buffer.from("obviously-fake admin token");
+        },
+        statFile: () => ({ isFile: () => true, mode: 0o100600 }),
+      },
+    ]) {
+      let caught;
+      try {
+        await adminRequest(adminConfiguration(environment), "/admin/api/v1/runs", {
+          ...dependencies,
+          fetchImpl: async () => { throw new Error("request must not run"); },
+          realpathFile: (path) => path,
+          checkoutRoot: "/example/repository",
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught.message).not.toContain("obviously-fake");
+    }
+    expect(reads, "a file with unsafe permissions must be refused before reading").toBe(1);
+    await expect(adminRequest(adminConfiguration(environment), "/v1/tasks", {
+      fetchImpl: async () => { throw new Error("request must not run"); },
+      readFile: () => Buffer.from("obviously-fake-admin-token"),
+      realpathFile: (path) => path,
+      checkoutRoot: "/example/repository",
+      statFile: () => ({ isFile: () => true, mode: 0o100600 }),
+    })).rejects.toThrow("administrator Runs path");
+  });
+
+  test("administrator requests refuse token files resolved inside the repository", async () => {
+    const environment = {
+      STEWARD_JOURNEY_ADMIN_TOKEN_FILE: "/example/repository/linked-admin-token",
+      STEWARD_JOURNEY_BASE_URL: "https://steward.example.com",
+    };
+    let reads = 0;
+    for (const resolvedToken of [
+      "/example/repository/secrets/admin-token",
+      "/example/repository/.worktrees/other-task/admin-token",
+    ]) {
+      await expect(adminRequest(adminConfiguration(environment), "/admin/api/v1/runs", {
+        checkoutRoot: "/example/repository/.worktrees/current-task",
+        fetchImpl: async () => { throw new Error("request must not run"); },
+        readFile: () => {
+          reads += 1;
+          return Buffer.from("obviously-fake-admin-token");
+        },
+        realpathFile: (path) => path.endsWith("linked-admin-token") ? resolvedToken : path,
+        statFile: () => ({ isFile: () => true, mode: 0o100600 }),
+      })).rejects.toThrow("outside the repository");
+    }
+    expect(reads, "a repository-contained credential must be refused before reading").toBe(0);
+  });
+
   test("credential-bearing URLs are exact and verified", () => {
     expect(exactHttpUrl("exchange", "https://identity.example.com/v1/oidc/exchange", { path: "/v1/oidc/exchange" }).hostname)
       .toBe("identity.example.com");

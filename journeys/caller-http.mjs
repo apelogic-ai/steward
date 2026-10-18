@@ -1,12 +1,14 @@
 import { spawnSync } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const MAX_EXCHANGE_BYTES = 64 * 1024;
 const MAX_JSON_BYTES = 1024 * 1024;
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
+const JOURNEY_CHECKOUT_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 
 function required(name, environment = process.env) {
   const value = environment[name]?.trim();
@@ -33,6 +35,79 @@ export function exactHttpUrl(name, value, { path = null } = {}) {
     throw new Error(`${name} must use the exact path ${path}.`);
   }
   return url;
+}
+
+export function adminConfiguration(environment = process.env) {
+  const tokenFile = required("STEWARD_JOURNEY_ADMIN_TOKEN_FILE", environment);
+  if (!isAbsolute(tokenFile)) {
+    throw new Error("STEWARD_JOURNEY_ADMIN_TOKEN_FILE must use an absolute path.");
+  }
+  return {
+    apiOrigin: exactHttpUrl(
+      "STEWARD_JOURNEY_BASE_URL",
+      required("STEWARD_JOURNEY_BASE_URL", environment),
+    ).origin,
+    tokenFile,
+  };
+}
+
+function adminToken(config, dependencies) {
+  let repositoryRoot;
+  let tokenFile;
+  try {
+    const realpathFile = dependencies.realpathFile ?? realpathSync;
+    const checkoutRoot = realpathFile(dependencies.checkoutRoot ?? JOURNEY_CHECKOUT_ROOT);
+    const checkoutParent = dirname(checkoutRoot);
+    repositoryRoot = basename(checkoutParent) === ".worktrees"
+      ? dirname(checkoutParent)
+      : checkoutRoot;
+    tokenFile = realpathFile(config.tokenFile);
+  } catch {
+    throw new Error("The administrator token file could not be read.");
+  }
+  const repositoryRelative = relative(repositoryRoot, tokenFile);
+  if (repositoryRelative === ""
+      || (!repositoryRelative.startsWith(`..${sep}`)
+          && repositoryRelative !== ".."
+          && !isAbsolute(repositoryRelative))) {
+    throw new Error("The administrator token file must be outside the repository.");
+  }
+  let metadata;
+  try {
+    metadata = (dependencies.statFile ?? statSync)(tokenFile);
+  } catch {
+    throw new Error("The administrator token file could not be read.");
+  }
+  if (!metadata.isFile() || (metadata.mode & 0o777) !== 0o600) {
+    throw new Error("The administrator token file must be a regular file with mode 0600.");
+  }
+  let contents;
+  try {
+    contents = (dependencies.readFile ?? readFileSync)(tokenFile);
+  } catch {
+    throw new Error("The administrator token file could not be read.");
+  }
+  const bytes = Buffer.isBuffer(contents) ? contents : Buffer.from(contents);
+  if (!bytes.length || bytes.length > MAX_EXCHANGE_BYTES) {
+    throw new Error("The administrator token file is empty or too large.");
+  }
+  const token = bytes.toString("utf8").trim();
+  if (!token || /\s/.test(token)) {
+    throw new Error("The administrator token file does not contain one valid credential.");
+  }
+  return token;
+}
+
+export async function adminRequest(config, path, dependencies = {}) {
+  const url = new URL(path, `${config.apiOrigin}/`);
+  if (url.origin !== config.apiOrigin
+      || (url.pathname !== "/admin/api/v1/runs" && !url.pathname.startsWith("/admin/api/v1/runs/"))) {
+    throw new Error("The administrator credential may be sent only to an administrator Runs path.");
+  }
+  return request(dependencies.fetchImpl ?? fetch, url, {
+    headers: { authorization: `Bearer ${adminToken(config, dependencies)}` },
+    method: "GET",
+  });
 }
 
 export function callerConfiguration(name, environment = process.env) {
