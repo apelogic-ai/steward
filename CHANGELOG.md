@@ -42,6 +42,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Exact Jira webhook replays now return `200 No run needed` even when a retry reaches a different
+  receiver process or the original process restarted. Only a new PostgreSQL Task reservation can
+  return `202 Accepted`; a duplicate never uploads inputs, starts, or finalizes the existing Task,
+  and it does not consume the receiving process's cooldown or concurrency limit.
 - Caller journeys now use a protected short-lived administrator token for Run checks, so Jenkins,
   Temporal, and Jira acceptance can run without a person's browser session or putting the bearer
   in Playwright traces.
