@@ -12,10 +12,10 @@ futures.workspace = true
 kube = { workspace = true, features = ["admission", "client", "ring", "runtime", "rustls-tls"] }
 serde_json.workspace = true
 sha2.workspace = true
-steward-admission = { path = "../steward-admission", version = "=0.3.19" }
-steward-ports = { path = "../steward-ports", version = "=0.3.19" }
-steward-store = { path = "../steward-store", version = "=0.3.19" }
-steward-types = { path = "../steward-types", version = "=0.3.19" }
+steward-admission = { path = "../steward-admission", version = "=0.3.20" }
+steward-ports = { path = "../steward-ports", version = "=0.3.20" }
+steward-store = { path = "../steward-store", version = "=0.3.20" }
+steward-types = { path = "../steward-types", version = "=0.3.20" }
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]

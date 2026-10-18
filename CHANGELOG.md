@@ -7,11 +7,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.20] - 2026-10-18
+
+Steward v0.3.20 adds governed external Run API callers and signed Jira webhook Triggers, including
+an isolated trigger receiver with bounded delivery, replay, cooldown, and cleanup behavior. Run
+views can show caller-supplied display context without using it to decide whether a request is
+accepted.
+
+Failed Tasks can expose validated partial output and requested bounded diagnostics, and API Runs
+now carry an explicit origin. The release also strengthens receiver startup, delivery recovery,
+chart rendering, caller refusal coverage, and coding-agent execution evidence.
+
 ### Added
 
 - Added a Jira webhook Trigger operator guide covering exact-path exposure, signing Secrets,
   read-only Envelope checks, filters, run limits, cooldowns, response meanings, optional issue
-  links, and the pending deployment acceptance evidence.
+  links, and deployment acceptance requirements.
 - Release publication now includes the Jira trigger receiver image, its immutable digest, scan,
   provenance, release handoff entry, and registry-mirror values alongside the core components.
 - External Run API callers may attach a bounded display label and optional HTTPS link. My runs,
@@ -67,15 +78,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Upgrade and rollback
 
-- Migration 0073 adds nullable immutable caller-reference context to Tasks without rewriting
-  historical rows. The Jira Trigger receiver uses `config.apiserver.jiraBaseUrl`, when set, as
-  the validated HTTPS site and optional context path for issue links; without it, runs retain a
-  label without a link. Issue display metadata never determines whether a delivery is accepted.
-  Deploy the chart, API, web, and receiver images together.
-- Rolling back leaves the nullable column and its values in place; older API and web versions
-  ignore them. A full chart rollback removes the new receiver configuration field. Image-only
-  rollback of the receiver requires leaving `config.apiserver.jiraBaseUrl` unset; otherwise the
-  older strict config parser rejects that unknown field.
+- Apply additive migrations 0072 and 0073 before starting v0.3.20. Migration 0072 accepts the new
+  `api` Task origin without rewriting historical rows. Migration 0073 adds nullable immutable
+  caller-reference context without rewriting historical rows. The Jira Trigger receiver uses
+  `config.apiserver.jiraBaseUrl`, when set, as the validated HTTPS site and optional context path
+  for issue links; without it, runs retain a label without a link. Issue display metadata never
+  determines whether a delivery is accepted. Deploy the chart, API, web, and receiver images
+  together.
+- Before rolling back to v0.3.19, stop Task submission and prove that no stored Task has the `api`
+  origin; v0.3.19 cannot read that new immutable value. If any such row exists, restore the
+  pre-upgrade database or keep v0.3.20 API readers. The nullable caller-reference column and its
+  values may remain because older API and web versions ignore them. A full chart rollback removes
+  the receiver and its configuration.
 
 ## [0.3.19] - 2026-10-15
 
@@ -1444,7 +1458,8 @@ The release workflow stopped during validation and published no artifacts.
 
 Earlier releases are available on the [GitHub releases page](https://github.com/apelogic-ai/steward/releases).
 
-[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.19...HEAD
+[Unreleased]: https://github.com/apelogic-ai/steward/compare/v0.3.20...HEAD
+[0.3.20]: https://github.com/apelogic-ai/steward/compare/v0.3.19...v0.3.20
 [0.3.19]: https://github.com/apelogic-ai/steward/compare/v0.3.18...v0.3.19
 [0.3.18]: https://github.com/apelogic-ai/steward/compare/v0.3.17...v0.3.18
 [0.3.17]: https://github.com/apelogic-ai/steward/compare/v0.3.16...v0.3.17

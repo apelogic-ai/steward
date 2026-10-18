@@ -11,7 +11,7 @@ version.workspace = true
 serde.workspace = true
 # Send Jira issue and comment requests over the workspace's rustls-backed HTTP client.
 reqwest.workspace = true
-steward-ports = { path = "../../crates/steward-ports", version = "=0.3.19" }
+steward-ports = { path = "../../crates/steward-ports", version = "=0.3.20" }
 
 [dev-dependencies]
 # Drive async adapter tests against a local mock Jira server.

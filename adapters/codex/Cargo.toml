@@ -9,10 +9,10 @@ version.workspace = true
 [dependencies]
 reqwest.workspace = true # Validates the configured inference endpoint without performing I/O.
 serde_json.workspace = true # Safely quotes the governed tool endpoint in generated TOML.
-steward-ports = { path = "../../crates/steward-ports", version = "=0.3.19" }
+steward-ports = { path = "../../crates/steward-ports", version = "=0.3.20" }
 
 [dev-dependencies]
-steward-types = { path = "../../crates/steward-types", version = "=0.3.19" }
+steward-types = { path = "../../crates/steward-types", version = "=0.3.20" }
 
 [lints]
 workspace = true
