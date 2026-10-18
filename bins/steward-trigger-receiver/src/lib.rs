@@ -642,10 +642,13 @@ impl Receiver {
                 return Err(error);
             }
         };
-        pending.accept().await;
         match start {
-            TaskStart::Duplicate => Ok(WebhookResult::Noop),
+            TaskStart::Duplicate => {
+                pending.rollback().await;
+                Ok(WebhookResult::Noop)
+            }
             TaskStart::Started(completion) => {
+                pending.accept().await;
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(error) = completion.await {
@@ -1531,13 +1534,18 @@ mod tests {
         expect(&r, "two", "bob", Err(E::Busy)).await;
 
         let exact = Tasks::default();
-        let first = make_receiver(config_json("[]", 1, 0), envelopes(), exact.clone()).await?;
-        let retry = make_receiver(config_json("[]", 1, 0), envelopes(), exact.clone()).await?;
+        let first = make_receiver(config_json("[]", 1, 60), envelopes(), exact.clone()).await?;
+        let retry = make_receiver(config_json("[]", 1, 60), envelopes(), exact.clone()).await?;
         expect(&first, "same", "alice", Ok(W::Accepted)).await;
         expect(&retry, "same", "alice", Ok(W::Noop)).await;
         assert_eq!(
+            send(&retry, "fresh", "bob").await,
+            Ok(W::Accepted),
+            "a duplicate on another receiver must release its cooldown and concurrency reservation"
+        );
+        assert_eq!(
             exact.calls.lock().map_err(|_| "calls lock failed")?.len(),
-            2
+            3
         );
         let config = ReceiverConfig::from_json(&config_json("[]", 1, 0), &limits())?;
         let mut conflict = exact

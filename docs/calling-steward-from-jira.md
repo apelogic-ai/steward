@@ -94,7 +94,10 @@ successful no-op; it is not an error and does not create a Task.
 
 For one Trigger, semantically identical JSON bodies share one replay key even
 when whitespace or object-field order differs. A retry after acceptance returns
-`200` and does not start a second Task. A changed event body is a new delivery.
+`200` and does not start a second Task. The Task API stores that key in PostgreSQL,
+so this remains true when a retry reaches another receiver process or the first
+process restarted. A duplicate does not consume the receiver's cooldown or
+concurrency limit. A changed event body is a new delivery.
 
 ## Configure the Jira webhook
 
