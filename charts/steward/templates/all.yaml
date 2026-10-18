@@ -815,33 +815,33 @@ spec:
             - { name: STEWARD_TRIGGER_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
             - { name: STEWARD_TRIGGER_SERVICE_ACCOUNT, value: steward-trigger-receiver }
             - { name: STEWARD_WORKLOAD_SOURCE_AUDIENCE, value: {{ .Values.triggerReceiver.workloadExchange.audience | quote }} }
-            - { name: STEWARD_WORKLOAD_SOURCE_TOKEN_SECONDS, value: {{ .Values.triggerReceiver.limits.sourceTokenSeconds | quote }} }
+            - { name: STEWARD_WORKLOAD_SOURCE_TOKEN_SECONDS, value: {{ .Values.triggerReceiver.limits.sourceTokenSeconds | int64 | quote }} }
             - { name: STEWARD_WORKLOAD_EXCHANGE_ENDPOINT, value: {{ .Values.triggerReceiver.workloadExchange.endpoint | quote }} }
             - { name: STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME, value: {{ .Values.triggerReceiver.workloadExchange.serverName | quote }} }
             - { name: STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE, value: /run/workload-exchange/ca.crt }
             - { name: STEWARD_API_ORIGIN, value: {{ printf "https://steward-apiserver.%s.svc.%s:%v" .Release.Namespace .Values.services.clusterDomain .Values.services.apiserverPort | quote }} }
             - { name: STEWARD_API_SERVER_NAME, value: {{ printf "steward-apiserver.%s.svc.%s" .Release.Namespace .Values.services.clusterDomain | quote }} }
             - { name: STEWARD_API_CA_CERTIFICATE_FILE, value: /run/task-api/ca.crt }
-            - { name: STEWARD_TRIGGER_MAX_CONFIG_BYTES, value: {{ .Values.triggerReceiver.limits.maxConfigBytes | quote }} }
-            - { name: STEWARD_TRIGGER_MAX_BODY_BYTES, value: {{ .Values.triggerReceiver.limits.maxBodyBytes | quote }} }
-            - { name: STEWARD_TRIGGER_MAX_IDENTIFIER_BYTES, value: {{ .Values.triggerReceiver.limits.maxIdentifierBytes | quote }} }
-            - { name: STEWARD_TRIGGER_MAX_TRIGGERS, value: {{ .Values.triggerReceiver.limits.maxTriggers | quote }} }
-            - { name: STEWARD_TRIGGER_MAX_IGNORED_ACCOUNTS, value: {{ .Values.triggerReceiver.limits.maxIgnoredAccounts | quote }} }
-            - { name: STEWARD_TRIGGER_MAX_CONCURRENCY, value: {{ .Values.triggerReceiver.limits.maxConcurrency | quote }} }
-            - { name: STEWARD_TRIGGER_MAX_COOLDOWN_SECONDS, value: {{ .Values.triggerReceiver.limits.maxCooldownSeconds | quote }} }
-            - { name: STEWARD_TRIGGER_MAX_RECENT_DELIVERIES, value: {{ .Values.triggerReceiver.limits.maxRecentDeliveries | quote }} }
-            - { name: STEWARD_TRIGGER_MAX_ISSUE_COOLDOWNS, value: {{ .Values.triggerReceiver.limits.maxIssueCooldowns | quote }} }
-            - { name: STEWARD_TRIGGER_MAX_SIGNING_SECRET_BYTES, value: {{ .Values.triggerReceiver.limits.maxSigningSecretBytes | quote }} }
-            - { name: STEWARD_TRIGGER_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.databaseAcquireTimeoutMilliseconds | quote }} }
-            - { name: STEWARD_WORKLOAD_EXCHANGE_CONNECT_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.exchangeConnectTimeoutMilliseconds | quote }} }
-            - { name: STEWARD_WORKLOAD_EXCHANGE_REQUEST_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.exchangeRequestTimeoutMilliseconds | quote }} }
-            - { name: STEWARD_WORKLOAD_EXCHANGE_MAX_REPLY_BYTES, value: {{ .Values.triggerReceiver.limits.exchangeMaxReplyBytes | quote }} }
-            - { name: STEWARD_TRIGGER_TASK_DEADLINE_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.taskDeadlineMilliseconds | quote }} }
-            - { name: STEWARD_TRIGGER_POLL_INITIAL_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.pollInitialMilliseconds | quote }} }
-            - { name: STEWARD_TRIGGER_POLL_MAX_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.pollMaxMilliseconds | quote }} }
-            - { name: STEWARD_TRIGGER_API_CONNECT_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.apiConnectTimeoutMilliseconds | quote }} }
-            - { name: STEWARD_TRIGGER_API_REQUEST_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.apiRequestTimeoutMilliseconds | quote }} }
-            - { name: STEWARD_TRIGGER_MAX_TASK_REPLY_BYTES, value: {{ .Values.triggerReceiver.limits.maxTaskReplyBytes | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_CONFIG_BYTES, value: {{ .Values.triggerReceiver.limits.maxConfigBytes | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_BODY_BYTES, value: {{ .Values.triggerReceiver.limits.maxBodyBytes | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_IDENTIFIER_BYTES, value: {{ .Values.triggerReceiver.limits.maxIdentifierBytes | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_TRIGGERS, value: {{ .Values.triggerReceiver.limits.maxTriggers | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_IGNORED_ACCOUNTS, value: {{ .Values.triggerReceiver.limits.maxIgnoredAccounts | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_CONCURRENCY, value: {{ .Values.triggerReceiver.limits.maxConcurrency | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_COOLDOWN_SECONDS, value: {{ .Values.triggerReceiver.limits.maxCooldownSeconds | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_RECENT_DELIVERIES, value: {{ .Values.triggerReceiver.limits.maxRecentDeliveries | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_ISSUE_COOLDOWNS, value: {{ .Values.triggerReceiver.limits.maxIssueCooldowns | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_SIGNING_SECRET_BYTES, value: {{ .Values.triggerReceiver.limits.maxSigningSecretBytes | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.databaseAcquireTimeoutMilliseconds | int64 | quote }} }
+            - { name: STEWARD_WORKLOAD_EXCHANGE_CONNECT_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.exchangeConnectTimeoutMilliseconds | int64 | quote }} }
+            - { name: STEWARD_WORKLOAD_EXCHANGE_REQUEST_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.exchangeRequestTimeoutMilliseconds | int64 | quote }} }
+            - { name: STEWARD_WORKLOAD_EXCHANGE_MAX_REPLY_BYTES, value: {{ .Values.triggerReceiver.limits.exchangeMaxReplyBytes | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_TASK_DEADLINE_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.taskDeadlineMilliseconds | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_POLL_INITIAL_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.pollInitialMilliseconds | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_POLL_MAX_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.pollMaxMilliseconds | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_API_CONNECT_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.apiConnectTimeoutMilliseconds | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_API_REQUEST_TIMEOUT_MILLISECONDS, value: {{ .Values.triggerReceiver.limits.apiRequestTimeoutMilliseconds | int64 | quote }} }
+            - { name: STEWARD_TRIGGER_MAX_TASK_REPLY_BYTES, value: {{ .Values.triggerReceiver.limits.maxTaskReplyBytes | int64 | quote }} }
           volumeMounts:
             - { name: trigger-config, mountPath: /run/trigger-config, readOnly: true }
             - { name: trigger-signing, mountPath: /run/trigger-signing, readOnly: true }

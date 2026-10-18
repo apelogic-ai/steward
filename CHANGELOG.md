@@ -41,6 +41,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- The Helm chart now renders every Jira receiver numeric environment setting as decimal digits,
+  preventing the receiver from rejecting large default or ceiling values written in scientific
+  notation.
 - The Codex reference runtime now pins the latest reviewed Ubuntu kernel headers and limits its
   vulnerability exception to three named, unfixed kernel-code findings with a dated review.
 - Jira webhook delivery now recovers its concurrency and cooldown state if Task startup stops
