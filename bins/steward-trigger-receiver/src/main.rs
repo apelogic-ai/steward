@@ -257,6 +257,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chart_rendered_environment_is_parseable() -> Result<(), String> {
+        let fallback = serde_json::json!({
+            "STEWARD_TRIGGER_MAX_CONFIG_BYTES": "4194304",
+            "STEWARD_TRIGGER_MAX_BODY_BYTES": "1048576",
+            "STEWARD_TRIGGER_MAX_IDENTIFIER_BYTES": "1024",
+            "STEWARD_TRIGGER_MAX_TRIGGERS": "4096",
+            "STEWARD_TRIGGER_MAX_IGNORED_ACCOUNTS": "4096",
+            "STEWARD_TRIGGER_MAX_CONCURRENCY": "1024",
+            "STEWARD_TRIGGER_MAX_COOLDOWN_SECONDS": "31536000",
+            "STEWARD_TRIGGER_MAX_RECENT_DELIVERIES": "1000000",
+            "STEWARD_TRIGGER_MAX_ISSUE_COOLDOWNS": "1000000",
+            "STEWARD_TRIGGER_MAX_SIGNING_SECRET_BYTES": "65536",
+            "STEWARD_TRIGGER_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS": "60000",
+            "STEWARD_WORKLOAD_SOURCE_TOKEN_SECONDS": "600",
+            "STEWARD_WORKLOAD_EXCHANGE_CONNECT_TIMEOUT_MILLISECONDS": "5000",
+            "STEWARD_WORKLOAD_EXCHANGE_REQUEST_TIMEOUT_MILLISECONDS": "30000",
+            "STEWARD_WORKLOAD_EXCHANGE_MAX_REPLY_BYTES": "65536",
+            "STEWARD_TRIGGER_TASK_DEADLINE_MILLISECONDS": "600000",
+            "STEWARD_TRIGGER_POLL_INITIAL_MILLISECONDS": "500",
+            "STEWARD_TRIGGER_POLL_MAX_MILLISECONDS": "5000",
+            "STEWARD_TRIGGER_API_CONNECT_TIMEOUT_MILLISECONDS": "5000",
+            "STEWARD_TRIGGER_API_REQUEST_TIMEOUT_MILLISECONDS": "30000",
+            "STEWARD_TRIGGER_MAX_TASK_REPLY_BYTES": "1048576"
+        });
+        let json = std::env::var("STEWARD_CHART_RUNTIME_SETTINGS_JSON")
+            .unwrap_or_else(|_| fallback.to_string());
+        let values: BTreeMap<String, String> =
+            serde_json::from_str(&json).map_err(|error| error.to_string())?;
+        runtime_settings_from(|name| {
+            values
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("rendered chart omitted {name}"))
+        })?;
+        Ok(())
+    }
+
+    #[test]
     fn environment_settings_accept_an_unknown_value_below_the_ceiling() -> Result<(), String> {
         let settings = runtime_settings_from(|name| {
             Ok(match name {

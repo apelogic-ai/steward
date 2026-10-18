@@ -124,6 +124,46 @@ receiver_config="$(
 inline_env_value() {
   sed -n "/name: ${1},/s/.*value: \"\([^\"]*\)\".*/\1/p" "${rendered}" | head -1
 }
+receiver_numeric_env_names=(
+  STEWARD_TRIGGER_MAX_CONFIG_BYTES
+  STEWARD_TRIGGER_MAX_BODY_BYTES
+  STEWARD_TRIGGER_MAX_IDENTIFIER_BYTES
+  STEWARD_TRIGGER_MAX_TRIGGERS
+  STEWARD_TRIGGER_MAX_IGNORED_ACCOUNTS
+  STEWARD_TRIGGER_MAX_CONCURRENCY
+  STEWARD_TRIGGER_MAX_COOLDOWN_SECONDS
+  STEWARD_TRIGGER_MAX_RECENT_DELIVERIES
+  STEWARD_TRIGGER_MAX_ISSUE_COOLDOWNS
+  STEWARD_TRIGGER_MAX_SIGNING_SECRET_BYTES
+  STEWARD_TRIGGER_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS
+  STEWARD_WORKLOAD_SOURCE_TOKEN_SECONDS
+  STEWARD_WORKLOAD_EXCHANGE_CONNECT_TIMEOUT_MILLISECONDS
+  STEWARD_WORKLOAD_EXCHANGE_REQUEST_TIMEOUT_MILLISECONDS
+  STEWARD_WORKLOAD_EXCHANGE_MAX_REPLY_BYTES
+  STEWARD_TRIGGER_TASK_DEADLINE_MILLISECONDS
+  STEWARD_TRIGGER_POLL_INITIAL_MILLISECONDS
+  STEWARD_TRIGGER_POLL_MAX_MILLISECONDS
+  STEWARD_TRIGGER_API_CONNECT_TIMEOUT_MILLISECONDS
+  STEWARD_TRIGGER_API_REQUEST_TIMEOUT_MILLISECONDS
+  STEWARD_TRIGGER_MAX_TASK_REPLY_BYTES
+)
+assert_receiver_numeric_environment() {
+  local settings='{}' name value
+  for name in "${receiver_numeric_env_names[@]}"; do
+    value="$(inline_env_value "${name}")"
+    if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+      echo "receiver numeric environment value must contain decimal digits only: ${name}=${value}" >&2
+      return 1
+    fi
+    settings="$(jq -c --arg name "${name}" --arg value "${value}" \
+      '. + {($name): $value}' <<< "${settings}")"
+  done
+  STEWARD_CHART_RUNTIME_SETTINGS_JSON="${settings}" \
+    cargo test --quiet --package steward-trigger-receiver \
+      --bin steward-trigger-receiver \
+      tests::chart_rendered_environment_is_parseable -- --exact
+}
+assert_receiver_numeric_environment
 STEWARD_CHART_RECEIVER_CONFIG="${receiver_config}" \
 STEWARD_CHART_API_ORIGIN="$(inline_env_value STEWARD_API_ORIGIN)" \
 STEWARD_CHART_API_SERVER_NAME="$(inline_env_value STEWARD_API_SERVER_NAME)" \
@@ -131,6 +171,28 @@ STEWARD_CHART_EXCHANGE_ENDPOINT="$(inline_env_value STEWARD_WORKLOAD_EXCHANGE_EN
 STEWARD_CHART_EXCHANGE_SERVER_NAME="$(inline_env_value STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME)" \
   cargo test --quiet --package steward-trigger-receiver \
     client::tests::chart_render_contract_from_environment -- --exact
+
+receiver_ceiling_trigger="$(jq -c '.[0].cooldownSeconds = 31536000' <<< "${receiver_trigger}")"
+receiver_ceiling_limits='{"maxConfigBytes":4194304,"maxBodyBytes":1048576,"maxIdentifierBytes":1024,"maxTriggers":4096,"maxIgnoredAccounts":4096,"maxConcurrency":1024,"maxCooldownSeconds":31536000,"maxRecentDeliveries":1000000,"maxIssueCooldowns":1000000,"maxSigningSecretBytes":65536,"databaseAcquireTimeoutMilliseconds":60000,"sourceTokenSeconds":86400,"exchangeConnectTimeoutMilliseconds":60000,"exchangeRequestTimeoutMilliseconds":300000,"exchangeMaxReplyBytes":65536,"taskDeadlineMilliseconds":86400000,"pollInitialMilliseconds":60000,"pollMaxMilliseconds":60000,"apiConnectTimeoutMilliseconds":60000,"apiRequestTimeoutMilliseconds":300000,"maxTaskReplyBytes":1048576}'
+receiver_ceiling_inputs=(
+  --set-json "triggerReceiver.limits=${receiver_ceiling_limits}"
+  --set workspace.maxHistoryDepth=4294967295
+  --set-json "triggerReceiver.triggers=${receiver_ceiling_trigger}"
+)
+helm_template "${receiver_inputs[@]}" "${receiver_ceiling_inputs[@]}" > "${rendered}"
+assert_receiver_numeric_environment
+grep -qF '\"maxHistoryDepth\":4294967295' "${rendered}" || {
+  echo 'workspace history depth ceiling must render as a decimal JSON integer' >&2
+  exit 1
+}
+ceiling_receiver_config="$(
+  awk '/^metadata: \{ name: steward-trigger-receiver-config/ { found = 1 } found && /^  config.json: / { sub(/^  config.json: /, ""); print; exit }' "${rendered}" |
+    jq -r .
+)"
+jq -e '.triggers[0].cooldownSeconds == 31536000' <<< "${ceiling_receiver_config}" > /dev/null || {
+  echo 'receiver cooldown ceiling must render as a decimal JSON integer' >&2
+  exit 1
+}
 
 helm_template "${receiver_inputs[@]}" \
   --set-string config.apiserver.jiraBaseUrl= > "${rendered}"
