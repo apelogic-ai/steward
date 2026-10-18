@@ -71,7 +71,7 @@ Higher-ranked sources control. No post-M1 document may reinterpret a frozen M1 f
 | [`task-submission-api.md`](task-submission-api.md) | **Current implementation** | Current `steward.task/v2` API, User-Envelope-only authority, and digest-qualified Envelope selection. |
 | [`contracts/run-api/README.md`](contracts/run-api/README.md) | **Generated current implementation** | Generated OpenAPI contract for the `/v1/tasks` Run API lifecycle. |
 | [`calling-steward-from-jenkins-and-temporal.md`](calling-steward-from-jenkins-and-temporal.md) | **Current implementation** | Token exchange, idempotency, polling, and output handling for Jenkins and Temporal callers. |
-| [`calling-steward-from-jira.md`](calling-steward-from-jira.md) | **Current implementation, with stated activation dependency** | Signed Jira webhook Trigger configuration, read-only checks, response meanings, and deployment acceptance placeholder. |
+| [`calling-steward-from-jira.md`](calling-steward-from-jira.md) | **Current implementation, with stated activation dependency** | Signed Jira webhook Trigger configuration, read-only checks, response meanings, and local-main deployment acceptance evidence. |
 
 ### Accepted implementation architecture
 
