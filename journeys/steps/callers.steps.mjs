@@ -1,6 +1,8 @@
 import { expect } from "@playwright/test";
 
 import {
+  adminConfiguration,
+  adminRequest,
   ExchangeRefusedError,
   callerConfiguration,
   deleteCallerTask,
@@ -33,15 +35,15 @@ function targetOrigin() {
   ).origin;
 }
 
-async function adminRuns(page) {
+async function adminRuns(journey) {
   const runs = [];
   const cursors = new Set();
   let cursor = null;
   do {
     const query = new URLSearchParams({ limit: "100" });
     if (cursor) query.set("cursor", cursor);
-    const response = await page.request.get(`${targetOrigin()}/admin/api/v1/runs?${query}`);
-    expect(response.ok(), "the caller journey requires a signed-in Steward administrator session").toBeTruthy();
+    const response = await adminRequest(journey.adminConfig, `/admin/api/v1/runs?${query}`);
+    expect(response.ok, "the caller journey requires a valid Steward administrator credential").toBeTruthy();
     const body = await response.json();
     expect(body.apiVersion).toBe("steward.admin/runs/v1");
     expect(Array.isArray(body.runs)).toBeTruthy();
@@ -56,13 +58,13 @@ async function adminRuns(page) {
 }
 
 async function recordInitialRuns(journey, page) {
-  journey.callerInitialRunIds = new Set((await adminRuns(page)).map((run) => run.taskUid));
+  journey.callerInitialRunIds = new Set((await adminRuns(journey)).map((run) => run.taskUid));
   journey.receiverNewRuns = [];
 }
 
 async function newRuns(journey, page) {
   expect(journey.callerInitialRunIds, "the journey must record existing Tasks before sending a request").toBeTruthy();
-  return (await adminRuns(page)).filter((run) => !journey.callerInitialRunIds.has(run.taskUid));
+  return (await adminRuns(journey)).filter((run) => !journey.callerInitialRunIds.has(run.taskUid));
 }
 
 async function expectNewRunCount(journey, page, expected) {
@@ -92,6 +94,7 @@ async function sendConfiguredJiraDelivery(journey, deliveryId, issueKey, depende
 Given("the caller journey target is configured", async ({ journey }) => {
   targetOrigin();
   requiredEnvironment("STEWARD_JOURNEY_RUN_PREFIX");
+  journey.adminConfig = adminConfiguration();
   expect(Array.isArray(journey.cleanups)).toBeTruthy();
 });
 
@@ -231,13 +234,13 @@ Then(/^the receiver creates (\d+) new Tasks?$/, async ({ journey, page }, expect
   await expectNewRunCount(journey, page, Number(expectedText));
 });
 
-Then("the receiver Task ends as {string} within {int} min", async ({ journey, page }, phase, minutes) => {
+Then("the receiver Task ends as {string} within {int} min", async ({ journey }, phase, minutes) => {
   expect(journey.receiverNewRuns).toHaveLength(1);
   const taskUid = journey.receiverNewRuns[0].taskUid;
   let run;
   await expect.poll(async () => {
-    const response = await page.request.get(`${targetOrigin()}/admin/api/v1/runs/${encodeURIComponent(taskUid)}`);
-    expect(response.ok(), "the receiver-created Task should remain visible to an administrator").toBeTruthy();
+    const response = await adminRequest(journey.adminConfig, `/admin/api/v1/runs/${encodeURIComponent(taskUid)}`);
+    expect(response.ok, "the receiver-created Task should remain visible to an administrator").toBeTruthy();
     run = (await response.json()).run;
     return `${run.phase}:${run.finalized === true}`;
   }, {

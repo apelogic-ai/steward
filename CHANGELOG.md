@@ -41,6 +41,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Caller journeys now use a protected short-lived administrator token for Run checks, so Jenkins,
+  Temporal, and Jira acceptance can run without a person's browser session or putting the bearer
+  in Playwright traces.
 - Steward binaries now select their shared TLS crypto provider before constructing clients or
   servers, preventing the Jira receiver from panicking during startup.
 - The Helm chart now renders every Jira receiver numeric environment setting as decimal digits,

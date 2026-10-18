@@ -171,12 +171,14 @@ cargo xtask journeys --tags @needs-jira
 
 ### Service callers
 
-J12 calls the exchange, Run API and receiver endpoints directly. It still uses the signed-in
-administrator storage state to prove that a refusal or replay created no extra Task. Configure
+J12 calls the exchange, Run API and receiver endpoints directly. It uses a short-lived
+administrator bearer to prove that a refusal or replay created no extra Task; it does not need a
+signed-in browser storage state. Its administrator HTTP calls stay outside Playwright. Configure
 these non-secret values for the target installation:
 
 | Variable | Value |
 |---|---|
+| `STEWARD_JOURNEY_ADMIN_TOKEN_FILE` | Absolute path outside the repository to a mode-`0600` file containing one short-lived Steward administrator bearer. The runner resolves symlinks, reads the file again for every administrator request and never sends it through Playwright. |
 | `STEWARD_JOURNEY_JENKINS_EXCHANGE_URL` | Exact generic OIDC exchange URL ending in `/v1/oidc/exchange`. |
 | `STEWARD_JOURNEY_JENKINS_WORKFLOW` | Versioned Workflow bound to the Jenkins service, such as `release-summary@1`. |
 | `STEWARD_JOURNEY_TEMPORAL_EXCHANGE_URL` | Exact workload exchange URL ending in `/v1/workload/exchange`. |
@@ -196,6 +198,10 @@ again for every exchange and never reports its output. Configure
 `STEWARD_JOURNEY_UNBOUND_SOURCE_HELPER`. Put the Jira signing secrets in credential files outside
 the repository and set `STEWARD_JOURNEY_JIRA_SIGNING_SECRET_FILE` and
 `STEWARD_JOURNEY_JIRA_WRITE_SIGNING_SECRET_FILE` to their absolute paths.
+
+For `@callers` and `@callers and not @live-jira-webhook`, the runner does not require
+`STEWARD_JOURNEY_STORAGE_STATE`, `STEWARD_JOURNEY_REPOSITORY`, or
+`STEWARD_JOURNEY_MEMBER_ROLE`. Other journey selections still require all three browser inputs.
 
 The read-only Trigger must have a per-issue cooldown of at least 60 seconds and the receiver must
 retain at least four issue reservations. Those bounds keep the second same-issue delivery inside
