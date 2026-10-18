@@ -731,6 +731,79 @@ struct BrowserApplicationConfig {
     managed_inference_cipher: Option<ManagedInferenceKeyCipher>,
 }
 
+fn configured_browser_user_tokens() -> Result<Option<google_oidc::UserTokenConfig>, io::Error> {
+    parse_browser_user_token_config(
+        optional_unicode_environment("STEWARD_USER_TOKEN_API_AUDIENCE")?,
+        optional_unicode_environment("STEWARD_USER_TOKEN_PORTAL_AUDIENCE")?,
+        optional_unicode_environment("STEWARD_USER_TOKEN_PORTAL_AUDIENCE_ENABLED")?,
+        optional_unicode_environment("STEWARD_USER_TOKEN_FRONTEND_CLIENT_IDS")?,
+        optional_unicode_environment("STEWARD_USER_TOKEN_MAX_AGE_SECONDS")?,
+    )
+}
+
+fn parse_browser_user_token_config(
+    api_audience: Option<String>,
+    portal_audience: Option<String>,
+    portal_audience_enabled: Option<String>,
+    frontend_client_ids_json: Option<String>,
+    maximum_token_age_seconds: Option<String>,
+) -> Result<Option<google_oidc::UserTokenConfig>, io::Error> {
+    let api_audience = api_audience.unwrap_or_default();
+    let portal_audience = portal_audience.unwrap_or_default();
+    let portal_audience_enabled = match portal_audience_enabled.as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        _ => {
+            return Err(io::Error::other(
+                "STEWARD_USER_TOKEN_PORTAL_AUDIENCE_ENABLED must be true or false",
+            ));
+        }
+    };
+    let frontend_client_ids: Vec<String> = serde_json::from_str(
+        frontend_client_ids_json.as_deref().unwrap_or("[]"),
+    )
+    .map_err(|_| {
+        io::Error::other("STEWARD_USER_TOKEN_FRONTEND_CLIENT_IDS must be a JSON string array")
+    })?;
+    let maximum_was_configured = maximum_token_age_seconds.is_some();
+    let maximum_token_age_seconds = maximum_token_age_seconds
+        .as_deref()
+        .unwrap_or("300")
+        .parse::<u64>()
+        .map_err(|_| {
+            io::Error::other("STEWARD_USER_TOKEN_MAX_AGE_SECONDS must be a positive integer")
+        })?;
+    if api_audience.is_empty() {
+        if !portal_audience.is_empty()
+            || portal_audience_enabled
+            || !frontend_client_ids.is_empty()
+            || (maximum_was_configured && maximum_token_age_seconds != 300)
+        {
+            return Err(io::Error::other(
+                "user token configuration requires the HyperShell API audience",
+            ));
+        }
+        return Ok(None);
+    }
+    let portal_audience = match (portal_audience_enabled, portal_audience.is_empty()) {
+        (true, false) => Some(portal_audience),
+        (false, true) => None,
+        _ => {
+            return Err(io::Error::other(
+                "the portal audience must be non-empty exactly when its opt-in is enabled",
+            ));
+        }
+    };
+    google_oidc::UserTokenConfig::new(
+        api_audience,
+        portal_audience,
+        frontend_client_ids,
+        maximum_token_age_seconds,
+    )
+    .map(Some)
+    .map_err(io::Error::other)
+}
+
 async fn browser_application_router(
     store: PgStore,
     runtimes: KubeRuntimeRepository,
@@ -811,12 +884,19 @@ async fn browser_application_router(
         required("STEWARD_GOOGLE_OIDC_CLIENT_SECRET")?,
     )
     .map_err(io::Error::other)?;
-    let auth = browser_auth::BrowserAuthService::google(
+    let user_tokens = configured_browser_user_tokens()?;
+    let mut auth = browser_auth::BrowserAuthService::google(
         config,
-        Arc::new(provider),
+        Arc::new(provider.clone()),
         Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
     )
     .map_err(io::Error::other)?;
+    if let Some(user_tokens) = user_tokens {
+        auth = auth.with_user_token_verifier(Arc::new(google_oidc::GoogleUserTokenVerifier::new(
+            provider,
+            user_tokens,
+        )));
+    }
     let connections = governed_connections_configuration(
         &origin,
         store.clone(),
@@ -1911,9 +1991,9 @@ mod tests {
         custom_envelope_safety_ceiling_startup_warning, decode_tls_material,
         default_template_threshold_is_rollback_compatible, format_effective_access_human,
         github_source_adapter_from_values, kubernetes_token_review_audience, operator_exit_code,
-        parse_execution_bindings_mode, parse_inference_mode, parse_template_document,
-        rustls_crypto_provider, stable_bridge_configuration_from_values, templates_command,
-        validate_execution_bindings, with_claude_code_execution_adapter,
+        parse_browser_user_token_config, parse_execution_bindings_mode, parse_inference_mode,
+        parse_template_document, rustls_crypto_provider, stable_bridge_configuration_from_values,
+        templates_command, validate_execution_bindings, with_claude_code_execution_adapter,
     };
 
     static NEXT_PREFLIGHT_CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -1953,6 +2033,66 @@ mod tests {
             Some(steward_types::InferenceMode::Managed),
             "the apiserver must admit managed mode once Mint can resolve stored credentials"
         );
+    }
+
+    #[test]
+    fn user_token_startup_configuration_is_disabled_by_default_and_refuses_partial_portal_opt_in()
+    -> Result<(), String> {
+        assert!(
+            parse_browser_user_token_config(None, None, None, None, None)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            parse_browser_user_token_config(
+                Some(String::new()),
+                Some(String::new()),
+                Some("false".to_owned()),
+                Some("[]".to_owned()),
+                Some("300".to_owned()),
+            )
+            .map_err(|error| error.to_string())?
+            .is_none()
+        );
+        assert!(
+            parse_browser_user_token_config(
+                Some("steward-api".to_owned()),
+                None,
+                Some("false".to_owned()),
+                Some("[\"portal-client\"]".to_owned()),
+                Some("600".to_owned()),
+            )
+            .map_err(|error| error.to_string())?
+            .is_some()
+        );
+        for (portal_audience, enabled) in [
+            (Some("portal-audience".to_owned()), Some("false".to_owned())),
+            (None, Some("true".to_owned())),
+        ] {
+            assert!(
+                parse_browser_user_token_config(
+                    Some("steward-api".to_owned()),
+                    portal_audience,
+                    enabled,
+                    Some("[\"portal-client\"]".to_owned()),
+                    Some("600".to_owned()),
+                )
+                .is_err(),
+                "portal audience and opt-in must be configured together"
+            );
+        }
+        assert!(
+            parse_browser_user_token_config(
+                Some(String::new()),
+                None,
+                None,
+                Some("[\"portal-client\"]".to_owned()),
+                None,
+            )
+            .is_err(),
+            "client allowlists cannot silently enable without the API audience"
+        );
+        Ok(())
     }
 
     #[test]

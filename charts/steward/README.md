@@ -352,6 +352,14 @@ Google's endpoints evolve. A local isolated lane may instead set
 `networkPolicy.enabled=false`; that is not a substitute for a production
 egress policy.
 
+Headless user-token acceptance is optional and disabled by default under
+`browserAuth.google.userTokens`. Enabling it requires a nonempty
+`hyperShellAudience`, at least one `frontendClientIds` entry, and a positive
+`maximumTokenAgeSeconds` no greater than 86,400. To accept the portal's own audience, set both a
+nonempty `portalAudience` and `acceptPortalAudience=true`; either value without the other is
+rejected. These access tokens authenticate only `/app/api/v1/*` and reuse the same canonical-user
+and local-RBAC rules as browser login. They do not grant access to administrator routes.
+
 ## Direct package source resolution
 
 `githubSource` defaults to disabled. Enabling it is an atomic apiserver-only

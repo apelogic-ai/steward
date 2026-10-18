@@ -9,6 +9,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- Optional headless user access accepts a customer's Google OIDC access token on
+  `/app/api/v1/*` when the HyperShell audience, frontend client IDs, and maximum token age are
+  configured. The portal audience is a separate opt-in. Tokens reuse canonical users and local
+  RBAC, never grant administrator-route access, and record the issuer and frontend client ID
+  without recording the token.
 - Added a Jira webhook Trigger operator guide covering exact-path exposure, signing Secrets,
   read-only Envelope checks, filters, run limits, cooldowns, response meanings, optional issue
   links, and the pending deployment acceptance evidence.

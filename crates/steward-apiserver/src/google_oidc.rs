@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -13,13 +14,16 @@ use serde::Deserialize;
 
 use crate::browser_auth::{
     BrowserAuthFailure, BrowserAuthorizationRequest, BrowserFuture, BrowserOidcProvider,
-    GoogleOidcConfig, VerifiedOrganizationClaims,
+    BrowserUserTokenVerifier, GoogleOidcConfig, VerifiedOrganizationClaims,
+    VerifiedUserTokenClaims,
 };
 
 const MAX_ID_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_DISCOVERY_BYTES: usize = 32 * 1024;
 const MAX_JWKS_BYTES: usize = 128 * 1024;
 const MAX_TOKEN_RESPONSE_BYTES: usize = 32 * 1024;
+const MAX_USER_TOKEN_AGE_SECONDS: u64 = 86_400;
+const MAX_USER_TOKEN_CLIENTS: usize = 32;
 const CLOCK_SKEW_SECONDS: u64 = 60;
 const MAX_TOKEN_AGE_SECONDS: u64 = 300;
 const DEFAULT_CACHE_SECONDS: u64 = 300;
@@ -53,6 +57,87 @@ struct IdTokenClaims {
     hd: String,
     #[serde(default)]
     name: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+struct UserTokenClaims {
+    iss: String,
+    sub: String,
+    aud: Audience,
+    #[serde(default)]
+    azp: Option<String>,
+    #[serde(default)]
+    client_id: Option<String>,
+    exp: u64,
+    iat: u64,
+    #[serde(default)]
+    nbf: Option<u64>,
+    email: String,
+    email_verified: bool,
+    hd: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct UserTokenConfig {
+    api_audience: String,
+    portal_audience: Option<String>,
+    frontend_client_ids: BTreeSet<String>,
+    maximum_token_age_seconds: u64,
+}
+
+impl UserTokenConfig {
+    pub fn new(
+        api_audience: String,
+        portal_audience: Option<String>,
+        frontend_client_ids: Vec<String>,
+        maximum_token_age_seconds: u64,
+    ) -> Result<Self, String> {
+        let valid_value = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 512
+                && value.is_ascii()
+                && !value.bytes().any(|byte| byte.is_ascii_whitespace())
+        };
+        if !valid_value(&api_audience)
+            || portal_audience
+                .as_deref()
+                .is_some_and(|value| !valid_value(value))
+            || frontend_client_ids.is_empty()
+            || frontend_client_ids.len() > MAX_USER_TOKEN_CLIENTS
+            || maximum_token_age_seconds == 0
+            || maximum_token_age_seconds > MAX_USER_TOKEN_AGE_SECONDS
+        {
+            return Err("user token configuration is invalid".to_owned());
+        }
+        let requested_client_count = frontend_client_ids.len();
+        let frontend_client_ids = frontend_client_ids.into_iter().collect::<BTreeSet<_>>();
+        if frontend_client_ids.len() != requested_client_count
+            || frontend_client_ids.len() > MAX_USER_TOKEN_CLIENTS
+            || frontend_client_ids.iter().any(|value| !valid_value(value))
+        {
+            return Err("user token configuration is invalid".to_owned());
+        }
+        Ok(Self {
+            api_audience,
+            portal_audience,
+            frontend_client_ids,
+            maximum_token_age_seconds,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct GoogleUserTokenVerifier {
+    provider: GoogleOidcProvider,
+    config: UserTokenConfig,
+}
+
+impl GoogleUserTokenVerifier {
+    pub fn new(provider: GoogleOidcProvider, config: UserTokenConfig) -> Self {
+        Self { provider, config }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,6 +275,117 @@ fn validate_claims(
         display_name: claims.name.map(|name| name.trim().to_owned()),
         nonce: claims.nonce,
     })
+}
+
+fn validate_user_token_claims(
+    claims: UserTokenClaims,
+    config: &UserTokenConfig,
+    now: u64,
+) -> Result<VerifiedUserTokenClaims, IdTokenError> {
+    let valid_value = |value: &str, maximum: usize| {
+        !value.is_empty()
+            && value.len() <= maximum
+            && value.is_ascii()
+            && !value.bytes().any(|byte| byte.is_ascii_whitespace())
+    };
+    let audience_matches = match &claims.aud {
+        Audience::Single(audience) => {
+            valid_value(audience, 512)
+                && (audience == &config.api_audience
+                    || config.portal_audience.as_ref() == Some(audience))
+        }
+        Audience::Multiple(audiences) => {
+            !audiences.is_empty()
+                && audiences.len() <= 16
+                && audiences.iter().all(|audience| valid_value(audience, 512))
+                && audiences.iter().any(|audience| {
+                    audience == &config.api_audience
+                        || config.portal_audience.as_ref() == Some(audience)
+                })
+        }
+    };
+    let frontend_client_id = match (&claims.azp, &claims.client_id) {
+        (Some(azp), Some(client_id)) if azp == client_id => azp,
+        (Some(azp), None) => azp,
+        (None, Some(client_id)) => client_id,
+        _ => return Err(IdTokenError::InvalidClaims),
+    };
+    let subject_is_bounded = valid_value(&claims.sub, 255);
+    let email_is_bounded = !claims.email.is_empty() && claims.email.len() <= 320;
+    let hosted_domain_is_bounded = valid_value(&claims.hd, 253);
+    let display_name_is_bounded = claims.name.as_ref().is_none_or(|name| {
+        let trimmed = name.trim();
+        !trimmed.is_empty() && trimmed.len() <= 256 && !trimmed.chars().any(char::is_control)
+    });
+    let expiration_is_valid = claims.exp > claims.iat && claims.exp > now;
+    let issued_at_is_valid = claims.iat <= now.saturating_add(CLOCK_SKEW_SECONDS)
+        && now <= claims.iat.saturating_add(config.maximum_token_age_seconds);
+    let not_before_is_valid = claims.nbf.is_none_or(|not_before| not_before <= now);
+    if claims.iss != steward_types::GOOGLE_ORGANIZATION_ISSUER
+        || !audience_matches
+        || !config.frontend_client_ids.contains(frontend_client_id)
+        || !valid_value(frontend_client_id, 512)
+        || !expiration_is_valid
+        || !issued_at_is_valid
+        || !not_before_is_valid
+        || !subject_is_bounded
+        || !email_is_bounded
+        || !hosted_domain_is_bounded
+        || !display_name_is_bounded
+        || !claims.email_verified
+    {
+        return Err(IdTokenError::InvalidClaims);
+    }
+    Ok(VerifiedUserTokenClaims {
+        issuer: claims.iss,
+        subject: claims.sub,
+        hosted_domain: claims.hd,
+        email: claims.email,
+        email_verified: claims.email_verified,
+        display_name: claims.name.map(|name| name.trim().to_owned()),
+        frontend_client_id: frontend_client_id.to_owned(),
+    })
+}
+
+fn verify_user_token(
+    token: &str,
+    jwks: &JwkSet,
+    config: &UserTokenConfig,
+    now: u64,
+) -> Result<VerifiedUserTokenClaims, IdTokenError> {
+    if token.is_empty() || token.len() > MAX_ID_TOKEN_BYTES {
+        return Err(IdTokenError::Malformed);
+    }
+    let header = decode_header(token).map_err(|_| IdTokenError::Malformed)?;
+    if header.alg != Algorithm::RS256
+        || header.jku.is_some()
+        || header.jwk.is_some()
+        || header.x5u.is_some()
+        || header.x5c.is_some()
+        || header.x5t.is_some()
+        || header.x5t_s256.is_some()
+        || header.crit.is_some()
+    {
+        return Err(IdTokenError::ForbiddenHeader);
+    }
+    let kid = header.kid.ok_or(IdTokenError::MissingKeyId)?;
+    if kid.is_empty() || kid.len() > 128 || !kid.is_ascii() {
+        return Err(IdTokenError::MissingKeyId);
+    }
+    let key = select_verification_key(jwks, &kid)?;
+    let decoding_key = DecodingKey::from_jwk(key).map_err(|_| IdTokenError::InvalidKey)?;
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.required_spec_claims.clear();
+    validation.validate_exp = false;
+    validation.validate_aud = false;
+    let token = decode::<UserTokenClaims>(token, &decoding_key, &validation).map_err(|error| {
+        if matches!(error.kind(), ErrorKind::InvalidSignature) {
+            IdTokenError::InvalidSignature
+        } else {
+            IdTokenError::Malformed
+        }
+    })?;
+    validate_user_token_claims(token.claims, config, now)
 }
 
 fn map_id_token_error(_error: IdTokenError) -> BrowserAuthFailure {
@@ -520,6 +716,25 @@ impl GoogleOidcProvider {
         Self::from_parts(config, client_secret, transport, Arc::new(now))
     }
 
+    async fn jwks_for_token(&self, token: &str) -> Result<JwkSet, BrowserAuthFailure> {
+        let header = decode_header(token).map_err(|_| BrowserAuthFailure::InvalidIdentity)?;
+        let kid = header
+            .kid
+            .filter(|kid| !kid.is_empty() && kid.len() <= 128 && kid.is_ascii())
+            .ok_or(BrowserAuthFailure::InvalidIdentity)?;
+        let jwks = self.jwks(None).await?;
+        let generation = self
+            .cache
+            .lock()
+            .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?
+            .jwks_generation;
+        match select_verification_key(&jwks, &kid) {
+            Ok(_) => Ok(jwks),
+            Err(IdTokenError::UnknownKeyId) => self.jwks(Some(generation)).await,
+            Err(error) => Err(map_id_token_error(error)),
+        }
+    }
+
     async fn discovery(&self) -> Result<DiscoveryDocument, BrowserAuthFailure> {
         let now = (self.now)();
         if let Some(document) = self
@@ -678,6 +893,19 @@ impl GoogleOidcProvider {
     }
 }
 
+impl BrowserUserTokenVerifier for GoogleUserTokenVerifier {
+    fn verify<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> BrowserFuture<'a, Result<VerifiedUserTokenClaims, BrowserAuthFailure>> {
+        Box::pin(async move {
+            let jwks = self.provider.jwks_for_token(token).await?;
+            verify_user_token(token, &jwks, &self.config, (self.provider.now)())
+                .map_err(map_id_token_error)
+        })
+    }
+}
+
 impl BrowserOidcProvider for GoogleOidcProvider {
     fn authorization_url(
         &self,
@@ -735,23 +963,7 @@ impl BrowserOidcProvider for GoogleOidcProvider {
             if token.id_token.is_empty() || token.id_token.len() > MAX_ID_TOKEN_BYTES {
                 return Err(BrowserAuthFailure::InvalidIdentity);
             }
-            let header =
-                decode_header(&token.id_token).map_err(|_| BrowserAuthFailure::InvalidIdentity)?;
-            let kid = header
-                .kid
-                .filter(|kid| !kid.is_empty() && kid.len() <= 128 && kid.is_ascii())
-                .ok_or(BrowserAuthFailure::InvalidIdentity)?;
-            let jwks = self.jwks(None).await?;
-            let generation = self
-                .cache
-                .lock()
-                .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?
-                .jwks_generation;
-            let jwks = match select_verification_key(&jwks, &kid) {
-                Ok(_) => jwks,
-                Err(IdTokenError::UnknownKeyId) => self.jwks(Some(generation)).await?,
-                Err(error) => return Err(map_id_token_error(error)),
-            };
+            let jwks = self.jwks_for_token(&token.id_token).await?;
             verify_id_token(
                 &token.id_token,
                 &jwks,
@@ -832,13 +1044,16 @@ mod tests {
 
     use jsonwebtoken::jwk::JwkSet;
 
-    use crate::browser_auth::{BrowserAuthFailure, BrowserOidcProvider, GoogleOidcConfig};
+    use crate::browser_auth::{
+        BrowserAuthFailure, BrowserOidcProvider, BrowserUserTokenVerifier, GoogleOidcConfig,
+    };
     use steward_types::OrganizationId;
 
     use super::{
         Audience, Cached, DiscoveryDocument, GoogleClientSecret, GoogleHttpTransport,
-        GoogleOidcProvider, HttpFailure, HttpFuture, HttpResponse, IdTokenClaims, IdTokenError,
-        JWKS_REFRESH_FAILURE_BACKOFF_SECONDS, TokenExchangeRequest, cache_ttl, validate_claims,
+        GoogleOidcProvider, GoogleUserTokenVerifier, HttpFailure, HttpFuture, HttpResponse,
+        IdTokenClaims, IdTokenError, JWKS_REFRESH_FAILURE_BACKOFF_SECONDS, TokenExchangeRequest,
+        UserTokenClaims, UserTokenConfig, cache_ttl, validate_claims, validate_user_token_claims,
         verify_id_token,
     };
 
@@ -1568,6 +1783,130 @@ mod tests {
         let mut valid_without_azp = fixture_claims();
         valid_without_azp.azp = None;
         assert!(check(valid_without_azp).is_ok());
+    }
+
+    fn fixture_user_token_claims() -> UserTokenClaims {
+        UserTokenClaims {
+            iss: "https://accounts.google.com".to_owned(),
+            sub: "fixture-subject".to_owned(),
+            aud: Audience::Single("steward-api".to_owned()),
+            azp: Some("portal-client".to_owned()),
+            client_id: None,
+            exp: 2_000,
+            iat: 1_000,
+            nbf: Some(1_000),
+            email: "alice@example.com".to_owned(),
+            email_verified: true,
+            hd: "example.com".to_owned(),
+            name: Some("Alice Example".to_owned()),
+        }
+    }
+
+    #[test]
+    fn user_token_claims_refuse_wrong_issuer_audience_expiry_and_disabled_portal_audience()
+    -> Result<(), String> {
+        let config = UserTokenConfig::new(
+            "steward-api".to_owned(),
+            None,
+            vec!["portal-client".to_owned()],
+            300,
+        )?;
+        let verified = validate_user_token_claims(fixture_user_token_claims(), &config, 1_100)
+            .map_err(|error| format!("verify user token fixture: {error:?}"))?;
+        assert_eq!(verified.frontend_client_id, "portal-client");
+
+        let mut cases = Vec::new();
+        let mut claims = fixture_user_token_claims();
+        claims.iss = "https://issuer.example.test".to_owned();
+        cases.push(claims);
+        let mut claims = fixture_user_token_claims();
+        claims.aud = Audience::Single("other-api".to_owned());
+        cases.push(claims);
+        let mut claims = fixture_user_token_claims();
+        claims.exp = 1_100;
+        cases.push(claims);
+        let mut claims = fixture_user_token_claims();
+        claims.iat = 799;
+        cases.push(claims);
+        let mut claims = fixture_user_token_claims();
+        claims.aud = Audience::Single("portal-audience".to_owned());
+        cases.push(claims);
+        let mut claims = fixture_user_token_claims();
+        claims.azp = Some("other-client".to_owned());
+        cases.push(claims);
+        let mut claims = fixture_user_token_claims();
+        claims.nbf = Some(1_101);
+        cases.push(claims);
+        let mut claims = fixture_user_token_claims();
+        claims.sub.clear();
+        cases.push(claims);
+        for claims in cases {
+            assert!(matches!(
+                validate_user_token_claims(claims, &config, 1_100),
+                Err(IdTokenError::InvalidClaims)
+            ));
+        }
+
+        let portal_config = UserTokenConfig::new(
+            "steward-api".to_owned(),
+            Some("portal-audience".to_owned()),
+            vec!["portal-client".to_owned()],
+            300,
+        )?;
+        let mut portal_claims = fixture_user_token_claims();
+        portal_claims.aud = Audience::Single("portal-audience".to_owned());
+        assert!(validate_user_token_claims(portal_claims, &portal_config, 1_100).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn signed_user_token_reuses_cached_jwks_and_refuses_bad_signature_and_unknown_key()
+    -> Result<(), String> {
+        let transport = Arc::new(FixtureTransport::new(
+            vec![json_response(fixture_jwks_value())?],
+            Vec::new(),
+        ));
+        let provider = GoogleOidcProvider::with_transport(
+            fixture_config()?,
+            "fixture-secret".to_owned(),
+            transport,
+            fixture_now,
+        )?;
+        seed_provider_cache(&provider, fixture_now(), 2_000, 7)?;
+        let verifier = GoogleUserTokenVerifier::new(
+            provider,
+            UserTokenConfig::new(
+                "fixture-client".to_owned(),
+                None,
+                vec!["fixture-client".to_owned()],
+                300,
+            )?,
+        );
+        let verified = verifier
+            .verify(&fixture_token())
+            .await
+            .map_err(|error| format!("verify signed user token: {error:?}"))?;
+        assert_eq!(verified.subject, "fixture-subject");
+
+        let bad_signature = format!(
+            "{FIXTURE_HEADER}.{FIXTURE_PAYLOAD}.A{}",
+            &FIXTURE_SIGNATURE[1..]
+        );
+        assert!(matches!(
+            verifier.verify(&bad_signature).await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ));
+        let unknown_key =
+            token_with_header(serde_json::json!({"alg":"RS256","typ":"JWT","kid":"unknown-key"}))?;
+        assert!(matches!(
+            verifier.verify(&unknown_key).await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ));
+        assert!(matches!(
+            verifier.verify("opaque-token").await,
+            Err(BrowserAuthFailure::InvalidIdentity)
+        ));
+        Ok(())
     }
 
     fn token_with_header(header: serde_json::Value) -> Result<String, String> {

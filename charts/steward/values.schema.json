@@ -350,7 +350,7 @@
         "google": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["clientId", "origin", "workspaceDomain", "organizationId", "clientSecret"],
+          "required": ["clientId", "origin", "workspaceDomain", "organizationId", "clientSecret", "userTokens"],
           "properties": {
             "clientId": {"type": "string"},
             "origin": {"type": "string"},
@@ -364,6 +364,55 @@
                 "name": {"type": "string"},
                 "key": {"type": "string"}
               }
+            },
+            "userTokens": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["hyperShellAudience", "portalAudience", "acceptPortalAudience", "frontendClientIds", "maximumTokenAgeSeconds"],
+              "properties": {
+                "hyperShellAudience": {"type": "string", "maxLength": 512},
+                "portalAudience": {"type": "string", "maxLength": 512},
+                "acceptPortalAudience": {"type": "boolean"},
+                "frontendClientIds": {
+                  "type": "array",
+                  "maxItems": 32,
+                  "uniqueItems": true,
+                  "items": {"type": "string", "minLength": 1, "maxLength": 512, "pattern": "^\\S+$"}
+                },
+                "maximumTokenAgeSeconds": {"type": "integer", "minimum": 1, "maximum": 86400}
+              },
+              "oneOf": [
+                {
+                  "properties": {
+                    "hyperShellAudience": {"const": ""},
+                    "portalAudience": {"const": ""},
+                    "acceptPortalAudience": {"const": false},
+                    "frontendClientIds": {"maxItems": 0},
+                    "maximumTokenAgeSeconds": {"const": 300}
+                  }
+                },
+                {
+                  "required": ["hyperShellAudience", "frontendClientIds"],
+                  "properties": {
+                    "hyperShellAudience": {"type": "string", "minLength": 1, "pattern": "^\\S+$"},
+                    "frontendClientIds": {"minItems": 1}
+                  },
+                  "oneOf": [
+                    {
+                      "properties": {
+                        "acceptPortalAudience": {"const": false},
+                        "portalAudience": {"const": ""}
+                      }
+                    },
+                    {
+                      "properties": {
+                        "acceptPortalAudience": {"const": true},
+                        "portalAudience": {"type": "string", "minLength": 1, "pattern": "^\\S+$"}
+                      }
+                    }
+                  ]
+                }
+              ]
             }
           }
         }
@@ -382,6 +431,15 @@
                   "properties": {
                     "name": {"const": ""},
                     "key": {"const": ""}
+                  }
+                },
+                "userTokens": {
+                  "properties": {
+                    "hyperShellAudience": {"const": ""},
+                    "portalAudience": {"const": ""},
+                    "acceptPortalAudience": {"const": false},
+                    "frontendClientIds": {"maxItems": 0},
+                    "maximumTokenAgeSeconds": {"const": 300}
                   }
                 }
               }

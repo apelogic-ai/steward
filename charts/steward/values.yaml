@@ -159,6 +159,14 @@ browserAuth:
     clientSecret:
       name: ""
       key: ""
+    # Optional headless user-token acceptance reuses this Google issuer, tenant,
+    # canonical-user registration, and RBAC mapping. Empty audience keeps it off.
+    userTokens:
+      hyperShellAudience: ""
+      portalAudience: ""
+      acceptPortalAudience: false
+      frontendClientIds: []
+      maximumTokenAgeSeconds: 300
 workloadExchangeTrust:
   kind: ConfigMap
   name: steward-workload-exchange-ca

@@ -1,8 +1,8 @@
 # Steward browser session contract v1
 
-Status: local callback/session slice plus production Google code exchange and signed ID-token
-verification. Runtime activation remains fail-closed until LBE-235 supplies the Google web-client
-metadata and client secret through the reviewed configuration and secret paths.
+Status: production Google code exchange and signed ID-token verification, with optional headless
+user-token acceptance on the application API. Both paths are disabled unless their reviewed
+configuration and secret inputs are present.
 
 ## Identity boundary
 
@@ -115,6 +115,31 @@ Missing browser authentication returns 401, an authenticated ordinary user retur
 session resolved with the administrator role receives the typed authority. A Kubernetes
 TokenReview bearer cannot satisfy this browser guard, and a browser cookie cannot satisfy the
 separate operator TokenReview boundary.
+
+## Optional headless user access
+
+When `browserAuth.google.userTokens.hyperShellAudience` is nonempty, a native or third-party
+frontend may call only `/app/api/v1/*` with `Authorization: Bearer <access-token>`. Steward verifies
+the token with the same pinned Google discovery and JWKS path used by browser login. It requires
+the exact Google issuer, the configured HyperShell audience, one allowlisted `azp` or `client_id`,
+a verified organization email and hosted domain, a valid signature and key ID, current `exp` and
+`nbf`, and an `iat` within `maximumTokenAgeSeconds`. Opaque tokens fail closed.
+
+The optional portal audience is accepted only when `acceptPortalAudience=true`, a nonempty
+`portalAudience` is configured, and the frontend client ID is allowlisted. It does not replace the
+HyperShell audience or relax the client and age checks. Empty user-token values retain the existing
+cookie-only behavior.
+
+The verified subject is resolved or registered through the same canonical identity resolver as
+browser login. Access still comes only from Steward's local RBAC assignments; token claims do
+not grant administrator or member roles. Each request carries the verified issuer and frontend
+client ID as audit context, while the raw token is never logged or stored. The request binding is a
+SHA-256-derived opaque value and never exposes the token.
+
+A bearer-only mutation does not need browser CSRF proof. If a request also contains a browser
+cookie, the cookie remains subject to the existing origin, fetch-site, content-type, and CSRF
+checks. If cookie and bearer resolve to different people, Steward returns 401. User bearer tokens
+never authenticate `/admin/*`, operator, hook, or direct Task-token routes.
 
 ## Production verifier and activation boundary
 
