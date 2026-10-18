@@ -22,6 +22,8 @@ Prepare all of the following:
 - a deployment capability catalog that classifies every tool in that Envelope
   as `read`;
 - an existing Kubernetes Secret containing the Jira webhook signing secret;
+- the release's immutable `images.triggerReceiver` image, using the
+  `<version>-trigger-receiver` tag and its matching digest;
 - a separate, read-only database credential for Envelope lookup;
 - the workload-exchange and Task API HTTPS trust settings; and
 - an HTTPS Gateway or Ingress route that publishes only the exact Trigger path.
@@ -148,8 +150,8 @@ deployment's existing Jira site setting.
 
 ## Deployment acceptance
 
-**Pending.** Replace this paragraph with the release/build and evidence link
-after a deployed receiver has demonstrated signed delivery (`202`), replay
-without a second Task (`200`), invalid-signature refusal (`401`), run-limit and
-cooldown refusal (`429`), read-only Envelope refusal, exact-path-only exposure,
-and no Jira write-back. This guide does not claim that deployment check has run.
+Local-main deployment acceptance passed on Steward revision `e37e7c54`
+([acceptance evidence](https://github.com/apelogic-ai/steward/issues/524#issuecomment-6246865924)).
+The exact Trigger route refused an unsigned delivery with `401`. A fresh signed
+delivery returned `202` and created exactly one new AgentRuntime. Replaying the
+same signed delivery returned `200` and created no new Task.
