@@ -95,6 +95,7 @@ Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test
 | `@needs-github` | Needs an external repository that the installation allows. |
 | `@needs-jira` | Needs a connected Jira account and the `jira-read` template fixture created after `@smoke` with the same run prefix. |
 | `@callers` | Exercises external caller exchange, Run API and receiver paths in J12. |
+| `@covered-by-process-e2e` | Covered by the named real-process integration test instead of an installation journey. Unlike `@known-failing-*`, it is not waiting for a product fix. |
 | `@live-jira-webhook` | Causes a real Jira event to reach a public receiver. It also requires `@owner-only`. |
 | `@needs-public-ingress` | Requires the target receiver to be reachable from the external service. |
 | `@owner-only` | Runs only after the owner explicitly authorizes that live external action for the current run. |
@@ -188,54 +189,52 @@ these non-secret values for the target installation:
 | `STEWARD_JOURNEY_JIRA_TRIGGER_ID` | That read-only Trigger's configured ID. The local-main acceptance configuration uses `local-read`. |
 | `STEWARD_JOURNEY_JIRA_COOLDOWN_SECONDS` | The read-only Trigger's configured per-issue cooldown in seconds; J12 requires at least `60`. |
 | `STEWARD_JOURNEY_JIRA_MAX_ISSUE_COOLDOWNS` | The receiver's configured issue-reservation capacity; J12 requires at least `4`. |
-| `STEWARD_JOURNEY_JIRA_WRITE_RECEIVER_ORIGIN` | Origin of an already-running receiver whose Trigger Envelope was changed to include write access. |
-| `STEWARD_JOURNEY_JIRA_WRITE_TRIGGER_ID` | That Trigger's configured ID. |
 
 Credential helpers are absolute executable paths outside the repository. Each helper receives no
 arguments and must write only one fresh source assertion to standard output. The runner invokes it
 again for every exchange and never reports its output. Configure
 `STEWARD_JOURNEY_JENKINS_SOURCE_HELPER`, `STEWARD_JOURNEY_TEMPORAL_SOURCE_HELPER`, and
-`STEWARD_JOURNEY_UNBOUND_SOURCE_HELPER`. Put the Jira signing secrets in credential files outside
-the repository and set `STEWARD_JOURNEY_JIRA_SIGNING_SECRET_FILE` and
-`STEWARD_JOURNEY_JIRA_WRITE_SIGNING_SECRET_FILE` to their absolute paths.
+`STEWARD_JOURNEY_UNBOUND_SOURCE_HELPER`. Put the Jira signing secret in a credential file outside
+the repository and set `STEWARD_JOURNEY_JIRA_SIGNING_SECRET_FILE` to its absolute path.
 
-For `@callers` and `@callers and not @live-jira-webhook`, the runner does not require
-`STEWARD_JOURNEY_STORAGE_STATE`, `STEWARD_JOURNEY_REPOSITORY`, or
+For `@callers`, `@callers and not @live-jira-webhook`, and the two selectors shown below, the runner
+does not require `STEWARD_JOURNEY_STORAGE_STATE`, `STEWARD_JOURNEY_REPOSITORY`, or
 `STEWARD_JOURNEY_MEMBER_ROLE`. Other journey selections still require all three browser inputs.
 
 The read-only Trigger must have a per-issue cooldown of at least 60 seconds and the receiver must
 retain at least four issue reservations. Those bounds keep the second same-issue delivery inside
 the cooldown while leaving room for both earlier accepted deliveries and the optional live case.
 
-The write-capable refusal uses a separate receiver so its deliberately unsafe state cannot affect
-`local-read`. Start that receiver and its Trigger against a read-only Envelope, wait for readiness,
-then change only its isolated capability-catalog copy so one of that Envelope's grants is classified
-as write-capable. Keep the receiver running: it rechecks the Envelope and current catalog on the
-request and must return the read-only refusal. Restore or remove this acceptance-only fixture during
-teardown. A receiver configured with unsafe authority at startup is not a valid fixture because it
-must fail closed before serving.
+The write-capable refusal stays out of local-main because constructing its deliberately unsafe
+receiver there would weaken the shared test installation. The real-process integration test at
+`bins/steward-trigger-receiver/tests/write_catalog_process.rs` covers both enforcement points: a
+running receiver refuses the next signed delivery after a catalog grant becomes write-capable, and
+a fresh receiver refuses to start with that unsafe catalog. Both paths use the real receiver and
+TLS-required PostgreSQL and assert that no Task is created.
 
 Once apelogic-ai/gitops#272 lands, local-main uses the `local-read` Trigger and its exact edge route
-for `STEWARD_JOURNEY_JIRA_RECEIVER_ORIGIN`, plus the isolated runtime-revalidation fixture above.
-All direct signed-payload and refusal paths run with one command:
+for `STEWARD_JOURNEY_JIRA_RECEIVER_ORIGIN`. All remaining direct signed-payload and refusal paths
+run with one command:
 
 ```console
-cargo xtask journeys --tags '@callers and not @live-jira-webhook'
+cargo xtask journeys --tags '@callers and not @live-jira-webhook and not @covered-by-process-e2e'
 ```
 
 The direct receiver assertions follow its public response contract: `202` means one Task was
 accepted, `200` means a replay or filtered event needed no run, `401` means the signature was
 missing or invalid, and `429` means the Trigger's concurrency or cooldown limit refused the
-delivery. The write-capable Envelope probe expects the receiver's `400` read-only refusal.
+delivery. The process integration test asserts the write-capable Envelope's exact `400` read-only
+refusal separately.
 
 The live Jira path additionally requires a public receiver, an owner instruction for the current
 run, `STEWARD_JOURNEY_ALLOW_LIVE_JIRA_WEBHOOK=$STEWARD_JOURNEY_RUN_PREFIX`, the exact neutral issue key in
 `STEWARD_JOURNEY_LIVE_JIRA_ISSUE_KEY`, and an absolute no-argument
 `STEWARD_JOURNEY_LIVE_JIRA_HELPER`. The helper performs the already-configured Jira action and its
-output is discarded. With those safeguards in place, the complete caller set remains one command:
+output is discarded. With those safeguards in place, the installation caller set remains one
+command; the real-process integration test continues to cover write-capable refusal separately:
 
 ```console
-cargo xtask journeys --tags @callers
+cargo xtask journeys --tags '@callers and not @covered-by-process-e2e'
 ```
 
 The extended fixture authors run-prefixed `basic` and `broad` templates through the real admin API
