@@ -4,7 +4,28 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rendered="$(mktemp)"
 missing_namespace_error="$(mktemp)"
-trap 'rm -f "${rendered}" "${missing_namespace_error}"' EXIT
+receiver_startup_config="$(mktemp)"
+receiver_startup_output="$(mktemp)"
+receiver_stub_port="$(mktemp)"
+receiver_stub_kubeconfig="$(mktemp)"
+receiver_stub_pid=""
+receiver_process_pid=""
+cleanup() {
+  status="$?"
+  trap - EXIT INT TERM
+  if [[ -n "${receiver_process_pid}" ]]; then
+    kill "${receiver_process_pid}" 2>/dev/null || true
+    wait "${receiver_process_pid}" 2>/dev/null || true
+  fi
+  if [[ -n "${receiver_stub_pid}" ]]; then
+    kill "${receiver_stub_pid}" 2>/dev/null || true
+    wait "${receiver_stub_pid}" 2>/dev/null || true
+  fi
+  rm -f "${rendered}" "${missing_namespace_error}" "${receiver_startup_config}" \
+    "${receiver_startup_output}" "${receiver_stub_port}" "${receiver_stub_kubeconfig}"
+  exit "${status}"
+}
+trap cleanup EXIT INT TERM
 
 customer_images=(
   --set-string images.repository=registry.example.test/customer/steward
@@ -164,6 +185,150 @@ assert_receiver_numeric_environment() {
       tests::chart_rendered_environment_is_parseable -- --exact
 }
 assert_receiver_numeric_environment
+
+assert_receiver_startup() {
+  local settings='{}' name value status=0 stub_port
+  local -a startup_environment=()
+  for name in "${receiver_numeric_env_names[@]}"; do
+    value="$(inline_env_value "${name}")"
+    settings="$(jq -c --arg name "${name}" --arg value "${value}" \
+      '. + {($name): $value}' <<< "${settings}")"
+  done
+  while IFS=$'\t' read -r name value; do
+    startup_environment+=("${name}=${value}")
+  done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' <<< "${settings}")
+  jq '.triggers |= map(.enabled = false)' <<< "${receiver_config}" > "${receiver_startup_config}"
+
+  python3 -c '
+import socket
+import struct
+import time
+
+def receive_exact(connection, length):
+    value = b""
+    while len(value) < length:
+        chunk = connection.recv(length - len(value))
+        if not chunk:
+            return value
+        value += chunk
+    return value
+
+with socket.socket() as server:
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    print(server.getsockname()[1], flush=True)
+    connection, _ = server.accept()
+    with connection:
+        startup_length = receive_exact(connection, 4)
+        if len(startup_length) == 4:
+            receive_exact(connection, struct.unpack("!I", startup_length)[0] - 4)
+            connection.sendall(b"R" + struct.pack("!II", 8, 0))
+            connection.sendall(b"K" + struct.pack("!III", 12, 1, 1))
+            connection.sendall(b"Z" + struct.pack("!I", 5) + b"I")
+        time.sleep(10)
+' > "${receiver_stub_port}" &
+  receiver_stub_pid="$!"
+  for _ in {1..50}; do
+    [[ -s "${receiver_stub_port}" ]] && break
+    sleep 0.1
+  done
+  if [[ ! -s "${receiver_stub_port}" ]]; then
+    echo 'receiver startup database stub did not publish its port' >&2
+    return 1
+  fi
+  stub_port="$(cat "${receiver_stub_port}")"
+  cat > "${receiver_stub_kubeconfig}" <<'EOF'
+apiVersion: v1
+kind: Config
+clusters:
+  - name: synthetic
+    cluster:
+      server: https://127.0.0.1:1
+      insecure-skip-tls-verify: true
+contexts:
+  - name: synthetic
+    context:
+      cluster: synthetic
+      user: synthetic
+current-context: synthetic
+users:
+  - name: synthetic
+    user:
+      token: synthetic-token
+EOF
+
+  cargo build --quiet --locked --package steward-trigger-receiver --bin steward-trigger-receiver
+  env -i \
+    PATH="${PATH}" \
+    CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}" \
+    HOME="${HOME}" \
+    KUBECONFIG="${receiver_stub_kubeconfig}" \
+    "${startup_environment[@]}" \
+    STEWARD_TRIGGER_CONFIG_FILE="${receiver_startup_config}" \
+    STEWARD_CAPABILITY_CATALOG_FILE="${rendered}" \
+    STEWARD_DATABASE_URL="postgresql://steward@127.0.0.1:${stub_port}/steward?sslmode=disable" \
+    STEWARD_TRIGGER_NAMESPACE=steward-test \
+    STEWARD_TRIGGER_SERVICE_ACCOUNT=steward-trigger-receiver \
+    STEWARD_TRIGGER_BIND=127.0.0.1:0 \
+    STEWARD_WORKLOAD_SOURCE_AUDIENCE=steward-workload-exchange \
+    STEWARD_WORKLOAD_EXCHANGE_ENDPOINT=https://exchange.example.test:1/v1/workload/exchange \
+    STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME=exchange.example.test \
+    STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE="${rendered}" \
+    STEWARD_API_ORIGIN=https://steward.example.test:1 \
+    STEWARD_API_SERVER_NAME=steward.example.test \
+    STEWARD_API_CA_CERTIFICATE_FILE="${rendered}" \
+    "${root}/target/debug/steward-trigger-receiver" \
+      > "${receiver_startup_output}" 2>&1 &
+  receiver_process_pid="$!"
+  local completed=0
+  for _ in {1..200}; do
+    if ! kill -0 "${receiver_process_pid}" 2>/dev/null; then
+      completed=1
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ "${completed}" == 0 ]]; then
+    kill "${receiver_process_pid}" 2>/dev/null || true
+    wait "${receiver_process_pid}" 2>/dev/null || true
+    receiver_process_pid=""
+    echo 'receiver startup exceeded its deadline' >&2
+    return 1
+  fi
+  if wait "${receiver_process_pid}"; then
+    status=0
+  else
+    status="$?"
+  fi
+  receiver_process_pid=""
+  kill "${receiver_stub_pid}" 2>/dev/null || true
+  wait "${receiver_stub_pid}" 2>/dev/null || true
+  receiver_stub_pid=""
+  if [[ "${status}" == 0 ]]; then
+    echo 'receiver startup unexpectedly connected to its loopback database stub' >&2
+    return 1
+  fi
+  if grep -Fq 'Could not automatically determine the process-level CryptoProvider' \
+    "${receiver_startup_output}"
+  then
+    echo 'receiver startup did not install the Rustls crypto provider' >&2
+    cat "${receiver_startup_output}" >&2
+    return 1
+  fi
+  if grep -Eq "panicked at|thread '[^']+' panicked" "${receiver_startup_output}"; then
+    echo 'receiver panicked during startup' >&2
+    cat "${receiver_startup_output}" >&2
+    return 1
+  fi
+  grep -Eq 'certificate|PEM' \
+    "${receiver_startup_output}" || {
+      echo 'receiver startup did not pass the stub database into TLS client construction' >&2
+      cat "${receiver_startup_output}" >&2
+      return 1
+    }
+}
+assert_receiver_startup
+
 STEWARD_CHART_RECEIVER_CONFIG="${receiver_config}" \
 STEWARD_CHART_API_ORIGIN="$(inline_env_value STEWARD_API_ORIGIN)" \
 STEWARD_CHART_API_SERVER_NAME="$(inline_env_value STEWARD_API_SERVER_NAME)" \

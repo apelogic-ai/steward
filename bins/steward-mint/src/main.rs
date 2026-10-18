@@ -1,3 +1,6 @@
+#[path = "../../rustls_crypto_provider.rs"]
+mod rustls_crypto_provider;
+
 use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
@@ -310,7 +313,7 @@ impl ControlPlaneWorkloadAuthenticator for KubernetesControlPlaneWorkloadAuthent
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    install_rustls_crypto_provider()?;
+    rustls_crypto_provider::install()?;
     let client = Client::try_default().await?;
     let identity = OpenShellIdentityResolver::discover(
         client.clone(),
@@ -433,21 +436,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-fn install_rustls_crypto_provider() -> Result<(), io::Error> {
-    use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
-
-    if CryptoProvider::get_default().is_none() {
-        let _ = ring::default_provider().install_default();
-    }
-    if CryptoProvider::get_default().is_some() {
-        Ok(())
-    } else {
-        Err(io::Error::other(
-            "install the Steward Rustls crypto provider",
-        ))
-    }
 }
 
 fn required(name: &str) -> Result<String, io::Error> {

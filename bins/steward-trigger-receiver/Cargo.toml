@@ -22,11 +22,11 @@ steward-ports = { path = "../../crates/steward-ports", version = "=0.3.19" }
 steward-store = { path = "../../crates/steward-store", version = "=0.3.19" }
 steward-types = { path = "../../crates/steward-types", version = "=0.3.19" }
 tokio.workspace = true
+tokio-rustls.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13.2"
-tokio-rustls.workspace = true
 tower.workspace = true
 
 [lints]

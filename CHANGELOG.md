@@ -41,6 +41,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Fixed
 
+- Steward binaries now select their shared TLS crypto provider before constructing clients or
+  servers, preventing the Jira receiver from panicking during startup.
 - The Helm chart now renders every Jira receiver numeric environment setting as decimal digits,
   preventing the receiver from rejecting large default or ceiling values written in scientific
   notation.

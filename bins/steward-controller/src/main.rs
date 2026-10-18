@@ -1,3 +1,6 @@
+#[path = "../../rustls_crypto_provider.rs"]
+mod rustls_crypto_provider;
+
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -104,7 +107,7 @@ impl InferencePlane for DeploymentInferencePlane {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    install_rustls_crypto_provider()?;
+    rustls_crypto_provider::install()?;
     if env::args().nth(1).as_deref() == Some("validate-jira-config") {
         jira_adapter()?;
         return Ok(());
@@ -308,21 +311,6 @@ fn task_orchestration_mode() -> Result<TaskOrchestrationMode, io::Error> {
     let value = required("STEWARD_TASK_ORCHESTRATION_MODE")?;
     TaskOrchestrationMode::parse(&value)
         .map_err(|_| io::Error::other("STEWARD_TASK_ORCHESTRATION_MODE must be staged or active"))
-}
-
-fn install_rustls_crypto_provider() -> Result<(), io::Error> {
-    use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
-
-    if CryptoProvider::get_default().is_none() {
-        let _ = ring::default_provider().install_default();
-    }
-    if CryptoProvider::get_default().is_some() {
-        Ok(())
-    } else {
-        Err(io::Error::other(
-            "install the Steward Rustls crypto provider",
-        ))
-    }
 }
 
 fn required(name: &str) -> Result<String, io::Error> {
@@ -809,8 +797,8 @@ mod tests {
     use super::{
         GITHUB_ATTESTATION_TRUST_MODE, OPERATOR_PINNED_TRUST_MODE, TlsListener,
         bridge_gateway_origin_for_image, bridge_gateway_version_for_image,
-        connections_bridge_startup_log, decode_tls_material, install_rustls_crypto_provider,
-        openshell_task_log_mode, parse_inference_mode, parse_runtime_controller_config,
+        connections_bridge_startup_log, decode_tls_material, openshell_task_log_mode,
+        parse_inference_mode, parse_runtime_controller_config, rustls_crypto_provider,
         verify_bridge_image_provenance, verify_connections_bridge_image_configuration,
     };
     use steward_adapter_openshell::OpenShellTaskLogMode;
@@ -1133,7 +1121,7 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_tls_handshakes_do_not_serialize_acceptance() -> Result<(), String> {
-        install_rustls_crypto_provider().map_err(|error| error.to_string())?;
+        rustls_crypto_provider::install().map_err(|error| error.to_string())?;
         let tcp = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|error| format!("bind test listener: {error}"))?;
