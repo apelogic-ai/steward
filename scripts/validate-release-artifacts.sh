@@ -41,6 +41,7 @@ image:web          run   run
 smoke:web          run   run
 smoke:bridge       run   skip
 smoke:mint         run   skip
+smoke:trigger-receiver run skip
 '
 
 usage() {
@@ -156,14 +157,34 @@ backend_tls_policy="$(mktemp)"
 secret_trust_rendered="$(mktemp)"
 mint_synthetic_kubeconfig="$(mktemp)"
 mint_startup_output="$(mktemp)"
+receiver_synthetic_kubeconfig="$(mktemp)"
+receiver_startup_config="$(mktemp)"
+receiver_startup_output="$(mktemp)"
+receiver_stub_ca="$(mktemp)"
+receiver_stub_catalog="$(mktemp)"
+receiver_stub_port="$(mktemp)"
+receiver_stub_pid=""
+receiver_container_name=""
+receiver_run_pid=""
 web_container_id=""
 
 cleanup() {
   status="$?"
   trap - EXIT INT TERM
   set +e
+  if [[ -n "${receiver_run_pid}" ]]; then
+    kill "${receiver_run_pid}" 2>/dev/null || true
+    wait "${receiver_run_pid}" 2>/dev/null || true
+  fi
   if [[ -n "${web_container_id}" ]]; then
     docker stop --time 5 "${web_container_id}" >/dev/null 2>&1
+  fi
+  if [[ -n "${receiver_container_name}" ]]; then
+    docker rm --force "${receiver_container_name}" >/dev/null 2>&1
+  fi
+  if [[ -n "${receiver_stub_pid}" ]]; then
+    kill "${receiver_stub_pid}" 2>/dev/null || true
+    wait "${receiver_stub_pid}" 2>/dev/null || true
   fi
   rm -f "${rendered}" "${managed_inference_rendered}" \
     "${managed_inference_mint_deployment}" "${default_rendered}" \
@@ -186,7 +207,10 @@ cleanup() {
     "${web_rendered}" "${web_deployment}" "${external_edge_rendered}" "${http_route_rendered}" \
     "${backend_tls_policy}" \
     "${secret_trust_rendered}" \
-    "${mint_synthetic_kubeconfig}" "${mint_startup_output}"
+    "${mint_synthetic_kubeconfig}" "${mint_startup_output}" \
+    "${receiver_synthetic_kubeconfig}" "${receiver_startup_config}" \
+    "${receiver_startup_output}" "${receiver_stub_ca}" \
+    "${receiver_stub_catalog}" "${receiver_stub_port}"
   exit "${status}"
 }
 trap cleanup EXIT INT TERM
@@ -1628,6 +1652,171 @@ EOF
   grep -Fq 'OpenShell identity discovery failed' "${mint_startup_output}"
 }
 
+smoke_trigger_receiver_image() {
+  local completed=0 status=0 stub_port
+  cat > "${receiver_synthetic_kubeconfig}" <<'EOF'
+apiVersion: v1
+kind: Config
+clusters:
+  - name: synthetic
+    cluster:
+      server: https://127.0.0.1:1
+      insecure-skip-tls-verify: true
+contexts:
+  - name: synthetic
+    context:
+      cluster: synthetic
+      user: synthetic
+current-context: synthetic
+users:
+  - name: synthetic
+    user:
+      token: synthetic-token
+EOF
+  cat > "${receiver_startup_config}" <<'EOF'
+{"triggers":[{"id":"Jira_read","enabled":false,"source":"jira","workflow":"triage@1","service":"event-worker","ownerUserId":"usr_11111111111111111111111111111111","envelopeDigest":"steward:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","signingSecretFile":"/run/trigger-signing/Jira_read","filters":{"event":"jira:issue_updated","project":"PROJ","issueType":"10001"},"ignoredAccountIds":[],"concurrencyLimit":1,"cooldownSeconds":1}]}
+EOF
+  printf '%s\n' '{}' > "${receiver_stub_catalog}"
+  printf '%s\n' 'not-a-certificate' > "${receiver_stub_ca}"
+  chmod 0644 "${receiver_synthetic_kubeconfig}" "${receiver_startup_config}" \
+    "${receiver_stub_catalog}" "${receiver_stub_ca}"
+
+  python3 -c '
+import socket
+import struct
+import time
+
+def receive_exact(connection, length):
+    value = b""
+    while len(value) < length:
+        chunk = connection.recv(length - len(value))
+        if not chunk:
+            return value
+        value += chunk
+    return value
+
+with socket.socket() as server:
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", 0))
+    server.listen(1)
+    print(server.getsockname()[1], flush=True)
+    connection, _ = server.accept()
+    with connection:
+        startup_length = receive_exact(connection, 4)
+        if len(startup_length) == 4:
+            receive_exact(connection, struct.unpack("!I", startup_length)[0] - 4)
+            connection.sendall(b"R" + struct.pack("!II", 8, 0))
+            connection.sendall(b"K" + struct.pack("!III", 12, 1, 1))
+            connection.sendall(b"Z" + struct.pack("!I", 5) + b"I")
+        time.sleep(30)
+' > "${receiver_stub_port}" &
+  receiver_stub_pid="$!"
+  for _ in {1..50}; do
+    [[ -s "${receiver_stub_port}" ]] && break
+    sleep 0.1
+  done
+  if [[ ! -s "${receiver_stub_port}" ]]; then
+    echo 'receiver release-image database stub did not publish its port' >&2
+    exit 1
+  fi
+  stub_port="$(cat "${receiver_stub_port}")"
+  receiver_container_name="steward-release-trigger-receiver-$$"
+  docker run --rm \
+    --name "${receiver_container_name}" \
+    --network host \
+    --read-only \
+    --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+    --label "steward.test/run-id=release-trigger-receiver-$$" \
+    --env KUBECONFIG=/run/steward-release/kubeconfig \
+    --env STEWARD_TRIGGER_CONFIG_FILE=/run/steward-release/config.json \
+    --env STEWARD_CAPABILITY_CATALOG_FILE=/run/steward-release/catalog.json \
+    --env "STEWARD_DATABASE_URL=postgresql://steward@127.0.0.1:${stub_port}/steward?sslmode=disable" \
+    --env STEWARD_TRIGGER_NAMESPACE=steward-test \
+    --env STEWARD_TRIGGER_SERVICE_ACCOUNT=steward-trigger-receiver \
+    --env STEWARD_TRIGGER_BIND=127.0.0.1:0 \
+    --env STEWARD_WORKLOAD_SOURCE_AUDIENCE=steward-workload-exchange \
+    --env STEWARD_WORKLOAD_EXCHANGE_ENDPOINT=https://exchange.example.test:1/v1/workload/exchange \
+    --env STEWARD_WORKLOAD_EXCHANGE_SERVER_NAME=exchange.example.test \
+    --env STEWARD_WORKLOAD_EXCHANGE_CA_CERTIFICATE_FILE=/run/steward-release/ca.crt \
+    --env STEWARD_API_ORIGIN=https://steward.example.test:1 \
+    --env STEWARD_API_SERVER_NAME=steward.example.test \
+    --env STEWARD_API_CA_CERTIFICATE_FILE=/run/steward-release/ca.crt \
+    --env STEWARD_TRIGGER_MAX_CONFIG_BYTES=4194304 \
+    --env STEWARD_TRIGGER_MAX_BODY_BYTES=1048576 \
+    --env STEWARD_TRIGGER_MAX_IDENTIFIER_BYTES=1024 \
+    --env STEWARD_TRIGGER_MAX_TRIGGERS=4096 \
+    --env STEWARD_TRIGGER_MAX_IGNORED_ACCOUNTS=4096 \
+    --env STEWARD_TRIGGER_MAX_CONCURRENCY=1024 \
+    --env STEWARD_TRIGGER_MAX_COOLDOWN_SECONDS=31536000 \
+    --env STEWARD_TRIGGER_MAX_RECENT_DELIVERIES=1000000 \
+    --env STEWARD_TRIGGER_MAX_ISSUE_COOLDOWNS=1000000 \
+    --env STEWARD_TRIGGER_MAX_SIGNING_SECRET_BYTES=65536 \
+    --env STEWARD_TRIGGER_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS=5000 \
+    --env STEWARD_WORKLOAD_SOURCE_TOKEN_SECONDS=600 \
+    --env STEWARD_WORKLOAD_EXCHANGE_CONNECT_TIMEOUT_MILLISECONDS=1000 \
+    --env STEWARD_WORKLOAD_EXCHANGE_REQUEST_TIMEOUT_MILLISECONDS=1000 \
+    --env STEWARD_WORKLOAD_EXCHANGE_MAX_REPLY_BYTES=65536 \
+    --env STEWARD_TRIGGER_TASK_DEADLINE_MILLISECONDS=600000 \
+    --env STEWARD_TRIGGER_POLL_INITIAL_MILLISECONDS=100 \
+    --env STEWARD_TRIGGER_POLL_MAX_MILLISECONDS=1000 \
+    --env STEWARD_TRIGGER_API_CONNECT_TIMEOUT_MILLISECONDS=1000 \
+    --env STEWARD_TRIGGER_API_REQUEST_TIMEOUT_MILLISECONDS=1000 \
+    --env STEWARD_TRIGGER_MAX_TASK_REPLY_BYTES=1048576 \
+    --volume "${receiver_synthetic_kubeconfig}:/run/steward-release/kubeconfig:ro" \
+    --volume "${receiver_startup_config}:/run/steward-release/config.json:ro" \
+    --volume "${receiver_stub_catalog}:/run/steward-release/catalog.json:ro" \
+    --volume "${receiver_stub_ca}:/run/steward-release/ca.crt:ro" \
+    steward-trigger-receiver:release-validation > "${receiver_startup_output}" 2>&1 &
+  receiver_run_pid="$!"
+  for _ in {1..200}; do
+    if ! kill -0 "${receiver_run_pid}" 2>/dev/null; then
+      completed=1
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ "${completed}" == 0 ]]; then
+    kill "${receiver_run_pid}" 2>/dev/null || true
+    docker rm --force "${receiver_container_name}" >/dev/null 2>&1 || true
+    wait "${receiver_run_pid}" 2>/dev/null || true
+    receiver_run_pid=""
+    receiver_container_name=""
+    echo 'the receiver release-image startup exceeded its deadline' >&2
+    exit 1
+  fi
+  if wait "${receiver_run_pid}"; then
+    status=0
+  else
+    status="$?"
+  fi
+  receiver_run_pid=""
+  receiver_container_name=""
+  kill "${receiver_stub_pid}" 2>/dev/null || true
+  wait "${receiver_stub_pid}" 2>/dev/null || true
+  receiver_stub_pid=""
+  if [[ "${status}" == 0 ]]; then
+    echo 'the receiver release-image smoke expects the stub certificate to be rejected' >&2
+    exit 1
+  fi
+  if grep -Fq 'Could not automatically determine the process-level CryptoProvider' \
+    "${receiver_startup_output}"
+  then
+    echo 'the receiver release image must select the Rustls crypto provider before startup' >&2
+    cat "${receiver_startup_output}" >&2
+    exit 1
+  fi
+  if grep -Eq "panicked at|thread '[^']+' panicked" "${receiver_startup_output}"; then
+    echo 'the receiver release image panicked during startup' >&2
+    cat "${receiver_startup_output}" >&2
+    exit 1
+  fi
+  grep -Eq 'certificate|PEM' "${receiver_startup_output}" || {
+    echo 'the receiver release image did not reach TLS client construction' >&2
+    cat "${receiver_startup_output}" >&2
+    exit 1
+  }
+}
+
 for image_step in ${planned_image_steps}; do
   case "${image_step}" in
     image:apiserver|image:controller|image:mint|image:trigger-receiver)
@@ -1638,6 +1827,7 @@ for image_step in ${planned_image_steps}; do
     smoke:web) smoke_web_image ;;
     smoke:bridge) smoke_bridge_image ;;
     smoke:mint) smoke_mint_image ;;
+    smoke:trigger-receiver) smoke_trigger_receiver_image ;;
     *)
       echo "image step has no implementation: ${image_step}" >&2
       exit 1

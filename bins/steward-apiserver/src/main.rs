@@ -1,3 +1,6 @@
+#[path = "../../rustls_crypto_provider.rs"]
+mod rustls_crypto_provider;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
@@ -106,7 +109,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
-    install_rustls_crypto_provider()?;
+    rustls_crypto_provider::install()?;
     let mut arguments = arguments.into_iter();
     match arguments.next().as_deref() {
         Some("bootstrap-rbac") => return bootstrap_rbac(arguments.collect()).await,
@@ -709,21 +712,6 @@ fn configured_task_identity_resolver(
         ),
         task_identity_issuer: Some(issuer),
     })
-}
-
-fn install_rustls_crypto_provider() -> Result<(), io::Error> {
-    use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
-
-    if CryptoProvider::get_default().is_none() {
-        let _ = ring::default_provider().install_default();
-    }
-    if CryptoProvider::get_default().is_some() {
-        Ok(())
-    } else {
-        Err(io::Error::other(
-            "install the Steward Rustls crypto provider",
-        ))
-    }
 }
 
 fn custom_envelope_safety_ceiling_startup_warning(configured: bool) -> Option<&'static str> {
@@ -1922,10 +1910,10 @@ mod tests {
         bootstrap_rbac_arguments, connection_auto_association_issuer,
         custom_envelope_safety_ceiling_startup_warning, decode_tls_material,
         default_template_threshold_is_rollback_compatible, format_effective_access_human,
-        github_source_adapter_from_values, install_rustls_crypto_provider,
-        kubernetes_token_review_audience, operator_exit_code, parse_execution_bindings_mode,
-        parse_inference_mode, parse_template_document, stable_bridge_configuration_from_values,
-        templates_command, validate_execution_bindings, with_claude_code_execution_adapter,
+        github_source_adapter_from_values, kubernetes_token_review_audience, operator_exit_code,
+        parse_execution_bindings_mode, parse_inference_mode, parse_template_document,
+        rustls_crypto_provider, stable_bridge_configuration_from_values, templates_command,
+        validate_execution_bindings, with_claude_code_execution_adapter,
     };
 
     static NEXT_PREFLIGHT_CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -2604,7 +2592,7 @@ fi
 
     #[tokio::test]
     async fn stalled_tls_handshakes_do_not_serialize_acceptance() -> Result<(), String> {
-        install_rustls_crypto_provider().map_err(|error| error.to_string())?;
+        rustls_crypto_provider::install().map_err(|error| error.to_string())?;
         let tcp = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|error| format!("bind test listener: {error}"))?;

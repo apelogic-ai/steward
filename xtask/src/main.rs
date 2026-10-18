@@ -4808,6 +4808,18 @@ mod tests {
                 "release validation must smoke-test the combined mint image startup: missing {required}"
             );
         }
+        for required in [
+            "smoke:trigger-receiver",
+            "steward-trigger-receiver:release-validation",
+            "steward.test/run-id=release-trigger-receiver-$$",
+            "receiver release image must select the Rustls crypto provider before startup",
+            "receiver release image did not reach TLS client construction",
+        ] {
+            assert!(
+                release_validation.contains(required),
+                "release validation must smoke-test the trigger receiver startup: missing {required}"
+            );
+        }
         assert!(
             release_validation.contains("image:trigger-receiver"),
             "release validation must expose the trigger receiver image build target"

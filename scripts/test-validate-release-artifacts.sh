@@ -72,6 +72,7 @@ image:web
 smoke:web
 smoke:bridge
 smoke:mint
+smoke:trigger-receiver
 checks:release-workflow'
 
 web_scope='checks:release-helper-tests
@@ -137,6 +138,14 @@ web_images="$(grep '^image:' <<<"${web_plan}" || true)"
   fail "the web scope must build exactly the web image, but builds: ${web_images//$'\n'/ }"
 grep -Fxq smoke:web <<<"${web_plan}" ||
   fail "the web scope must smoke-test the web image"
+grep -Fxq smoke:trigger-receiver <<<"${full_plan}" ||
+  fail "the full scope must smoke-test the trigger receiver image"
+grep -Fq 'STEWARD_TRIGGER_BIND=127.0.0.1:0' "${script}" ||
+  fail "the trigger receiver smoke must bind only an ephemeral loopback port"
+grep -Fq 'the receiver release image panicked during startup' "${script}" ||
+  fail "the trigger receiver smoke must reject every Rust panic"
+grep -Fq 'the receiver release-image startup exceeded its deadline' "${script}" ||
+  fail "the trigger receiver smoke must enforce a startup deadline"
 
 # Every image the release publishes is built by the full scope.
 release_components="$(sed -n 's/^ *for component in \(.*\); do$/\1/p' \
@@ -171,6 +180,7 @@ while IFS= read -r step; do
       arm='build_packaged_image "${image_step#image:}"'
       ;;
     image:*) arm="${step}) build_${step#image:}_image ;;" ;;
+    smoke:trigger-receiver) arm='smoke:trigger-receiver) smoke_trigger_receiver_image ;;' ;;
     smoke:*) arm="${step}) smoke_${step#smoke:}_image ;;" ;;
     *) continue ;;
   esac
@@ -186,7 +196,7 @@ done <<<"${full_plan}"
 grep -Fq 'trigger-receiver) binary=steward-trigger-receiver ;;' "${script}" ||
   fail "the trigger receiver image must select the exact Cargo binary name"
 for implementation in build_packaged_image build_bridge_image build_web_image \
-  smoke_web_image smoke_bridge_image smoke_mint_image
+  smoke_web_image smoke_bridge_image smoke_mint_image smoke_trigger_receiver_image
 do
   [[ "$(grep -c "^${implementation}() {\$" "${script}")" == 1 ]] ||
     fail "${implementation} is not defined exactly once"

@@ -1,3 +1,6 @@
+#[path = "../../rustls_crypto_provider.rs"]
+mod rustls_crypto_provider;
+
 use kube::Client as KubeClient;
 use std::collections::BTreeMap;
 use std::env;
@@ -192,6 +195,7 @@ fn runtime_settings() -> Result<RuntimeSettings, Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    rustls_crypto_provider::install()?;
     let settings = runtime_settings()?;
     let config = ReceiverConfig::from_json(
         &fs::read_to_string(required("STEWARD_TRIGGER_CONFIG_FILE")?)?,
