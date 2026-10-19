@@ -281,7 +281,8 @@ config:
       pollIntervalSeconds: 2
       maxConcurrentTurns: 8
       maxTransientAttempts: 3
-      maxNameBytes: 200
+      retryBackoffSeconds: 2
+      maxNameCharacters: 200
       maxInstructionsBytes: 16384
       maxMessageBytes: 16384
       maxQueuedBytes: 24576
