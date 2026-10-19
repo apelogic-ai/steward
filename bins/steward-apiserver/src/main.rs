@@ -34,7 +34,8 @@ use steward_apiserver::{
     MAX_SOURCE_REPOSITORY_BINDINGS_BYTES, StewardRunWorkflowInstallationMode, TaskApiConfig,
     agent_runs_ui, browser_admin, browser_auth, browser_task_rerunner, browser_task_router,
     connections, github_automation, google_oidc, governed_connections, inference_connections,
-    operator_admin, router, stable_runtime_bridge, task_router, user_envelopes, workflows,
+    operator_admin, personal_agents, router, stable_runtime_bridge, task_router, user_envelopes,
+    workflows,
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
@@ -817,6 +818,16 @@ async fn browser_application_router(
         Arc::new(browser_auth::PgBrowserIdentityResolver::new(store.clone())),
     )
     .map_err(io::Error::other)?;
+    let personal_agent_config = personal_agent_configuration()?;
+    let personal_agent_refs = workflow_agents
+        .iter()
+        .map(|agent| agent.agent_ref.clone())
+        .collect::<Vec<_>>();
+    let _personal_agent_dispatcher = personal_agents::spawn_dispatcher(
+        store.clone(),
+        task_api_config.clone(),
+        personal_agent_config,
+    );
     let connections = governed_connections_configuration(
         &origin,
         store.clone(),
@@ -846,6 +857,11 @@ async fn browser_application_router(
         application_config.task_identity_discovery_enabled,
     );
     let app = browser_auth::browser_auth_router(auth.clone())
+        .merge(personal_agents::protected_router(
+            store.clone(),
+            personal_agent_refs,
+            auth.clone(),
+        ))
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(
                 store.clone(),
@@ -933,6 +949,44 @@ async fn browser_application_router(
         None => app,
     };
     Ok(Some(app))
+}
+
+fn personal_agent_configuration() -> Result<personal_agents::PersonalAgentConfig, io::Error> {
+    let recent_turn_limit =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_RECENT_TURN_LIMIT")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_RECENT_TURN_LIMIT.to_string());
+    let lease_seconds = optional_unicode_environment("STEWARD_PERSONAL_AGENT_LEASE_SECONDS")?
+        .unwrap_or_else(|| personal_agents::DEFAULT_LEASE_SECONDS.to_string());
+    let poll_interval_seconds =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_POLL_INTERVAL_SECONDS")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_POLL_INTERVAL_SECONDS.to_string());
+    personal_agent_configuration_from_values(
+        &recent_turn_limit,
+        &lease_seconds,
+        &poll_interval_seconds,
+    )
+}
+
+fn personal_agent_configuration_from_values(
+    recent_turn_limit: &str,
+    lease_seconds: &str,
+    poll_interval_seconds: &str,
+) -> Result<personal_agents::PersonalAgentConfig, io::Error> {
+    let recent_turn_limit = recent_turn_limit.parse::<i64>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_RECENT_TURN_LIMIT must be an integer")
+    })?;
+    let lease_seconds = lease_seconds
+        .parse::<i64>()
+        .map_err(|_| io::Error::other("STEWARD_PERSONAL_AGENT_LEASE_SECONDS must be an integer"))?;
+    let poll_interval_seconds = poll_interval_seconds.parse::<u64>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_POLL_INTERVAL_SECONDS must be an integer")
+    })?;
+    personal_agents::PersonalAgentConfig::new(
+        recent_turn_limit,
+        lease_seconds,
+        poll_interval_seconds,
+    )
+    .map_err(io::Error::other)
 }
 
 type GovernedConnectionMutations =
@@ -1912,11 +1966,31 @@ mod tests {
         default_template_threshold_is_rollback_compatible, format_effective_access_human,
         github_source_adapter_from_values, kubernetes_token_review_audience, operator_exit_code,
         parse_execution_bindings_mode, parse_inference_mode, parse_template_document,
-        rustls_crypto_provider, stable_bridge_configuration_from_values, templates_command,
-        validate_execution_bindings, with_claude_code_execution_adapter,
+        personal_agent_configuration_from_values, rustls_crypto_provider,
+        stable_bridge_configuration_from_values, templates_command, validate_execution_bindings,
+        with_claude_code_execution_adapter,
     };
 
     static NEXT_PREFLIGHT_CONFIG_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn personal_agent_dispatcher_configuration_is_bounded_and_coherent() {
+        assert!(personal_agent_configuration_from_values("8", "30", "2").is_ok());
+        for values in [
+            ("0", "30", "2"),
+            ("101", "30", "2"),
+            ("8", "4", "2"),
+            ("8", "3601", "2"),
+            ("8", "30", "0"),
+            ("8", "30", "16"),
+            ("eight", "30", "2"),
+        ] {
+            assert!(
+                personal_agent_configuration_from_values(values.0, values.1, values.2).is_err(),
+                "invalid personal-agent dispatcher configuration {values:?} must fail startup"
+            );
+        }
+    }
 
     #[test]
     fn default_template_accepts_an_equal_legacy_threshold_without_republishing()
