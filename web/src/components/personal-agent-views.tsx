@@ -42,11 +42,43 @@ export type PersonalAgentThread = {
 
 export type PersonalAgents = PersonalAgentsResponse;
 
-type PersonalAgentApiResult<T> = {
+export type PersonalAgentApiResult<T> = {
   data?: T;
   error?: unknown;
   response?: Response;
 };
+
+type EnvelopeRequestPageLoader = (
+  cursor?: string,
+) => Promise<PersonalAgentApiResult<EnvelopeRequestsResponse>>;
+
+export async function loadProvisionedEnvelopeRequests(
+  loadPage: EnvelopeRequestPageLoader = (cursor) => listRequests({
+    cache: "no-store",
+    credentials: "same-origin",
+    query: { cursor, limit: 100, status: "provisioned" },
+  }),
+): Promise<PersonalAgentApiResult<EnvelopeRequestsResponse>> {
+  const requests: EnvelopeRequestsResponse["requests"] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  let apiVersion = "";
+  let firstResponse: Response | undefined;
+  do {
+    const page = await loadPage(cursor);
+    firstResponse ??= page.response;
+    if (!page.data || !page.response?.ok) return page;
+    apiVersion ||= page.data.apiVersion;
+    requests.push(...page.data.requests);
+    const nextCursor = page.data.nextCursor ?? undefined;
+    if (nextCursor && seen.has(nextCursor)) {
+      return { response: new Response(null, { status: 502 }) };
+    }
+    if (nextCursor) seen.add(nextCursor);
+    cursor = nextCursor;
+  } while (cursor);
+  return { data: { apiVersion, nextCursor: null, requests }, response: firstResponse };
+}
 
 export type PersonalAgentEnvelopeCandidate = {
   approvedEnvelope?: null | { spec: { llms: ModelRef[] } };
@@ -79,11 +111,23 @@ export function selectedPersonalAgentModel(
   envelopeChoices: ReadonlyArray<PersonalAgentEnvelopeChoice>,
   envelopeRequestId: string,
   selectedModelKey: string,
+  supportedProviders?: ReadonlyArray<string>,
 ): ModelRef | undefined {
   const models = envelopeChoices.find((choice) => choice.requestId === envelopeRequestId)?.models ?? [];
+  const compatibleModels = supportedProviders
+    ? compatiblePersonalAgentModels(models, supportedProviders)
+    : models;
   return models.length > 1
-    ? models.find((model) => modelKey(model) === selectedModelKey)
+    ? compatibleModels.find((model) => modelKey(model) === selectedModelKey)
     : undefined;
+}
+
+export function compatiblePersonalAgentModels(
+  models: ReadonlyArray<ModelRef>,
+  supportedProviders: ReadonlyArray<string>,
+): ModelRef[] {
+  const providers = new Set(supportedProviders);
+  return models.filter((model) => providers.has(model.provider));
 }
 
 export function personalAgentFailureMessage(
@@ -97,11 +141,21 @@ export function personalAgentFailureMessage(
   return fallback;
 }
 
-export function nextPersonalAgentMessageKey(
-  current: string | null,
+export type PersonalAgentMessageAttempt = {
+  content: string;
+  key: string;
+};
+
+export function nextPersonalAgentMessageAttempt(
+  current: PersonalAgentMessageAttempt | null,
+  content: string,
   create: () => string,
-): string {
-  return current ?? create();
+): PersonalAgentMessageAttempt {
+  return current?.content === content ? current : { content, key: create() };
+}
+
+export function isCurrentPersonalAgentRefresh(latestGeneration: number, completedGeneration: number): boolean {
+  return latestGeneration === completedGeneration;
 }
 
 export function PersonalAgentsListContent({ state }: Readonly<{
@@ -174,7 +228,7 @@ export function NewPersonalAgentView() {
   const load = useCallback(async () => {
     const [capabilities, envelopes] = await Promise.all([
       getUserCapabilities({ cache: "no-store", credentials: "same-origin" }),
-      listRequests({ cache: "no-store", credentials: "same-origin" }),
+      loadProvisionedEnvelopeRequests(),
     ]);
     const response = !capabilities.response?.ok ? capabilities.response : envelopes.response;
     return capabilities.data && envelopes.data
@@ -198,6 +252,9 @@ export function NewPersonalAgentView() {
       envelopeChoices,
       envelopeRequestId,
       String(form.get("model") ?? ""),
+      state.status === "ready"
+        ? state.value.capabilities.agents.find((agent) => agent.agentRef === String(form.get("agentRef") ?? ""))?.models.providers
+        : undefined,
     );
     const body = {
       agentRef: String(form.get("agentRef") ?? "").trim(),
@@ -232,6 +289,7 @@ export function NewPersonalAgentView() {
             harnessChoices={capabilities.agents.map((agent) => ({
               agentRef: agent.agentRef,
               label: agent.displayName?.trim() || agent.agentRef,
+              providers: agent.models.providers,
             }))}
             onSubmit={(event) => void submit(event)}
             saving={saving}
@@ -280,9 +338,13 @@ function usePersonalAgentThread(agentId: string): Readonly<{
 }> {
   const [state, setState] = useState<ResourceState<PersonalAgentThread>>({ status: "loading" });
   const mounted = useRef(false);
+  const refreshGeneration = useRef(0);
   const refresh = useCallback(async () => {
+    const generation = ++refreshGeneration.current;
     const next = classifyResource(await loadPersonalAgentThread(agentId));
-    if (mounted.current) setState(next);
+    if (mounted.current && isCurrentPersonalAgentRefresh(refreshGeneration.current, generation)) {
+      setState(next);
+    }
   }, [agentId]);
 
   useEffect(() => {
@@ -306,11 +368,11 @@ export function PersonalAgentDetailView({ agentId }: Readonly<{ agentId: string 
   const [draft, setDraft] = useState("");
   const [failure, setFailure] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
-  const idempotencyKey = useRef<string | null>(null);
+  const messageAttempt = useRef<PersonalAgentMessageAttempt | null>(null);
   const { refresh, state } = usePersonalAgentThread(agentId);
 
   const updateDraft = (value: string) => {
-    if (value !== draft) idempotencyKey.current = null;
+    if (messageAttempt.current?.content !== value.trim()) messageAttempt.current = null;
     setDraft(value);
   };
   const send = async (event: FormEvent<HTMLFormElement>) => {
@@ -321,13 +383,17 @@ export function PersonalAgentDetailView({ agentId }: Readonly<{ agentId: string 
       setFailure("Sign in again, then retry.");
       return;
     }
-    idempotencyKey.current = nextPersonalAgentMessageKey(idempotencyKey.current, () => crypto.randomUUID());
+    messageAttempt.current = nextPersonalAgentMessageAttempt(
+      messageAttempt.current,
+      content,
+      () => crypto.randomUUID(),
+    );
     setFailure(null);
     setSending(true);
     const result = await postPersonalAgentMessageRequest({
       body: {
         content,
-        idempotencyKey: idempotencyKey.current,
+        idempotencyKey: messageAttempt.current.key,
       },
       cache: "no-store",
       credentials: "same-origin",
@@ -336,7 +402,7 @@ export function PersonalAgentDetailView({ agentId }: Readonly<{ agentId: string 
     });
     setSending(false);
     if (result.data && result.response?.ok) {
-      idempotencyKey.current = null;
+      messageAttempt.current = null;
       setDraft("");
       await refresh();
       return;
@@ -448,17 +514,26 @@ export function NewPersonalAgentForm({
   saving,
 }: Readonly<{
   envelopeChoices: ReadonlyArray<PersonalAgentEnvelopeChoice>;
-  harnessChoices: ReadonlyArray<{ agentRef: string; label: string }>;
+  harnessChoices: ReadonlyArray<{ agentRef: string; label: string; providers: string[] }>;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   saving: boolean;
 }>) {
   const [selectedEnvelopeRequestId, setSelectedEnvelopeRequestId] = useState(
     envelopeChoices[0]?.requestId ?? "",
   );
+  const [selectedAgentRef, setSelectedAgentRef] = useState(harnessChoices[0]?.agentRef ?? "");
   const selectedEnvelope = envelopeChoices.find((choice) => choice.requestId === selectedEnvelopeRequestId)
     ?? envelopeChoices[0];
-  const modelChoices = selectedEnvelope?.models ?? [];
-  const ready = envelopeChoices.length > 0 && harnessChoices.length > 0;
+  const compatibleHarnessChoices = harnessChoices.filter((choice) => (
+    compatiblePersonalAgentModels(selectedEnvelope?.models ?? [], choice.providers).length > 0
+  ));
+  const selectedHarness = compatibleHarnessChoices.find((choice) => choice.agentRef === selectedAgentRef)
+    ?? compatibleHarnessChoices[0];
+  const modelChoices = compatiblePersonalAgentModels(
+    selectedEnvelope?.models ?? [],
+    selectedHarness?.providers ?? [],
+  );
+  const ready = Boolean(selectedEnvelope && selectedHarness && modelChoices.length > 0);
   return (
     <form className="space-y-5" onSubmit={onSubmit}>
       <label className="grid gap-2 text-sm font-semibold" htmlFor="personal-agent-name">
@@ -467,8 +542,8 @@ export function NewPersonalAgentForm({
       </label>
       <label className="grid gap-2 text-sm font-semibold" htmlFor="personal-agent-harness">
         Coding agent
-        <select className="min-h-11 rounded-control border bg-panel px-3 font-normal" disabled={saving || harnessChoices.length === 0} id="personal-agent-harness" name="agentRef" required>
-          {harnessChoices.map((choice) => <option key={choice.agentRef} value={choice.agentRef}>{choice.label}</option>)}
+        <select className="min-h-11 rounded-control border bg-panel px-3 font-normal" disabled={saving || compatibleHarnessChoices.length === 0} id="personal-agent-harness" name="agentRef" onChange={(event) => setSelectedAgentRef(event.target.value)} required value={selectedHarness?.agentRef ?? ""}>
+          {harnessChoices.map((choice) => <option disabled={!compatibleHarnessChoices.includes(choice)} key={choice.agentRef} value={choice.agentRef}>{choice.label}</option>)}
         </select>
       </label>
       <label className="grid gap-2 text-sm font-semibold" htmlFor="personal-agent-instructions">
@@ -481,9 +556,9 @@ export function NewPersonalAgentForm({
           {envelopeChoices.map((choice) => <option key={choice.requestId} value={choice.requestId}>{choice.label}</option>)}
         </select>
       </label>
-      {modelChoices.length > 1 ? <label className="grid gap-2 text-sm font-semibold" htmlFor="personal-agent-model">
+      {(selectedEnvelope?.models.length ?? 0) > 1 ? <label className="grid gap-2 text-sm font-semibold" htmlFor="personal-agent-model">
         Model
-        <select className="min-h-11 rounded-control border bg-panel px-3 font-mono font-normal" disabled={saving} id="personal-agent-model" key={selectedEnvelope?.requestId} name="model" required>
+        <select className="min-h-11 rounded-control border bg-panel px-3 font-mono font-normal" disabled={saving || modelChoices.length === 0} id="personal-agent-model" key={`${selectedEnvelope?.requestId}:${selectedHarness?.agentRef}`} name="model" required>
           {modelChoices.map((model) => <option key={modelKey(model)} value={modelKey(model)}>{modelOptionLabel(model, modelChoices)}</option>)}
         </select>
       </label> : null}

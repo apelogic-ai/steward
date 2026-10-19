@@ -48,7 +48,7 @@ are available.
 
 ## To add a scenario or a journey
 
-1. A new feature first goes into the journey whose goal it serves, as a new scenario. Start a new file only for a new goal. Name it `J13-short-name.feature`.
+1. A new feature first goes into the journey whose goal it serves, as a new scenario. Start a new file only for a new goal. Name it `J14-short-name.feature`.
 2. Write each line with a pattern from `STEPS.md`.
 3. If no pattern fits, write the sentence the way a person would say it, and add it to `STEPS.md` in the same change. See "A sentence with no code behind it" below.
 4. Add the tags that apply.

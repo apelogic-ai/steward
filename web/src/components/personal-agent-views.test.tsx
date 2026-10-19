@@ -8,7 +8,10 @@ import {
   PersonalAgentDetailContent,
   PersonalAgentsListContent,
   activeEnvelopeChoices,
-  nextPersonalAgentMessageKey,
+  compatiblePersonalAgentModels,
+  isCurrentPersonalAgentRefresh,
+  loadProvisionedEnvelopeRequests,
+  nextPersonalAgentMessageAttempt,
   personalAgentFailureMessage,
   selectedPersonalAgentModel,
   subscribePersonalAgentEvents,
@@ -42,6 +45,25 @@ const thread: PersonalAgentThread = {
 const source = readFileSync(new URL("./personal-agent-views.tsx", import.meta.url), "utf8");
 
 describe("personal agent creation", () => {
+  test("loads every page of active Envelopes", async () => {
+    const cursors: Array<string | undefined> = [];
+    const result = await loadProvisionedEnvelopeRequests(async (cursor) => {
+      cursors.push(cursor);
+      return {
+        data: {
+          apiVersion: "steward.envelope-requests/v1",
+          nextCursor: cursor ? null : "next-page",
+          requests: [{ id: cursor ? "envelope-2" : "envelope-1", status: "provisioned" } as never],
+        },
+        response: new Response(null, { status: 200 }),
+      };
+    });
+
+    expect(cursors).toEqual([undefined, "next-page"]);
+    expect(result.data?.requests.map((request) => request.id)).toEqual(["envelope-1", "envelope-2"]);
+    expect(result.data?.nextCursor).toBeNull();
+  });
+
   test("offers only active Envelopes and keeps their configured labels", () => {
     expect(activeEnvelopeChoices([
       {
@@ -68,7 +90,7 @@ describe("personal agent creation", () => {
   test("labels every required field and disables creation without an active Envelope", () => {
     const markup = renderToStaticMarkup(<NewPersonalAgentForm
       envelopeChoices={[]}
-      harnessChoices={[{ agentRef: "codex@configured", label: "Codex" }]}
+      harnessChoices={[{ agentRef: "codex@configured", label: "Codex", providers: ["example"] }]}
       onSubmit={() => undefined}
       saving={false}
     />);
@@ -86,7 +108,7 @@ describe("personal agent creation", () => {
         models: [{ provider: "example", model: "model-a" }],
         requestId: "envelope-one",
       }]}
-      harnessChoices={[{ agentRef: "codex@configured", label: "Codex" }]}
+      harnessChoices={[{ agentRef: "codex@configured", label: "Codex", providers: ["example"] }]}
       onSubmit={() => undefined}
       saving={false}
     />);
@@ -99,7 +121,7 @@ describe("personal agent creation", () => {
         ],
         requestId: "envelope-multiple",
       }]}
-      harnessChoices={[{ agentRef: "codex@configured", label: "Codex" }]}
+      harnessChoices={[{ agentRef: "codex@configured", label: "Codex", providers: ["example", "future-provider"] }]}
       onSubmit={() => undefined}
       saving={false}
     />);
@@ -108,6 +130,16 @@ describe("personal agent creation", () => {
     expect(multipleModels).toContain("personal-agent-model");
     expect(multipleModels).toContain("example/model-a");
     expect(multipleModels).toContain("future-provider/future-model");
+  });
+
+  test("offers only models supported by the selected coding agent", () => {
+    const models = [
+      { provider: "provider-a", model: "model-a" },
+      { provider: "provider-b", model: "model-b" },
+    ];
+    expect(compatiblePersonalAgentModels(models, ["provider-b"])).toEqual([
+      { provider: "provider-b", model: "model-b" },
+    ]);
   });
 
   test("sends an explicit model only for an Envelope with multiple choices", () => {
@@ -171,9 +203,18 @@ describe("personal agent thread", () => {
     expect(source).not.toContain("setTimeout");
   });
 
-  test("keeps one idempotency key while retrying the same message", () => {
-    expect(nextPersonalAgentMessageKey("message-1", () => "message-2")).toBe("message-1");
-    expect(nextPersonalAgentMessageKey(null, () => "message-2")).toBe("message-2");
+  test("keeps one idempotency key while retrying the same normalized message", () => {
+    const first = nextPersonalAgentMessageAttempt(null, "Repeat this", () => "message-1");
+    expect(nextPersonalAgentMessageAttempt(first, "Repeat this", () => "message-2")).toEqual(first);
+    expect(nextPersonalAgentMessageAttempt(first, "Different message", () => "message-2")).toEqual({
+      content: "Different message",
+      key: "message-2",
+    });
+  });
+
+  test("applies only the latest completed thread refresh", () => {
+    expect(isCurrentPersonalAgentRefresh(3, 3)).toBeTrue();
+    expect(isCurrentPersonalAgentRefresh(3, 2)).toBeFalse();
   });
 
   test("opens one resumable browser stream only after the agent is found", () => {
