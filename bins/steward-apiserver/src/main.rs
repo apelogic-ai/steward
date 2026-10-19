@@ -39,7 +39,7 @@ use steward_apiserver::{
 };
 use steward_store::{
     BrowserRbacAssignment, BrowserRbacAssignmentAction, BrowserRbacAssignmentChange,
-    EnvelopeTemplatePublication, ManagedInferenceKeyCipher, PgStore,
+    EnvelopeTemplatePublication, ManagedInferenceKeyCipher, PersonalAgentLimits, PgStore,
     RETIRED_AUTO_PROVISION_THRESHOLD_MESSAGE, TaskOrchestrationMode,
 };
 use steward_types::{CanonicalUserId, InferenceMode, OrganizationId};
@@ -861,6 +861,7 @@ async fn browser_application_router(
             store.clone(),
             personal_agent_refs,
             auth.clone(),
+            personal_agent_config,
         ))
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(
@@ -960,17 +961,87 @@ fn personal_agent_configuration() -> Result<personal_agents::PersonalAgentConfig
     let poll_interval_seconds =
         optional_unicode_environment("STEWARD_PERSONAL_AGENT_POLL_INTERVAL_SECONDS")?
             .unwrap_or_else(|| personal_agents::DEFAULT_POLL_INTERVAL_SECONDS.to_string());
-    personal_agent_configuration_from_values(
+    let max_concurrent_turns =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_MAX_CONCURRENT_TURNS")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_MAX_CONCURRENT_TURNS.to_string());
+    let max_transient_attempts =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_MAX_TRANSIENT_ATTEMPTS")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_MAX_TRANSIENT_ATTEMPTS.to_string());
+    let max_name_bytes =
+        personal_agent_limit("MAX_NAME_BYTES", personal_agents::DEFAULT_MAX_NAME_BYTES)?;
+    let max_instructions_bytes = personal_agent_limit(
+        "MAX_INSTRUCTIONS_BYTES",
+        personal_agents::DEFAULT_MAX_INSTRUCTIONS_BYTES,
+    )?;
+    let max_message_bytes = personal_agent_limit(
+        "MAX_MESSAGE_BYTES",
+        personal_agents::DEFAULT_MAX_MESSAGE_BYTES,
+    )?;
+    let max_queued_bytes = personal_agent_limit(
+        "MAX_QUEUED_BYTES",
+        personal_agents::DEFAULT_MAX_QUEUED_BYTES,
+    )?;
+    let max_reply_bytes =
+        personal_agent_limit("MAX_REPLY_BYTES", personal_agents::DEFAULT_MAX_REPLY_BYTES)?;
+    let max_prompt_bytes = personal_agent_limit(
+        "MAX_PROMPT_BYTES",
+        personal_agents::DEFAULT_MAX_PROMPT_BYTES,
+    )?;
+    personal_agent_configuration_from_all_values(
         &recent_turn_limit,
         &lease_seconds,
         &poll_interval_seconds,
+        &max_concurrent_turns,
+        &max_transient_attempts,
+        PersonalAgentLimits {
+            max_name_bytes,
+            max_instructions_bytes,
+            max_message_bytes,
+            max_queued_bytes,
+            max_reply_bytes,
+            max_prompt_bytes,
+        },
     )
 }
 
+fn personal_agent_limit(name: &str, default: usize) -> Result<usize, io::Error> {
+    let variable = format!("STEWARD_PERSONAL_AGENT_{name}");
+    optional_unicode_environment(&variable)?
+        .unwrap_or_else(|| default.to_string())
+        .parse::<usize>()
+        .map_err(|_| io::Error::other(format!("{variable} must be an integer")))
+}
+
+#[cfg(test)]
 fn personal_agent_configuration_from_values(
     recent_turn_limit: &str,
     lease_seconds: &str,
     poll_interval_seconds: &str,
+) -> Result<personal_agents::PersonalAgentConfig, io::Error> {
+    personal_agent_configuration_from_all_values(
+        recent_turn_limit,
+        lease_seconds,
+        poll_interval_seconds,
+        &personal_agents::DEFAULT_MAX_CONCURRENT_TURNS.to_string(),
+        &personal_agents::DEFAULT_MAX_TRANSIENT_ATTEMPTS.to_string(),
+        PersonalAgentLimits {
+            max_name_bytes: personal_agents::DEFAULT_MAX_NAME_BYTES,
+            max_instructions_bytes: personal_agents::DEFAULT_MAX_INSTRUCTIONS_BYTES,
+            max_message_bytes: personal_agents::DEFAULT_MAX_MESSAGE_BYTES,
+            max_queued_bytes: personal_agents::DEFAULT_MAX_QUEUED_BYTES,
+            max_reply_bytes: personal_agents::DEFAULT_MAX_REPLY_BYTES,
+            max_prompt_bytes: personal_agents::DEFAULT_MAX_PROMPT_BYTES,
+        },
+    )
+}
+
+fn personal_agent_configuration_from_all_values(
+    recent_turn_limit: &str,
+    lease_seconds: &str,
+    poll_interval_seconds: &str,
+    max_concurrent_turns: &str,
+    max_transient_attempts: &str,
+    limits: PersonalAgentLimits,
 ) -> Result<personal_agents::PersonalAgentConfig, io::Error> {
     let recent_turn_limit = recent_turn_limit.parse::<i64>().map_err(|_| {
         io::Error::other("STEWARD_PERSONAL_AGENT_RECENT_TURN_LIMIT must be an integer")
@@ -981,10 +1052,19 @@ fn personal_agent_configuration_from_values(
     let poll_interval_seconds = poll_interval_seconds.parse::<u64>().map_err(|_| {
         io::Error::other("STEWARD_PERSONAL_AGENT_POLL_INTERVAL_SECONDS must be an integer")
     })?;
+    let max_concurrent_turns = max_concurrent_turns.parse::<usize>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_MAX_CONCURRENT_TURNS must be an integer")
+    })?;
+    let max_transient_attempts = max_transient_attempts.parse::<i32>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_MAX_TRANSIENT_ATTEMPTS must be an integer")
+    })?;
     personal_agents::PersonalAgentConfig::new(
         recent_turn_limit,
         lease_seconds,
         poll_interval_seconds,
+        max_concurrent_turns,
+        max_transient_attempts,
+        limits,
     )
     .map_err(io::Error::other)
 }

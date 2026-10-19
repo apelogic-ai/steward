@@ -503,6 +503,14 @@ spec:
             - { name: STEWARD_PERSONAL_AGENT_RECENT_TURN_LIMIT, value: {{ .Values.config.apiserver.personalAgents.recentTurnLimit | int64 | quote }} }
             - { name: STEWARD_PERSONAL_AGENT_LEASE_SECONDS, value: {{ .Values.config.apiserver.personalAgents.leaseSeconds | int64 | quote }} }
             - { name: STEWARD_PERSONAL_AGENT_POLL_INTERVAL_SECONDS, value: {{ .Values.config.apiserver.personalAgents.pollIntervalSeconds | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_MAX_CONCURRENT_TURNS, value: {{ .Values.config.apiserver.personalAgents.maxConcurrentTurns | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_MAX_TRANSIENT_ATTEMPTS, value: {{ .Values.config.apiserver.personalAgents.maxTransientAttempts | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_MAX_NAME_BYTES, value: {{ .Values.config.apiserver.personalAgents.maxNameBytes | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_MAX_INSTRUCTIONS_BYTES, value: {{ .Values.config.apiserver.personalAgents.maxInstructionsBytes | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_MAX_MESSAGE_BYTES, value: {{ .Values.config.apiserver.personalAgents.maxMessageBytes | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_MAX_QUEUED_BYTES, value: {{ .Values.config.apiserver.personalAgents.maxQueuedBytes | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_MAX_REPLY_BYTES, value: {{ .Values.config.apiserver.personalAgents.maxReplyBytes | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_MAX_PROMPT_BYTES, value: {{ .Values.config.apiserver.personalAgents.maxPromptBytes | int64 | quote }} }
             - { name: STEWARD_WORKSPACE_POLICY_JSON, value: {{ .Values.workspace | toJson | quote }} }
 {{- if .Values.githubSource.enabled }}
             - { name: STEWARD_GITHUB_SOURCE_APP_ID, value: {{ .Values.githubSource.appId | quote }} }

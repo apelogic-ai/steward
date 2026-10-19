@@ -34,9 +34,9 @@ use steward_ports::{
 };
 use steward_store::{
     EnvelopeRequestRecord, FederatedSubjectObservation, FederatedSubjectRecord,
-    ManagedInferenceKeyCipher, PgStore, StoreError, TaskOrchestrationMode, TaskOutputTranscript,
-    TaskRecord, TaskReservationRequest, TaskRuntimeOperationRecord, TaskRuntimeOwnership,
-    WorkflowRevisionRecord,
+    ManagedInferenceKeyCipher, PersonalAgentRecord, PgStore, StoreError, TaskOrchestrationMode,
+    TaskOutputTranscript, TaskRecord, TaskReservationRequest, TaskRuntimeOperationRecord,
+    TaskRuntimeOwnership, WorkflowRevisionRecord,
 };
 use steward_types::direct_package::{
     BoundedText, BrowserTaskEvidence, BrowserTaskSubmission, ClosureEntry, ClosureEntryKind,
@@ -2077,8 +2077,8 @@ pub(crate) struct PersonalAgentTaskRunner<L> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PersonalAgentTaskError {
-    Rejected,
-    Unavailable,
+    Permanent,
+    Transient,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2104,8 +2104,9 @@ pub(crate) fn personal_agent_task_definition(
     agent_ref: &str,
     prompt: &str,
     envelope: &steward_admission::Envelope,
+    model: &ModelRef,
 ) -> Result<DirectTaskDefinition, String> {
-    let mut requirements = direct_requirements_from_envelope(&envelope.spec)
+    let mut requirements = direct_requirements_from_envelope_with_platform_default(&envelope.spec)
         .map_err(|error| format!("personal agent Envelope cannot be projected: {error:?}"))?;
     requirements.authority.tools.clear();
     let definition = DirectTaskDefinition {
@@ -2116,7 +2117,10 @@ pub(crate) fn personal_agent_task_definition(
         runtime: steward_types::direct_package::RuntimeSelection {
             agent_ref: steward_types::direct_package::AgentRef::parse(agent_ref.to_owned())
                 .map_err(|error| format!("personal agent reference is invalid: {error}"))?,
-            model: None,
+            model: Some(steward_types::direct_package::ModelRequirement {
+                provider: steward_types::direct_package::Slug::parse(model.provider.clone())?,
+                model: steward_types::direct_package::BoundedText::parse(model.model.clone())?,
+            }),
         },
         prompt: None,
         prompt_text: Some(prompt.to_owned()),
@@ -2145,7 +2149,7 @@ where
         turn_id: Uuid,
         owner_user_id: CanonicalUserId,
         owner: Email,
-        agent_ref: &str,
+        agent: &PersonalAgentRecord,
         prompt: &str,
         envelope: &EnvelopeRequestRecord,
     ) -> Result<Uuid, PersonalAgentTaskError> {
@@ -2153,27 +2157,28 @@ where
             .approved_envelope
             .as_ref()
             .filter(|_| envelope.status == steward_store::EnvelopeRequestStatus::Provisioned)
-            .ok_or(PersonalAgentTaskError::Rejected)?;
+            .ok_or(PersonalAgentTaskError::Permanent)?;
         let digest = envelope
             .envelope_digest
             .as_deref()
-            .ok_or(PersonalAgentTaskError::Rejected)?;
+            .ok_or(PersonalAgentTaskError::Permanent)?;
         let digest = EnvelopeDigest::parse(if digest.starts_with("steward:") {
             digest.to_owned()
         } else {
             format!("steward:{digest}")
         })
-        .map_err(|_| PersonalAgentTaskError::Rejected)?;
-        let definition = personal_agent_task_definition(agent_ref, prompt, approved)
-            .map_err(|_| PersonalAgentTaskError::Rejected)?;
+        .map_err(|_| PersonalAgentTaskError::Permanent)?;
         let definition =
-            serde_json::to_string(&definition).map_err(|_| PersonalAgentTaskError::Unavailable)?;
+            personal_agent_task_definition(&agent.agent_ref, prompt, approved, &agent.model)
+                .map_err(|_| PersonalAgentTaskError::Permanent)?;
+        let definition =
+            serde_json::to_string(&definition).map_err(|_| PersonalAgentTaskError::Permanent)?;
         let request = BrowserTaskSubmission {
             package: steward_types::direct_package::BrowserPackageLocator {
                 source: "inline".to_owned(),
                 revision: None,
                 path: RelativePath::parse("task-definition.json")
-                    .map_err(|_| PersonalAgentTaskError::Rejected)?,
+                    .map_err(|_| PersonalAgentTaskError::Permanent)?,
                 files: Some(BTreeMap::from([(
                     "task-definition.json".to_owned(),
                     definition,
@@ -2207,8 +2212,8 @@ where
                 | ApiError::DirectPackageSourceDisabled
                 | ApiError::MissingEnvelope
                 | ApiError::Conflict(_)
-                | ApiError::Store(StoreError::StaleEnvelope) => PersonalAgentTaskError::Rejected,
-                _ => PersonalAgentTaskError::Unavailable,
+                | ApiError::Store(StoreError::StaleEnvelope) => PersonalAgentTaskError::Permanent,
+                _ => PersonalAgentTaskError::Transient,
             })
     }
 
@@ -2222,29 +2227,29 @@ where
             .ledger
             .task_for_submitter(task_uid, "steward-personal-agent", owner_user_id.as_str())
             .await
-            .map_err(|_| PersonalAgentTaskError::Unavailable)?
-            .ok_or(PersonalAgentTaskError::Unavailable)?;
+            .map_err(|_| PersonalAgentTaskError::Transient)?
+            .ok_or(PersonalAgentTaskError::Permanent)?;
         match task.phase {
             TaskPhase::Succeeded => {
                 let archive = task
                     .output_archive
-                    .ok_or(PersonalAgentTaskError::Rejected)?;
+                    .ok_or(PersonalAgentTaskError::Permanent)?;
                 let entries =
                     task_output_archive_entries(&archive, TaskOutputArchiveCompatibility::Strict)
-                        .map_err(|_| PersonalAgentTaskError::Rejected)?;
+                        .map_err(|_| PersonalAgentTaskError::Permanent)?;
                 let entry = entries
                     .iter()
                     .find(|entry| entry.path == "reply.txt")
-                    .ok_or(PersonalAgentTaskError::Rejected)?;
+                    .ok_or(PersonalAgentTaskError::Permanent)?;
                 let end = entry
                     .offset
                     .checked_add(entry.size)
                     .filter(|end| *end <= archive.len())
-                    .ok_or(PersonalAgentTaskError::Rejected)?;
+                    .ok_or(PersonalAgentTaskError::Permanent)?;
                 let reply = std::str::from_utf8(&archive[entry.offset..end])
                     .ok()
                     .filter(|reply| !reply.is_empty())
-                    .ok_or(PersonalAgentTaskError::Rejected)?;
+                    .ok_or(PersonalAgentTaskError::Permanent)?;
                 Ok(PersonalAgentTaskState::Done(reply.to_owned()))
             }
             TaskPhase::Failed | TaskPhase::Cancelled => {
@@ -6644,6 +6649,19 @@ fn verified_git_file(file: GitFile, request: &GitFileRequest) -> Result<Vec<u8>,
 }
 
 fn direct_requirements_from_envelope(spec: &EnvelopeSpec) -> Result<DirectRequirements, ApiError> {
+    direct_requirements_from_envelope_inner(spec, false)
+}
+
+fn direct_requirements_from_envelope_with_platform_default(
+    spec: &EnvelopeSpec,
+) -> Result<DirectRequirements, ApiError> {
+    direct_requirements_from_envelope_inner(spec, true)
+}
+
+fn direct_requirements_from_envelope_inner(
+    spec: &EnvelopeSpec,
+    include_empty_platforms: bool,
+) -> Result<DirectRequirements, ApiError> {
     let mut authority = serde_json::to_value(spec)
         .map_err(|error| ApiError::Admission(format!("Envelope cannot be projected: {error}")))?;
     let authority = authority
@@ -6663,9 +6681,11 @@ fn direct_requirements_from_envelope(spec: &EnvelopeSpec) -> Result<DirectRequir
         .ok_or_else(|| {
             ApiError::Admission("Envelope runner requirements are invalid".to_owned())
         })?;
-    runner
-        .entry("platforms".to_owned())
-        .or_insert_with(|| serde_json::json!([]));
+    if include_empty_platforms {
+        runner
+            .entry("platforms".to_owned())
+            .or_insert_with(|| serde_json::json!([]));
+    }
     for field in ["memory", "compute", "storage"] {
         runner
             .entry(field.to_owned())

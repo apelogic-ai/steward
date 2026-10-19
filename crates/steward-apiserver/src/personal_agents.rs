@@ -13,10 +13,11 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use steward_store::{
     CreatePersonalAgentRequest as StoreCreatePersonalAgentRequest, EnvelopeRequestStatus,
-    PersonalAgentDispatchRecord, PersonalAgentMessageRecord, PersonalAgentRecord,
-    PersonalAgentReplyRecord, PersonalAgentTurnRecord, PersonalAgentTurnStatus, PgStore,
-    StoreError,
+    PersonalAgentDispatchRecord, PersonalAgentLimits, PersonalAgentMessageRecord,
+    PersonalAgentRecord, PersonalAgentReplyRecord, PersonalAgentTurnRecord,
+    PersonalAgentTurnStatus, PgStore, StoreError, personal_agent_turn_prompt,
 };
+use steward_types::ModelRef;
 use uuid::Uuid;
 
 use crate::TaskApiConfig;
@@ -32,13 +33,23 @@ pub const PERSONAL_AGENTS_API_VERSION: &str = "steward.personal-agents/v1";
 pub const DEFAULT_RECENT_TURN_LIMIT: i64 = 8;
 pub const DEFAULT_LEASE_SECONDS: i64 = 30;
 pub const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 2;
-const MAX_PROMPT_BYTES: usize = 32 * 1024;
+pub const DEFAULT_MAX_CONCURRENT_TURNS: usize = 8;
+pub const DEFAULT_MAX_TRANSIENT_ATTEMPTS: i32 = 3;
+pub const DEFAULT_MAX_NAME_BYTES: usize = 200;
+pub const DEFAULT_MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 16 * 1024;
+pub const DEFAULT_MAX_QUEUED_BYTES: usize = 24 * 1024;
+pub const DEFAULT_MAX_REPLY_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PersonalAgentConfig {
     recent_turn_limit: i64,
     lease_seconds: i64,
     poll_interval: Duration,
+    max_concurrent_turns: usize,
+    max_transient_attempts: i32,
+    limits: PersonalAgentLimits,
 }
 
 impl PersonalAgentConfig {
@@ -46,6 +57,9 @@ impl PersonalAgentConfig {
         recent_turn_limit: i64,
         lease_seconds: i64,
         poll_interval_seconds: u64,
+        max_concurrent_turns: usize,
+        max_transient_attempts: i32,
+        limits: PersonalAgentLimits,
     ) -> Result<Self, String> {
         if !(1..=100).contains(&recent_turn_limit) {
             return Err("personal agent thread turn limit must be between 1 and 100".to_owned());
@@ -59,10 +73,25 @@ impl PersonalAgentConfig {
                     .to_owned(),
             );
         }
+        if max_concurrent_turns == 0 || max_transient_attempts <= 0 {
+            return Err("personal agent concurrency and retry limits must be positive".to_owned());
+        }
+        if limits.max_name_bytes == 0
+            || limits.max_instructions_bytes == 0
+            || limits.max_message_bytes == 0
+            || limits.max_queued_bytes < limits.max_message_bytes
+            || limits.max_reply_bytes == 0
+            || limits.max_prompt_bytes == 0
+        {
+            return Err("personal agent content limits must be positive and consistent".to_owned());
+        }
         Ok(Self {
             recent_turn_limit,
             lease_seconds,
             poll_interval: Duration::from_secs(poll_interval_seconds),
+            max_concurrent_turns,
+            max_transient_attempts,
+            limits,
         })
     }
 }
@@ -71,6 +100,7 @@ impl PersonalAgentConfig {
 pub(crate) struct PersonalAgentApiState {
     store: PgStore,
     agent_refs: Arc<BTreeSet<String>>,
+    limits: PersonalAgentLimits,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, utoipa::ToSchema)]
@@ -79,6 +109,7 @@ pub(crate) struct CreatePersonalAgentBody {
     name: String,
     agent_ref: String,
     instructions: String,
+    model: Option<ModelRef>,
     #[schema(value_type = String, format = "uuid")]
     envelope_request_id: Uuid,
 }
@@ -98,6 +129,7 @@ pub(crate) struct PersonalAgentView {
     name: String,
     agent_ref: String,
     instructions: String,
+    model: ModelRef,
     #[schema(value_type = String, format = "uuid")]
     envelope_request_id: Uuid,
     created_at: String,
@@ -111,6 +143,7 @@ impl From<PersonalAgentRecord> for PersonalAgentView {
             name: record.name,
             agent_ref: record.agent_ref,
             instructions: record.instructions,
+            model: record.model,
             envelope_request_id: record.envelope_request_id,
             created_at: record.created_at,
             updated_at: record.updated_at,
@@ -245,6 +278,7 @@ pub fn protected_router(
     store: PgStore,
     agent_refs: impl IntoIterator<Item = String>,
     browser_auth: BrowserAuthService,
+    config: PersonalAgentConfig,
 ) -> Router {
     let routes = Router::new()
         .route(
@@ -259,6 +293,7 @@ pub fn protected_router(
         .with_state(PersonalAgentApiState {
             store,
             agent_refs: Arc::new(agent_refs.into_iter().collect()),
+            limits: config.limits,
         });
     protect_browser_routes(routes, browser_auth)
 }
@@ -345,14 +380,18 @@ pub(crate) async fn create_personal_agent(
     }
     match state
         .store
-        .create_personal_agent(StoreCreatePersonalAgentRequest {
-            id: Uuid::new_v4(),
-            owner_user_id: &session.principal.canonical_user_id,
-            name: &body.name,
-            agent_ref: &body.agent_ref,
-            instructions: &body.instructions,
-            envelope_request_id: body.envelope_request_id,
-        })
+        .create_personal_agent(
+            StoreCreatePersonalAgentRequest {
+                id: Uuid::new_v4(),
+                owner_user_id: &session.principal.canonical_user_id,
+                name: &body.name,
+                agent_ref: &body.agent_ref,
+                instructions: &body.instructions,
+                model: body.model.as_ref(),
+                envelope_request_id: body.envelope_request_id,
+            },
+            state.limits,
+        )
         .await
     {
         Ok(agent) => (
@@ -480,6 +519,7 @@ pub(crate) async fn post_personal_agent_message(
             Uuid::new_v4(),
             &body.content,
             &body.idempotency_key,
+            state.limits,
         )
         .await
     {
@@ -541,9 +581,12 @@ fn invalid_request() -> Response {
 
 fn store_error_response(error: StoreError) -> Response {
     match error {
-        StoreError::PersonalAgentNotFound | StoreError::PersonalAgentEnvelopeNotFound => {
-            agent_not_found()
-        }
+        StoreError::PersonalAgentNotFound => agent_not_found(),
+        StoreError::PersonalAgentEnvelopeNotFound => personal_agent_error(
+            StatusCode::NOT_FOUND,
+            "envelope_not_found",
+            "That Envelope isn't available.",
+        ),
         StoreError::PersonalAgentEnvelopeInactive => personal_agent_error(
             StatusCode::CONFLICT,
             "envelope_not_active",
@@ -553,6 +596,21 @@ fn store_error_response(error: StoreError) -> Response {
             StatusCode::CONFLICT,
             "idempotency_conflict",
             "This message key was already used for different content.",
+        ),
+        StoreError::PersonalAgentModelRequired => personal_agent_error(
+            StatusCode::CONFLICT,
+            "model_required",
+            "Choose a model for this Envelope.",
+        ),
+        StoreError::PersonalAgentModelUnavailable => personal_agent_error(
+            StatusCode::CONFLICT,
+            "model_not_available",
+            "Choose a model from this Envelope.",
+        ),
+        StoreError::PersonalAgentConversationTooLarge => personal_agent_error(
+            StatusCode::CONFLICT,
+            "conversation_too_large",
+            "This conversation is too large for another message. Start a new personal agent.",
         ),
         StoreError::InvalidPersonalAgent | StoreError::InvalidPersonalAgentMessage => {
             invalid_request()
@@ -567,178 +625,244 @@ pub(crate) async fn run_dispatcher(
     config: PersonalAgentConfig,
 ) {
     let worker = format!("personal-agent-dispatcher:{}", Uuid::new_v4());
+    let mut active = tokio::task::JoinSet::new();
     loop {
-        match store
-            .claim_personal_agent_turn(&worker, config.lease_seconds, config.recent_turn_limit)
-            .await
-        {
-            Ok(Some(dispatch)) => run_turn(&store, &runner, &worker, config, dispatch).await,
-            Ok(None) | Err(_) => tokio::time::sleep(config.poll_interval).await,
+        let mut found_turn = false;
+        while active.len() < config.max_concurrent_turns {
+            match store
+                .claim_personal_agent_turn(&worker, config.lease_seconds, config.recent_turn_limit)
+                .await
+            {
+                Ok(Some(dispatch)) => {
+                    found_turn = true;
+                    let store = store.clone();
+                    let runner = runner.clone();
+                    let worker = worker.clone();
+                    active.spawn(
+                        async move { run_turn(store, runner, worker, config, dispatch).await },
+                    );
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        if active.is_empty() {
+            tokio::time::sleep(config.poll_interval).await;
+        } else if found_turn && active.len() == config.max_concurrent_turns {
+            report_completed_turn(active.join_next().await);
+        } else {
+            tokio::select! {
+                completed = active.join_next() => report_completed_turn(completed),
+                () = tokio::time::sleep(config.poll_interval) => {}
+            }
+        }
+    }
+}
+
+fn report_completed_turn(result: Option<Result<Result<(), StoreError>, tokio::task::JoinError>>) {
+    match result {
+        Some(Ok(Ok(()))) | None => {}
+        Some(Ok(Err(error))) => {
+            eprintln!("personal agent turn will be retried after storage failure: {error}");
+        }
+        Some(Err(error)) => {
+            eprintln!("personal agent turn worker stopped unexpectedly: {error}");
         }
     }
 }
 
 async fn run_turn(
-    store: &PgStore,
-    runner: &PersonalAgentTaskRunner<PgStore>,
-    worker: &str,
+    store: PgStore,
+    runner: PersonalAgentTaskRunner<PgStore>,
+    worker: String,
     config: PersonalAgentConfig,
     dispatch: PersonalAgentDispatchRecord,
-) {
-    let Some(envelope) = dispatch
-        .envelope_request
-        .as_ref()
-        .filter(|envelope| envelope.status == EnvelopeRequestStatus::Provisioned)
-    else {
-        let _ = store
-            .fail_personal_agent_turn(
-                dispatch.turn.id,
-                worker,
-                "This agent no longer has active access. Choose an active Envelope.",
-            )
-            .await;
-        return;
-    };
-    let Some(prompt) = turn_prompt(&dispatch) else {
-        let _ = store
-            .fail_personal_agent_turn(
-                dispatch.turn.id,
-                worker,
-                "This conversation is too large for one turn. Start a new personal agent.",
-            )
-            .await;
-        return;
-    };
+) -> Result<(), StoreError> {
     let task_uid = match dispatch.turn.task_uid {
         Some(task_uid) => task_uid,
-        None => match runner
-            .submit(
-                dispatch.turn.id,
-                dispatch.owner_user_id.clone(),
-                dispatch.owner_display_email.clone(),
-                &dispatch.agent.agent_ref,
-                &prompt,
-                envelope,
-            )
-            .await
-        {
-            Ok(task_uid) => {
-                if store
-                    .attach_personal_agent_task(dispatch.turn.id, worker, task_uid)
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                task_uid
-            }
-            Err(PersonalAgentTaskError::Rejected) => {
-                let _ = store
+        None => {
+            let Some(envelope) = dispatch
+                .envelope_request
+                .as_ref()
+                .filter(|envelope| envelope.status == EnvelopeRequestStatus::Provisioned)
+            else {
+                return store
                     .fail_personal_agent_turn(
                         dispatch.turn.id,
-                        worker,
+                        &worker,
+                        "This agent no longer has active access. Choose an active Envelope.",
+                    )
+                    .await;
+            };
+            let Some(prompt) = turn_prompt(&dispatch, config.limits.max_prompt_bytes) else {
+                return store
+                    .fail_personal_agent_turn(
+                        dispatch.turn.id,
+                        &worker,
+                        "This conversation is too large for one turn. Start a new personal agent.",
+                    )
+                    .await;
+            };
+            match runner
+                .submit(
+                    dispatch.turn.id,
+                    dispatch.owner_user_id.clone(),
+                    dispatch.owner_display_email.clone(),
+                    &dispatch.agent,
+                    &prompt,
+                    envelope,
+                )
+                .await
+            {
+                Ok(task_uid) => {
+                    store
+                        .attach_personal_agent_task(dispatch.turn.id, &worker, task_uid)
+                        .await?;
+                    task_uid
+                }
+                Err(error) => {
+                    return handle_task_error(
+                        &store,
+                        &worker,
+                        &dispatch,
+                        config,
+                        error,
                         "This turn could not start with the selected coding agent and Envelope.",
                     )
                     .await;
-                return;
+                }
             }
-            Err(PersonalAgentTaskError::Unavailable) => return,
-        },
+        }
     };
     loop {
-        if store
-            .renew_personal_agent_turn_lease(dispatch.turn.id, worker, config.lease_seconds)
-            .await
-            .is_err()
-        {
-            return;
-        }
+        store
+            .renew_personal_agent_turn_lease(dispatch.turn.id, &worker, config.lease_seconds)
+            .await?;
         match runner.status(task_uid, &dispatch.owner_user_id).await {
             Ok(PersonalAgentTaskState::Pending) => {
                 tokio::time::sleep(config.poll_interval).await;
             }
             Ok(PersonalAgentTaskState::Done(reply)) => {
-                let _ = store
-                    .complete_personal_agent_turn(dispatch.turn.id, worker, &reply)
-                    .await;
-                return;
+                return match store
+                    .complete_personal_agent_turn(
+                        dispatch.turn.id,
+                        &worker,
+                        &reply,
+                        config.limits.max_reply_bytes,
+                    )
+                    .await
+                {
+                    Err(StoreError::PersonalAgentReplyTooLarge) => {
+                        store
+                            .fail_personal_agent_turn(
+                                dispatch.turn.id,
+                                &worker,
+                                "The reply was too large to save.",
+                            )
+                            .await
+                    }
+                    result => result,
+                };
             }
             Ok(PersonalAgentTaskState::Failed(reason)) => {
-                let _ = store
-                    .fail_personal_agent_turn(dispatch.turn.id, worker, &reason)
+                return store
+                    .fail_personal_agent_turn(dispatch.turn.id, &worker, &reason)
                     .await;
-                return;
             }
-            Err(PersonalAgentTaskError::Rejected) => {
-                let _ = store
-                    .fail_personal_agent_turn(
-                        dispatch.turn.id,
-                        worker,
-                        "The coding agent did not return a usable reply. Try again.",
-                    )
-                    .await;
-                return;
+            Err(error) => {
+                return handle_task_error(
+                    &store,
+                    &worker,
+                    &dispatch,
+                    config,
+                    error,
+                    "The coding agent did not return a usable reply. Try again.",
+                )
+                .await;
             }
-            Err(PersonalAgentTaskError::Unavailable) => return,
         }
     }
 }
 
-fn turn_prompt(dispatch: &PersonalAgentDispatchRecord) -> Option<String> {
-    let mut history = dispatch.recent_turns.as_slice();
-    loop {
-        let mut prompt = String::from("Follow these personal agent instructions:\n");
-        prompt.push_str(&dispatch.agent.instructions);
-        prompt.push_str("\n\nRecent conversation:\n");
-        for turn in history {
-            for message in &turn.messages {
-                prompt.push_str("User: ");
-                prompt.push_str(&message.content);
-                prompt.push('\n');
-            }
-            if let Some(reply) = &turn.reply {
-                prompt.push_str("Agent: ");
-                prompt.push_str(&reply.content);
-                prompt.push('\n');
-            }
+async fn handle_task_error(
+    store: &PgStore,
+    worker: &str,
+    dispatch: &PersonalAgentDispatchRecord,
+    config: PersonalAgentConfig,
+    error: PersonalAgentTaskError,
+    permanent_reason: &str,
+) -> Result<(), StoreError> {
+    match error {
+        PersonalAgentTaskError::Permanent => {
+            store
+                .fail_personal_agent_turn(dispatch.turn.id, worker, permanent_reason)
+                .await
         }
-        prompt.push_str("\nNew messages:\n");
-        for message in &dispatch.turn.messages {
-            prompt.push_str("User: ");
-            prompt.push_str(&message.content);
-            prompt.push('\n');
+        PersonalAgentTaskError::Transient
+            if dispatch.turn.dispatch_attempts >= config.max_transient_attempts =>
+        {
+            store
+                .fail_personal_agent_turn(
+                    dispatch.turn.id,
+                    worker,
+                    "This turn could not continue after several attempts. Try again.",
+                )
+                .await
         }
-        prompt.push_str(
-            "\nAnswer the new messages. Do not use tools. Write only the final reply to out/reply.txt.",
-        );
-        if prompt.len() <= MAX_PROMPT_BYTES {
-            return Some(prompt);
+        PersonalAgentTaskError::Transient => {
+            store
+                .retry_personal_agent_turn(dispatch.turn.id, worker)
+                .await
         }
-        history = history.get(1..)?;
     }
+}
+
+fn turn_prompt(dispatch: &PersonalAgentDispatchRecord, max_prompt_bytes: usize) -> Option<String> {
+    personal_agent_turn_prompt(
+        &dispatch.agent.instructions,
+        &dispatch.recent_turns,
+        &dispatch.turn.messages,
+        max_prompt_bytes,
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{PersonalAgentConfig, PersonalAgentDispatchRecord, turn_prompt};
+    use super::{
+        DEFAULT_MAX_INSTRUCTIONS_BYTES, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_NAME_BYTES,
+        DEFAULT_MAX_PROMPT_BYTES, DEFAULT_MAX_QUEUED_BYTES, DEFAULT_MAX_REPLY_BYTES,
+        PersonalAgentConfig, PersonalAgentDispatchRecord, turn_prompt,
+    };
     use crate::tasks::personal_agent_task_definition;
     use steward_admission::{Envelope, EnvelopeSpec};
     use steward_store::{
-        PersonalAgentMessageRecord, PersonalAgentRecord, PersonalAgentTurnRecord,
-        PersonalAgentTurnStatus,
+        PersonalAgentLimits, PersonalAgentMessageRecord, PersonalAgentRecord,
+        PersonalAgentTurnRecord, PersonalAgentTurnStatus,
     };
     use steward_types::{
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
     };
     use uuid::Uuid;
 
+    fn limits() -> PersonalAgentLimits {
+        PersonalAgentLimits {
+            max_name_bytes: DEFAULT_MAX_NAME_BYTES,
+            max_instructions_bytes: DEFAULT_MAX_INSTRUCTIONS_BYTES,
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+            max_queued_bytes: DEFAULT_MAX_QUEUED_BYTES,
+            max_reply_bytes: DEFAULT_MAX_REPLY_BYTES,
+            max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
+        }
+    }
+
     #[test]
     fn configuration_refuses_unbounded_or_unsafe_dispatch_values() {
-        assert!(PersonalAgentConfig::new(0, 30, 1).is_err());
-        assert!(PersonalAgentConfig::new(101, 30, 1).is_err());
-        assert!(PersonalAgentConfig::new(8, 4, 1).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 16).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1).is_ok());
+        assert!(PersonalAgentConfig::new(0, 30, 1, 8, 3, limits()).is_err());
+        assert!(PersonalAgentConfig::new(101, 30, 1, 8, 3, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 4, 1, 8, 3, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 16, 8, 3, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 0, 3, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 0, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, limits()).is_ok());
     }
 
     #[test]
@@ -757,6 +881,7 @@ mod tests {
             created_at: "2026-10-19T00:00:00Z".to_owned(),
             started_at: Some("2026-10-19T00:00:01Z".to_owned()),
             completed_at: None,
+            dispatch_attempts: 1,
         };
         let dispatch = PersonalAgentDispatchRecord {
             agent: PersonalAgentRecord {
@@ -764,6 +889,10 @@ mod tests {
                 name: "Helper".to_owned(),
                 agent_ref: "example-agent@1.0.0".to_owned(),
                 instructions: "Be concise.".to_owned(),
+                model: ModelRef {
+                    provider: "example".to_owned(),
+                    model: "model-a".to_owned(),
+                },
                 envelope_request_id: Uuid::new_v4(),
                 created_at: "2026-10-19T00:00:00Z".to_owned(),
                 updated_at: "2026-10-19T00:00:00Z".to_owned(),
@@ -774,7 +903,7 @@ mod tests {
             recent_turns: Vec::new(),
             envelope_request: None,
         };
-        let prompt = turn_prompt(&dispatch).ok_or("prompt")?;
+        let prompt = turn_prompt(&dispatch, DEFAULT_MAX_PROMPT_BYTES).ok_or("prompt")?;
         assert!(prompt.contains("Be concise."));
         assert!(prompt.contains("User: first"));
         assert!(prompt.contains("Do not use tools."));
@@ -807,9 +936,14 @@ mod tests {
                 runner: RunnerRequirements::default(),
             },
         };
-        let definition =
-            personal_agent_task_definition("future-agent@9.0.0", "Answer the user.", &envelope)
-                .map_err(|error| format!("build personal agent definition: {error}"))?;
+        let selected_model = envelope.spec.llms[0].clone();
+        let definition = personal_agent_task_definition(
+            "future-agent@9.0.0",
+            "Answer the user.",
+            &envelope,
+            &selected_model,
+        )
+        .map_err(|error| format!("build personal agent definition: {error}"))?;
         assert_eq!(definition.runtime.agent_ref.as_str(), "future-agent@9.0.0");
         let requirements = definition.requires.ok_or("requirements")?;
         assert_eq!(requirements.authority.llms.len(), 1);

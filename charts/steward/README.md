@@ -670,9 +670,11 @@ Steward release namespace also creates `steward-workflows`.
   mounts it read-only in the apiserver, and rolls the apiserver when its checksum
   changes. See [Execution bindings](../../docs/installation/execution-bindings.md).
 - `config.apiserver.personalAgents` bounds the personal-agent dispatcher. The defaults retain
-  8 completed turns in each new prompt, lease a running turn for 30 seconds, and check Task status
-  every 2 seconds when no terminal result is available. `pollIntervalSeconds` must be no more than
-  half of `leaseSeconds`; the apiserver refuses inconsistent values at startup.
+  8 completed turns in each new prompt, run up to 8 turns at once, try transient failures at most
+  3 times, lease a running turn for 30 seconds, and check Task status every 2 seconds when no
+  terminal result is available. The byte settings bound agent names, instructions, messages,
+  queued input, replies, and assembled prompts. `pollIntervalSeconds` must be no more than half of
+  `leaseSeconds`; the apiserver refuses inconsistent values at startup.
 - `workspace` governs typed Task workspaces before runtime creation.
   `enabledTypes` selects `git` and/or `scratch`; `maxTotalSize`, `maxFiles`,
   `maxHistoryDepth`, `maxSubmoduleDepth`, `maxSubmodulesPerEntry`,

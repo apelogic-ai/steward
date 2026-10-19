@@ -279,6 +279,14 @@ config:
       recentTurnLimit: 8
       leaseSeconds: 30
       pollIntervalSeconds: 2
+      maxConcurrentTurns: 8
+      maxTransientAttempts: 3
+      maxNameBytes: 200
+      maxInstructionsBytes: 16384
+      maxMessageBytes: 16384
+      maxQueuedBytes: 24576
+      maxReplyBytes: 1048576
+      maxPromptBytes: 32768
   controller:
     openshellEndpoint: ""
     openshellServerName: ""
