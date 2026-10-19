@@ -15,6 +15,7 @@ pub mod governed_connections;
 pub mod inference_connections;
 pub mod onboarding;
 pub mod operator_admin;
+pub mod personal_agents;
 pub mod preferences;
 pub mod stable_runtime_bridge;
 pub mod task_auth;
@@ -450,6 +451,11 @@ pub struct GrantRevocationRequest {
         operator_admin::apply_template,
         operator_admin::provision,
         onboarding::get_starter_task,
+        personal_agents::list_personal_agents,
+        personal_agents::create_personal_agent,
+        personal_agents::get_personal_agent,
+        personal_agents::list_personal_agent_messages,
+        personal_agents::post_personal_agent_message,
         agent_runs_contract,
         agent_run_contract,
         agent_run_timeline_contract
@@ -531,6 +537,18 @@ pub struct GrantRevocationRequest {
         onboarding::StarterTaskGitExample,
         onboarding::StarterTaskSetting,
         onboarding::StarterTaskResponse,
+        personal_agents::CreatePersonalAgentBody,
+        personal_agents::PostPersonalAgentMessageBody,
+        personal_agents::PersonalAgentView,
+        personal_agents::PersonalAgentTurnStatusView,
+        personal_agents::PersonalAgentMessageView,
+        personal_agents::PersonalAgentReplyView,
+        personal_agents::PersonalAgentTurnView,
+        personal_agents::PersonalAgentsResponse,
+        personal_agents::PersonalAgentResponse,
+        personal_agents::PersonalAgentTurnsResponse,
+        personal_agents::PersonalAgentTurnResponse,
+        personal_agents::PersonalAgentErrorResponse,
         AgentRunAvailability,
         AgentRunDataStatus,
         AgentRunSpendView,
@@ -2922,7 +2940,9 @@ impl IntoResponse for ApiError {
                 | StoreError::EnvelopeTemplateNotFound
                 | StoreError::WorkflowNotFound
                 | StoreError::ConnectionOperationNotFound
-                | StoreError::CumulativeEscalationNotFound,
+                | StoreError::CumulativeEscalationNotFound
+                | StoreError::PersonalAgentNotFound
+                | StoreError::PersonalAgentEnvelopeNotFound,
             ) => StatusCode::NOT_FOUND,
             Self::Store(StoreError::CanonicalIdentityInactive) => StatusCode::FORBIDDEN,
             Self::Store(
@@ -2971,7 +2991,14 @@ impl IntoResponse for ApiError {
                 | StoreError::ConnectionOperationConflict
                 | StoreError::ConnectionOperationIdempotencyConflict
                 | StoreError::ConnectionOAuthFlowPending
-                | StoreError::CumulativeEscalationConflict,
+                | StoreError::CumulativeEscalationConflict
+                | StoreError::PersonalAgentEnvelopeInactive
+                | StoreError::PersonalAgentModelRequired
+                | StoreError::PersonalAgentModelUnavailable
+                | StoreError::PersonalAgentMessageConflict
+                | StoreError::PersonalAgentMessageQueueFull
+                | StoreError::PersonalAgentConversationTooLarge
+                | StoreError::PersonalAgentLeaseLost,
             ) => StatusCode::CONFLICT,
             Self::Store(
                 StoreError::InvalidGrantExpiry
@@ -2989,7 +3016,10 @@ impl IntoResponse for ApiError {
                 | StoreError::InvalidManagedInferenceCredential
                 | StoreError::InvalidCumulativeEscalation
                 | StoreError::InvalidWorkflow
-                | StoreError::InvalidConnectionOperation,
+                | StoreError::InvalidConnectionOperation
+                | StoreError::InvalidPersonalAgent
+                | StoreError::InvalidPersonalAgentMessage
+                | StoreError::PersonalAgentReplyTooLarge,
             ) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Store(StoreError::InvalidRunQuery | StoreError::InvalidRunCursor) => {
                 StatusCode::BAD_REQUEST
@@ -5120,6 +5150,55 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[test]
+    fn personal_agent_routes_are_published_in_the_openapi_contract() -> Result<(), String> {
+        let document = serde_json::to_value(ApiDoc::openapi())
+            .map_err(|error| format!("failed to serialize OpenAPI document: {error}"))?;
+        for (pointer, operation_id) in [
+            ("/paths/~1app~1api~1v1~1agents/get", "listPersonalAgents"),
+            ("/paths/~1app~1api~1v1~1agents/post", "createPersonalAgent"),
+            (
+                "/paths/~1app~1api~1v1~1agents~1{agent_id}/get",
+                "getPersonalAgent",
+            ),
+            (
+                "/paths/~1app~1api~1v1~1agents~1{agent_id}~1messages/get",
+                "listPersonalAgentMessages",
+            ),
+            (
+                "/paths/~1app~1api~1v1~1agents~1{agent_id}~1messages/post",
+                "postPersonalAgentMessage",
+            ),
+        ] {
+            assert_eq!(
+                document.pointer(&format!("{pointer}/operationId")),
+                Some(&serde_json::json!(operation_id)),
+                "personal agent operation must be published"
+            );
+            assert_eq!(
+                document.pointer(&format!("{pointer}/security/0/browserSession")),
+                Some(&serde_json::json!([])),
+                "personal agent operation must require a browser session"
+            );
+        }
+        for schema in [
+            "CreatePersonalAgentBody",
+            "PostPersonalAgentMessageBody",
+            "PersonalAgentResponse",
+            "PersonalAgentTurnsResponse",
+            "PersonalAgentTurnResponse",
+            "PersonalAgentErrorResponse",
+        ] {
+            assert!(
+                document
+                    .pointer(&format!("/components/schemas/{schema}"))
+                    .is_some(),
+                "personal agent OpenAPI is missing its {schema} component"
+            );
+        }
+        Ok(())
     }
 
     #[test]
