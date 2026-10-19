@@ -97,10 +97,6 @@ export function activeEnvelopeChoices(
     : []);
 }
 
-export function shouldPollPersonalAgentThread(turns: ReadonlyArray<PersonalAgentTurn>): boolean {
-  return turns.some((turn) => turn.status === "queued" || turn.status === "running");
-}
-
 export function personalAgentFailureMessage(
   error: unknown,
   fallback = "Could not save this agent. Try again.",
@@ -176,14 +172,14 @@ async function personalAgentRequest<T>(
 }
 
 function listPersonalAgents(): Promise<PersonalAgentApiResult<PersonalAgents>> {
-  return personalAgentRequest("/app/api/v1/personal-agents");
+  return personalAgentRequest("/app/api/v1/agents");
 }
 
 function createPersonalAgent(
   body: { agentRef: string; envelopeRequestId: string; instructions: string; name: string },
   csrf: string,
 ): Promise<PersonalAgentApiResult<PersonalAgentResponse>> {
-  return personalAgentRequest("/app/api/v1/personal-agents", {
+  return personalAgentRequest("/app/api/v1/agents", {
     body: JSON.stringify(body),
     headers: { "Content-Type": "application/json", "X-Steward-CSRF": csrf },
     method: "POST",
@@ -191,11 +187,11 @@ function createPersonalAgent(
 }
 
 function getPersonalAgent(agentId: string): Promise<PersonalAgentApiResult<PersonalAgentResponse>> {
-  return personalAgentRequest(`/app/api/v1/personal-agents/${encodeURIComponent(agentId)}`);
+  return personalAgentRequest(`/app/api/v1/agents/${encodeURIComponent(agentId)}`);
 }
 
 function getPersonalAgentMessages(agentId: string): Promise<PersonalAgentApiResult<PersonalAgentThreadResponse>> {
-  return personalAgentRequest(`/app/api/v1/personal-agents/${encodeURIComponent(agentId)}/messages`);
+  return personalAgentRequest(`/app/api/v1/agents/${encodeURIComponent(agentId)}/messages`);
 }
 
 function postPersonalAgentMessage(
@@ -203,7 +199,7 @@ function postPersonalAgentMessage(
   body: { content: string; idempotencyKey: string },
   csrf: string,
 ): Promise<PersonalAgentApiResult<PersonalAgentMutationResult>> {
-  return personalAgentRequest(`/app/api/v1/personal-agents/${encodeURIComponent(agentId)}/messages`, {
+  return personalAgentRequest(`/app/api/v1/agents/${encodeURIComponent(agentId)}/messages`, {
     body: JSON.stringify(body),
     headers: { "Content-Type": "application/json", "X-Steward-CSRF": csrf },
     method: "POST",
@@ -294,36 +290,64 @@ export function NewPersonalAgentView() {
   );
 }
 
-function usePersonalAgentThread(agentId: string, refreshKey: number): ResourceState<PersonalAgentThread> {
+type PersonalAgentEventSource = {
+  close: () => void;
+  onmessage: ((event: MessageEvent) => void) | null;
+};
+
+type PersonalAgentEventSourceFactory = (
+  path: string,
+  init: EventSourceInit,
+) => PersonalAgentEventSource;
+
+export function subscribePersonalAgentEvents(
+  status: ResourceState<PersonalAgentThread>["status"],
+  agentId: string,
+  onEvent: () => void,
+  createEventSource: PersonalAgentEventSourceFactory = (path, init) => new EventSource(path, init),
+): (() => void) | undefined {
+  if (status !== "ready") return undefined;
+  const source = createEventSource(`/app/api/v1/agents/${encodeURIComponent(agentId)}/events`, {
+    withCredentials: true,
+  });
+  source.onmessage = () => onEvent();
+  return () => source.close();
+}
+
+function usePersonalAgentThread(agentId: string): Readonly<{
+  refresh: () => Promise<void>;
+  state: ResourceState<PersonalAgentThread>;
+}> {
   const [state, setState] = useState<ResourceState<PersonalAgentThread>>({ status: "loading" });
+  const mounted = useRef(false);
+  const refresh = useCallback(async () => {
+    const next = classifyResource(await loadPersonalAgentThread(agentId));
+    if (mounted.current) setState(next);
+  }, [agentId]);
+
   useEffect(() => {
-    let active = true;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    const refresh = async () => {
-      const next = classifyResource(await loadPersonalAgentThread(agentId));
-      if (!active) return;
-      setState(next);
-      if (next.status === "ready" && shouldPollPersonalAgentThread(next.value.turns)) {
-        timeout = setTimeout(() => void refresh(), 2_000);
-      }
-    };
+    mounted.current = true;
     void refresh();
     return () => {
-      active = false;
-      if (timeout) clearTimeout(timeout);
+      mounted.current = false;
     };
-  }, [agentId, refreshKey]);
-  return state;
+  }, [refresh]);
+
+  useEffect(
+    () => subscribePersonalAgentEvents(state.status, agentId, () => void refresh()),
+    [agentId, refresh, state.status],
+  );
+
+  return { refresh, state };
 }
 
 export function PersonalAgentDetailView({ agentId }: Readonly<{ agentId: string }>) {
   const session = useSession();
   const [draft, setDraft] = useState("");
   const [failure, setFailure] = useState<string | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
   const [sending, setSending] = useState(false);
   const idempotencyKey = useRef<string | null>(null);
-  const state = usePersonalAgentThread(agentId, refreshKey);
+  const { refresh, state } = usePersonalAgentThread(agentId);
 
   const updateDraft = (value: string) => {
     if (value !== draft) idempotencyKey.current = null;
@@ -348,7 +372,7 @@ export function PersonalAgentDetailView({ agentId }: Readonly<{ agentId: string 
     if (result.data && result.response?.ok) {
       idempotencyKey.current = null;
       setDraft("");
-      setRefreshKey((value) => value + 1);
+      await refresh();
       return;
     }
     setFailure(personalAgentFailureMessage(result.error, "Could not send this message. Try again."));

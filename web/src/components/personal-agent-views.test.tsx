@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import { classifyResource } from "@/data/use-api-resource";
@@ -9,7 +10,7 @@ import {
   activeEnvelopeChoices,
   nextPersonalAgentMessageKey,
   personalAgentFailureMessage,
-  shouldPollPersonalAgentThread,
+  subscribePersonalAgentEvents,
   type PersonalAgentThread,
 } from "./personal-agent-views";
 
@@ -34,6 +35,8 @@ const thread: PersonalAgentThread = {
     updatedAt: "2026-10-19T05:04:00Z",
   }],
 };
+
+const source = readFileSync(new URL("./personal-agent-views.tsx", import.meta.url), "utf8");
 
 describe("personal agent creation", () => {
   test("offers only active Envelopes and keeps their configured labels", () => {
@@ -88,16 +91,44 @@ describe("personal agent list", () => {
 });
 
 describe("personal agent thread", () => {
+  test("uses the owner-approved agent API routes", () => {
+    expect(source).toContain('personalAgentRequest("/app/api/v1/agents")');
+    expect(source).toContain("/app/api/v1/agents/${encodeURIComponent(agentId)}");
+    expect(source).not.toContain("/app/api/v1/personal-agents");
+  });
+
+  test("uses a browser event stream instead of polling for turn updates", () => {
+    expect(source).toContain("new EventSource");
+    expect(source).not.toContain("setTimeout");
+  });
+
   test("keeps one idempotency key while retrying the same message", () => {
     expect(nextPersonalAgentMessageKey("message-1", () => "message-2")).toBe("message-1");
     expect(nextPersonalAgentMessageKey(null, () => "message-2")).toBe("message-2");
   });
 
-  test("polls only while a turn is pending", () => {
-    expect(shouldPollPersonalAgentThread([{ ...thread.turns[0], status: "queued" }])).toBe(true);
-    expect(shouldPollPersonalAgentThread([{ ...thread.turns[0], status: "running" }])).toBe(true);
-    expect(shouldPollPersonalAgentThread([{ ...thread.turns[0], status: "done" }])).toBe(false);
-    expect(shouldPollPersonalAgentThread([{ ...thread.turns[0], status: "failed" }])).toBe(false);
+  test("opens one resumable browser stream only after the agent is found", () => {
+    let opened = 0;
+    let closed = 0;
+    let path = "";
+    let withCredentials = false;
+    const createEventSource = (nextPath: string, init: EventSourceInit) => {
+      opened += 1;
+      path = nextPath;
+      withCredentials = init.withCredentials ?? false;
+      return { close: () => { closed += 1; }, onmessage: null };
+    };
+
+    const missing = classifyResource<PersonalAgentThread>({ response: new Response(null, { status: 404 }) });
+    expect(subscribePersonalAgentEvents(missing.status, "not-owned", () => undefined, createEventSource)).toBeUndefined();
+    expect(opened).toBe(0);
+
+    const close = subscribePersonalAgentEvents("ready", "agent/1", () => undefined, createEventSource);
+    expect(opened).toBe(1);
+    expect(path).toBe("/app/api/v1/agents/agent%2F1/events");
+    expect(withCredentials).toBe(true);
+    close?.();
+    expect(closed).toBe(1);
   });
 
   test("shows the ordered conversation, turn status, and existing Run link", () => {

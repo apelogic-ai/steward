@@ -28,8 +28,8 @@ describe("primary navigation", () => {
     expect(isActive("/tasks/steward%3Asha256%3Aexample", "/runs")).toBe(false);
   });
 
-  test("offers Agents and selects it for list, creation, and thread routes", () => {
-    expect(source).toContain('{ href: "/agents", label: "Agents" }');
+  test("offers My agents and selects it for list, creation, and thread routes", () => {
+    expect(source).toContain('{ href: "/agents", label: "My agents" }');
     for (const pathname of ["/agents", "/agents/new", "/agents/agent-1"]) {
       expect(isActive(pathname, "/agents")).toBe(true);
     }
@@ -92,16 +92,16 @@ describe("breadcrumbs", () => {
   test("names agent list, creation, and thread routes", () => {
     expect(breadcrumbsForPath("/agents")).toEqual([
       { label: "User" },
-      { label: "Agents" },
+      { label: "My agents" },
     ]);
     expect(breadcrumbsForPath("/agents/new")).toEqual([
       { label: "User" },
-      { href: "/agents", label: "Agents" },
+      { href: "/agents", label: "My agents" },
       { label: "New agent" },
     ]);
     expect(breadcrumbsForPath("/agents/agent-3c9e1b27-long-value")).toEqual([
       { label: "User" },
-      { href: "/agents", label: "Agents" },
+      { href: "/agents", label: "My agents" },
       { label: "agent-3c9e1b…", mono: true },
     ]);
   });

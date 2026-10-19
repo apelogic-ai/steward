@@ -21,7 +21,7 @@ const userNavigation = [
   { href: "/get-started", label: "Get started" },
   { href: "/envelopes", label: "Envelopes" },
   { href: "/tasks", label: "Tasks" },
-  { href: "/agents", label: "Agents" },
+  { href: "/agents", label: "My agents" },
   { href: "/runs", label: "Runs" },
   { href: "/connections", label: "Connections" },
   { href: "/settings", label: "Settings" },
@@ -113,9 +113,9 @@ export function breadcrumbsForPath(pathname: string): BreadcrumbItem[] {
     return items;
   }
   if (!admin && rest[0] === "agents") {
-    if (!rest[1]) return [root, { label: "Agents" }];
-    if (rest[1] === "new") return [root, { href: "/agents", label: "Agents" }, { label: "New agent" }];
-    return [root, { href: "/agents", label: "Agents" }, { label: shortId(rest[1]), mono: true }];
+    if (!rest[1]) return [root, { label: "My agents" }];
+    if (rest[1] === "new") return [root, { href: "/agents", label: "My agents" }, { label: "New agent" }];
+    return [root, { href: "/agents", label: "My agents" }, { label: shortId(rest[1]), mono: true }];
   }
   if (admin && rest[0] === "approvals") {
     return rest[1]

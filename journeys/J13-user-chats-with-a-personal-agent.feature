@@ -13,7 +13,7 @@ Feature: J13 - User chats with a personal agent
     And I hold an Envelope from the template "standard"
 
   Scenario: Create an agent and see its reply and Run
-    When I open "Agents"
+    When I open "My agents"
     And I press "New agent"
     And I type "<run-prefix>-release-helper" into "Name"
     And I type "Reply to every message with exactly: personal agent complete" into "Instructions"
