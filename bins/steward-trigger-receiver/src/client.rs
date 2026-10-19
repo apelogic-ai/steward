@@ -570,6 +570,9 @@ impl TaskLifecycle for WorkloadExchangeClient {
                 return Err(classify_status(status));
             }
             let reply = read_task_reply(response, self.timing.max_reply_bytes).await?;
+            if status == StatusCode::OK {
+                return Ok(TaskStart::Duplicate);
+            }
             let base = format!("v1/tasks/{}", reply.task_uid);
             match reply.phase.as_str() {
                 "succeeded" | "failed" | "cancelled" => {
@@ -1829,9 +1832,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_duplicate_is_finalized_before_noop() -> Result<(), String> {
-        let (client, state, handle) =
-            client_fixture(StatusCode::OK, "succeeded", 0, Duration::from_secs(1), None).await?;
+    async fn accepted_terminal_task_is_finalized_before_noop() -> Result<(), String> {
+        let (client, state, handle) = client_fixture(
+            StatusCode::ACCEPTED,
+            "succeeded",
+            0,
+            Duration::from_secs(1),
+            None,
+        )
+        .await?;
         let result = client
             .start(&trigger()?, invocation()?)
             .await
@@ -1890,9 +1899,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_duplicate_reports_finalize_failure() -> Result<(), String> {
+    async fn accepted_terminal_task_reports_finalize_failure() -> Result<(), String> {
         let (client, state, handle) = client_fixture(
-            StatusCode::OK,
+            StatusCode::ACCEPTED,
             "succeeded",
             0,
             Duration::from_secs(1),
@@ -2130,29 +2139,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submitted_duplicate_resumes_upload_and_execute() -> Result<(), String> {
-        let (client, state, handle) =
-            client_fixture(StatusCode::OK, "submitted", 0, Duration::from_secs(1), None).await?;
-        let TaskStart::Started(completion) = client
-            .start(&trigger()?, invocation()?)
-            .await
-            .map_err(|error| format!("{error:?}"))?
-        else {
-            return Err("submitted duplicate must resume".to_owned());
-        };
-        completion.await.map_err(|error| format!("{error:?}"))?;
-        let requests = state.requests.lock().map_err(|_| "poisoned")?;
-        assert!(
-            requests
-                .iter()
-                .any(|(method, path, _)| *method == Method::PUT && path.ends_with("/inputs"))
-        );
-        assert!(
-            requests
-                .iter()
-                .any(|(method, path, _)| *method == Method::POST && path.ends_with("/execute"))
-        );
-        handle.abort();
+    async fn duplicate_create_never_mutates_the_existing_task() -> Result<(), String> {
+        for phase in [
+            "submitted",
+            "parked",
+            "queued",
+            "running",
+            "succeeded",
+            "failed",
+            "cancelled",
+        ] {
+            let (client, state, handle) =
+                client_fixture(StatusCode::OK, phase, 0, Duration::from_secs(1), None).await?;
+            assert!(matches!(
+                client
+                    .start(&trigger()?, invocation()?)
+                    .await
+                    .map_err(|error| format!("{error:?}"))?,
+                TaskStart::Duplicate
+            ));
+            let requests = state.requests.lock().map_err(|_| "poisoned")?;
+            assert_eq!(
+                requests.len(),
+                1,
+                "a {phase} duplicate must make only the create request"
+            );
+            assert_eq!(requests[0].0, Method::POST);
+            assert_eq!(requests[0].1, "/v1/tasks");
+            drop(requests);
+            handle.abort();
+        }
         Ok(())
     }
 }

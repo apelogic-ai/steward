@@ -131,7 +131,8 @@ cargo test \
   --features postgres-e2e \
   --test write_catalog_process \
   -- \
-  --nocapture
+  --nocapture \
+  --test-threads=1
 cargo test \
   --manifest-path "${ROOT}/e2e/Cargo.toml" \
   --test postgres_tls \

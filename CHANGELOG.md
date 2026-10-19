@@ -29,9 +29,10 @@ chart rendering, caller refusal coverage, and coding-agent execution evidence.
   All runs, and run details show that context with the service name from the verified Task token;
   the Jira receiver supplies its Trigger id, issue key, and configured-site issue link.
 - Added prepared `@callers` journeys for Jenkins and Temporal Run API callers, Jira receiver
-  delivery and replay, unbound-caller refusal, write-capable Envelope refusal, missing or invalid
-  Jira signatures, and Trigger cooldown. Direct receiver paths now follow the deployed response
-  contract; the live Jira path still requires an explicit owner opt-in.
+  delivery and replay, unbound-caller refusal, missing or invalid Jira signatures, and Trigger
+  cooldown. The real receiver process test covers write-capable Envelope refusal without adding a
+  deliberately write-capable receiver to local-main. Direct receiver paths now follow the deployed
+  response contract; the live Jira path still requires an explicit owner opt-in.
 - Added validation, routing, and the ability to start and clean up governed Tasks for signed,
   bounded Jira webhook Triggers. The Helm chart can now deploy that receiver with isolated
   identity, exact Secret and CA projections, bounded runtime settings, and deny-by-default
@@ -52,6 +53,10 @@ chart rendering, caller refusal coverage, and coding-agent execution evidence.
 
 ### Fixed
 
+- Exact Jira webhook replays now return `200 No run needed` even when a retry reaches a different
+  receiver process or the original process restarted. Only a new PostgreSQL Task reservation can
+  return `202 Accepted`; a duplicate never uploads inputs, starts, or finalizes the existing Task,
+  and it does not consume the receiving process's cooldown or concurrency limit.
 - Caller journeys now use a protected short-lived administrator token for Run checks, so Jenkins,
   Temporal, and Jira acceptance can run without a person's browser session or putting the bearer
   in Playwright traces.

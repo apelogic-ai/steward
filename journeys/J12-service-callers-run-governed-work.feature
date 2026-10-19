@@ -38,6 +38,9 @@ Feature: J12 - Service callers run governed work
     And the receiver creates 1 new Task
     And the receiver Task ends as "succeeded" within 4 min
 
+  # Covered by bins/steward-trigger-receiver/tests/write_catalog_process.rs, which proves both
+  # startup and live-reload refusal with the real receiver and PostgreSQL.
+  @covered-by-process-e2e
   Scenario: A write-capable Envelope is refused by the Jira receiver
     Given the Jira receiver uses a write-capable Envelope
     When Jira sends the signed delivery "delivery-456" for issue "PROJ-124"
