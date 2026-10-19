@@ -1,25 +1,30 @@
 //! Browser-session personal agents and their one-turn-at-a-time dispatcher.
 
 use std::collections::{BTreeSet, HashMap};
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use chrono::{DateTime, TimeDelta, Utc};
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use steward_admission::duration_seconds;
 use steward_store::{
     CreatePersonalAgentRequest as StoreCreatePersonalAgentRequest, EnvelopeRequestStatus,
-    PersonalAgentDispatchRecord, PersonalAgentLimits, PersonalAgentMessageRecord,
-    PersonalAgentRecord, PersonalAgentReplyRecord, PersonalAgentTurnRecord,
-    PersonalAgentTurnStatus, PgStore, StoreError, personal_agent_turn_prompt,
+    PersonalAgentDispatchRecord, PersonalAgentEventListener, PersonalAgentEventRecord,
+    PersonalAgentLimits, PersonalAgentMessageRecord, PersonalAgentRecord, PersonalAgentReplyRecord,
+    PersonalAgentTurnRecord, PersonalAgentTurnStatus, PgStore, StoreError,
+    personal_agent_turn_prompt,
 };
 use steward_types::ModelRef;
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::TaskApiConfig;
@@ -46,6 +51,30 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub const DEFAULT_MAX_QUEUED_BYTES: usize = 24 * 1024;
 pub const DEFAULT_MAX_REPLY_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
+const PERSONAL_AGENT_EVENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const PERSONAL_AGENT_EVENT_RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+const PERSONAL_AGENT_EVENT_NOTIFICATION_BUFFER: usize = 256;
+
+fn personal_agent_sse_response<S>(stream: S) -> Response
+where
+    S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
+{
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(PERSONAL_AGENT_EVENT_HEARTBEAT_INTERVAL)
+                .text("ping"),
+        )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PersonalAgentDispatchSettings {
@@ -137,6 +166,7 @@ impl PersonalAgentConfig {
 pub(crate) struct PersonalAgentApiState {
     store: PgStore,
     agent_refs: Arc<BTreeSet<String>>,
+    event_notifications: broadcast::Sender<i64>,
     limits: PersonalAgentLimits,
 }
 
@@ -311,12 +341,19 @@ pub(crate) struct PersonalAgentErrorResponse {
     failure_reason: &'static str,
 }
 
-pub fn protected_router(
+pub async fn protected_router(
     store: PgStore,
     agent_refs: impl IntoIterator<Item = String>,
     browser_auth: BrowserAuthService,
     config: PersonalAgentConfig,
-) -> Router {
+) -> Result<Router, StoreError> {
+    let listener = store.personal_agent_event_listener().await?;
+    let (event_notifications, _) = broadcast::channel(PERSONAL_AGENT_EVENT_NOTIFICATION_BUFFER);
+    tokio::spawn(forward_personal_agent_event_notifications(
+        store.clone(),
+        listener,
+        event_notifications.clone(),
+    ));
     let routes = Router::new()
         .route(
             "/app/api/v1/agents",
@@ -327,12 +364,42 @@ pub fn protected_router(
             "/app/api/v1/agents/{agent_id}/messages",
             get(list_personal_agent_messages).post(post_personal_agent_message),
         )
+        .route(
+            "/app/api/v1/agents/{agent_id}/events",
+            get(personal_agent_events),
+        )
         .with_state(PersonalAgentApiState {
             store,
             agent_refs: Arc::new(agent_refs.into_iter().collect()),
+            event_notifications,
             limits: config.limits,
         });
-    protect_browser_routes(routes, browser_auth)
+    Ok(protect_browser_routes(routes, browser_auth))
+}
+
+async fn forward_personal_agent_event_notifications(
+    store: PgStore,
+    mut listener: PersonalAgentEventListener,
+    notifications: broadcast::Sender<i64>,
+) {
+    loop {
+        match listener.recv_sequence().await {
+            Ok(sequence) => {
+                let _ = notifications.send(sequence);
+            }
+            Err(_) => loop {
+                tokio::time::sleep(PERSONAL_AGENT_EVENT_RECONNECT_INTERVAL).await;
+                match store.personal_agent_event_listener().await {
+                    Ok(reconnected) => {
+                        listener = reconnected;
+                        let _ = notifications.send(0);
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            },
+        }
+    }
 }
 
 pub fn spawn_dispatcher(
@@ -574,6 +641,145 @@ pub(crate) async fn post_personal_agent_message(
             .into_response(),
         Err(error) => store_error_response(error),
     }
+}
+
+#[utoipa::path(
+    get,
+    operation_id = "personalAgentEvents",
+    path = "/app/api/v1/agents/{agent_id}/events",
+    params(
+        ("agent_id" = String, Path, format = "uuid"),
+        ("Last-Event-ID" = Option<i64>, Header)
+    ),
+    responses(
+        (status = 200, body = String, content_type = "text/event-stream"),
+        (status = 400, body = PersonalAgentErrorResponse),
+        (status = 401, description = "Browser session is absent or invalid"),
+        (status = 404, body = PersonalAgentErrorResponse),
+        (status = 503, body = PersonalAgentErrorResponse)
+    ),
+    security(("browserSession" = []))
+)]
+pub(crate) async fn personal_agent_events(
+    session: Option<Extension<BrowserSessionContext>>,
+    State(state): State<PersonalAgentApiState>,
+    Path(agent_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(Extension(session)) = session else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let last_event_id = match personal_agent_last_event_id(&headers) {
+        Ok(last_event_id) => last_event_id,
+        Err(()) => return invalid_request(),
+    };
+    let owner_user_id = session.principal.canonical_user_id;
+    let mut notifications = state.event_notifications.subscribe();
+    let (mut cursor, initial_events) = if let Some(last_event_id) = last_event_id {
+        let events = match state
+            .store
+            .personal_agent_events_after(&owner_user_id, agent_id, last_event_id)
+            .await
+        {
+            Ok(Some(events)) => events,
+            Ok(None) => return agent_not_found(),
+            Err(_) => return unavailable(),
+        };
+        let mut cursor = last_event_id;
+        let mut initial = Vec::with_capacity(events.len());
+        for event in events {
+            cursor = event.seq;
+            let Ok(event) = personal_agent_turn_sse_event(event) else {
+                return unavailable();
+            };
+            initial.push(event);
+        }
+        (cursor, initial)
+    } else {
+        let snapshot = match state
+            .store
+            .personal_agent_thread_snapshot(&owner_user_id, agent_id)
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return agent_not_found(),
+            Err(_) => return unavailable(),
+        };
+        let payload = PersonalAgentTurnsResponse {
+            api_version: PERSONAL_AGENTS_API_VERSION,
+            turns: snapshot.turns.into_iter().map(Into::into).collect(),
+        };
+        let Ok(event) =
+            personal_agent_sse_event(snapshot.event_sequence, "thread.snapshot", &payload)
+        else {
+            return unavailable();
+        };
+        (snapshot.event_sequence, vec![event])
+    };
+    let store = state.store.clone();
+    let stream = async_stream::stream! {
+        for event in initial_events {
+            yield Ok::<Event, Infallible>(event);
+        }
+        loop {
+            match notifications.recv().await {
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+            let events = match store
+                .personal_agent_events_after(&owner_user_id, agent_id, cursor)
+                .await
+            {
+                Ok(Some(events)) => events,
+                Ok(None) | Err(_) => break,
+            };
+            for event in events {
+                cursor = event.seq;
+                let Ok(event) = personal_agent_turn_sse_event(event) else {
+                    return;
+                };
+                yield Ok::<Event, Infallible>(event);
+            }
+        }
+    };
+    personal_agent_sse_response(stream)
+}
+
+fn personal_agent_last_event_id(headers: &HeaderMap) -> Result<Option<i64>, ()> {
+    let Some(value) = headers.get("last-event-id") else {
+        return Ok(None);
+    };
+    let sequence = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|sequence| *sequence >= 0)
+        .ok_or(())?;
+    Ok(Some(sequence))
+}
+
+fn personal_agent_turn_sse_event(
+    event: PersonalAgentEventRecord,
+) -> Result<Event, serde_json::Error> {
+    personal_agent_sse_event(
+        event.seq,
+        "turn.updated",
+        &PersonalAgentTurnResponse {
+            api_version: PERSONAL_AGENTS_API_VERSION,
+            turn: event.turn.into(),
+        },
+    )
+}
+
+fn personal_agent_sse_event(
+    sequence: i64,
+    kind: &'static str,
+    payload: &impl Serialize,
+) -> Result<Event, serde_json::Error> {
+    Ok(Event::default()
+        .id(sequence.to_string())
+        .event(kind)
+        .data(serde_json::to_string(payload)?))
 }
 
 fn personal_agent_error(
@@ -979,22 +1185,95 @@ fn turn_prompt(dispatch: &PersonalAgentDispatchRecord, max_prompt_bytes: usize) 
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+
+    use axum::body::to_bytes;
+    use axum::http::{HeaderValue, StatusCode, header};
+    use futures::StreamExt;
+
     use super::{
         DEFAULT_MAX_INSTRUCTIONS_BYTES, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_NAME_CHARACTERS,
         DEFAULT_MAX_PROMPT_BYTES, DEFAULT_MAX_QUEUED_BYTES, DEFAULT_MAX_REPLY_BYTES,
-        PersonalAgentConfig, PersonalAgentDispatchRecord, PersonalAgentDispatchSettings,
-        keep_monitoring_after_status_error, monitoring_deadline_from_values, retry_delay_seconds,
-        safe_failure_reason, store_error_response, turn_prompt,
+        PERSONAL_AGENT_EVENT_HEARTBEAT_INTERVAL, PERSONAL_AGENTS_API_VERSION, PersonalAgentConfig,
+        PersonalAgentDispatchRecord, PersonalAgentDispatchSettings,
+        keep_monitoring_after_status_error, monitoring_deadline_from_values,
+        personal_agent_last_event_id, personal_agent_sse_event, personal_agent_sse_response,
+        retry_delay_seconds, safe_failure_reason, store_error_response, turn_prompt,
     };
-    use crate::tasks::PersonalAgentTaskError;
-    use crate::tasks::personal_agent_task_definition;
-    use axum::body::to_bytes;
-    use axum::http::StatusCode;
+    use crate::tasks::{PersonalAgentTaskError, personal_agent_task_definition};
     use steward_admission::{Envelope, EnvelopeSpec};
     use steward_store::{
         PersonalAgentLimits, PersonalAgentMessageRecord, PersonalAgentRecord,
         PersonalAgentTurnRecord, PersonalAgentTurnStatus,
     };
+
+    #[tokio::test]
+    async fn personal_agent_sse_disables_edge_buffering() {
+        let response = personal_agent_sse_response(futures::stream::empty());
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/event-stream"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-cache"))
+        );
+        assert_eq!(
+            response.headers().get("x-accel-buffering"),
+            Some(&HeaderValue::from_static("no"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn personal_agent_sse_sends_ping_before_edge_idle_timeouts() -> Result<(), String> {
+        assert!((15..=30).contains(&PERSONAL_AGENT_EVENT_HEARTBEAT_INTERVAL.as_secs()));
+        let response = personal_agent_sse_response(futures::stream::pending::<
+            Result<axum::response::sse::Event, Infallible>,
+        >());
+        let mut body = response.into_body().into_data_stream();
+        let read = tokio::spawn(async move { body.next().await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(PERSONAL_AGENT_EVENT_HEARTBEAT_INTERVAL).await;
+        let chunk = read
+            .await
+            .map_err(|error| format!("join heartbeat read: {error}"))?
+            .ok_or_else(|| "heartbeat stream closed".to_owned())?
+            .map_err(|error| format!("read heartbeat: {error}"))?;
+        assert_eq!(&chunk[..], b": ping\n\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn personal_agent_sse_frames_durable_sequence_and_payload() -> Result<(), String> {
+        let event = personal_agent_sse_event(
+            7,
+            "turn.updated",
+            &serde_json::json!({"apiVersion": PERSONAL_AGENTS_API_VERSION}),
+        )
+        .map_err(|error| format!("serialize event: {error}"))?;
+        let response =
+            personal_agent_sse_response(futures::stream::iter([Ok::<_, Infallible>(event)]));
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .map_err(|error| format!("read event: {error}"))?;
+        let body = std::str::from_utf8(&body).map_err(|error| format!("decode event: {error}"))?;
+        assert!(body.contains("id: 7\n"));
+        assert!(body.contains("event: turn.updated\n"));
+        assert!(body.contains("\"apiVersion\":\"steward.personal-agents/v1\""));
+        Ok(())
+    }
+
+    #[test]
+    fn personal_agent_last_event_id_is_optional_nonnegative_and_strict() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(personal_agent_last_event_id(&headers), Ok(None));
+        headers.insert("last-event-id", HeaderValue::from_static("42"));
+        assert_eq!(personal_agent_last_event_id(&headers), Ok(Some(42)));
+        for invalid in ["-1", "1.5", "not-a-sequence"] {
+            headers.insert("last-event-id", HeaderValue::from_static(invalid));
+            assert_eq!(personal_agent_last_event_id(&headers), Err(()));
+        }
+    }
     use steward_types::{
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
     };

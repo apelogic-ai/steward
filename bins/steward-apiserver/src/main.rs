@@ -828,6 +828,14 @@ async fn browser_application_router(
         task_api_config.clone(),
         personal_agent_config,
     );
+    let personal_agent_router = personal_agents::protected_router(
+        store.clone(),
+        personal_agent_refs,
+        auth.clone(),
+        personal_agent_config,
+    )
+    .await
+    .map_err(io::Error::other)?;
     let connections = governed_connections_configuration(
         &origin,
         store.clone(),
@@ -857,12 +865,7 @@ async fn browser_application_router(
         application_config.task_identity_discovery_enabled,
     );
     let app = browser_auth::browser_auth_router(auth.clone())
-        .merge(personal_agents::protected_router(
-            store.clone(),
-            personal_agent_refs,
-            auth.clone(),
-            personal_agent_config,
-        ))
+        .merge(personal_agent_router)
         .merge(user_envelopes::protected_router(
             user_envelopes::PgEnvelopeRequestBroker::new(
                 store.clone(),

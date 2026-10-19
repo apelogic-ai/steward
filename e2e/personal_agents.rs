@@ -852,16 +852,77 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Resul
         .collect::<Vec<_>>();
     assert_eq!(&merged_messages[..2], ["Second message", "Third message"]);
     assert_eq!(merged_messages.len(), 8);
-    let event_count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*)::bigint FROM personal_agent_turn_events WHERE agent_id = $1",
-    )
-    .bind(agent.id)
-    .fetch_one(&pool)
-    .await?;
+    let events = store
+        .personal_agent_events_after(&alice, agent.id, 0)
+        .await?
+        .ok_or_else(|| io::Error::other("event stream disappeared"))?;
     assert!(
-        event_count >= 7,
+        events.len() >= 7,
         "each durable turn change must append an event"
     );
+    assert!(
+        events
+            .windows(2)
+            .all(|events| events[0].seq < events[1].seq),
+        "durable event sequences must be strictly increasing"
+    );
+    assert!(events.iter().any(|event| {
+        event.turn.status == PersonalAgentTurnStatus::Done
+            && event
+                .turn
+                .reply
+                .as_ref()
+                .map(|reply| reply.content.as_str())
+                == Some("First reply")
+    }));
+    assert!(
+        store
+            .personal_agent_events_after(&bob, agent.id, 0)
+            .await?
+            .is_none(),
+        "another owner must not distinguish an existing event stream"
+    );
+    let replay_cursor = events[2].seq;
+    let replayed = store
+        .personal_agent_events_after(&alice, agent.id, replay_cursor)
+        .await?
+        .ok_or_else(|| io::Error::other("event replay disappeared"))?;
+    assert_eq!(
+        replayed.iter().map(|event| event.seq).collect::<Vec<_>>(),
+        events
+            .iter()
+            .filter(|event| event.seq > replay_cursor)
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        "Last-Event-ID replay must return each later durable event exactly once"
+    );
+    let snapshot = store
+        .personal_agent_thread_snapshot(&alice, agent.id)
+        .await?
+        .ok_or_else(|| io::Error::other("thread snapshot disappeared"))?;
+    assert_eq!(snapshot.event_sequence, events.last().ok_or("event")?.seq);
+
+    let mut listener = store.personal_agent_event_listener().await?;
+    store
+        .post_personal_agent_message(
+            &alice,
+            agent.id,
+            Uuid::new_v4(),
+            "Fourth message",
+            "message-4",
+            limits,
+        )
+        .await?;
+    let notified_sequence =
+        tokio::time::timeout(StdDuration::from_secs(2), listener.recv_sequence())
+            .await
+            .map_err(|_| io::Error::other("personal-agent event notification timed out"))??;
+    let notified_events = store
+        .personal_agent_events_after(&alice, agent.id, snapshot.event_sequence)
+        .await?
+        .ok_or_else(|| io::Error::other("notified event stream disappeared"))?;
+    assert_eq!(notified_events.len(), 1);
+    assert_eq!(notified_events[0].seq, notified_sequence);
     Ok(())
 }
 
@@ -972,6 +1033,7 @@ async fn personal_agent_router_statuses(
         )
     };
     let unauthorized = routes()
+        .await?
         .oneshot(
             Request::builder()
                 .uri("/app/api/v1/agents")
@@ -1018,6 +1080,7 @@ async fn personal_agent_router_statuses(
         .to_owned();
 
     let malformed = routes()
+        .await?
         .oneshot(mutation_request(
             "/app/api/v1/agents",
             &session_cookie,
@@ -1028,6 +1091,7 @@ async fn personal_agent_router_statuses(
         .await?;
     assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
     let missing = routes()
+        .await?
         .oneshot(
             Request::builder()
                 .uri(format!("/app/api/v1/agents/{}", Uuid::new_v4()))
@@ -1044,6 +1108,7 @@ async fn personal_agent_router_statuses(
     })
     .to_string();
     let conflict = routes()
+        .await?
         .oneshot(mutation_request(
             "/app/api/v1/agents",
             &session_cookie,

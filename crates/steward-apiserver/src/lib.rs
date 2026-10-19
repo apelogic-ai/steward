@@ -456,6 +456,7 @@ pub struct GrantRevocationRequest {
         personal_agents::get_personal_agent,
         personal_agents::list_personal_agent_messages,
         personal_agents::post_personal_agent_message,
+        personal_agents::personal_agent_events,
         agent_runs_contract,
         agent_run_contract,
         agent_run_timeline_contract
@@ -5170,6 +5171,10 @@ mod tests {
             (
                 "/paths/~1app~1api~1v1~1agents~1{agent_id}~1messages/post",
                 "postPersonalAgentMessage",
+            ),
+            (
+                "/paths/~1app~1api~1v1~1agents~1{agent_id}~1events/get",
+                "personalAgentEvents",
             ),
         ] {
             assert_eq!(

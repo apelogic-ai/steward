@@ -8,7 +8,7 @@ use std::time::Duration;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgListener, PgPoolOptions};
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 use steward_admission::{
@@ -11575,6 +11575,111 @@ impl PgStore {
         Ok(Some(turns))
     }
 
+    pub async fn personal_agent_thread_snapshot(
+        &self,
+        owner_user_id: &CanonicalUserId,
+        agent_id: Uuid,
+    ) -> Result<Option<PersonalAgentThreadSnapshot>, StoreError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        let owned = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM personal_agents WHERE id = $1 AND owner_user_id = $2",
+        )
+        .bind(agent_id)
+        .bind(owner_user_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if owned.is_none() {
+            return Ok(None);
+        }
+        let ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM personal_agent_turns WHERE agent_id = $1 \
+             ORDER BY created_at, id",
+        )
+        .bind(agent_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let mut turns = Vec::with_capacity(ids.len());
+        for turn_id in ids {
+            turns.push(personal_agent_turn_in_transaction(&mut transaction, turn_id).await?);
+        }
+        let event_sequence = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(max(seq), 0)::bigint FROM personal_agent_turn_events \
+             WHERE agent_id = $1",
+        )
+        .bind(agent_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(Some(PersonalAgentThreadSnapshot {
+            event_sequence,
+            turns,
+        }))
+    }
+
+    pub async fn personal_agent_events_after(
+        &self,
+        owner_user_id: &CanonicalUserId,
+        agent_id: Uuid,
+        after_sequence: i64,
+    ) -> Result<Option<Vec<PersonalAgentEventRecord>>, StoreError> {
+        if after_sequence < 0 {
+            return Err(StoreError::InvalidPersonalAgent);
+        }
+        let owned = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM personal_agents WHERE id = $1 AND owner_user_id = $2",
+        )
+        .bind(agent_id)
+        .bind(owner_user_id.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if owned.is_none() {
+            return Ok(None);
+        }
+        let events = sqlx::query(
+            "SELECT seq, payload FROM personal_agent_turn_events \
+             WHERE agent_id = $1 AND seq > $2 ORDER BY seq",
+        )
+        .bind(agent_id)
+        .bind(after_sequence)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|row| {
+            let seq = row.try_get("seq").map_err(database_error)?;
+            let payload = row
+                .try_get::<Json<serde_json::Value>, _>("payload")
+                .map_err(database_error)?
+                .0;
+            let turn =
+                serde_json::from_value(payload).map_err(|_| StoreError::InvalidPersonalAgent)?;
+            Ok(PersonalAgentEventRecord { seq, turn })
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok(Some(events))
+    }
+
+    pub async fn personal_agent_event_listener(
+        &self,
+    ) -> Result<PersonalAgentEventListener, StoreError> {
+        let mut listener = PgListener::connect_with(&self.pool)
+            .await
+            .map_err(database_error)?;
+        listener
+            .listen("steward_personal_agent_turn_events")
+            .await
+            .map_err(database_error)?;
+        Ok(PersonalAgentEventListener { listener })
+    }
+
     pub async fn post_personal_agent_message(
         &self,
         owner_user_id: &CanonicalUserId,
@@ -12475,6 +12580,34 @@ pub struct PersonalAgentTurnRecord {
 pub struct PersonalAgentMessageResult {
     pub turn: PersonalAgentTurnRecord,
     pub duplicate: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersonalAgentThreadSnapshot {
+    pub event_sequence: i64,
+    pub turns: Vec<PersonalAgentTurnRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersonalAgentEventRecord {
+    pub seq: i64,
+    pub turn: PersonalAgentTurnRecord,
+}
+
+pub struct PersonalAgentEventListener {
+    listener: PgListener,
+}
+
+impl PersonalAgentEventListener {
+    pub async fn recv_sequence(&mut self) -> Result<i64, StoreError> {
+        let notification = self.listener.recv().await.map_err(database_error)?;
+        notification
+            .payload()
+            .parse::<i64>()
+            .ok()
+            .filter(|sequence| *sequence > 0)
+            .ok_or(StoreError::InvalidPersonalAgent)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

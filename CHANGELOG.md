@@ -15,8 +15,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   Run after restart, and always requests one selected Envelope model without tools. Envelopes with
   multiple models require an explicit choice. Deployment settings bound concurrent turns,
   Task-start attempts, unexpected restarts, retained conversation turns, leases, status checks,
-  total monitoring time, and every content size. Resumable live turn events will follow
-  separately.
+  total monitoring time, and every content size. A resumable event stream sends durable status and
+  final-reply updates, with heartbeat and no-buffering headers for the browser edge path.
 
 ## [0.3.20] - 2026-10-18
 
