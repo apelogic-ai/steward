@@ -3144,6 +3144,353 @@
         ]
       }
     },
+    "/app/api/v1/agents": {
+      "get": {
+        "tags": [
+          "personal_agents"
+        ],
+        "operationId": "listPersonalAgents",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Browser session is absent or invalid"
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "personal_agents"
+        ],
+        "operationId": "createPersonalAgent",
+        "parameters": [
+          {
+            "name": "X-Steward-CSRF",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePersonalAgentBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Browser session is absent or invalid"
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/app/api/v1/agents/{agent_id}": {
+      "get": {
+        "tags": [
+          "personal_agents"
+        ],
+        "operationId": "getPersonalAgent",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Browser session is absent or invalid"
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
+    "/app/api/v1/agents/{agent_id}/messages": {
+      "get": {
+        "tags": [
+          "personal_agents"
+        ],
+        "operationId": "listPersonalAgentMessages",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentTurnsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Browser session is absent or invalid"
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "personal_agents"
+        ],
+        "operationId": "postPersonalAgentMessage",
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "X-Steward-CSRF",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PostPersonalAgentMessageBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentTurnResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentTurnResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Browser session is absent or invalid"
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalAgentErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "browserSession": []
+          }
+        ]
+      }
+    },
     "/app/api/v1/capabilities": {
       "get": {
         "tags": [
@@ -9948,6 +10295,31 @@
         },
         "additionalProperties": false
       },
+      "CreatePersonalAgentBody": {
+        "type": "object",
+        "required": [
+          "name",
+          "agentRef",
+          "instructions",
+          "envelopeRequestId"
+        ],
+        "properties": {
+          "agentRef": {
+            "type": "string"
+          },
+          "envelopeRequestId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateRuntimeRequest": {
         "type": "object",
         "required": [
@@ -12051,6 +12423,250 @@
           },
           "entryPoint": {
             "$ref": "#/components/schemas/RelativePath"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PersonalAgentErrorResponse": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "error",
+          "failureReason"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "failureReason": {
+            "type": "string"
+          }
+        }
+      },
+      "PersonalAgentMessageView": {
+        "type": "object",
+        "required": [
+          "id",
+          "content",
+          "createdAt"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "PersonalAgentReplyView": {
+        "type": "object",
+        "required": [
+          "content",
+          "createdAt"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string"
+          }
+        }
+      },
+      "PersonalAgentResponse": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "agent"
+        ],
+        "properties": {
+          "agent": {
+            "$ref": "#/components/schemas/PersonalAgentView"
+          },
+          "apiVersion": {
+            "type": "string"
+          }
+        }
+      },
+      "PersonalAgentTurnResponse": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "turn"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "turn": {
+            "$ref": "#/components/schemas/PersonalAgentTurnView"
+          }
+        }
+      },
+      "PersonalAgentTurnStatusView": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "done",
+          "failed"
+        ]
+      },
+      "PersonalAgentTurnView": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "messages",
+          "createdAt"
+        ],
+        "properties": {
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "failureReason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersonalAgentMessageView"
+            }
+          },
+          "reply": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PersonalAgentReplyView"
+              }
+            ]
+          },
+          "runId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/PersonalAgentTurnStatusView"
+          }
+        }
+      },
+      "PersonalAgentTurnsResponse": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "turns"
+        ],
+        "properties": {
+          "apiVersion": {
+            "type": "string"
+          },
+          "turns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersonalAgentTurnView"
+            }
+          }
+        }
+      },
+      "PersonalAgentView": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "agentRef",
+          "instructions",
+          "envelopeRequestId",
+          "createdAt",
+          "updatedAt"
+        ],
+        "properties": {
+          "agentRef": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "envelopeRequestId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        }
+      },
+      "PersonalAgentsResponse": {
+        "type": "object",
+        "required": [
+          "apiVersion",
+          "agents"
+        ],
+        "properties": {
+          "agents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersonalAgentView"
+            }
+          },
+          "apiVersion": {
+            "type": "string"
+          }
+        }
+      },
+      "PostPersonalAgentMessageBody": {
+        "type": "object",
+        "required": [
+          "content",
+          "idempotencyKey"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "idempotencyKey": {
+            "type": "string"
           }
         },
         "additionalProperties": false
