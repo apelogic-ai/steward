@@ -18,8 +18,8 @@ use steward_types::{
 };
 
 #[tokio::test]
-async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe()
--> Result<(), Box<dyn Error>> {
+async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Result<(), Box<dyn Error>>
+{
     install_rustls_crypto_provider()?;
     let database_url = env::var("STEWARD_TEST_DATABASE_URL")?;
     let pool = PgPoolOptions::new()
@@ -45,7 +45,10 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe()
             envelope_request_id: envelope,
         })
         .await;
-    assert!(matches!(foreign, Err(StoreError::PersonalAgentEnvelopeNotFound)));
+    assert!(matches!(
+        foreign,
+        Err(StoreError::PersonalAgentEnvelopeNotFound)
+    ));
 
     let inactive = store
         .create_personal_agent(CreatePersonalAgentRequest {
@@ -57,7 +60,10 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe()
             envelope_request_id: inactive_envelope,
         })
         .await;
-    assert!(matches!(inactive, Err(StoreError::PersonalAgentEnvelopeInactive)));
+    assert!(matches!(
+        inactive,
+        Err(StoreError::PersonalAgentEnvelopeInactive)
+    ));
 
     let agent = store
         .create_personal_agent(CreatePersonalAgentRequest {
@@ -193,7 +199,10 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe()
     .bind(agent.id)
     .fetch_one(&pool)
     .await?;
-    assert!(event_count >= 7, "each durable turn change must append an event");
+    assert!(
+        event_count >= 7,
+        "each durable turn change must append an event"
+    );
     Ok(())
 }
 
@@ -287,7 +296,10 @@ async fn provision_envelope(
 ) -> Result<Uuid, Box<dyn Error>> {
     let request_id = reserve_envelope(store, owner, suffix).await?;
     let envelope = test_envelope();
-    let digest = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&envelope)?));
+    let digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&envelope)?)
+    );
     store
         .append_envelope_request_status(
             request_id,
