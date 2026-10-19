@@ -948,6 +948,7 @@ export type CreatePersonalAgentBody = {
     agentRef: string;
     envelopeRequestId: string;
     instructions: string;
+    model?: null | ModelRef;
     name: string;
 };
 
@@ -1531,6 +1532,7 @@ export type PersonalAgentView = {
     envelopeRequestId: string;
     id: string;
     instructions: string;
+    model: ModelRef;
     name: string;
     updatedAt: string;
 };

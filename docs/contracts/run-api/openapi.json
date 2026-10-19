@@ -10314,6 +10314,16 @@
           "instructions": {
             "type": "string"
           },
+          "model": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ModelRef"
+              }
+            ]
+          },
           "name": {
             "type": "string"
           }
@@ -12607,6 +12617,7 @@
           "name",
           "agentRef",
           "instructions",
+          "model",
           "envelopeRequestId",
           "createdAt",
           "updatedAt"
@@ -12628,6 +12639,9 @@
           },
           "instructions": {
             "type": "string"
+          },
+          "model": {
+            "$ref": "#/components/schemas/ModelRef"
           },
           "name": {
             "type": "string"
