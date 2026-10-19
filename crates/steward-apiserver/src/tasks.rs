@@ -2109,6 +2109,11 @@ pub(crate) fn personal_agent_task_definition(
     let mut requirements = direct_requirements_from_envelope_with_platform_default(&envelope.spec)
         .map_err(|error| format!("personal agent Envelope cannot be projected: {error:?}"))?;
     requirements.authority.tools.clear();
+    let selected_model = steward_types::direct_package::ModelRequirement {
+        provider: steward_types::direct_package::Slug::parse(model.provider.clone())?,
+        model: steward_types::direct_package::BoundedText::parse(model.model.clone())?,
+    };
+    requirements.authority.llms = vec![selected_model.clone()];
     let definition = DirectTaskDefinition {
         schema_version: steward_types::direct_package::DIRECT_TASK_DEFINITION_SCHEMA.to_owned(),
         name: steward_types::direct_package::Slug::parse("personal-agent-turn")
@@ -2117,10 +2122,7 @@ pub(crate) fn personal_agent_task_definition(
         runtime: steward_types::direct_package::RuntimeSelection {
             agent_ref: steward_types::direct_package::AgentRef::parse(agent_ref.to_owned())
                 .map_err(|error| format!("personal agent reference is invalid: {error}"))?,
-            model: Some(steward_types::direct_package::ModelRequirement {
-                provider: steward_types::direct_package::Slug::parse(model.provider.clone())?,
-                model: steward_types::direct_package::BoundedText::parse(model.model.clone())?,
-            }),
+            model: Some(selected_model),
         },
         prompt: None,
         prompt_text: Some(prompt.to_owned()),

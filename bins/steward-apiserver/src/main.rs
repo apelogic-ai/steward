@@ -970,8 +970,13 @@ fn personal_agent_configuration() -> Result<personal_agents::PersonalAgentConfig
     let max_transient_attempts =
         optional_unicode_environment("STEWARD_PERSONAL_AGENT_MAX_TRANSIENT_ATTEMPTS")?
             .unwrap_or_else(|| personal_agents::DEFAULT_MAX_TRANSIENT_ATTEMPTS.to_string());
-    let max_name_bytes =
-        personal_agent_limit("MAX_NAME_BYTES", personal_agents::DEFAULT_MAX_NAME_BYTES)?;
+    let retry_backoff_seconds =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_RETRY_BACKOFF_SECONDS")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_RETRY_BACKOFF_SECONDS.to_string());
+    let max_name_characters = personal_agent_limit(
+        "MAX_NAME_CHARACTERS",
+        personal_agents::DEFAULT_MAX_NAME_CHARACTERS,
+    )?;
     let max_instructions_bytes = personal_agent_limit(
         "MAX_INSTRUCTIONS_BYTES",
         personal_agents::DEFAULT_MAX_INSTRUCTIONS_BYTES,
@@ -996,8 +1001,9 @@ fn personal_agent_configuration() -> Result<personal_agents::PersonalAgentConfig
         &poll_interval_seconds,
         &max_concurrent_turns,
         &max_transient_attempts,
+        &retry_backoff_seconds,
         PersonalAgentLimits {
-            max_name_bytes,
+            max_name_characters,
             max_instructions_bytes,
             max_message_bytes,
             max_queued_bytes,
@@ -1027,8 +1033,9 @@ fn personal_agent_configuration_from_values(
         poll_interval_seconds,
         &personal_agents::DEFAULT_MAX_CONCURRENT_TURNS.to_string(),
         &personal_agents::DEFAULT_MAX_TRANSIENT_ATTEMPTS.to_string(),
+        &personal_agents::DEFAULT_RETRY_BACKOFF_SECONDS.to_string(),
         PersonalAgentLimits {
-            max_name_bytes: personal_agents::DEFAULT_MAX_NAME_BYTES,
+            max_name_characters: personal_agents::DEFAULT_MAX_NAME_CHARACTERS,
             max_instructions_bytes: personal_agents::DEFAULT_MAX_INSTRUCTIONS_BYTES,
             max_message_bytes: personal_agents::DEFAULT_MAX_MESSAGE_BYTES,
             max_queued_bytes: personal_agents::DEFAULT_MAX_QUEUED_BYTES,
@@ -1044,6 +1051,7 @@ fn personal_agent_configuration_from_all_values(
     poll_interval_seconds: &str,
     max_concurrent_turns: &str,
     max_transient_attempts: &str,
+    retry_backoff_seconds: &str,
     limits: PersonalAgentLimits,
 ) -> Result<personal_agents::PersonalAgentConfig, io::Error> {
     let recent_turn_limit = recent_turn_limit.parse::<i64>().map_err(|_| {
@@ -1061,12 +1069,16 @@ fn personal_agent_configuration_from_all_values(
     let max_transient_attempts = max_transient_attempts.parse::<i32>().map_err(|_| {
         io::Error::other("STEWARD_PERSONAL_AGENT_MAX_TRANSIENT_ATTEMPTS must be an integer")
     })?;
+    let retry_backoff_seconds = retry_backoff_seconds.parse::<i64>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_RETRY_BACKOFF_SECONDS must be an integer")
+    })?;
     personal_agents::PersonalAgentConfig::new(
         recent_turn_limit,
         lease_seconds,
         poll_interval_seconds,
         max_concurrent_turns,
         max_transient_attempts,
+        retry_backoff_seconds,
         limits,
     )
     .map_err(io::Error::other)

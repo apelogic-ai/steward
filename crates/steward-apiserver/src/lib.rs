@@ -2997,6 +2997,7 @@ impl IntoResponse for ApiError {
                 | StoreError::PersonalAgentModelRequired
                 | StoreError::PersonalAgentModelUnavailable
                 | StoreError::PersonalAgentMessageConflict
+                | StoreError::PersonalAgentMessageQueueFull
                 | StoreError::PersonalAgentConversationTooLarge
                 | StoreError::PersonalAgentLeaseLost,
             ) => StatusCode::CONFLICT,

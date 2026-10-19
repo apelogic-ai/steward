@@ -1,6 +1,6 @@
 //! Browser-session personal agents and their one-turn-at-a-time dispatcher.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +40,8 @@ pub const DEFAULT_LEASE_SECONDS: i64 = 30;
 pub const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 2;
 pub const DEFAULT_MAX_CONCURRENT_TURNS: usize = 8;
 pub const DEFAULT_MAX_TRANSIENT_ATTEMPTS: i32 = 3;
-pub const DEFAULT_MAX_NAME_BYTES: usize = 200;
+pub const DEFAULT_RETRY_BACKOFF_SECONDS: i64 = 2;
+pub const DEFAULT_MAX_NAME_CHARACTERS: usize = 200;
 pub const DEFAULT_MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub const DEFAULT_MAX_QUEUED_BYTES: usize = 24 * 1024;
@@ -78,6 +79,7 @@ pub struct PersonalAgentConfig {
     poll_interval: Duration,
     max_concurrent_turns: usize,
     max_transient_attempts: i32,
+    retry_backoff_seconds: i64,
     limits: PersonalAgentLimits,
 }
 
@@ -88,6 +90,7 @@ impl PersonalAgentConfig {
         poll_interval_seconds: u64,
         max_concurrent_turns: usize,
         max_transient_attempts: i32,
+        retry_backoff_seconds: i64,
         limits: PersonalAgentLimits,
     ) -> Result<Self, String> {
         if !(1..=100).contains(&recent_turn_limit) {
@@ -102,10 +105,13 @@ impl PersonalAgentConfig {
                     .to_owned(),
             );
         }
-        if max_concurrent_turns == 0 || max_transient_attempts <= 0 {
+        if max_concurrent_turns == 0
+            || max_transient_attempts <= 0
+            || !(1..=3_600).contains(&retry_backoff_seconds)
+        {
             return Err("personal agent concurrency and retry limits must be positive".to_owned());
         }
-        if limits.max_name_bytes == 0
+        if limits.max_name_characters == 0
             || limits.max_instructions_bytes == 0
             || limits.max_message_bytes == 0
             || limits.max_queued_bytes < limits.max_message_bytes
@@ -120,6 +126,7 @@ impl PersonalAgentConfig {
             poll_interval: Duration::from_secs(poll_interval_seconds),
             max_concurrent_turns,
             max_transient_attempts,
+            retry_backoff_seconds,
             limits,
         })
     }
@@ -803,6 +810,11 @@ fn store_error_response(error: StoreError) -> Response {
             "idempotency_conflict",
             "This message key was already used for different content.",
         ),
+        StoreError::PersonalAgentMessageQueueFull => personal_agent_error(
+            StatusCode::CONFLICT,
+            "message_queue_full",
+            "Wait for the current turn to finish, then try again.",
+        ),
         StoreError::PersonalAgentModelRequired => personal_agent_error(
             StatusCode::CONFLICT,
             "model_required",
@@ -830,56 +842,80 @@ pub(crate) async fn run_dispatcher(
     runner: PersonalAgentTaskRunner<PgStore>,
     config: PersonalAgentConfig,
 ) {
-    let worker = format!("personal-agent-dispatcher:{}", Uuid::new_v4());
     let mut active = tokio::task::JoinSet::new();
+    let mut active_turns = HashMap::new();
     loop {
         let mut found_turn = false;
         while active.len() < config.max_concurrent_turns {
+            let lease_id = format!("personal-agent-turn:{}", Uuid::new_v4());
+            let excluded_turn_ids = active_turns.values().copied().collect::<Vec<_>>();
             match store
-                .claim_personal_agent_turn(&worker, config.lease_seconds, config.recent_turn_limit)
+                .claim_personal_agent_turn(
+                    &lease_id,
+                    config.lease_seconds,
+                    config.recent_turn_limit,
+                    &excluded_turn_ids,
+                )
                 .await
             {
                 Ok(Some(dispatch)) => {
                     found_turn = true;
+                    let turn_id = dispatch.turn.id;
                     let store = store.clone();
                     let runner = runner.clone();
-                    let worker = worker.clone();
-                    active.spawn(
-                        async move { run_turn(store, runner, worker, config, dispatch).await },
-                    );
+                    let handle = active.spawn(async move {
+                        run_turn(store, runner, lease_id, config, dispatch).await
+                    });
+                    active_turns.insert(handle.id(), turn_id);
                 }
-                Ok(None) | Err(_) => break,
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("personal agent claim failed and was rolled back: {error}");
+                    break;
+                }
             }
         }
         if active.is_empty() {
             tokio::time::sleep(config.poll_interval).await;
         } else if found_turn && active.len() == config.max_concurrent_turns {
-            report_completed_turn(active.join_next().await);
+            report_completed_turn(active.join_next_with_id().await, &mut active_turns);
         } else {
             tokio::select! {
-                completed = active.join_next() => report_completed_turn(completed),
+                completed = active.join_next_with_id() => {
+                    report_completed_turn(completed, &mut active_turns);
+                },
                 () = tokio::time::sleep(config.poll_interval) => {}
             }
         }
     }
 }
 
-fn report_completed_turn(result: Option<Result<Result<(), StoreError>, tokio::task::JoinError>>) {
+type CompletedTurn = Result<(tokio::task::Id, Result<(), StoreError>), tokio::task::JoinError>;
+
+fn report_completed_turn(
+    result: Option<CompletedTurn>,
+    active_turns: &mut HashMap<tokio::task::Id, Uuid>,
+) {
     match result {
-        Some(Ok(Ok(()))) | None => {}
-        Some(Ok(Err(error))) => {
+        Some(Ok((task_id, Ok(())))) => {
+            active_turns.remove(&task_id);
+        }
+        Some(Ok((task_id, Err(error)))) => {
+            active_turns.remove(&task_id);
             eprintln!("personal agent turn will be retried after storage failure: {error}");
         }
         Some(Err(error)) => {
+            active_turns.remove(&error.id());
             eprintln!("personal agent turn worker stopped unexpectedly: {error}");
         }
+        None => {}
     }
 }
 
 async fn run_turn(
     store: PgStore,
     runner: PersonalAgentTaskRunner<PgStore>,
-    worker: String,
+    lease_id: String,
     config: PersonalAgentConfig,
     dispatch: PersonalAgentDispatchRecord,
 ) -> Result<(), StoreError> {
@@ -894,7 +930,7 @@ async fn run_turn(
                 return store
                     .fail_personal_agent_turn(
                         dispatch.turn.id,
-                        &worker,
+                        &lease_id,
                         "This agent no longer has active access. Choose an active Envelope.",
                     )
                     .await;
@@ -903,7 +939,7 @@ async fn run_turn(
                 return store
                     .fail_personal_agent_turn(
                         dispatch.turn.id,
-                        &worker,
+                        &lease_id,
                         "This conversation is too large for one turn. Start a new personal agent.",
                     )
                     .await;
@@ -921,14 +957,14 @@ async fn run_turn(
             {
                 Ok(task_uid) => {
                     store
-                        .attach_personal_agent_task(dispatch.turn.id, &worker, task_uid)
+                        .attach_personal_agent_task(dispatch.turn.id, &lease_id, task_uid)
                         .await?;
                     task_uid
                 }
                 Err(error) => {
                     return handle_task_error(
                         &store,
-                        &worker,
+                        &lease_id,
                         &dispatch,
                         config,
                         error,
@@ -941,7 +977,7 @@ async fn run_turn(
     };
     loop {
         store
-            .renew_personal_agent_turn_lease(dispatch.turn.id, &worker, config.lease_seconds)
+            .renew_personal_agent_turn_lease(dispatch.turn.id, &lease_id, config.lease_seconds)
             .await?;
         match runner.status(task_uid, &dispatch.owner_user_id).await {
             Ok(PersonalAgentTaskState::Pending) => {
@@ -951,7 +987,7 @@ async fn run_turn(
                 return match store
                     .complete_personal_agent_turn(
                         dispatch.turn.id,
-                        &worker,
+                        &lease_id,
                         &reply,
                         config.limits.max_reply_bytes,
                     )
@@ -961,8 +997,17 @@ async fn run_turn(
                         store
                             .fail_personal_agent_turn(
                                 dispatch.turn.id,
-                                &worker,
+                                &lease_id,
                                 "The reply was too large to save.",
+                            )
+                            .await
+                    }
+                    Err(StoreError::InvalidPersonalAgentMessage) => {
+                        store
+                            .fail_personal_agent_turn(
+                                dispatch.turn.id,
+                                &lease_id,
+                                "The reply couldn't be saved.",
                             )
                             .await
                     }
@@ -970,28 +1015,37 @@ async fn run_turn(
                 };
             }
             Ok(PersonalAgentTaskState::Failed(reason)) => {
+                let reason = safe_failure_reason(&reason);
                 return store
-                    .fail_personal_agent_turn(dispatch.turn.id, &worker, &reason)
+                    .fail_personal_agent_turn(dispatch.turn.id, &lease_id, reason)
                     .await;
             }
             Err(error) => {
-                return handle_task_error(
-                    &store,
-                    &worker,
-                    &dispatch,
-                    config,
-                    error,
-                    "The coding agent did not return a usable reply. Try again.",
-                )
-                .await;
+                if keep_monitoring_after_status_error(error) {
+                    tokio::time::sleep(config.poll_interval).await;
+                } else {
+                    return handle_task_error(
+                        &store,
+                        &lease_id,
+                        &dispatch,
+                        config,
+                        error,
+                        "The coding agent did not return a usable reply. Try again.",
+                    )
+                    .await;
+                }
             }
         }
     }
 }
 
+fn keep_monitoring_after_status_error(error: PersonalAgentTaskError) -> bool {
+    error == PersonalAgentTaskError::Transient
+}
+
 async fn handle_task_error(
     store: &PgStore,
-    worker: &str,
+    lease_id: &str,
     dispatch: &PersonalAgentDispatchRecord,
     config: PersonalAgentConfig,
     error: PersonalAgentTaskError,
@@ -1000,25 +1054,38 @@ async fn handle_task_error(
     match error {
         PersonalAgentTaskError::Permanent => {
             store
-                .fail_personal_agent_turn(dispatch.turn.id, worker, permanent_reason)
-                .await
-        }
-        PersonalAgentTaskError::Transient
-            if dispatch.turn.dispatch_attempts >= config.max_transient_attempts =>
-        {
-            store
-                .fail_personal_agent_turn(
-                    dispatch.turn.id,
-                    worker,
-                    "This turn could not continue after several attempts. Try again.",
-                )
+                .fail_personal_agent_turn(dispatch.turn.id, lease_id, permanent_reason)
                 .await
         }
         PersonalAgentTaskError::Transient => {
+            let delay_seconds = retry_delay_seconds(
+                config.retry_backoff_seconds,
+                dispatch.turn.dispatch_attempts,
+            );
             store
-                .retry_personal_agent_turn(dispatch.turn.id, worker)
+                .retry_personal_agent_turn(
+                    dispatch.turn.id,
+                    lease_id,
+                    delay_seconds,
+                    config.max_transient_attempts,
+                )
                 .await
         }
+    }
+}
+
+fn retry_delay_seconds(base_seconds: i64, prior_failures: i32) -> i64 {
+    let shift = u32::try_from(prior_failures.max(0))
+        .unwrap_or(u32::MAX)
+        .min(30);
+    base_seconds.saturating_mul(1_i64 << shift).min(3_600)
+}
+
+fn safe_failure_reason(reason: &str) -> &str {
+    if reason.is_empty() || reason.contains('\0') || reason.chars().count() > 500 {
+        "This turn could not be completed. Try again."
+    } else {
+        reason
     }
 }
 
@@ -1036,17 +1103,18 @@ mod tests {
     use std::convert::Infallible;
 
     use axum::body::to_bytes;
-    use axum::http::{HeaderValue, header};
+    use axum::http::{HeaderValue, StatusCode, header};
     use futures::StreamExt;
 
     use super::{
-        DEFAULT_MAX_INSTRUCTIONS_BYTES, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_NAME_BYTES,
+        DEFAULT_MAX_INSTRUCTIONS_BYTES, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_NAME_CHARACTERS,
         DEFAULT_MAX_PROMPT_BYTES, DEFAULT_MAX_QUEUED_BYTES, DEFAULT_MAX_REPLY_BYTES,
         PERSONAL_AGENT_EVENT_HEARTBEAT_INTERVAL, PERSONAL_AGENTS_API_VERSION, PersonalAgentConfig,
-        PersonalAgentDispatchRecord, personal_agent_last_event_id, personal_agent_sse_event,
-        personal_agent_sse_response, turn_prompt,
+        PersonalAgentDispatchRecord, keep_monitoring_after_status_error,
+        personal_agent_last_event_id, personal_agent_sse_event, personal_agent_sse_response,
+        retry_delay_seconds, safe_failure_reason, store_error_response, turn_prompt,
     };
-    use crate::tasks::personal_agent_task_definition;
+    use crate::tasks::{PersonalAgentTaskError, personal_agent_task_definition};
     use steward_admission::{Envelope, EnvelopeSpec};
     use steward_store::{
         PersonalAgentLimits, PersonalAgentMessageRecord, PersonalAgentRecord,
@@ -1127,7 +1195,7 @@ mod tests {
 
     fn limits() -> PersonalAgentLimits {
         PersonalAgentLimits {
-            max_name_bytes: DEFAULT_MAX_NAME_BYTES,
+            max_name_characters: DEFAULT_MAX_NAME_CHARACTERS,
             max_instructions_bytes: DEFAULT_MAX_INSTRUCTIONS_BYTES,
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             max_queued_bytes: DEFAULT_MAX_QUEUED_BYTES,
@@ -1138,13 +1206,62 @@ mod tests {
 
     #[test]
     fn configuration_refuses_unbounded_or_unsafe_dispatch_values() {
-        assert!(PersonalAgentConfig::new(0, 30, 1, 8, 3, limits()).is_err());
-        assert!(PersonalAgentConfig::new(101, 30, 1, 8, 3, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 4, 1, 8, 3, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 16, 8, 3, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 0, 3, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 0, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, limits()).is_ok());
+        assert!(PersonalAgentConfig::new(0, 30, 1, 8, 3, 2, limits()).is_err());
+        assert!(PersonalAgentConfig::new(101, 30, 1, 8, 3, 2, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 4, 1, 8, 3, 2, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 16, 8, 3, 2, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 0, 3, 2, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 0, 2, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, 0, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, 2, limits()).is_ok());
+    }
+
+    #[test]
+    fn retries_grow_from_configuration_and_attached_tasks_keep_monitoring() {
+        assert_eq!(retry_delay_seconds(2, 0), 2);
+        assert_eq!(retry_delay_seconds(2, 1), 4);
+        assert_eq!(retry_delay_seconds(2, 2), 8);
+        assert_eq!(retry_delay_seconds(2, 30), 3_600);
+        assert!(keep_monitoring_after_status_error(
+            PersonalAgentTaskError::Transient
+        ));
+        assert!(!keep_monitoring_after_status_error(
+            PersonalAgentTaskError::Permanent
+        ));
+    }
+
+    #[test]
+    fn task_failure_reasons_are_safe_to_persist() {
+        assert_eq!(
+            safe_failure_reason("Model access ended."),
+            "Model access ended."
+        );
+        assert_eq!(
+            safe_failure_reason("bad\0reason"),
+            "This turn could not be completed. Try again."
+        );
+        assert_eq!(
+            safe_failure_reason(&"x".repeat(501)),
+            "This turn could not be completed. Try again."
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_full_response_tells_the_user_to_wait() -> Result<(), String> {
+        let response =
+            store_error_response(steward_store::StoreError::PersonalAgentMessageQueueFull);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 4 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+        assert_eq!(body["error"], "message_queue_full");
+        assert_eq!(
+            body["failureReason"],
+            "Wait for the current turn to finish, then try again."
+        );
+        Ok(())
     }
 
     #[test]
@@ -1198,10 +1315,16 @@ mod tests {
         let envelope = Envelope {
             revision: 1,
             spec: EnvelopeSpec {
-                llms: vec![ModelRef {
-                    provider: "future-provider".to_owned(),
-                    model: "future-model".to_owned(),
-                }],
+                llms: vec![
+                    ModelRef {
+                        provider: "future-provider".to_owned(),
+                        model: "future-model".to_owned(),
+                    },
+                    ModelRef {
+                        provider: "second-provider".to_owned(),
+                        model: "second-model".to_owned(),
+                    },
+                ],
                 tools: vec![ToolGrant {
                     provider: "example".to_owned(),
                     resource: "documents".to_owned(),
@@ -1218,7 +1341,7 @@ mod tests {
                 runner: RunnerRequirements::default(),
             },
         };
-        let selected_model = envelope.spec.llms[0].clone();
+        let selected_model = envelope.spec.llms[1].clone();
         let definition = personal_agent_task_definition(
             "future-agent@9.0.0",
             "Answer the user.",
@@ -1231,11 +1354,11 @@ mod tests {
         assert_eq!(requirements.authority.llms.len(), 1);
         assert_eq!(
             requirements.authority.llms[0].provider.as_str(),
-            "future-provider"
+            "second-provider"
         );
         assert_eq!(
             requirements.authority.llms[0].model.as_str(),
-            "future-model"
+            "second-model"
         );
         assert!(requirements.authority.tools.is_empty());
         Ok(())
