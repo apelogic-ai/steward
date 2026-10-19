@@ -97,7 +97,7 @@ Limits such as 2 GiB, 1,000 generations or 100.00 USD are the values of the test
 | `@needs-github` | Needs an external repository that the installation allows. |
 | `@needs-jira` | Needs a connected Jira account and the `jira-read` template fixture created after `@smoke` with the same run prefix. |
 | `@callers` | Exercises external caller exchange, Run API and receiver paths in J12. |
-| `@personal-agents` | Exercises the signed-in personal-agent path in J13 after `@smoke` has created its active Envelope fixture. |
+| `@personal-agents` | Exercises the signed-in personal-agent path in J13. It creates its own standard-template Envelope fixture. |
 | `@covered-by-process-e2e` | Covered by the named real-process integration test instead of an installation journey. Unlike `@known-failing-*`, it is not waiting for a product fix. |
 | `@live-jira-webhook` | Causes a real Jira event to reach a public receiver. It also requires `@owner-only`. |
 | `@needs-public-ingress` | Requires the target receiver to be reachable from the external service. |
@@ -166,9 +166,9 @@ objects under that prefix:
 cargo xtask journeys --tags @extended
 ```
 
-Run the personal-agent path with the same prefix after smoke has created the active `standard`
-Envelope. It creates a run-prefixed personal agent, sends one message, waits for the reply, and
-opens the linked Run:
+Run the personal-agent path with its own unique prefix. It creates the standard template and its
+active Envelope, then creates a run-prefixed personal agent, sends one message, waits for the
+reply, and opens the linked Run:
 
 ```console
 cargo xtask journeys --tags @personal-agents
