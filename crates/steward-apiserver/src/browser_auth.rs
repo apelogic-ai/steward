@@ -254,6 +254,7 @@ pub struct VerifiedUserTokenClaims {
     pub identity: OrganizationIdentity,
     pub display_name: Option<String>,
     pub frontend_client_id: String,
+    pub email_linking_allowed: bool,
 }
 
 pub trait BrowserUserTokenVerifier: Send + Sync + 'static {
@@ -297,6 +298,15 @@ pub trait BrowserIdentityResolver: Send + Sync + 'static {
     ) -> BrowserFuture<'a, Result<(), BrowserAuthFailure>> {
         Box::pin(async { Ok(()) })
     }
+
+    fn resolve_or_register_user_token<'a>(
+        &'a self,
+        identity: &'a OrganizationIdentity,
+        _actor: &'a str,
+        _email_linking_allowed: bool,
+    ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+        self.resolve_or_register(identity)
+    }
 }
 
 #[derive(Clone)]
@@ -318,11 +328,19 @@ impl BrowserIdentityResolver for PgBrowserIdentityResolver {
         Box::pin(async move {
             let principal = match self.store.resolve_canonical_identity(identity).await {
                 Ok(principal) => principal,
-                Err(StoreError::CanonicalIdentityNotFound) => self
+                Err(StoreError::CanonicalIdentityNotFound) => match self
                     .store
-                    .register_canonical_identity(identity, "browser-oidc")
+                    .link_verified_canonical_identity_by_email(identity, "browser-oidc")
                     .await
-                    .map_err(map_store_error)?,
+                {
+                    Ok(principal) => principal,
+                    Err(StoreError::CanonicalIdentityNotFound) => self
+                        .store
+                        .register_canonical_identity(identity, "browser-oidc")
+                        .await
+                        .map_err(map_store_error)?,
+                    Err(error) => return Err(map_store_error(error)),
+                },
                 Err(error) => return Err(map_store_error(error)),
             };
             let assignments = self
@@ -344,6 +362,46 @@ impl BrowserIdentityResolver for PgBrowserIdentityResolver {
                 .record_browser_sign_in(user_id, display_name)
                 .await
                 .map_err(map_store_error)
+        })
+    }
+
+    fn resolve_or_register_user_token<'a>(
+        &'a self,
+        identity: &'a OrganizationIdentity,
+        actor: &'a str,
+        email_linking_allowed: bool,
+    ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
+        Box::pin(async move {
+            let principal = match self.store.resolve_canonical_identity(identity).await {
+                Ok(principal) => principal,
+                Err(StoreError::CanonicalIdentityNotFound) if email_linking_allowed => {
+                    match self
+                        .store
+                        .link_verified_canonical_identity_by_email(identity, actor)
+                        .await
+                    {
+                        Ok(principal) => principal,
+                        Err(StoreError::CanonicalIdentityNotFound) => self
+                            .store
+                            .register_canonical_identity(identity, actor)
+                            .await
+                            .map_err(map_store_error)?,
+                        Err(error) => return Err(map_store_error(error)),
+                    }
+                }
+                Err(StoreError::CanonicalIdentityNotFound) => self
+                    .store
+                    .register_canonical_identity(identity, actor)
+                    .await
+                    .map_err(map_store_error)?,
+                Err(error) => return Err(map_store_error(error)),
+            };
+            let assignments = self
+                .store
+                .browser_rbac_assignments(&principal.user_id)
+                .await
+                .map_err(map_store_error)?;
+            Ok(browser_principal_from_assignments(principal, assignments))
         })
     }
 }
@@ -636,12 +694,8 @@ impl BrowserIdentityResolver for LocalFakeIdentityResolver {
     ) -> BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
         Box::pin(async move {
             let (user_id, role) = match identity.subject() {
-                "fake-user" | "fixture-user" => {
-                    ("usr_0123456789abcdef0123456789abcdef", BrowserRole::User)
-                }
-                "fake-admin" | "fixture-admin" => {
-                    ("usr_abcdef0123456789abcdef0123456789", BrowserRole::Admin)
-                }
+                "fake-user" => ("usr_0123456789abcdef0123456789abcdef", BrowserRole::User),
+                "fake-admin" => ("usr_abcdef0123456789abcdef0123456789", BrowserRole::Admin),
                 _ => return Err(BrowserAuthFailure::InvalidIdentity),
             };
             Ok(BrowserPrincipal {
@@ -1086,14 +1140,6 @@ async fn authenticate_browser_user_request(
         }
         request.extensions_mut().insert(BrowserMutationProof(()));
     }
-    if let Some(audit) = &audit {
-        eprintln!(
-            "user token request authenticated: user_id={} issuer={} frontend_client_id={}",
-            principal.canonical_user_id.as_str(),
-            audit.issuer,
-            audit.frontend_client_id,
-        );
-    }
     request.extensions_mut().insert(BrowserSessionContext {
         principal,
         binding,
@@ -1110,22 +1156,35 @@ fn user_token_credential(
     if service.user_tokens.is_none() {
         return Ok(None);
     }
-    let mut authorization = headers.get_all(header::AUTHORIZATION).iter();
-    let Some(value) = authorization.next() else {
+    if !(path == "/app/api/v1" || path.starts_with("/app/api/v1/")) {
         return Ok(None);
-    };
-    if authorization.next().is_some()
-        || !(path == "/app/api/v1" || path.starts_with("/app/api/v1/"))
-    {
+    }
+    let authorization = headers
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .collect::<Vec<_>>();
+    if authorization.is_empty() {
+        return Ok(None);
+    }
+    let bearer_count = authorization
+        .iter()
+        .filter(|value| value.as_bytes().starts_with(b"Bearer "))
+        .count();
+    if bearer_count == 0 {
+        return Ok(None);
+    }
+    if authorization.len() != 1 {
         return Err(BrowserAuthFailure::InvalidSession);
     }
-    let value = value
+    let value = authorization[0]
         .to_str()
         .map_err(|_| BrowserAuthFailure::InvalidSession)?;
-    let token = value
-        .strip_prefix("Bearer ")
-        .filter(|token| !token.is_empty() && !token.bytes().any(|byte| byte.is_ascii_whitespace()))
-        .ok_or(BrowserAuthFailure::InvalidSession)?;
+    let Some(token) = value.strip_prefix("Bearer ") else {
+        return Ok(None);
+    };
+    if token.is_empty() || token.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(BrowserAuthFailure::InvalidSession);
+    }
     Ok(Some(token.to_owned()))
 }
 
@@ -1144,9 +1203,10 @@ async fn resolve_user_token(
         BrowserAuthFailure::ProviderUnavailable | BrowserAuthFailure::IdentityUnavailable => error,
         _ => BrowserAuthFailure::InvalidSession,
     })?;
+    let actor = format!("user-token:{}", claims.identity.issuer());
     let mut principal = service
         .identities
-        .resolve_or_register(&claims.identity)
+        .resolve_or_register_user_token(&claims.identity, &actor, claims.email_linking_allowed)
         .await
         .map_err(|error| match error {
             BrowserAuthFailure::IdentityUnavailable => error,
@@ -1519,58 +1579,54 @@ mod tests {
     use axum::routing::{get, post};
     use axum::{Extension, Json, Router};
     use steward_store::BrowserRbacAssignments;
-    use steward_types::{CanonicalUserId, Email, OrganizationId, OrganizationIdentityPolicy};
+    use steward_types::{CanonicalUserId, Email, OrganizationId};
     use tower::ServiceExt;
 
     use super::{
-        BrowserAdminAuthority, BrowserAuthError, BrowserAuthFailure, BrowserMutationProof,
-        BrowserOidcProvider, BrowserPrincipal, BrowserRole, BrowserSessionContext,
-        BrowserSessionRegistry, BrowserUserTokenVerifier, GoogleOidcConfig, LocalFakeIdentity,
+        BrowserAdminAuthority, BrowserAuthError, BrowserAuthFailure, BrowserIdentityResolver,
+        BrowserMutationProof, BrowserOidcProvider, BrowserPrincipal, BrowserRole,
+        BrowserSessionContext, BrowserSessionRegistry, GoogleOidcConfig, LocalFakeIdentity,
         LocalFakeOidcProvider, MAX_BROWSER_SESSIONS, MAX_PENDING_AUTHORIZATIONS,
-        PendingAuthorization, VerifiedUserTokenClaims, browser_auth_router,
-        local_fake_browser_auth_service, protect_browser_admin_routes, protect_browser_routes,
+        PendingAuthorization, browser_auth_router, local_fake_browser_auth_service,
+        protect_browser_admin_routes, protect_browser_routes,
     };
 
-    const ALICE_USER_TOKEN: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6InJvdXRlLWZpeHR1cmUiLCJ0eXAiOiJhdCtqd3QifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlLnRlc3QiLCJhdWQiOiJzdGV3YXJkLWFwaSIsImF6cCI6InBvcnRhbC1jbGllbnQiLCJzdWIiOiJmaXh0dXJlLXVzZXIiLCJlbWFpbCI6ImFsaWNlQGV4YW1wbGUuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImV4cCI6NDEwMjQ0NDgwMCwiaWF0IjoxODkzNDU2MDAwLCJuYmYiOjE4OTM0NTYwMDB9.i7T8nvyQ7xCwgfRMpyv3vwEJYk5UnY6H0v3Zq3GfiYgWOug07SlQKHO-zo1RgMVMbpIOmN9uwh6mdytvaTZAjC2cG8svbwzx03Va9jygq2Fll3CVe_9iEwgOWG0JSokuUDBAQIx8SDAOYuqO3yaFi72pQEbEsQvBDRfVjca4UaDYQU0Q1vOQIx9SRcYplDQd8f_9IFVT982Suz88qRi-i-T4ONsctQyUqlpP-vxEY50H-op5RWtB5XD7T4zxH65nVPFZua4_O-zK15bb_dUIVOo3EMHNA-D_Vuvj7Xu4aJpaPpd_LQJtPUzM6H8eGxgdKFdfwoWTCJsG40K7o0RREw";
-    const BOB_USER_TOKEN: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6InJvdXRlLWZpeHR1cmUiLCJ0eXAiOiJhdCtqd3QifQ.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlLnRlc3QiLCJhdWQiOiJzdGV3YXJkLWFwaSIsImF6cCI6InBvcnRhbC1jbGllbnQiLCJzdWIiOiJmaXh0dXJlLWFkbWluIiwiZW1haWwiOiJib2JAZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiZXhwIjo0MTAyNDQ0ODAwLCJpYXQiOjE4OTM0NTYwMDAsIm5iZiI6MTg5MzQ1NjAwMH0.IRafuJRfLkIHZsAVYlQUA2avv7V4CT988VVLCNhpucwD4-GXlDG0SIyjzUHiT1v1dWyMfxIG5w7cNsYrONQ39x1lIwrZvkaolBWDYPSARQ3lUKq1gEWLLuCHfoxTeSAfNy8sM59gXfmd6Q_YZrZSdGtOvayFeg_QBoULOOatfNDI-tHUzgmvYPCFNLJKDGWREDnjvHWUAb--q_rHVjCfrcbT4BmEzWcrrOWHgsLmJP0XkyJugHz6TMgJi4W9vTwcLpbFBsNDH3a6mumfVxTYGQwYvFV4fLr0ptc8nrR4fSSqamXQgBl4UrpuXrBjT0PZXbC3nwRwbucWSEGYuRIKiw";
-
     #[derive(Clone, Copy)]
-    struct SignedFixtureUserTokenVerifier;
+    struct FixtureTokenIdentityResolver;
 
-    impl BrowserUserTokenVerifier for SignedFixtureUserTokenVerifier {
-        fn verify<'a>(
+    impl BrowserIdentityResolver for FixtureTokenIdentityResolver {
+        fn resolve_or_register<'a>(
             &'a self,
-            token: &'a str,
-        ) -> super::BrowserFuture<'a, Result<VerifiedUserTokenClaims, BrowserAuthFailure>> {
+            identity: &'a steward_types::OrganizationIdentity,
+        ) -> super::BrowserFuture<'a, Result<BrowserPrincipal, BrowserAuthFailure>> {
             Box::pin(async move {
-                let (subject, email, client_id) = match token {
-                    ALICE_USER_TOKEN => ("fixture-user", "alice@example.com", "portal-client"),
-                    BOB_USER_TOKEN => ("fixture-admin", "bob@example.com", "portal-client"),
-                    _ => return Err(BrowserAuthFailure::InvalidSession),
-                };
-                let identity = OrganizationIdentityPolicy::new_configured_oidc(
-                    "https://issuer.example.test",
-                    "example.com",
-                    OrganizationId::parse("org_example".to_owned())
-                        .map_err(|_| BrowserAuthFailure::InvalidSession)?,
-                )
-                .and_then(|policy| {
-                    policy.validate(
-                        "https://issuer.example.test",
-                        subject,
-                        "example.com",
-                        email,
-                        true,
+                if identity.subject() != "fixture-user-subject" {
+                    return Err(BrowserAuthFailure::InvalidIdentity);
+                }
+                Ok(BrowserPrincipal {
+                    canonical_user_id: CanonicalUserId::parse(
+                        "usr_0123456789abcdef0123456789abcdef",
                     )
-                })
-                .map_err(|_| BrowserAuthFailure::InvalidSession)?;
-                Ok(VerifiedUserTokenClaims {
-                    identity,
-                    display_name: None,
-                    frontend_client_id: client_id.to_owned(),
+                    .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
+                    display_name: "Alice Example".to_owned(),
+                    display_email: Email::parse("alice@example.com".to_owned())
+                        .map_err(|_| BrowserAuthFailure::IdentityUnavailable)?,
+                    role: BrowserRole::User,
+                    member_roles: Vec::new(),
                 })
             })
         }
+    }
+
+    fn user_token_test_service() -> Result<super::BrowserAuthService, String> {
+        let service = super::BrowserAuthService::local_fake(
+            "http://127.0.0.1:33001",
+            Arc::new(LocalFakeOidcProvider::new(LocalFakeIdentity::User)),
+            Arc::new(FixtureTokenIdentityResolver),
+        )?;
+        Ok(service.with_user_token_verifier(Arc::new(
+            crate::google_oidc::fixture_user_token_verifier(false)?,
+        )))
     }
 
     #[test]
@@ -2530,9 +2586,8 @@ mod tests {
         .map_err(|error| format!("execute disabled bearer request: {error}"))?;
         assert_eq!(disabled.status(), StatusCode::UNAUTHORIZED);
 
-        let service =
-            local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?
-                .with_user_token_verifier(Arc::new(SignedFixtureUserTokenVerifier));
+        let service = user_token_test_service()?;
+        let access_token = crate::google_oidc::fixture_user_access_token();
         let routes = || {
             protect_browser_routes(
                 Router::new().route("/app/api/v1/probe", get(probe).post(probe)),
@@ -2557,7 +2612,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/app/api/v1/probe")
-                    .header(header::AUTHORIZATION, format!("Bearer {ALICE_USER_TOKEN}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::empty())
                     .map_err(|error| format!("build bearer user request: {error}"))?,
@@ -2574,6 +2629,19 @@ mod tests {
         assert_eq!(audit["frontendClientId"], "portal-client");
         assert!(audit.get("token").is_none());
 
+        let id_token = crate::google_oidc::fixture_user_id_token();
+        let browser_id_token = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/probe")
+                    .header(header::AUTHORIZATION, format!("Bearer {id_token}"))
+                    .body(Body::empty())
+                    .map_err(|error| format!("build browser ID-token request: {error}"))?,
+            )
+            .await
+            .map_err(|error| format!("execute browser ID-token request: {error}"))?;
+        assert_eq!(browser_id_token.status(), StatusCode::UNAUTHORIZED);
+
         let outside_user_api = protect_browser_routes(
             Router::new().route("/admin/api/v1/probe", get(probe)),
             service.clone(),
@@ -2581,7 +2649,7 @@ mod tests {
         .oneshot(
             Request::builder()
                 .uri("/admin/api/v1/probe")
-                .header(header::AUTHORIZATION, format!("Bearer {ALICE_USER_TOKEN}"))
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
                 .body(Body::empty())
                 .map_err(|error| format!("build out-of-scope bearer request: {error}"))?,
         )
@@ -2593,6 +2661,43 @@ mod tests {
             .registry
             .issue(principal()?, super::epoch_seconds())
             .map_err(|error| format!("issue conflict cookie: {error:?}"))?;
+        let cookie_with_unrelated_authorization = protect_browser_routes(
+            Router::new().route("/outside-bearer-scope", get(probe)),
+            service.clone(),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/outside-bearer-scope")
+                .header(
+                    header::COOKIE,
+                    format!("steward-local-session={}", cookie.token),
+                )
+                .header(header::AUTHORIZATION, "Basic proxy-credential")
+                .body(Body::empty())
+                .map_err(|error| format!("build cookie request with proxy auth: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("execute cookie request with proxy auth: {error}"))?;
+        assert_eq!(cookie_with_unrelated_authorization.status(), StatusCode::OK);
+
+        let scoped_cookie_with_non_bearer = routes()
+            .oneshot(
+                Request::builder()
+                    .uri("/app/api/v1/probe")
+                    .header(
+                        header::COOKIE,
+                        format!("steward-local-session={}", cookie.token),
+                    )
+                    .header(header::AUTHORIZATION, "Basic proxy-credential")
+                    .body(Body::empty())
+                    .map_err(|error| {
+                        format!("build scoped cookie request with Basic auth: {error}")
+                    })?,
+            )
+            .await
+            .map_err(|error| format!("execute scoped cookie request with Basic auth: {error}"))?;
+        assert_eq!(scoped_cookie_with_non_bearer.status(), StatusCode::OK);
+
         let same_person_without_csrf = routes()
             .oneshot(
                 Request::builder()
@@ -2602,7 +2707,7 @@ mod tests {
                         header::COOKIE,
                         format!("steward-local-session={}", cookie.token),
                     )
-                    .header(header::AUTHORIZATION, format!("Bearer {ALICE_USER_TOKEN}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
                     .header(header::ORIGIN, "http://127.0.0.1:33001")
                     .header("sec-fetch-site", "same-origin")
                     .header(header::CONTENT_TYPE, "application/json")
@@ -2613,15 +2718,23 @@ mod tests {
             .map_err(|error| format!("execute cookie and bearer mutation: {error}"))?;
         assert_eq!(same_person_without_csrf.status(), StatusCode::FORBIDDEN);
 
+        let mut other_principal = principal()?;
+        other_principal.canonical_user_id =
+            CanonicalUserId::parse("usr_abcdef0123456789abcdef0123456789")?;
+        other_principal.display_email = Email::parse("bob@example.org".to_owned())?;
+        let other_cookie = service
+            .registry
+            .issue(other_principal, super::epoch_seconds())
+            .map_err(|error| format!("issue conflicting cookie: {error:?}"))?;
         let conflict = routes()
             .oneshot(
                 Request::builder()
                     .uri("/app/api/v1/probe")
                     .header(
                         header::COOKIE,
-                        format!("steward-local-session={}", cookie.token),
+                        format!("steward-local-session={}", other_cookie.token),
                     )
-                    .header(header::AUTHORIZATION, format!("Bearer {BOB_USER_TOKEN}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
                     .body(Body::empty())
                     .map_err(|error| format!("build conflicting identities request: {error}"))?,
             )
@@ -2643,9 +2756,8 @@ mod tests {
             }))
         }
 
-        let service =
-            local_fake_browser_auth_service("http://127.0.0.1:33001", LocalFakeIdentity::User)?
-                .with_user_token_verifier(Arc::new(SignedFixtureUserTokenVerifier));
+        let service = user_token_test_service()?;
+        let access_token = crate::google_oidc::fixture_user_access_token();
         let routes = || {
             protect_browser_admin_routes(
                 Router::new().route("/admin-probe", axum::routing::get(admin_probe)),
@@ -2678,7 +2790,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin-probe")
-                    .header(header::AUTHORIZATION, format!("Bearer {ALICE_USER_TOKEN}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
                     .body(Body::empty())
                     .map_err(|error| format!("build valid user bearer admin request: {error}"))?,
             )

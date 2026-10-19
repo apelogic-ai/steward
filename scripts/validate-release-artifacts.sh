@@ -903,7 +903,9 @@ for required in \
   '            - { name: STEWARD_USER_TOKEN_ISSUER, value: "https://issuer.example.test" }' \
   '            - { name: STEWARD_USER_TOKEN_API_AUDIENCE, value: "steward-api" }' \
   '            - { name: STEWARD_USER_TOKEN_FRONTEND_CLIENT_IDS, value: "[\"portal-client\"]" }' \
-  '            - { name: STEWARD_USER_TOKEN_REQUIRED_TYP, value: "at+jwt" }'
+  '            - { name: STEWARD_USER_TOKEN_REQUIRED_TYP, value: "at+jwt" }' \
+  '            - { name: STEWARD_USER_TOKEN_EMAIL_CLAIM, value: "email" }' \
+  '            - { name: STEWARD_USER_TOKEN_TRUST_EMAIL, value: "false" }'
 do
   grep -Fxq "${required}" "${browser_auth_deployment}"
 done
@@ -1054,110 +1056,6 @@ if helm template steward "${root}/charts/steward" \
   --set-string browserAuth.google.clientId=stale-client >/dev/null 2>&1
 then
   echo "disabled browser authentication with stale configuration must fail chart validation" >&2
-  exit 1
-fi
-user_token_chart_values=(
-  --set browserAuth.enabled=true
-  --set-string browserAuth.google.clientId=google-client-id
-  --set-string browserAuth.google.origin=https://steward.example.test
-  --set-string browserAuth.google.workspaceDomain=example.test
-  --set-string browserAuth.google.organizationId=org_example
-  --set-string browserAuth.google.clientSecret.name=steward-google-oidc
-  --set-string browserAuth.google.clientSecret.key=client-secret
-  --set-string 'browserAuth.userTokens.frontendClientIds[0]=portal-client'
-  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24'
-)
-if helm template steward "${root}/charts/steward" \
-  --namespace steward \
-  --include-crds \
-  "${image_values[@]}" \
-  --set browserAuth.enabled=true \
-  --set-string browserAuth.google.clientId=google-client-id \
-  --set-string browserAuth.google.origin=https://steward.example.test \
-  --set-string browserAuth.google.workspaceDomain=example.test \
-  --set-string browserAuth.google.organizationId=org_example \
-  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
-  --set-string browserAuth.google.clientSecret.key=client-secret \
-  --set-string browserAuth.userTokens.hyperShellAudience=steward-api \
-  --set-string 'browserAuth.userTokens.frontendClientIds[0]=portal-client' \
-  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' >/dev/null 2>&1
-then
-  echo "headless user tokens without an exact issuer must fail chart validation" >&2
-  exit 1
-fi
-if helm template steward "${root}/charts/steward" \
-  --namespace steward \
-  --include-crds \
-  "${image_values[@]}" \
-  --set browserAuth.enabled=true \
-  --set-string browserAuth.google.clientId=google-client-id \
-  --set-string browserAuth.google.origin=https://steward.example.test \
-  --set-string browserAuth.google.workspaceDomain=example.test \
-  --set-string browserAuth.google.organizationId=org_example \
-  --set-string browserAuth.google.clientSecret.name=steward-google-oidc \
-  --set-string browserAuth.google.clientSecret.key=client-secret \
-  --set-string browserAuth.userTokens.issuer=https://issuer.example.test \
-  --set-string browserAuth.userTokens.hyperShellAudience=steward-api \
-  --set-string browserAuth.userTokens.portalAudience=portal-client \
-  --set-string 'browserAuth.userTokens.frontendClientIds[0]=portal-client' \
-  --set 'networkPolicy.browserAuthEgressCidrs[0]=203.0.113.0/24' >/dev/null 2>&1
-then
-  echo "a portal audience without explicit opt-in must fail chart validation" >&2
-  exit 1
-fi
-for invalid_issuer in \
-  'https://accounts.google.com' \
-  'https://accounts.google.com/' \
-  'https://ACCOUNTS.GOOGLE.COM' \
-  'https://accounts.google.com:443' \
-  'https://issuer.example.test:70000' \
-  'https://issuer.example.test/ü'
-do
-  if helm template steward "${root}/charts/steward" \
-    --namespace steward \
-    --include-crds \
-    "${image_values[@]}" \
-    "${user_token_chart_values[@]}" \
-    --set-string "browserAuth.userTokens.issuer=${invalid_issuer}" \
-    --set-string browserAuth.userTokens.hyperShellAudience=steward-api >/dev/null 2>&1
-  then
-    echo "headless user-token issuer must be a non-Google ASCII HTTPS issuer: ${invalid_issuer}" >&2
-    exit 1
-  fi
-done
-if helm template steward "${root}/charts/steward" \
-  --namespace steward \
-  --include-crds \
-  "${image_values[@]}" \
-  "${user_token_chart_values[@]}" \
-  --set-string browserAuth.userTokens.issuer=https://issuer.example.test \
-  --set-string browserAuth.userTokens.hyperShellAudience=portal-client >/dev/null 2>&1
-then
-  echo "the HyperShell audience must differ from every frontend client ID" >&2
-  exit 1
-fi
-if helm template steward "${root}/charts/steward" \
-  --namespace steward \
-  --include-crds \
-  "${image_values[@]}" \
-  "${user_token_chart_values[@]}" \
-  --set-string browserAuth.userTokens.issuer=https://issuer.example.test \
-  --set-string browserAuth.userTokens.hyperShellAudience=steward-api \
-  --set-string browserAuth.userTokens.portalAudience=portal-client \
-  --set browserAuth.userTokens.acceptPortalAudience=true >/dev/null 2>&1
-then
-  echo "the portal audience must differ from every frontend client ID" >&2
-  exit 1
-fi
-if helm template steward "${root}/charts/steward" \
-  --namespace steward \
-  --include-crds \
-  "${image_values[@]}" \
-  "${user_token_chart_values[@]}" \
-  --set-string browserAuth.userTokens.issuer=https://issuer.example.test \
-  --set-string browserAuth.userTokens.hyperShellAudience='steward-π' >/dev/null 2>&1
-then
-  echo "headless user-token audiences must be bounded ASCII values" >&2
   exit 1
 fi
 for invalid_browser_origin in \

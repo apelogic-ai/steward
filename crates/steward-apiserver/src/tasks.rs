@@ -2163,14 +2163,34 @@ where
         canonical_user_id: session.principal.canonical_user_id,
         source_provenance: None,
     };
+    let caller_reference = match browser_caller_reference(session.user_token.as_ref()) {
+        Ok(reference) => reference,
+        Err(error) => return error.into_response(),
+    };
     match state
         .application
-        .submit_browser(idempotency_key, identity, &request)
+        .submit_browser(
+            idempotency_key,
+            identity,
+            caller_reference.as_ref(),
+            &request,
+        )
         .await
     {
         Ok(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+fn browser_caller_reference(
+    audit: Option<&crate::browser_auth::BrowserUserTokenAudit>,
+) -> Result<Option<CallerReference>, ApiError> {
+    audit
+        .map(|audit| {
+            CallerReference::new(audit.frontend_client_id.clone(), Some(audit.issuer.clone()))
+                .map_err(ApiError::Admission)
+        })
+        .transpose()
 }
 
 pub fn task_router<L, I>(ledger: L, identities: I, config: TaskApiConfig) -> Router
@@ -2580,6 +2600,7 @@ where
         &self,
         idempotency_key: &str,
         identity: TaskIdentity,
+        caller_reference: Option<&CallerReference>,
         request: &BrowserTaskSubmission,
     ) -> Result<BrowserRunSubmissionResponse, ApiError> {
         request.validate().map_err(ApiError::Admission)?;
@@ -2589,13 +2610,23 @@ where
             ));
         }
         let (mut record, evidence) = if request.package.source.starts_with("steward:registry/") {
-            self.submit_browser_registry(idempotency_key, identity.clone(), request)
-                .await
-                .map_err(|error| self.browser_task_persistence_error(error))?
+            self.submit_browser_registry(
+                idempotency_key,
+                identity.clone(),
+                caller_reference,
+                request,
+            )
+            .await
+            .map_err(|error| self.browser_task_persistence_error(error))?
         } else {
-            self.submit_browser_package(idempotency_key, identity.clone(), request)
-                .await
-                .map_err(|error| self.browser_task_persistence_error(error))?
+            self.submit_browser_package(
+                idempotency_key,
+                identity.clone(),
+                caller_reference,
+                request,
+            )
+            .await
+            .map_err(|error| self.browser_task_persistence_error(error))?
         };
         let caller_input_archive = browser_inputs_archive(&request.inputs)?;
         if !record
@@ -2682,6 +2713,7 @@ where
         &self,
         idempotency_key: &str,
         identity: TaskIdentity,
+        caller_reference: Option<&CallerReference>,
         request: &BrowserTaskSubmission,
     ) -> Result<(TaskRecord, BrowserTaskEvidence), ApiError> {
         let name = request
@@ -2729,7 +2761,7 @@ where
         evidence.validate().map_err(ApiError::Admission)?;
         let task_request = TaskSubmissionRequest {
             workflow: format!("{name}@{version}"),
-            caller_reference: None,
+            caller_reference: caller_reference.cloned(),
             envelope_digest: request.envelope_digest.clone(),
             coding_agent_runtime: None,
             agent_runtime_uid: None,
@@ -2765,6 +2797,7 @@ where
         &self,
         idempotency_key: &str,
         identity: TaskIdentity,
+        caller_reference: Option<&CallerReference>,
         request: &BrowserTaskSubmission,
     ) -> Result<(TaskRecord, BrowserTaskEvidence), ApiError> {
         let existing = self
@@ -2833,7 +2866,7 @@ where
                 operation_id,
                 idempotency_key,
                 submitter_service: &identity.service,
-                caller_reference: None,
+                caller_reference,
                 acting_user: identity.acting_user.as_ref().map(|email| email.0.as_str()),
                 acting_user_id: identity
                     .acting_user
@@ -3243,8 +3276,15 @@ where
                 canonical_user_id: session.principal.canonical_user_id.clone(),
                 source_provenance: None,
             };
+            let caller_reference = browser_caller_reference(session.user_token.as_ref())
+                .map_err(|_| BrowserTaskRerunError::Rejected)?;
             self.application
-                .submit_browser(idempotency_key, identity, &request)
+                .submit_browser(
+                    idempotency_key,
+                    identity,
+                    caller_reference.as_ref(),
+                    &request,
+                )
                 .await
                 .map(|response| response.task_uid)
                 .map_err(|error| match error {
@@ -7062,16 +7102,17 @@ mod workflow_request_tests {
         DirectGitResolver, MAX_WORKSPACE_MATERIALIZED_BYTES, TaskApiConfig, TaskCreateRequest,
         TaskSubmissionRequest, WorkspaceAdmissionPolicy, WorkspaceGitPackLimits,
         WorkspaceGitPackTarget, WorkspaceResolutionBudget, append_workspace_git_pack,
-        browser_input_retry_matches, browser_inputs_archive, browser_inputs_from_archive,
-        browser_rerun_submission, browser_task_evidence_matches, browser_workspace_trigger_commit,
-        default_workspace_name, direct_authority_spec, direct_effective_requirements,
-        direct_requirements_for_task, direct_task_evidence_matches, format_workspace_bytes,
-        prepare_task_input_archive, resolve_scratch_workspace_entry, resolve_versioned_task_plan,
-        source_port_error, source_port_error_with_reporter, stable_task_runtime_name,
-        task_orchestration_reservation, validate_workspace_policy, versioned_workflow_reference,
-        workspace_admission_policy, workspace_git_materialized_budget,
-        workspace_named_ref_error_with_reporter, workspace_submodule_is_selected,
-        workspace_submodule_repository_url, workspace_tree_inventory,
+        browser_caller_reference, browser_input_retry_matches, browser_inputs_archive,
+        browser_inputs_from_archive, browser_rerun_submission, browser_task_evidence_matches,
+        browser_workspace_trigger_commit, default_workspace_name, direct_authority_spec,
+        direct_effective_requirements, direct_requirements_for_task, direct_task_evidence_matches,
+        format_workspace_bytes, prepare_task_input_archive, resolve_scratch_workspace_entry,
+        resolve_versioned_task_plan, source_port_error, source_port_error_with_reporter,
+        stable_task_runtime_name, task_orchestration_reservation, validate_workspace_policy,
+        versioned_workflow_reference, workspace_admission_policy,
+        workspace_git_materialized_budget, workspace_named_ref_error_with_reporter,
+        workspace_submodule_is_selected, workspace_submodule_repository_url,
+        workspace_tree_inventory,
     };
     use crate::{ApiError, TaskIdentity};
     use steward_admission::{
@@ -7093,6 +7134,25 @@ mod workflow_request_tests {
         Budget, CanonicalUserId, Duration, Email, ModelRef, RunnerRequirements, ToolGrant,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn bearer_task_caller_reference_records_issuer_and_frontend_client() -> Result<(), String> {
+        let audit = crate::browser_auth::BrowserUserTokenAudit {
+            issuer: "https://issuer.example.test".to_owned(),
+            frontend_client_id: "portal-client".to_owned(),
+        };
+        let reference = browser_caller_reference(Some(&audit))
+            .map_err(|error| format!("build bearer caller reference: {error:?}"))?
+            .ok_or_else(|| "bearer caller reference missing".to_owned())?;
+        assert_eq!(reference.label(), "portal-client");
+        assert_eq!(reference.url(), Some("https://issuer.example.test"));
+        assert!(
+            browser_caller_reference(None)
+                .map_err(|error| format!("cookie caller: {error:?}"))?
+                .is_none()
+        );
+        Ok(())
+    }
 
     #[test]
     fn workspace_byte_messages_use_readable_rounded_units() {

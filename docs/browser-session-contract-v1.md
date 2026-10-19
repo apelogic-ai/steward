@@ -26,9 +26,8 @@ dependency.
 The headless path accepts only a signed RS256 or ES256 JWT access token from the configured issuer.
 An operator may require an exact protected JOSE `typ`, such as `at+jwt`; otherwise `typ` is
 optional. A browser ID token is not interchangeable with an API access token because its audience
-is a frontend client rather than the configured API audience. Provider `groups` claims cannot
-grant Steward roles and are refused when non-empty. The canonical user's existing local RBAC
-assignments remain the only role source.
+is a frontend client rather than the configured API audience. Provider `groups` claims are ignored;
+the canonical user's existing local RBAC assignments remain the only role source.
 
 ## First local RBAC grant
 
@@ -129,9 +128,11 @@ When `browserAuth.userTokens.issuer` and `hyperShellAudience` are nonempty, a na
 frontend may call only `/app/api/v1/*` with `Authorization: Bearer <access-token>`. Steward fetches
 bounded discovery and JWKS documents from that exact HTTPS issuer, follows no redirects, and
 accepts only RS256 or ES256 signatures. It requires the configured HyperShell audience, one
-allowlisted `azp` or `client_id`, a verified email in the browser workspace domain, a valid key ID,
-current `exp` and `nbf`, and an `iat` within `maximumTokenAgeSeconds`. If `requiredTyp` is nonempty,
-the JOSE `typ` must exactly match it. Opaque tokens and provider group claims fail closed.
+allowlisted `azp` or `client_id`, an email in the browser workspace domain, a valid key ID, current
+`exp` and `nbf` with bounded clock skew, and an `iat` within `maximumTokenAgeSeconds`. `emailClaim`
+selects the email claim. By default `email_verified` must be true; `trustEmail=true` is an explicit
+operator decision to trust the configured issuer's email. If `requiredTyp` is nonempty, the JOSE
+`typ` must exactly match it. Opaque tokens fail closed.
 
 The optional portal audience is accepted only when `acceptPortalAudience=true`, a nonempty
 `portalAudience` is configured, and the frontend client ID is allowlisted. It does not replace the
@@ -143,15 +144,22 @@ tokens are not API bearer credentials: their client-ID audience does not satisfy
 HyperShell audience. Opaque-token introspection or exchange is outside this contract.
 
 The verified subject is resolved or registered through the same canonical identity resolver as
-browser login. Access still comes only from Steward's local RBAC assignments; token claims do
-not grant administrator or member roles. Each request carries the verified issuer and frontend
-client ID as audit context, while the raw token is never logged or stored. The request binding is a
-SHA-256-derived opaque value and never exposes the token.
+browser login. Google and a trusted-email access-token issuer may link their exact subject to an
+existing canonical user only when the organization and workspace email domain match; an access
+token attachment records actor `user-token:<issuer>` and does not create a second user. An
+access-token issuer that still requires `email_verified` cannot use email linking. Access still
+comes only from Steward's local RBAC
+assignments; token claims do not grant administrator or member roles. Browser Tasks persist the
+verified issuer and frontend client ID through their existing caller reference. The raw token is
+never logged or stored. The request binding is a SHA-256-derived opaque value and never exposes
+the token.
 
 A bearer-only mutation does not need browser CSRF proof. If a request also contains a browser
 cookie, the cookie remains subject to the existing origin, fetch-site, content-type, and CSRF
 checks. If cookie and bearer resolve to different people, Steward returns 401. User bearer tokens
 never authenticate `/admin/*`, operator, hook, or direct Task-token routes.
+Authorization headers outside `/app/api/v1/*`, and non-Bearer schemes, do not change cookie-session
+behavior.
 
 ## Production verifier and activation boundary
 

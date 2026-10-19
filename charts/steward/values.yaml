@@ -169,6 +169,8 @@ browserAuth:
     frontendClientIds: []
     maximumTokenAgeSeconds: 300
     requiredTyp: ""
+    emailClaim: email
+    trustEmail: false
 workloadExchangeTrust:
   kind: ConfigMap
   name: steward-workload-exchange-ca

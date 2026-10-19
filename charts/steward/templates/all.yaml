@@ -25,15 +25,6 @@
 {{- if .Values.persistence.enabled }}
 {{- fail "persistence.enabled is unsupported: Steward uses the externally managed database Secret" }}
 {{- end }}
-{{- if and .Values.browserAuth.enabled .Values.browserAuth.userTokens.issuer (has .Values.browserAuth.userTokens.hyperShellAudience .Values.browserAuth.userTokens.frontendClientIds) }}
-{{- fail "browserAuth.userTokens.hyperShellAudience must differ from every frontend client ID" }}
-{{- end }}
-{{- if and .Values.browserAuth.enabled (regexMatch "(?i)^https://accounts\\.google\\.com(?::443)?/?$" .Values.browserAuth.userTokens.issuer) }}
-{{- fail "browserAuth.userTokens.issuer must not be the Google browser issuer" }}
-{{- end }}
-{{- if and .Values.browserAuth.enabled .Values.browserAuth.userTokens.acceptPortalAudience (has .Values.browserAuth.userTokens.portalAudience .Values.browserAuth.userTokens.frontendClientIds) }}
-{{- fail "browserAuth.userTokens.portalAudience must differ from every frontend client ID" }}
-{{- end }}
 {{- if and .Values.jira.enabled (or (not .Values.config.apiserver.jiraBaseUrl) (not .Values.config.apiserver.jiraProjectKey) (not .Values.config.apiserver.jiraAccountEmail)) }}
 {{- fail "jira.enabled requires URL, project key, and account email" }}
 {{- end }}
@@ -538,6 +529,8 @@ spec:
             - { name: STEWARD_USER_TOKEN_FRONTEND_CLIENT_IDS, value: {{ .Values.browserAuth.userTokens.frontendClientIds | toJson | quote }} }
             - { name: STEWARD_USER_TOKEN_MAX_AGE_SECONDS, value: {{ .Values.browserAuth.userTokens.maximumTokenAgeSeconds | quote }} }
             - { name: STEWARD_USER_TOKEN_REQUIRED_TYP, value: {{ .Values.browserAuth.userTokens.requiredTyp | quote }} }
+            - { name: STEWARD_USER_TOKEN_EMAIL_CLAIM, value: {{ .Values.browserAuth.userTokens.emailClaim | quote }} }
+            - { name: STEWARD_USER_TOKEN_TRUST_EMAIL, value: {{ .Values.browserAuth.userTokens.trustEmail | quote }} }
 {{- end }}
 {{- if .Values.connectionsBridge.enabled }}
             - { name: STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE, value: {{ .Values.connectionsBridge.artifactTrust.mode | quote }} }

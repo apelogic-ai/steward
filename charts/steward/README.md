@@ -363,6 +363,11 @@ reuse the browser workspace domain, canonical-user, and local-RBAC rules. They d
 to administrator routes. Google sign-in continues to use browser sessions because Google user
 access tokens are opaque and are not accepted by this JWT verifier.
 
+`emailClaim` names the issuer claim containing the organization email and defaults to `email`.
+By default, the token must also carry `email_verified: true`. Set `trustEmail=true` only when the
+configured issuer contract makes that claim unnecessary. That opt-in also allows Steward to link
+the exact organization email to an existing canonical user; issuer groups never grant roles.
+
 ## Direct package source resolution
 
 `githubSource` defaults to disabled. Enabling it is an atomic apiserver-only

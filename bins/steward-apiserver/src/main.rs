@@ -739,6 +739,8 @@ struct BrowserUserTokenEnvironment {
     frontend_client_ids_json: Option<String>,
     maximum_token_age_seconds: Option<String>,
     required_typ: Option<String>,
+    email_claim: Option<String>,
+    trust_email: Option<String>,
 }
 
 fn configured_browser_user_tokens(
@@ -760,6 +762,8 @@ fn configured_browser_user_tokens(
                 "STEWARD_USER_TOKEN_MAX_AGE_SECONDS",
             )?,
             required_typ: optional_unicode_environment("STEWARD_USER_TOKEN_REQUIRED_TYP")?,
+            email_claim: optional_unicode_environment("STEWARD_USER_TOKEN_EMAIL_CLAIM")?,
+            trust_email: optional_unicode_environment("STEWARD_USER_TOKEN_TRUST_EMAIL")?,
         },
         organization_claim,
         organization_id,
@@ -802,12 +806,26 @@ fn parse_browser_user_token_config(
             io::Error::other("STEWARD_USER_TOKEN_MAX_AGE_SECONDS must be a positive integer")
         })?;
     let required_typ = environment.required_typ.unwrap_or_default();
+    let email_claim = environment
+        .email_claim
+        .unwrap_or_else(|| "email".to_owned());
+    let trust_email = match environment.trust_email.as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        _ => {
+            return Err(io::Error::other(
+                "STEWARD_USER_TOKEN_TRUST_EMAIL must be true or false",
+            ));
+        }
+    };
     if issuer.is_empty() && api_audience.is_empty() {
         if !portal_audience.is_empty()
             || portal_audience_enabled
             || !frontend_client_ids.is_empty()
             || (maximum_was_configured && maximum_token_age_seconds != 300)
             || !required_typ.is_empty()
+            || email_claim != "email"
+            || trust_email
         {
             return Err(io::Error::other(
                 "user token configuration requires an issuer and HyperShell API audience",
@@ -829,15 +847,18 @@ fn parse_browser_user_token_config(
             ));
         }
     };
-    google_oidc::UserTokenConfig::new(
-        google_oidc::UserTokenIdentityConfig::new(issuer, organization_claim, organization_id)
-            .map_err(io::Error::other)?,
+    google_oidc::UserTokenConfig::new(google_oidc::UserTokenSettings {
+        issuer,
+        organization_claim,
+        organization_id,
+        email_claim,
+        trust_email,
         api_audience,
         portal_audience,
         frontend_client_ids,
         maximum_token_age_seconds,
-        (!required_typ.is_empty()).then_some(required_typ),
-    )
+        required_typ: (!required_typ.is_empty()).then_some(required_typ),
+    })
     .map(Some)
     .map_err(io::Error::other)
 }
@@ -2057,6 +2078,8 @@ mod tests {
                 frontend_client_ids_json,
                 maximum_token_age_seconds,
                 required_typ: None,
+                email_claim: None,
+                trust_email: None,
             },
             "example.com".to_owned(),
             steward_types::OrganizationId::parse("org_example".to_owned())
@@ -2168,6 +2191,8 @@ mod tests {
                     frontend_client_ids_json: Some("[\"portal-client\"]".to_owned()),
                     maximum_token_age_seconds: Some("600".to_owned()),
                     required_typ: None,
+                    email_claim: None,
+                    trust_email: None,
                 },
                 "example.com".to_owned(),
                 steward_types::OrganizationId::parse("org_example".to_owned())?,
@@ -2185,6 +2210,8 @@ mod tests {
                     frontend_client_ids_json: Some("[\"portal-client\"]".to_owned()),
                     maximum_token_age_seconds: Some("600".to_owned()),
                     required_typ: Some("at+jwt".to_owned()),
+                    email_claim: Some("preferred_email".to_owned()),
+                    trust_email: Some("true".to_owned()),
                 },
                 "example.com".to_owned(),
                 steward_types::OrganizationId::parse("org_example".to_owned())?,

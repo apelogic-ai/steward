@@ -10,9 +10,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Optional headless user access accepts RS256 or ES256 JWT access tokens from an exact configured
   OIDC issuer on `/app/api/v1/*` when the HyperShell audience, frontend client IDs, and maximum
   token age are configured. The portal audience and token `typ` are separate opt-ins. Tokens reuse
-  canonical users and local RBAC, never grant administrator-route access, and record the issuer
-  and frontend client ID without recording the token. Google access tokens remain browser-session
-  only because Google issues opaque user access tokens.
+  canonical users and local RBAC, ignore provider groups, never grant administrator-route access,
+  and persist the issuer and frontend client ID without recording the token. The email claim is
+  configurable; operators may either require `email_verified` or explicitly trust the issuer's
+  email, which also permits exact same-organization email linking to an existing canonical user.
+  Google access tokens remain browser-session only because Google issues opaque user access tokens.
 
 ## [0.3.20] - 2026-10-18
 
