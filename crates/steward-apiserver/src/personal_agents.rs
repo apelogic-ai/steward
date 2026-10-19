@@ -48,6 +48,18 @@ pub const DEFAULT_MAX_REPLY_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_PROMPT_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersonalAgentDispatchSettings {
+    pub recent_turn_limit: i64,
+    pub lease_seconds: i64,
+    pub poll_interval_seconds: u64,
+    pub max_concurrent_turns: usize,
+    pub max_transient_attempts: i32,
+    pub retry_backoff_seconds: i64,
+    pub max_claims_per_turn: i32,
+    pub monitoring_grace_seconds: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PersonalAgentConfig {
     recent_turn_limit: i64,
     lease_seconds: i64,
@@ -62,16 +74,19 @@ pub struct PersonalAgentConfig {
 
 impl PersonalAgentConfig {
     pub fn new(
-        recent_turn_limit: i64,
-        lease_seconds: i64,
-        poll_interval_seconds: u64,
-        max_concurrent_turns: usize,
-        max_transient_attempts: i32,
-        retry_backoff_seconds: i64,
-        max_claims_per_turn: i32,
-        monitoring_grace_seconds: i64,
+        settings: PersonalAgentDispatchSettings,
         limits: PersonalAgentLimits,
     ) -> Result<Self, String> {
+        let PersonalAgentDispatchSettings {
+            recent_turn_limit,
+            lease_seconds,
+            poll_interval_seconds,
+            max_concurrent_turns,
+            max_transient_attempts,
+            retry_backoff_seconds,
+            max_claims_per_turn,
+            monitoring_grace_seconds,
+        } = settings;
         if !(1..=100).contains(&recent_turn_limit) {
             return Err("personal agent thread turn limit must be between 1 and 100".to_owned());
         }
@@ -967,9 +982,9 @@ mod tests {
     use super::{
         DEFAULT_MAX_INSTRUCTIONS_BYTES, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_NAME_CHARACTERS,
         DEFAULT_MAX_PROMPT_BYTES, DEFAULT_MAX_QUEUED_BYTES, DEFAULT_MAX_REPLY_BYTES,
-        PersonalAgentConfig, PersonalAgentDispatchRecord, keep_monitoring_after_status_error,
-        monitoring_deadline_from_values, retry_delay_seconds, safe_failure_reason,
-        store_error_response, turn_prompt,
+        PersonalAgentConfig, PersonalAgentDispatchRecord, PersonalAgentDispatchSettings,
+        keep_monitoring_after_status_error, monitoring_deadline_from_values, retry_delay_seconds,
+        safe_failure_reason, store_error_response, turn_prompt,
     };
     use crate::tasks::PersonalAgentTaskError;
     use crate::tasks::personal_agent_task_definition;
@@ -996,18 +1011,62 @@ mod tests {
         }
     }
 
+    fn dispatch_settings() -> PersonalAgentDispatchSettings {
+        PersonalAgentDispatchSettings {
+            recent_turn_limit: 8,
+            lease_seconds: 30,
+            poll_interval_seconds: 1,
+            max_concurrent_turns: 8,
+            max_transient_attempts: 3,
+            retry_backoff_seconds: 2,
+            max_claims_per_turn: 10,
+            monitoring_grace_seconds: 60,
+        }
+    }
+
     #[test]
     fn configuration_refuses_unbounded_or_unsafe_dispatch_values() {
-        assert!(PersonalAgentConfig::new(0, 30, 1, 8, 3, 2, 10, 60, limits()).is_err());
-        assert!(PersonalAgentConfig::new(101, 30, 1, 8, 3, 2, 10, 60, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 4, 1, 8, 3, 2, 10, 60, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 16, 8, 3, 2, 10, 60, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 0, 3, 2, 10, 60, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 0, 2, 10, 60, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, 0, 10, 60, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, 2, 0, 60, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, 2, 10, 0, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, 2, 10, 60, limits()).is_ok());
+        for invalid in [
+            PersonalAgentDispatchSettings {
+                recent_turn_limit: 0,
+                ..dispatch_settings()
+            },
+            PersonalAgentDispatchSettings {
+                recent_turn_limit: 101,
+                ..dispatch_settings()
+            },
+            PersonalAgentDispatchSettings {
+                lease_seconds: 4,
+                ..dispatch_settings()
+            },
+            PersonalAgentDispatchSettings {
+                poll_interval_seconds: 16,
+                ..dispatch_settings()
+            },
+            PersonalAgentDispatchSettings {
+                max_concurrent_turns: 0,
+                ..dispatch_settings()
+            },
+            PersonalAgentDispatchSettings {
+                max_transient_attempts: 0,
+                ..dispatch_settings()
+            },
+            PersonalAgentDispatchSettings {
+                retry_backoff_seconds: 0,
+                ..dispatch_settings()
+            },
+            PersonalAgentDispatchSettings {
+                max_claims_per_turn: 0,
+                ..dispatch_settings()
+            },
+            PersonalAgentDispatchSettings {
+                monitoring_grace_seconds: 0,
+                ..dispatch_settings()
+            },
+        ] {
+            assert!(PersonalAgentConfig::new(invalid, limits()).is_err());
+        }
+        assert!(PersonalAgentConfig::new(dispatch_settings(), limits()).is_ok());
     }
 
     #[test]
@@ -1025,13 +1084,13 @@ mod tests {
     }
 
     #[test]
-    fn monitoring_deadline_uses_turn_start_envelope_ttl_and_grace() {
+    fn monitoring_deadline_uses_turn_start_envelope_ttl_and_grace() -> Result<(), String> {
         let deadline = monitoring_deadline_from_values(
             "2026-10-19T00:00:00Z",
             &Duration("30m".to_owned()),
             60,
         )
-        .expect("valid deadline");
+        .ok_or_else(|| "valid deadline was rejected".to_owned())?;
         assert_eq!(deadline.to_rfc3339(), "2026-10-19T00:31:00+00:00");
         assert!(
             monitoring_deadline_from_values(
@@ -1041,6 +1100,7 @@ mod tests {
             )
             .is_none()
         );
+        Ok(())
     }
 
     #[test]

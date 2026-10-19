@@ -17,7 +17,9 @@ use steward_apiserver::browser_auth::{
     BrowserOidcProvider, BrowserPrincipal, BrowserRole, GoogleOidcConfig,
     VerifiedOrganizationClaims, browser_auth_router,
 };
-use steward_apiserver::personal_agents::{PersonalAgentConfig, protected_router, spawn_dispatcher};
+use steward_apiserver::personal_agents::{
+    PersonalAgentConfig, PersonalAgentDispatchSettings, protected_router, spawn_dispatcher,
+};
 use steward_store::{
     CreatePersonalAgentRequest, EnvelopeRequestReservationRequest, EnvelopeRequestStatus,
     EnvelopeRequestStatusUpdate, EnvelopeTemplatePublication, PersonalAgentLimits,
@@ -42,8 +44,20 @@ async fn personal_agent_inbox_is_owner_scoped_merged_and_restart_safe() -> Resul
     let store = PgStore::new(pool.clone());
     store.migrate().await?;
     let limits = test_limits();
-    let dispatcher_config =
-        PersonalAgentConfig::new(8, 5, 1, 2, 3, 1, 3, 1, limits).map_err(io::Error::other)?;
+    let dispatcher_config = PersonalAgentConfig::new(
+        PersonalAgentDispatchSettings {
+            recent_turn_limit: 8,
+            lease_seconds: 5,
+            poll_interval_seconds: 1,
+            max_concurrent_turns: 2,
+            max_transient_attempts: 3,
+            retry_backoff_seconds: 1,
+            max_claims_per_turn: 3,
+            monitoring_grace_seconds: 1,
+        },
+        limits,
+    )
+    .map_err(io::Error::other)?;
     let cascading_history_links = sqlx::query_scalar::<_, i64>(
         "SELECT count(*)::bigint FROM pg_constraint \
          WHERE contype = 'f' AND confdeltype <> 'r' \
