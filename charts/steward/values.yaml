@@ -282,6 +282,8 @@ config:
       maxConcurrentTurns: 8
       maxTransientAttempts: 3
       retryBackoffSeconds: 2
+      maxClaimsPerTurn: 10
+      monitoringGraceSeconds: 60
       maxNameCharacters: 200
       maxInstructionsBytes: 16384
       maxMessageBytes: 16384
