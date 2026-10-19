@@ -1593,6 +1593,8 @@ mod tests {
                 .map_err(|error| format!("Codex reference runtime VEX must be JSON: {error}"))?;
         let workflow = fs::read_to_string(root().join(".github/workflows/release.yml"))
             .map_err(|error| format!("release workflow is required: {error}"))?;
+        let ci_workflow = fs::read_to_string(root().join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("CI workflow is required: {error}"))?;
         let documentation =
             fs::read_to_string(root().join("docs/installation/codex-reference-runtime.md"))
                 .map_err(|error| {
@@ -1605,9 +1607,6 @@ mod tests {
             "ghcr.io/nvidia/openshell-community/sandboxes/base@sha256:",
             "@openai/codex@0.140.0",
             "codex-cli 0.140.0",
-            "LINUX_LIBC_DEV_VERSION=6.8.0-147.147",
-            "LINUX_LIBC_DEV_SHA256=fec8e4a308c03cd98dace67370a8d5a8031c36741796065c9f6e3f9548ab0cd2",
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin dpkg --install",
             "tar@7.5.22",
             "/usr/lib/node_modules/npm/node_modules/tar/package.json",
             "node --print 'require(\"/usr/lib/node_modules/tar/package.json\").version'",
@@ -1616,6 +1615,31 @@ mod tests {
             assert!(
                 container.contains(required),
                 "Codex reference runtime must pin {required}"
+            );
+        }
+        for forbidden in [
+            "LINUX_LIBC_DEV_VERSION",
+            "linux-libc-dev_${",
+            "/tmp/linux-libc-dev.deb",
+        ] {
+            assert!(
+                !container.contains(forbidden),
+                "Codex reference runtime must not download or install kernel headers: {forbidden}"
+            );
+        }
+        assert!(
+            container.contains("apt-get purge --yes --auto-remove linux-libc-dev"),
+            "Codex reference runtime must remove kernel headers inherited from its base image"
+        );
+        for required in [
+            "--entrypoint /usr/bin/dpkg steward-codex-runtime:release-validation -l linux-libc-dev",
+            "grep -Eq '^ii[[:space:]]+linux-libc-dev[[:space:]]'",
+            "exit-code: \"1\"",
+            "severity: CRITICAL",
+        ] {
+            assert!(
+                ci_workflow.contains(required),
+                "Codex reference runtime CI must retain {required}"
             );
         }
         let statements = vulnerability_exceptions["statements"]

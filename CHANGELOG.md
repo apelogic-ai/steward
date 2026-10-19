@@ -76,8 +76,9 @@ chart rendering, caller refusal coverage, and coding-agent execution evidence.
 - The Helm chart now renders every Jira receiver numeric environment setting as decimal digits,
   preventing the receiver from rejecting large default or ceiling values written in scientific
   notation.
-- The Codex reference runtime now pins the latest reviewed Ubuntu kernel headers and limits its
-  vulnerability exception to three named, unfixed kernel-code findings with a dated review.
+- The Codex reference runtime now removes inherited C build tools and kernel headers after
+  installing its prebuilt tools. Its release scan still fails on critical findings and verifies
+  that the header package is absent.
 - Jira webhook delivery now recovers its concurrency and cooldown state if Task startup stops
   unexpectedly, treats semantically identical JSON retries as one delivery, reuses bounded
   Kubernetes access credentials within one Task lifecycle, requests a fresh workload assertion for
