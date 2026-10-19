@@ -11,6 +11,7 @@ use jsonwebtoken::jwk::{
 };
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
+use steward_types::{OrganizationId, OrganizationIdentityPolicy};
 
 use crate::browser_auth::{
     BrowserAuthFailure, BrowserAuthorizationRequest, BrowserFuture, BrowserOidcProvider,
@@ -24,6 +25,7 @@ const MAX_JWKS_BYTES: usize = 128 * 1024;
 const MAX_TOKEN_RESPONSE_BYTES: usize = 32 * 1024;
 const MAX_USER_TOKEN_AGE_SECONDS: u64 = 86_400;
 const MAX_USER_TOKEN_CLIENTS: usize = 32;
+const MAX_USER_TOKEN_KEYS: usize = 64;
 const CLOCK_SKEW_SECONDS: u64 = 60;
 const MAX_TOKEN_AGE_SECONDS: u64 = 300;
 const DEFAULT_CACHE_SECONDS: u64 = 300;
@@ -74,31 +76,85 @@ struct UserTokenClaims {
     nbf: Option<u64>,
     email: String,
     email_verified: bool,
-    hd: String,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    groups: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct UserTokenIdentityConfig {
+    issuer: String,
+    discovery_endpoint: String,
+    identity_policy: OrganizationIdentityPolicy,
+    organization_claim: String,
+}
+
+impl UserTokenIdentityConfig {
+    pub fn new(
+        issuer: String,
+        organization_claim: String,
+        organization_id: OrganizationId,
+    ) -> Result<Self, String> {
+        let issuer_url = reqwest::Url::parse(&issuer)
+            .map_err(|_| "user token issuer must be one exact HTTPS issuer".to_owned())?;
+        if issuer_url.scheme() != "https"
+            || issuer_url.host_str().is_none()
+            || !issuer_url.username().is_empty()
+            || issuer_url.password().is_some()
+            || issuer_url.query().is_some()
+            || issuer_url.fragment().is_some()
+            || issuer.len() > 2_048
+            || !issuer.is_ascii()
+            || (issuer_url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("accounts.google.com"))
+                && issuer_url.port_or_known_default() == Some(443)
+                && issuer_url.path() == "/")
+        {
+            return Err("user token configuration is invalid".to_owned());
+        }
+        let discovery_endpoint = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        );
+        let identity_policy = OrganizationIdentityPolicy::new_configured_oidc(
+            issuer.clone(),
+            organization_claim.clone(),
+            organization_id,
+        )?;
+        Ok(Self {
+            issuer,
+            discovery_endpoint,
+            identity_policy,
+            organization_claim,
+        })
+    }
 }
 
 #[derive(Clone)]
 pub struct UserTokenConfig {
+    identity: UserTokenIdentityConfig,
     api_audience: String,
     portal_audience: Option<String>,
     frontend_client_ids: BTreeSet<String>,
     maximum_token_age_seconds: u64,
+    required_typ: Option<String>,
 }
 
 impl UserTokenConfig {
     pub fn new(
+        identity: UserTokenIdentityConfig,
         api_audience: String,
         portal_audience: Option<String>,
         frontend_client_ids: Vec<String>,
         maximum_token_age_seconds: u64,
+        required_typ: Option<String>,
     ) -> Result<Self, String> {
         let valid_value = |value: &str| {
             !value.is_empty()
                 && value.len() <= 512
-                && value.is_ascii()
-                && !value.bytes().any(|byte| byte.is_ascii_whitespace())
+                && value.bytes().all(|byte| byte.is_ascii_graphic())
         };
         if !valid_value(&api_audience)
             || portal_audience
@@ -111,32 +167,271 @@ impl UserTokenConfig {
         {
             return Err("user token configuration is invalid".to_owned());
         }
+        let required_typ = required_typ
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                if value.len() > 64 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+                    Err("user token configuration is invalid".to_owned())
+                } else {
+                    Ok(value)
+                }
+            })
+            .transpose()?;
         let requested_client_count = frontend_client_ids.len();
         let frontend_client_ids = frontend_client_ids.into_iter().collect::<BTreeSet<_>>();
         if frontend_client_ids.len() != requested_client_count
             || frontend_client_ids.len() > MAX_USER_TOKEN_CLIENTS
             || frontend_client_ids.iter().any(|value| !valid_value(value))
+            || frontend_client_ids.contains(&api_audience)
+            || portal_audience
+                .as_ref()
+                .is_some_and(|audience| frontend_client_ids.contains(audience))
         {
             return Err("user token configuration is invalid".to_owned());
         }
         Ok(Self {
+            identity,
             api_audience,
             portal_audience,
             frontend_client_ids,
             maximum_token_age_seconds,
+            required_typ,
         })
     }
 }
 
 #[derive(Clone)]
-pub struct GoogleUserTokenVerifier {
-    provider: GoogleOidcProvider,
+pub struct OidcUserTokenVerifier {
+    transport: Arc<dyn OidcHttpTransport>,
+    now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    cache: Arc<Mutex<UserTokenProviderCache>>,
+    refresh_gate: Arc<RefreshGate>,
     config: UserTokenConfig,
 }
 
-impl GoogleUserTokenVerifier {
-    pub fn new(provider: GoogleOidcProvider, config: UserTokenConfig) -> Self {
-        Self { provider, config }
+impl OidcUserTokenVerifier {
+    pub fn new(config: UserTokenConfig) -> Result<Self, String> {
+        Ok(Self::from_parts(
+            config,
+            Arc::new(ReqwestOidcTransport::new()?),
+            Arc::new(crate::browser_auth::epoch_seconds),
+        ))
+    }
+
+    fn from_parts(
+        config: UserTokenConfig,
+        transport: Arc<dyn OidcHttpTransport>,
+        now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        Self {
+            transport,
+            now,
+            cache: Arc::new(Mutex::new(UserTokenProviderCache::default())),
+            refresh_gate: Arc::new(RefreshGate::default()),
+            config,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_transport<F>(
+        config: UserTokenConfig,
+        transport: Arc<dyn OidcHttpTransport>,
+        now: F,
+    ) -> Self
+    where
+        F: Fn() -> u64 + Send + Sync + 'static,
+    {
+        Self::from_parts(config, transport, Arc::new(now))
+    }
+
+    async fn jwks_for_token(&self, token: &str) -> Result<JwkSet, BrowserAuthFailure> {
+        let header = decode_header(token).map_err(|_| BrowserAuthFailure::InvalidIdentity)?;
+        if !matches!(header.alg, Algorithm::RS256 | Algorithm::ES256) {
+            return Err(BrowserAuthFailure::InvalidIdentity);
+        }
+        let kid = header
+            .kid
+            .filter(|kid| !kid.is_empty() && kid.len() <= 128 && kid.is_ascii())
+            .ok_or(BrowserAuthFailure::InvalidIdentity)?;
+        let jwks = self.jwks(None, None).await?;
+        let generation = self
+            .cache
+            .lock()
+            .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?
+            .jwks_generation;
+        match select_user_verification_key(&jwks, &kid, header.alg) {
+            Ok(_) => Ok(jwks),
+            Err(IdTokenError::UnknownKeyId) => {
+                self.jwks(Some(generation), Some((&kid, header.alg))).await
+            }
+            Err(error) => Err(map_id_token_error(error)),
+        }
+    }
+
+    async fn discovery_after_refresh_gate(
+        &self,
+    ) -> Result<UserTokenDiscoveryDocument, BrowserAuthFailure> {
+        let now = (self.now)();
+        if let Some(document) = self
+            .cache
+            .lock()
+            .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?
+            .discovery
+            .as_ref()
+            .filter(|cached| cached.expires_at > now)
+            .map(|cached| cached.value.clone())
+        {
+            return Ok(document);
+        }
+        let response = self
+            .transport
+            .get(
+                &self.config.identity.discovery_endpoint,
+                MAX_DISCOVERY_BYTES,
+            )
+            .await
+            .map_err(map_http_failure)?;
+        if response.body.len() > MAX_DISCOVERY_BYTES {
+            return Err(BrowserAuthFailure::ProviderUnavailable);
+        }
+        let ttl = validate_json_response(&response)?;
+        let document: UserTokenDiscoveryDocument = serde_json::from_slice(&response.body)
+            .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
+        let document = document.validate(&self.config.identity.issuer)?;
+        let stored_at = (self.now)();
+        self.cache
+            .lock()
+            .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?
+            .discovery = Some(Cached {
+            value: document.clone(),
+            expires_at: stored_at.saturating_add(ttl),
+        });
+        Ok(document)
+    }
+
+    async fn jwks(
+        &self,
+        force_after_generation: Option<u64>,
+        required_key: Option<(&str, Algorithm)>,
+    ) -> Result<JwkSet, BrowserAuthFailure> {
+        let now = (self.now)();
+        let cached = self
+            .cache
+            .lock()
+            .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?
+            .jwks
+            .as_ref()
+            .filter(|cached| cached.expires_at > now)
+            .map(|cached| cached.value.clone());
+        if force_after_generation.is_none()
+            && let Some(jwks) = cached
+        {
+            return Ok(jwks);
+        }
+        let _permit = self.refresh_gate.acquire().await?;
+        let now = (self.now)();
+        let attempt_generation = {
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
+            if force_after_generation.is_some_and(|expected| cache.jwks_generation != expected)
+                && let Some(jwks) = cache
+                    .jwks
+                    .as_ref()
+                    .filter(|cached| cached.expires_at > now)
+                    .map(|cached| cached.value.clone())
+            {
+                match required_key {
+                    Some((kid, algorithm)) => {
+                        match select_user_verification_key(&jwks, kid, algorithm) {
+                            Ok(_) => return Ok(jwks),
+                            Err(IdTokenError::UnknownKeyId) => {}
+                            Err(error) => return Err(map_id_token_error(error)),
+                        }
+                    }
+                    None => return Ok(jwks),
+                }
+            }
+            if force_after_generation.is_none()
+                && let Some(jwks) = cache
+                    .jwks
+                    .as_ref()
+                    .filter(|cached| cached.expires_at > now)
+                    .map(|cached| cached.value.clone())
+            {
+                return Ok(jwks);
+            }
+            if cache.jwks_refresh_failure.is_some_and(|failure| {
+                failure.observed_generation == cache.jwks_generation && failure.retry_at > now
+            }) {
+                return Err(BrowserAuthFailure::ProviderUnavailable);
+            }
+            cache.jwks_generation
+        };
+        let refreshed = async {
+            let discovery = self.discovery_after_refresh_gate().await?;
+            let response = self
+                .transport
+                .get(&discovery.jwks_uri, MAX_JWKS_BYTES)
+                .await
+                .map_err(map_http_failure)?;
+            if response.body.len() > MAX_JWKS_BYTES {
+                return Err(BrowserAuthFailure::ProviderUnavailable);
+            }
+            let ttl = validate_json_response(&response)?;
+            let jwks: JwkSet = serde_json::from_slice(&response.body)
+                .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
+            validate_user_token_jwks(&jwks)?;
+            Ok((jwks, ttl))
+        }
+        .await;
+        match refreshed {
+            Ok((jwks, ttl)) => {
+                let stored_at = (self.now)();
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
+                cache.jwks_generation = cache.jwks_generation.saturating_add(1);
+                cache.jwks_refresh_failure = None;
+                cache.jwks = Some(Cached {
+                    value: jwks.clone(),
+                    expires_at: stored_at.saturating_add(ttl),
+                });
+                match required_key {
+                    Some((kid, algorithm)) => {
+                        match select_user_verification_key(&jwks, kid, algorithm) {
+                            Ok(_) => Ok(jwks),
+                            Err(IdTokenError::UnknownKeyId) => {
+                                cache.jwks_refresh_failure = Some(JwksRefreshFailure {
+                                    observed_generation: cache.jwks_generation,
+                                    retry_at: stored_at
+                                        .saturating_add(JWKS_REFRESH_FAILURE_BACKOFF_SECONDS),
+                                });
+                                Err(BrowserAuthFailure::InvalidIdentity)
+                            }
+                            Err(error) => Err(map_id_token_error(error)),
+                        }
+                    }
+                    None => Ok(jwks),
+                }
+            }
+            Err(error) => {
+                let failed_at = (self.now)();
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
+                if cache.jwks_generation == attempt_generation {
+                    cache.jwks_refresh_failure = Some(JwksRefreshFailure {
+                        observed_generation: attempt_generation,
+                        retry_at: failed_at.saturating_add(JWKS_REFRESH_FAILURE_BACKOFF_SECONDS),
+                    });
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -222,6 +517,47 @@ fn select_verification_key<'a>(jwks: &'a JwkSet, kid: &str) -> Result<&'a Jwk, I
     Ok(key)
 }
 
+fn select_user_verification_key<'a>(
+    jwks: &'a JwkSet,
+    kid: &str,
+    algorithm: Algorithm,
+) -> Result<&'a Jwk, IdTokenError> {
+    let mut matching = jwks
+        .keys
+        .iter()
+        .filter(|key| key.common.key_id.as_deref() == Some(kid));
+    let key = matching.next().ok_or(IdTokenError::UnknownKeyId)?;
+    if matching.next().is_some() {
+        return Err(IdTokenError::DuplicateKeyId);
+    }
+    let algorithm_matches = match algorithm {
+        Algorithm::RS256 => {
+            matches!(key.algorithm, AlgorithmParameters::RSA(_))
+                && matches!(key.common.key_algorithm, None | Some(KeyAlgorithm::RS256))
+        }
+        Algorithm::ES256 => {
+            matches!(key.algorithm, AlgorithmParameters::EllipticCurve(_))
+                && matches!(key.common.key_algorithm, None | Some(KeyAlgorithm::ES256))
+        }
+        _ => false,
+    };
+    if !algorithm_matches
+        || !matches!(
+            key.common.public_key_use,
+            None | Some(PublicKeyUse::Signature)
+        )
+        || !key.common.key_operations.as_ref().is_none_or(|operations| {
+            !operations.is_empty()
+                && operations
+                    .iter()
+                    .all(|operation| matches!(operation, KeyOperations::Verify))
+        })
+    {
+        return Err(IdTokenError::InvalidKey);
+    }
+    Ok(key)
+}
+
 fn validate_claims(
     claims: IdTokenClaims,
     client_id: &str,
@@ -285,8 +621,7 @@ fn validate_user_token_claims(
     let valid_value = |value: &str, maximum: usize| {
         !value.is_empty()
             && value.len() <= maximum
-            && value.is_ascii()
-            && !value.bytes().any(|byte| byte.is_ascii_whitespace())
+            && value.bytes().all(|byte| byte.is_ascii_graphic())
     };
     let audience_matches = match &claims.aud {
         Audience::Single(audience) => {
@@ -312,7 +647,6 @@ fn validate_user_token_claims(
     };
     let subject_is_bounded = valid_value(&claims.sub, 255);
     let email_is_bounded = !claims.email.is_empty() && claims.email.len() <= 320;
-    let hosted_domain_is_bounded = valid_value(&claims.hd, 253);
     let display_name_is_bounded = claims.name.as_ref().is_none_or(|name| {
         let trimmed = name.trim();
         !trimmed.is_empty() && trimmed.len() <= 256 && !trimmed.chars().any(char::is_control)
@@ -321,7 +655,7 @@ fn validate_user_token_claims(
     let issued_at_is_valid = claims.iat <= now.saturating_add(CLOCK_SKEW_SECONDS)
         && now <= claims.iat.saturating_add(config.maximum_token_age_seconds);
     let not_before_is_valid = claims.nbf.is_none_or(|not_before| not_before <= now);
-    if claims.iss != steward_types::GOOGLE_ORGANIZATION_ISSUER
+    if claims.iss != config.identity.issuer
         || !audience_matches
         || !config.frontend_client_ids.contains(frontend_client_id)
         || !valid_value(frontend_client_id, 512)
@@ -330,18 +664,25 @@ fn validate_user_token_claims(
         || !not_before_is_valid
         || !subject_is_bounded
         || !email_is_bounded
-        || !hosted_domain_is_bounded
         || !display_name_is_bounded
+        || !claims.groups.is_empty()
         || !claims.email_verified
     {
         return Err(IdTokenError::InvalidClaims);
     }
+    let identity = config
+        .identity
+        .identity_policy
+        .validate(
+            &claims.iss,
+            &claims.sub,
+            &config.identity.organization_claim,
+            &claims.email,
+            claims.email_verified,
+        )
+        .map_err(|_| IdTokenError::InvalidClaims)?;
     Ok(VerifiedUserTokenClaims {
-        issuer: claims.iss,
-        subject: claims.sub,
-        hosted_domain: claims.hd,
-        email: claims.email,
-        email_verified: claims.email_verified,
+        identity,
         display_name: claims.name.map(|name| name.trim().to_owned()),
         frontend_client_id: frontend_client_id.to_owned(),
     })
@@ -357,7 +698,11 @@ fn verify_user_token(
         return Err(IdTokenError::Malformed);
     }
     let header = decode_header(token).map_err(|_| IdTokenError::Malformed)?;
-    if header.alg != Algorithm::RS256
+    if !matches!(header.alg, Algorithm::RS256 | Algorithm::ES256)
+        || config
+            .required_typ
+            .as_deref()
+            .is_some_and(|required| header.typ.as_deref() != Some(required))
         || header.jku.is_some()
         || header.jwk.is_some()
         || header.x5u.is_some()
@@ -372,9 +717,9 @@ fn verify_user_token(
     if kid.is_empty() || kid.len() > 128 || !kid.is_ascii() {
         return Err(IdTokenError::MissingKeyId);
     }
-    let key = select_verification_key(jwks, &kid)?;
+    let key = select_user_verification_key(jwks, &kid, header.alg)?;
     let decoding_key = DecodingKey::from_jwk(key).map_err(|_| IdTokenError::InvalidKey)?;
-    let mut validation = Validation::new(Algorithm::RS256);
+    let mut validation = Validation::new(header.alg);
     validation.required_spec_claims.clear();
     validation.validate_exp = false;
     validation.validate_aud = false;
@@ -417,6 +762,21 @@ struct DiscoveryDocument {
     response_types_supported: Vec<String>,
     id_token_signing_alg_values_supported: Vec<String>,
     code_challenge_methods_supported: Vec<String>,
+}
+
+#[derive(Clone, Deserialize)]
+struct UserTokenDiscoveryDocument {
+    issuer: String,
+    jwks_uri: String,
+}
+
+impl UserTokenDiscoveryDocument {
+    fn validate(self, expected_issuer: &str) -> Result<Self, BrowserAuthFailure> {
+        if self.issuer != expected_issuer || validate_https_url(&self.jwks_uri).is_err() {
+            return Err(BrowserAuthFailure::ProviderUnavailable);
+        }
+        Ok(self)
+    }
 }
 
 impl DiscoveryDocument {
@@ -464,6 +824,14 @@ struct JwksRefreshFailure {
 #[derive(Default)]
 struct ProviderCache {
     discovery: Option<Cached<DiscoveryDocument>>,
+    jwks: Option<Cached<JwkSet>>,
+    jwks_generation: u64,
+    jwks_refresh_failure: Option<JwksRefreshFailure>,
+}
+
+#[derive(Default)]
+struct UserTokenProviderCache {
+    discovery: Option<Cached<UserTokenDiscoveryDocument>>,
     jwks: Option<Cached<JwkSet>>,
     jwks_generation: u64,
     jwks_refresh_failure: Option<JwksRefreshFailure>,
@@ -545,7 +913,7 @@ enum HttpFailure {
     InvalidResponse,
 }
 
-trait GoogleHttpTransport: Send + Sync + 'static {
+trait OidcHttpTransport: Send + Sync + 'static {
     fn get<'a>(&'a self, url: &'a str, max_body: usize) -> HttpFuture<'a>;
 
     fn post_token<'a>(
@@ -564,20 +932,20 @@ struct TokenExchangeRequest<'a> {
     pkce_verifier: &'a str,
 }
 
-struct ReqwestGoogleTransport {
+struct ReqwestOidcTransport {
     client: reqwest::Client,
 }
 
-impl ReqwestGoogleTransport {
+impl ReqwestOidcTransport {
     fn new() -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(5))
-            .user_agent("steward-google-oidc/1")
+            .user_agent("steward-oidc/1")
             .build()
-            .map_err(|_| "build bounded Google OIDC HTTP client".to_owned())?;
+            .map_err(|_| "build bounded OIDC HTTP client".to_owned())?;
         Ok(Self { client })
     }
 
@@ -622,10 +990,16 @@ impl ReqwestGoogleTransport {
     }
 }
 
-impl GoogleHttpTransport for ReqwestGoogleTransport {
+impl OidcHttpTransport for ReqwestOidcTransport {
     fn get<'a>(&'a self, url: &'a str, max_body: usize) -> HttpFuture<'a> {
         Box::pin(async move {
-            if !matches!(url, GOOGLE_DISCOVERY_ENDPOINT | GOOGLE_JWKS_ENDPOINT) {
+            let url = reqwest::Url::parse(url).map_err(|_| HttpFailure::InvalidResponse)?;
+            if url.scheme() != "https"
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.fragment().is_some()
+            {
                 return Err(HttpFailure::InvalidResponse);
             }
             let response = self
@@ -671,7 +1045,7 @@ impl GoogleHttpTransport for ReqwestGoogleTransport {
 pub struct GoogleOidcProvider {
     config: GoogleOidcConfig,
     client_secret: Arc<GoogleClientSecret>,
-    transport: Arc<dyn GoogleHttpTransport>,
+    transport: Arc<dyn OidcHttpTransport>,
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
     cache: Arc<Mutex<ProviderCache>>,
     refresh_gate: Arc<RefreshGate>,
@@ -682,7 +1056,7 @@ impl GoogleOidcProvider {
         Self::from_parts(
             config,
             client_secret,
-            Arc::new(ReqwestGoogleTransport::new()?),
+            Arc::new(ReqwestOidcTransport::new()?),
             Arc::new(crate::browser_auth::epoch_seconds),
         )
     }
@@ -690,7 +1064,7 @@ impl GoogleOidcProvider {
     fn from_parts(
         config: GoogleOidcConfig,
         client_secret: String,
-        transport: Arc<dyn GoogleHttpTransport>,
+        transport: Arc<dyn OidcHttpTransport>,
         now: Arc<dyn Fn() -> u64 + Send + Sync>,
     ) -> Result<Self, String> {
         Ok(Self {
@@ -707,7 +1081,7 @@ impl GoogleOidcProvider {
     fn with_transport<F>(
         config: GoogleOidcConfig,
         client_secret: String,
-        transport: Arc<dyn GoogleHttpTransport>,
+        transport: Arc<dyn OidcHttpTransport>,
         now: F,
     ) -> Result<Self, String>
     where
@@ -893,15 +1267,14 @@ impl GoogleOidcProvider {
     }
 }
 
-impl BrowserUserTokenVerifier for GoogleUserTokenVerifier {
+impl BrowserUserTokenVerifier for OidcUserTokenVerifier {
     fn verify<'a>(
         &'a self,
         token: &'a str,
     ) -> BrowserFuture<'a, Result<VerifiedUserTokenClaims, BrowserAuthFailure>> {
         Box::pin(async move {
-            let jwks = self.provider.jwks_for_token(token).await?;
-            verify_user_token(token, &jwks, &self.config, (self.provider.now)())
-                .map_err(map_id_token_error)
+            let jwks = self.jwks_for_token(token).await?;
+            verify_user_token(token, &jwks, &self.config, (self.now)()).map_err(map_id_token_error)
         })
     }
 }
@@ -981,6 +1354,20 @@ fn map_http_failure(_error: HttpFailure) -> BrowserAuthFailure {
     BrowserAuthFailure::ProviderUnavailable
 }
 
+fn validate_https_url(value: &str) -> Result<(), BrowserAuthFailure> {
+    let url = reqwest::Url::parse(value).map_err(|_| BrowserAuthFailure::ProviderUnavailable)?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || value.len() > 2_048
+    {
+        return Err(BrowserAuthFailure::ProviderUnavailable);
+    }
+    Ok(())
+}
+
 fn validate_json_response(response: &HttpResponse) -> Result<u64, BrowserAuthFailure> {
     if !(200..300).contains(&response.status) || !has_json_content_type(response) {
         return Err(BrowserAuthFailure::ProviderUnavailable);
@@ -1034,6 +1421,35 @@ fn validate_jwks(jwks: &JwkSet) -> Result<(), BrowserAuthFailure> {
     Ok(())
 }
 
+fn validate_user_token_jwks(jwks: &JwkSet) -> Result<(), BrowserAuthFailure> {
+    if jwks.keys.is_empty() || jwks.keys.len() > MAX_USER_TOKEN_KEYS {
+        return Err(BrowserAuthFailure::ProviderUnavailable);
+    }
+    let mut kids = std::collections::HashSet::with_capacity(jwks.keys.len());
+    for key in &jwks.keys {
+        let kid = key
+            .common
+            .key_id
+            .as_deref()
+            .filter(|kid| !kid.is_empty() && kid.len() <= 128 && kid.is_ascii())
+            .ok_or(BrowserAuthFailure::ProviderUnavailable)?;
+        let algorithm = match (&key.algorithm, key.common.key_algorithm) {
+            (AlgorithmParameters::RSA(_), None | Some(KeyAlgorithm::RS256)) => Algorithm::RS256,
+            (AlgorithmParameters::EllipticCurve(_), None | Some(KeyAlgorithm::ES256)) => {
+                Algorithm::ES256
+            }
+            _ => return Err(BrowserAuthFailure::ProviderUnavailable),
+        };
+        if !kids.insert(kid)
+            || select_user_verification_key(jwks, kid, algorithm).is_err()
+            || DecodingKey::from_jwk(key).is_err()
+        {
+            return Err(BrowserAuthFailure::ProviderUnavailable);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -1050,20 +1466,69 @@ mod tests {
     use steward_types::OrganizationId;
 
     use super::{
-        Audience, Cached, DiscoveryDocument, GoogleClientSecret, GoogleHttpTransport,
-        GoogleOidcProvider, GoogleUserTokenVerifier, HttpFailure, HttpFuture, HttpResponse,
-        IdTokenClaims, IdTokenError, JWKS_REFRESH_FAILURE_BACKOFF_SECONDS, TokenExchangeRequest,
-        UserTokenClaims, UserTokenConfig, cache_ttl, validate_claims, validate_user_token_claims,
-        verify_id_token,
+        Audience, Cached, DiscoveryDocument, GoogleClientSecret, GoogleOidcProvider, HttpFailure,
+        HttpFuture, HttpResponse, IdTokenClaims, IdTokenError,
+        JWKS_REFRESH_FAILURE_BACKOFF_SECONDS, OidcHttpTransport, OidcUserTokenVerifier,
+        TokenExchangeRequest, UserTokenClaims, UserTokenConfig, UserTokenIdentityConfig, cache_ttl,
+        validate_claims, validate_user_token_claims, verify_id_token, verify_user_token,
     };
 
     const FIXTURE_HEADER: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImZpeHR1cmUta2V5In0";
     const FIXTURE_PAYLOAD: &str = "eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJzdWIiOiJmaXh0dXJlLXN1YmplY3QiLCJhdWQiOiJmaXh0dXJlLWNsaWVudCIsImF6cCI6ImZpeHR1cmUtY2xpZW50IiwiZXhwIjoyMDAwLCJpYXQiOjEwMDAsIm5vbmNlIjoiZml4dHVyZS1ub25jZSIsImVtYWlsIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaGQiOiJleGFtcGxlLmNvbSJ9";
     const FIXTURE_SIGNATURE: &str = "zM7KyP19QiF_mYofXn7XRXMbLJaC9PNwbs5rVUmq-MU0RH752hE4JtJXwKViKp9jc5jKqqB-rhlqTNLpp3JKjPeIv_ZMwtI4-dbIfvZXkGtl2biQ27i6CA0eYotZm_KOuIO8etRseG89IdRRHjCOeV2LgBN_3WswM_Yvun9fejzbHlPOgmF149Q4gDxsmtB5hOVoFcgU8uaDVYDo-rJwebLsUUEpCA1lEAQIuARh9kuJw-xD9kVsRwAM4hc3h4puTmRNCoeSAeak5DBtlRY6Y4arwUcRt6dkA-Rr1xfgzEp3DW6rldIMAp_dAS9ZWUKz_e1hlG3X4twnEetvO_-JKg";
     const FIXTURE_MODULUS: &str = "7lwICTwFDPsqKp-jQTx5kGWbea0KNnIWYGRDqfqiK7ultoTvn4oyiUtT5il14OkSr7JTz-gFFKsIg9_Vcsby12Cyc86xbttYL8LJHSUM4OLwB_x1NzMBuijWcOuoGACqLWUi8upA2yM_7z8XyDeQONxNA880w4MJ0xQyXk6Rk-rVmU7SJJgBgDC1lAsfc5j0k4e3wo4L5zBV9_XdhqyqtOZdsrKSuVLHA-lBT-xSKWAl_pPMTIi7NMWvpiRTQ_2vu0bty1EqgitxQ164U-UZChY_ILX_ooweeOODS7l3vcQuyUQ3rbA-b7VFOQpeIE134NYnhWhlJRNN8Bc2MrzYew";
+    const USER_TOKEN_FIXTURE_HEADER: &str =
+        "eyJhbGciOiJSUzI1NiIsInR5cCI6ImF0K2p3dCIsImtpZCI6InVzZXItdG9rZW4tZml4dHVyZS1rZXkifQ";
+    const USER_TOKEN_FIXTURE_PAYLOAD: &str = "eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJmaXh0dXJlLXVzZXItc3ViamVjdCIsImF6cCI6InBvcnRhbC1jbGllbnQiLCJleHAiOjIwMDAsImlhdCI6MTAwMCwibmJmIjoxMDAwLCJlbWFpbCI6ImFsaWNlQGV4YW1wbGUuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsIm5hbWUiOiJBbGljZSBFeGFtcGxlIiwiYXVkIjoic3Rld2FyZC1hcGkifQ";
+    const USER_TOKEN_FIXTURE_SIGNATURE: &str = "Q6B63SKh36prVYxUO2HanbqtIITSOdFpJga6_tQjD9kkRjXESYaKCEMR_gVKb0xwirkthGfctk5e2GZAbtBF0mJUbGWH3EmJvFY_X8f6xmlDJgdL-01HGimbjwSnfGRCa5I7dNw2QUVfzz2Zu4SeFEOxgUzYcZS4ac5MiLO-tidTQrQyrtu8F_tLPXkRGF1BgSnUz7rIvm6vOnBTOaNG7tjAyApbd0ho-pN7kCJy7t4HpDmK6ygC_RmBxHl7gxPR6CduNa0eJrqGQVfqY3yE_2H6dVNFxegfZJ1A_vjlHJgjYPtDW9rhP_PH3KskuGYrQChUxU-CU41UsOQBHkDH4A";
+    const USER_TOKEN_FIXTURE_MODULUS: &str = "p4AkZb7cQ3OdRD6ymSZ2km-qeVKFV2shZ_bgi9D_uzULB5hzC4DIFuErY2G-60NJgO2o9WgolasVN6rmjNGVAIRiKble3zc9fs_Ud2u1bDiNn_VWeQwu03najyF1aPFIyt-9FnV6HKg5B0Bfh18wr7rs4wPVE6YZkvNjSyw_LElSwPKydsgS_gWl6OKBi1O0D5GT8OTau2QquMFcnfcxw_Vc9oS7MY4LoCY4fl0gjEOijqFQ66N1E1Kc8OAW3mwrmWdGL6wAvHsx7VV6fBFelN8evWJGjXza1-r3psDYpEHfQuhhDDPkyAlyZPUXegF_3GNSi8wBUpT9ydogI8vhMw";
+    const USER_ID_TOKEN_FIXTURE_HEADER: &str =
+        "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InVzZXItdG9rZW4tZml4dHVyZS1rZXkifQ";
+    const USER_ID_TOKEN_FIXTURE_PAYLOAD: &str = "eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJmaXh0dXJlLXVzZXItc3ViamVjdCIsImF6cCI6InBvcnRhbC1jbGllbnQiLCJleHAiOjIwMDAsImlhdCI6MTAwMCwibmJmIjoxMDAwLCJlbWFpbCI6ImFsaWNlQGV4YW1wbGUuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsIm5hbWUiOiJBbGljZSBFeGFtcGxlIiwiYXVkIjoicG9ydGFsLWNsaWVudCJ9";
+    const USER_ID_TOKEN_FIXTURE_SIGNATURE: &str = "SUG09-K8QFmruvGZpkujk4JhW9X-kIKR6bOtaetKaJsOoRr52B0r9Ihnieo2YHVm1ZW5MYUZo_jlkZAVQ1iyPBcIllOcYIL5C4AjZLfLFWCx3AHSAf1UJv5phzbW4fbuoKE4raSjDT1VyvikUTAU2h86iJ59G4PQVpdn46190MdeJ6dvyJ78niRCezyQNtJER_nVPG7qqhWqBF2AIBgFpTHdQ-c78TBUOcENWvgirZPrbLXO-pYnWPcjKPEGaOzBavQcl7-SQnm4Zokl_rhv2Yyw2e98NGw0yssus1BCVfFO_CxdzjjY2W1AMFREfVwAcUtsucX0wqH14dK3D_7w8g";
+    const USER_TOKEN_EC_FIXTURE_HEADER: &str =
+        "eyJhbGciOiJFUzI1NiIsImtpZCI6InVzZXItdG9rZW4tZWMtZml4dHVyZS1rZXkifQ";
+    const USER_TOKEN_EC_FIXTURE_PAYLOAD: &str = "eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJmaXh0dXJlLWVjLXN1YmplY3QiLCJhdWQiOiJzdGV3YXJkLWFwaSIsImNsaWVudF9pZCI6InBvcnRhbC1jbGllbnQiLCJleHAiOjIwMDAsImlhdCI6MTAwMCwiZW1haWwiOiJhbGljZUBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlfQ";
+    const USER_TOKEN_EC_FIXTURE_SIGNATURE: &str =
+        "pU2MD53VsZNMtfJwkgop7AE3y2bonZRE9rGadYju88Y8HiTo3EZLJs6ym-jvL4LMpACNj2rOhLxf-rQZ7HXdKQ";
 
     fn fixture_token() -> String {
         format!("{FIXTURE_HEADER}.{FIXTURE_PAYLOAD}.{FIXTURE_SIGNATURE}")
+    }
+
+    fn fixture_user_access_token() -> String {
+        format!(
+            "{USER_TOKEN_FIXTURE_HEADER}.{USER_TOKEN_FIXTURE_PAYLOAD}.{USER_TOKEN_FIXTURE_SIGNATURE}"
+        )
+    }
+
+    fn fixture_user_token_jwks() -> Result<JwkSet, String> {
+        serde_json::from_value(serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "use": "sig",
+                "alg": "RS256",
+                "kid": "user-token-fixture-key",
+                "n": USER_TOKEN_FIXTURE_MODULUS,
+                "e": "AQAB"
+            }]
+        }))
+        .map_err(|error| format!("parse neutral user-token JWKS fixture: {error}"))
+    }
+
+    fn fixture_user_token_ec_jwks() -> Result<JwkSet, String> {
+        serde_json::from_value(serde_json::json!({
+            "keys": [{
+                "kty": "EC",
+                "use": "sig",
+                "alg": "ES256",
+                "kid": "user-token-ec-fixture-key",
+                "crv": "P-256",
+                "x": "ixeYSNkzZWYQwqvizPEdKOR95tUCx3LFMymIJ7l3mxA",
+                "y": "BgijYGLVVS3p48Tha-4lY74J0RBLFOzivyonHWykTUs"
+            }]
+        }))
+        .map_err(|error| format!("parse neutral EC user-token JWKS fixture: {error}"))
     }
 
     fn fixture_jwks() -> Result<JwkSet, String> {
@@ -1090,9 +1555,31 @@ mod tests {
         )
     }
 
+    fn fixture_user_token_config(
+        portal_audience: Option<&str>,
+        required_typ: Option<&str>,
+    ) -> Result<UserTokenConfig, String> {
+        UserTokenConfig::new(
+            UserTokenIdentityConfig::new(
+                "https://issuer.example.test".to_owned(),
+                "example.com".to_owned(),
+                OrganizationId::parse("org_example")?,
+            )?,
+            "steward-api".to_owned(),
+            portal_audience.map(str::to_owned),
+            vec!["portal-client".to_owned()],
+            300,
+            required_typ.map(str::to_owned),
+        )
+    }
+
     struct FixtureTransport {
         gets: Mutex<VecDeque<HttpResponse>>,
         posts: Mutex<VecDeque<HttpResponse>>,
+        get_calls: AtomicUsize,
+        blocked_get_call: Option<usize>,
+        get_started: Notify,
+        release_get: Notify,
     }
 
     impl FixtureTransport {
@@ -1100,18 +1587,40 @@ mod tests {
             Self {
                 gets: Mutex::new(gets.into()),
                 posts: Mutex::new(posts.into()),
+                get_calls: AtomicUsize::new(0),
+                blocked_get_call: None,
+                get_started: Notify::new(),
+                release_get: Notify::new(),
+            }
+        }
+
+        fn blocking_get(gets: Vec<HttpResponse>, blocked_get_call: usize) -> Self {
+            Self {
+                gets: Mutex::new(gets.into()),
+                posts: Mutex::new(VecDeque::new()),
+                get_calls: AtomicUsize::new(0),
+                blocked_get_call: Some(blocked_get_call),
+                get_started: Notify::new(),
+                release_get: Notify::new(),
             }
         }
     }
 
-    impl GoogleHttpTransport for FixtureTransport {
+    impl OidcHttpTransport for FixtureTransport {
         fn get<'a>(&'a self, _url: &'a str, _max_body: usize) -> HttpFuture<'a> {
             Box::pin(async move {
-                self.gets
+                let call = self.get_calls.fetch_add(1, Ordering::SeqCst);
+                let response = self
+                    .gets
                     .lock()
                     .map_err(|_| HttpFailure::Unavailable)?
                     .pop_front()
-                    .ok_or(HttpFailure::Unavailable)
+                    .ok_or(HttpFailure::Unavailable)?;
+                if self.blocked_get_call == Some(call) {
+                    self.get_started.notify_one();
+                    self.release_get.notified().await;
+                }
+                Ok(response)
             })
         }
 
@@ -1152,7 +1661,7 @@ mod tests {
         }
     }
 
-    impl GoogleHttpTransport for BlockingFailureTransport {
+    impl OidcHttpTransport for BlockingFailureTransport {
         fn get<'a>(&'a self, _url: &'a str, _max_body: usize) -> HttpFuture<'a> {
             Box::pin(async move {
                 let call = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1189,7 +1698,7 @@ mod tests {
         }
     }
 
-    impl GoogleHttpTransport for CountingFailureTransport {
+    impl OidcHttpTransport for CountingFailureTransport {
         fn get<'a>(&'a self, _url: &'a str, _max_body: usize) -> HttpFuture<'a> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1787,7 +2296,7 @@ mod tests {
 
     fn fixture_user_token_claims() -> UserTokenClaims {
         UserTokenClaims {
-            iss: "https://accounts.google.com".to_owned(),
+            iss: "https://issuer.example.test".to_owned(),
             sub: "fixture-subject".to_owned(),
             aud: Audience::Single("steward-api".to_owned()),
             azp: Some("portal-client".to_owned()),
@@ -1797,27 +2306,61 @@ mod tests {
             nbf: Some(1_000),
             email: "alice@example.com".to_owned(),
             email_verified: true,
-            hd: "example.com".to_owned(),
             name: Some("Alice Example".to_owned()),
+            groups: Vec::new(),
         }
+    }
+
+    #[test]
+    fn user_token_configuration_refuses_identity_token_and_non_ascii_values() -> Result<(), String>
+    {
+        let identity = || {
+            UserTokenIdentityConfig::new(
+                "https://issuer.example.test".to_owned(),
+                "example.com".to_owned(),
+                OrganizationId::parse("org_example")?,
+            )
+        };
+        for (api_audience, portal_audience, clients) in [
+            ("portal-client", None, vec!["portal-client"]),
+            ("steward-π", None, vec!["portal-client"]),
+            ("steward-api", Some("portal-client"), vec!["portal-client"]),
+            ("steward-api", None, vec!["portal-π"]),
+        ] {
+            assert!(
+                UserTokenConfig::new(
+                    identity()?,
+                    api_audience.to_owned(),
+                    portal_audience.map(str::to_owned),
+                    clients.into_iter().map(str::to_owned).collect(),
+                    300,
+                    None,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            UserTokenIdentityConfig::new(
+                "https://issuer.example.test/π".to_owned(),
+                "example.com".to_owned(),
+                OrganizationId::parse("org_example")?,
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]
     fn user_token_claims_refuse_wrong_issuer_audience_expiry_and_disabled_portal_audience()
     -> Result<(), String> {
-        let config = UserTokenConfig::new(
-            "steward-api".to_owned(),
-            None,
-            vec!["portal-client".to_owned()],
-            300,
-        )?;
+        let config = fixture_user_token_config(None, None)?;
         let verified = validate_user_token_claims(fixture_user_token_claims(), &config, 1_100)
             .map_err(|error| format!("verify user token fixture: {error:?}"))?;
         assert_eq!(verified.frontend_client_id, "portal-client");
 
         let mut cases = Vec::new();
         let mut claims = fixture_user_token_claims();
-        claims.iss = "https://issuer.example.test".to_owned();
+        claims.iss = "https://other-issuer.example.test".to_owned();
         cases.push(claims);
         let mut claims = fixture_user_token_claims();
         claims.aud = Audience::Single("other-api".to_owned());
@@ -1847,64 +2390,216 @@ mod tests {
             ));
         }
 
-        let portal_config = UserTokenConfig::new(
-            "steward-api".to_owned(),
-            Some("portal-audience".to_owned()),
-            vec!["portal-client".to_owned()],
-            300,
-        )?;
+        let portal_config = fixture_user_token_config(Some("portal-audience"), None)?;
         let mut portal_claims = fixture_user_token_claims();
         portal_claims.aud = Audience::Single("portal-audience".to_owned());
         assert!(validate_user_token_claims(portal_claims, &portal_config, 1_100).is_ok());
+
+        let claims_with_provider_role: UserTokenClaims =
+            serde_json::from_value(serde_json::json!({
+                "iss": "https://issuer.example.test",
+                "sub": "fixture-subject",
+                "aud": "steward-api",
+                "azp": "portal-client",
+                "exp": 2_000,
+                "iat": 1_000,
+                "nbf": 1_000,
+                "email": "alice@example.com",
+                "email_verified": true,
+                "groups": ["admin"]
+            }))
+            .map_err(|error| format!("parse hostile user-token claims: {error}"))?;
+        assert!(matches!(
+            validate_user_token_claims(claims_with_provider_role, &config, 1_100),
+            Err(IdTokenError::InvalidClaims)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn user_access_token_contract_refuses_a_browser_id_token() -> Result<(), String> {
+        let config = fixture_user_token_config(None, None)?;
+        let same_issuer_id_token = format!(
+            "{USER_ID_TOKEN_FIXTURE_HEADER}.{USER_ID_TOKEN_FIXTURE_PAYLOAD}.{USER_ID_TOKEN_FIXTURE_SIGNATURE}"
+        );
+        assert!(matches!(
+            verify_user_token(
+                &same_issuer_id_token,
+                &fixture_user_token_jwks()?,
+                &config,
+                1_100,
+            ),
+            Err(IdTokenError::InvalidClaims)
+        ));
+        assert!(
+            verify_user_token(
+                &fixture_user_access_token(),
+                &fixture_user_token_jwks()?,
+                &fixture_user_token_config(None, None)?,
+                1_100,
+            )
+            .is_ok()
+        );
+        for google_issuer in [
+            steward_types::GOOGLE_ORGANIZATION_ISSUER,
+            "https://accounts.google.com/",
+            "https://ACCOUNTS.GOOGLE.COM",
+            "https://accounts.google.com:443",
+        ] {
+            assert!(
+                UserTokenIdentityConfig::new(
+                    google_issuer.to_owned(),
+                    "example.com".to_owned(),
+                    OrganizationId::parse("org_example")?,
+                )
+                .is_err(),
+                "Google browser credentials must not enter the JWT bearer verifier: {google_issuer}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn user_access_token_allows_rs256_and_es256_and_refuses_type_and_algorithm_confusion()
+    -> Result<(), String> {
+        let config = fixture_user_token_config(None, None)?;
+        let ec_token = format!(
+            "{USER_TOKEN_EC_FIXTURE_HEADER}.{USER_TOKEN_EC_FIXTURE_PAYLOAD}.{USER_TOKEN_EC_FIXTURE_SIGNATURE}"
+        );
+        assert!(
+            verify_user_token(&ec_token, &fixture_user_token_ec_jwks()?, &config, 1_100).is_ok()
+        );
+        assert!(
+            verify_user_token(
+                &fixture_user_access_token(),
+                &fixture_user_token_jwks()?,
+                &fixture_user_token_config(None, Some("at+jwt"))?,
+                1_100,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            verify_user_token(
+                &ec_token,
+                &fixture_user_token_ec_jwks()?,
+                &fixture_user_token_config(None, Some("at+jwt"))?,
+                1_100,
+            ),
+            Err(IdTokenError::ForbiddenHeader)
+        ));
+        for algorithm in ["none", "HS256"] {
+            let token = user_token_with_header(
+                serde_json::json!({"alg":algorithm,"kid":"user-token-fixture-key"}),
+            )?;
+            assert!(
+                verify_user_token(&token, &fixture_user_token_jwks()?, &config, 1_100).is_err(),
+                "{algorithm} must never enter access-token verification"
+            );
+        }
         Ok(())
     }
 
     #[tokio::test]
     async fn signed_user_token_reuses_cached_jwks_and_refuses_bad_signature_and_unknown_key()
     -> Result<(), String> {
-        let transport = Arc::new(FixtureTransport::new(
-            vec![json_response(fixture_jwks_value())?],
-            Vec::new(),
+        let transport = Arc::new(FixtureTransport::blocking_get(
+            vec![
+                json_response(serde_json::json!({
+                    "issuer": "https://issuer.example.test",
+                    "jwks_uri": "https://issuer.example.test/jwks"
+                }))?,
+                json_response(serde_json::json!({
+                    "keys": [{
+                        "kty": "RSA",
+                        "use": "sig",
+                        "alg": "RS256",
+                        "kid": "user-token-fixture-key",
+                        "n": USER_TOKEN_FIXTURE_MODULUS,
+                        "e": "AQAB"
+                    }]
+                }))?,
+                json_response(serde_json::json!({
+                    "keys": [{
+                        "kty": "RSA",
+                        "use": "sig",
+                        "alg": "RS256",
+                        "kid": "user-token-fixture-key",
+                        "n": USER_TOKEN_FIXTURE_MODULUS,
+                        "e": "AQAB"
+                    }]
+                }))?,
+            ],
+            2,
         ));
-        let provider = GoogleOidcProvider::with_transport(
-            fixture_config()?,
-            "fixture-secret".to_owned(),
-            transport,
+        let verifier = OidcUserTokenVerifier::with_transport(
+            fixture_user_token_config(None, None)?,
+            transport.clone(),
             fixture_now,
-        )?;
-        seed_provider_cache(&provider, fixture_now(), 2_000, 7)?;
-        let verifier = GoogleUserTokenVerifier::new(
-            provider,
-            UserTokenConfig::new(
-                "fixture-client".to_owned(),
-                None,
-                vec!["fixture-client".to_owned()],
-                300,
-            )?,
         );
         let verified = verifier
-            .verify(&fixture_token())
+            .verify(&fixture_user_access_token())
             .await
             .map_err(|error| format!("verify signed user token: {error:?}"))?;
-        assert_eq!(verified.subject, "fixture-subject");
+        assert_eq!(verified.identity.subject(), "fixture-user-subject");
 
         let bad_signature = format!(
-            "{FIXTURE_HEADER}.{FIXTURE_PAYLOAD}.A{}",
-            &FIXTURE_SIGNATURE[1..]
+            "{USER_TOKEN_FIXTURE_HEADER}.{USER_TOKEN_FIXTURE_PAYLOAD}.A{}",
+            &USER_TOKEN_FIXTURE_SIGNATURE[1..]
         );
         assert!(matches!(
             verifier.verify(&bad_signature).await,
             Err(BrowserAuthFailure::InvalidIdentity)
         ));
-        let unknown_key =
-            token_with_header(serde_json::json!({"alg":"RS256","typ":"JWT","kid":"unknown-key"}))?;
+        let unknown_key = token_with_header(
+            serde_json::json!({"alg":"RS256","typ":"at+jwt","kid":"unknown-key"}),
+        )?;
+        let another_unknown_key = user_token_with_header(
+            serde_json::json!({"alg":"RS256","typ":"at+jwt","kid":"another-unknown-key"}),
+        )?;
+        let first_verifier = verifier.clone();
+        let first = tokio::spawn(async move { first_verifier.verify(&unknown_key).await });
+        transport.get_started.notified().await;
+        let second_verifier = verifier.clone();
+        let second =
+            tokio::spawn(async move { second_verifier.verify(&another_unknown_key).await });
+        tokio::task::yield_now().await;
+        transport.release_get.notify_one();
         assert!(matches!(
-            verifier.verify(&unknown_key).await,
-            Err(BrowserAuthFailure::InvalidIdentity)
+            first.await,
+            Ok(Err(BrowserAuthFailure::InvalidIdentity))
         ));
+        assert!(matches!(
+            second.await,
+            Ok(Err(BrowserAuthFailure::ProviderUnavailable))
+        ));
+        assert_eq!(
+            transport.get_calls.load(Ordering::SeqCst),
+            3,
+            "a concurrent distinct unknown key must observe the cooldown before the gate opens"
+        );
         assert!(matches!(
             verifier.verify("opaque-token").await,
             Err(BrowserAuthFailure::InvalidIdentity)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_token_discovery_requires_the_exact_configured_issuer() -> Result<(), String> {
+        let verifier = OidcUserTokenVerifier::with_transport(
+            fixture_user_token_config(None, None)?,
+            Arc::new(FixtureTransport::new(
+                vec![json_response(serde_json::json!({
+                    "issuer": "https://other-issuer.example.test",
+                    "jwks_uri": "https://issuer.example.test/jwks"
+                }))?],
+                Vec::new(),
+            )),
+            fixture_now,
+        );
+        assert!(matches!(
+            verifier.verify(&fixture_user_access_token()).await,
+            Err(BrowserAuthFailure::ProviderUnavailable)
         ));
         Ok(())
     }
@@ -1914,6 +2609,15 @@ mod tests {
             .map_err(|error| format!("serialize hostile JOSE header: {error}"))?;
         Ok(format!(
             "{}.{FIXTURE_PAYLOAD}.{FIXTURE_SIGNATURE}",
+            crate::browser_auth::base64_url(&header)
+        ))
+    }
+
+    fn user_token_with_header(header: serde_json::Value) -> Result<String, String> {
+        let header = serde_json::to_vec(&header)
+            .map_err(|error| format!("serialize hostile user-token JOSE header: {error}"))?;
+        Ok(format!(
+            "{}.{USER_TOKEN_FIXTURE_PAYLOAD}.{USER_TOKEN_FIXTURE_SIGNATURE}",
             crate::browser_auth::base64_url(&header)
         ))
     }

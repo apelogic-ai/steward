@@ -1,8 +1,8 @@
 # Steward browser session contract v1
 
-Status: production Google code exchange and signed ID-token verification, with optional headless
-user-token acceptance on the application API. Both paths are disabled unless their reviewed
-configuration and secret inputs are present.
+Status: Google code exchange and signed ID-token verification were released in Steward v0.3.20.
+Configured-issuer headless JWT access-token acceptance on the application API is Unreleased. Both
+paths are disabled unless their reviewed configuration and secret inputs are present.
 
 ## Identity boundary
 
@@ -22,6 +22,13 @@ the ordinary user role with no member-role access; administrator and member-role
 explicit local grant events, and revocation appends a new event. Google email or hosted-domain
 membership does not imply any Steward authority. This boundary has no AWS or Kubernetes identity
 dependency.
+
+The headless path accepts only a signed RS256 or ES256 JWT access token from the configured issuer.
+An operator may require an exact protected JOSE `typ`, such as `at+jwt`; otherwise `typ` is
+optional. A browser ID token is not interchangeable with an API access token because its audience
+is a frontend client rather than the configured API audience. Provider `groups` claims cannot
+grant Steward roles and are refused when non-empty. The canonical user's existing local RBAC
+assignments remain the only role source.
 
 ## First local RBAC grant
 
@@ -118,17 +125,22 @@ separate operator TokenReview boundary.
 
 ## Optional headless user access
 
-When `browserAuth.google.userTokens.hyperShellAudience` is nonempty, a native or third-party
-frontend may call only `/app/api/v1/*` with `Authorization: Bearer <access-token>`. Steward verifies
-the token with the same pinned Google discovery and JWKS path used by browser login. It requires
-the exact Google issuer, the configured HyperShell audience, one allowlisted `azp` or `client_id`,
-a verified organization email and hosted domain, a valid signature and key ID, current `exp` and
-`nbf`, and an `iat` within `maximumTokenAgeSeconds`. Opaque tokens fail closed.
+When `browserAuth.userTokens.issuer` and `hyperShellAudience` are nonempty, a native or third-party
+frontend may call only `/app/api/v1/*` with `Authorization: Bearer <access-token>`. Steward fetches
+bounded discovery and JWKS documents from that exact HTTPS issuer, follows no redirects, and
+accepts only RS256 or ES256 signatures. It requires the configured HyperShell audience, one
+allowlisted `azp` or `client_id`, a verified email in the browser workspace domain, a valid key ID,
+current `exp` and `nbf`, and an `iat` within `maximumTokenAgeSeconds`. If `requiredTyp` is nonempty,
+the JOSE `typ` must exactly match it. Opaque tokens and provider group claims fail closed.
 
 The optional portal audience is accepted only when `acceptPortalAudience=true`, a nonempty
 `portalAudience` is configured, and the frontend client ID is allowlisted. It does not replace the
 HyperShell audience or relax the client and age checks. Empty user-token values retain the existing
 cookie-only behavior.
+
+Google user access tokens are opaque, so Google sign-in remains browser-session only. Google ID
+tokens are not API bearer credentials: their client-ID audience does not satisfy the configured
+HyperShell audience. Opaque-token introspection or exchange is outside this contract.
 
 The verified subject is resolved or registered through the same canonical identity resolver as
 browser login. Access still comes only from Steward's local RBAC assignments; token claims do

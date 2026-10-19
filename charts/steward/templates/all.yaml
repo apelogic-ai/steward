@@ -25,6 +25,15 @@
 {{- if .Values.persistence.enabled }}
 {{- fail "persistence.enabled is unsupported: Steward uses the externally managed database Secret" }}
 {{- end }}
+{{- if and .Values.browserAuth.enabled .Values.browserAuth.userTokens.issuer (has .Values.browserAuth.userTokens.hyperShellAudience .Values.browserAuth.userTokens.frontendClientIds) }}
+{{- fail "browserAuth.userTokens.hyperShellAudience must differ from every frontend client ID" }}
+{{- end }}
+{{- if and .Values.browserAuth.enabled (regexMatch "(?i)^https://accounts\\.google\\.com(?::443)?/?$" .Values.browserAuth.userTokens.issuer) }}
+{{- fail "browserAuth.userTokens.issuer must not be the Google browser issuer" }}
+{{- end }}
+{{- if and .Values.browserAuth.enabled .Values.browserAuth.userTokens.acceptPortalAudience (has .Values.browserAuth.userTokens.portalAudience .Values.browserAuth.userTokens.frontendClientIds) }}
+{{- fail "browserAuth.userTokens.portalAudience must differ from every frontend client ID" }}
+{{- end }}
 {{- if and .Values.jira.enabled (or (not .Values.config.apiserver.jiraBaseUrl) (not .Values.config.apiserver.jiraProjectKey) (not .Values.config.apiserver.jiraAccountEmail)) }}
 {{- fail "jira.enabled requires URL, project key, and account email" }}
 {{- end }}
@@ -522,11 +531,13 @@ spec:
             - { name: STEWARD_GOOGLE_WORKSPACE_DOMAIN, value: {{ .Values.browserAuth.google.workspaceDomain | quote }} }
             - { name: STEWARD_ORGANIZATION_ID, value: {{ .Values.browserAuth.google.organizationId | quote }} }
             - { name: STEWARD_GOOGLE_OIDC_CLIENT_SECRET, valueFrom: { secretKeyRef: { name: {{ .Values.browserAuth.google.clientSecret.name }}, key: {{ .Values.browserAuth.google.clientSecret.key }} } } }
-            - { name: STEWARD_USER_TOKEN_API_AUDIENCE, value: {{ .Values.browserAuth.google.userTokens.hyperShellAudience | quote }} }
-            - { name: STEWARD_USER_TOKEN_PORTAL_AUDIENCE, value: {{ .Values.browserAuth.google.userTokens.portalAudience | quote }} }
-            - { name: STEWARD_USER_TOKEN_PORTAL_AUDIENCE_ENABLED, value: {{ .Values.browserAuth.google.userTokens.acceptPortalAudience | quote }} }
-            - { name: STEWARD_USER_TOKEN_FRONTEND_CLIENT_IDS, value: {{ .Values.browserAuth.google.userTokens.frontendClientIds | toJson | quote }} }
-            - { name: STEWARD_USER_TOKEN_MAX_AGE_SECONDS, value: {{ .Values.browserAuth.google.userTokens.maximumTokenAgeSeconds | quote }} }
+            - { name: STEWARD_USER_TOKEN_ISSUER, value: {{ .Values.browserAuth.userTokens.issuer | quote }} }
+            - { name: STEWARD_USER_TOKEN_API_AUDIENCE, value: {{ .Values.browserAuth.userTokens.hyperShellAudience | quote }} }
+            - { name: STEWARD_USER_TOKEN_PORTAL_AUDIENCE, value: {{ .Values.browserAuth.userTokens.portalAudience | quote }} }
+            - { name: STEWARD_USER_TOKEN_PORTAL_AUDIENCE_ENABLED, value: {{ .Values.browserAuth.userTokens.acceptPortalAudience | quote }} }
+            - { name: STEWARD_USER_TOKEN_FRONTEND_CLIENT_IDS, value: {{ .Values.browserAuth.userTokens.frontendClientIds | toJson | quote }} }
+            - { name: STEWARD_USER_TOKEN_MAX_AGE_SECONDS, value: {{ .Values.browserAuth.userTokens.maximumTokenAgeSeconds | quote }} }
+            - { name: STEWARD_USER_TOKEN_REQUIRED_TYP, value: {{ .Values.browserAuth.userTokens.requiredTyp | quote }} }
 {{- end }}
 {{- if .Values.connectionsBridge.enabled }}
             - { name: STEWARD_CONNECTIONS_BRIDGE_ARTIFACT_TRUST_MODE, value: {{ .Values.connectionsBridge.artifactTrust.mode | quote }} }

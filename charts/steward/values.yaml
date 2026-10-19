@@ -159,14 +159,16 @@ browserAuth:
     clientSecret:
       name: ""
       key: ""
-    # Optional headless user-token acceptance reuses this Google issuer, tenant,
-    # canonical-user registration, and RBAC mapping. Empty audience keeps it off.
-    userTokens:
-      hyperShellAudience: ""
-      portalAudience: ""
-      acceptPortalAudience: false
-      frontendClientIds: []
-      maximumTokenAgeSeconds: 300
+  # Optional headless access accepts JWT access tokens from this exact OIDC issuer.
+  # It reuses the browser workspace domain, canonical users, and local RBAC.
+  userTokens:
+    issuer: ""
+    hyperShellAudience: ""
+    portalAudience: ""
+    acceptPortalAudience: false
+    frontendClientIds: []
+    maximumTokenAgeSeconds: 300
+    requiredTyp: ""
 workloadExchangeTrust:
   kind: ConfigMap
   name: steward-workload-exchange-ca

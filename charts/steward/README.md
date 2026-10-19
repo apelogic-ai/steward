@@ -346,19 +346,22 @@ Service.
 When `networkPolicy.enabled=true`, browser authentication additionally requires
 at least one `networkPolicy.browserAuthEgressCidrs` entry. The chart allows
 apiserver HTTPS egress only to those platform-managed CIDRs; it does not open
-unrestricted internet egress or encode Google IP ranges. The deployment
+unrestricted internet egress or encode provider IP ranges. The deployment
 adapter is responsible for maintaining the approved resolver/egress policy as
-Google's endpoints evolve. A local isolated lane may instead set
-`networkPolicy.enabled=false`; that is not a substitute for a production
-egress policy.
+Google's and the configured access-token issuer's endpoints evolve. A local
+isolated lane may instead set `networkPolicy.enabled=false`; that is not a
+substitute for a production egress policy.
 
 Headless user-token acceptance is optional and disabled by default under
-`browserAuth.google.userTokens`. Enabling it requires a nonempty
+`browserAuth.userTokens`. Enabling it requires an exact HTTPS `issuer`, a nonempty
 `hyperShellAudience`, at least one `frontendClientIds` entry, and a positive
 `maximumTokenAgeSeconds` no greater than 86,400. To accept the portal's own audience, set both a
 nonempty `portalAudience` and `acceptPortalAudience=true`; either value without the other is
-rejected. These access tokens authenticate only `/app/api/v1/*` and reuse the same canonical-user
-and local-RBAC rules as browser login. They do not grant access to administrator routes.
+rejected. `requiredTyp` optionally requires an exact JOSE `typ`, such as `at+jwt`; it is empty by
+default for providers that omit it. These access tokens authenticate only `/app/api/v1/*` and
+reuse the browser workspace domain, canonical-user, and local-RBAC rules. They do not grant access
+to administrator routes. Google sign-in continues to use browser sessions because Google user
+access tokens are opaque and are not accepted by this JWT verifier.
 
 ## Direct package source resolution
 

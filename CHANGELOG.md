@@ -7,6 +7,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+- Optional headless user access accepts RS256 or ES256 JWT access tokens from an exact configured
+  OIDC issuer on `/app/api/v1/*` when the HyperShell audience, frontend client IDs, and maximum
+  token age are configured. The portal audience and token `typ` are separate opt-ins. Tokens reuse
+  canonical users and local RBAC, never grant administrator-route access, and record the issuer
+  and frontend client ID without recording the token. Google access tokens remain browser-session
+  only because Google issues opaque user access tokens.
+
 ## [0.3.20] - 2026-10-18
 
 Steward v0.3.20 adds governed external Run API callers and signed Jira webhook Triggers, including
@@ -20,11 +27,6 @@ chart rendering, caller refusal coverage, and coding-agent execution evidence.
 
 ### Added
 
-- Optional headless user access accepts a customer's Google OIDC access token on
-  `/app/api/v1/*` when the HyperShell audience, frontend client IDs, and maximum token age are
-  configured. The portal audience is a separate opt-in. Tokens reuse canonical users and local
-  RBAC, never grant administrator-route access, and record the issuer and frontend client ID
-  without recording the token.
 - Added a Jira webhook Trigger operator guide covering exact-path exposure, signing Secrets,
   read-only Envelope checks, filters, run limits, cooldowns, response meanings, optional issue
   links, and deployment acceptance requirements.
