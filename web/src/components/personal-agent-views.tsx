@@ -19,10 +19,10 @@ import { classifyResource, useApiResource, type ResourceState } from "@/data/use
 import { useSession } from "@/session/session-context";
 
 export type PersonalAgent = {
-  agentId: string;
   agentRef: string;
   createdAt: string;
   envelopeRequestId: string;
+  id: string;
   instructions: string;
   name: string;
   updatedAt: string;
@@ -31,16 +31,24 @@ export type PersonalAgent = {
 export type PersonalAgentMessage = {
   content: string;
   createdAt: string;
-  role: "agent" | "user";
+  id: string;
+};
+
+export type PersonalAgentReply = {
+  content: string;
+  createdAt: string;
 };
 
 export type PersonalAgentTurn = {
+  completedAt?: string | null;
+  createdAt: string;
   failureReason?: string | null;
+  id: string;
   messages: PersonalAgentMessage[];
+  reply?: PersonalAgentReply | null;
   runId?: string | null;
+  startedAt?: string | null;
   status: "done" | "failed" | "queued" | "running";
-  turnId: string;
-  updatedAt: string;
 };
 
 export type PersonalAgentThread = {
@@ -135,8 +143,8 @@ export function PersonalAgentsListContent({ state }: Readonly<{
             ]}
             gridTemplateColumns="minmax(220px,1fr) minmax(220px,1fr)"
             minWidth="520px"
-            rowHref={(agent) => `/agents/${encodeURIComponent(agent.agentId)}`}
-            rowKey={(agent) => agent.agentId}
+            rowHref={(agent) => `/agents/${encodeURIComponent(agent.id)}`}
+            rowKey={(agent) => agent.id}
             rows={agents}
           />}
       </ResourceBoundary>
@@ -263,7 +271,7 @@ export function NewPersonalAgentView() {
     const result = await createPersonalAgent(body, session.value.csrf);
     setSaving(false);
     if (result.data && result.response?.ok) {
-      router.push(`/agents/${encodeURIComponent(result.data.agent.agentId)}`);
+      router.push(`/agents/${encodeURIComponent(result.data.agent.id)}`);
       return;
     }
     setFailure(personalAgentFailureMessage(result.error));
@@ -291,8 +299,8 @@ export function NewPersonalAgentView() {
 }
 
 type PersonalAgentEventSource = {
+  addEventListener: (eventName: string, handler: () => void) => void;
   close: () => void;
-  onmessage: ((event: MessageEvent) => void) | null;
 };
 
 type PersonalAgentEventSourceFactory = (
@@ -304,13 +312,20 @@ export function subscribePersonalAgentEvents(
   status: ResourceState<PersonalAgentThread>["status"],
   agentId: string,
   onEvent: () => void,
-  createEventSource: PersonalAgentEventSourceFactory = (path, init) => new EventSource(path, init),
+  createEventSource: PersonalAgentEventSourceFactory = (path, init) => {
+    const source = new EventSource(path, init);
+    return {
+      addEventListener: (eventName, handler) => source.addEventListener(eventName, handler),
+      close: () => source.close(),
+    };
+  },
 ): (() => void) | undefined {
   if (status !== "ready") return undefined;
   const source = createEventSource(`/app/api/v1/agents/${encodeURIComponent(agentId)}/events`, {
     withCredentials: true,
   });
-  source.onmessage = () => onEvent();
+  source.addEventListener("thread.snapshot", onEvent);
+  source.addEventListener("turn.updated", onEvent);
   return () => source.close();
 }
 
@@ -410,16 +425,22 @@ function PersonalAgentThreadView({ thread }: Readonly<{ thread: PersonalAgentThr
       {thread.turns.map((turn) => (
         <SectionCard
           actions={<StatusPill tone={turnStatusTone(turn.status)} value={turnStatusLabel(turn.status)} />}
-          key={turn.turnId}
+          key={turn.id}
           title="Turn"
         >
           <div className="space-y-4">
-            {turn.messages.map((message, index) => (
-              <article className={message.role === "user" ? "ms-auto max-w-3xl rounded-card bg-brand-soft px-4 py-3" : "max-w-3xl rounded-card bg-subtle px-4 py-3"} key={`${message.createdAt}-${message.role}-${index}`}>
-                <p className="text-xs font-semibold text-muted-ink">{message.role === "user" ? "You" : thread.agent.name}</p>
+            {turn.messages.map((message) => (
+              <article className="ms-auto max-w-3xl rounded-card bg-brand-soft px-4 py-3" key={message.id}>
+                <p className="text-xs font-semibold text-muted-ink">You</p>
                 <p className="mt-1 whitespace-pre-wrap text-sm leading-6">{message.content}</p>
               </article>
             ))}
+            {turn.reply ? (
+              <article className="max-w-3xl rounded-card bg-subtle px-4 py-3">
+                <p className="text-xs font-semibold text-muted-ink">{thread.agent.name}</p>
+                <p className="mt-1 whitespace-pre-wrap text-sm leading-6">{turn.reply.content}</p>
+              </article>
+            ) : null}
             {turn.status === "failed" && turn.failureReason ? <p className="text-sm text-err" role="status">{turn.failureReason}</p> : null}
             {turn.runId ? <Link className="inline-flex min-h-10 items-center rounded-control border px-4 text-sm font-semibold hover:bg-subtle" href={`/runs/${encodeURIComponent(turn.runId)}`}>Open Run</Link> : null}
           </div>

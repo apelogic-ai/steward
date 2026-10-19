@@ -16,23 +16,24 @@ import {
 
 const thread: PersonalAgentThread = {
   agent: {
-    agentId: "agent-1",
     agentRef: "codex@configured",
     createdAt: "2026-10-19T05:00:00Z",
     envelopeRequestId: "envelope-active",
+    id: "agent-1",
     instructions: "Keep replies concise.",
     name: "Release helper",
     updatedAt: "2026-10-19T05:04:00Z",
   },
   turns: [{
-    messages: [
-      { content: "Summarize the release.", createdAt: "2026-10-19T05:01:00Z", role: "user" },
-      { content: "The release is ready.", createdAt: "2026-10-19T05:04:00Z", role: "agent" },
-    ],
+    completedAt: "2026-10-19T05:04:00Z",
+    createdAt: "2026-10-19T05:01:00Z",
+    failureReason: null,
+    id: "turn-1",
+    messages: [{ id: "message-1", content: "Summarize the release.", createdAt: "2026-10-19T05:01:00Z" }],
+    reply: { content: "The release is ready.", createdAt: "2026-10-19T05:04:00Z" },
     runId: "run-1",
+    startedAt: "2026-10-19T05:02:00Z",
     status: "done",
-    turnId: "turn-1",
-    updatedAt: "2026-10-19T05:04:00Z",
   }],
 };
 
@@ -112,21 +113,33 @@ describe("personal agent thread", () => {
     let closed = 0;
     let path = "";
     let withCredentials = false;
+    const eventNames: string[] = [];
+    const eventHandlers: Array<() => void> = [];
     const createEventSource = (nextPath: string, init: EventSourceInit) => {
       opened += 1;
       path = nextPath;
       withCredentials = init.withCredentials ?? false;
-      return { close: () => { closed += 1; }, onmessage: null };
+      return {
+        addEventListener: (eventName: string, handler: () => void) => {
+          eventNames.push(eventName);
+          eventHandlers.push(handler);
+        },
+        close: () => { closed += 1; },
+      };
     };
 
     const missing = classifyResource<PersonalAgentThread>({ response: new Response(null, { status: 404 }) });
     expect(subscribePersonalAgentEvents(missing.status, "not-owned", () => undefined, createEventSource)).toBeUndefined();
     expect(opened).toBe(0);
 
-    const close = subscribePersonalAgentEvents("ready", "agent/1", () => undefined, createEventSource);
+    let refreshes = 0;
+    const close = subscribePersonalAgentEvents("ready", "agent/1", () => { refreshes += 1; }, createEventSource);
     expect(opened).toBe(1);
     expect(path).toBe("/app/api/v1/agents/agent%2F1/events");
     expect(withCredentials).toBe(true);
+    expect(eventNames).toEqual(["thread.snapshot", "turn.updated"]);
+    eventHandlers.forEach((handler) => handler());
+    expect(refreshes).toBe(2);
     close?.();
     expect(closed).toBe(1);
   });
