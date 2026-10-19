@@ -7,6 +7,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Signed-in users can create owner-scoped personal agents from a configured coding agent and an
+  active Envelope, post idempotent messages, and read ordered turns linked to their normal Runs.
+  The dispatcher merges messages that arrive during a turn into one next turn, resumes the same
+  Run after restart, and always requests models without tools. Deployment settings bound retained
+  conversation turns, leases, and status checks. Resumable live turn events will follow separately.
+
 ## [0.3.20] - 2026-10-18
 
 Steward v0.3.20 adds governed external Run API callers and signed Jira webhook Triggers, including

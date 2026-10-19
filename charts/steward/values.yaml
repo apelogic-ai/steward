@@ -273,6 +273,12 @@ config:
     # Exact streamable HTTP endpoint rendered only into tool-bearing Task plans.
     # Empty keeps tool-less tasks available and makes tool-bearing submission fail closed.
     mcpGatewayEndpoint: ""
+    # Personal-agent dispatcher bounds. A turn keeps only this many completed turns in its
+    # prompt, renews one database lease, and uses the poll interval as its Task-status fallback.
+    personalAgents:
+      recentTurnLimit: 8
+      leaseSeconds: 30
+      pollIntervalSeconds: 2
   controller:
     openshellEndpoint: ""
     openshellServerName: ""

@@ -638,7 +638,8 @@
             "executionBindings",
             "inferenceEndpoint",
             "anthropicInferenceEndpoint",
-            "mcpGatewayEndpoint"
+            "mcpGatewayEndpoint",
+            "personalAgents"
           ],
           "properties": {
             "jiraBaseUrl": {"type": "string", "pattern": "^$|^https://"},
@@ -1002,6 +1003,16 @@
             "mcpGatewayEndpoint": {
               "type": "string",
               "pattern": "^$|^https?://[^\\s/@?#:]+(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:/[^\\s?#]*)?$"
+            },
+            "personalAgents": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["recentTurnLimit", "leaseSeconds", "pollIntervalSeconds"],
+              "properties": {
+                "recentTurnLimit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "leaseSeconds": {"type": "integer", "minimum": 5, "maximum": 3600},
+                "pollIntervalSeconds": {"type": "integer", "minimum": 1, "maximum": 1800}
+              }
             }
           }
         },

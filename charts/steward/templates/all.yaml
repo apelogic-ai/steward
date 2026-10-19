@@ -500,6 +500,9 @@ spec:
             - { name: STEWARD_TASK_ANTHROPIC_INFERENCE_ENDPOINT, value: {{ .Values.config.apiserver.anthropicInferenceEndpoint | quote }} }
 {{- end }}
             - { name: STEWARD_TASK_MCP_GW_ENDPOINT, value: {{ .Values.config.apiserver.mcpGatewayEndpoint | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_RECENT_TURN_LIMIT, value: {{ .Values.config.apiserver.personalAgents.recentTurnLimit | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_LEASE_SECONDS, value: {{ .Values.config.apiserver.personalAgents.leaseSeconds | int64 | quote }} }
+            - { name: STEWARD_PERSONAL_AGENT_POLL_INTERVAL_SECONDS, value: {{ .Values.config.apiserver.personalAgents.pollIntervalSeconds | int64 | quote }} }
             - { name: STEWARD_WORKSPACE_POLICY_JSON, value: {{ .Values.workspace | toJson | quote }} }
 {{- if .Values.githubSource.enabled }}
             - { name: STEWARD_GITHUB_SOURCE_APP_ID, value: {{ .Values.githubSource.appId | quote }} }
