@@ -10,6 +10,7 @@ import {
   activeEnvelopeChoices,
   nextPersonalAgentMessageKey,
   personalAgentFailureMessage,
+  selectedPersonalAgentModel,
   subscribePersonalAgentEvents,
   type PersonalAgentThread,
 } from "./personal-agent-views";
@@ -21,6 +22,7 @@ const thread: PersonalAgentThread = {
     envelopeRequestId: "envelope-active",
     id: "agent-1",
     instructions: "Keep replies concise.",
+    model: { provider: "example", model: "model-a" },
     name: "Release helper",
     updatedAt: "2026-10-19T05:04:00Z",
   },
@@ -42,10 +44,20 @@ const source = readFileSync(new URL("./personal-agent-views.tsx", import.meta.ur
 describe("personal agent creation", () => {
   test("offers only active Envelopes and keeps their configured labels", () => {
     expect(activeEnvelopeChoices([
-      { envelopeDigest: "sha256:active", id: "envelope-active", status: "provisioned", templateDisplayName: "Standard" },
+      {
+        approvedEnvelope: { spec: { llms: [{ provider: "example", model: "model-a" }] } },
+        envelopeDigest: "sha256:active",
+        id: "envelope-active",
+        status: "provisioned",
+        templateDisplayName: "Standard",
+      },
       { envelopeDigest: null, id: "envelope-pending", status: "pending", templateDisplayName: "Pending" },
       { envelopeDigest: "sha256:stale", id: "envelope-stale", status: "stale", templateDisplayName: "Stale" },
-    ])).toEqual([{ label: "Standard", requestId: "envelope-active" }]);
+    ])).toEqual([{
+      label: "Standard",
+      models: [{ provider: "example", model: "model-a" }],
+      requestId: "envelope-active",
+    }]);
   });
 
   test("shows a plain failure reason supplied by the API", () => {
@@ -65,6 +77,59 @@ describe("personal agent creation", () => {
     expect(markup).toContain("Instructions");
     expect(markup).toContain("Envelope");
     expect(markup).toContain("disabled");
+  });
+
+  test("asks for a model only when the selected Envelope offers more than one", () => {
+    const oneModel = renderToStaticMarkup(<NewPersonalAgentForm
+      envelopeChoices={[{
+        label: "Standard",
+        models: [{ provider: "example", model: "model-a" }],
+        requestId: "envelope-one",
+      }]}
+      harnessChoices={[{ agentRef: "codex@configured", label: "Codex" }]}
+      onSubmit={() => undefined}
+      saving={false}
+    />);
+    const multipleModels = renderToStaticMarkup(<NewPersonalAgentForm
+      envelopeChoices={[{
+        label: "Flexible",
+        models: [
+          { provider: "example", model: "model-a" },
+          { provider: "future-provider", model: "future-model" },
+        ],
+        requestId: "envelope-multiple",
+      }]}
+      harnessChoices={[{ agentRef: "codex@configured", label: "Codex" }]}
+      onSubmit={() => undefined}
+      saving={false}
+    />);
+
+    expect(oneModel).not.toContain("personal-agent-model");
+    expect(multipleModels).toContain("personal-agent-model");
+    expect(multipleModels).toContain("example/model-a");
+    expect(multipleModels).toContain("future-provider/future-model");
+  });
+
+  test("sends an explicit model only for an Envelope with multiple choices", () => {
+    const choices = [{
+      label: "Flexible",
+      models: [
+        { provider: "example", model: "model-a" },
+        { provider: "future-provider", model: "future-model" },
+      ],
+      requestId: "envelope-multiple",
+    }];
+
+    expect(selectedPersonalAgentModel(
+      choices,
+      "envelope-multiple",
+      JSON.stringify(["future-provider", "future-model"]),
+    )).toEqual({ provider: "future-provider", model: "future-model" });
+    expect(selectedPersonalAgentModel(
+      [{ ...choices[0], models: [choices[0].models[0]] }],
+      "envelope-multiple",
+      JSON.stringify(["example", "model-a"]),
+    )).toBeUndefined();
   });
 });
 

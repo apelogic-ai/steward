@@ -14,6 +14,7 @@ import {
   postPersonalAgentMessage as postPersonalAgentMessageRequest,
   type EnvelopeRequestStatus,
   type EnvelopeRequestsResponse,
+  type ModelRef,
   type PersonalAgentMessageView,
   type PersonalAgentReplyView,
   type PersonalAgentsResponse,
@@ -24,6 +25,7 @@ import {
 import { DataTable } from "@/components/hs/data-table";
 import { SectionCard } from "@/components/hs/section-card";
 import { StatusPill } from "@/components/hs/status-pill";
+import { modelKey, modelOptionLabel } from "@/components/model-selection";
 import { EmptyState, PageHeader, PrimaryLink, ResourceBoundary } from "@/components/workspace-ui";
 import { classifyResource, useApiResource, type ResourceState } from "@/data/use-api-resource";
 import { useSession } from "@/session/session-context";
@@ -47,6 +49,7 @@ type PersonalAgentApiResult<T> = {
 };
 
 export type PersonalAgentEnvelopeCandidate = {
+  approvedEnvelope?: null | { spec: { llms: ModelRef[] } };
   envelopeDigest?: string | null;
   id: string;
   status: EnvelopeRequestStatus;
@@ -55,6 +58,7 @@ export type PersonalAgentEnvelopeCandidate = {
 
 export type PersonalAgentEnvelopeChoice = {
   label: string;
+  models: ModelRef[];
   requestId: string;
 };
 
@@ -64,9 +68,21 @@ export function activeEnvelopeChoices(
   return requests.flatMap((request) => request.status === "provisioned" && request.envelopeDigest
     ? [{
         label: request.templateDisplayName?.trim() || `Envelope ${request.id}`,
+        models: [...(request.approvedEnvelope?.spec.llms ?? [])],
         requestId: request.id,
       }]
     : []);
+}
+
+export function selectedPersonalAgentModel(
+  envelopeChoices: ReadonlyArray<PersonalAgentEnvelopeChoice>,
+  envelopeRequestId: string,
+  selectedModelKey: string,
+): ModelRef | undefined {
+  const models = envelopeChoices.find((choice) => choice.requestId === envelopeRequestId)?.models ?? [];
+  return models.length > 1
+    ? models.find((model) => modelKey(model) === selectedModelKey)
+    : undefined;
 }
 
 export function personalAgentFailureMessage(
@@ -173,10 +189,20 @@ export function NewPersonalAgentView() {
       return;
     }
     const form = new FormData(event.currentTarget);
+    const envelopeRequestId = String(form.get("envelopeRequestId") ?? "").trim();
+    const envelopeChoices = state.status === "ready"
+      ? activeEnvelopeChoices(state.value.envelopes.requests)
+      : [];
+    const model = selectedPersonalAgentModel(
+      envelopeChoices,
+      envelopeRequestId,
+      String(form.get("model") ?? ""),
+    );
     const body = {
       agentRef: String(form.get("agentRef") ?? "").trim(),
-      envelopeRequestId: String(form.get("envelopeRequestId") ?? "").trim(),
+      envelopeRequestId,
       instructions: String(form.get("instructions") ?? "").trim(),
+      ...(model ? { model } : {}),
       name: String(form.get("name") ?? "").trim(),
     };
     setFailure(null);
@@ -425,6 +451,12 @@ export function NewPersonalAgentForm({
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   saving: boolean;
 }>) {
+  const [selectedEnvelopeRequestId, setSelectedEnvelopeRequestId] = useState(
+    envelopeChoices[0]?.requestId ?? "",
+  );
+  const selectedEnvelope = envelopeChoices.find((choice) => choice.requestId === selectedEnvelopeRequestId)
+    ?? envelopeChoices[0];
+  const modelChoices = selectedEnvelope?.models ?? [];
   const ready = envelopeChoices.length > 0 && harnessChoices.length > 0;
   return (
     <form className="space-y-5" onSubmit={onSubmit}>
@@ -444,10 +476,16 @@ export function NewPersonalAgentForm({
       </label>
       <label className="grid gap-2 text-sm font-semibold" htmlFor="personal-agent-envelope">
         Envelope
-        <select className="min-h-11 rounded-control border bg-panel px-3 font-normal" disabled={saving || envelopeChoices.length === 0} id="personal-agent-envelope" name="envelopeRequestId" required>
+        <select className="min-h-11 rounded-control border bg-panel px-3 font-normal" disabled={saving || envelopeChoices.length === 0} id="personal-agent-envelope" name="envelopeRequestId" onChange={(event) => setSelectedEnvelopeRequestId(event.target.value)} required value={selectedEnvelope?.requestId ?? ""}>
           {envelopeChoices.map((choice) => <option key={choice.requestId} value={choice.requestId}>{choice.label}</option>)}
         </select>
       </label>
+      {modelChoices.length > 1 ? <label className="grid gap-2 text-sm font-semibold" htmlFor="personal-agent-model">
+        Model
+        <select className="min-h-11 rounded-control border bg-panel px-3 font-mono font-normal" disabled={saving} id="personal-agent-model" key={selectedEnvelope?.requestId} name="model" required>
+          {modelChoices.map((model) => <option key={modelKey(model)} value={modelKey(model)}>{modelOptionLabel(model, modelChoices)}</option>)}
+        </select>
+      </label> : null}
       {!ready ? <p className="text-sm text-muted-ink" role="status">You need an active Envelope and an available coding agent before you can create an agent.</p> : null}
       <button className="inline-flex min-h-10 items-center rounded-control bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:cursor-not-allowed disabled:opacity-60" disabled={saving || !ready} type="submit">
         {saving ? "Creating…" : "Create agent"}
