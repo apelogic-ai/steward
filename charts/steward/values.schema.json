@@ -1007,7 +1007,7 @@
             "personalAgents": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["recentTurnLimit", "leaseSeconds", "pollIntervalSeconds", "maxConcurrentTurns", "maxTransientAttempts", "retryBackoffSeconds", "maxNameCharacters", "maxInstructionsBytes", "maxMessageBytes", "maxQueuedBytes", "maxReplyBytes", "maxPromptBytes"],
+              "required": ["recentTurnLimit", "leaseSeconds", "pollIntervalSeconds", "maxConcurrentTurns", "maxTransientAttempts", "retryBackoffSeconds", "maxClaimsPerTurn", "monitoringGraceSeconds", "maxNameCharacters", "maxInstructionsBytes", "maxMessageBytes", "maxQueuedBytes", "maxReplyBytes", "maxPromptBytes"],
               "properties": {
                 "recentTurnLimit": {"type": "integer", "minimum": 1, "maximum": 100},
                 "leaseSeconds": {"type": "integer", "minimum": 5, "maximum": 3600},
@@ -1015,6 +1015,8 @@
                 "maxConcurrentTurns": {"type": "integer", "minimum": 1},
                 "maxTransientAttempts": {"type": "integer", "minimum": 1},
                 "retryBackoffSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+                "maxClaimsPerTurn": {"type": "integer", "minimum": 1},
+                "monitoringGraceSeconds": {"type": "integer", "minimum": 1, "maximum": 86400},
                 "maxNameCharacters": {"type": "integer", "minimum": 1},
                 "maxInstructionsBytes": {"type": "integer", "minimum": 1},
                 "maxMessageBytes": {"type": "integer", "minimum": 1},

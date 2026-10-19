@@ -10,6 +10,7 @@ version.workspace = true
 async-stream.workspace = true
 axum.workspace = true
 base64.workspace = true
+chrono.workspace = true # Keeps dispatcher deadlines stable across worker restarts.
 futures.workspace = true
 jsonwebtoken.workspace = true
 k8s-openapi.workspace = true

@@ -970,6 +970,12 @@ fn personal_agent_configuration() -> Result<personal_agents::PersonalAgentConfig
     let retry_backoff_seconds =
         optional_unicode_environment("STEWARD_PERSONAL_AGENT_RETRY_BACKOFF_SECONDS")?
             .unwrap_or_else(|| personal_agents::DEFAULT_RETRY_BACKOFF_SECONDS.to_string());
+    let max_claims_per_turn =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_MAX_CLAIMS_PER_TURN")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_MAX_CLAIMS_PER_TURN.to_string());
+    let monitoring_grace_seconds =
+        optional_unicode_environment("STEWARD_PERSONAL_AGENT_MONITORING_GRACE_SECONDS")?
+            .unwrap_or_else(|| personal_agents::DEFAULT_MONITORING_GRACE_SECONDS.to_string());
     let max_name_characters = personal_agent_limit(
         "MAX_NAME_CHARACTERS",
         personal_agents::DEFAULT_MAX_NAME_CHARACTERS,
@@ -999,6 +1005,8 @@ fn personal_agent_configuration() -> Result<personal_agents::PersonalAgentConfig
         &max_concurrent_turns,
         &max_transient_attempts,
         &retry_backoff_seconds,
+        &max_claims_per_turn,
+        &monitoring_grace_seconds,
         PersonalAgentLimits {
             max_name_characters,
             max_instructions_bytes,
@@ -1031,6 +1039,8 @@ fn personal_agent_configuration_from_values(
         &personal_agents::DEFAULT_MAX_CONCURRENT_TURNS.to_string(),
         &personal_agents::DEFAULT_MAX_TRANSIENT_ATTEMPTS.to_string(),
         &personal_agents::DEFAULT_RETRY_BACKOFF_SECONDS.to_string(),
+        &personal_agents::DEFAULT_MAX_CLAIMS_PER_TURN.to_string(),
+        &personal_agents::DEFAULT_MONITORING_GRACE_SECONDS.to_string(),
         PersonalAgentLimits {
             max_name_characters: personal_agents::DEFAULT_MAX_NAME_CHARACTERS,
             max_instructions_bytes: personal_agents::DEFAULT_MAX_INSTRUCTIONS_BYTES,
@@ -1049,6 +1059,8 @@ fn personal_agent_configuration_from_all_values(
     max_concurrent_turns: &str,
     max_transient_attempts: &str,
     retry_backoff_seconds: &str,
+    max_claims_per_turn: &str,
+    monitoring_grace_seconds: &str,
     limits: PersonalAgentLimits,
 ) -> Result<personal_agents::PersonalAgentConfig, io::Error> {
     let recent_turn_limit = recent_turn_limit.parse::<i64>().map_err(|_| {
@@ -1069,6 +1081,12 @@ fn personal_agent_configuration_from_all_values(
     let retry_backoff_seconds = retry_backoff_seconds.parse::<i64>().map_err(|_| {
         io::Error::other("STEWARD_PERSONAL_AGENT_RETRY_BACKOFF_SECONDS must be an integer")
     })?;
+    let max_claims_per_turn = max_claims_per_turn.parse::<i32>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_MAX_CLAIMS_PER_TURN must be an integer")
+    })?;
+    let monitoring_grace_seconds = monitoring_grace_seconds.parse::<i64>().map_err(|_| {
+        io::Error::other("STEWARD_PERSONAL_AGENT_MONITORING_GRACE_SECONDS must be an integer")
+    })?;
     personal_agents::PersonalAgentConfig::new(
         recent_turn_limit,
         lease_seconds,
@@ -1076,6 +1094,8 @@ fn personal_agent_configuration_from_all_values(
         max_concurrent_turns,
         max_transient_attempts,
         retry_backoff_seconds,
+        max_claims_per_turn,
+        monitoring_grace_seconds,
         limits,
     )
     .map_err(io::Error::other)

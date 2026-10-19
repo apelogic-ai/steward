@@ -10,7 +10,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
+use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
+use steward_admission::duration_seconds;
 use steward_store::{
     CreatePersonalAgentRequest as StoreCreatePersonalAgentRequest, EnvelopeRequestStatus,
     PersonalAgentDispatchRecord, PersonalAgentLimits, PersonalAgentMessageRecord,
@@ -36,6 +38,8 @@ pub const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 2;
 pub const DEFAULT_MAX_CONCURRENT_TURNS: usize = 8;
 pub const DEFAULT_MAX_TRANSIENT_ATTEMPTS: i32 = 3;
 pub const DEFAULT_RETRY_BACKOFF_SECONDS: i64 = 2;
+pub const DEFAULT_MAX_CLAIMS_PER_TURN: i32 = 10;
+pub const DEFAULT_MONITORING_GRACE_SECONDS: i64 = 60;
 pub const DEFAULT_MAX_NAME_CHARACTERS: usize = 200;
 pub const DEFAULT_MAX_INSTRUCTIONS_BYTES: usize = 16 * 1024;
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 16 * 1024;
@@ -51,6 +55,8 @@ pub struct PersonalAgentConfig {
     max_concurrent_turns: usize,
     max_transient_attempts: i32,
     retry_backoff_seconds: i64,
+    max_claims_per_turn: i32,
+    monitoring_grace_seconds: i64,
     limits: PersonalAgentLimits,
 }
 
@@ -62,6 +68,8 @@ impl PersonalAgentConfig {
         max_concurrent_turns: usize,
         max_transient_attempts: i32,
         retry_backoff_seconds: i64,
+        max_claims_per_turn: i32,
+        monitoring_grace_seconds: i64,
         limits: PersonalAgentLimits,
     ) -> Result<Self, String> {
         if !(1..=100).contains(&recent_turn_limit) {
@@ -78,9 +86,14 @@ impl PersonalAgentConfig {
         }
         if max_concurrent_turns == 0
             || max_transient_attempts <= 0
+            || max_claims_per_turn <= 0
             || !(1..=3_600).contains(&retry_backoff_seconds)
+            || !(1..=86_400).contains(&monitoring_grace_seconds)
         {
-            return Err("personal agent concurrency and retry limits must be positive".to_owned());
+            return Err(
+                "personal agent concurrency, retry, claim, and monitoring limits must be positive"
+                    .to_owned(),
+            );
         }
         if limits.max_name_characters == 0
             || limits.max_instructions_bytes == 0
@@ -98,6 +111,8 @@ impl PersonalAgentConfig {
             max_concurrent_turns,
             max_transient_attempts,
             retry_backoff_seconds,
+            max_claims_per_turn,
+            monitoring_grace_seconds,
             limits,
         })
     }
@@ -648,6 +663,7 @@ pub(crate) async fn run_dispatcher(
                     &lease_id,
                     config.lease_seconds,
                     config.recent_turn_limit,
+                    config.max_claims_per_turn,
                     &excluded_turn_ids,
                 )
                 .await
@@ -769,7 +785,25 @@ async fn run_turn(
             }
         }
     };
+    let Some(monitoring_deadline) = turn_monitoring_deadline(&dispatch, config) else {
+        return store
+            .fail_personal_agent_turn(
+                dispatch.turn.id,
+                &lease_id,
+                "This agent's settings couldn't be read.",
+            )
+            .await;
+    };
     loop {
+        if Utc::now() >= monitoring_deadline {
+            return store
+                .fail_personal_agent_turn(
+                    dispatch.turn.id,
+                    &lease_id,
+                    "This turn took too long and was stopped watching.",
+                )
+                .await;
+        }
         store
             .renew_personal_agent_turn_lease(dispatch.turn.id, &lease_id, config.lease_seconds)
             .await?;
@@ -816,6 +850,10 @@ async fn run_turn(
             }
             Err(error) => {
                 if keep_monitoring_after_status_error(error) {
+                    eprintln!(
+                        "personal agent Task status could not be read; turn_id={}: transient error",
+                        dispatch.turn.id
+                    );
                     tokio::time::sleep(config.poll_interval).await;
                 } else {
                     return handle_task_error(
@@ -831,6 +869,38 @@ async fn run_turn(
             }
         }
     }
+}
+
+fn turn_monitoring_deadline(
+    dispatch: &PersonalAgentDispatchRecord,
+    config: PersonalAgentConfig,
+) -> Option<DateTime<Utc>> {
+    monitoring_deadline_from_values(
+        dispatch.turn.started_at.as_deref()?,
+        &dispatch
+            .envelope_request
+            .as_ref()?
+            .approved_envelope
+            .as_ref()?
+            .spec
+            .ttl,
+        config.monitoring_grace_seconds,
+    )
+}
+
+fn monitoring_deadline_from_values(
+    started_at: &str,
+    ttl: &steward_types::Duration,
+    monitoring_grace_seconds: i64,
+) -> Option<DateTime<Utc>> {
+    let started_at = DateTime::parse_from_rfc3339(started_at)
+        .ok()?
+        .with_timezone(&Utc);
+    let ttl_seconds = duration_seconds(ttl).ok()?;
+    let total_seconds = i64::try_from(ttl_seconds)
+        .ok()?
+        .checked_add(monitoring_grace_seconds)?;
+    started_at.checked_add_signed(TimeDelta::seconds(total_seconds))
 }
 
 fn keep_monitoring_after_status_error(error: PersonalAgentTaskError) -> bool {
@@ -898,7 +968,8 @@ mod tests {
         DEFAULT_MAX_INSTRUCTIONS_BYTES, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_NAME_CHARACTERS,
         DEFAULT_MAX_PROMPT_BYTES, DEFAULT_MAX_QUEUED_BYTES, DEFAULT_MAX_REPLY_BYTES,
         PersonalAgentConfig, PersonalAgentDispatchRecord, keep_monitoring_after_status_error,
-        retry_delay_seconds, safe_failure_reason, store_error_response, turn_prompt,
+        monitoring_deadline_from_values, retry_delay_seconds, safe_failure_reason,
+        store_error_response, turn_prompt,
     };
     use crate::tasks::PersonalAgentTaskError;
     use crate::tasks::personal_agent_task_definition;
@@ -927,14 +998,16 @@ mod tests {
 
     #[test]
     fn configuration_refuses_unbounded_or_unsafe_dispatch_values() {
-        assert!(PersonalAgentConfig::new(0, 30, 1, 8, 3, 2, limits()).is_err());
-        assert!(PersonalAgentConfig::new(101, 30, 1, 8, 3, 2, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 4, 1, 8, 3, 2, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 16, 8, 3, 2, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 0, 3, 2, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 0, 2, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, 0, limits()).is_err());
-        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, 2, limits()).is_ok());
+        assert!(PersonalAgentConfig::new(0, 30, 1, 8, 3, 2, 10, 60, limits()).is_err());
+        assert!(PersonalAgentConfig::new(101, 30, 1, 8, 3, 2, 10, 60, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 4, 1, 8, 3, 2, 10, 60, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 16, 8, 3, 2, 10, 60, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 0, 3, 2, 10, 60, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 0, 2, 10, 60, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, 0, 10, 60, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, 2, 0, 60, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, 2, 10, 0, limits()).is_err());
+        assert!(PersonalAgentConfig::new(8, 30, 1, 8, 3, 2, 10, 60, limits()).is_ok());
     }
 
     #[test]
@@ -949,6 +1022,25 @@ mod tests {
         assert!(!keep_monitoring_after_status_error(
             PersonalAgentTaskError::Permanent
         ));
+    }
+
+    #[test]
+    fn monitoring_deadline_uses_turn_start_envelope_ttl_and_grace() {
+        let deadline = monitoring_deadline_from_values(
+            "2026-10-19T00:00:00Z",
+            &Duration("30m".to_owned()),
+            60,
+        )
+        .expect("valid deadline");
+        assert_eq!(deadline.to_rfc3339(), "2026-10-19T00:31:00+00:00");
+        assert!(
+            monitoring_deadline_from_values(
+                "2026-10-19T00:00:00Z",
+                &Duration("invalid".to_owned()),
+                60,
+            )
+            .is_none()
+        );
     }
 
     #[test]
