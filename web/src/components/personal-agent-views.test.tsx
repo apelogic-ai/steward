@@ -45,9 +45,9 @@ describe("personal agent creation", () => {
   test("offers only active Envelopes and keeps their configured labels", () => {
     expect(activeEnvelopeChoices([
       {
-        approvedEnvelope: { spec: { llms: [{ provider: "example", model: "model-a" }] } },
         envelopeDigest: "sha256:active",
         id: "envelope-active",
+        requestedEnvelope: { spec: { llms: [{ provider: "example", model: "model-a" }] } },
         status: "provisioned",
         templateDisplayName: "Standard",
       },

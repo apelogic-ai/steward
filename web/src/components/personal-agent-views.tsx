@@ -52,6 +52,7 @@ export type PersonalAgentEnvelopeCandidate = {
   approvedEnvelope?: null | { spec: { llms: ModelRef[] } };
   envelopeDigest?: string | null;
   id: string;
+  requestedEnvelope?: { spec: { llms: ModelRef[] } };
   status: EnvelopeRequestStatus;
   templateDisplayName?: string | null;
 };
@@ -68,7 +69,7 @@ export function activeEnvelopeChoices(
   return requests.flatMap((request) => request.status === "provisioned" && request.envelopeDigest
     ? [{
         label: request.templateDisplayName?.trim() || `Envelope ${request.id}`,
-        models: [...(request.approvedEnvelope?.spec.llms ?? [])],
+        models: [...(request.approvedEnvelope ?? request.requestedEnvelope)?.spec.llms ?? []],
         requestId: request.id,
       }]
     : []);
